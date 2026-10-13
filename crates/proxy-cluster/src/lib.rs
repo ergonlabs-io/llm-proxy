@@ -349,7 +349,6 @@ impl BudgetHandle {
         Some(CbGuard {
             active: Arc::clone(&self.active),
             notify: self.notify.clone(),
-            _active_request: None,
         })
     }
 }
@@ -364,27 +363,6 @@ pub struct CbGuard {
     /// one parked waiter after this guard's `Drop` frees the slot. `None`
     /// for every other budget's guard.
     notify: Option<Arc<tokio::sync::Notify>>,
-    /// An in-flight-request count riding on this guard so it shares the
-    /// guard's lifetime. Only set for upgraded tunnels, whose
-    /// `UpgradeTunnel` carries a single `CbGuard` for the connection's whole
-    /// life; field order means it drops after the budget slot is released.
-    _active_request: Option<ActiveRequestGuard>,
-}
-
-impl CbGuard {
-    /// Attach `active` to `existing` (or to a stand-alone guard when the
-    /// dial had no budget slot) so both are released together.
-    pub fn with_active_request(existing: Option<CbGuard>, active: ActiveRequestGuard) -> CbGuard {
-        let mut guard = existing.unwrap_or_else(|| CbGuard {
-            // A private gauge no budget reads: starts at 1 so this guard's
-            // own `Drop` decrement balances it.
-            active: Arc::new(std::sync::atomic::AtomicU32::new(1)),
-            notify: None,
-            _active_request: None,
-        });
-        guard._active_request = Some(active);
-        guard
-    }
 }
 
 impl Drop for CbGuard {

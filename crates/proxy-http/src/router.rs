@@ -826,14 +826,10 @@ impl RouterHandler {
             }
         };
         let proxy_cluster::UpstreamStream { io, cb_guard } = upstream_stream;
-        // Count this upgraded connection against the host for the tunnel's
-        // whole life: the guard rides on `cb_guard`, which the declined
-        // path ties to the response body and the accepted path hands to
-        // `UpgradeTunnel` (held until the bridge ends).
-        let cb_guard = Some(proxy_cluster::CbGuard::with_active_request(
-            cb_guard,
-            host.begin_request(),
-        ));
+        // `LEAST_REQUEST` reads this count. It lives as long as `cb_guard`:
+        // the declined path ties both to the response body, and the accepted
+        // path hands both to `UpgradeTunnel`, held until the bridge ends.
+        let active_request = host.begin_request();
 
         let body_bytes = self.captured_body.clone();
         dcb.stream_info().bytes_received = body_bytes.len() as u64;
@@ -907,7 +903,7 @@ impl RouterHandler {
                 ));
             }
             attempt_guard.0 = None;
-            resp.body = local_boxed(GuardedBody::new(resp.body, cb_guard));
+            resp.body = local_boxed(GuardedBody::new(resp.body, (cb_guard, active_request)));
             return resp;
         }
 
@@ -958,6 +954,7 @@ impl RouterHandler {
                 downstream: downstream_on_upgrade,
                 upstream: upstream_on_upgrade,
                 cb_guard,
+                active_request: Some(active_request),
             }),
         }
     }

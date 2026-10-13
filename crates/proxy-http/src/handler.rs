@@ -160,6 +160,10 @@ pub struct UpgradeTunnel {
     /// `None` only when the dial had no real budget to acquire against (see
     /// that same doc).
     pub cb_guard: Option<proxy_cluster::CbGuard>,
+    /// The upstream host's in-flight count for `LEAST_REQUEST`, held for the
+    /// tunnel's whole life like `cb_guard`. `None` only where no host was
+    /// selected.
+    pub active_request: Option<proxy_cluster::ActiveRequestGuard>,
 }
 
 /// One per HTTP connection manager instance. The codec calls `handle` once

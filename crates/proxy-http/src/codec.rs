@@ -1061,9 +1061,14 @@ async fn serve_one(
         downstream,
         upstream,
         cb_guard,
+        active_request,
     }) = upgrade
     {
-        tunnels.spawn(bridge_upgrade(downstream, upstream, cb_guard));
+        tunnels.spawn(bridge_upgrade(
+            downstream,
+            upstream,
+            (cb_guard, active_request),
+        ));
     }
 
     built
@@ -1141,7 +1146,10 @@ const WEBSOCKET_TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 async fn bridge_upgrade(
     downstream: hyper::upgrade::OnUpgrade,
     upstream: hyper::upgrade::OnUpgrade,
-    _cb_guard: Option<proxy_cluster::CbGuard>,
+    _cb_guard: (
+        Option<proxy_cluster::CbGuard>,
+        Option<proxy_cluster::ActiveRequestGuard>,
+    ),
 ) {
     // Rust note: `tokio::try_join!` polls both futures concurrently and
     // resolves as soon as either errors, or once both have resolved
