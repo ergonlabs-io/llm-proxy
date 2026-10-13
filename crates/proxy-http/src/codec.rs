@@ -345,6 +345,21 @@ pub fn is_remote_reset(err: &UpstreamCodecError) -> bool {
     }
 }
 
+/// Did the upstream break the protocol (a malformed status line, header,
+/// or version) rather than reset or close the connection? Envoy reports the
+/// first as `UPE` with a `502` and the second as `UC`/`UR` with a `503`
+/// ("upstream connect error or disconnect/reset before headers"); see
+/// `router::codec_error_reply`. A remote h2 reset is never a protocol error
+/// here, whatever its reason code: [`is_remote_reset`] is checked first.
+pub fn is_protocol_error(err: &UpstreamCodecError) -> bool {
+    match err {
+        UpstreamCodecError::Send(e) | UpstreamCodecError::Connection(e) => e.is_parse(),
+        UpstreamCodecError::Handshake(_)
+        | UpstreamCodecError::MissingAuthority
+        | UpstreamCodecError::RefusedStream => false,
+    }
+}
+
 /// Send one request upstream over `io` as HTTP/1.1 and return the response,
 /// head-first with a streaming body -- the client-side mirror of
 /// `serve_http1`/`serve_one`.
@@ -492,6 +507,15 @@ where
         uri,
         headers,
     } = req.head;
+    // S10: `serve_one` strips `connection` from an upgrade request (S9 rule
+    // 6) and keeps only `upgrade`; this is the h1 wire, so ask for the
+    // switch hop-by-hop again here, the inverse of `send_upstream_h2_connect`
+    // turning `upgrade` into `:protocol`.
+    let mut headers = headers;
+    headers.insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("upgrade"),
+    );
     let mut builder = Request::builder().method(method).uri(uri);
     *builder.headers_mut().expect("builder not yet finalized") = headers;
     let request = builder
@@ -945,6 +969,15 @@ async fn serve_one(
 
     let (parts, incoming) = req.into_parts();
     let mut headers = parts.headers;
+    // S9 rule 6, request direction, before any filter sees the head (Envoy
+    // `mutateRequestHeaders`). hyper has already read `Connection: close`
+    // to decide this downstream connection's fate; forwarding it would
+    // close the pooled upstream connection too.
+    if on_upgrade.is_some() {
+        crate::headers::sanitize_upgrade_hop_by_hop(&mut headers);
+    } else {
+        crate::headers::sanitize_hop_by_hop(&mut headers);
+    }
     // Rust note: normalize the h2 `:protocol` pseudo-header into a
     // SYNTHETIC `Upgrade: <protocol>` header on the request head we hand the
     // router, purely so `router.rs`'s existing `is_upgrade_allowed`/
@@ -992,6 +1025,23 @@ async fn serve_one(
     // partial move is sound, and it's what lets the tunnel handles survive
     // past that call.
     let upgrade = response.upgrade.take();
+
+    // S9 rule 6, response direction, after the filter chain (Envoy
+    // `mutateResponseHeaders`): the upstream's connection management
+    // (`connection: close`, `keep-alive`, its framing) describes the
+    // upstream hop, never this one. hyper re-adds `connection: close`
+    // itself when it is closing this connection (drain, an unread body).
+    // An h1 `101` keeps `upgrade` and re-synthesizes `connection: upgrade`,
+    // which the client needs to complete the handshake.
+    if upgrade.is_some() && response.head.status == http::StatusCode::SWITCHING_PROTOCOLS {
+        crate::headers::sanitize_upgrade_hop_by_hop(&mut response.head.headers);
+        response.head.headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("upgrade"),
+        );
+    } else {
+        crate::headers::sanitize_hop_by_hop(&mut response.head.headers);
+    }
 
     let built = build_response(response);
 

@@ -350,18 +350,38 @@ pub fn set_forwarded_proto(headers: &mut HeaderMap, is_tls: bool) {
     );
 }
 
-/// S9 rule 6: hop-by-hop header sanitization. `connection`, `upgrade`, and
-/// `transfer-encoding` are always stripped (they describe *this* hop's wire
-/// framing, not anything upstream/downstream should see repeated). `te` is
-/// stripped down to only `trailers` values — dropping every other `te`
-/// value (`gzip`, `deflate`, ...) but *keeping* `trailers` if present,
-/// because gRPC-over-h2 depends on `te: trailers` surviving the proxy hop to
-/// negotiate trailer support; dropping it silently is a classic way to break
-/// gRPC.
+/// S9 rule 6: hop-by-hop header sanitization. `connection`, `upgrade`,
+/// `transfer-encoding`, `keep-alive`, and `proxy-connection` are always
+/// stripped: they describe *this* hop's connection and framing, and
+/// forwarding them lets one peer manage the other's connection (an upstream
+/// `connection: close` would close the client's keep-alive connection).
+/// Envoy strips the same set in both directions
+/// (`ConnectionManagerUtility::mutateRequestHeaders` /
+/// `mutateResponseHeaders`). `te` is stripped down to only `trailers` --
+/// dropping every other `te` value (`gzip`, `deflate`, ...) but *keeping*
+/// `trailers` if present, because gRPC-over-h2 depends on `te: trailers`
+/// surviving the proxy hop to negotiate trailer support; dropping it
+/// silently is a classic way to break gRPC.
+///
+/// Called by `codec::serve_one` on every request before the filter chain
+/// and on every response after it. An upgrade uses
+/// [`sanitize_upgrade_hop_by_hop`] instead.
 pub fn sanitize_hop_by_hop(headers: &mut HeaderMap) {
-    headers.remove(http::header::CONNECTION);
     headers.remove(http::header::UPGRADE);
+    sanitize_upgrade_hop_by_hop(headers);
+}
+
+/// [`sanitize_hop_by_hop`] for an upgrade (S10): everything except
+/// `upgrade`, which names the protocol and is what the router's S10.1 gate
+/// reads. `connection` is still stripped; each h1 codec re-synthesizes
+/// `connection: upgrade` on the wire (`send_upstream_http1_upgrade` toward
+/// the upstream, `serve_one` on a `101` toward the client), so a client's
+/// extra tokens (`keep-alive, Upgrade`) never reach the upstream.
+pub fn sanitize_upgrade_hop_by_hop(headers: &mut HeaderMap) {
+    headers.remove(http::header::CONNECTION);
     headers.remove(http::header::TRANSFER_ENCODING);
+    headers.remove(HeaderName::from_static("keep-alive"));
+    headers.remove(HeaderName::from_static("proxy-connection"));
 
     let trailers_present = headers.get_all(http::header::TE).iter().any(|v| {
         v.to_str()

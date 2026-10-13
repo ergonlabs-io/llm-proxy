@@ -214,15 +214,21 @@ async fn spawn_upgrade_echo_upstream(accepted: Arc<AtomicUsize>) -> SocketAddr {
             }
         }
         let request_text = String::from_utf8_lossy(&buf).to_ascii_lowercase();
-        assert!(
-            request_text.contains("upgrade: websocket"),
-            "expected the router to forward the Upgrade header, got: {request_text:?}"
-        );
+        // S9 rule 6 strips the client's `Connection` header; the h1 codec
+        // must ask for the switch again, or a real WebSocket server refuses.
+        // A failed assertion drops the stream, so the client sees no `101`.
+        let wants_switch = request_text.contains("upgrade: websocket")
+            && request_text.contains("connection: upgrade\r\n")
+            && !request_text.contains("keep-alive");
+        if !wants_switch {
+            return;
+        }
         stream
             .write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\n\
                   Upgrade: websocket\r\n\
-                  Connection: Upgrade\r\n\r\n",
+                  Connection: Upgrade, keep-alive\r\n\
+                  Keep-Alive: timeout=5\r\n\r\n",
             )
             .await
             .unwrap();
@@ -328,7 +334,8 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
                 .uri("/chat")
                 .header(http::header::HOST, "test.local")
                 .header(http::header::UPGRADE, "websocket")
-                .header(http::header::CONNECTION, "Upgrade")
+                .header(http::header::CONNECTION, "keep-alive, Upgrade")
+                .header("keep-alive", "timeout=5")
                 .body(Empty::<Bytes>::new())
                 .unwrap();
 
@@ -342,6 +349,13 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
                 response.headers().get(http::header::UPGRADE).unwrap(),
                 "websocket"
             );
+            // The upstream's hop-by-hop tokens stay on the upstream hop; the
+            // client gets exactly the `Connection: upgrade` a 101 needs.
+            assert_eq!(
+                response.headers().get(http::header::CONNECTION).unwrap(),
+                "upgrade"
+            );
+            assert!(!response.headers().contains_key("keep-alive"));
 
             let client_upgraded = hyper::upgrade::on(&mut response)
                 .await

@@ -321,8 +321,8 @@ async fn refused_addr() -> SocketAddr {
 
 /// Accepts the connection, reads the request, then answers with bytes that
 /// are not a valid HTTP status line at all -- `hyper`'s client fails to
-/// parse a response out of this, which is exactly `UpstreamCodecError::Send`
-/// (see `codec.rs::send_upstream_http1`), the real condition behind `UC`.
+/// parse a response out of this (`hyper::Error::is_parse`), the real
+/// condition behind `UPE`.
 async fn spawn_upstream_garbage_response() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -333,6 +333,21 @@ async fn spawn_upstream_garbage_response() -> SocketAddr {
         let _ = stream
             .write_all(b"not an http response at all\r\n\r\n")
             .await;
+        let _ = stream.shutdown().await;
+    });
+    addr
+}
+
+/// Accepts the connection, reads the request, then closes without a
+/// response -- hyper's client reports an incomplete message, the real
+/// condition behind `UC`.
+async fn spawn_upstream_that_closes_before_headers() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
         let _ = stream.shutdown().await;
     });
     addr
@@ -621,14 +636,16 @@ async fn a_refused_connection_records_and_renders_the_uf_flag() {
         .await;
 }
 
-// --- UC: upstream codec error -----------------------------------------------
+// --- UC / UPE: upstream codec error -----------------------------------------
 
+/// The upstream broke the protocol: Envoy answers `502` and flags `UPE`
+/// (a codec protocol error), not `UC`.
 #[tokio::test(flavor = "current_thread")]
-async fn a_garbled_upstream_response_records_and_renders_the_uc_flag() {
+async fn a_garbled_upstream_response_records_and_renders_the_upe_flag() {
     LocalSet::new()
         .run_until(async {
             let addr = spawn_upstream_garbage_response().await;
-            let path = temp_path("uc-flag");
+            let path = temp_path("upe-flag");
             let handler = build_router(
                 Scenario::forwarding_to(addr, forward_to(ForwardTarget::Cluster("up".into()))),
                 &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
@@ -639,7 +656,32 @@ async fn a_garbled_upstream_response_records_and_renders_the_uc_flag() {
             assert_eq!(resp.head.status, StatusCode::BAD_GATEWAY);
             resp.body.collect().await.unwrap();
 
-            assert_eq!(read_to_string(&path), "502 UC\n");
+            assert_eq!(read_to_string(&path), "502 UPE\n");
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+/// The upstream closed the connection before sending response headers:
+/// Envoy's "upstream connect error or disconnect/reset before headers" is
+/// `503` with `UC`, not `502`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_upstream_that_closes_before_headers_records_503_and_the_uc_flag() {
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_upstream_that_closes_before_headers().await;
+            let path = temp_path("uc-flag");
+            let handler = build_router(
+                Scenario::forwarding_to(addr, forward_to(ForwardTarget::Cluster("up".into()))),
+                &[text_logger(&path, "%RESPONSE_CODE% %RESPONSE_FLAGS%\n")],
+            )
+            .await;
+
+            let resp = handler.handle(request("/v1/chat/completions")).await;
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            resp.body.collect().await.unwrap();
+
+            assert_eq!(read_to_string(&path), "503 UC\n");
             std::fs::remove_file(&path).unwrap();
         })
         .await;
@@ -769,12 +811,12 @@ async fn a_refused_h2_stream_records_and_renders_the_ur_flag() {
             .await;
 
             let resp = handler.handle(request("/v1/chat")).await;
-            assert_eq!(resp.head.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
             resp.body.collect().await.unwrap();
 
             assert_eq!(
                 read_to_string(&path),
-                "502 UR\n",
+                "503 UR\n",
                 "a stream the peer refused is a remote reset, not a codec failure -- `UC` here \
                  would mean the refused-stream decode never reached the router"
             );
@@ -832,12 +874,12 @@ async fn a_cancelled_h2_stream_records_and_renders_the_ur_flag() {
             .await;
 
             let resp = handler.handle(request("/v1/chat")).await;
-            assert_eq!(resp.head.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
             resp.body.collect().await.unwrap();
 
             assert_eq!(
                 read_to_string(&path),
-                "502 UR\n",
+                "503 UR\n",
                 "an h2 RST_STREAM(CANCEL) is a remote reset -- `UC` here would mean the router \
                  still treats every non-refused reset reason as a plain connection failure"
             );

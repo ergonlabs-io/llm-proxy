@@ -121,10 +121,12 @@ pub enum ResponseFlag {
     /// specifically after a successful connect) remains a classification
     /// decision -- see `internal-docs/envoy-divergences.md`.
     UpstreamRemoteReset,
-    /// UC: upstream connection termination. Reachable: any hyper-level
-    /// failure sending the request or parsing the response (a malformed
-    /// response is the simplest reproduction). See `proxy_http`'s
-    /// `response_flags::a_garbled_upstream_response_records_and_renders_the_uc_flag`.
+    /// UC: upstream connection termination. Reachable: a hyper-level
+    /// failure sending the request or reading the response that is neither
+    /// a remote reset (`UR`) nor a protocol error (`UPE`), such as an
+    /// upstream that closes before sending headers. Answered with `503`, as
+    /// Envoy does. See `proxy_http`'s
+    /// `response_flags::an_upstream_that_closes_before_headers_records_503_and_the_uc_flag`.
     UpstreamConnectionTermination,
     /// RL: rate limited locally. Reachable: `proxy_filters::token_limit_filter`
     /// denies a request once its budget is exhausted (an audit found this was
@@ -160,16 +162,12 @@ pub enum ResponseFlag {
     /// `StreamInfo` is ever constructed -- there is no stream to attach a
     /// flag to at the point this failure occurs.
     DownstreamProtocolError,
-    /// UPE: upstream protocol error. Unreachable today: `codec.rs`'s
-    /// `UpstreamCodecError` does not classify `hyper::Error` by kind -- a
-    /// genuine protocol violation (a malformed status line, bad chunked
-    /// framing) and a plain connection drop both collapse into the same
-    /// `Send`/`Connection` variants, which `router.rs` already maps
-    /// uniformly to `UC`. Distinguishing them is buildable (`hyper::Error`
-    /// exposes `is_parse()`), but deciding exactly which hyper error kinds
-    /// count as "protocol" versus "connection" (matching Envoy's own
-    /// `UPE`/`UC` split) is a classification design decision, not a wiring
-    /// fix -- see `internal-docs/envoy-divergences.md`.
+    /// UPE: upstream protocol error. Reachable: hyper could not parse the
+    /// upstream response (`hyper::Error::is_parse`: a malformed status line,
+    /// header, or version), classified by `proxy_http::codec::is_protocol_error`.
+    /// Answered with `502`, as Envoy answers a codec protocol error. See
+    /// `proxy_http`'s
+    /// `response_flags::a_garbled_upstream_response_records_and_renders_the_upe_flag`.
     UpstreamProtocolError,
     /// UMSDR: upstream request reached max stream duration. Unreachable: no
     /// `max_stream_duration` feature (distinct from the route `timeout` and

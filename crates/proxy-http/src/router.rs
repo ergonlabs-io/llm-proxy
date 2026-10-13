@@ -869,15 +869,8 @@ impl RouterHandler {
             Ok(pair) => pair,
             Err(err) => {
                 attempt_guard.finish(proxy_observability::records::Termination::UpstreamError);
-                if crate::codec::is_remote_reset(&err) {
-                    dcb.stream_info()
-                        .set_response_flag(ResponseFlag::UpstreamRemoteReset);
-                } else {
-                    dcb.stream_info()
-                        .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
-                }
                 tracing::debug!(cluster = %attempt_cluster, error = %err, "S10: upgrade send failed");
-                return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
+                return codec_error_reply(&err, dcb);
             }
         };
 
@@ -1716,7 +1709,7 @@ impl RouterHandler {
                                 // attempt while the hedge is live.  Let the
                                 // newly-issued attempt decide this race
                                 // instead of turning a recoverable original
-                                // reset into an immediate downstream 502.
+                                // reset into an immediate downstream 503.
                                 Err(_) => {
                                     response_already_guarded = false;
                                     response_from_hedge = true;
@@ -2092,17 +2085,10 @@ impl RouterHandler {
                         // Flag-only: retry classification is unchanged (a
                         // reset before headers is retriable under `reset`
                         // either way).
-                        if crate::codec::is_remote_reset(&err) {
-                            tracing::debug!(response_flag = "UR", cluster = %attempt_cluster, "upstream reset the stream");
-                            dcb.stream_info()
-                                .set_response_flag(ResponseFlag::UpstreamRemoteReset);
-                        } else {
-                            tracing::debug!(response_flag = "UC", cluster = %attempt_cluster, "upstream codec error");
-                            dcb.stream_info()
-                                .set_response_flag(ResponseFlag::UpstreamConnectionTermination);
-                        }
+                        tracing::debug!(cluster = %attempt_cluster, error = %err, "upstream codec error");
+                        let resp = codec_error_reply(&err, dcb);
                         record_retry_limit_exceeded_if_applicable(&retry_state, &outcome, dcb);
-                        return local_reply(StatusCode::BAD_GATEWAY, "upstream connection failure");
+                        return resp;
                     }
                 }
             }
@@ -2827,6 +2813,33 @@ fn select_host_for_request(
 /// A locally-synthesized error reply (no upstream involved) with a
 /// plain-text body -- mirrors `stub::FixedResponseHandler`'s body
 /// construction.
+/// The local reply and response flag for a failed upstream send, as
+/// Envoy's router answers a reset before response headers: `502` with `UPE`
+/// only when the upstream broke the protocol, otherwise `503` with `UR` (an
+/// explicit remote reset) or `UC` (the connection closed or failed). The
+/// `503` matches the `PoolError::ResetBeforeHeaders` arm, which also flags
+/// `UR`.
+fn codec_error_reply(
+    err: &crate::codec::UpstreamCodecError,
+    dcb: &mut dyn DecoderCallbacks,
+) -> HttpResponseParts {
+    let (flag, status) = if crate::codec::is_remote_reset(err) {
+        (
+            ResponseFlag::UpstreamRemoteReset,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    } else if crate::codec::is_protocol_error(err) {
+        (ResponseFlag::UpstreamProtocolError, StatusCode::BAD_GATEWAY)
+    } else {
+        (
+            ResponseFlag::UpstreamConnectionTermination,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    };
+    dcb.stream_info().set_response_flag(flag);
+    local_reply(status, "upstream connection failure")
+}
+
 fn local_reply(status: StatusCode, msg: &str) -> HttpResponseParts {
     local_reply_with_status(status, Bytes::copy_from_slice(msg.as_bytes()))
 }

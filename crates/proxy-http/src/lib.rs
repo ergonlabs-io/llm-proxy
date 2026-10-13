@@ -47,7 +47,7 @@ pub use handler::{
 };
 pub use headers::{
     apply_xff, ensure_request_id, generate_request_id, is_internal_request,
-    resolve_trusted_address, sanitize_hop_by_hop, set_forwarded_proto,
+    resolve_trusted_address, sanitize_hop_by_hop, sanitize_upgrade_hop_by_hop, set_forwarded_proto,
     strip_envoy_headers_from_external, XffOptions,
 };
 pub use retry::{backoff_delay, should_retry, AttemptOutcome, RetryState};
