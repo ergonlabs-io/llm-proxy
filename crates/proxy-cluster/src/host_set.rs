@@ -9,7 +9,7 @@
 //!
 //! Envoy itself publishes incremental host-set *deltas* to workers rather
 //! than whole-set swaps. This implementation always rebuilds the snapshot wholesale
-//! (see [`crate::manager::ClusterManager::refresh_cluster`]) but still exposes the
+//! (see `ManagedCluster::resolve_and_publish` in `manager.rs`) but still exposes the
 //! added/removed/unchanged classification via [`diff_host_sets`], both for
 //! observability and so tests can assert on it.
 

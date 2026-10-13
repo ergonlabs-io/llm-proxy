@@ -49,9 +49,6 @@
 //!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
 //!   means "no idle timeout" for now, not "inherit the listener's".
 //! - The retry & hedging engine (S3).
-//! - Connection-level circuit breakers (`max_connections`,
-//!   `max_pending_requests`) -- not implemented; this router still only
-//!   enforces the S5 `max_requests` per-cluster budget above.
 //!
 //! Response flags are recorded onto a per-request
 //! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below --

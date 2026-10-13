@@ -642,7 +642,9 @@ where
 /// a cache can hold `sender` far longer than one request, this task simply
 /// lives exactly as long as whatever holds `sender` does -- that's what makes
 /// reuse work, not a leak, as long as the holder eventually drops it (the
-/// cache's `clear`/`invalidate`, or the process exiting).
+/// cache's `clear`/`invalidate`, the periodic sweep dropping a closed or
+/// idle-expired entry, the socket being dropped by the peer or an error, or
+/// the process exiting).
 pub async fn handshake_upstream_http2<IO>(
     io: IO,
 ) -> Result<hyper::client::conn::http2::SendRequest<StreamBody>, UpstreamCodecError>

@@ -153,7 +153,7 @@ struct ManagedCluster {
     /// an EDS cluster (no `ClusterConfig` to read one from -- see [`Self::eds`]).
     health_engine: Option<Arc<HealthCheckEngine>>,
     /// Live probe tasks, one per currently-probed host address. Reconciled
-    /// against membership on every `refresh_cluster`/`accept_eds_update`
+    /// against membership on every resolve/`accept_eds_update`
     /// call by [`Self::reconcile_probes`]. Kept here (not on the engine
     /// itself) because it's per-*cluster* membership, and a `ManagedCluster`
     /// is what actually gets discarded wholesale on a config reload -- see
@@ -383,9 +383,8 @@ impl ManagedCluster {
     /// Run discovery and publish the result into this cluster's own
     /// `host_set`, returning the diff against whatever it held before. This is
     /// the one resolve path: the initial resolution in
-    /// [`ClusterManager::update_from_snapshot`], the manual
-    /// [`ClusterManager::refresh_cluster`], and the refresh timer
-    /// ([`run_dns_refresh`]) all end up here.
+    /// [`ClusterManager::update_from_snapshot`] and the refresh timer
+    /// ([`run_dns_refresh`]) both end up here.
     ///
     /// Two shapes have nothing to resolve, and both return an explicit no-op
     /// rather than a resolve of zero endpoints.
@@ -736,9 +735,8 @@ impl ClusterManager {
         // `host_set` -- nothing here is reachable through `self.clusters` yet
         // (the `store` below hasn't happened), so nothing else can observe
         // these half-resolved `ManagedCluster`s mid-loop. `resolve_cluster`
-        // is the same logic `refresh_cluster` runs (it's the extraction of
-        // that method's body -- see its own doc), so an EDS-typed cluster
-        // still isn't resolved here either (it would return empty, and there
+        // runs the same `resolve_and_publish` the refresh timer does, so an
+        // EDS-typed cluster still isn't resolved here either (it would return empty, and there
         // is no membership to carry over at construction time).
         for name in &freshly_built {
             let managed = &next[name];
@@ -839,40 +837,11 @@ impl ClusterManager {
         Ok(diff)
     }
 
-    /// Re-run discovery for one cluster right now and publish the resulting
-    /// host set, returning the diff against the previous one. A no-op (empty
-    /// diff) for EDS-sourced clusters, which have no self-driven resolution
-    /// -- use [`Self::accept_eds_update`] for those.
-    ///
-    /// This is the on-demand, by-name entry point, and it shares its resolve
-    /// path (`ManagedCluster::resolve_and_publish`) with the refresh timer.
-    /// The timer (`run_dns_refresh`) does not call it by name, on purpose: a
-    /// name resolves to whichever cluster is *currently published*, so an old
-    /// cluster's timer that kept refreshing "its" name after a reload would
-    /// refresh the replacement instead, and run next to the replacement's own
-    /// timer. The timer holds its own cluster.
-    ///
-    /// It looks the cluster up by name in the CURRENTLY PUBLISHED registry
-    /// and resolves it there. [`Self::resolve_cluster`] is the same logic for
-    /// a `ManagedCluster` that isn't registered yet, which
-    /// [`Self::update_from_snapshot`] needs (see that method's doc for why).
-    pub async fn refresh_cluster(&self, name: &str) -> io::Result<HostSetDiff> {
-        let managed = self
-            .clusters
-            .load()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| not_found(name))?;
-        self.resolve_cluster(&managed).await
-    }
-
     /// Run discovery for `managed` with this manager's resolver and publish
     /// the result into ITS OWN `host_set`, returning the diff against
-    /// whatever it held before. Does not touch `self.clusters` at all -- the
-    /// caller decides whether/how `managed` is registered
-    /// ([`Self::refresh_cluster`] looks it up there first;
-    /// [`Self::update_from_snapshot`] calls this on a cluster that hasn't
-    /// been published yet).
+    /// whatever it held before. Does not touch `self.clusters` at all: it
+    /// serves [`Self::update_from_snapshot`], which resolves a cluster that
+    /// hasn't been published yet.
     async fn resolve_cluster(&self, managed: &ManagedCluster) -> io::Result<HostSetDiff> {
         managed.resolve_and_publish(self.resolver.as_ref()).await
     }
@@ -1223,6 +1192,14 @@ mod tests {
         })
     }
 
+    /// Re-resolve the published cluster `name` through the production path
+    /// (`ManagedCluster::resolve_and_publish`, which the refresh timer also
+    /// uses), without waiting for the timer.
+    async fn resolve_now(manager: &ClusterManager, name: &str) -> io::Result<HostSetDiff> {
+        let managed = manager.clusters.load().get(name).cloned().unwrap();
+        managed.resolve_and_publish(manager.resolver.as_ref()).await
+    }
+
     /// Same shape as `cluster_config`, plus a caller-supplied
     /// `connect_timeout`. Tests use this to build a
     /// second config that's a genuine, if inconsequential, content change
@@ -1569,7 +1546,7 @@ mod tests {
             "svc.internal",
             vec![IpAddr::from([10, 0, 0, 2]), IpAddr::from([10, 0, 0, 3])],
         );
-        let diff = manager.refresh_cluster("dns-svc").await.unwrap();
+        let diff = resolve_now(&manager, "dns-svc").await.unwrap();
 
         assert_eq!(
             diff.added,
@@ -2015,7 +1992,7 @@ mod tests {
     /// landed), re-run discovery against an unchanged DNS record set, and
     /// confirm the flag survives.
     #[tokio::test]
-    async fn refresh_cluster_carries_over_health_flags_for_unchanged_hosts() {
+    async fn resolve_carries_over_health_flags_for_unchanged_hosts() {
         let resolver = Arc::new(FakeResolver::new());
         resolver.set("svc.internal", vec![IpAddr::from([10, 0, 0, 1])]);
         let manager = ClusterManager::with_default_transport(resolver.clone());
@@ -2050,7 +2027,7 @@ mod tests {
         // Same DNS record set -- `addr` is `unchanged`, so its flipped flag
         // must survive, not be reset to `HealthFlags::default()` by the
         // freshly-resolved `Host` this refresh builds.
-        manager.refresh_cluster("dns-svc").await.unwrap();
+        resolve_now(&manager, "dns-svc").await.unwrap();
 
         let host = managed
             .host_set
@@ -2061,12 +2038,12 @@ mod tests {
             .expect("host must still be present after refresh");
         assert!(
             !host.is_healthy(),
-            "an unchanged host's health flag was reset by refresh_cluster"
+            "an unchanged host's health flag was reset by a re-resolve"
         );
     }
 
     /// A removed host's probe must stop: flip `host-doomed`'s DNS record to
-    /// empty and re-resolve the *same* cluster (`refresh_cluster`, not a
+    /// empty and re-resolve the *same* cluster (the same `ManagedCluster`, not a
     /// config reload) -- `reconcile_probes`'s `removed` path must abort its
     /// task, not just drop the map entry (a bare drop doesn't abort the
     /// underlying tokio task -- see `ManagedCluster`'s `Drop` impl doc).
@@ -2106,7 +2083,7 @@ mod tests {
         .await;
 
         resolver.set("host-doomed", vec![]);
-        manager.refresh_cluster("removal").await.unwrap();
+        resolve_now(&manager, "removal").await.unwrap();
 
         let doomed_after_removal = doomed_hits.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2825,8 +2802,8 @@ mod tests {
         );
     }
 
-    /// Mirrors `refresh_cluster_carries_over_health_flags_for_unchanged_hosts`,
-    /// but across `update_from_snapshot` rather than `refresh_cluster`: an
+    /// Mirrors `resolve_carries_over_health_flags_for_unchanged_hosts`,
+    /// but across `update_from_snapshot` rather than a re-resolve: an
     /// active-health-check failure flag flipped directly on a host must
     /// survive an unrelated cluster's config change in the same snapshot.
     #[tokio::test]
@@ -3534,7 +3511,7 @@ mod tests {
         assert_eq!(live(&manager, &snapshot, "eds-svc"), ["10.0.0.5:80"]);
 
         // The by-name path shares the guard.
-        let diff = manager.refresh_cluster("eds-svc").await.unwrap();
+        let diff = resolve_now(&manager, "eds-svc").await.unwrap();
         assert_eq!(diff, HostSetDiff::default());
         assert_eq!(live(&manager, &snapshot, "eds-svc"), ["10.0.0.5:80"]);
     }

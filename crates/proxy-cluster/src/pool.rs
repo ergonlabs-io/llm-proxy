@@ -54,9 +54,7 @@ impl ClusterBuildId {
     /// pools charge for dials (`ClusterEntry::circuit_breaker` with the
     /// priority `http_pool` uses), or two builds can collide on one id.
     pub fn of(breaker: &CircuitBreakerState) -> Self {
-        // `connections` and `active` are private to the crate root; this
-        // module is a descendant of it, so it can read them.
-        Self(Arc::clone(&breaker.connections.active))
+        Self(breaker.connections_counter())
     }
 }
 

@@ -357,6 +357,12 @@ impl Drop for CbGuard {
 }
 
 impl CircuitBreakerState {
+    /// The shared `max_connections` counter. Its allocation is unique per
+    /// built cluster, which is what [`pool::ClusterBuildId`] keys on.
+    pub(crate) fn connections_counter(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::clone(&self.connections.active)
+    }
+
     /// Builds all four budgets from a cluster's lowered [`CircuitBreakerThresholds`].
     pub fn from_thresholds(t: proxy_config::ir::CircuitBreakerThresholds) -> Self {
         let connections = BudgetHandle::new_with_notify(t.max_connections);
@@ -474,9 +480,10 @@ pub struct UpstreamStream {
     /// [`CircuitBreakerState::try_acquire_connection`]). Dropping it releases
     /// the slot, so it must live exactly as long as `io`'s underlying
     /// connection does -- for h1 (connect-per-stream) that's this struct's
-    /// own lifetime; for the h2 cache (`proxy-http`'s `UpstreamConnCache`)
-    /// the caller moves it into the cached connection's own entry so it
-    /// outlives this `UpstreamStream`, not the other way round.
+    /// own lifetime; for a pooled connection (`proxy-http`'s
+    /// `upstream_pool`) the caller takes the guard out and moves it into the
+    /// byte stream itself (`SlotIo`), so the slot is released when the
+    /// socket is dropped, however the cache entry ended.
     ///
     /// `None` only on paths with no real budget to acquire against (test
     /// helpers, or a caller that never runs `new_stream` through a

@@ -1598,7 +1598,7 @@ fn publish_to_workers(
 /// (`tests/ads_e2e.rs`, see its module doc). The reason is structural: the
 /// damage window is the microseconds between `publish` storing the snapshot
 /// and `update_from_snapshot` storing the cluster map, which it does
-/// synchronously before its per-cluster `refresh_cluster().await` loop. No
+/// synchronously before it resolves each new cluster's discovery. No
 /// black-box observer can reliably land inside it, and AGENTS.md "Build And Test"'s
 /// lesson is that an instrument which lies is worse than none.
 ///
