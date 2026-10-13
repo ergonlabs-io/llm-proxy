@@ -233,6 +233,10 @@ static_resources:
 {model_authz_filter}          - name: llmproxy.spend_limit
             typed_config:
               '@type': type.llmproxy.dev/llmproxy.filters.v0.SpendLimit
+              # Tests here set tenant budgets at runtime; the admin API refuses
+              # that unless the filter sets the cutover, because the next start
+              # would otherwise refuse the stored budget.
+              legacy_tenant_budget_cutover: START_KEYS_FRESH
               pricing:
               - cluster: provider:p1
                 models:

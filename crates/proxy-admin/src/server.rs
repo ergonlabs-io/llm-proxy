@@ -745,7 +745,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
             handle_set_policy(&control_plane, id, &body)
         }
         WriteRoute::TenantBudget(id) | WriteRoute::ScopedTenantBudget(_, id) => {
-            handle_set_budget(&control_plane, id, &body)
+            handle_set_budget(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
             handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
@@ -1267,6 +1267,24 @@ fn resolve_spend_state(
     Ok(singleton
         .and_then(|s| s.downcast::<SharedSpendLimitState>().ok())
         .map(|shared| Arc::clone(shared.accumulator())))
+}
+
+/// The chain's spend filter state, scoped when `stat_prefix` is given and
+/// across scopes otherwise. `None` covers "no spend filter on this chain" and
+/// the unscoped ambiguity case, which the control-plane gate has already
+/// refused by the time a handler asks.
+fn resolve_spend_shared(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+) -> Option<Arc<SharedSpendLimitState>> {
+    let singleton = match stat_prefix {
+        Some(name) => factory_state.get_by_name(name, proxy_filters::spend_limit_filter::TYPE_URL),
+        None => factory_state
+            .get_across_scopes(proxy_filters::spend_limit_filter::TYPE_URL)
+            .ok()
+            .flatten(),
+    };
+    singleton.and_then(|s| s.downcast::<SharedSpendLimitState>().ok())
 }
 
 /// The scoped (`/chains/{stat_prefix}/...`) counterpart of
@@ -2175,6 +2193,8 @@ fn budget_from_spec(spec: BudgetSpec) -> Result<TenantBudget, Response<Full<Byte
 /// configured price uses -- so a malformed decimal string is a 400 naming
 /// the problem, not a silently-truncated ceiling.
 fn handle_set_budget(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
     control_plane: &ControlPlane,
     tenant: &str,
     body: &[u8],
@@ -2194,6 +2214,27 @@ fn handle_set_budget(
             Err(response) => return response,
         },
     };
+
+    // The start-up check in `llmproxy.spend_limit` treats any tenant budget in
+    // the store as a legacy one and refuses to start without the cutover. A
+    // budget written here would pass now and stop the next restart, and a
+    // rolling restart would crash-loop every replica, so refuse it at write
+    // time, where the operator is looking. Clearing a budget is always fine,
+    // and rows already in the store behave as they did.
+    if budget.is_some() {
+        if let Some(shared) = resolve_spend_shared(factory_state, stat_prefix) {
+            if !shared.legacy_tenant_budget_cutover() {
+                return text(
+                    StatusCode::CONFLICT,
+                    "this chain's llmproxy.spend_limit does not set \
+                     `typed_config.legacy_tenant_budget_cutover`, and without it the next start \
+                     refuses to load a stored tenant budget. Set it to START_KEYS_FRESH on the \
+                     spend filter first (key budgets, PUT /keys/{id}/budget, need no cutover). \
+                     Nothing was changed.",
+                );
+            }
+        }
+    }
 
     match control_plane.set_budget(&TenantId::new(tenant), budget.as_ref()) {
         Ok(()) => {

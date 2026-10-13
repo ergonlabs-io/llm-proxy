@@ -127,6 +127,7 @@
 //! are never rendered in metrics labels or response bodies.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -503,10 +504,16 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                     accumulator,
                     usage_missing_warner: Arc::new(UsageMissingWarner::new()),
                     unpriced_warner: Arc::new(UnpricedWarner::new(ctx.stat_prefix.clone())),
+                    legacy_tenant_budget_cutover: AtomicBool::new(cutover == 1),
                 }) as Arc<dyn std::any::Any + Send + Sync>)
             })?
             .downcast::<SharedSpendLimitState>()
             .expect("spend_limit singleton is always a SharedSpendLimitState");
+        // The singleton outlives a reload, so record what THIS build's
+        // configuration says: the admin API answers from it.
+        shared
+            .legacy_tenant_budget_cutover
+            .store(cutover == 1, Ordering::Relaxed);
 
         Ok(Box::new(SpendLimitInstanceFactory {
             price_table,
@@ -533,9 +540,21 @@ pub struct SharedSpendLimitState {
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     unpriced_warner: Arc<UnpricedWarner>,
+    /// Whether `typed_config.legacy_tenant_budget_cutover` is set. Without it,
+    /// the next start refuses to load a tenant budget from the store (see
+    /// `create`), so the admin API must not write one. An atomic because a
+    /// reload can change it while the admin server reads it.
+    legacy_tenant_budget_cutover: AtomicBool,
 }
 
 impl SharedSpendLimitState {
+    /// Whether this chain's spend filter was configured with
+    /// `legacy_tenant_budget_cutover`. `PUT /tenants/{id}/budget` refuses to
+    /// store a budget when it was not: the budget would stop the next start.
+    pub fn legacy_tenant_budget_cutover(&self) -> bool {
+        self.legacy_tenant_budget_cutover.load(Ordering::Relaxed)
+    }
+
     /// The shared spend accumulator this chain's `llmproxy.spend_limit`
     /// filter accrues into -- what the admin spend read reports from.
     pub fn accumulator(&self) -> &Arc<SpendAccumulator> {
@@ -555,7 +574,19 @@ impl SharedSpendLimitState {
             accumulator,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             unpriced_warner: Arc::new(UnpricedWarner::new(String::new())),
+            legacy_tenant_budget_cutover: AtomicBool::new(true),
         }
+    }
+
+    /// As [`Self::for_test`], for a filter configured WITHOUT the cutover,
+    /// which is what production builds unless the operator sets it.
+    #[doc(hidden)]
+    pub fn for_test_without_cutover(accumulator: Arc<SpendAccumulator>) -> Self {
+        let state = Self::for_test(accumulator);
+        state
+            .legacy_tenant_budget_cutover
+            .store(false, Ordering::Relaxed);
+        state
     }
 }
 

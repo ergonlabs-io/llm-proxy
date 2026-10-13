@@ -64,8 +64,13 @@ legacy_tenant_budget_cutover: START_KEYS_FRESH
 Without it, the load error names `typed_config.legacy_tenant_budget_cutover`
 and reads `legacy tenant budgets require an explicit START_KEYS_FRESH cutover;
 retain history and configure key budgets before serving`. A tenant budget that
-you set at runtime with `PUT /tenants/{id}/budget` counts too. The next start
-fails until you set the policy.
+you set at runtime with `PUT /tenants/{id}/budget` counts too, so that request
+returns `409` while the serving spend filter lacks the policy. The error names
+`typed_config.legacy_tenant_budget_cutover` and changes nothing, so the problem
+shows when you write the budget and not at the next deploy. Clearing a tenant
+budget (`{"budget": null}`) is always allowed, a chain with no spend filter is
+not checked, and a tenant budget already in the store behaves as before: the
+next start fails until you set the policy. Key budgets need no cutover.
 
 This selects a deliberate fresh-key cutover while retaining legacy history.
 Stop traffic, retain a backup of the original store, record the cutover time,
