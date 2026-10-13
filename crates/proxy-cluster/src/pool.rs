@@ -9,7 +9,10 @@
 //! on [`UpstreamStream`]). The pool is protocol-agnostic: it produces bytes,
 //! and the router picks the codec from the cluster's `upstream_protocol`.
 
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +20,69 @@ use futures::future::BoxFuture;
 
 use crate::transport::UpstreamTransportSocket;
 use crate::{CircuitBreakerState, HttpConnPool, PoolError, UpstreamStream};
+
+/// Identifies one *build* of a cluster, so a worker's connection caches can
+/// tell a connection dialed under the cluster as it is now from one dialed
+/// under a build the control plane has since replaced.
+///
+/// A cluster whose config changes is rebuilt from scratch
+/// (`ClusterManager::update_from_snapshot`): new transport socket, so new TLS
+/// trust roots and client certificates, and new circuit-breaker gauges. Its
+/// name and endpoint addresses are usually unchanged, so a cache keyed on
+/// those alone would hand the new build a connection that was negotiated under
+/// the old settings. This id is the part of the cache key that changes when the
+/// build does.
+///
+/// It is the identity of the build's `max_connections` gauge, which is the one
+/// per-build object a caller can reach through the public `ClusterEntry`
+/// surface (`circuit_breaker`), and the object a pooled connection is accounted
+/// against for its whole life. Every `ConnectPool` built for a cluster clones
+/// that gauge, so all of them share one id, and a carried-forward cluster
+/// keeps it across unrelated reloads.
+///
+/// Rust note: equality is `Arc::ptr_eq`, not a comparison of the counter's
+/// value, and the id holds a strong clone of the `Arc`. Holding it is what
+/// rules out an address being freed and reused by a later build while an id
+/// for the old one still sits in a map: the allocation cannot be freed while
+/// any clone is alive, so two live ids with the same address are always the
+/// same build.
+#[derive(Clone)]
+pub struct ClusterBuildId(Arc<AtomicU32>);
+
+impl ClusterBuildId {
+    /// The id of the build that owns `breaker`. Pass the budget the cluster's
+    /// pools charge for dials (`ClusterEntry::circuit_breaker` with the
+    /// priority `http_pool` uses), or two builds can collide on one id.
+    pub fn of(breaker: &CircuitBreakerState) -> Self {
+        // `connections` and `active` are private to the crate root; this
+        // module is a descendant of it, so it can read them.
+        Self(Arc::clone(&breaker.connections.active))
+    }
+}
+
+impl PartialEq for ClusterBuildId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ClusterBuildId {}
+
+impl Hash for ClusterBuildId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Must agree with `eq`: the address, never the counter's value, which
+        // changes with every dial.
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+impl fmt::Debug for ClusterBuildId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The derived `Debug` would print the gauge's live value, which says
+        // nothing about which build this is.
+        write!(f, "ClusterBuildId({:p})", Arc::as_ptr(&self.0))
+    }
+}
 
 /// One pool per (worker, host, protocol) in the real design; v1 is just a
 /// dialer for a single fixed address plus the cluster's transport socket.

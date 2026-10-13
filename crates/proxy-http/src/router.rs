@@ -49,9 +49,6 @@
 //!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
 //!   means "no idle timeout" for now, not "inherit the listener's".
 //! - The retry & hedging engine (S3).
-//! - HTTP/1.1 idle-connection eviction (an idle-timeout that closes a cached
-//!   h1 connection nobody's leased in a while) -- deliberately scoped
-//!   out; see `crate::upstream_pool::H1ConnCache`'s doc.
 //! - Connection-level circuit breakers (`max_connections`,
 //!   `max_pending_requests`) -- not implemented; this router still only
 //!   enforces the S5 `max_requests` per-cluster budget above.
@@ -75,6 +72,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use proxy_cluster::manager::{ClusterManager, ClusterRegistrySnapshot};
 use proxy_cluster::outlier::RequestResult;
+use proxy_cluster::pool::ClusterBuildId;
 use proxy_cluster::{
     CbGuard, ClusterEntry, LoadBalancerContext, PoolError, RoutingPriority, UpstreamProtocol,
 };
@@ -1341,7 +1339,18 @@ impl RouterHandler {
                 // reuse-vs-discard rule that makes that safe. `ConnKey`'s
                 // `protocol` field is what keeps the two caches' entries from
                 // ever being confused with each other.
-                let conn_key = ConnKey::new(attempt_cluster, host.address, proto);
+                //
+                // The key also names the cluster *build*, taken from the
+                // owning member's connection budget -- the same budget
+                // `http_pool` above charges for the dial -- so a cluster that
+                // was reloaded with different settings never reuses a
+                // connection negotiated under the old ones.
+                let conn_key = ConnKey::new(
+                    attempt_cluster,
+                    host.address,
+                    proto,
+                    ClusterBuildId::of(attempt_entry.circuit_breaker(RoutingPriority::Default)),
+                );
                 let connect_result: Result<Connected, PoolError> = match proto {
                     UpstreamProtocol::Http2 => self
                         .conn_cache

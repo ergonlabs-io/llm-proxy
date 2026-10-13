@@ -55,21 +55,54 @@
 //! to live per worker, where the h1/h2 codec already runs.
 //! [`proxy_cluster::pool::ConnectPool`] keeps doing exactly what it does
 //! today (dial raw bytes); this cache sits on top of it, worker-side.
+//!
+//! ## Connection lifetime
+//!
+//! Both caches keep a connection until something ends it, so three separate
+//! mechanisms keep a stale entry from costing anything:
+//!
+//! - **The `max_connections` slot belongs to the socket, not to the cache
+//!   entry** ([`SlotIo`]). A pooled connection holds one of the cluster's S5
+//!   connection slots, and the gauge behind it is shared by every worker and
+//!   every host in the cluster. If the slot were released when the *entry*
+//!   was evicted, an idle connection whose peer had hung up would keep its
+//!   slot until something happened to look that key up again -- which, once a
+//!   cluster's endpoint addresses change at runtime, may be never. The slot
+//!   rides inside the byte stream instead, so it is returned the moment the
+//!   connection is dropped by whoever owns it: the peer closing it, an error,
+//!   or us letting go. An h2 connection that is evicted while streams are
+//!   still running on it keeps its slot until those streams end, because the
+//!   socket is still open.
+//! - **A periodic sweep** ([`SWEEP_INTERVAL`]) drops closed connections,
+//!   connections that have been idle for [`UPSTREAM_IDLE_TIMEOUT`], and keys
+//!   with nothing left under them. It runs in a task of its own, never inside
+//!   a request, so no request pays for the size of the cache. Lookups still
+//!   check `is_closed()` themselves: the sweep is periodic and a peer can
+//!   hang up between two sweeps.
+//! - **The cluster build is part of the key** ([`ConnKey::build`]), so a
+//!   cluster that was rebuilt with different TLS or protocol settings never
+//!   reuses a connection negotiated under the old ones. The old build's
+//!   entries are unreachable from then on and age out through the sweep.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::client::conn::http1::SendRequest as Http1SendRequest;
 use hyper::client::conn::http2::SendRequest;
-use proxy_cluster::{HttpConnPool, PoolError, UpstreamProtocol};
+use proxy_cluster::pool::ClusterBuildId;
+use proxy_cluster::{HttpConnPool, PoolError, UpstreamProtocol, UpstreamStream};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::codec::{
     handshake_upstream_http1, handshake_upstream_http2, send_on_http2, UpstreamCodecError,
@@ -93,19 +126,38 @@ use crate::handler::{local_boxed, BodyError, HttpRequestParts, HttpResponseParts
 /// following the routing decision instead of the connection); a future
 /// reader who notices `addr` alone "looks like enough" and removes `cluster`
 /// to shrink the key would reopen it a third time.
+///
+/// `build` is the same kind of boundary across *time* rather than across
+/// clusters. A cluster that is reloaded with different settings keeps its name
+/// and its addresses, but it gets a new transport socket (TLS roots, client
+/// certificate, SNI) and a new connection budget. Without `build`, the new
+/// cluster would reuse a connection the old one negotiated, and the connection
+/// would be counted against a `max_connections` gauge the new cluster no longer
+/// reads. The old build's entries stay in the map under their own key, for the
+/// requests of the configuration generation that still routes to that build,
+/// until the sweep retires them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnKey {
     pub cluster: String,
     pub addr: SocketAddr,
     pub protocol: UpstreamProtocol,
+    /// Which build of `cluster` dialed the connection -- see
+    /// [`ClusterBuildId`].
+    pub build: ClusterBuildId,
 }
 
 impl ConnKey {
-    pub fn new(cluster: impl Into<String>, addr: SocketAddr, protocol: UpstreamProtocol) -> Self {
+    pub fn new(
+        cluster: impl Into<String>,
+        addr: SocketAddr,
+        protocol: UpstreamProtocol,
+        build: ClusterBuildId,
+    ) -> Self {
         Self {
             cluster: cluster.into(),
             addr,
             protocol,
+            build,
         }
     }
 }
@@ -120,6 +172,149 @@ impl Hash for ConnKey {
         self.cluster.hash(state);
         self.addr.hash(state);
         matches!(self.protocol, UpstreamProtocol::Http2).hash(state);
+        self.build.hash(state);
+    }
+}
+
+/// How long a connection may sit with no stream on it before the sweep closes
+/// it: Envoy's default for a cluster's upstream connection idle timeout
+/// (`internal-docs/envoy-semantics.md` S4, `common_http_protocol_options.idle_timeout`,
+/// one hour). That field is rejected in strict mode, so there is nothing to
+/// configure and nothing to inherit; this is the value Envoy would apply.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// How often each worker sweeps its connection caches. The idle timeout is an
+/// hour, so a minute of granularity means a connection is closed between an
+/// hour and an hour and a minute after it went idle, which is the precision
+/// an operator can see anyway. Short enough that entries for an endpoint that
+/// has gone away do not linger, long enough that a worker with nothing to
+/// reclaim does almost no work.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What one sweep took out of a cache. The periodic task logs it when it is
+/// not empty, and the tests read it, so an operator and a test see the same
+/// account of what was reclaimed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepReport {
+    /// Connections dropped: closed by the peer, or idle past
+    /// [`UPSTREAM_IDLE_TIMEOUT`].
+    connections: usize,
+    /// Keys removed because no connection was left under them.
+    keys: usize,
+}
+
+/// Run `sweep` over a cache's entries every [`SWEEP_INTERVAL`], for as long as
+/// the cache lives.
+///
+/// Rust note: the task holds a `Weak`, not an `Rc`. A strong handle in a task
+/// that never ends would keep the cache alive for the life of the runtime;
+/// with a `Weak`, the loop upgrades on every tick and simply returns once the
+/// cache is gone. `spawn_local` (not `spawn`) because the entries are `!Send`
+/// (ADR-0003), so the task has to stay on this worker's thread, where the
+/// cache already lives.
+///
+/// `MissedTickBehavior::Delay` so a worker that was stalled does not answer a
+/// long stall with a burst of back-to-back sweeps: the next tick is one
+/// interval after the one that was just delivered.
+fn spawn_sweeper<S: 'static>(
+    entries: &Rc<RefCell<S>>,
+    cache: &'static str,
+    sweep: fn(&RefCell<S>, Instant) -> SweepReport,
+) {
+    let entries: Weak<RefCell<S>> = Rc::downgrade(entries);
+    tokio::task::spawn_local(async move {
+        let mut ticks = tokio::time::interval_at(Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(entries) = entries.upgrade() else {
+                return;
+            };
+            let report = sweep(&entries, Instant::now());
+            if report != SweepReport::default() {
+                tracing::debug!(
+                    cache,
+                    connections = report.connections,
+                    keys = report.keys,
+                    "swept the upstream connection cache"
+                );
+            }
+        }
+    });
+}
+
+/// An upstream byte stream that owns the S5 `max_connections` slot its
+/// connection was dialed under.
+///
+/// The codecs take ownership of the stream and drop it when the connection is
+/// over, however that happens: the peer closes it, an I/O error ends it, the
+/// driver task is aborted, or the cache lets go of the last handle. Putting the
+/// slot inside the stream makes "the slot is released when the connection
+/// closes" true by construction, for both protocols. It is also the only
+/// place that is right for h2: hyper runs an h2 connection in a task of its
+/// own, started through the executor, that outlives the `SendRequest` the
+/// cache holds -- dropping the cache entry does not close the socket while
+/// streams are still running on it, and the slot must not be released then.
+///
+/// Rust note: fields drop in declaration order, so `io` is dropped (the socket
+/// closes) before `_slot` hands the budget back. A waiter that is woken by the
+/// release therefore never sees a free slot while the old socket is still open.
+/// The `AsyncRead`/`AsyncWrite` impls forward to `io` unchanged, including the
+/// vectored-write capability, so hyper batches writes exactly as it would on
+/// the bare stream.
+struct SlotIo {
+    io: proxy_cluster::BoxedUpstreamIo,
+    _slot: Option<proxy_cluster::CbGuard>,
+}
+
+impl SlotIo {
+    /// Take the slot out of `stream` and bind it to the stream's lifetime.
+    fn new(stream: UpstreamStream) -> Self {
+        let UpstreamStream { io, cb_guard } = stream;
+        Self {
+            io,
+            _slot: cb_guard,
+        }
+    }
+}
+
+impl AsyncRead for SlotIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SlotIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
     }
 }
 
@@ -176,21 +371,51 @@ const MAX_CONNECTIONS_PER_KEY: usize = 4;
 /// best guess at how many streams are currently in flight on it -- see
 /// [`StreamGuard`] for how that counter is kept honest across the whole
 /// request/response lifetime, not just until headers arrive.
+///
+/// The connection's `max_connections` slot is not a field here: it travels
+/// inside the socket (see [`SlotIo`]), so evicting this entry gives the slot
+/// back only if that also ends the connection.
 struct PooledConn {
     sender: SendRequest<StreamBody>,
-    in_flight: Rc<Cell<usize>>,
-    /// The S5 `max_connections` slot this physical connection holds
-    /// -- moved out of the [`proxy_cluster::UpstreamStream`] `pool.new_stream()`
-    /// returned, rather than dropped at the end of `get_or_connect`, so it
-    /// lives exactly as long as this cached connection does and releases the
-    /// slot only when the connection is evicted (dead-connection `retain`,
-    /// `invalidate`, or `clear`). Never read -- it's a pure RAII drop-guard.
-    _cb_guard: Option<proxy_cluster::CbGuard>,
+    activity: Rc<ConnActivity>,
+}
+
+impl PooledConn {
+    /// Has this connection had no stream on it for the whole of
+    /// [`UPSTREAM_IDLE_TIMEOUT`] as of `now`? A connection that is carrying
+    /// even one stream is not idle, however long ago it was dialed -- an LLM
+    /// response can legitimately stream for longer than the timeout.
+    fn idle_expired(&self, now: Instant) -> bool {
+        self.activity.in_flight.get() == 0
+            && now.saturating_duration_since(self.activity.idle_since.get())
+                >= UPSTREAM_IDLE_TIMEOUT
+    }
+}
+
+/// How busy one cached connection is, shared between its cache entry and every
+/// [`StreamGuard`] leased from it.
+#[derive(Debug)]
+struct ConnActivity {
+    in_flight: Cell<usize>,
+    /// When `in_flight` last fell to zero, or when the connection was dialed.
+    /// Only meaningful while `in_flight` is zero. Stamped when a stream ends
+    /// rather than when it starts, so a connection that was busy for hours is
+    /// idle for a full timeout *after* its last stream, not instantly.
+    idle_since: Cell<Instant>,
+}
+
+impl ConnActivity {
+    fn new() -> Self {
+        Self {
+            in_flight: Cell::new(0),
+            idle_since: Cell::new(Instant::now()),
+        }
+    }
 }
 
 /// One cache slot: the bounded set of connections currently held for a
 /// single [`ConnKey`]. Empty means nobody has successfully dialed this key
-/// yet (or every prior occupant died and was cleared).
+/// yet (or every prior occupant died and was swept).
 /// `Rc<tokio::sync::Mutex<_>>`, not a plain `RefCell` -- see
 /// [`UpstreamConnCache::get_or_connect`]'s doc for why a real (queueing)
 /// lock is required here even though this whole cache never leaves one
@@ -234,7 +459,7 @@ impl PooledSendRequest {
 
 /// RAII stream-accounting handle. Created by
 /// [`UpstreamConnCache::get_or_connect`] (via `lease`, incrementing
-/// [`PooledConn::in_flight`] there and then), and decremented on `Drop`
+/// [`ConnActivity::in_flight`] there and then), and decremented on `Drop`
 /// -- whichever way that happens: the response body read to completion, an
 /// early `?` before one was ever produced, or the body simply being dropped
 /// because the downstream client went away mid-stream. Every one of those is
@@ -248,12 +473,19 @@ impl PooledSendRequest {
 /// through a shared `Rc`.
 #[derive(Debug)]
 struct StreamGuard {
-    in_flight: Rc<Cell<usize>>,
+    activity: Rc<ConnActivity>,
 }
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        self.in_flight.set(self.in_flight.get().saturating_sub(1));
+        let remaining = self.activity.in_flight.get().saturating_sub(1);
+        self.activity.in_flight.set(remaining);
+        // The connection has just become idle: start its idle clock from now.
+        // One clock read per connection going idle, not one per stream -- a
+        // connection with overlapping streams only reads it for the last one.
+        if remaining == 0 {
+            self.activity.idle_since.set(Instant::now());
+        }
     }
 }
 
@@ -322,8 +554,17 @@ impl Body for GuardedBody {
 /// single-threaded aliasing rule `RefCell` exists for. Each individual
 /// `Slot` is the one place this module needs a real async lock -- see
 /// below.
+///
+/// The map is behind an `Rc` as well, because the periodic sweep (see this
+/// module's "Connection lifetime" section) runs in a task that must reach it
+/// without borrowing the cache; that task holds a `Weak`.
 pub struct UpstreamConnCache {
-    slots: RefCell<HashMap<ConnKey, Slot>>,
+    slots: Rc<RefCell<HashMap<ConnKey, Slot>>>,
+    /// Whether this cache's sweep task has been started. It starts with the
+    /// first connection the cache dials, which is the first moment there is
+    /// anything to sweep, and which is also known to be inside a `LocalSet`
+    /// (the handshake just spawned onto it).
+    sweeper_started: Cell<bool>,
 }
 
 impl Default for UpstreamConnCache {
@@ -335,7 +576,14 @@ impl Default for UpstreamConnCache {
 impl UpstreamConnCache {
     pub fn new() -> Self {
         Self {
-            slots: RefCell::new(HashMap::new()),
+            slots: Rc::new(RefCell::new(HashMap::new())),
+            sweeper_started: Cell::new(false),
+        }
+    }
+
+    fn ensure_sweeper(&self) {
+        if !self.sweeper_started.replace(true) {
+            spawn_sweeper(&self.slots, "h2", sweep_h2);
         }
     }
 
@@ -395,8 +643,8 @@ impl UpstreamConnCache {
         // why this is our own bookkeeping, not a real signal from hyper.
         if let Some(conn) = conns
             .iter()
-            .filter(|c| c.in_flight.get() < SOFT_STREAMS_PER_CONNECTION)
-            .min_by_key(|c| c.in_flight.get())
+            .filter(|c| c.activity.in_flight.get() < SOFT_STREAMS_PER_CONNECTION)
+            .min_by_key(|c| c.activity.in_flight.get())
         {
             return Ok(lease(conn));
         }
@@ -405,13 +653,11 @@ impl UpstreamConnCache {
         // as long as the set is still under the hard cap on how many
         // physical connections this key is allowed to hold.
         if conns.len() < MAX_CONNECTIONS_PER_KEY {
-            // Rust note: destructure rather than binding `upstream` whole --
-            // `upstream.io` moves into `handshake_upstream_http2` below and
-            // `upstream.cb_guard` must survive that move to ride into the
-            // `PooledConn` we push, so both fields need to come out
-            // independently instead of through a struct that would otherwise
-            // still be holding the guard when `io` is consumed.
-            let proxy_cluster::UpstreamStream { io, cb_guard } = pool.new_stream().await?;
+            // The connection's `max_connections` slot moves into the stream
+            // (`SlotIo`), so it is released when the socket is, not when this
+            // cache happens to evict the entry. A failed handshake drops the
+            // stream, and with it the slot, right here.
+            let io = SlotIo::new(pool.new_stream().await?);
             // A handshake failure is folded into `PoolError::TlsHandshake`:
             // there's no dedicated pool-error variant for "connected, but
             // the h2 preface/settings exchange failed" (`PoolError` lives in
@@ -424,9 +670,9 @@ impl UpstreamConnCache {
                 .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
             conns.push(PooledConn {
                 sender,
-                in_flight: Rc::new(Cell::new(0)),
-                _cb_guard: cb_guard,
+                activity: Rc::new(ConnActivity::new()),
             });
+            self.ensure_sweeper();
             let conn = conns.last().expect("just pushed one line above");
             return Ok(lease(conn));
         }
@@ -439,7 +685,7 @@ impl UpstreamConnCache {
         // its own real capacity.
         let conn = conns
             .iter()
-            .min_by_key(|c| c.in_flight.get())
+            .min_by_key(|c| c.activity.in_flight.get())
             .expect("MAX_CONNECTIONS_PER_KEY > 0, so the set is non-empty by branch 2");
         Ok(lease(conn))
     }
@@ -449,6 +695,10 @@ impl UpstreamConnCache {
     /// wants the next request/retry to redial rather than risk getting
     /// handed the same now-suspect connection again before its
     /// `is_closed()` catches up.
+    ///
+    /// Evicting an entry stops new requests using the connection; it does not
+    /// cut off a stream already running on it. Such a connection stays open,
+    /// and keeps its `max_connections` slot, until that stream ends.
     pub fn invalidate(&self, key: &ConnKey) {
         self.slots.borrow_mut().remove(key);
     }
@@ -478,13 +728,51 @@ impl UpstreamConnCache {
 /// a sender clone paired with the [`StreamGuard`] that decrements it again
 /// once the caller is done -- see [`PooledSendRequest::send`].
 fn lease(conn: &PooledConn) -> PooledSendRequest {
-    conn.in_flight.set(conn.in_flight.get() + 1);
+    let in_flight = &conn.activity.in_flight;
+    in_flight.set(in_flight.get() + 1);
     PooledSendRequest {
         sender: conn.sender.clone(),
         guard: StreamGuard {
-            in_flight: conn.in_flight.clone(),
+            activity: conn.activity.clone(),
         },
     }
+}
+
+/// One pass of the h2 cache's sweep: drop every connection that is closed or
+/// has been idle for [`UPSTREAM_IDLE_TIMEOUT`] as of `now`, then every key left
+/// with no connection. A free function over the shared map (not a method) so
+/// the periodic task can call it through a `Weak` -- see [`spawn_sweeper`].
+///
+/// A key whose slot a checkout currently holds is skipped, closed connections
+/// and all. A checkout holds the slot's lock from its lookup through its dial,
+/// so a locked slot is one in use right now, and the checkout prunes closed
+/// connections itself. What the sweep must not do is remove the key from the
+/// map under it: the connection it is about to dial would be pushed into a
+/// slot the map no longer reaches, and the next request would dial again.
+/// `try_lock` and not `lock` because the sweep must never wait for a dial.
+///
+/// Evicted connections are dropped only after the map's `RefCell` borrow has
+/// ended, so nothing a destructor does can reach back into the cache while it
+/// is borrowed.
+fn sweep_h2(slots: &RefCell<HashMap<ConnKey, Slot>>, now: Instant) -> SweepReport {
+    let mut report = SweepReport::default();
+    let mut evicted: Vec<PooledConn> = Vec::new();
+    slots.borrow_mut().retain(|_key, slot| {
+        let Ok(mut conns) = slot.try_lock() else {
+            return true;
+        };
+        let (gone, live): (Vec<PooledConn>, Vec<PooledConn>) = std::mem::take(&mut *conns)
+            .into_iter()
+            .partition(|conn| conn.sender.is_closed() || conn.idle_expired(now));
+        *conns = live;
+        report.connections += gone.len();
+        evicted.extend(gone);
+        let retire = conns.is_empty();
+        report.keys += usize::from(retire);
+        !retire
+    });
+    drop(evicted);
+    report
 }
 
 thread_local! {
@@ -520,39 +808,40 @@ pub fn worker_conn_cache() -> Rc<UpstreamConnCache> {
 /// but holding a socket open on the CHANCE the next request happens to be
 /// for the same upstream soon -- 8 is enough to smooth out a bursty
 /// sequential workload against one provider without accumulating a large
-/// number of sockets that just sit there between bursts. There is
-/// deliberately no idle-timeout eviction yet (see this module's
-/// doc and `router.rs`'s "Deferred" list) -- an idle connection nobody
-/// leases again just waits until the peer closes it, and the next
-/// `get_or_connect_h1` call's `is_closed()` check on it catches that.
+/// number of sockets that just sit there between bursts.
+///
+/// An idle connection nobody leases again is not left to wait for its peer
+/// forever: the periodic sweep closes it after [`UPSTREAM_IDLE_TIMEOUT`], and
+/// the slot goes back with the socket if the peer hangs up first (see
+/// [`SlotIo`]). The sweep is periodic, though, so a lookup still checks
+/// `is_closed()` on every entry it is about to hand out -- a peer can close a
+/// connection between two sweeps, and a request must never be sent on one
+/// that is already known to be dead.
 const MAX_IDLE_PER_KEY: usize = 8;
 
 /// One IDLE h1 connection [`H1ConnCache`] is holding onto between requests --
 /// handshaken, currently unleased, and (as far as this cache last checked)
-/// still open.
+/// still open. Its `max_connections` slot is not a field here: it travels
+/// inside the socket (see [`SlotIo`]).
 struct IdleH1Conn {
     sender: Http1SendRequest<StreamBody>,
     conn_task: tokio::task::JoinHandle<()>,
-    /// The S5 `max_connections` slot this physical connection holds,
-    /// exactly like [`PooledConn::_cb_guard`] -- moved out of the
-    /// `proxy_cluster::UpstreamStream` `pool.new_stream()` returned, and kept
-    /// alive for as long as this connection is cached, releasing the slot
-    /// only when [`IdleH1Conn::discard`] runs (or the connection is leased
-    /// back out and later discarded from `H1ReuseBody`).
-    cb_guard: Option<proxy_cluster::CbGuard>,
+    /// When this connection was returned to the idle queue, for
+    /// [`UPSTREAM_IDLE_TIMEOUT`].
+    idle_since: Instant,
 }
 
 impl IdleH1Conn {
     /// Explicitly tear this idle connection down: abort `conn_task` (which
-    /// stops it being polled, dropping the underlying IO), then let
-    /// `sender`/`cb_guard` drop normally as this method returns -- `cb_guard`
-    /// dropping is what releases the `max_connections` slot.
+    /// stops it being polled, dropping the underlying IO and with it the
+    /// `max_connections` slot the stream carries), then let `sender` drop
+    /// normally as this method returns.
     ///
     /// Rust note: this is a plain consuming method, not a `Drop` impl.
     /// `Drop::drop` only ever gets `&mut self`, and Rust forbids moving a
     /// field out of a value that implements `Drop` at all -- but the REUSE
     /// path (`H1ConnCache::get_or_connect_h1`, below) needs to move
-    /// `sender`/`conn_task`/`cb_guard` out of an `IdleH1Conn` wholesale, by
+    /// `sender`/`conn_task` out of an `IdleH1Conn` wholesale, by
     /// value, into a [`LeasedH1`]. Giving this type a `Drop` impl would make
     /// that move illegal. An explicit `discard(self)`, called at every site
     /// that decides NOT to keep an idle entry, gets the same guarantee (a
@@ -563,6 +852,43 @@ impl IdleH1Conn {
     fn discard(self) {
         self.conn_task.abort();
     }
+
+    fn idle_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.idle_since) >= UPSTREAM_IDLE_TIMEOUT
+    }
+}
+
+/// One pass of the h1 cache's sweep: discard every idle connection that is
+/// closed or has waited [`UPSTREAM_IDLE_TIMEOUT`] as of `now`, then every key
+/// left with an empty queue. Only idle connections are ever in this cache, so
+/// unlike the h2 sweep there is no "carrying a stream" case to protect: a
+/// leased connection is not here to be swept.
+///
+/// An empty queue is the normal state of a key between requests (a lease
+/// pops the connection out), so this is what stops every key that has ever
+/// been used from staying in the map forever. Removing it costs nothing
+/// when the connection comes back: `H1ReuseBody` recreates the entry.
+///
+/// As in [`sweep_h2`], discarded connections are dropped after the map's
+/// borrow ends.
+fn sweep_h1(slots: &RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>, now: Instant) -> SweepReport {
+    let mut report = SweepReport::default();
+    let mut evicted: Vec<IdleH1Conn> = Vec::new();
+    slots.borrow_mut().retain(|_key, idle| {
+        let (gone, live): (VecDeque<IdleH1Conn>, VecDeque<IdleH1Conn>) = std::mem::take(idle)
+            .into_iter()
+            .partition(|conn| conn.sender.is_closed() || conn.idle_expired(now));
+        *idle = live;
+        report.connections += gone.len();
+        evicted.extend(gone);
+        let retire = idle.is_empty();
+        report.keys += usize::from(retire);
+        !retire
+    });
+    for conn in evicted {
+        conn.discard();
+    }
+    report
 }
 
 /// Per-worker cache of IDLE, reusable HTTP/1.1 upstream connections, keyed by
@@ -590,8 +916,14 @@ impl IdleH1Conn {
 /// peer is still mid-write of the previous response -- a real
 /// response/request desync, not just a wasted connection. See `H1ReuseBody`
 /// for where that decision is made, and why it's made in `Drop`.
+///
+/// The map is behind an `Rc` for the same reason as [`UpstreamConnCache`]'s:
+/// the periodic sweep reaches it through a `Weak` from a task of its own.
 pub struct H1ConnCache {
-    slots: RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>,
+    slots: Rc<RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>>,
+    /// Whether this cache's sweep task has been started -- see
+    /// [`UpstreamConnCache::sweeper_started`].
+    sweeper_started: Cell<bool>,
 }
 
 impl Default for H1ConnCache {
@@ -603,7 +935,14 @@ impl Default for H1ConnCache {
 impl H1ConnCache {
     pub fn new() -> Self {
         Self {
-            slots: RefCell::new(HashMap::new()),
+            slots: Rc::new(RefCell::new(HashMap::new())),
+            sweeper_started: Cell::new(false),
+        }
+    }
+
+    fn ensure_sweeper(&self) {
+        if !self.sweeper_started.replace(true) {
+            spawn_sweeper(&self.slots, "h1", sweep_h1);
         }
     }
 
@@ -642,24 +981,21 @@ impl H1ConnCache {
                 continue;
             }
             let IdleH1Conn {
-                sender,
-                conn_task,
-                cb_guard,
+                sender, conn_task, ..
             } = idle;
             return Ok(LeasedH1 {
                 sender,
                 conn_task,
-                cb_guard,
                 cache: self,
                 key,
             });
         }
 
-        // Nothing reusable was cached for this key -- dial fresh. Same
-        // destructure-for-independent-moves reasoning as
-        // `UpstreamConnCache::get_or_connect`'s own dial branch: `io` moves
-        // into the handshake below, `cb_guard` has to survive that move.
-        let proxy_cluster::UpstreamStream { io, cb_guard } = pool.new_stream().await?;
+        // Nothing reusable was cached for this key -- dial fresh. The
+        // connection's `max_connections` slot moves into the stream
+        // (`SlotIo`), so it goes back when the socket does, wherever the
+        // connection ends up -- idle in this cache, leased, or discarded.
+        let io = SlotIo::new(pool.new_stream().await?);
         // A handshake failure folds into `PoolError::TlsHandshake`, same
         // "never got a usable connection" bucket `UpstreamConnCache::get_or_connect`
         // already folds its own h2 handshake failure into -- see that call
@@ -668,10 +1004,10 @@ impl H1ConnCache {
         let (sender, conn_task) = handshake_upstream_http1(io)
             .await
             .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))?;
+        self.ensure_sweeper();
         Ok(LeasedH1 {
             sender,
             conn_task,
-            cb_guard,
             cache: self,
             key,
         })
@@ -685,7 +1021,6 @@ impl H1ConnCache {
 pub struct LeasedH1 {
     sender: Http1SendRequest<StreamBody>,
     conn_task: tokio::task::JoinHandle<()>,
-    cb_guard: Option<proxy_cluster::CbGuard>,
     cache: Rc<H1ConnCache>,
     key: ConnKey,
 }
@@ -705,7 +1040,6 @@ impl LeasedH1 {
         let LeasedH1 {
             mut sender,
             conn_task,
-            cb_guard,
             cache,
             key,
         } = self;
@@ -729,12 +1063,10 @@ impl LeasedH1 {
                 // right as we wrote, or mid-write of the request itself) --
                 // reusing it would be exactly the "poisoned connection"
                 // outcome this whole design exists to prevent. Abort the
-                // conn task explicitly (tears the connection down); `sender`/
-                // `cb_guard` drop normally right after, releasing the
-                // `max_connections` slot.
+                // conn task explicitly: that tears the connection down, and
+                // the `max_connections` slot goes back with the socket.
                 conn_task.abort();
                 drop(sender);
-                drop(cb_guard);
                 return Err(UpstreamCodecError::Send(send_err));
             }
         };
@@ -768,7 +1100,6 @@ impl LeasedH1 {
             inner,
             sender: Some(sender),
             conn_task: Some(conn_task),
-            cb_guard,
             cache,
             key,
             reusable,
@@ -817,7 +1148,6 @@ struct H1ReuseBody {
     inner: StreamBody,
     sender: Option<Http1SendRequest<StreamBody>>,
     conn_task: Option<tokio::task::JoinHandle<()>>,
-    cb_guard: Option<proxy_cluster::CbGuard>,
     cache: Rc<H1ConnCache>,
     key: ConnKey,
     /// Decided once, from the response head, in `LeasedH1::send` -- see that
@@ -886,9 +1216,6 @@ impl Drop for H1ReuseBody {
     /// `conn_task` must come out via `Option::take()` rather than a
     /// wholesale destructure (illegal here -- see `IdleH1Conn::discard`'s
     /// doc for the general rule this and that are opposite sides of).
-    /// `cb_guard` is already `Option<CbGuard>` in its own right (a cluster
-    /// with no `max_connections` limit configured has no guard to hold at
-    /// all), so `.take()` on it needs no extra wrapping.
     fn drop(&mut self) {
         let (Some(sender), Some(conn_task)) = (self.sender.take(), self.conn_task.take()) else {
             // `Drop::drop` only ever runs once per value, so this is
@@ -897,7 +1224,6 @@ impl Drop for H1ReuseBody {
             // stays a safe, total match instead of a bare `.unwrap()`.
             return;
         };
-        let cb_guard = self.cb_guard.take();
 
         // The ONE safe-to-reuse condition, checked in full: the response
         // body reached a CLEAN end of stream (no error anywhere along the
@@ -914,7 +1240,7 @@ impl Drop for H1ReuseBody {
                 idle_conns.push_back(IdleH1Conn {
                     sender,
                     conn_task,
-                    cb_guard,
+                    idle_since: Instant::now(),
                 });
                 return;
             }
@@ -941,9 +1267,9 @@ impl Drop for H1ReuseBody {
         //   - `sender.is_closed()`: already gone, nothing to return;
         //   - the idle queue was full: not unsafe, just no room -- discarded
         //     rather than grown unbounded (see `MAX_IDLE_PER_KEY`'s doc).
-        // In every one of these, abort the connection task (tears the
-        // connection down) and let `sender`/`cb_guard` drop normally right
-        // after, releasing the `max_connections` slot.
+        // In every one of these, abort the connection task: that tears the
+        // connection down, and the `max_connections` slot goes back with the
+        // socket.
         conn_task.abort();
     }
 }
@@ -965,18 +1291,24 @@ mod tests {
     use super::*;
     use crate::handler::{local_boxed, DownstreamInfo, HttpRequestParts};
     use bytes::Bytes;
+    use futures::future::BoxFuture;
     use http::{HeaderMap, Method, StatusCode, Uri};
-    use http_body_util::{BodyExt, Full};
+    use http_body_util::combinators::UnsyncBoxBody;
+    use http_body_util::{BodyExt, Full, StreamBody};
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::Request;
     use hyper_util::rt::TokioIo;
     use proxy_cluster::pool::ConnectPool;
     use proxy_cluster::transport::RawTransportSocket;
+    use proxy_cluster::CircuitBreakerState;
+    use proxy_config::ir::CircuitBreakerThresholds;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tokio::net::TcpListener;
+    use std::sync::{Arc, OnceLock};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{watch, Notify, Semaphore};
     use tokio::task::LocalSet;
 
     /// Same-shape test-only executor as `codec::LocalExec` -- this one only
@@ -1141,6 +1473,362 @@ mod tests {
         }
     }
 
+    /// A key on a given cluster build, identified (as in production) by that
+    /// build's connection budget.
+    fn key_on(
+        cluster: &str,
+        addr: SocketAddr,
+        protocol: UpstreamProtocol,
+        budget: &CircuitBreakerState,
+    ) -> ConnKey {
+        ConnKey::new(cluster, addr, protocol, ClusterBuildId::of(budget))
+    }
+
+    /// The key most tests want: every key built here is on one shared build, so
+    /// two keys differ only in what the test varies on purpose (the cluster
+    /// name, the address). A test about builds makes its own budgets instead.
+    fn test_key(cluster: &str, addr: SocketAddr, protocol: UpstreamProtocol) -> ConnKey {
+        static BUILD: OnceLock<CircuitBreakerState> = OnceLock::new();
+        key_on(
+            cluster,
+            addr,
+            protocol,
+            BUILD.get_or_init(CircuitBreakerState::default),
+        )
+    }
+
+    /// A connection budget of exactly one that refuses a second dial at once
+    /// instead of parking it, so exhaustion shows up as `PoolError::Overflow`
+    /// rather than as a wait.
+    fn one_connection_budget() -> CircuitBreakerState {
+        CircuitBreakerState::from_thresholds(CircuitBreakerThresholds {
+            max_connections: 1,
+            max_pending_requests: 0,
+            ..CircuitBreakerThresholds::ENVOY_DEFAULT
+        })
+    }
+
+    /// A pool for `addr` that charges `budget`. `ConnectPool` clones the
+    /// budget's gauge, so pools for different hosts of one cluster share one
+    /// count -- the same way `ClusterHandle::http_pool` builds them.
+    fn pool_on(addr: SocketAddr, budget: &CircuitBreakerState) -> ConnectPool {
+        ConnectPool::new(
+            addr,
+            Arc::new(RawTransportSocket),
+            addr.ip().to_string(),
+            Duration::from_secs(30),
+            budget.clone(),
+        )
+    }
+
+    /// A loopback upstream that answers every request `200` and keeps its
+    /// connections open until told otherwise. It reports what it sees on the
+    /// wire -- connections accepted, requests read, connections the *client*
+    /// closed -- so a test asserts on the peer's view of the proxy instead of
+    /// on the cache's internals.
+    struct Upstream {
+        addr: SocketAddr,
+        accepted: Arc<AtomicUsize>,
+        shared: ServeState,
+        /// Bumping the value makes every connection accepted before the bump
+        /// close itself; connections accepted afterwards are unaffected.
+        hang_up_signal: watch::Sender<u64>,
+        listener_task: tokio::task::JoinHandle<()>,
+    }
+
+    /// What an [`Upstream`] holds back until the test releases it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Hold {
+        /// Nothing: every request is answered at once.
+        Nothing,
+        /// The whole response, head included, so the request is in flight.
+        Response,
+        /// The end of the response body only: the head goes out at once and
+        /// the body then streams, like a long LLM completion. h2 only.
+        Body,
+    }
+
+    /// What each served connection shares with the test.
+    #[derive(Clone)]
+    struct ServeState {
+        requests: Arc<AtomicUsize>,
+        closed_by_client: Arc<AtomicUsize>,
+        hold: Hold,
+        /// One permit lets one held response (or body) through.
+        gate: Arc<Semaphore>,
+        hang_up: watch::Receiver<u64>,
+    }
+
+    impl Upstream {
+        async fn spawn(protocol: UpstreamProtocol) -> Self {
+            Self::start(protocol, Hold::Nothing).await
+        }
+
+        /// Like [`Self::spawn`], but holds back what `hold` names until the
+        /// test calls [`Self::release`].
+        async fn spawn_holding(protocol: UpstreamProtocol, hold: Hold) -> Self {
+            Self::start(protocol, hold).await
+        }
+
+        async fn start(protocol: UpstreamProtocol, hold: Hold) -> Self {
+            assert!(
+                hold != Hold::Body || protocol == UpstreamProtocol::Http2,
+                "only the h2 mock can hold a body back"
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let (hang_up_signal, hang_up_rx) = watch::channel(0u64);
+            let shared = ServeState {
+                requests: Arc::new(AtomicUsize::new(0)),
+                closed_by_client: Arc::new(AtomicUsize::new(0)),
+                hold,
+                gate: Arc::new(Semaphore::new(0)),
+                hang_up: hang_up_rx,
+            };
+            let listener_task = tokio::task::spawn_local({
+                let accepted = accepted.clone();
+                let shared = shared.clone();
+                async move {
+                    while let Ok((stream, _peer)) = listener.accept().await {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        let conn = shared.clone();
+                        match protocol {
+                            UpstreamProtocol::Http1 => {
+                                tokio::task::spawn_local(conn.serve_h1(stream));
+                            }
+                            UpstreamProtocol::Http2 => {
+                                tokio::task::spawn_local(conn.serve_h2(stream));
+                            }
+                        }
+                    }
+                }
+            });
+            Self {
+                addr,
+                accepted,
+                shared,
+                hang_up_signal,
+                listener_task,
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> usize {
+            self.shared.requests.load(Ordering::SeqCst)
+        }
+
+        fn closed_by_client(&self) -> usize {
+            self.shared.closed_by_client.load(Ordering::SeqCst)
+        }
+
+        /// Let `n` held-back responses (or bodies) through.
+        fn release(&self, n: usize) {
+            self.shared.gate.add_permits(n);
+        }
+
+        /// Close every connection currently open, from the upstream's side.
+        fn hang_up(&self) {
+            self.hang_up_signal
+                .send_modify(|generation| *generation += 1);
+        }
+
+        /// The endpoint disappears: open connections are closed and nothing
+        /// listens at the address any more.
+        fn go_away(&self) {
+            self.listener_task.abort();
+            self.hang_up();
+        }
+    }
+
+    impl ServeState {
+        async fn serve_h1(mut self, mut stream: TcpStream) {
+            let generation = *self.hang_up.borrow();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                // One request head at a time. The test requests are bodyless
+                // GETs, so the head is the whole request.
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    tokio::select! {
+                        _ = self.hang_up.wait_for(|g| *g != generation) => return,
+                        read = stream.read(&mut chunk) => match read {
+                            Ok(0) | Err(_) => {
+                                self.closed_by_client.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        },
+                    }
+                }
+                head.clear();
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                if self.hold == Hold::Response {
+                    self.gate
+                        .acquire()
+                        .await
+                        .expect("the gate stays open")
+                        .forget();
+                }
+                let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                if stream.write_all(reply).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        async fn serve_h2(mut self, stream: TcpStream) {
+            let generation = *self.hang_up.borrow();
+            let (requests, gate, hold) = (self.requests.clone(), self.gate.clone(), self.hold);
+            let service = service_fn(move |_req: Request<Incoming>| {
+                let (requests, gate) = (requests.clone(), gate.clone());
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let body: UnsyncBoxBody<Bytes, std::convert::Infallible> = match hold {
+                        Hold::Nothing => Full::new(Bytes::new()).boxed_unsync(),
+                        Hold::Response => {
+                            gate.acquire().await.expect("the gate stays open").forget();
+                            Full::new(Bytes::new()).boxed_unsync()
+                        }
+                        // The head is sent as soon as this service returns;
+                        // the body is a one-item stream that ends only when
+                        // a permit arrives.
+                        Hold::Body => StreamBody::new(futures::stream::once(async move {
+                            gate.acquire().await.expect("the gate stays open").forget();
+                            Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(
+                                b"done",
+                            )))
+                        }))
+                        .boxed_unsync(),
+                    };
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(body)
+                            .unwrap(),
+                    )
+                }
+            });
+            let connection = hyper::server::conn::http2::Builder::new(LocalExec)
+                .serve_connection(TokioIo::new(stream), service);
+            tokio::pin!(connection);
+            tokio::select! {
+                // Dropping `connection` on this arm closes the socket.
+                _ = self.hang_up.wait_for(|g| *g != generation) => {}
+                _ = &mut connection => {
+                    self.closed_by_client.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// Both caches behind one interface, so a scenario is written once and run
+    /// against h1 and h2.
+    struct Caches {
+        h2: Rc<UpstreamConnCache>,
+        h1: Rc<H1ConnCache>,
+    }
+
+    impl Caches {
+        fn new() -> Self {
+            Self {
+                h2: Rc::new(UpstreamConnCache::new()),
+                h1: Rc::new(H1ConnCache::new()),
+            }
+        }
+
+        /// Check a connection out for `key`, send one GET over it, read the
+        /// body to its clean end and let go of everything: the connection is
+        /// left idle in its cache. Fails only if the checkout itself does (a
+        /// refused dial, an exhausted budget).
+        async fn round_trip(&self, key: ConnKey, pool: &ConnectPool) -> Result<(), PoolError> {
+            let response = match key.protocol {
+                UpstreamProtocol::Http2 => {
+                    self.h2
+                        .get_or_connect(key, pool)
+                        .await?
+                        .send(get_request())
+                        .await
+                }
+                UpstreamProtocol::Http1 => {
+                    self.h1
+                        .clone()
+                        .get_or_connect_h1(key, pool)
+                        .await?
+                        .send(get_request())
+                        .await
+                }
+            }
+            .expect("the upstream answers");
+            response
+                .body
+                .collect()
+                .await
+                .expect("the body ends cleanly");
+            Ok(())
+        }
+
+        fn sweep(&self, protocol: UpstreamProtocol, now: Instant) -> SweepReport {
+            match protocol {
+                UpstreamProtocol::Http2 => sweep_h2(&self.h2.slots, now),
+                UpstreamProtocol::Http1 => sweep_h1(&self.h1.slots, now),
+            }
+        }
+    }
+
+    /// Wait for `condition` by yielding to the scheduler, for effects that
+    /// happen in this process (a task being polled) and so need no clock. A
+    /// timeout is useless as a hang guard while the clock is frozen -- it
+    /// never fires, or fires at once when the runtime idles -- so the
+    /// iteration cap is what turns a hang into a failure.
+    async fn settle(what: &str, mut condition: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if condition() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("never settled: {what}");
+    }
+
+    /// Wait for `condition` on the real clock, for effects that need the
+    /// kernel (a peer noticing a close). The bound only turns a hang into a
+    /// failure; nothing asserts on how long the wait took.
+    async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+        let wait = async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .is_err()
+        {
+            panic!("timed out waiting for: {what}");
+        }
+    }
+
+    /// A pool whose dial waits for the test, so a checkout can be held in the
+    /// middle of dialing a key.
+    struct GatedPool {
+        inner: ConnectPool,
+        gate: Arc<Notify>,
+    }
+
+    impl HttpConnPool for GatedPool {
+        fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>> {
+            let dial = self.inner.new_stream();
+            let gate = self.gate.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                dial.await
+            })
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn two_clusters_at_the_same_address_do_not_share_a_connection() {
         // The `ConnKey` security property from this module's doc: two
@@ -1153,8 +1841,8 @@ mod tests {
                 let pool = plaintext_pool(addr);
                 let cache = UpstreamConnCache::new();
 
-                let key_a = ConnKey::new("cluster-a", addr, UpstreamProtocol::Http2);
-                let key_b = ConnKey::new("cluster-b", addr, UpstreamProtocol::Http2);
+                let key_a = test_key("cluster-a", addr, UpstreamProtocol::Http2);
+                let key_b = test_key("cluster-b", addr, UpstreamProtocol::Http2);
 
                 let sender_a = cache
                     .get_or_connect(key_a, &pool)
@@ -1190,7 +1878,7 @@ mod tests {
                 let (addr, accepted) = spawn_counting_h2_upstream().await;
                 let pool = plaintext_pool(addr);
                 let cache = UpstreamConnCache::new();
-                let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
 
                 let sender1 = cache
                     .get_or_connect(key.clone(), &pool)
@@ -1221,7 +1909,7 @@ mod tests {
 
                 let dead_pool = plaintext_pool(addr);
                 let cache = UpstreamConnCache::new();
-                let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
 
                 cache
                     .get_or_connect(key.clone(), &dead_pool)
@@ -1235,7 +1923,7 @@ mod tests {
 
                 let sender = cache
                     .get_or_connect(
-                        ConnKey::new("up", real_addr, UpstreamProtocol::Http2),
+                        test_key("up", real_addr, UpstreamProtocol::Http2),
                         &live_pool,
                     )
                     .await
@@ -1265,7 +1953,7 @@ mod tests {
                 let (addr, accepted) = spawn_counting_h2_upstream().await;
                 let pool = plaintext_pool(addr);
                 let cache = UpstreamConnCache::new();
-                let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
 
                 let sender1 = cache.get_or_connect(key.clone(), &pool).await.unwrap();
                 sender1.send(get_request()).await.unwrap();
@@ -1291,7 +1979,7 @@ mod tests {
                 let (addr, accepted) = spawn_counting_h2_upstream().await;
                 let pool = plaintext_pool(addr);
                 let cache = UpstreamConnCache::new();
-                let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
 
                 let sender1 = cache.get_or_connect(key.clone(), &pool).await.unwrap();
                 sender1.send(get_request()).await.unwrap();
@@ -1331,7 +2019,7 @@ mod tests {
                     spawn_h2_upstream_with_stream_limit(PEER_LIMIT, hold).await;
                 let pool = plaintext_pool(addr);
                 let cache = UpstreamConnCache::new();
-                let key = ConnKey::new("up", addr, UpstreamProtocol::Http2);
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
 
                 // Warm up the first connection with one full, sequential
                 // round trip before anything below leases a second stream
@@ -1442,6 +2130,450 @@ mod tests {
                     opened <= MAX_CONNECTIONS_PER_KEY,
                     "opened {opened} connections, more than the cache's own cap of \
                      {MAX_CONNECTIONS_PER_KEY}"
+                );
+            })
+            .await;
+    }
+
+    // ------------------------------------------------ connection lifetime --
+
+    /// The reason the slot rides inside the socket. A cluster with a budget of
+    /// one connection pools an idle connection to host A; A hangs up on it; a
+    /// request is then routed to host B (the cluster's addresses rotated). If
+    /// the slot were held until something looked A's key up again -- which
+    /// nothing will -- B's dial would overflow for as long as the dead entry
+    /// sat in the cache.
+    async fn an_idle_connection_closed_by_its_peer_gives_its_slot_back(protocol: UpstreamProtocol) {
+        let host_a = Upstream::spawn(protocol).await;
+        let host_b = Upstream::spawn(protocol).await;
+        let budget = one_connection_budget();
+        let caches = Caches::new();
+        let key_a = key_on("up", host_a.addr, protocol, &budget);
+        let key_b = key_on("up", host_b.addr, protocol, &budget);
+        let pool_a = pool_on(host_a.addr, &budget);
+        let pool_b = pool_on(host_b.addr, &budget);
+
+        caches
+            .round_trip(key_a, &pool_a)
+            .await
+            .expect("the first dial is within budget");
+        assert!(
+            budget.try_acquire_connection().is_none(),
+            "premise: the idle pooled connection holds the cluster's only slot"
+        );
+        // Negative control: while A's connection is open, B really cannot dial.
+        // Without it this test would also pass if the budget never saturated.
+        let refused = caches.round_trip(key_b.clone(), &pool_b).await;
+        assert!(
+            matches!(refused, Err(PoolError::Overflow)),
+            "a dial past the budget must overflow while the idle connection is open, got {refused:?}"
+        );
+
+        host_a.hang_up();
+        eventually("the closed connection's slot to come back", || {
+            budget.try_acquire_connection().is_some()
+        })
+        .await;
+
+        caches
+            .round_trip(key_b, &pool_b)
+            .await
+            .expect("a dial to the other host succeeds once the closed connection's slot is back");
+        assert_eq!(host_b.accepted(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h1_idle_connection_closed_by_its_peer_gives_its_slot_back() {
+        LocalSet::new()
+            .run_until(an_idle_connection_closed_by_its_peer_gives_its_slot_back(
+                UpstreamProtocol::Http1,
+            ))
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_idle_connection_closed_by_its_peer_gives_its_slot_back() {
+        LocalSet::new()
+            .run_until(an_idle_connection_closed_by_its_peer_gives_its_slot_back(
+                UpstreamProtocol::Http2,
+            ))
+            .await;
+    }
+
+    /// The other side of the slot-travels-with-the-socket rule: a connection
+    /// that is *abandoned* mid-request (a per-try timeout, a client that went
+    /// away) must not strand its slot either. Before the slot rode in the
+    /// socket this was released the instant the request future was dropped;
+    /// now it is released when the socket closes, so this pins that hyper does
+    /// close an h1 connection whose response nobody is waiting for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_an_h1_request_in_flight_gives_its_slot_back() {
+        LocalSet::new()
+            .run_until(async {
+                // Never answers, so the request is in flight until abandoned.
+                let host = Upstream::spawn_holding(UpstreamProtocol::Http1, Hold::Response).await;
+                let budget = one_connection_budget();
+                let caches = Caches::new();
+                let key = key_on("up", host.addr, UpstreamProtocol::Http1, &budget);
+                let pool = Rc::new(pool_on(host.addr, &budget));
+
+                let request = tokio::task::spawn_local({
+                    let h1 = caches.h1.clone();
+                    async move {
+                        let leased = h1.get_or_connect_h1(key, &*pool).await?;
+                        Ok::<_, PoolError>(leased.send(get_request()).await)
+                    }
+                });
+                eventually("the request to reach the upstream", || host.requests() == 1).await;
+                assert!(
+                    budget.try_acquire_connection().is_none(),
+                    "premise: the connection carrying the request holds the slot"
+                );
+
+                request.abort();
+
+                eventually("the abandoned connection's slot to come back", || {
+                    budget.try_acquire_connection().is_some()
+                })
+                .await;
+            })
+            .await;
+    }
+
+    /// Same rule, earlier in the attempt: the router checks a connection out
+    /// before it applies the provider credential and rewrites the body, and
+    /// returns a local reply if either fails. The leased connection is then
+    /// dropped without ever carrying a request, and must not strand its slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_leased_h1_connection_that_never_sent_gives_its_slot_back() {
+        LocalSet::new()
+            .run_until(async {
+                let host = Upstream::spawn(UpstreamProtocol::Http1).await;
+                let budget = one_connection_budget();
+                let caches = Caches::new();
+                let key = key_on("up", host.addr, UpstreamProtocol::Http1, &budget);
+
+                let leased = caches
+                    .h1
+                    .clone()
+                    .get_or_connect_h1(key, &pool_on(host.addr, &budget))
+                    .await
+                    .expect("dial");
+                assert!(
+                    budget.try_acquire_connection().is_none(),
+                    "premise: the leased connection holds the slot"
+                );
+
+                drop(leased);
+
+                eventually("the unused connection's slot to come back", || {
+                    budget.try_acquire_connection().is_some()
+                })
+                .await;
+            })
+            .await;
+    }
+
+    /// A key whose endpoint is gone -- its connection closed and nothing
+    /// listening any more, as after a DNS answer rotates -- must not stay in
+    /// the map. A key that still has a live connection must.
+    async fn the_sweep_retires_a_key_whose_endpoint_is_gone(protocol: UpstreamProtocol) {
+        let gone = Upstream::spawn(protocol).await;
+        let alive = Upstream::spawn(protocol).await;
+        let caches = Caches::new();
+        let (gone_pool, alive_pool) = (plaintext_pool(gone.addr), plaintext_pool(alive.addr));
+        let alive_key = test_key("up", alive.addr, protocol);
+        caches
+            .round_trip(test_key("up", gone.addr, protocol), &gone_pool)
+            .await
+            .unwrap();
+        caches
+            .round_trip(alive_key.clone(), &alive_pool)
+            .await
+            .unwrap();
+
+        gone.go_away();
+
+        // The client side notices the close asynchronously, so sweep until it
+        // has. Everything the sweep removes is accounted for in the report.
+        let mut report = SweepReport::default();
+        eventually("the sweep to find the closed connection", || {
+            report = caches.sweep(protocol, Instant::now());
+            report != SweepReport::default()
+        })
+        .await;
+        assert_eq!(
+            report,
+            SweepReport {
+                connections: 1,
+                keys: 1
+            },
+            "the dead connection and the key that held it are both retired, and nothing else"
+        );
+
+        caches
+            .round_trip(alive_key, &alive_pool)
+            .await
+            .expect("the live key still works");
+        assert_eq!(
+            alive.accepted(),
+            1,
+            "the live key's connection was left alone, so it is reused rather than redialed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h1_sweep_retires_a_key_whose_endpoint_is_gone() {
+        LocalSet::new()
+            .run_until(the_sweep_retires_a_key_whose_endpoint_is_gone(
+                UpstreamProtocol::Http1,
+            ))
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_sweep_retires_a_key_whose_endpoint_is_gone() {
+        LocalSet::new()
+            .run_until(the_sweep_retires_a_key_whose_endpoint_is_gone(
+                UpstreamProtocol::Http2,
+            ))
+            .await;
+    }
+
+    /// The whole production path for idle expiry, timer included: the cache
+    /// starts its own sweep task when it dials, the task wakes every
+    /// `SWEEP_INTERVAL`, and a connection idle for `UPSTREAM_IDLE_TIMEOUT` is
+    /// closed -- slot freed, socket closed -- with nobody calling the sweep.
+    ///
+    /// Time is frozen only once all socket I/O is done and thawed again before
+    /// the last wait. With the clock paused for the whole test, tokio
+    /// auto-advances it whenever the runtime waits for I/O, which would race
+    /// the connect and the waits' own timeouts.
+    async fn an_idle_connection_is_closed_after_the_upstream_idle_timeout(
+        protocol: UpstreamProtocol,
+    ) {
+        let host = Upstream::spawn(protocol).await;
+        let budget = one_connection_budget();
+        let caches = Caches::new();
+        let key = key_on("up", host.addr, protocol, &budget);
+        caches
+            .round_trip(key, &pool_on(host.addr, &budget))
+            .await
+            .unwrap();
+        assert!(
+            budget.try_acquire_connection().is_none(),
+            "premise: the idle pooled connection holds the slot"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(UPSTREAM_IDLE_TIMEOUT - Duration::from_secs(120)).await;
+        assert_eq!(
+            caches.sweep(protocol, Instant::now()),
+            SweepReport::default(),
+            "a connection idle for less than the timeout is kept"
+        );
+
+        tokio::time::advance(Duration::from_secs(180)).await;
+        settle(
+            "the periodic sweep to close the connection that has been idle for an hour",
+            || budget.try_acquire_connection().is_some(),
+        )
+        .await;
+
+        tokio::time::resume();
+        eventually("the upstream to see the proxy close the connection", || {
+            host.closed_by_client() == 1
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h1_idle_connection_is_closed_after_the_upstream_idle_timeout() {
+        LocalSet::new()
+            .run_until(
+                an_idle_connection_is_closed_after_the_upstream_idle_timeout(
+                    UpstreamProtocol::Http1,
+                ),
+            )
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_idle_connection_is_closed_after_the_upstream_idle_timeout() {
+        LocalSet::new()
+            .run_until(
+                an_idle_connection_is_closed_after_the_upstream_idle_timeout(
+                    UpstreamProtocol::Http2,
+                ),
+            )
+            .await;
+    }
+
+    /// An h2 connection is idle only while it carries no stream. An LLM
+    /// response can stream for longer than the idle timeout, and the sweep must
+    /// not close a connection out from under it however old the connection
+    /// is. And the idle clock starts when the last stream ends, not when the
+    /// connection was dialed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_h2_connection_with_a_stream_in_flight_is_not_idle() {
+        LocalSet::new()
+            .run_until(async {
+                // The head goes out at once and the body streams until released.
+                let host = Upstream::spawn_holding(UpstreamProtocol::Http2, Hold::Body).await;
+                let budget = one_connection_budget();
+                let caches = Caches::new();
+                let key = key_on("up", host.addr, UpstreamProtocol::Http2, &budget);
+                let response = caches
+                    .h2
+                    .get_or_connect(key, &pool_on(host.addr, &budget))
+                    .await
+                    .expect("dial")
+                    .send(get_request())
+                    .await
+                    .expect("the response head arrives; its body is still streaming");
+
+                // Two idle timeouts pass while the body streams.
+                tokio::time::pause();
+                tokio::time::advance(2 * UPSTREAM_IDLE_TIMEOUT).await;
+                assert_eq!(
+                    sweep_h2(&caches.h2.slots, Instant::now()),
+                    SweepReport::default(),
+                    "a connection carrying a stream is not idle, however old it is"
+                );
+                assert!(
+                    budget.try_acquire_connection().is_none(),
+                    "the connection is still open and still holds its slot"
+                );
+                tokio::time::resume();
+
+                host.release(1);
+                response
+                    .body
+                    .collect()
+                    .await
+                    .expect("the stream finishes on the same connection");
+
+                let just_idle = Instant::now();
+                assert_eq!(
+                    sweep_h2(&caches.h2.slots, just_idle),
+                    SweepReport::default(),
+                    "a connection that has only just gone idle is kept, though it was dialed \
+                     two hours ago"
+                );
+                assert_eq!(
+                    sweep_h2(
+                        &caches.h2.slots,
+                        just_idle + UPSTREAM_IDLE_TIMEOUT - Duration::from_secs(60)
+                    ),
+                    SweepReport::default()
+                );
+                assert_eq!(
+                    sweep_h2(
+                        &caches.h2.slots,
+                        just_idle + UPSTREAM_IDLE_TIMEOUT + Duration::from_secs(60)
+                    ),
+                    SweepReport {
+                        connections: 1,
+                        keys: 1
+                    },
+                    "an hour after its last stream ended, the connection is idle and goes"
+                );
+            })
+            .await;
+    }
+
+    /// Evicting a cache entry is not closing its connection. When an h2 entry
+    /// is dropped (`invalidate`, after a send error) while a response is still
+    /// streaming, hyper keeps the socket open until that stream ends -- and the
+    /// connection's slot must stay held until then, because the connection is
+    /// still using it. Then, with nobody left holding the connection, it closes
+    /// and the slot comes back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn evicting_an_h2_connection_keeps_its_slot_until_the_stream_on_it_ends() {
+        LocalSet::new()
+            .run_until(async {
+                let host = Upstream::spawn_holding(UpstreamProtocol::Http2, Hold::Body).await;
+                let budget = one_connection_budget();
+                let caches = Caches::new();
+                let key = key_on("up", host.addr, UpstreamProtocol::Http2, &budget);
+                let response = caches
+                    .h2
+                    .get_or_connect(key.clone(), &pool_on(host.addr, &budget))
+                    .await
+                    .expect("dial")
+                    .send(get_request())
+                    .await
+                    .expect("the response head arrives; its body is still streaming");
+
+                // The cache lets go of the connection. No `SendRequest` handle
+                // is left anywhere: only the streaming body still uses it.
+                caches.h2.invalidate(&key);
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    budget.try_acquire_connection().is_none(),
+                    "the evicted connection is still carrying a stream, so it still holds its slot"
+                );
+
+                host.release(1);
+                response
+                    .body
+                    .collect()
+                    .await
+                    .expect("the stream survives its connection being evicted from the cache");
+                eventually("the finished, unreferenced connection to close", || {
+                    budget.try_acquire_connection().is_some()
+                })
+                .await;
+            })
+            .await;
+    }
+
+    /// The sweep must not take a key out of the map from under a checkout that
+    /// is dialing it: the connection that checkout produces would be stored in
+    /// a slot nothing can reach, and the next request would dial again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_does_not_retire_a_key_a_checkout_is_dialing() {
+        LocalSet::new()
+            .run_until(async {
+                let host = Upstream::spawn(UpstreamProtocol::Http2).await;
+                let gate = Arc::new(Notify::new());
+                let gated = GatedPool {
+                    inner: plaintext_pool(host.addr),
+                    gate: gate.clone(),
+                };
+                let caches = Caches::new();
+                let key = test_key("up", host.addr, UpstreamProtocol::Http2);
+
+                // A checkout parked in the middle of its dial, holding the key.
+                let dialing = tokio::task::spawn_local({
+                    let (h2, key) = (caches.h2.clone(), key.clone());
+                    async move { h2.get_or_connect(key, &gated).await }
+                });
+                settle("the checkout to register its key and park", || {
+                    caches.h2.slots.borrow().len() == 1
+                })
+                .await;
+
+                assert_eq!(
+                    sweep_h2(&caches.h2.slots, Instant::now()),
+                    SweepReport::default(),
+                    "a key with a checkout in flight is not empty-and-unused"
+                );
+
+                gate.notify_one();
+                let leased = dialing.await.unwrap().expect("the dial completes");
+                leased.send(get_request()).await.unwrap();
+                caches
+                    .round_trip(key, &plaintext_pool(host.addr))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    host.accepted(),
+                    1,
+                    "the second checkout reuses the connection the first dialed; a second \
+                     connection means the first landed in a slot the sweep had already retired"
                 );
             })
             .await;
