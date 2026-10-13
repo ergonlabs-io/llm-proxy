@@ -984,7 +984,7 @@ mod tests {
     use super::*;
     use crate::resolver::FakeResolver;
     use crate::HealthFlags;
-    use proxy_config::ir::{DiscoveryType, LbPolicy};
+    use proxy_config::ir::{DiscoveryType, DnsRefresh, LbPolicy};
     use std::net::{IpAddr, SocketAddr};
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -1352,7 +1352,7 @@ mod tests {
             "dns-svc".to_string(),
             cluster_config(
                 "dns-svc",
-                DiscoveryType::StrictDns,
+                DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
                 vec![endpoint("svc.internal", 80)],
             ),
         );
@@ -1818,7 +1818,7 @@ mod tests {
             "dns-svc".to_string(),
             cluster_config(
                 "dns-svc",
-                DiscoveryType::StrictDns,
+                DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
                 vec![endpoint("svc.internal", 80)],
             ),
         );
@@ -1885,7 +1885,7 @@ mod tests {
             "removal".to_string(),
             cluster_config_with_health_check(
                 "removal",
-                DiscoveryType::StrictDns,
+                DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
                 vec![
                     endpoint("host-live", live_addr.port()),
                     endpoint("host-doomed", doomed_addr.port()),
@@ -2291,7 +2291,7 @@ mod tests {
                 "dns-svc".to_string(),
                 cluster_config(
                     "dns-svc",
-                    DiscoveryType::StrictDns,
+                    DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
                     vec![endpoint("svc.internal", 80)],
                 ),
             ),
@@ -2336,7 +2336,7 @@ mod tests {
                 // written out rather than `..base.clone()`.
                 eds: None,
                 name: "dns-svc".to_string(),
-                discovery: DiscoveryType::StrictDns,
+                discovery: DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
                 lb_policy: LbPolicy::RoundRobin,
                 connect_timeout: Duration::from_secs(6),
                 endpoints: vec![endpoint("svc.internal", 80)],

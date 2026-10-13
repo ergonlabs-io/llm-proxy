@@ -423,7 +423,26 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "outlier_detection",
             // EDS clusters -- see `convert_eds_cluster_config`.
             "eds_cluster_config",
+            // STRICT_DNS / LOGICAL_DNS re-resolution timing -- see
+            // `convert_dns_refresh`. The resolver itself is not
+            // configurable: `dns_lookup_family`, `dns_resolvers`,
+            // `use_tcp_for_dns_lookups`, `dns_resolution_config` and
+            // `typed_dns_resolver_config` stay off this list on purpose, so
+            // setting one fails loudly instead of being ignored.
+            "dns_refresh_rate",
+            "dns_jitter",
+            "dns_failure_refresh_rate",
+            // Listed only so `convert_dns_refresh` can reject `true` with an
+            // explanation; the generic "not implemented yet" text would not
+            // say why.
+            "respect_dns_ttl",
         ],
+        // The `dns_failure_refresh_rate` message. Both fields are mapped by
+        // `convert_dns_refresh`; the entry is here so a field a later Envoy
+        // adds to the message is rejected instead of skipped (an absent entry
+        // makes the surface walk accept everything, see the two entries
+        // below).
+        "envoy.config.cluster.v3.Cluster.RefreshRate" => &["base_interval", "max_interval"],
         // The only custom cluster type implemented is
         // `envoy.clusters.aggregate` (see `convert_cluster`'s
         // `ClusterDiscoveryType::ClusterType` arm).
@@ -3696,12 +3715,19 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // cluster's own endpoints into hosts" vs "does this cluster own hosts at
     // all") have to be answered together here, even though `ClusterConfig`
     // keeps them as separate fields (see its `kind` doc for why).
+    let dns_fields = dns_refresh_fields(c);
     let (discovery, kind) = match &c.cluster_discovery_type {
         None => (DiscoveryType::Static, ClusterKind::Endpoints), // proto default: STATIC
         Some(ClusterDiscoveryType::Type(t)) => match ProtoDiscovery::try_from(*t) {
             Ok(ProtoDiscovery::Static) => (DiscoveryType::Static, ClusterKind::Endpoints),
-            Ok(ProtoDiscovery::StrictDns) => (DiscoveryType::StrictDns, ClusterKind::Endpoints),
-            Ok(ProtoDiscovery::LogicalDns) => (DiscoveryType::LogicalDns, ClusterKind::Endpoints),
+            Ok(ProtoDiscovery::StrictDns) => (
+                DiscoveryType::StrictDns(convert_dns_refresh(&dns_fields, path)?),
+                ClusterKind::Endpoints,
+            ),
+            Ok(ProtoDiscovery::LogicalDns) => (
+                DiscoveryType::LogicalDns(convert_dns_refresh(&dns_fields, path)?),
+                ClusterKind::Endpoints,
+            ),
             Ok(ProtoDiscovery::Eds) => (DiscoveryType::Eds, ClusterKind::Endpoints),
             _ => {
                 return Err(unsupported(
@@ -3762,6 +3788,21 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         }
     };
     let is_aggregate = matches!(kind, ClusterKind::Aggregate { .. });
+
+    // Envoy ignores the DNS refresh settings on any cluster that does not
+    // re-resolve on a timer. A config that sets one there almost always
+    // changed the cluster's type and left the setting behind, so reject it
+    // with its path instead of ignoring it (AGENTS.md invariant 1).
+    if discovery.dns_refresh().is_none() {
+        let cluster_type = if is_aggregate {
+            "an aggregate cluster"
+        } else if discovery == DiscoveryType::Eds {
+            "an EDS cluster"
+        } else {
+            "a STATIC cluster"
+        };
+        reject_inert_dns_refresh(&dns_fields, path, cluster_type)?;
+    }
 
     // `eds_cluster_config`'s shape and defaulting, only
     // consulted for the `Eds` arm just above -- see `convert_eds_cluster_config`.
@@ -3972,6 +4013,150 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         outlier_detection,
         eds,
     })
+}
+
+/// The four cluster-level DNS refresh settings, borrowed from a `Cluster`.
+/// Exists so the deprecated proto fields are read in exactly one place
+/// ([`dns_refresh_fields`]); everything else works on this struct.
+struct DnsRefreshFields<'a> {
+    dns_refresh_rate: Option<&'a prost_types::Duration>,
+    dns_jitter: Option<&'a prost_types::Duration>,
+    dns_failure_refresh_rate: Option<&'a cluster_v3::cluster::RefreshRate>,
+    respect_dns_ttl: bool,
+}
+
+/// Read the DNS refresh settings off a `Cluster`.
+///
+/// Rust note: Envoy deprecated these fields in favor of configuring a
+/// `DnsCluster` extension through `cluster_type`, and prost carries that over
+/// as `#[deprecated]` on each generated field. The extension is not
+/// implemented here, so the deprecated fields are the only way an Envoy
+/// config can set DNS timing and reading them is the point; the lint is
+/// silenced on this one function rather than the module.
+#[allow(deprecated)]
+fn dns_refresh_fields(c: &cluster_v3::Cluster) -> DnsRefreshFields<'_> {
+    DnsRefreshFields {
+        dns_refresh_rate: c.dns_refresh_rate.as_ref(),
+        dns_jitter: c.dns_jitter.as_ref(),
+        dns_failure_refresh_rate: c.dns_failure_refresh_rate.as_ref(),
+        respect_dns_ttl: c.respect_dns_ttl,
+    }
+}
+
+/// Envoy's shared lower bound for DNS intervals: its proto rule is
+/// `duration.gt = 1ms`, so exactly 1ms is rejected.
+const MIN_DNS_INTERVAL_EXCLUSIVE: StdDuration = StdDuration::from_millis(1);
+
+/// One DNS interval: non-negative (like every duration here) and above
+/// Envoy's 1ms floor. The bootstrap file path also runs the proto's own
+/// validation rule before lowering, but an xDS-delivered cluster does not, so
+/// the check lives here as well.
+fn convert_dns_interval(d: &prost_types::Duration, path: &str) -> Result<StdDuration, ConfigError> {
+    let interval = to_std_duration(d, path)?;
+    if interval <= MIN_DNS_INTERVAL_EXCLUSIVE {
+        return Err(invalid(path, "must be greater than 1ms"));
+    }
+    Ok(interval)
+}
+
+/// `dns_refresh_rate`, `dns_jitter` and `dns_failure_refresh_rate` of a
+/// `STRICT_DNS` or `LOGICAL_DNS` cluster -> [`DnsRefresh`], with Envoy's
+/// defaults filled in (Envoy v1.38 `Cluster` proto):
+///
+/// - `dns_refresh_rate` defaults to 5s and must exceed 1ms.
+/// - `dns_jitter` defaults to none and must not be negative.
+/// - Unset `dns_failure_refresh_rate`: failed lookups retry at the refresh
+///   rate. Set: `base_interval` is required (above 1ms), `max_interval` is
+///   optional (above 1ms, at least the base) and defaults to 10 times the
+///   base.
+///
+/// `respect_dns_ttl: true` is rejected: the resolver is `getaddrinfo`, which
+/// does not report record TTLs, so there is no TTL to schedule on. Accepting
+/// the flag and refreshing on the fixed rate instead would silently change
+/// what the operator asked for.
+fn convert_dns_refresh(
+    fields: &DnsRefreshFields<'_>,
+    path: &str,
+) -> Result<DnsRefresh, ConfigError> {
+    if fields.respect_dns_ttl {
+        return Err(unsupported(
+            format!("{path}.respect_dns_ttl"),
+            "respect_dns_ttl: true is not implemented: lookups go through the platform resolver \
+             (getaddrinfo), which does not report record TTLs. Remove it to re-resolve every \
+             dns_refresh_rate (default 5s)",
+        ));
+    }
+    let refresh_rate = match fields.dns_refresh_rate {
+        Some(d) => convert_dns_interval(d, &format!("{path}.dns_refresh_rate"))?,
+        None => DnsRefresh::ENVOY_DEFAULT.refresh_rate,
+    };
+    let jitter = match fields.dns_jitter {
+        Some(d) => to_std_duration(d, &format!("{path}.dns_jitter"))?,
+        None => StdDuration::ZERO,
+    };
+    let (failure_base_interval, failure_max_interval) = match fields.dns_failure_refresh_rate {
+        None => (refresh_rate, refresh_rate),
+        Some(failure) => {
+            let failure_path = format!("{path}.dns_failure_refresh_rate");
+            let base_path = format!("{failure_path}.base_interval");
+            let base = failure
+                .base_interval
+                .as_ref()
+                .ok_or_else(|| invalid(&base_path, "base_interval is required"))?;
+            let base = convert_dns_interval(base, &base_path)?;
+            let max = match &failure.max_interval {
+                Some(d) => {
+                    let max_path = format!("{failure_path}.max_interval");
+                    let max = convert_dns_interval(d, &max_path)?;
+                    if max < base {
+                        return Err(invalid(
+                            max_path,
+                            "max_interval must be greater than or equal to base_interval",
+                        ));
+                    }
+                    max
+                }
+                None => base.saturating_mul(10),
+            };
+            (base, max)
+        }
+    };
+    Ok(DnsRefresh {
+        refresh_rate,
+        jitter,
+        failure_base_interval,
+        failure_max_interval,
+    })
+}
+
+/// Reject any DNS refresh setting on a cluster that never re-resolves on a
+/// timer (`cluster_type` says which kind, for the message). Envoy ignores the
+/// settings there; see the call site for why we do not.
+fn reject_inert_dns_refresh(
+    fields: &DnsRefreshFields<'_>,
+    path: &str,
+    cluster_type: &str,
+) -> Result<(), ConfigError> {
+    let set = [
+        ("dns_refresh_rate", fields.dns_refresh_rate.is_some()),
+        ("dns_jitter", fields.dns_jitter.is_some()),
+        (
+            "dns_failure_refresh_rate",
+            fields.dns_failure_refresh_rate.is_some(),
+        ),
+        ("respect_dns_ttl", fields.respect_dns_ttl),
+    ];
+    match set.iter().find(|(_, is_set)| *is_set) {
+        Some((field, _)) => Err(unsupported(
+            format!("{path}.{field}"),
+            format!(
+                "only applies to STRICT_DNS and LOGICAL_DNS clusters; this is {cluster_type}, \
+                 where Envoy ignores it. Remove it, or change the cluster type if a DNS \
+                 cluster was meant"
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// `Cluster.eds_cluster_config` -> IR, called only for the `Eds` arm of

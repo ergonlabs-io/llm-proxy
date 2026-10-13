@@ -37,8 +37,8 @@ pub const DEFAULT_INITIAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 pub async fn resolve(config: &ClusterConfig, resolver: &dyn HostResolver) -> io::Result<HostSet> {
     let hosts = match config.discovery {
         DiscoveryType::Static => static_hosts(&config.endpoints)?,
-        DiscoveryType::StrictDns => strict_dns_hosts(&config.endpoints, resolver).await?,
-        DiscoveryType::LogicalDns => logical_dns_hosts(&config.endpoints, resolver).await?,
+        DiscoveryType::StrictDns(_) => strict_dns_hosts(&config.endpoints, resolver).await?,
+        DiscoveryType::LogicalDns(_) => logical_dns_hosts(&config.endpoints, resolver).await?,
         // An EDS cluster owns no endpoints to resolve -- its membership
         // arrives through
         // [`crate::manager::ClusterManager::accept_eds_update`]. Empty, not
@@ -136,7 +136,7 @@ async fn logical_dns_hosts(
 mod tests {
     use super::*;
     use crate::resolver::FakeResolver;
-    use proxy_config::ir::{ClusterKind, LbPolicy};
+    use proxy_config::ir::{ClusterKind, DnsRefresh, LbPolicy};
     use std::time::Duration as StdDuration;
 
     fn cluster(discovery: DiscoveryType, endpoints: Vec<EndpointIR>) -> ClusterConfig {
@@ -191,7 +191,10 @@ mod tests {
 
     #[tokio::test]
     async fn strict_dns_yields_all_records() {
-        let config = cluster(DiscoveryType::StrictDns, vec![endpoint("svc.internal", 80)]);
+        let config = cluster(
+            DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
+            vec![endpoint("svc.internal", 80)],
+        );
         let resolver = FakeResolver::new();
         resolver.set(
             "svc.internal",
@@ -208,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn logical_dns_keeps_a_single_host() {
         let config = cluster(
-            DiscoveryType::LogicalDns,
+            DiscoveryType::LogicalDns(DnsRefresh::ENVOY_DEFAULT),
             vec![endpoint("svc.internal", 80)],
         );
         let resolver = FakeResolver::new();

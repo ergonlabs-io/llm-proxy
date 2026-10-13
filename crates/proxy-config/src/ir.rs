@@ -1189,10 +1189,12 @@ impl Default for CircuitBreakers {
 pub enum DiscoveryType {
     /// Endpoints are literal IPs.
     Static,
-    /// DNS-resolve every returned address.
-    StrictDns,
-    /// DNS-resolve, use one address at a time.
-    LogicalDns,
+    /// DNS-resolve every returned address, and re-resolve on the cadence in
+    /// the [`DnsRefresh`].
+    StrictDns(DnsRefresh),
+    /// DNS-resolve, use one address at a time, and re-resolve on the cadence
+    /// in the [`DnsRefresh`].
+    LogicalDns(DnsRefresh),
     /// Endpoints arrive over EDS rather than from the cluster's own
     /// `endpoints` list -- `ClusterConfig::endpoints` is always empty for a
     /// cluster with this discovery type (`lower.rs::convert_cluster` rejects
@@ -1200,6 +1202,74 @@ pub enum DiscoveryType {
     /// subscription is what delivers a host set for these; lowering only
     /// makes the config surface loadable.
     Eds,
+}
+
+impl DiscoveryType {
+    /// The re-resolution timing of a DNS discovery type; `None` for
+    /// [`DiscoveryType::Static`] and [`DiscoveryType::Eds`], which never
+    /// resolve a name on a timer.
+    ///
+    /// Rust note: `self` by value is fine because `DiscoveryType` is `Copy`
+    /// (it holds only a `Copy` `DnsRefresh`), so callers keep their copy.
+    pub fn dns_refresh(self) -> Option<DnsRefresh> {
+        match self {
+            Self::StrictDns(refresh) | Self::LogicalDns(refresh) => Some(refresh),
+            Self::Static | Self::Eds => None,
+        }
+    }
+}
+
+/// How often a `STRICT_DNS` or `LOGICAL_DNS` cluster re-resolves its
+/// hostnames, and how it backs off when a lookup fails.
+///
+/// This lives on the DNS [`DiscoveryType`] variants rather than on
+/// [`ClusterConfig`] because the settings mean nothing to a STATIC or EDS
+/// cluster: Envoy ignores them there, and lowering rejects them there
+/// (`lower.rs::convert_cluster`) rather than carry a field no discovery type
+/// reads. Every default is resolved at lowering time, so the data plane never
+/// re-derives one.
+///
+/// Mapped from `Cluster.dns_refresh_rate`, `dns_jitter` and
+/// `dns_failure_refresh_rate` (Envoy v1.38). `respect_dns_ttl` has no field
+/// here: the resolver is the platform's `getaddrinfo`, which reports no
+/// record TTLs, so lowering rejects `respect_dns_ttl: true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsRefresh {
+    /// Wait between lookups while they succeed. Envoy default 5s; Envoy
+    /// requires more than 1ms.
+    pub refresh_rate: Duration,
+    /// Exclusive upper bound of a uniform random delay added to every
+    /// `refresh_rate` wait, so a fleet does not look up in lockstep.
+    /// [`Duration::ZERO`] (the Envoy default) means no jitter.
+    pub jitter: Duration,
+    /// Wait after the first failed lookup; each further consecutive failure
+    /// doubles it until `failure_max_interval`. When the config sets no
+    /// `dns_failure_refresh_rate`, Envoy retries at the refresh rate, which
+    /// this field and `failure_max_interval` both carry.
+    pub failure_base_interval: Duration,
+    /// Ceiling for the failure wait. Envoy defaults it to 10 times the base
+    /// interval when `dns_failure_refresh_rate` omits `max_interval`, and
+    /// requires it to be at least the base. Equal to `failure_base_interval`
+    /// means a fixed retry interval.
+    pub failure_max_interval: Duration,
+}
+
+impl DnsRefresh {
+    /// Envoy's documented defaults, applied when a DNS cluster sets none of
+    /// the refresh fields: a lookup every 5s, no jitter, and failures
+    /// retried at that same fixed 5s.
+    pub const ENVOY_DEFAULT: Self = Self {
+        refresh_rate: Duration::from_secs(5),
+        jitter: Duration::ZERO,
+        failure_base_interval: Duration::from_secs(5),
+        failure_max_interval: Duration::from_secs(5),
+    };
+}
+
+impl Default for DnsRefresh {
+    fn default() -> Self {
+        Self::ENVOY_DEFAULT
+    }
 }
 
 /// Where a cluster's hosts come from -- see [`ClusterConfig::kind`]'s doc for

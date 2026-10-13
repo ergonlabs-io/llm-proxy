@@ -776,7 +776,10 @@ static_resources:
 "#;
     let snapshot = snapshot_from(yaml).expect("must lower");
     let cluster = snapshot.clusters.get("openai").expect("cluster");
-    assert_eq!(cluster.discovery, DiscoveryType::LogicalDns);
+    assert_eq!(
+        cluster.discovery,
+        DiscoveryType::LogicalDns(DnsRefresh::ENVOY_DEFAULT)
+    );
     assert_eq!(cluster.endpoints[0].host, "api.openai.com");
     let tls = cluster.transport_socket.as_ref().expect("tls");
     assert_eq!(tls.sni.as_deref(), Some("api.openai.com"));
