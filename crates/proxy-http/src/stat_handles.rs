@@ -35,6 +35,14 @@
 //! [`RouterStats::warn_unknown_cluster_once`]) so the gap stays visible
 //! without spamming a line per request.
 //!
+//! A miss also happens for a name that WAS configured: once a name is absent
+//! from two consecutive configs, the registry drains its series and
+//! `resolve_missing` drops the entry, but a minutes-long stream dialled
+//! before that still finishes against it. Under config churn those names are
+//! unbounded, so the per-worker dedup sets hold at most
+//! `UNKNOWN_NAME_WARN_CAP` names each and then log one line saying further
+//! names are suppressed (see `UnknownNames`).
+//!
 //! # The other two instruments
 //!
 //! [`DownstreamStatHandles`]/[`DownstreamStats`] and
@@ -77,6 +85,82 @@ use proxy_observability::stats::{
     instruments, record_tenant_credential_request, Handle, HandleMemo, HistogramHandle, Registry,
     StatsControl, WorkerId,
 };
+
+/// How many distinct unknown names each per-worker dedup set remembers, and
+/// so warns about, before it stops growing. Names are configured, not
+/// client-supplied, so a real deployment that misses this many is already
+/// churning clusters; the cap bounds memory, and the first name past it logs
+/// one suppression line so the gap stays visible.
+const UNKNOWN_NAME_WARN_CAP: usize = 64;
+
+/// What a recorder should log for a lookup miss on one name.
+#[derive(Debug, PartialEq, Eq)]
+enum UnknownNameWarning {
+    /// First miss on this name, and the set has room: warn naming it.
+    First,
+    /// First miss on a name after the set filled: log the one suppression
+    /// line, which names no label value.
+    CapReached,
+    /// Already warned about this name, or already logged the suppression
+    /// line: stay silent.
+    Silent,
+}
+
+/// The warn-once dedup state behind every recorder's lookup-miss path,
+/// bounded by [`UNKNOWN_NAME_WARN_CAP`]. AGENTS.md "Fail-open controls":
+/// repeats are suppressed so the log does not become the incident, and the
+/// state is touched only on a miss, never on the healthy lookup-hit path.
+///
+/// Rust note: interior mutability because the recorders take `&self` (they
+/// are shared behind `Arc`, same shape as `ClusterManager`), so mutating
+/// the set through a shared reference needs a lock. Only the rare miss path
+/// takes it, so a `Mutex` costs nothing that matters.
+#[derive(Default)]
+struct UnknownNames(Mutex<UnknownNamesState>);
+
+#[derive(Default)]
+struct UnknownNamesState {
+    names: HashSet<String>,
+    suppressed: bool,
+}
+
+impl UnknownNames {
+    fn note(&self, name: &str) -> UnknownNameWarning {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.names.contains(name) {
+            UnknownNameWarning::Silent
+        } else if state.names.len() < UNKNOWN_NAME_WARN_CAP {
+            state.names.insert(name.to_string());
+            UnknownNameWarning::First
+        } else if !state.suppressed {
+            state.suppressed = true;
+            UnknownNameWarning::CapReached
+        } else {
+            UnknownNameWarning::Silent
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .names
+            .len()
+    }
+}
+
+/// Logs the one line a recorder emits when its [`UnknownNames`] set fills.
+/// `kind` is a fixed word ("cluster", "listener", "provider"), never a name.
+fn warn_unknown_names_suppressed(kind: &'static str) {
+    tracing::warn!(
+        kind,
+        cap = UNKNOWN_NAME_WARN_CAP,
+        "stats: already warned about the maximum number of unknown names of this kind on \
+         this worker -- traffic to further unknown names is still not counted in /stats, \
+         but is no longer logged"
+    );
+}
 
 /// One cluster's pre-resolved handles: the `upstream_rq` counter and the
 /// `upstream_rq_time` histogram, both already resolved with `cluster` =
@@ -216,14 +300,7 @@ pub struct RouterStats {
     registry: Arc<Registry>,
     handles: Arc<StatHandles>,
     worker: WorkerId,
-    /// Rust note: interior mutability for the "warn once per unknown
-    /// cluster" dedup set. `record_attempt`/`record_attempt_duration_ms`
-    /// take `&self` (this type is shared behind `Arc`, same shape as
-    /// `ClusterManager`), so mutating a plain `HashSet` through a shared
-    /// reference needs a lock. Only ever touched on the rare,
-    /// config-shaped "unknown cluster" path -- never on the common
-    /// per-request path -- so a `Mutex` here costs nothing that matters.
-    warned_unknown_clusters: Mutex<HashSet<String>>,
+    warned_unknown_clusters: UnknownNames,
 }
 
 impl RouterStats {
@@ -232,7 +309,7 @@ impl RouterStats {
             registry,
             handles,
             worker,
-            warned_unknown_clusters: Mutex::new(HashSet::new()),
+            warned_unknown_clusters: UnknownNames::default(),
         }
     }
 
@@ -310,17 +387,15 @@ impl RouterStats {
     }
 
     fn warn_unknown_cluster_once(&self, cluster: &str) {
-        let mut warned = self
-            .warned_unknown_clusters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if warned.insert(cluster.to_string()) {
-            tracing::warn!(
+        match self.warned_unknown_clusters.note(cluster) {
+            UnknownNameWarning::First => tracing::warn!(
                 cluster,
                 "stats: no resolved upstream_rq/upstream_rq_time handles for this cluster -- \
-                 traffic to it will not be counted in /stats (the cluster was not present in \
-                 the config snapshot the stats handle table was built from)"
-            );
+                 traffic to it will not be counted in /stats (no applied config has named \
+                 the cluster yet, or it left the config and its series was retired)"
+            ),
+            UnknownNameWarning::CapReached => warn_unknown_names_suppressed("cluster"),
+            UnknownNameWarning::Silent => {}
         }
     }
 }
@@ -429,7 +504,7 @@ pub struct DownstreamStats {
     registry: Arc<Registry>,
     handles: Arc<DownstreamStatHandles>,
     worker: WorkerId,
-    warned_unknown_listeners: Mutex<HashSet<String>>,
+    warned_unknown_listeners: UnknownNames,
 }
 
 impl DownstreamStats {
@@ -442,7 +517,7 @@ impl DownstreamStats {
             registry,
             handles,
             worker,
-            warned_unknown_listeners: Mutex::new(HashSet::new()),
+            warned_unknown_listeners: UnknownNames::default(),
         }
     }
 
@@ -484,17 +559,15 @@ impl DownstreamStats {
     }
 
     fn warn_unknown_listener_once(&self, listener: &str) {
-        let mut warned = self
-            .warned_unknown_listeners
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if warned.insert(listener.to_string()) {
-            tracing::warn!(
+        match self.warned_unknown_listeners.note(listener) {
+            UnknownNameWarning::First => tracing::warn!(
                 listener,
                 "stats: no resolved downstream_cx_total handle for this listener -- \
-                 connections accepted on it will not be counted in /stats (the listener was \
-                 not present in the config snapshot the stats handle table was built from)"
-            );
+                 connections accepted on it will not be counted in /stats (no applied config has named \
+                 the listener yet, or it left the config and its series was retired)"
+            ),
+            UnknownNameWarning::CapReached => warn_unknown_names_suppressed("listener"),
+            UnknownNameWarning::Silent => {}
         }
     }
 }
@@ -607,12 +680,13 @@ impl TokenUsageStatHandles {
 /// reached via `crate::filter_manager::FilterChainHandler`'s stored
 /// `Arc<GenAiTokenStats>` (see [`crate::filter_manager::FilterChainHandler::with_token_stats`]).
 /// A no-op, not a panic, for a provider this table never resolved handles
-/// for -- warns at most once per unique unknown name.
+/// for -- warns at most once per unique unknown name, up to
+/// `UNKNOWN_NAME_WARN_CAP` names.
 pub struct GenAiTokenStats {
     registry: Arc<Registry>,
     handles: Arc<TokenUsageStatHandles>,
     worker: WorkerId,
-    warned_unknown_providers: Mutex<HashSet<String>>,
+    warned_unknown_providers: UnknownNames,
     /// Worker-local memo of `(provider, type, tenant)` -> handle, in front of
     /// `resolve_capped`. A tenant seen before records without the registry's
     /// process-wide lock; a tenant folded into the overflow series is never
@@ -726,7 +800,7 @@ impl GenAiTokenStats {
             registry,
             handles,
             worker,
-            warned_unknown_providers: Mutex::new(HashSet::new()),
+            warned_unknown_providers: UnknownNames::default(),
             tenant_memo: HandleMemo::new(),
         }
     }
@@ -814,17 +888,15 @@ impl GenAiTokenStats {
     }
 
     fn warn_unknown_provider_once(&self, provider: &str) {
-        let mut warned = self
-            .warned_unknown_providers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if warned.insert(provider.to_string()) {
-            tracing::warn!(
+        match self.warned_unknown_providers.note(provider) {
+            UnknownNameWarning::First => tracing::warn!(
                 provider,
                 "stats: no resolved llm.client.token.usage handles for this provider -- \
-                 token usage will not be counted in /stats (the cluster was not present in the \
-                 config snapshot the stats handle table was built from)"
-            );
+                 token usage will not be counted in /stats (no applied config has named the \
+                 cluster yet, or it left the config and its series was retired)"
+            ),
+            UnknownNameWarning::CapReached => warn_unknown_names_suppressed("provider"),
+            UnknownNameWarning::Silent => {}
         }
     }
 }
@@ -905,6 +977,46 @@ mod tests {
         let handles = Arc::new(StatHandles::build(&control, names.iter().copied()));
         (control, handles)
     }
+
+    /// A `tracing` writer that appends to a shared buffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` under a subscriber that captures every log line, and returns
+    /// those lines.
+    fn capture_logs(f: impl FnOnce()) -> Vec<String> {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn count_containing(lines: &[String], needle: &str) -> usize {
+        lines.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    const CLUSTER_MISS: &str = "no resolved upstream_rq/upstream_rq_time handles";
+    const LISTENER_MISS: &str = "no resolved downstream_cx_total handle";
+    const PROVIDER_MISS: &str = "no resolved llm.client.token.usage handles";
+    const SUPPRESSED: &str = "maximum number of unknown names";
 
     #[test]
     fn for_cluster_finds_a_built_cluster() {
@@ -1003,6 +1115,94 @@ mod tests {
     }
 
     #[test]
+    fn churned_out_names_warn_within_a_bounded_set_then_one_suppression_line() {
+        // More removed names than the dedup cap, each configured once and
+        // then pruned by two configs that omit it: the case of a long
+        // stream finishing against a cluster that left the config.
+        let churned: Vec<String> = (0..UNKNOWN_NAME_WARN_CAP + 10)
+            .map(|i| format!("churned-{i}"))
+            .collect();
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let names = || churned.iter().map(String::as_str).chain(["kept"]);
+        let router = Arc::new(StatHandles::build(&control, names()));
+        let downstream = Arc::new(DownstreamStatHandles::build(&control, names()));
+        let token_usage = Arc::new(TokenUsageStatHandles::build(&control, names()));
+        let router_stats = RouterStats::new(registry.clone(), router.clone(), WorkerId(0));
+        let downstream_stats =
+            DownstreamStats::new(registry.clone(), downstream.clone(), WorkerId(0));
+        let token_stats = GenAiTokenStats::new(registry.clone(), token_usage.clone(), WorkerId(0));
+        let apply_only_kept = || {
+            let kept: HashSet<String> = ["kept".to_string()].into();
+            control.set_live_scope(proxy_observability::stats::LiveScope {
+                clusters: Some(kept.clone()),
+                listeners: Some(kept),
+                ..Default::default()
+            });
+            router.resolve_missing(&control, ["kept"]);
+            downstream.resolve_missing(&control, ["kept"]);
+            token_usage.resolve_missing(&control, ["kept"]);
+        };
+        let record_all = |name: &str| {
+            router_stats.record_attempt(name);
+            downstream_stats.record_connection_accepted(name);
+            token_stats.record_usage(name, None, sample_tokens());
+        };
+
+        // Absent from one config: the entry stays, so a finishing request
+        // still counts into the hidden series and nothing warns.
+        apply_only_kept();
+        let logs = capture_logs(|| record_all("churned-0"));
+        assert!(logs.is_empty(), "{logs:?}");
+
+        // Absent from a second config: drained and pruned.
+        apply_only_kept();
+        assert!(router.for_cluster("churned-0").is_none());
+        let logs = capture_logs(|| {
+            for name in &churned {
+                record_all(name);
+                record_all(name);
+                record_all("kept");
+            }
+        });
+
+        for (miss, kind) in [
+            (CLUSTER_MISS, "cluster"),
+            (LISTENER_MISS, "listener"),
+            (PROVIDER_MISS, "provider"),
+        ] {
+            let named: Vec<&String> = logs.iter().filter(|l| l.contains(miss)).collect();
+            assert_eq!(named.len(), UNKNOWN_NAME_WARN_CAP, "{kind}: {logs:?}");
+            assert!(
+                named.iter().all(|l| l.contains("series was retired")),
+                "{kind}: the warning must cover a retired name: {named:?}"
+            );
+            let suppressed: Vec<&String> = logs
+                .iter()
+                .filter(|l| l.contains(SUPPRESSED) && l.contains(kind))
+                .collect();
+            assert_eq!(suppressed.len(), 1, "{kind}: {logs:?}");
+            assert!(
+                !suppressed[0].contains("churned-"),
+                "the suppression line names no label value: {suppressed:?}"
+            );
+        }
+        assert_eq!(count_containing(&logs, "kept"), 0, "a hit never warns");
+        assert_eq!(
+            router_stats.warned_unknown_clusters.len(),
+            UNKNOWN_NAME_WARN_CAP
+        );
+        assert_eq!(
+            downstream_stats.warned_unknown_listeners.len(),
+            UNKNOWN_NAME_WARN_CAP
+        );
+        assert_eq!(
+            token_stats.warned_unknown_providers.len(),
+            UNKNOWN_NAME_WARN_CAP
+        );
+    }
+
+    #[test]
     fn record_attempt_increments_the_resolved_counter() {
         let (control, handles) = control_and_handles(&["openai"]);
         let registry = control.registry();
@@ -1022,17 +1222,18 @@ mod tests {
         let registry = control.registry();
         let stats = RouterStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
-        stats.record_attempt("anthropic");
-        stats.record_attempt("anthropic");
-        stats.record_attempt_duration_ms("anthropic", 12.0);
+        let logs = capture_logs(|| {
+            stats.record_attempt("anthropic");
+            stats.record_attempt("anthropic");
+            stats.record_attempt_duration_ms("anthropic", 12.0);
+        });
 
         let h = handles.for_cluster("openai").unwrap();
         assert_eq!(registry.value(h.rq), 0);
         assert_eq!(registry.histogram_snapshot(h.rq_time).count, 0);
         assert!(handles.for_cluster("anthropic").is_none());
-        let warned = stats.warned_unknown_clusters.lock().unwrap();
-        assert_eq!(warned.len(), 1);
-        assert!(warned.contains("anthropic"));
+        assert_eq!(count_containing(&logs, CLUSTER_MISS), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "anthropic"), 1, "{logs:?}");
     }
 
     #[test]
@@ -1073,15 +1274,16 @@ mod tests {
         let stats = DownstreamStats::new(registry.clone(), handles.clone(), WorkerId(0));
 
         // "ingress" is known, "admin" is not.
-        stats.record_connection_accepted("admin");
-        stats.record_connection_accepted("admin");
+        let logs = capture_logs(|| {
+            stats.record_connection_accepted("admin");
+            stats.record_connection_accepted("admin");
+        });
 
         let h = handles.for_listener("ingress").unwrap();
         assert_eq!(registry.value(h.cx_total), 0);
         assert!(handles.for_listener("admin").is_none());
-        let warned = stats.warned_unknown_listeners.lock().unwrap();
-        assert_eq!(warned.len(), 1);
-        assert!(warned.contains("admin"));
+        assert_eq!(count_containing(&logs, LISTENER_MISS), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "admin"), 1, "{logs:?}");
     }
 
     #[test]
@@ -1160,17 +1362,19 @@ mod tests {
         // "openai" is known, "anthropic" is not. Checked with a real tenant
         // too: an unknown provider must stay silent regardless of the
         // tenant dimension.
-        stats.record_usage("anthropic", None, sample_tokens());
-        stats.record_usage("anthropic", Some("acme"), sample_tokens());
+        let logs = capture_logs(|| {
+            stats.record_usage("anthropic", None, sample_tokens());
+            stats.record_usage("anthropic", Some("acme"), sample_tokens());
+        });
 
         let h = handles.for_provider("openai").unwrap();
         assert_eq!(registry.value(h.input), 0);
         assert_eq!(registry.value(h.cached), 0);
         assert_eq!(registry.value(h.cache_creation), 0);
         assert_eq!(registry.value(h.output), 0);
-        let warned = stats.warned_unknown_providers.lock().unwrap();
-        assert_eq!(warned.len(), 1);
-        assert!(warned.contains("anthropic"));
+        assert_eq!(count_containing(&logs, PROVIDER_MISS), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "anthropic"), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "acme"), 0, "{logs:?}");
     }
 
     // ---- the `tenant` dimension ------------------------------------

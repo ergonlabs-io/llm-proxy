@@ -45,6 +45,8 @@ h2 = "0.4"
 # (tests/hyper_spike.rs) only -- the real data-plane dependency surface above
 # is untouched.
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time", "test-util"] }
+# Captures the stats recorders' warn-once lines in `stat_handles` tests.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
