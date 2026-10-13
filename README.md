@@ -245,6 +245,51 @@ charges. This configuration covers OpenAI-compatible chat and streaming; other
 OpenRouter API families are not qualified by this example. See the
 [OpenRouter model API](https://openrouter.ai/docs/api/api-reference/models/get-models).
 
+The OpenRouter importer installs exact token rates in
+`pricing.price_list`, and preserves all published pricing in `pricing.catalog`.
+The Pricing UI reads `GET /pricing` from the proxy, including the active version
+and explicit reasons for models without a usable token rate card. No cache rates
+are inferred and fractional nanodollars are never rounded. An unknown cache rate
+makes requests reporting that cache bucket unpriced; ordinary requests still use
+the known input/output rates. Whole-request tier overrides are imported with
+inclusive thresholds. Non-token charges remain visible but are excluded from
+token cost calculation.
+
+`PUT /pricing` is not the same as a restart. It replaces the whole rate card in
+the memory of the one replica that receives it. It does not write the rate card
+to the configuration or to the shared store, and it does not reach other
+replicas. A request that has started keeps the rate card that was active when it
+started. A restart loads the rate card from the configuration again. A `SIGHUP`
+reload does not change the rate card.
+
+**Warning:** A model with no price adds $0 to every `llmproxy.spend_limit`
+dollar budget. The proxy does not refuse the request and logs no warning. A
+model has no price when the rate card has no entry for it and the `pricing`
+list of `llmproxy.spend_limit` has none either. `PUT /pricing` replaces the
+whole rate card, so a model that is missing from the new rate card has no price.
+The access log shows `-` for `%LLM_LIST_COST%` when the rate card has no price.
+`GET /keys/{id}/spend` counts these requests in `unpriced_requests`.
+
+To change the rate card on running replicas:
+
+1. Send the same `PUT /pricing` request to the admin port of every replica.
+2. Change the rate card in the configuration of every replica, so that a
+   restart keeps it. Edit the `pricing` section in the dialect, or
+   `pricing_json` of the `llmproxy.usage` filter in bootstrap mode.
+
+`PUT /pricing` needs the admin token (`LLMPROXY_ADMIN_TOKEN`) as a bearer token.
+It returns `503` when the filter chain has no `llmproxy.auth` filter. In the
+dialect, that means no `auth` section, and `examples/llmproxy-openrouter.yaml`
+has none. It returns `413` for a body larger than 65536 bytes, and the rate card
+in `examples/llmproxy-openrouter.yaml` is larger. To change a large rate card,
+do only step 2. Then restart every replica.
+
+Each priced request records the rate card version (`%LLM_RATE_CARD_VERSION%` in
+the access log). Replicas with different price entries record different
+versions. `GET /pricing` also shows `rate_card_version`.
+
+Importing prices does not create dollar budgets.
+
 ### Install a release
 
 On macOS (Apple Silicon) or Linux (x86-64), install the latest release and start
@@ -521,15 +566,3 @@ yet.
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-The OpenRouter importer installs exact token rates in
-`pricing.price_list`, and preserves all published pricing in `pricing.catalog`.
-The Pricing UI reads `GET /pricing` from the proxy, including the active version
-and explicit reasons for models without a usable token rate card. No cache rates
-are inferred and fractional nanodollars are never rounded. An unknown cache rate
-makes requests reporting that cache bucket unpriced; ordinary requests still use
-the known input/output rates. Whole-request tier overrides are imported with
-inclusive thresholds. Non-token charges remain visible but are excluded from
-token cost calculation. Restart the proxy after refreshing the import, or update its rate card through
-authenticated `PUT /pricing`. Dollar budgets still
-require tenant/user spend policies; importing prices does not create budgets.
