@@ -1,10 +1,11 @@
 ---
 title: WebSocket and other HTTP upgrades
 summary: How the HTTP connection manager tunnels an HTTP/1.1 `Upgrade`
-  request (WebSocket included) to a provider, what gates it, and the real
-  limits of today's transparent tunnel — bootstrap configuration only, not
-  yet reachable from the plain configuration format.
-last_updated: 2026-08-26
+  request or an HTTP/2 extended CONNECT request (WebSocket included) to a
+  provider, what gates it, and the real limits of today's transparent tunnel
+  — bootstrap configuration only, not yet reachable from the plain
+  configuration format.
+last_updated: 2026-10-13
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/timeouts-and-retries/
@@ -13,9 +14,11 @@ related:
 
 # WebSocket and other HTTP upgrades
 
-llm-proxy can tunnel an HTTP/1.1 `Upgrade` request — WebSocket is the
-practical case, since several providers' realtime APIs use it — straight
-through to a provider, byte for byte, once the upstream accepts it. This page
+llm-proxy can tunnel an HTTP/1.1 `Upgrade` request or an HTTP/2 extended
+CONNECT request (RFC 8441) — WebSocket is the practical case, since several
+providers' realtime APIs use it — straight through to a provider, byte for
+byte, once the upstream accepts it. Both sides of one tunnel must use the same
+protocol: h1 to h1, or h2 to h2. This page
 covers `upgrade_configs`, the gate that decides whether a request is even
 allowed to ask, and exactly what the tunnel does and does not do once it is
 open.
@@ -79,17 +82,30 @@ upgrade_configs:
    branch).
 3. **llm-proxy dials the picked cluster fresh** — a new connection, never one
    drawn from the ordinary connection-reuse caches (see
-   [Providers and clusters](../providers-and-routing/providers-and-clusters/)),
+   [Providers and clusters](../../providers-and-routing/providers-and-clusters/)),
    because an upgraded connection is consumed whole by the tunnel and can
    never be handed back for a later request to reuse.
-4. **If the upstream answers `101 Switching Protocols`**, llm-proxy bridges
-   the two connections transparently and bidirectionally: every byte the
-   client writes goes to the provider, every byte the provider writes goes to
-   the client, until either side closes
+4. **The protocol of the client and the protocol of the provider must
+   match.** An h1 client with an `Upgrade` header can reach only a cluster
+   with `protocol: http1`. An h2 client with extended CONNECT can reach only a
+   cluster with `protocol: http2`. Any other pair is refused before any dial:
+   **`502`**, body `cross-protocol websocket bridging (h1<->h2) is not
+   supported` (`h2_downstream_to_h1_upstream_is_rejected_as_cross_protocol` and
+   `h1_downstream_to_h2_upstream_is_rejected_as_cross_protocol` in
+   `crates/proxy-http/tests/router_h2_upgrade_e2e.rs`). For h2, the proxy turns
+   the `:protocol` pseudo-header into an `Upgrade` header, so the same
+   `upgrade_configs` gate in step 1 applies.
+5. **If the upstream accepts**, llm-proxy bridges the two connections
+   transparently and bidirectionally. The accept status is `101 Switching
+   Protocols` for h1 and exactly `200` for h2. Every byte the client writes
+   goes to the provider, every byte the provider writes goes to the client,
+   until either side closes
    (`websocket_upgrade_tunnel_echoes_bytes_end_to_end` in
-   `crates/proxy-http/tests/router_upgrade_e2e.rs`, which proves a real byte
-   round-trip, not just the handshake).
-5. **If the upstream answers anything else**, that response is passed
+   `crates/proxy-http/tests/router_upgrade_e2e.rs` for h1, and
+   `h2_websocket_tunnel_echoes_bytes_end_to_end` in
+   `router_h2_upgrade_e2e.rs` for h2. Both prove a real byte round-trip, not
+   just the handshake).
+6. **If the upstream answers anything else**, that response is passed
    straight through to the client with no tunnel — the request does not hang
    waiting for an upgrade that is never coming
    (`upstream_declining_upgrade_passes_the_response_through` in the same
@@ -97,12 +113,12 @@ upgrade_configs:
 
 ## What the tunnel does not do
 
-- **HTTP/1.1 upstreams only.** If the picked host's cluster is configured for
-  `http2`, the upgrade is refused before any dial: `502`, body `websocket
-  upstream must be http/1.1` (`crates/proxy-http/src/router.rs`'s
-  `handle_upgrade`). h2's extended CONNECT (RFC 8441 — WebSocket carried
-  inside an h2 stream) is a later increment, not implemented, and so is
-  `Upgrade: h2c` on the downstream side.
+- **No protocol bridging.** The client side and the provider side must use the
+  same protocol, as step 4 above describes. An h1 client cannot reach an h2
+  provider, and an h2 client cannot reach an h1 provider. The proxy would have
+  to build the WebSocket handshake itself, and it does not. Setting
+  `protocol: http2` on a provider does not stop h2 tunnels: it stops h1
+  clients from tunneling to that provider.
 - **No retries.** A tunnel is a single attempt against a single host. Once a
   `101` has gone out, the client may already be writing tunnel bytes; there
   is no well-defined way to replay a byte stream already in flight, so
@@ -118,29 +134,70 @@ upgrade_configs:
   error naming the field, not a silent no-op
   (`per_upgrade_filters_are_rejected` in
   `crates/proxy-config/tests/upgrade_configs.rs`).
-- **Nothing bounds an idle tunnel.** The route's own `idle_timeout` (see
-  [Timeouts and retries](../providers-and-routing/timeouts-and-retries/))
-  wraps an ordinary forwarded response body, but the tunnel bridges the two
-  raw `Upgraded` streams directly with `tokio::io::copy_bidirectional`
-  (`crates/proxy-http/src/codec.rs`'s `bridge_upgrade`), which has no
-  timeout of its own and is never wrapped in one. A WebSocket connection
-  that both sides simply stop writing to — no close frame, no FIN — stays
-  open until one side's OS-level connection eventually drops it, not until
-  `idle_timeout` fires. This is the WebSocket-tunnel version of the same gap
-  [Timeouts and retries](../providers-and-routing/timeouts-and-retries/)
-  documents for a silent ordinary response: an idle-based guard only ever
-  bounds a body it is actually wrapping, and the tunnel's raw byte stream is
-  never handed to it.
+- **The idle limit is fixed at 300 seconds.** The tunnel closes when no byte
+  moves in either direction for 300 seconds. Any byte in either direction, such
+  as a ping or pong frame, restarts the timer. The route's own `idle_timeout`
+  (see [Timeouts and retries](../../providers-and-routing/timeouts-and-retries/))
+  does not apply to a tunnel, and no field changes the 300 seconds
+  (`WEBSOCKET_TUNNEL_IDLE_TIMEOUT` and `pump_with_idle_timeout` in
+  `crates/proxy-http/src/codec.rs`; the tests are `idle_tunnel_is_torn_down_after_idle_window`
+  and `activity_resets_idle_timer` in the same file). A clean close from one side
+  closes the other side's write half and ends the tunnel when both sides are done.
+
+## Hop-by-hop headers on an upgrade
+
+The proxy removes the headers that describe one connection (`connection`,
+`transfer-encoding`, `keep-alive`, `proxy-connection`, and `te` unless its
+value is `trailers`) from every request and every response, as
+[Providers and clusters](../../providers-and-routing/providers-and-clusters/#hop-by-hop-headers)
+describes. An upgrade keeps one extra header: `Upgrade`, because it names the
+protocol and the router reads it.
+
+For h1, the proxy adds `Connection: upgrade` back on both hops. It sends
+`Connection: upgrade` to the provider with the upgrade request, and it sends
+`Connection: upgrade` to the client with the `101` response. Extra tokens in the
+client's `Connection` header, such as `keep-alive`, do not reach the provider.
+An h2 tunnel has no `Connection` header: the proxy uses the `:protocol`
+pseudo-header on each hop. Proof: `sanitize_upgrade_hop_by_hop` in
+`crates/proxy-http/src/headers.rs`, `send_upstream_http1_upgrade` and
+`serve_one` in `crates/proxy-http/src/codec.rs`, and
+`websocket_upgrade_tunnel_echoes_bytes_end_to_end`, which sends
+`Connection: keep-alive, Upgrade` and checks both hops.
+
+## Draining
+
+A live tunnel keeps the connection open for drain. When a drain starts, the
+proxy does not cut the tunnel, and the drain does not finish while a tunnel
+still carries bytes. The tunnel ends when a peer closes it, when the 300 second
+idle limit passes, or when the drain deadline (`--drain-time-s`, default 600)
+ends the process. See
+[Draining and shutdown](../../operations/draining-and-shutdown/). Proof:
+`an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes` in
+`crates/proxy-core/src/listener_drain_tests.rs`.
+
+## Load balancing
+
+A tunnel counts as one active request on its host for as long as it is open.
+`LEAST_REQUEST` reads that count. See
+[Load balancing](../../providers-and-routing/load-balancing/#what-least_request-counts).
 
 ## Failure modes and what they mean
 
 | Response | Body | Cause |
 |---|---|---|
 | `403` | `upgrade not allowed` | No `Upgrade` header, an unlisted type, or `enabled: false`. |
-| `502` | `websocket upstream must be http/1.1` | The picked cluster is `protocol: http2`. |
-| `503` | `no cluster` / `unknown cluster` / `no healthy upstream` | Ordinary routing/cluster-health failures, same as a non-upgrade request. |
-| `502` | `upgrade handshake failed` | The upstream answered `101` but llm-proxy's own downstream/upstream upgrade handles were unexpectedly missing — an internal-invariant failure, not a client-caused one. |
-| `502` | `upstream connection failure` | The upstream connection broke while sending the upgrade request. |
+| `502` | `cross-protocol websocket bridging (h1<->h2) is not supported` | The client and the picked cluster use different protocols (h1 client with an `http2` cluster, or h2 client with an `http1` cluster). |
+| `503` | `no cluster` / `unknown cluster` / `cluster not warmed` / `no healthy upstream` | Ordinary routing/cluster-health failures, same as a non-upgrade request. |
+| `503` | `upstream overloaded` / `upstream connect failure` / `upstream TLS handshake failure` / `upstream reset` | The dial of the fresh connection failed. These bodies are in `handle_upgrade` in `crates/proxy-http/src/router.rs`. |
+| `503` | `upstream connection failure` | The send of the upgrade request failed before response headers, and the cause was a connection close or an upstream reset. The response flag is `UC` or `UR`. |
+| `502` | `upstream connection failure` | The send of the upgrade request failed because the upstream broke the protocol (hyper could not parse the response). The response flag is `UPE`. |
+| `502` | `upgrade handshake failed` | The upstream accepted, but llm-proxy's own downstream/upstream upgrade handles were unexpectedly missing — an internal-invariant failure, not a client-caused one. |
+
+The `503` and `502` rows for `upstream connection failure` come from
+`codec_error_reply` in `crates/proxy-http/src/router.rs`. The ordinary
+request path uses the same helper, and `crates/proxy-http/tests/response_flags.rs`
+pins its results there: `502 UPE`, `503 UC`, and `503 UR`. I found no test that
+drives these three results through an upgrade request.
 
 Every one of these responses is a plain-text body, not the JSON error shape
 chat/completions error responses use — an upgrade failure happens before any

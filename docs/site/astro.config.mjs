@@ -78,12 +78,14 @@ export default defineConfig({
 						{ label: 'Virtual keys', slug: 'authentication/virtual-keys' },
 						{ label: 'Managing secrets', slug: 'authentication/managing-secrets' },
 						{ label: 'Tenant provider credentials', slug: 'authentication/tenant-provider-credentials' },
+						{ label: 'External authorization', slug: 'authentication/external-authorization' },
 					],
 				},
 				{
 					label: 'Limits and budgets',
 					items: [
 						{ label: 'Token rate limiting', slug: 'limits-and-budgets/token-rate-limiting' },
+						{ label: 'Spend policies', slug: 'limits-and-budgets/spend-policies' },
 						// { label: 'Tenants', slug: 'limits-and-budgets/tenants' },
 					],
 				},
@@ -92,7 +94,8 @@ export default defineConfig({
 					items: [
 						{ label: 'Access logs', slug: 'observability/access-logs' },
 						{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
-						// { label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
+						{ label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
+						{ label: 'Request capture', slug: 'observability/request-capture' },
 					],
 				},
 				{
@@ -102,7 +105,7 @@ export default defineConfig({
 						{ label: 'Config reload', slug: 'operations/config-reload' },
 						{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
 						{ label: 'xDS conformance', slug: 'operations/xds-conformance' },
-						// { label: 'TLS', slug: 'operations/tls' },
+						{ label: 'TLS', slug: 'operations/tls' },
 					],
 				},
 				{

@@ -18,9 +18,9 @@ spend per minute. Only one combination is enforced today —
 `key: tenant` (which needs `auth:` configured) or `key: header:authorization`,
 with `tokens_per_minute` set. Every other `limits:` field is accepted,
 recorded, and produces a load-time warning rather than a rejection; see
-[Configuration file](../configuration/configuration-file/)'s `limits[]`
+[Configuration file](../../configuration/configuration-file/)'s `limits[]`
 reference for the full field table, and
-[Virtual keys](../authentication/virtual-keys/) for why the limiter buckets
+[Virtual keys](../../authentication/virtual-keys/) for why the limiter buckets
 on the authenticated tenant rather than the caller's raw header once `auth:`
 is configured.
 
@@ -67,7 +67,7 @@ Two things must be true for this endpoint to return real data:
 2. **A `limits:` entry must actually produce the token limiter.** The
    endpoint is implemented inside the `llmproxy.token_limit` filter itself,
    so a listener with `auth:` but no enforced `limits:` entry (see
-   [Configuration file](../configuration/configuration-file/)) never loads
+   [Configuration file](../../configuration/configuration-file/)) never loads
    that filter at all — `GET /v1/usage` is then an ordinary, unmatched
    request like any other, not a 401
    (`crates/proxy-simple-config/src/lower.rs`'s `lower_limits`, which emits
@@ -158,9 +158,9 @@ outcome than a visible failure
   nanodollars as `%LLM_LIST_COST%`. To total the cost of one tenant, sum
   `%LLM_LIST_COST%` by `%LLM_TENANT%` in your log pipeline. The rate card is the
   `pricing` section of the configuration file; see
-  [`pricing`](../configuration/configuration-file/#pricing-pricing). The
+  [`pricing`](../../configuration/configuration-file/#pricing-pricing). The
   operators are in the
-  [access log reference](../observability/access-logs/#the-operator-set).
+  [access log reference](../../observability/access-logs/#the-operator-set).
 
 ## Bootstrap configuration
 

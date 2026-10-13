@@ -3,7 +3,7 @@ title: Failover and aggregates
 summary: What a route's `fallbacks` list actually does — the aggregate
   cluster it lowers to, the same-dialect requirement, and how retry budget
   and member order interact.
-last_updated: 2026-08-23
+last_updated: 2026-10-13
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/timeouts-and-retries/
@@ -30,7 +30,7 @@ is unaffected: it still targets `provider:<name>` directly, and no aggregate
 cluster is emitted at all.
 
 Each member cluster keeps its own TLS, credentials, and `Host` header — see
-[Providers and clusters](../providers-and-routing/providers-and-clusters/).
+[Providers and clusters](../../providers-and-routing/providers-and-clusters/).
 An end-to-end router test proves the isolation directly: after a failover
 from a provider with a closed port to a live one, the live provider's
 upstream request carries the live provider's API key and never the failed
@@ -46,7 +46,7 @@ a response with status 429, 500, 502, or 503
 (`crates/proxy-simple-config/src/lower.rs`'s `lower_route`, which hardcodes
 the route's `retry_on` to `connect-failure,refused-stream,reset,
 retriable-status-codes` with that exact status list). See
-[Timeouts and retries](../providers-and-routing/timeouts-and-retries/) for
+[Timeouts and retries](../../providers-and-routing/timeouts-and-retries/) for
 the full trigger table — the same one applies here, since a fallback attempt
 *is* a retry, just one that lands on a different member.
 
@@ -107,16 +107,22 @@ the wrong dialect's parser — silently wrong billing numbers, not just a
 broken request
 (`cross_dialect_fallback_is_rejected` in
 `crates/proxy-simple-config/tests/fallbacks.rs`). See
-[Getting started](../getting-started/quickstart/) for the exact error text
+[Getting started](../../getting-started/quickstart/) for the exact error text
 this produces.
 
-## The `models` catalogue has no fallback of its own
+## Fallback in the `models` catalogue
 
-`models.<name>.providers` is an ordered list, but in this schema version only
-`providers[0]` is ever used to serve traffic — there is no failover among a
-model's listed providers the way `routes[].fallbacks` provides. See
-[Providers and clusters](../providers-and-routing/providers-and-clusters/)
-for what a `models` entry does support.
+`models.<name>.providers` is an ordered list. The first provider is the
+primary and later providers are fallbacks. An entry with more than one
+provider lowers to an ordered aggregate cluster named `fallback:model-<name>`
+that retries `count - 1` times, the same way `routes[].fallbacks` does. Every
+provider in the list must speak the same dialect as the first; a different
+dialect is a load error at `models.<name>.providers[<n>]` (`lower_model` in
+`crates/proxy-simple-config/src/lower.rs`, and
+`models_multiple_providers_lower_to_ordered_fallback` in
+`crates/proxy-simple-config/tests/dialect.rs`). See
+[Configuration file](../../configuration/configuration-file/) for the retry
+conditions and the fields a `models` entry accepts.
 
 ## Bootstrap configuration
 

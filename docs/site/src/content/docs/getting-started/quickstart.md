@@ -3,7 +3,7 @@ title: Getting started with llm-proxy
 summary: Build the llm-proxy binary, validate a config, serve it against an
   OpenAI-compatible provider, and read the access log line it writes for the
   request.
-last_updated: 2026-08-09
+last_updated: 2026-10-13
 related:
   - ../getting-started/introduction/
   - ../configuration/configuration-file/
@@ -11,8 +11,63 @@ related:
 
 # Getting started
 
-This guide takes you from a checkout to a served request. Every command
-below was run against this repository; the exact output follows each one.
+This guide has two paths. [Install a release](#install-a-release) gives you a
+running service with a starter config. [Build from source](#prerequisites)
+takes you from a checkout to a served request. The build commands below were
+run against this repository; the exact output follows each one.
+
+## Install a release
+
+`scripts/install.sh` downloads the latest release for macOS (Apple Silicon) or
+Linux (x86_64 or arm64), checks its SHA-256 sum, and starts it as a service.
+Intel macOS has no prebuilt release; build from source.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh
+```
+
+As a normal user, the script installs `llm-proxy` and `llm-capture-agent` in
+`~/.local/bin`, and the data in `~/.config/llm-proxy`. As root on Linux, it
+uses `/usr/local/bin` and `/var/lib/llm-proxy`. The service is a launchd agent
+on macOS, a systemd user unit on Linux, or a system unit when you run as root.
+Without systemd, the proxy runs as a background process and does not start at
+boot.
+
+The script runs `llm-proxy init` on the data directory, creates an admin token
+in `service.env`, and prints the admin UI address, the proxy API address, the
+admin token, and an API key. The token and the key are shown once. Run the
+script again to upgrade the binary. An upgrade keeps the existing config,
+secret, and token.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--version TAG` | latest release | Install this release, for example `v0.3.1`. |
+| `--port N` | `53421` | Proxy port. Applies to a new config only. |
+| `--admin-port N` | `53422` | Admin and UI port on `127.0.0.1`. Applies to a new config only. |
+| `--admin-address HOST:PORT` | `127.0.0.1:53422` | Admin and UI address, for example `0.0.0.0:53422`. Do not use with `--admin-port`. |
+| `--no-start` | off | Install the binary and the config. Do not start. |
+| `--no-service` | off | Start a background process instead of a service. |
+| `--uninstall` | off | Stop and remove the service and the binaries. Keep the data. |
+| `--purge` | off | With `--uninstall`, also delete the data directory. |
+
+**The admin API is plain HTTP.** With `--admin-address 0.0.0.0:53422`, the
+admin token crosses the network unencrypted. Use it only on a network you
+trust. Source: `scripts/install.sh` usage block.
+
+### Create a starter config without the script
+
+`llm-proxy init [DIRECTORY]` writes the same starter config and secret. See
+[CLI reference](../../reference/cli/) for the files it creates.
+
+```sh
+llm-proxy init ./llmproxy-home
+cd ./llmproxy-home
+llm-proxy --config llmproxy.yaml
+```
+
+Run the proxy from that directory. The config names `./auth-secret` relative
+to the working directory. From another directory, validation fails with
+`failed to read ./auth-secret: No such file or directory`.
 
 ## Prerequisites
 
@@ -46,7 +101,7 @@ Run `--help` to see the full flag list.
 `serve` is the default mode. `validate` takes a config and exits without
 binding a listener, reporting whether the config loads. `keygen` generates a
 virtual key for downstream authentication and needs no config at all — see
-[Configuration file reference](../configuration/configuration-file/).
+[Configuration file reference](../../configuration/configuration-file/).
 
 ## Step 3: Validate a config
 
@@ -136,19 +191,26 @@ With `observability.access_logs` configured, llm-proxy writes one JSON line
 per completed request. This is the line the request above produced:
 
 ```json
-{"authority":"127.0.0.1:18080","bytes_received":"67","bytes_sent":"283",
- "duration_ms":"1","llm_cache_creation_tokens":"0","llm_cached_tokens":"0",
- "llm_input_tokens":"12","llm_max_stall_ms":"-","llm_output_tokens":"6",
- "llm_response_chunks":"1","llm_total_tokens":"18","llm_tpot_ms":"0.252",
- "llm_ttft_ms":"0","method":"POST","path":"/v1/chat/completions",
- "protocol":"HTTP/1.1","request_id":"62524bba-436d-4114-a666-6808f6517686",
- "response_code":"200","response_flags":"DC",
- "start_time":"2026-08-09T16:44:06.955Z","upstream_host":"127.0.0.1:18999"}
+{"authority":"127.0.0.1:48080","bytes_received":"67","bytes_sent":"283",
+ "duration_ms":"13","llm_cache_creation_tokens":"0","llm_cached_tokens":"0",
+ "llm_input_tokens":"12","llm_key_id":"-","llm_list_cost_nanodollars":"-",
+ "llm_max_stall_ms":"-","llm_output_tokens":"6","llm_rate_card_version":"-",
+ "llm_requested_model":"llama3.1:8b","llm_response_chunks":"1",
+ "llm_selected_model":"llama3.1:8b","llm_tenant":"-","llm_total_tokens":"18",
+ "llm_tpot_ms":"2.245","llm_ttft_ms":"0","llm_user_id":"-","method":"POST",
+ "path":"/v1/chat/completions","protocol":"HTTP/1.1",
+ "request_id":"b856029f-798f-4925-a3bd-3e89e80bef1d","response_code":"200",
+ "response_flags":"-","selected_provider":"provider:ollama",
+ "start_time":"2026-10-13T22:44:32.563Z","upstream_host":"127.0.0.1:48999"}
 ```
 
 `llm_input_tokens` and `llm_output_tokens` are the counts llm-proxy extracted
 from the provider's own `usage` block — 12 and 6 here, matching the response
-above exactly. Every field renders as a JSON string, including numbers; a
+above exactly. `llm_tenant`, `llm_key_id`, and `llm_user_id` are `"-"`
+because this config has no `auth` block. `llm_list_cost_nanodollars` and
+`llm_rate_card_version` are `"-"` in this run, which configures no pricing.
+(The line was produced with ports `48080` and `48999`; yours show the ports
+from your config.) Every field renders as a JSON string, including numbers; a
 field with no value (`llm_max_stall_ms` on a single-chunk response) renders
 as `"-"`, not `null` or `0`. If `observability.access_logs` is omitted, no
 access log is written at all.

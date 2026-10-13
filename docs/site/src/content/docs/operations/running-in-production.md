@@ -4,7 +4,7 @@ summary: What changes when you run more than one replica — which state is
   shared, which stays local, the propagation and staleness bounds for each,
   and what the store does when it cannot be reached. Configuring a shared
   store is Envoy-mode only today; the `llmproxy` dialect has no field for it.
-last_updated: 2026-09-07
+last_updated: 2026-10-13
 related:
   - ../authentication/virtual-keys/
   - ../limits-and-budgets/token-rate-limiting/
@@ -33,7 +33,7 @@ runs single-replica identity and budget state, however many processes you
 start. Do not confuse this with the dialect's `limits:` block
 (`tokens_per_minute`), which is a separate mechanism (`BudgetStore`, not
 `ControlPlaneStore`) with no shared implementation at all; see
-[Token rate limiting](../limits-and-budgets/token-rate-limiting/). Everything
+[Token rate limiting](../../limits-and-budgets/token-rate-limiting/). Everything
 below is about `llmproxy.auth` and `llmproxy.spend_limit`, configured through
 a hand-written bootstrap.
 
@@ -236,6 +236,37 @@ age and the bound once it is exceeded (`control.rs`'s `run_policy_poller`,
 lines 2013–2029), suppressed to at most once per ten intervals so the
 warning itself does not become the incident.
 
+## Redis connections and the policy load log
+
+A replica opens up to two Redis connections to the shared store. It opens each
+one on first use. The policy lane carries the generation poll, the policy load,
+and every admin write. The spend lane carries spend reconciliation and the
+spend reads at bind time. A slow call on one lane does not delay a call on the
+other. Each lane has a 1 second timeout for connect, read, and write. After an
+error, the lane drops its own connection and reconnects on the next call. The
+other lane keeps its connection (`crates/proxy-filters/src/control_redis.rs:88`;
+tests `a_flush_stuck_on_the_spend_lane_does_not_delay_policy_calls`,
+`a_load_stuck_on_the_control_lane_does_not_delay_spend_reconciliation`, and
+`a_failed_call_resets_only_its_own_lane_and_that_lane_reconnects`).
+
+A Redis that stops answering still stalls both lanes, because both lanes use
+it.
+
+Each successful policy load logs one `info` line:
+`loaded control-plane state from redis`. The line has these fields:
+
+| Field | Meaning |
+|---|---|
+| `duration_ms` | Total time of the load, including decoding the rows. |
+| `fetch_ms` | Time to read the replies from the wire, including any wait for the policy connection. |
+| `tenants`, `keys`, `policies`, `budgets`, `tenant_credentials`, `rate_cards` | Row counts for each kind. |
+| `payload_bytes` | Combined length of the field names, set members, and values read. |
+
+The line carries counts and lengths only. It never carries row content (test
+`a_load_logs_its_duration_and_size_and_never_row_content`). A load reads the
+whole policy state, so `duration_ms` grows with the state. Use this line to
+size a large deployment.
+
 ## Store outage: fails open, loudly
 
 If a replica cannot reconcile with the shared store for longer than
@@ -289,7 +320,7 @@ composes the backlog, so the total becomes exactly correct — nothing is
 lost, only delayed (ADR-0006 §5). A configured local recovery journal preserves checkpointed outage
 backlog across SIGKILL. Charges since the last successful local checkpoint
 remain volatile; without a journal, the entire unflushed outage backlog is
-volatile. See [Spend policies and recovery](/limits-and-budgets/spend-policies/)
+volatile. See [Spend policies and recovery](../../limits-and-budgets/spend-policies/)
 for configuration, migration, key lifecycle, and concurrent admission limits.
 
 ## What stays local, even with a shared store
@@ -316,7 +347,7 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   subsystem and has no shared implementation at all.** It runs on
   `BudgetStore`, not `ControlPlaneStore`, and only an in-process
   implementation exists — this is unaffected by everything above. See
-  [Token rate limiting](../limits-and-budgets/token-rate-limiting/).
+  [Token rate limiting](../../limits-and-budgets/token-rate-limiting/).
 - **The rate card is shared only through a store.** With an `auth` store, the
   rate card is stored per chain and `PUT /pricing` writes it there. Every replica
   that shares the store installs it on its next policy poll, which is 48 to 60
@@ -334,6 +365,15 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   every replica's configuration and reload, or send the same `PUT /pricing`
   request to every replica.
 
+  If another replica writes a card to the same store between your `PUT /pricing`
+  write and the read-back, the other card stays active on the replica that
+  received your `PUT`. The `note` in the response then says `written, but a
+  concurrent publish to the same store superseded it; this replica now serves
+  the store's card`. The delivery from the store decides the active card
+  (`crates/proxy-filters/src/usage_filter.rs:473-484`; test
+  `a_concurrent_publish_from_another_replica_wins_on_the_publishing_replica`
+  in `crates/proxy-filters/src/usage_filter/rate_card_tests.rs`).
+
   Replicas with different rate cards price the same request differently. To find
   them, compare `rate_card_version` in `GET /pricing` on each replica, or the
   `%LLM_RATE_CARD_VERSION%` values in the access logs. The version covers the
@@ -344,7 +384,7 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   price. A request that neither prices, under a dollar budget, adds $0 to the
   budget and logs one warning per chain and model. The fields and the limits of
   `PUT /pricing` are in
-  [`pricing`](../configuration/configuration-file/#pricing-pricing).
+  [`pricing`](../../configuration/configuration-file/#pricing-pricing).
 
 ## Verifying a Redis-backed store
 

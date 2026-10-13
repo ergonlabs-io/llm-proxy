@@ -3,12 +3,13 @@ title: Timeouts and retries
 summary: The two timeouts a route actually has, exactly which failures
   trigger a retry, and a real gap worth knowing before you rely on this
   configuration format alone to bound a slow provider.
-last_updated: 2026-08-26
+last_updated: 2026-10-13
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/failover-and-aggregates/
   - ../configuration/configuration-file/
   - ../observability/access-logs/
+  - ../operations/tls/
 ---
 
 # Timeouts and retries
@@ -103,11 +104,55 @@ them). The point of drawing a random delay rather than waiting exactly the
 cap is to keep clients that all failed at once from retrying in lockstep and
 hammering a struggling upstream on a fixed beat.
 
+## What the client sees when the provider resets before any response byte
+
+If the provider connection fails or closes before the first response byte,
+and no retry remains, the client gets `503`. The access log shows a response
+flag that tells the two cases apart:
+
+| Case | Status | Flag |
+|---|---|---|
+| The provider sends an explicit reset | `503` | `UR` |
+| The provider closes the connection, or the connection fails | `503` | `UC` |
+| The provider sends bytes that are not valid HTTP | `502` | `UPE` |
+
+Only a protocol error gives `502`. A reset gives `503`
+(`codec_error_reply`, `crates/proxy-http/src/router.rs:2823-2848`).
+The tests are `an_upstream_that_closes_before_headers_records_503_and_the_uc_flag`
+and `a_garbled_upstream_response_records_and_renders_the_upe_flag`
+(`crates/proxy-http/tests/response_flags.rs`).
+Before this change, a failed send gave `502` with `UC`. Update any client
+or alert that matches on `502` for this case.
+
+## Downstream timeouts: how long a client has
+
+The timeouts above bound the provider. Three more bound the client. They
+protect the listener from slow clients. The page
+[Listener TLS and downstream admission](../../operations/tls/) has the full
+detail.
+
+| Timeout | Field | Default | On expiry |
+|---|---|---|---|
+| TLS handshake | `transport_socket_connect_timeout` (Envoy mode only) | `10s` | The proxy closes the connection. |
+| Request headers | `listen.request_headers_timeout` | `10s` | HTTP/1: the proxy closes the connection, with no `408`. HTTP/2: not enforced. |
+| Whole request | `listen.request_timeout` | `60s` | The proxy answers `408` (`request_overall_timeout`) and closes the HTTP/1 connection. |
+
+Set a request timeout to `0s` to disable it. The defaults above are the
+`llmproxy` dialect defaults
+(`crates/proxy-simple-config/src/model.rs:183-184`). A raw bootstrap
+configuration has both HTTP timeouts disabled until it sets them. The
+handshake default of `10s` applies in both front-ends.
+
+The request timeout stops when the proxy has the whole request body. It does
+not bound the response, so it does not cut a long generation. It also does
+not replace the caution at the top of this page: no timeout bounds the wait
+for the first provider response byte.
+
 ## Retries and fallbacks share one budget
 
 If a route also has `fallbacks`, the same retry count governs moving to the
 next provider in the chain — see
-[Failover and aggregates](../providers-and-routing/failover-and-aggregates/)
+[Failover and aggregates](../../providers-and-routing/failover-and-aggregates/)
 for exactly how `attempts` and the fallback chain interact, and the
 non-obvious case where `attempts: 0` does *not* disable failover.
 
@@ -164,6 +209,6 @@ proven end to end by `crates/proxy-http/tests/router_retry.rs`:
 `attempt_count_response_header_carries_the_total_attempts_made`, and
 `attempt_count_headers_are_absent_when_both_flags_are_off` for the default
 case. A retry that lands on a `fallbacks` member (see
-[Failover and aggregates](../providers-and-routing/failover-and-aggregates/))
+[Failover and aggregates](../../providers-and-routing/failover-and-aggregates/))
 increments the same counter — a fallback attempt is a retry against a
 different member, not a separate count.

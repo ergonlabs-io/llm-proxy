@@ -3,7 +3,7 @@ title: Load balancing
 summary: Which `lb_policy` values a cluster can actually run, why two are
   rejected at load time rather than approximated, and why load balancing has
   nothing to choose between in the plain configuration format.
-last_updated: 2026-08-26
+last_updated: 2026-10-13
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/failover-and-aggregates/
@@ -14,7 +14,7 @@ related:
 
 Load balancing picks a host among a cluster's endpoints. This page is about
 the engine's `lb_policy` support in general — see
-[Providers and clusters](../providers-and-routing/providers-and-clusters/)
+[Providers and clusters](../../providers-and-routing/providers-and-clusters/)
 first if you have not read it, because it changes what this page even means
 for this configuration format.
 
@@ -35,11 +35,11 @@ covered below.
 | `lb_policy` | Status | Notes |
 |---|---|---|
 | `ROUND_ROBIN` | Implemented | A plain rotating cursor when every candidate host has equal weight; smooth weighted round robin (nginx's algorithm) when weights differ, so a 5:1 weight split interleaves as `A A A B A A`, not batched as `A A A A A B`. |
-| `LEAST_REQUEST` | Implemented | Power-of-two-choices: draws `choice_count` candidates (2 by default) uniformly and picks whichever has fewer active requests. Degrades to uniform random once every host reads zero active requests, which is correct for "no signal yet", not a bug. |
+| `LEAST_REQUEST` | Implemented | Power-of-two-choices: draws `choice_count` candidates (2 by default) uniformly and picks whichever has fewer active requests. See "What `LEAST_REQUEST` counts" below. When every host has the same count, including when all are idle, the pick is uniform random. |
 | `RANDOM` | Implemented | Uniform pick over the candidate set. |
 | `RING_HASH` | **Rejected at load** | Session affinity only holds if every proxy in a fleet hashes identically; that bit-exact parity is unproven here, and there is no differential test harness yet to prove it. Configuring it is a load error naming the policy, not a silent substitution of another one. |
 | `MAGLEV` | **Rejected at load** | Same reason as `RING_HASH`: no bit-exact parity, no differential harness, rejected rather than approximated. |
-| `CLUSTER_PROVIDED` | Reserved | Only legal on an `envoy.clusters.aggregate` cluster — see [Failover and aggregates](../providers-and-routing/failover-and-aggregates/). Required there (an aggregate has no hosts of its own to run a policy over) and rejected everywhere else, since there is no other cluster-provided host-picking implemented. |
+| `CLUSTER_PROVIDED` | Reserved | Only legal on an `envoy.clusters.aggregate` cluster — see [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/). Required there (an aggregate has no hosts of its own to run a policy over) and rejected everywhere else, since there is no other cluster-provided host-picking implemented. |
 
 Rejection happens at config load, with the policy named in the error, both
 for a raw bootstrap configuration's `lb_policy` field and for the equivalent check
@@ -50,6 +50,43 @@ in `crates/proxy-cluster/src/load_balancer.rs`). The project's strict-config rul
 policy for another, so a config asking for session affinity that cannot be honored
 fails loudly instead of serving traffic under a policy that quietly breaks
 that affinity.
+
+## What `LEAST_REQUEST` counts
+
+Each host has a count of active requests. The router adds 1 to the count when
+it starts an attempt against the host. It subtracts 1 when the attempt ends.
+An attempt ends in one of three ways:
+
+- The response body reaches its end.
+- The client drops the response before the end.
+- For an upgraded connection (WebSocket), the tunnel closes.
+
+A retry or a fallback is a new attempt. It counts against the host that it
+uses. An attempt that fails before a response leaves no count. When the router
+hedges a request, each host that it tries counts once. A declined upgrade
+holds its count until its response body ends.
+
+The count belongs to the host, not to a snapshot of the cluster. A health
+check, an outlier ejection, or a DNS or EDS refresh rebuilds the host
+snapshot. The new snapshot for the same address shares the old counter, so
+in-flight requests keep their count and decrement the right counter. A new
+address starts at 0. A request counts from the moment the attempt starts, so
+a long SSE stream keeps its host loaded until the stream ends.
+
+Proof: `Host::begin_request` and `ActiveRequestGuard` in
+`crates/proxy-cluster/src/lib.rs`; the attempt guard in
+`crates/proxy-http/src/router.rs`; the tests
+`streaming_requests_are_counted_and_spread_by_least_request`,
+`downstream_dropping_a_streaming_response_releases_the_count`,
+`a_failed_attempt_leaves_no_count_and_the_retry_is_counted`,
+`an_accepted_upgrade_holds_the_count_for_the_tunnel_lifetime`,
+`a_declined_upgrade_holds_the_count_until_the_response_body_ends`, and
+`a_hedge_counts_each_attempted_host_once_and_releases_both` in
+`crates/proxy-http/tests/router_least_request.rs`; and
+`health_transition_rebuild_shares_the_in_flight_counter`,
+`ejection_rebuild_shares_the_in_flight_counter`, and
+`carry_over_shares_the_in_flight_counter_with_the_old_snapshot` in
+`crates/proxy-cluster`.
 
 ## What every policy shares: priority spillover and the panic threshold
 
@@ -84,21 +121,35 @@ on its own. A host only ever looks unhealthy to the picker above through
 active health-check fields written directly into a bootstrap configuration,
 which this page does not cover further.
 
-Of the four circuit-breaker budgets, only two are wired to a real call site
-today: `max_requests` (acquired per request, held for the full response
-stream — LLM streaming keeps a request "active" far longer than
-time-to-headers) and `max_connections`, enforced at the dial itself so an
-over-budget cluster never opens the socket
-(`crates/proxy-cluster/src/pool.rs`'s `ConnectPool::new_stream`, proven by
-`max_connections_is_enforced_at_dial_and_released_on_drop`). Either budget
-being exhausted produces the same outcome: `503`, the `UO` response flag, and
-an `x-envoy-overloaded: true` response header
+All four circuit-breaker budgets have an enforcement call site. This list
+gives the semantics of each:
+
+- `max_requests` is acquired per request and held for the full response stream.
+  LLM streaming keeps a request "active" far longer than time-to-headers.
+- `max_connections` counts the open upstream sockets of one cluster, across
+  every worker and every host. The dial claims a slot before it opens the
+  socket, so an over-budget cluster never opens it
+  (`crates/proxy-cluster/src/pool.rs`'s `ConnectPool::new_stream`, proven by
+  `max_connections_is_enforced_at_dial_and_released_on_drop`). An idle pooled
+  connection holds its slot. The slot returns when the socket closes, not when
+  the cache entry goes. The sweep, the peer, and the removal of an endpoint all
+  close sockets. See
+  [How a pooled connection ends](../../providers-and-routing/providers-and-clusters/#how-a-pooled-connection-ends).
+- `max_pending_requests` is a bounded parking queue in front of
+  `max_connections`. When all connection slots are held, a caller parks only if
+  it can acquire a pending slot. A full pending queue produces the same
+  immediate overload response.
+- `max_retries` limits the retries in flight at one time. The router asks for a
+  retry slot before each retry (`sleep_backoff_and_reserve_retry` in
+  `crates/proxy-http/src/router.rs`). A request that cannot get one stops
+  retrying and the access log shows the `URX` flag
+  (`retry_limit_exceeded_renders_the_urx_response_flag`).
+
+An exhausted `max_requests`, `max_connections`, or `max_pending_requests`
+budget produces the same outcome: `503`, the `UO` response flag, and an
+`x-envoy-overloaded: true` response header
 (`max_requests_zero_records_and_renders_the_uo_flag` in
-`crates/proxy-http/tests/response_flags.rs`). `max_pending_requests` is a
-bounded parking queue in front of `max_connections`: when all connection
-slots are held, a caller parks only if it can acquire a pending slot; a full
-pending queue produces the same immediate overload response. `max_retries`
-is parsed and recorded but has no enforcement call site yet.
+`crates/proxy-http/tests/response_flags.rs`).
 
 ## Bootstrap configuration: a worked weighted example
 
@@ -125,5 +176,5 @@ between them by active request count rather than a fixed split. This shape —
 more than one endpoint per cluster, an explicit `lb_policy` with real
 candidates to choose from — is not expressible in the plain configuration
 format at all; see
-[Providers and clusters](../providers-and-routing/providers-and-clusters/)
+[Providers and clusters](../../providers-and-routing/providers-and-clusters/)
 for why.

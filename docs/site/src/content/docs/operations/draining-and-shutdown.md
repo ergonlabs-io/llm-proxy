@@ -2,7 +2,7 @@
 title: Draining and shutdown
 summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
   changes, and what the drain deadline cuts.
-last_updated: 2026-10-10
+last_updated: 2026-10-13
 related:
   - ../operations/config-reload/
   - ../reference/cli/
@@ -24,12 +24,28 @@ falls back to the OS default.
 4. A request or stream already in flight keeps running. When it finishes, its
    connection closes: the response carries `Connection: close` on HTTP/1, and
    the proxy sends `GOAWAY` on HTTP/2.
-5. When no connection is left, the process flushes capture, traces, and
-   metrics, then exits `0`. It does not wait for the full window.
+5. When no connection is left, the process flushes the access-log queues,
+   then capture, traces, and metrics. Then it exits `0`. It does not wait for
+   the full window.
 6. If connections are still open after `--drain-time-s` (default 600), they
    are cut and the process exits `0`.
 
 TCP proxy connections are not closed early. They run until the window ends.
+
+An upgrade tunnel, for example a WebSocket, counts as an active connection. The
+drain start does not close it. The drain stays open until a peer closes the
+tunnel or the drain deadline passes (test
+`an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes`
+in `crates/proxy-core/src/listener_drain_tests.rs`).
+
+## Access-log lines at exit
+
+The proxy writes access-log lines from background writer threads (see
+[Access logs](../../observability/access-logs/#where-a-line-goes)). After the
+workers stop, the process waits for those queues to empty. It waits at most
+5 seconds. After a second signal it waits at most 1 second. If a queue is not
+empty at the end, the proxy logs `access-log writers did not drain before the
+shutdown budget; queued lines are lost` (`crates/proxy/src/main.rs:1510-1519`).
 
 ## A second signal
 
@@ -77,4 +93,4 @@ warming, until `initial_fetch_timeout`.
 | `--drain-time-s` | `600` | Seconds to wait for connections to finish before cutting them. |
 | `--drain-strategy` | `gradual` | Accepted for Envoy command lines. It has no effect: both values drain as described above, and the proxy logs a warning at startup. |
 
-See [CLI reference](../reference/cli/) for the full flag list.
+See [CLI reference](../../reference/cli/) for the full flag list.

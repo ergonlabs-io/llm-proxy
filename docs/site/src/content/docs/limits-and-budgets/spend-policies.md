@@ -1,6 +1,7 @@
 ---
 title: Spend policies and recovery
 description: Key and tenant ceilings, migration, shared Redis accounting, and crash recovery.
+last_updated: 2026-10-13
 ---
 
 Spend enforcement uses two kinds of ceiling, and either one can refuse a
@@ -13,8 +14,18 @@ Missing budget means unlimited; an explicit zero denies the first request.
 Charges use integer micro-dollars and the rate card for the provider actually
 dialled, including after fallback. A request that neither the rate card nor the
 `pricing` list of `llmproxy.spend_limit` prices adds $0 to every budget. The
-proxy does not log a warning for it. The spend reports count these requests in
-`unpriced_requests`.
+spend reports count these requests in `unpriced_requests`.
+
+When a budget applies to such a request, the proxy logs one warning for each
+filter chain and model. The warning names the chain, the model, the cluster,
+and the reason. It also tells you to add the model to the rate card or to the
+`pricing` list. A request with no applicable budget logs nothing. The proxy
+remembers at most 256 model names for each chain. After that it logs one
+summary line and names no more models. The request still adds $0 and still
+counts in `unpriced_requests`
+(`crates/proxy-filters/src/spend_limit_filter.rs:678-747`; tests
+`an_unpriced_model_without_a_budget_stays_silent` and
+`the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary`).
 
 ## Key lifecycle and API version
 
@@ -91,7 +102,7 @@ adds the spend of every key of the tenant, in the tenant budget's own period.
 A request gets `429` when its key ceiling or its tenant ceiling is reached.
 Clearing one ceiling does not change the spend or the ceiling of the other. A
 budget counts only the requests in its credential scope; see
-[Budgets](../authentication/tenant-provider-credentials/#budgets).
+[Budgets](../../authentication/tenant-provider-credentials/#budgets).
 `%RESPONSE_CODE_DETAILS%` shows `spend_budget_exceeded` for the `429`.
 
 When any key budget or tenant budget is configured, a request without an
@@ -158,6 +169,25 @@ total plus local accrual. A replica still denies once its own view reaches the
 ceiling. Authentication boot remains fail-closed when Redis is unavailable;
 a running replica keeps its last published identity-policy snapshot. Recovery
 composes the retained deltas and refreshes all replicas' totals.
+
+## Past-period buckets
+
+The proxy keeps one spend bucket for each key or tenant and each budget
+period. A bucket whose period has ended is settled after one successful
+reconciliation with the store since the period ended, if it has no pending
+charge. A settled bucket costs the store nothing more: the flusher does not
+visit it, and the recovery journal does not grow with it. The proxy keeps a
+settled bucket readable in memory until 1 hour after its period ends
+(`SETTLED_BUCKET_GRACE_SECS` in `crates/proxy-filters/src/spend.rs:828`). Then
+it evicts the bucket.
+
+A charge that arrives after eviction creates the bucket again. The new bucket
+starts from the last flush sequence of the store, so the store total stays
+exact (test
+`a_late_charge_after_eviction_reseeds_from_the_store_and_lands_exactly_once`).
+A report for an ended period with no bucket in memory reads the store and
+creates nothing. The unpriced-request detail of an evicted bucket does not
+survive eviction.
 
 ## Admission and overspend
 

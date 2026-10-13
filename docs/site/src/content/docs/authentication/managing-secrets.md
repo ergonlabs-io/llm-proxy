@@ -2,9 +2,9 @@
 title: Managing secrets
 summary: Generate a virtual key with `--mode keygen`, install its digest in
   configuration, verify it, revoke it, and what rotating the HMAC secret
-  costs you. Every step here edits the config file — there is no admin API
-  for this yet.
-last_updated: 2026-08-24
+  costs you. Every step here edits the config file; keys minted through the
+  admin API are covered on the Virtual keys page.
+last_updated: 2026-10-13
 related:
   - ../authentication/virtual-keys/
   - ../configuration/configuration-file/
@@ -16,13 +16,15 @@ related:
 
 This page is the operational lifecycle of a virtual key: mint one, install
 its digest, verify it authenticates, revoke it, and rotate the HMAC secret
-that keys every digest. See [Virtual keys](../authentication/virtual-keys/)
+that keys every digest. See [Virtual keys](../../authentication/virtual-keys/)
 for how verification works internally.
 
-**There is no key store and no admin API today.** Every action below is a
-config-file edit followed by a `SIGHUP` reload or a restart. A persistent,
-shared credential store and admin CRUD for keys are not built — see
-[Virtual keys](../authentication/virtual-keys/#what-is-not-built-yet).
+**This page covers keys listed in the config file.** Every action below is a
+config-file edit followed by a `SIGHUP` reload or a restart. Keys can also be
+minted, listed and revoked at runtime through the admin API, without a
+reload — see
+[Managing keys and tenants at runtime](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime)
+and [Admin endpoints](../../observability/admin-endpoints/).
 
 ## The HMAC secret
 
@@ -33,7 +35,7 @@ Every digest in `auth.keys[]` is `hex(HMAC-SHA256(hmac_secret,
   interpolated from the environment.
 - `auth.hmac_secret_file` — a path, re-read at listener-bind time and again
   on every `SIGHUP` reload, since a reload re-parses the whole config file
-  (see [Config reload](../operations/config-reload/)).
+  (see [Config reload](../../operations/config-reload/)).
 
 Setting both, or neither, is a load error
 (`crates/proxy-simple-config/src/lower.rs`'s `lower_auth`: `auth`, "set
@@ -75,7 +77,7 @@ llm-proxy --mode keygen --tenant acme --key-id alice-laptop --hmac-secret-file s
 
 This prints a paste-ready fragment. The values below are illustrative
 placeholders, not a real generated key — see
-[CLI reference](../reference/cli/#--mode-keygen) for the exact command that
+[CLI reference](../../reference/cli/#--mode-keygen) for the exact command that
 produced a real one:
 
 ```text
@@ -118,7 +120,7 @@ Every field is validated at load time with its dotted path — a duplicate
 characters is a load error, not a silent accept
 (`crates/proxy-simple-config/src/lower.rs`'s `lower_auth`/`validate_digest`).
 The bootstrap-configuration equivalent (`llmproxy.auth`'s `virtual_keys`) is
-shown in [Virtual keys](../authentication/virtual-keys/#bootstrap-configuration).
+shown in [Virtual keys](../../authentication/virtual-keys/#bootstrap-configuration).
 
 ## Step 3: Apply it
 
@@ -129,7 +131,7 @@ connections:
 kill -HUP <pid>
 ```
 
-See [Config reload](../operations/config-reload/) for what a reload does and
+See [Config reload](../../operations/config-reload/) for what a reload does and
 does not pick up. A config that fails to parse or validate — a malformed
 digest, for example — leaves the proxy serving the previous snapshot rather
 than taking it down.
@@ -158,7 +160,7 @@ unauthorized
 proven identical across all three cases by
 `all_three_failure_reasons_produce_an_identical_downstream_response`.) The
 identical response is deliberate — see
-[Virtual keys](../authentication/virtual-keys/#the-response-on-the-wire-is-identical-for-every-failure-reason)
+[Virtual keys](../../authentication/virtual-keys/#the-response-on-the-wire-is-identical-for-every-failure-reason)
 for why, and for the current gap in telling the three reasons apart
 operationally.
 
@@ -180,7 +182,7 @@ configuration; that is exactly the `CredentialStore` gap noted above. On the
 wire a revoked key gets the same 401 as one that was never configured at
 all. Keeping the record (instead of deleting it) matters once the access-log
 gap described in
-[Virtual keys](../authentication/virtual-keys/#the-response-on-the-wire-is-identical-for-every-failure-reason)
+[Virtual keys](../../authentication/virtual-keys/#the-response-on-the-wire-is-identical-for-every-failure-reason)
 closes: `revoked` is the only way the internal `auth_revoked_key` detail
 (distinct from `auth_unknown_key`) can ever be produced for that credential.
 

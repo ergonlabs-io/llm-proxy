@@ -4,7 +4,7 @@ summary: Field-by-field reference for the llm-proxy configuration file
   (--config), derived from schema/llmproxy-v0.schema.json, the normative
   source. Covers what each field does, its default, and whether it is
   enforced yet.
-last_updated: 2026-08-26
+last_updated: 2026-10-13
 related:
   - ../getting-started/introduction/
   - ../getting-started/quickstart/
@@ -36,10 +36,10 @@ applied before parsing.
 | `admin` | `HostPort` string | no | disabled | Admin/observability endpoint. Binds nothing unless set. |
 | `auth` | `Auth` object | no | disabled (no authentication) | Downstream authentication. Fails closed once present: an unrecognized credential gets a 401, never anonymous admission. |
 | `providers` | object of `Provider`, keyed by name | yes | — | Named upstream LLM APIs. Keys match `^[a-z0-9][a-z0-9-]*$`. At least one entry is required. |
-| `models` | object of `ModelDef`, keyed by name | no | `{}` | A client-facing model name mapped to an ordered list of providers. See "The `models` catalogue" below — only the first provider in each entry is used to serve traffic in this schema version. |
+| `models` | object of `ModelDef`, keyed by name | no | `{}` | A client-facing model name mapped to an ordered list of providers. See "The `models` catalogue" below. The first provider is the primary. Later providers are fallbacks. The proxy also serves `GET /v1/models` from this table. |
 | `routes` | array of `Route` | yes | — | Ordered routing rules. The first rule whose `model` pattern matches wins; there is no specificity reordering. At least one route is required. |
 | `limits` | array of `Limit` | no | `[]` | Rate limits and quotas. See "What `limits` actually enforces" below — most combinations are recorded but not enforced. |
-| `observability` | `Observability` object | no | none (no access log) | Access logging. See "A schema/code note worth knowing" below for the current state of admin-endpoint metrics. |
+| `observability` | `Observability` object | no | none (no access log, no OTLP export) | Access logging, OTLP metric export, and OTLP trace export. See "`observability` (`Observability`)" below. |
 | `pricing` | `Pricing` object | no | none (no request has a price) | The rate card. It prices each completed request in integer nanodollars, using all four token buckets. A `SIGHUP` reload installs a change, unless an `auth` store holds the rate card. See "`pricing` (`Pricing`)" below. |
 
 A request matching no `routes` entry and no `models` entry gets a 404 with a
@@ -49,18 +49,84 @@ JSON error body listing known models.
 
 | Field | Type | Required | Default | What it does |
 |---|---|---|---|---|
-| `type` | enum: `openai`, `anthropic`, `openai-compatible`, `azure-openai`, `vertex`, `bedrock` | no | `openai-compatible`, unless the provider's name is `openai` or `anthropic` | The wire shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. `azure-openai`/`vertex`/`bedrock` are named for the model catalogue but are not yet loadable as a `providers` entry — their credential scheme is not implemented, and configuring one is a load error naming the gap. |
-| `base_url` | string (URI) | only if the name/type does not imply one | `https://api.openai.com` for `openai`, `https://api.anthropic.com` for `anthropic` | The API base URL. Host and port only — a path prefix (e.g. `/openai` for Groq) is a load error in this schema version, not a silent truncation. |
-| `api_key` | string | no (mutually exclusive with `api_key_file`) | none | The API key, sent as `Authorization: Bearer` for OpenAI-shaped APIs or `x-api-key` for Anthropic. Omit both `api_key` and `api_key_file` for an unauthenticated local backend. |
-| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](../operations/config-reload/). |
+| `type` | enum: `openai`, `anthropic`, `openai-compatible`, `openrouter`, `azure-openai`, `vertex`, `bedrock` | no | `openai-compatible`, unless the provider's name is `openai`, `anthropic`, or `openrouter` | The wire shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. `openrouter` sends OpenAI-shaped requests and rewrites the `/v1` path prefix to `/api/v1`. `azure-openai`, `vertex`, and `bedrock` need the extra fields in "Provider-specific fields" below. |
+| `base_url` | string (URI) | only if the name/type does not imply one | `https://api.openai.com` for `openai`, `https://api.anthropic.com` for `anthropic`, `https://openrouter.ai` for `openrouter`. No default for `openai-compatible`, `azure-openai`, `vertex`, or `bedrock`. | The API base URL. Host and port only — a path prefix (e.g. `/openai` for Groq) is a load error in this schema version, not a silent truncation. |
+| `api_key` | string | no (mutually exclusive with `api_key_file`) | none | The API key. The proxy sends it as `Authorization: Bearer` for OpenAI-shaped APIs, `x-api-key` for Anthropic, and `api-key` for `azure-openai`. Omit both `api_key` and `api_key_file` for an unauthenticated local backend. A `vertex` or `bedrock` provider rejects both fields: use its own credential fields. |
+| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](../../operations/config-reload/). |
 | `extra_headers` | object of string | no | `{}` | Extra headers sent on every request to this provider. An Anthropic provider also gets a default `anthropic-version` header; setting it here overrides that default. |
 | `ca_file` | string (path) | no | system roots | PEM CA bundle for verifying this provider's TLS certificate. Only needed for a self-hosted backend with a private CA. |
 | `connect_timeout` | `Duration` | no | `5s` | TCP/TLS connection establishment timeout for this provider. |
-| `protocol` | enum: `http1`, `http2` | no | `http1` | Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse — the proxy keeps one multiplexed connection per worker to this provider instead of connecting fresh on every request. Most hosted providers support it; many local/self-hosted plaintext servers do not. |
-| `tenant_credentials` | boolean | no | `false` | Lets a tenant that stored its own key for this provider send that key instead of the operator key. Requires `auth.tenant_credentials`. Only header API-key types qualify: `openai`, `anthropic`, `openai-compatible`, `openrouter`, and `azure-openai`. `vertex` and `bedrock` are rejected at this field. The key goes in `x-api-key` for `anthropic`, in `api-key` for `azure-openai`, and in `Authorization: Bearer` for the rest. See [Tenant provider credentials](../authentication/tenant-provider-credentials/). |
-| `tenant_credential_verify_path` | string (path, starts with `/`) | no | `/api/v1/key` for `openrouter`; `/v1/models` for `openai` and `anthropic`; none for other types, and none when `base_url` is set | The path of the `GET` that checks a tenant key when `PUT` saves it. Sent as is. Requires `tenant_credentials: true`. Set it to use another path. Must be at most 2048 bytes, printable ASCII, no `#`. See [Save-time check](../authentication/tenant-provider-credentials/#save-time-check). |
+| `protocol` | enum: `http1`, `http2` | no | `http1` | Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse — each worker keeps up to 4 multiplexed connections to each address of this provider (it dials another connection when each open one carries 100 streams) instead of connecting fresh on every request. Most hosted providers support it; many local/self-hosted plaintext servers do not. |
+| `tenant_credentials` | boolean | no | `false` | Lets a tenant that stored its own key for this provider send that key instead of the operator key. Requires `auth.tenant_credentials`. Only header API-key types qualify: `openai`, `anthropic`, `openai-compatible`, `openrouter`, and `azure-openai`. `vertex` and `bedrock` are rejected at this field. The key goes in `x-api-key` for `anthropic`, in `api-key` for `azure-openai`, and in `Authorization: Bearer` for the rest. See [Tenant provider credentials](../../authentication/tenant-provider-credentials/). |
+| `tenant_credential_verify_path` | string (path, starts with `/`) | no | `/api/v1/key` for `openrouter`; `/v1/models` for `openai` and `anthropic`; none for other types, and none when `base_url` is set | The path of the `GET` that checks a tenant key when `PUT` saves it. Sent as is. Requires `tenant_credentials: true`. Set it to use another path. Must be at most 2048 bytes, printable ASCII, no `#`. See [Save-time check](../../authentication/tenant-provider-credentials/#save-time-check). |
 
 A `Provider` config rejects setting both `api_key` and `api_key_file`.
+
+### Provider-specific fields
+
+The fields in this table are valid for one provider type only. A field on
+another type is a load error such as `is only valid for vertex providers`
+(`parse.rs`, `validate_provider_specific_fields`). A missing required field is
+a load error such as `region is required for bedrock providers`. Each of these
+provider types also needs a `base_url`, because none has a default.
+
+| Type | Field | Required | What it does |
+|---|---|---|---|
+| `azure-openai` | `deployment` | yes | The Azure deployment name. The proxy rewrites the `/v1` path prefix to `/openai/deployments/<deployment>`. Letters, digits, `-`, `.`, `_`, and `~` only. |
+| `azure-openai` | `api_version` | yes | Sent as the `api-version` query parameter. The same character set as `deployment`. |
+| `vertex` | `project` | yes | The Google Cloud project ID. |
+| `vertex` | `location` | yes | The Google Cloud location. |
+| `vertex` | `publisher` | yes | The Vertex publisher, for example `google` or `anthropic`. |
+| `vertex` | `access_token` or `access_token_file` | exactly one | An OAuth access token. The proxy sends it as `Authorization: Bearer <token>` and replaces any `Authorization` header from the client. |
+| `bedrock` | `region` | yes | The AWS region. |
+| `bedrock` | `access_key_id` or `access_key_id_file` | exactly one | The AWS access key ID. |
+| `bedrock` | `secret_access_key` or `secret_access_key_file` | exactly one | The AWS secret access key. |
+| `bedrock` | `session_token` or `session_token_file` | no, at most one | An AWS session token. |
+
+For `vertex`, the proxy rewrites the request path to
+`/v1/projects/<project>/locations/<location>/publishers/<publisher>/models/<model>:streamRawPredict`.
+For `bedrock`, it rewrites the path to `/model/<model>/invoke` and signs the
+request with AWS SigV4 for the service name `bedrock`, using the region and
+keys above. The signature adds the
+`authorization`, `x-amz-date`, and `x-amz-content-sha256` headers. A session
+token adds the `x-amz-security-token` header.
+
+Rules for these types:
+
+- The token and the AWS keys are static values. The proxy reads them when it
+  loads the configuration. It does not mint or refresh them. A `*_file` field
+  is read once at startup and again on a `SIGHUP` reload, and the load emits a
+  warning that says so.
+- A `vertex` or `bedrock` provider serves more than one wire format. A
+  `routes[].provider` reference cannot say which one. Add a `models` entry
+  for the provider in the object form, and set `dialect` there.
+- `tenant_credentials: true` is a load error on `vertex` and `bedrock`.
+
+Proof: `validate_vertex_provider`, `validate_bedrock_provider`, and
+`validate_azure_provider` in `crates/proxy-simple-config/src/parse.rs`; the
+lowering in `crates/proxy-simple-config/src/lower.rs` (`lower_provider`);
+`ProviderCredentials::apply` in `crates/proxy-http/src/credential_provider.rs`;
+`apply_cluster_provider_path_template` in `crates/proxy-http/src/router.rs`.
+The tests are `vertex_and_bedrock_runtime_settings_survive_ir_lowering`,
+`azure_openai_lowers_auth_and_provider_path_rewrite`,
+`vertex_and_bedrock_credentials_require_valid_sources`, and
+`vertex_and_bedrock_fields_are_rejected_on_other_provider_types` in
+`crates/proxy-simple-config/tests/dialect.rs`, plus
+`bedrock_signature_uses_final_body_and_required_headers` and
+`vertex_credential_replaces_any_client_authorization` in `credential_provider.rs`.
+
+### OpenRouter
+
+A provider named `openrouter` has type `openrouter` without a `type` field. A
+provider with any other name needs `type: openrouter`. The base URL defaults to
+`https://openrouter.ai`. The proxy sends the key as `Authorization: Bearer`.
+The cluster rewrites the request path prefix `/v1` to `/api/v1`. A `base_url`
+with a path is a load error that names `providers.<name>.base_url`. The file
+`examples/llmproxy-openrouter.yaml` is a full example with a `models`
+catalogue. Proof: `openrouter_example_builds_cluster_owned_auth_and_path_rewrite`,
+`explicit_openrouter_type_works_with_custom_provider_name`, and
+`openrouter_rejects_endpoint_path_in_base_url` in
+`crates/proxy-simple-config/tests/openrouter.rs`.
 
 ## `routes[]` (`Route`)
 
@@ -71,12 +137,23 @@ A `Provider` config rejects setting both `api_key` and `api_key_file`.
 | `fallbacks` | array of `ProviderModelRef` | no | `[]` | Providers tried in order when the primary fails: a connection failure, a 429, or a 5xx received before any response byte — never after the client has started receiving a stream. Every provider in the chain must speak the same wire dialect as the primary; a cross-dialect entry is a load error naming the route and fallback index. |
 | `retries.attempts` | integer, 0–5 | no | `1` | Extra attempts against the *same* provider before moving to `fallbacks`. `0` disables same-provider retries. |
 | `idle_timeout` | `Duration` | no | `90s` | Maximum time with no bytes flowing (between chunks, SSE events, or WebSocket frames). There is deliberately no total-duration timeout — LLM generations are long-lived, so an idle-based guard is used instead. |
+| `streaming` | enum: `strict` | no | absent | Asserts that every HTTP filter on this route passes response bytes through without holding them. With `strict`, the configuration fails to load if any installed filter can buffer a response. `strict` is the only legal value. With the field absent, the proxy streams as normal and checks nothing. |
+
+A `streaming: strict` failure is a load error. Its path is the lowered route,
+not `routes[n]`, and the text is `route requires `streaming: strict`, but HTTP
+filter '<name>' can buffer response bytes`. Proof: the lowering in
+`crates/proxy-simple-config/src/lower.rs` (`io.llmproxy.streaming`), the check
+in `build_per_route_table` in `crates/proxy-http/src/filter_manager.rs`, and the
+tests `strict_streaming_rejects_a_filter_without_flush_through_capability` and
+`strict_streaming_accepts_an_explicit_flush_through_filter` in
+`crates/proxy-http/src/filter_manager/tests.rs`.
 
 The model-rewrite form (`provider/model`) is recorded but not yet applied:
 substituting the rewritten name into the request body needs a body rewriter
 not yet built, so a route or fallback using this form produces a
 load-time warning naming its exact path, and the client's original model
-name is forwarded unchanged.
+name is forwarded unchanged. The `model` field of a `models` entry works
+differently: the proxy applies it. See "The `models` catalogue".
 
 ### Route redirects are bootstrap-only
 
@@ -144,7 +221,7 @@ the load, but the error names the Envoy-mode field path,
 `typed_config.tenant_credentials.…`, not `auth.tenant_credentials.…`. This is a
 known gap in the error path, and it does not change what is rejected. The
 file rules and the rotation procedure are in
-[Tenant provider credentials](../authentication/tenant-provider-credentials/#1-create-the-key-encryption-key-file).
+[Tenant provider credentials](../../authentication/tenant-provider-credentials/#1-create-the-key-encryption-key-file).
 
 Example:
 
@@ -221,10 +298,48 @@ reach it.
 | `access_logs.output` | string: `stdout`, `stderr`, or a file path | no | `stdout` | Where per-request access-log lines are written. Not written at all unless `observability.access_logs` is present. |
 | `access_logs.format` | enum: `text`, `json` | no | `text` | `json` emits one structured object per line, recommended for log pipelines. |
 | `force_usage_reporting` | boolean | no | `true` | Forces `stream_options.include_usage` onto streaming OpenAI-dialect requests that did not already ask for it, so streamed responses still report token usage. Set `false` for strict passthrough if a hand-rolled client trips over the extra frame. |
+| `metrics.otlp_endpoint` | string | yes, if `metrics` is set | — | The OTLP/gRPC collector endpoint for metrics. It may differ from the tracing endpoint. Empty or missing is a load error: `is required and must not be empty when `observability.metrics` is set`. |
+| `metrics.service_name` | string | no | `llm-proxy` | The OTLP resource attribute `service.name`. |
+| `metrics.export_interval` | `Duration` | no | `15s` | How often the proxy exports a full cumulative snapshot of its metrics. The range is `1s` to `1h`. |
+| `metrics.export_deadline` | `Duration` | no | `10s` | The deadline for one export. A collector that accepts a connection and stops answering costs one deadline, not a stall. At least `100ms`, and it must be less than `export_interval`. |
+| `tracing.otlp_endpoint` | string | yes, if `tracing` is set | — | The OTLP/gRPC collector endpoint for traces. Empty or missing is a load error: `is required and must not be empty when `observability.tracing` is set`. |
+| `tracing.service_name` | string | no | `llm-proxy` | The OTLP resource attribute `service.name`. |
+| `tracing.export_deadline` | `Duration` | no | `5s` | The deadline for one trace-batch export. The range is `100ms` to `60s`. |
+| `tracing.sample_ratio` | number, 0.0 to 1.0 | no | `1.0` | The share of new root traces that the proxy samples. A value outside the range is a load error at `observability.tracing.sample_ratio`. |
+
+`metrics` and `tracing` are independent. Set `metrics` alone to export
+metrics with tracing off. Set `tracing` alone to export spans with no OTLP
+metrics. With neither, nothing is sent to a collector. The Prometheus
+endpoint `/stats/prometheus` works in every case: it needs no OTLP
+configuration.
+
+`export_deadline >= export_interval` is a load error. The error names a path
+that starts at `node.metadata["io.llmproxy.metrics"]`, not at
+`observability.metrics`, because the Envoy-mode loader checks the rule. The text
+is `must be less than `export_interval` (<n>s), got <n>s -- otherwise every
+export is abandoned as a timeout before the next one is due`.
+
+Tracing exports spans. This differs from the schema's description of
+`observability.tracing`, which says "nothing exports a span yet". The proxy
+starts an OTLP trace exporter when `tracing` is set and logs `OTLP trace
+export enabled`. When a request carries a valid `traceparent` header, the
+proxy joins that trace as a child span and keeps the sampled decision of the
+caller, whatever `sample_ratio` says. Without one, the proxy starts a new trace
+and samples it with probability `sample_ratio`. A clean shutdown sends a final
+batch. Proof: `traceparent_join_and_fallback_produce_the_right_span_tree`,
+`tracing_without_metrics_exports_spans_and_no_metrics`,
+`metrics_export_with_tracing_disabled_exports_metrics_and_no_spans`,
+`a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped`, and
+`a_clean_shutdown_delivers_a_final_trace_batch` in
+`crates/proxy/tests/otlp_trace_e2e.rs`; the bounds in
+`crates/proxy-config/src/lower.rs` (`convert_tracing_metadata`,
+`convert_metrics_metadata`). The tests configure OTLP through Envoy-mode
+bootstrap metadata. The lowering of the `llmproxy` dialect fields into that
+metadata is tested in `crates/proxy-simple-config/tests/dialect.rs`.
 
 A streamed response and a realtime session are both logged once, at stream
 end, with usage totals — not per chunk. See
-[Getting started](../getting-started/quickstart/) for what one line actually
+[Getting started](../../getting-started/quickstart/) for what one line actually
 contains.
 
 ## `pricing` (`Pricing`)
@@ -329,7 +444,29 @@ and `%LLM_LIST_COST%` shows `4000000`. A request with 250000 input tokens and
 
 A request for any other model has no price: `%LLM_LIST_COST%` and
 `%LLM_RATE_CARD_VERSION%` show `-`. Both operators are in the
-[access log reference](../observability/access-logs/#the-operator-set).
+[access log reference](../../observability/access-logs/#the-operator-set).
+
+### Unpriced requests under a dollar budget
+
+A dollar budget cannot count a request that has no price. The proxy charges
+such a request $0, so the budget does not count it, and the request is not
+refused. This is a deliberate fail-open choice. The proxy makes it visible: it
+writes one `warn` log line the first time a model is unpriced under a budget,
+and it writes no further line for that model. The line starts with
+`spend_limit: a request under a dollar budget was charged $0 because no price
+applies to it`. It names the chain, the cluster, the model, and the reason. A
+request with no budget on its tenant or key writes no line.
+
+The proxy keeps one set of model names for each filter chain, and the set
+holds at most 256 names. A name is cut to 128 characters. When a new name
+arrives and the set is full, the proxy logs one summary line for the chain
+(`more distinct unpriced model names than this chain remembers`). It names no
+further model. These requests are still charged $0 and still counted in the
+`unpriced_requests` counter. To remove the warning, add the model to the rate
+card with `PUT /pricing`. See [Spend policies](../../limits-and-budgets/spend-policies/).
+Proof: `UnpricedWarner` in `crates/proxy-filters/src/spend_limit_filter.rs`, and
+the tests `an_unpriced_model_under_a_budget_warns_once_per_model` and
+`an_unpriced_model_without_a_budget_stays_silent` in the same file.
 
 ### When a change takes effect
 
@@ -357,13 +494,22 @@ With a store, the store holds the rate card and wins:
   once that `pricing` differs from it.
 - A `SIGHUP` reload never replaces a stored rate card. It logs once when the
   changed `pricing` differs from it.
-- `PUT /pricing` writes the store and installs the rate card on the receiving
-  replica at once. Every other replica that shares the store installs it on its
-  next policy poll, which is 48 to 60 seconds at the default
+- `PUT /pricing` writes the store. It does not install the rate card itself.
+  The receiving replica installs the rate card that the store's watcher
+  delivers right after the write. Every other replica that shares the store
+  installs it on its next policy poll, which is 48 to 60 seconds at the default
   `poll_interval_seconds`. The response says `"persisted": true` when the store
   is `persistent` or `shared`. The default `in_memory` store keeps the rate card
   only for the life of the process, and the response says `"persisted": false`.
   If the store refuses the write, the response is `503` and no replica changes.
+- A second replica can write to the same store between your write and the
+  watcher delivery. The later write wins. The receiving replica then serves the
+  store's rate card, not yours. The `note` in the response says `written, but a
+  concurrent publish to the same store superseded it; this replica now serves
+  the store's card`. Read `GET /pricing` to see which rate card is active. Proof:
+  `a_concurrent_publish_from_another_replica_wins_on_the_publishing_replica` in
+  `crates/proxy-filters/src/usage_filter/rate_card_tests.rs`, and
+  `PricingRegistry::publish_json` in `crates/proxy-filters/src/usage_filter.rs`.
 - To replace a stored rate card, send it with `PUT /pricing`. Editing `pricing`
   does not replace it.
 
@@ -394,11 +540,24 @@ name exactly, evaluated after `routes` and before the 404 backstop.
 |---|---|---|---|---|
 | `providers` | array of `ProviderModelRef` string or `ModelProvider` object | yes, ≥1 item | — | Providers able to serve this model, in priority order. |
 
-**Only `providers[0]` is used to serve traffic in this schema version.**
-Every later entry is still validated at load time — a bad one still fails to
-load — but produces a load-time warning naming its exact path instead
-of being selected. Picking among them (fallback, weighted split, cost-aware
-routing) is not implemented yet.
+**The first provider is the primary. Later providers are fallbacks.** An
+entry with more than one provider lowers to an ordered aggregate cluster named
+`fallback:model-<name>`. The route retries `count - 1` times, on a connection
+failure, a `429`, a `500`, a `502`, or a `503`. Each retry moves to the next
+provider. Every provider in the list must speak the same wire dialect as the
+first. A different dialect is a load error at `models.<name>.providers[<n>]`:
+`cross-dialect model fallback needs request/response translation and is not
+supported`. A `models` entry has no `retries` or `idle_timeout` field: the idle
+timeout is always `90s`. Proof: `lower_model` in
+`crates/proxy-simple-config/src/lower.rs` and
+`models_multiple_providers_lower_to_ordered_fallback` in
+`crates/proxy-simple-config/tests/dialect.rs`.
+
+> **Schema conflict.** The schema descriptions of `models` and
+> `models.<name>.providers` say that only `providers[0]` serves traffic and
+> that later entries produce a load-time warning. The code does not do this:
+> `lower_model` builds the fallback chain, and the test above asserts that
+> lowering produces no warnings. This page follows the code.
 
 Use the object form (`ModelProvider`) only when you need to set `dialect`
 explicitly — the shorthand string form cannot carry it:
@@ -406,8 +565,22 @@ explicitly — the shorthand string form cannot carry it:
 | `ModelProvider` field | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `provider` | string, key into `providers` | yes | — | Which provider serves this entry. |
-| `model` | string | no | the catalogue's own name | The upstream model ID at this provider, if different (e.g. Anthropic's dated model IDs). Recorded but not yet substituted into the request body — the client's original model name is forwarded as-is, and this produces a load-time warning. |
+| `model` | string | no | the catalogue's own name | The upstream model ID at this provider, if different (e.g. Anthropic's dated model IDs). The proxy writes it into the `model` field of the request body for the provider that serves the attempt, and into the path for `vertex` and `bedrock`. After a fallback, the next provider gets its own `model`. The value is stored on the provider's cluster, so it never follows the route to another provider. Proof: `selected_provider_model_rewrite_changes_only_the_upstream_body` in `crates/proxy-http/src/router.rs`. |
 | `dialect` | enum: `openai`, `anthropic` | required for `vertex`/`bedrock`; derived otherwise | derived from the provider's `type` | The wire format this provider entry speaks. Required for `vertex`/`bedrock` because a single provider type there can serve more than one wire format (e.g. Vertex hosts Anthropic-shaped Claude and OpenAI-shaped Kimi under one provider). Omitting it where required is a load error, never a guess. |
+
+### `GET /v1/models`
+
+When `models` is not empty, the proxy answers `GET /v1/models` itself. It does
+not call a provider. The body is a fixed JSON list built at load time, with one
+entry for each `models` key that has no `*`:
+`{"id": "<name>", "object": "model", "created": 0, "owned_by": "llm-proxy"}`.
+Wildcard keys are routing rules, so they are not listed. The route matches the
+path `/v1/models` and sits before the first catch-all route (a `routes` rule
+with `model: "*"`, a `models` key `*`, or the 404 backstop). I did not verify
+whether the `auth` filter gates this route. Proof:
+`configured_catalog_lists_aliases_and_excludes_wildcards` in
+`crates/proxy-simple-config/tests/openrouter.rs`, and the lowering in
+`crates/proxy-simple-config/src/lower.rs` (`llmproxy_model_catalog`).
 
 ## Shared value shapes
 
@@ -426,14 +599,39 @@ explicitly — the shorthand string form cannot carry it:
 | `address` | `HostPort` | yes | — | Where the proxy binds. |
 | `tls.cert_file` | string (path) | yes, if `tls` is set | — | PEM certificate chain. |
 | `tls.key_file` | string (path) | yes, if `tls` is set | — | PEM private key. |
+| `tls` (handshake) | — | — | 10 s deadline | The proxy gives each client 10 seconds to finish the TLS handshake. See "What happens at a limit" below. The dialect has no field to change this deadline. |
 | `max_request_body_bytes` | integer, 1 to 4294967295 | no | `1048576` (1 MiB) | The largest request body the listener accepts, in bytes. See [Request body size limit](#request-body-size-limit). |
-| `max_connections` | integer, at least 1 | no | `50000` | The most client connections held open at once, across the whole proxy. |
-| `request_headers_timeout` | `Duration` | no | `10s` | Time allowed from a request's first byte to its complete headers. `0s` disables it. |
+| `max_connections` | integer, at least 1 | no | `50000` | The most client connections held open at once, across the whole proxy. The proxy closes a connection over the limit as soon as it accepts it. |
+| `request_headers_timeout` | `Duration` | no | `10s` | Time allowed from a request's first byte to its complete headers. `0s` disables it. Enforced for HTTP/1 only. |
 | `request_timeout` | `Duration` | no | `60s` | Time allowed to receive the whole request, headers and body. Does not bound the response. `0s` disables it. |
 
 The three limits above default to Envoy's edge-proxy guidance and apply even
 when `listen` is the shorthand `host:port` form. Envoy-mode config keeps
 Envoy's defaults, which are disabled.
+
+### What happens at a limit
+
+| Limit | On breach |
+|---|---|
+| `max_connections` | The proxy closes the new connection without a response. It adds 1 to the `listener.<name>.downstream_global_cx_overflow` stat. The connection is not counted in `downstream_cx_total`. A closed connection frees its slot. |
+| `request_headers_timeout` | On HTTP/1, the proxy closes a connection that has not sent complete headers in time. The limit does not apply to a response that is still streaming. On HTTP/2, the proxy does not enforce this limit. It logs one `warn` line per process when an HTTP/2 connection meets a listener that sets it: `request_headers_timeout is not enforced on HTTP/2 connections`. |
+| `request_timeout` | If the request body is not complete in time, the proxy answers `408` with the body `request timeout`, and closes the connection. The response code detail is `request_overall_timeout`. The request never reaches the provider. A response that streams past the deadline is not cut. |
+| TLS handshake (10 s) | The proxy closes the connection and counts it in `listener.<name>.downstream_cx_transport_socket_connect_timeout`. The slot is freed. Before this limit, a client that connected and stalled held a connection slot for ever. |
+
+Proof: `connection_cap_closes_the_overflow_and_frees_the_slot_when_a_connection_ends`,
+`request_headers_timeout_closes_a_stalled_http1_connection_but_not_a_long_response`,
+`request_timeout_answers_408_on_a_stalled_body_and_closes_the_connection`, and
+`request_timeout_does_not_cut_a_response_that_streams_past_the_deadline` in
+`crates/proxy-core/src/listener_admission_tests.rs`;
+`warn_h2_header_timeout_not_enforced_once` in
+`crates/proxy-core/src/listener.rs`;
+`stalled_tls_handshake_is_closed_at_the_deadline_and_frees_the_slot` in the
+same file; the defaults in `crates/proxy-simple-config/tests/admission_limits.rs`.
+The handshake deadline is a default of the engine: the dialect leaves
+`transport_socket_connect_timeout` unset, and an unset value gets 10 s
+(`tls_handshake_deadline` in `listener.rs`). Envoy applies none; see
+`internal-docs/envoy-divergences.md`, row 27. The terms for certificates and
+the handshake are in [TLS](../../operations/tls/).
 
 ### Request body size limit
 
@@ -457,24 +655,30 @@ another provider. Each in-flight request can hold up to this many bytes in
 memory, so a higher limit increases the memory that concurrent requests can
 use. The shorthand `listen: host:port` form always uses the 1 MiB default.
 
-The schema's description says certificate files under `tls` are "watched and
-hot-reloaded on change." The mechanism for a live swap exists internally
-(`SwapCertResolver`/`update_certificates` in `crates/proxy-core/src/tls/`,
-backed by an atomic pointer swap), but nothing in the running proxy calls it
-on a filesystem change today — there is no file watcher wired up, and the
-repository has no file-watching dependency at all. `update_certificates` is
-exercised only by a test (`crates/proxy-core/tests/tls.rs`). In practice, a
-renewed certificate needs a process restart, the same as every other file
-this configuration reads once at startup.
+The proxy reads the certificate files once at startup. No file watcher
+exists, so a renewed certificate needs a process restart, as for every other
+file this configuration reads once. The code can swap a certificate at run
+time (`update_certificates` in `crates/proxy-core/src/tls/`), but only when an
+xDS secret (SDS) delivers the new certificate
+(`crates/proxy-core/src/tls/secret_registry.rs`). The `--config` format has no
+SDS field. See [TLS](../../operations/tls/).
 
-## A schema/code note worth knowing
+## Schema and code differences
 
-The `observability` field's schema description says metrics "are always
-computed and exposed on the admin endpoint when `admin` is configured." As
-implemented today, `/stats` and `/stats/prometheus` both report real
-per-cluster request counts and latencies, but not every metric a reader might
-expect from that sentence exists yet — see
-[Metrics and /stats](../observability/metrics-and-stats/) for exactly which
-counters are wired to real traffic and which are defined but never
-incremented. Both endpoints are read-only and take no configuration beyond
-the `admin` bind address itself.
+The schema and the code disagree in these places. This page follows the code,
+and the list is a request to correct the schema descriptions.
+
+- `observability.tracing` says "nothing exports a span yet". The proxy exports
+  spans. See [`observability`](#observability-observability).
+- The top-level `observability` description says two instruments are "defined
+  but NOT yet recorded". For the current list of instruments, see
+  [Metrics and /stats](../../observability/metrics-and-stats/) and
+  [Admin endpoints](../../observability/admin-endpoints/). Both endpoints are
+  read-only and take no configuration beyond the `admin` bind address.
+- `models` and `models.<name>.providers` say that only `providers[0]` serves
+  traffic. See "The `models` catalogue".
+- `ModelProvider.model` says the upstream model ID is not substituted. See
+  "The `models` catalogue".
+- `Provider.protocol` says `http2` keeps one connection per worker. The code
+  keeps up to 4 per address. See
+  [Providers and clusters](../../providers-and-routing/providers-and-clusters/).

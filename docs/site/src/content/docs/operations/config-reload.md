@@ -3,7 +3,7 @@ title: Config reload
 summary: SIGHUP re-reads the config file a running proxy booted with and
   publishes a new snapshot. A config that fails to parse or validate leaves
   the proxy serving the previous snapshot and logs the full error.
-last_updated: 2026-08-09
+last_updated: 2026-10-13
 related:
   - ../configuration/configuration-file/
   - ../observability/metrics-and-stats/
@@ -47,7 +47,7 @@ booted with, then applies the result in this order
 1. Resolve stats handles for any cluster the new snapshot names that the
    running process has never seen before, so traffic to a brand-new cluster
    is counted in `/stats` from its first request — see
-   [Metrics and /stats](../observability/metrics-and-stats/).
+   [Metrics and /stats](../../observability/metrics-and-stats/).
 2. Update the shared cluster manager with the new cluster set. A cluster
    that fails to build (an unimplemented load-balancing policy, a bad TLS
    config) is logged at `error` and left out of the live cluster set —
@@ -79,16 +79,39 @@ re-read from disk on a reload, since the whole config file is re-parsed
 from scratch — this is the practical way to rotate a file-based secret
 without a restart, even though nothing watches the file automatically.
 
-The admin server's `/config_dump` and `/clusters` endpoints do **not**
-reflect a reload: they read a separate snapshot handle, taken once at
-startup, that a `SIGHUP` reload never publishes into
-(`crates/proxy/src/main.rs`'s `start_admin` builds its own
-`WorkerConfigHandle` from the boot snapshot; `reload`'s `publisher.publish`
-only reaches the handles `WorkerPool::spawn` created for workers,
-`crates/proxy-core/src/runtime.rs`). If you need to confirm a reload took
-effect, check the data plane itself (a new listener port becoming
-connectable, or `/stats` picking up a new cluster) or the `SIGHUP: config
-reload succeeded` log line, not `/config_dump`.
+The admin server's `/config_dump` and `/clusters` endpoints reflect a reload.
+The admin server and the workers register their snapshot handles with one
+registry, and a reload publishes into every handle in it. The end-to-end test
+`sighup_reload_is_reflected_in_config_dump_and_clusters` in
+`crates/proxy/tests/reload.rs` renames a cluster, sends `SIGHUP`, and checks
+that both endpoints show the new name. The unit test
+`start_admin_registers_its_handle_into_the_shared_registry` in
+`crates/proxy/src/main.rs` checks that a snapshot published through the shared
+registry reaches `/config_dump`. Before this fix both endpoints served the boot
+snapshot after a reload.
+
+These items also change on a reload:
+
+- **Stats series.** A reload hides the series of a cluster or listener that the
+  new config no longer names. After two consecutive configs omit the name, the
+  proxy frees the series slot. A name that returns later starts at zero. See
+  [Metrics and /stats](../../observability/metrics-and-stats/#series-lifetime-and-reload).
+- **Rate card (`pricing`).** Without a control-plane store, a reload installs a
+  changed `pricing`. A reload with an unchanged `pricing` keeps a card that
+  `PUT /pricing` installed. With a store, a reload never replaces the stored
+  card. Tests: `without_a_store_a_changed_configured_card_is_installed_on_reload`,
+  `without_a_store_a_reload_that_did_not_change_the_card_keeps_a_put_card`, and
+  `with_a_store_a_reload_never_replaces_the_stored_card` in
+  `crates/proxy-filters/src/usage_filter/rate_card_tests.rs`.
+- **Global connection limit.** The accept loop reads the limit and the
+  listener's `ignore_global_conn_limit` from the current snapshot on each
+  accepted connection. A reload applies to the next connection
+  (`crates/proxy-core/src/listener.rs:854-858`).
+- **Tenant-budget cutover.** `PUT /tenants/{id}/budget` returns `409` while the
+  serving spend filter lacks `legacy_tenant_budget_cutover`. Each build of the
+  filter records the value, so a reload that adds the field lifts the `409`
+  (`crates/proxy-filters/src/spend_limit_filter.rs:511-516`). See
+  [Spend policies](../../limits-and-budgets/spend-policies/#migrating-tenant-budgets).
 
 ## SIGTERM after a reload
 
@@ -96,5 +119,5 @@ A `SIGHUP` reload does not disturb the shutdown/drain sequence: a `SIGTERM`
 sent after one or more reloads still drains and exits cleanly, proven by
 `sigterm_after_a_reload_still_drains_and_exits_cleanly` in
 `crates/proxy/tests/reload.rs`. See
-[Draining and shutdown](../operations/draining-and-shutdown/) for what that
+[Draining and shutdown](../../operations/draining-and-shutdown/) for what that
 sequence does.

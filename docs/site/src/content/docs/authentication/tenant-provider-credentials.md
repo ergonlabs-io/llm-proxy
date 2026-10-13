@@ -4,7 +4,7 @@ summary: Let a tenant send its traffic on its own provider key. Covers strict
   tenant mode, Envoy-mode setup with the key-encryption key file and the
   cluster slot, the admin API and its save-time key check, access-log and
   counter attribution, budget scope, and what does not work yet.
-last_updated: 2026-10-11
+last_updated: 2026-10-13
 related:
   - ../authentication/virtual-keys/
   - ../authentication/managing-secrets/
@@ -159,7 +159,7 @@ routes:
 ```
 
 The field reference is in
-[Configuration file](../configuration/configuration-file/), section
+[Configuration file](../../configuration/configuration-file/), section
 `auth.tenant_credentials`.
 The header is derived from the provider type. `anthropic` uses `x-api-key`,
 `azure-openai` uses `api-key`, and the other header types use `Authorization:
@@ -269,7 +269,7 @@ key files, `previous_keys`, or the store.
 ### 5. Create the tenant, its virtual key, and its stored key
 
 Create the tenant and a virtual key as described in
-[Virtual keys](../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
 Then store the tenant key. The proxy checks the key with the provider before it
 stores it. The next request from that tenant uses the key.
 
@@ -385,7 +385,7 @@ Three routes manage a tenant's stored keys. They sit under the same bearer
 token as the other admin write routes. Set `LLMPROXY_ADMIN_TOKEN` and send it
 as `Authorization: Bearer`. The routes also accept the scoped
 `/chains/{stat_prefix}/...` form. See
-[Virtual keys](../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
 
 | Method and path | Request body | Success |
 |---|---|---|
@@ -446,9 +446,15 @@ Two access-log operators show the attribution:
 | `%LLM_TENANT%` | The authenticated tenant id. `-` when the request is not authenticated. |
 | `%LLM_CREDENTIAL_SOURCE%` | `platform` or `tenant`. The source of the last provider credential applied to this request. `-` when no credential was applied, for example after a `403 tenant_credential_missing`. |
 
-Both operators are in the [access log reference](../observability/access-logs/#the-operator-set).
+Both operators are in the [access log reference](../../observability/access-logs/#the-operator-set).
 Test: `access_log_renders_the_credential_source_the_router_chose` in
 `crates/proxy-http/tests/router_tenant_credentials.rs`.
+
+The fixed access-log formats of the `llmproxy` config file include
+`%LLM_TENANT%` but not `%LLM_CREDENTIAL_SOURCE%`. To log the credential
+source, use Envoy mode and set `log_format` on the access logger
+(`crates/proxy-simple-config/src/lower.rs`, `ACCESS_LOG_TEXT_FORMAT` and
+`lower_access_log`).
 
 ### Counter
 

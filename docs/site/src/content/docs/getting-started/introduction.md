@@ -4,7 +4,7 @@ summary: llm-proxy is a Rust proxy for LLM inference APIs, configured with a
   single YAML file (schema/llmproxy-v0.schema.json). It meters tokens,
   enforces token-based rate limits, fails over between same-dialect
   providers, and authenticates callers.
-last_updated: 2026-08-09
+last_updated: 2026-10-13
 related:
   - ../getting-started/quickstart/
   - ../configuration/configuration-file/
@@ -24,12 +24,12 @@ llm-proxy is configured with a single YAML file, normatively defined by
 `schema/llmproxy-v0.schema.json`. You name providers and routes by model
 pattern; llm-proxy handles the rest. Parsing is strict — an unknown or
 misspelled field is a load error naming its exact dotted path, never a
-silent ignore. [Configuration file reference](../configuration/configuration-file/)
+silent ignore. [Configuration file reference](../../configuration/configuration-file/)
 is the field-by-field reference.
 
 ## What ships today
 
-Four LLM-specific behaviors are implemented and exercised by tests:
+These LLM-specific behaviors are implemented and exercised by tests:
 
 - **Token metering.** Every response is parsed for token counts — OpenAI chat
   completions, OpenAI Responses, and Anthropic Messages, streaming and
@@ -57,12 +57,25 @@ Four LLM-specific behaviors are implemented and exercised by tests:
   provider is reached. Authentication fails closed; authorization (which
   models or providers an authenticated caller may use) is a separate,
   currently open, axis (`crates/proxy-filters/src/auth_filter.rs`).
+- **Spend budgets and pricing.** Tenant and key budgets in US dollars, priced
+  from a rate card. See [Spend policies](../../limits-and-budgets/spend-policies/).
+- **Tenant provider credentials.** A tenant can store its own provider key.
+  See [Tenant provider credentials](../../authentication/tenant-provider-credentials/).
+- **Admin API and UI.** Read endpoints, a bearer-gated write API, and a
+  browser UI at `/ui`. See [Admin endpoints](../../observability/admin-endpoints/).
+- **OTLP metrics export.** The `metrics` block sets an OTLP/gRPC collector
+  (`schema/llmproxy-v0.schema.json`). No docs page covers it yet.
+- **Request capture.** See [Request capture](../../observability/request-capture/).
+- **External authorization.** See
+  [External authorization](../../authentication/external-authorization/).
+- **Envoy config and xDS.** The same engine loads an Envoy bootstrap and
+  takes xDS updates. See [xDS conformance](../../operations/xds-conformance/).
 
 ## What it is not
 
 llm-proxy does not watch its config file for changes. A running process
 re-reads its config only on `SIGHUP` — see
-[Config reload](../operations/config-reload/) — never automatically. Changing a
+[Config reload](../../operations/config-reload/) — never automatically. Changing a
 config file on disk has no effect until you either send `SIGHUP` or restart
 the process.
 
@@ -71,5 +84,5 @@ is not yet a general "try any provider on failure" mechanism. And the
 `models` catalogue in the configuration (a named model mapped to an ordered
 list of providers) records every provider you list but, in this schema
 version, only ever routes to the first one; see
-[Configuration file reference](../configuration/configuration-file/)
+[Configuration file reference](../../configuration/configuration-file/)
 for the exact field-by-field behavior.
