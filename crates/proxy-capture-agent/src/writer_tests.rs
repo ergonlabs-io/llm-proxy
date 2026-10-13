@@ -386,3 +386,39 @@ fn an_inspection_ends_collection_and_an_inspection_alone_keeps_the_cohort() {
     assert_eq!(answered, [1]);
     drop(jobs);
 }
+
+#[tokio::test]
+async fn an_inspection_queued_behind_records_is_answered_after_their_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let (jobs, queue) = mpsc::sync_channel(MAX_CLIENTS);
+    let mut receipts = Vec::new();
+    for n in 0..3 {
+        let (job, receipt) = new_job(n, payload(&format!("before-{n}")));
+        jobs.try_send(job).unwrap();
+        receipts.push(receipt);
+    }
+    let (reply, stats) = oneshot::channel();
+    jobs.try_send(Work::Inspect(InspectJob {
+        query: Query::Stats,
+        tenants: Vec::new(),
+        reply,
+    }))
+    .unwrap();
+    // Start the writer only now, so one collection finds all four items queued.
+    let thread = spawn_writer(directory.path(), queue, HOUR, Duration::ZERO);
+    let answer = timeout(WAIT, stats).await.expect("no stats reply").unwrap();
+    let InspectReply::Stats(reply) = answer else {
+        panic!("a stats query is answered with stats");
+    };
+    let snapshot = reply.stats.expect("stats are available");
+    // The records were queued first, so the answer must include them.
+    assert_eq!(snapshot.retained_records, 3);
+    assert_eq!(snapshot.durable_through_sequence, 3);
+    assert_eq!(snapshot.durable_total, 3);
+    for receipt in receipts {
+        let receipt = timeout(WAIT, receipt).await.expect("no receipt").unwrap();
+        assert_eq!(receipt.outcome, Outcome::Durable);
+    }
+    drop(jobs);
+    thread.join().unwrap();
+}

@@ -38,6 +38,17 @@ impl Harness {
     /// Starts an agent whose only grant has `tenants` and `inspect`. `seed`
     /// holds `(event_id, tenant)` records appended to the spool beforehand.
     fn start(tenants: &[&str], inspect: bool, seed: &[(&str, &str)]) -> Self {
+        Self::start_acknowledged(tenants, inspect, seed, 0)
+    }
+
+    /// As `start`, with the seeded records acknowledged through a sequence, which
+    /// nothing in the agent does.
+    fn start_acknowledged(
+        tenants: &[&str],
+        inspect: bool,
+        seed: &[(&str, &str)],
+        acknowledged_through: u64,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_path_buf();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -84,6 +95,9 @@ impl Harness {
                 appended.unwrap();
             }
             spool.commit().unwrap();
+            if acknowledged_through > 0 {
+                spool.acknowledge(acknowledged_through).unwrap();
+            }
         }
         let socket = config.socket_path.clone();
         let agent = Agent::start(config).unwrap();
@@ -321,10 +335,99 @@ async fn out_of_range_queries_are_invalid_and_leave_the_connection_usable() {
         let reply = client.stats_with_version(VERSION + 1).await;
         assert_eq!(reply.outcome, InspectOutcome::Invalid);
         assert!(reply.stats.is_none());
+        // Payloads that are not valid queries get the same answer.
+        write_frame(&mut client.0, Kind::RecordsQuery, b"{not json")
+            .await
+            .unwrap();
+        let frame = read_frame(&mut client.0).await.unwrap();
+        assert_eq!(frame.kind, Kind::RecordsReply);
+        let reply: RecordsReply = decode(&frame.payload).unwrap();
+        assert_eq!(reply.outcome, InspectOutcome::Invalid);
+        assert!(reply.records.is_empty());
+        write_frame(&mut client.0, Kind::StatsQuery, b"[]")
+            .await
+            .unwrap();
+        let frame = read_frame(&mut client.0).await.unwrap();
+        assert_eq!(frame.kind, Kind::StatsReply);
+        let reply: StatsReply = decode(&frame.payload).unwrap();
+        assert_eq!(reply.outcome, InspectOutcome::Invalid);
         // The bound itself is accepted, on the same connection.
         let reply = client.records(0, 100).await;
         assert_eq!(reply.outcome, InspectOutcome::Ok);
         assert_eq!(reply.records.len(), 1);
+        harness.stop().await;
+    })
+    .await
+    .expect("test exceeded its deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clean_client_closes_do_not_count_as_agent_failures() {
+    timeout(WAIT, async {
+        let harness = Harness::start(&["default"], true, &[]);
+        // The proxy's pattern: one connection per query, closed after the reply.
+        for n in 0..3 {
+            let mut client = harness.connect().await;
+            client.submit(&format!("e{n}"), "default").await;
+            assert_eq!(client.stats().await.outcome, InspectOutcome::Ok);
+            drop(client);
+            let mut client = harness.connect().await;
+            assert_eq!(client.records(0, 10).await.outcome, InspectOutcome::Ok);
+        }
+        // A close is counted when the serving task notices it, so give the
+        // last ones a moment; the failure being excluded would show by then.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut client = harness.connect().await;
+        let stats = client.stats().await.stats.unwrap();
+        assert_eq!(stats.failures_total, 0);
+        assert_eq!(stats.durable_total, 3);
+        harness.stop().await;
+    })
+    .await
+    .expect("test exceeded its deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_cut_mid_frame_still_counts_as_a_failure() {
+    timeout(WAIT, async {
+        let harness = Harness::start(&["default"], true, &[]);
+        let mut cut = harness.connect().await;
+        // A header that promises a body, then the peer vanishes.
+        tokio::io::AsyncWriteExt::write_all(&mut cut.0, b"LMC1")
+            .await
+            .unwrap();
+        drop(cut);
+        let mut client = harness.connect().await;
+        let failures = loop {
+            let stats = client.stats().await.stats.unwrap();
+            if stats.failures_total > 0 {
+                break stats.failures_total;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(failures, 1);
+        harness.stop().await;
+    })
+    .await
+    .expect("test exceeded its deadline");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_page_never_moves_the_cursor_below_the_acknowledged_sequence() {
+    timeout(WAIT, async {
+        let harness = Harness::start_acknowledged(
+            &["default"],
+            true,
+            &[("e1", "default"), ("e2", "default")],
+            2,
+        );
+        let mut client = harness.connect().await;
+        let page = client.records(0, 10).await;
+        assert_eq!(page.outcome, InspectOutcome::Ok);
+        assert!(page.records.is_empty());
+        assert_eq!(page.next_after_sequence, 2);
+        // A cursor already past the acknowledged point is kept.
+        assert_eq!(client.records(5, 10).await.next_after_sequence, 5);
         harness.stop().await;
     })
     .await

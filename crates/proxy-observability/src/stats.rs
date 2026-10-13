@@ -848,7 +848,7 @@ pub mod instruments {
         buckets: None,
     };
 
-    // Rust note: a declarative macro stamps out the eight near-identical
+    // Rust note: a declarative macro stamps out the nine near-identical
     // attribute-less gauge definitions below; each expands to a `pub const`.
     macro_rules! spool_gauge {
         ($const_name:ident, $name:literal, $unit:literal, $doc:literal) => {
@@ -908,7 +908,15 @@ pub mod instruments {
         CAPTURE_AGENT_REACHABLE,
         "llmproxy_capture_agent_reachable",
         "1",
-        "1 when the last poll of the capture agent succeeded, else 0."
+        "1 when the capture agent answered the last poll (even with a refusal), 0 when \
+         it could not be reached."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_STATS_AVAILABLE,
+        "llmproxy_capture_spool_stats_available",
+        "1",
+        "1 when the last poll returned spool stats, 0 when the agent refused or could \
+         not answer (the spool gauges are then stale)."
     );
 
     /// Records successfully delivered by the collector thread: append-write in
@@ -992,15 +1000,20 @@ pub fn record_tenant_credential_request(
 /// remembers the last values it set and applies the difference; the mutex is
 /// uncontended because only the poller calls it.
 ///
-/// Unreachable choice: `publish(None)` sets only
-/// `llmproxy_capture_agent_reachable` to 0 and keeps the last spool values.
-/// Zeroing them would read as "spool empty and healthy" during an outage;
-/// stale values plus `reachable 0` say "unknown since the last good poll".
-/// Before the first successful poll every gauge is 0, including reachable.
+/// Two separate questions, two gauges. `llmproxy_capture_agent_reachable` is 0
+/// only when the agent could not be reached (transport failure); any answer,
+/// including a refusal for a grant without `"inspect": true` or a close from an
+/// agent too old to know the query, is 1, because record delivery works.
+/// `llmproxy_capture_spool_stats_available` is 1 only when stats came back.
+///
+/// When stats are not available the spool gauges keep their last values:
+/// zeroing them would read as "spool empty and healthy"; stale values plus
+/// `stats_available 0` say "unknown since the last good poll". Before the
+/// first successful poll every gauge is 0.
 pub struct CaptureSpoolStats {
     registry: Arc<Registry>,
-    gauges: [Handle; 8],
-    last: Mutex<[u64; 8]>,
+    gauges: [Handle; 9],
+    last: Mutex<[u64; 9]>,
 }
 
 impl CaptureSpoolStats {
@@ -1016,18 +1029,28 @@ impl CaptureSpoolStats {
                 &instruments::CAPTURE_SPOOL_DURABLE_THROUGH,
                 &instruments::CAPTURE_SPOOL_POISONED,
                 &instruments::CAPTURE_AGENT_REACHABLE,
+                &instruments::CAPTURE_SPOOL_STATS_AVAILABLE,
             ]
             .map(|instrument| control.resolve(instrument, &[])),
-            last: Mutex::new([0; 8]),
+            last: Mutex::new([0; 9]),
         }
     }
 
-    /// `Some` is a successful poll; `None` means the agent was unreachable.
-    pub fn publish(&self, snapshot: Option<&proxy_capture_protocol::SpoolSnapshot>) {
+    /// Publishes one poll result. `Ok` sets every gauge; `Err(Unreachable)`
+    /// clears `reachable` and `stats_available`; any other error means the
+    /// agent answered, so `reachable` is 1 and `stats_available` is 0.
+    pub fn publish(
+        &self,
+        result: Result<
+            &proxy_capture_protocol::SpoolSnapshot,
+            crate::capture_transport::InspectError,
+        >,
+    ) {
+        use crate::capture_transport::InspectError;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = *last;
-        match snapshot {
-            Some(s) => {
+        match result {
+            Ok(s) => {
                 next = [
                     s.retained_records,
                     s.pending_records,
@@ -1037,9 +1060,13 @@ impl CaptureSpoolStats {
                     s.durable_through_sequence,
                     u64::from(s.poisoned),
                     1,
+                    1,
                 ];
             }
-            None => next[7] = 0,
+            Err(error) => {
+                next[7] = u64::from(error != InspectError::Unreachable);
+                next[8] = 0;
+            }
         }
         for ((handle, old), new) in self.gauges.iter().zip(last.iter()).zip(next.iter()) {
             // Wrapping difference as i64: `add` applies it back as u64 wrapping.
@@ -2554,14 +2581,15 @@ mod tests {
     }
 
     #[test]
-    fn capture_spool_publish_sets_absolute_values_and_keeps_them_when_unreachable() {
+    fn capture_spool_publish_separates_reachable_from_stats_available() {
+        use crate::capture_transport::InspectError;
         let control = StatsControl::new(1);
         let stats = CaptureSpoolStats::resolve(&control);
         let registry = control.registry();
         let value =
             |instrument: &'static Instrument| registry.value(control.resolve(instrument, &[]));
 
-        stats.publish(Some(&spool_snapshot(8, false)));
+        stats.publish(Ok(&spool_snapshot(8, false)));
         assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 8);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_PENDING), 5);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_DISK_BYTES), 4096);
@@ -2570,26 +2598,49 @@ mod tests {
         assert_eq!(value(&instruments::CAPTURE_SPOOL_DURABLE_THROUGH), 9);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 0);
         assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE), 1);
 
         // A decrease, a flag flip, and a repeat must all land as absolutes.
-        stats.publish(Some(&spool_snapshot(3, true)));
-        stats.publish(Some(&spool_snapshot(3, true)));
+        stats.publish(Ok(&spool_snapshot(3, true)));
+        stats.publish(Ok(&spool_snapshot(3, true)));
         assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 1);
 
-        stats.publish(None);
+        // Only a transport failure reads as unreachable; spool values stay.
+        stats.publish(Err(InspectError::Unreachable));
         assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 0);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE), 0);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 1);
 
-        stats.publish(Some(&spool_snapshot(2, false)));
+        // An answering agent that cannot give stats is reachable.
+        for error in [
+            InspectError::Unauthorized,
+            InspectError::Invalid,
+            InspectError::Unavailable,
+            InspectError::Unsupported,
+        ] {
+            stats.publish(Err(InspectError::Unreachable));
+            stats.publish(Err(error));
+            assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1, "{error:?}");
+            assert_eq!(
+                value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE),
+                0,
+                "{error:?}"
+            );
+            assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3, "{error:?}");
+        }
+
+        stats.publish(Ok(&spool_snapshot(2, false)));
         assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE), 1);
         assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 2);
 
         // `/stats` omits names Envoy never had; the scrape is the operator surface.
         let scrape = prometheus_render::render(&registry);
         assert!(scrape.contains("envoy_llmproxy_capture_spool_retained_records 2"));
         assert!(scrape.contains("envoy_llmproxy_capture_agent_reachable 1"));
+        assert!(scrape.contains("envoy_llmproxy_capture_spool_stats_available 1"));
     }
 
     // ---- 1: resolve identity -------------------------------------------

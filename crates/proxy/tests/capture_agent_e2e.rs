@@ -867,6 +867,9 @@ fn inspect_rig(inspect: bool) -> InspectRig {
                 "test-node",
                 "--request-records-producer",
                 "test-proxy",
+                // The first poll waits one period; keep it short for tests.
+                "--capture-spool-poll-interval-ms",
+                "100",
             ])
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())
@@ -994,9 +997,10 @@ fn spool_inspection_pages_records_and_gates_them_behind_the_admin_token() {
     );
     assert!(status.contains(" 401"), "{status}");
 
-    // The poller's first tick is immediate, so the gauges are already live.
     wait(|| {
-        get(rig.admin, "/stats/prometheus").contains("envoy_llmproxy_capture_agent_reachable 1")
+        let scrape = get(rig.admin, "/stats/prometheus");
+        scrape.contains("envoy_llmproxy_capture_agent_reachable 1")
+            && scrape.contains("envoy_llmproxy_capture_spool_stats_available 1")
     });
     drop(rig.proxy);
 }
@@ -1013,7 +1017,12 @@ fn spool_inspection_without_an_inspect_grant_is_forbidden() {
     assert!(status.contains(" 403"), "{status} {body}");
     let (status, _) = get_with(rig.admin, "/capture/spool/stats", &[]);
     assert!(status.contains(" 403"), "{status}");
+    // The agent answered (with a refusal), so it is reachable; only the stats
+    // are unavailable. Reachable 0 here would warn about an outage that is
+    // really a missing `"inspect": true`.
     wait(|| {
-        get(rig.admin, "/stats/prometheus").contains("envoy_llmproxy_capture_agent_reachable 0")
+        let scrape = get(rig.admin, "/stats/prometheus");
+        scrape.contains("envoy_llmproxy_capture_agent_reachable 1")
+            && scrape.contains("envoy_llmproxy_capture_spool_stats_available 0")
     });
 }

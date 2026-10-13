@@ -196,14 +196,20 @@ async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
 /// record contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InspectError {
-    /// Connect, handshake, I/O, or deadline failure; the agent may be down.
+    /// Connect, handshake, or deadline failure before the agent answered
+    /// `Welcome`; the agent may be down.
     #[error("capture agent unreachable")]
     Unreachable,
+    /// The handshake succeeded, then the agent closed the connection or the
+    /// stream ended before a reply: an agent too old to know the inspection
+    /// frame kinds. The agent is up, so this is not a transport failure.
+    #[error("capture agent closed the connection on the inspection query")]
+    Unsupported,
     /// The agent refused the producer: its grant lacks `inspect`.
     #[error("capture agent refused the inspection query")]
     Unauthorized,
     /// The agent rejected the query, or sent a reply that breaks the protocol.
-    #[error("capture agent rejected or sent an invalid inspection exchange")]
+    #[error("capture agent rejected the inspection query as invalid, or sent a malformed reply")]
     Invalid,
     /// The agent is up but could not read its spool.
     #[error("capture agent spool unavailable")]
@@ -229,15 +235,29 @@ async fn inspect_exchange(
     query: Vec<u8>,
 ) -> Result<Vec<u8>, InspectError> {
     let exchange = async {
-        let mut stream = connect(config).await?;
-        write_frame(&mut stream, query_kind, &query).await?;
-        let frame = read_frame(&mut stream).await?;
-        Ok::<_, io::Error>(frame)
+        // Failures up to and including the handshake mean the agent is not
+        // reachable; failures after `Welcome` are classified separately.
+        let mut stream = connect(config)
+            .await
+            .map_err(|_| InspectError::Unreachable)?;
+        let after_welcome = |error: io::Error| match error.kind() {
+            // An agent that does not know the frame kind closes on it.
+            io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe => InspectError::Unsupported,
+            _ => InspectError::Unreachable,
+        };
+        write_frame(&mut stream, query_kind, &query)
+            .await
+            .map_err(after_welcome)?;
+        read_frame(&mut stream).await.map_err(after_welcome)
     };
+    // A deadline is `Unreachable`: a silent agent is indistinguishable from a
+    // down one.
     let frame = tokio::time::timeout(deadline, exchange)
         .await
-        .map_err(|_| InspectError::Unreachable)?
-        .map_err(|_| InspectError::Unreachable)?;
+        .map_err(|_| InspectError::Unreachable)??;
     if frame.kind != reply_kind {
         return Err(InspectError::Invalid);
     }

@@ -81,10 +81,13 @@
 //! Capture-agent inspection: `GET /capture/spool/stats` (ungated spool
 //! counters) and `GET /capture/spool/records?after=&limit=` (stored request
 //! records; **gated like the spend read**, since they are end-user metadata).
-//! Both open a fresh handshaken connection to the capture agent per request
-//! under a 2 s deadline, and answer 404 when no agent endpoint is configured,
-//! 503 when it is unreachable, and (records only) 403 when the agent's
-//! producer grant lacks `"inspect": true`.
+//! Each query opens a fresh handshaken connection to the capture agent under a
+//! 2 s deadline. Both answer 404 when no agent endpoint is configured, 503
+//! when it is unreachable, 403 when the agent's producer grant lacks
+//! `"inspect": true`, and 501 when the agent closes on the query because it
+//! predates inspection (retrying cannot help; upgrade it). The ungated stats
+//! answer is cached for 5 s (single-flight, errors included), so a flood
+//! costs the agent at most one query per 5 s; records are never cached.
 //!
 //! Everything else 404s, naming the endpoints that exist. `/quitquitquit`,
 //! `/logging`, and `/listeners` (Envoy admin endpoints) are not part of this

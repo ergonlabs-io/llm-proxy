@@ -13,7 +13,7 @@ use proxy_observability::capture_transport::AgentTransportConfig;
 use tokio::net::{UnixListener, UnixStream};
 
 use super::*;
-use crate::server::CaptureAgentProvider;
+use crate::server::{serve_with_stats_ttl, CaptureAgentProvider, CAPTURE_STATS_TTL};
 
 const NODE: &str = "node-1";
 /// Marks the stored record so a test can prove contents reach the caller.
@@ -35,6 +35,16 @@ struct FakeAgent {
 impl FakeAgent {
     /// `outcome` is what every query is answered with.
     fn start(outcome: InspectOutcome) -> Self {
+        Self::spawn(outcome, false)
+    }
+
+    /// An agent that completes the handshake, then closes on any query, as an
+    /// agent predating spool inspection does for the unknown frame kind.
+    fn start_closing_on_query() -> Self {
+        Self::spawn(InspectOutcome::Ok, true)
+    }
+
+    fn spawn(outcome: InspectOutcome, close_on_query: bool) -> Self {
         // `tempdir()` creates the directory 0700, so only this user can reach the socket.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("agent.sock");
@@ -48,7 +58,7 @@ impl FakeAgent {
                 };
                 let seen = Arc::clone(&seen_by_task);
                 tokio::spawn(async move {
-                    let _ = serve_one(stream, outcome, seen).await;
+                    let _ = serve_one(stream, outcome, close_on_query, seen).await;
                 });
             }
         });
@@ -100,6 +110,7 @@ fn snapshot() -> SpoolSnapshot {
 async fn serve_one(
     mut stream: UnixStream,
     outcome: InspectOutcome,
+    close_on_query: bool,
     seen: Arc<Mutex<Vec<Seen>>>,
 ) -> std::io::Result<()> {
     read_frame(&mut stream).await?; // Hello
@@ -109,6 +120,9 @@ async fn serve_one(
     })?;
     write_frame(&mut stream, Kind::Welcome, &welcome).await?;
     let frame = read_frame(&mut stream).await?;
+    if close_on_query {
+        return Ok(());
+    }
     let ok = outcome == InspectOutcome::Ok;
     match frame.kind {
         Kind::StatsQuery => {
@@ -152,8 +166,16 @@ async fn start_admin(
     admin_token: Option<&str>,
     capture_agent: Option<CaptureAgentProvider>,
 ) -> (AdminServer, SocketAddr) {
+    start_admin_with_ttl(admin_token, capture_agent, CAPTURE_STATS_TTL).await
+}
+
+async fn start_admin_with_ttl(
+    admin_token: Option<&str>,
+    capture_agent: Option<CaptureAgentProvider>,
+    stats_ttl: Duration,
+) -> (AdminServer, SocketAddr) {
     let config = SnapshotHandles::new().register(snapshot_with_secret());
-    let server = serve(
+    let server = serve_with_stats_ttl(
         "127.0.0.1:0".parse().unwrap(),
         AdminRuntime {
             config,
@@ -168,6 +190,7 @@ async fn start_admin(
             credential_probe: None,
             capture_agent,
         },
+        stats_ttl,
     )
     .await
     .expect("admin server bind");
@@ -333,4 +356,83 @@ async fn agent_refusals_map_to_403_with_an_inspect_hint_and_503_otherwise() {
         }
         assert!(!body.contains(RECORD_MARKER));
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_that_closes_on_the_query_is_501_with_an_upgrade_hint() {
+    let agent = FakeAgent::start_closing_on_query();
+    let (_server, addr) = start_admin(Some(ADMIN_TOKEN), provider(agent.config())).await;
+    for (path, bearer) in [
+        ("/capture/spool/stats", None),
+        ("/capture/spool/records", Some(ADMIN_TOKEN)),
+    ] {
+        let (status, body) = call(addr, path, bearer).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}: {body}");
+        assert!(body.contains("upgrade the capture agent"), "{path}: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_query_outcome_says_so_instead_of_claiming_the_agent_is_unavailable() {
+    let agent = FakeAgent::start(InspectOutcome::Invalid);
+    let (_server, addr) = start_admin(Some(ADMIN_TOKEN), provider(agent.config())).await;
+    let (status, body) = call(addr, "/capture/spool/records", Some(ADMIN_TOKEN)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("rejected the query as invalid"), "{body}");
+    assert!(!body.contains("unavailable"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_are_single_flight_cached_so_a_flood_costs_one_agent_query() {
+    let agent = FakeAgent::start(InspectOutcome::Ok);
+    // A long TTL makes "within the window" deterministic on a loaded box.
+    let (_server, addr) =
+        start_admin_with_ttl(None, provider(agent.config()), Duration::from_secs(3600)).await;
+
+    let concurrent: Vec<_> = (0..8)
+        .map(|_| tokio::spawn(call(addr, "/capture/spool/stats", None)))
+        .collect();
+    for task in concurrent {
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"retained_records\":12"), "{body}");
+    }
+    for _ in 0..4 {
+        let (status, _) = call(addr, "/capture/spool/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        agent.seen(),
+        [Seen::Stats],
+        "twelve requests inside the window must cost exactly one agent query"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_are_queried_again_once_the_cache_window_has_passed() {
+    let agent = FakeAgent::start(InspectOutcome::Ok);
+    // A zero TTL is "always expired": the second GET is after the window.
+    let (_server, addr) =
+        start_admin_with_ttl(None, provider(agent.config()), Duration::ZERO).await;
+    for _ in 0..2 {
+        let (status, _) = call(addr, "/capture/spool/stats", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(agent.seen(), [Seen::Stats, Seen::Stats]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn records_are_not_cached() {
+    let agent = FakeAgent::start(InspectOutcome::Ok);
+    let (_server, addr) = start_admin_with_ttl(
+        Some(ADMIN_TOKEN),
+        provider(agent.config()),
+        Duration::from_secs(3600),
+    )
+    .await;
+    for _ in 0..2 {
+        let (status, _) = call(addr, "/capture/spool/records", Some(ADMIN_TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(agent.seen().len(), 2);
 }

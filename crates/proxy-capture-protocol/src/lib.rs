@@ -152,8 +152,9 @@ pub struct RecordsReply {
     pub records: Vec<SpooledRecord>,
     /// The cursor for the next page: the last sequence this page scanned,
     /// including records filtered out for another tenant, so a sparse page
-    /// still advances. Equal to the query's `after_sequence` when nothing
-    /// newer is durable.
+    /// still advances. When nothing newer is durable it is the query's
+    /// `after_sequence`, raised to the acknowledgement watermark if the query
+    /// asked below it, so a caller never re-asks for deleted records forever.
     pub next_after_sequence: u64,
     pub durable_through_sequence: u64,
 }
@@ -191,8 +192,20 @@ fn valid_length(kind: Kind, length: usize) -> bool {
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
+    read_frame_or_eof(r)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "capture stream closed"))
+}
+
+/// Like [`read_frame`], but a peer that closes cleanly between frames yields
+/// `None` instead of an error. A close inside a header or body is still
+/// `UnexpectedEof`.
+pub async fn read_frame_or_eof<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Frame>> {
     let mut header = [0; 9];
-    r.read_exact(&mut header).await?;
+    if r.read(&mut header[..1]).await? == 0 {
+        return Ok(None);
+    }
+    r.read_exact(&mut header[1..]).await?;
     if &header[..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -224,7 +237,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
     }
     let mut payload = vec![0; length];
     r.read_exact(&mut payload).await?;
-    Ok(Frame { kind, payload })
+    Ok(Some(Frame { kind, payload }))
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(
@@ -376,6 +389,33 @@ mod tests {
                 io::ErrorKind::UnexpectedEof
             );
         }
+    }
+
+    #[tokio::test]
+    async fn clean_close_between_frames_is_none_but_a_cut_frame_is_an_error() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        write_frame(&mut writer, Kind::Hello, b"a").await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert_eq!(
+            read_frame_or_eof(&mut reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"a"
+        );
+        assert!(read_frame_or_eof(&mut reader).await.unwrap().is_none());
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&header(MAGIC, 1, 4)[..3]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert_eq!(
+            read_frame_or_eof(&mut reader).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[tokio::test]

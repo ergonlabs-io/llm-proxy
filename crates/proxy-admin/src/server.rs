@@ -200,6 +200,31 @@ pub type CaptureAgentProvider = Arc<dyn Fn() -> Option<AgentTransportConfig> + S
 /// and decrypts a page under this budget; a slower answer reads as down.
 const CAPTURE_QUERY_DEADLINE: Duration = Duration::from_secs(2);
 
+/// How long `/capture/spool/stats` serves its last agent answer. The endpoint
+/// is ungated, so without this any admin-port caller could make the agent walk
+/// its spool directory once per request.
+pub(crate) const CAPTURE_STATS_TTL: Duration = Duration::from_secs(5);
+
+/// Single-flight cache for the stats query: the async mutex is held across the
+/// agent round trip, so concurrent callers queue behind one query and then read
+/// its result. A flood costs the agent at most one query per TTL. Errors are
+/// cached too, so a down agent is not hammered either. Records stay uncached.
+struct CaptureStatsCache {
+    ttl: Duration,
+    // Rust note: `tokio::sync::Mutex` (unlike `std::sync::Mutex`) may be held
+    // across `.await`, which is exactly what single-flight needs here.
+    last: tokio::sync::Mutex<Option<(Instant, Result<serde_json::Value, InspectError>)>>,
+}
+
+impl CaptureStatsCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            last: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("admin server failed to bind {addr}: {source}")]
@@ -411,6 +436,18 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 /// shape. Nothing here needs `!Send`/`Rc` -- this is ordinary control-plane
 /// code, never the worker-local data plane (ADR-0003).
 pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServer, AdminError> {
+    serve_with_stats_ttl(addr, runtime, CAPTURE_STATS_TTL).await
+}
+
+/// [`serve`] with the `/capture/spool/stats` cache lifetime as a parameter, so
+/// tests can expire it without sleeping the production 5 s.
+pub(crate) async fn serve_with_stats_ttl(
+    addr: SocketAddr,
+    runtime: AdminRuntime,
+    stats_ttl: Duration,
+) -> Result<AdminServer, AdminError> {
+    // One cache per server, shared by every connection (and so every caller).
+    let stats_cache = Arc::new(CaptureStatsCache::new(stats_ttl));
     let admin_token = normalize_admin_token(runtime.admin_token.clone());
     let listener = TcpListener::bind(addr)
         .await
@@ -432,10 +469,14 @@ pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServe
             let mut runtime = runtime.clone();
             let admin_token = admin_token.clone();
             runtime.admin_token = admin_token;
+            let stats_cache = Arc::clone(&stats_cache);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let runtime = runtime.clone();
-                    async move { Ok::<_, std::convert::Infallible>(handle(req, &runtime).await) }
+                    let stats_cache = Arc::clone(&stats_cache);
+                    async move {
+                        Ok::<_, std::convert::Infallible>(handle(req, &runtime, &stats_cache).await)
+                    }
                 });
                 if let Err(err) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -453,7 +494,11 @@ pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServe
     })
 }
 
-async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full<Bytes>> {
+async fn handle(
+    req: Request<Incoming>,
+    runtime: &AdminRuntime,
+    stats_cache: &CaptureStatsCache,
+) -> Response<Full<Bytes>> {
     let config = &runtime.config;
     let registry = runtime.registry.as_deref();
     let started_at = runtime.started_at;
@@ -588,7 +633,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
             };
         }
         "/capture/spool/stats" => {
-            return handle_capture_stats(runtime.capture_agent.as_ref()).await;
+            return handle_capture_stats(runtime.capture_agent.as_ref(), stats_cache).await;
         }
         _ => {}
     }
@@ -1360,7 +1405,7 @@ fn admin_gate(
     let Some(token) = admin_token else {
         tracing::warn!(
             endpoint = %path,
-            "admin write refused: LLMPROXY_ADMIN_TOKEN is not set, so admin write endpoints are disabled"
+            "admin request refused: LLMPROXY_ADMIN_TOKEN is not set, so admin write endpoints are disabled"
         );
         return Some(text(
             StatusCode::FORBIDDEN,
@@ -1372,7 +1417,7 @@ fn admin_gate(
         None => false,
     };
     if !authorized {
-        tracing::warn!(endpoint = %path, "admin write refused: missing or invalid bearer token");
+        tracing::warn!(endpoint = %path, "admin request refused: missing or invalid bearer token");
         return Some(unauthorized("missing or invalid bearer token"));
     }
     None
@@ -1383,11 +1428,30 @@ const CAPTURE_NOT_CONFIGURED: &str = "no capture agent is configured for this pr
 
 /// `GET /capture/spool/stats`: the agent's spool counters. Ungated like
 /// `/stats`: counts and byte sizes only, no record contents.
-async fn handle_capture_stats(provider: Option<&CaptureAgentProvider>) -> Response<Full<Bytes>> {
+async fn handle_capture_stats(
+    provider: Option<&CaptureAgentProvider>,
+    cache: &CaptureStatsCache,
+) -> Response<Full<Bytes>> {
     let Some(config) = provider.and_then(|p| p()) else {
         return text(StatusCode::NOT_FOUND, CAPTURE_NOT_CONFIGURED);
     };
-    match query_spool_stats(&config, CAPTURE_QUERY_DEADLINE).await {
+    let mut last = cache.last.lock().await;
+    let result = match &*last {
+        Some((at, result)) if at.elapsed() < cache.ttl => result.clone(),
+        _ => {
+            // Cached as the JSON the endpoint serves, so the admin crate does
+            // not name the protocol crate's snapshot type.
+            let result = query_spool_stats(&config, CAPTURE_QUERY_DEADLINE)
+                .await
+                .and_then(|snapshot| {
+                    serde_json::to_value(snapshot).map_err(|_| InspectError::Invalid)
+                });
+            *last = Some((Instant::now(), result.clone()));
+            result
+        }
+    };
+    drop(last);
+    match result {
         Ok(snapshot) => json(StatusCode::OK, &snapshot),
         Err(error) => capture_error(error),
     }
@@ -1472,7 +1536,17 @@ fn capture_error(error: InspectError) -> Response<Full<Bytes>> {
             StatusCode::FORBIDDEN,
             "the capture agent refused the query; the proxy's producer grant needs \"inspect\": true",
         ),
-        InspectError::Unreachable | InspectError::Unavailable | InspectError::Invalid => {
+        // 501, not 503: the agent is up and will never answer this query, so
+        // a retry cannot help; the fix is upgrading it.
+        InspectError::Unsupported => (
+            StatusCode::NOT_IMPLEMENTED,
+            "agent does not support spool inspection; upgrade the capture agent",
+        ),
+        InspectError::Invalid => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the capture agent rejected the query as invalid",
+        ),
+        InspectError::Unreachable | InspectError::Unavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, "capture agent unavailable")
         }
     };

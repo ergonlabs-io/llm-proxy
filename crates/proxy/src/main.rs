@@ -119,6 +119,16 @@ struct Args {
     /// explicitly reported as truncated; forwarding retry policy is unchanged.
     #[arg(long, requires="capture_destination", value_parser = clap::value_parser!(u16).range(1..=64))]
     request_record_max_attempts: Option<u16>,
+    /// Milliseconds between capture-agent spool polls; the first poll waits one
+    /// period. A parameter so integration tests need not sleep the default.
+    #[arg(
+        long = "capture-spool-poll-interval-ms",
+        hide = true,
+        value_name = "MS",
+        default_value_t = CAPTURE_SPOOL_POLL_INTERVAL.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    capture_spool_poll_interval_ms: u64,
 
     /// How long the drain sequence waits for connections to close before
     /// forcing worker shutdown (serve mode only).
@@ -543,6 +553,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
                 producer_id: args.request_records_producer.unwrap(),
             }
         }),
+        Duration::from_millis(args.capture_spool_poll_interval_ms),
     ))
 }
 
@@ -582,35 +593,111 @@ fn advance_link(prev: AgentLink, reachable: bool) -> (AgentLink, Option<LinkEven
     }
 }
 
+/// Poller memory between ticks: reachability, plus which "agent answered but
+/// gave no stats" cause was already logged (cleared when stats return).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PollState {
+    link: AgentLink,
+    stats_notice: Option<proxy_observability::capture_transport::InspectError>,
+}
+
+impl PollState {
+    const START: Self = Self {
+        link: AgentLink::Unknown,
+        stats_notice: None,
+    };
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NoticeEvent {
+    Announce(proxy_observability::capture_transport::InspectError),
+    Cleared,
+}
+
+/// Decides when to log "agent answered but gave no stats". A cause is announced
+/// once; the same cause on later ticks is silent; a transport outage keeps the
+/// remembered cause so a flap does not repeat it; returning stats clears it.
+fn advance_stats_notice(
+    prev: Option<proxy_observability::capture_transport::InspectError>,
+    result: Result<(), proxy_observability::capture_transport::InspectError>,
+) -> (
+    Option<proxy_observability::capture_transport::InspectError>,
+    Option<NoticeEvent>,
+) {
+    use proxy_observability::capture_transport::InspectError;
+    match result {
+        Ok(()) => (None, prev.map(|_| NoticeEvent::Cleared)),
+        Err(InspectError::Unreachable) => (prev, None),
+        Err(error) if prev == Some(error) => (prev, None),
+        Err(error) => (Some(error), Some(NoticeEvent::Announce(error))),
+    }
+}
+
+/// Pure core of a poll's bookkeeping. Only a transport failure moves the link
+/// down: an agent that answers with a refusal or an unsupported-query close is
+/// reachable (record delivery works) and gets a one-time stats notice instead.
+fn advance_poll(
+    state: PollState,
+    result: Result<(), proxy_observability::capture_transport::InspectError>,
+) -> (PollState, Option<LinkEvent>, Option<NoticeEvent>) {
+    use proxy_observability::capture_transport::InspectError;
+    let reachable = !matches!(result, Err(InspectError::Unreachable));
+    let (link, link_event) = advance_link(state.link, reachable);
+    let (stats_notice, notice_event) = advance_stats_notice(state.stats_notice, result);
+    (PollState { link, stats_notice }, link_event, notice_event)
+}
+
 /// One poll: queries the agent, publishes the gauges, logs on transitions.
 /// Fail-open by design: the proxy keeps serving while the agent is down; the
 /// `llmproxy_capture_agent_reachable` gauge and the transition logs make that
-/// visible. Logged errors are fixed phrases, never record contents.
+/// visible. A transport failure is "unreachable"; an agent that answers but
+/// cannot give stats (grant without `"inspect": true`, an older agent) is
+/// reachable, because record delivery works, and is logged once per cause.
+/// Logged errors are fixed phrases, never record contents.
 async fn poll_capture_spool_once(
     stats: &proxy_observability::stats::CaptureSpoolStats,
     endpoint: Option<proxy_observability::capture_transport::AgentTransportConfig>,
-    link: AgentLink,
-) -> AgentLink {
+    state: PollState,
+) -> PollState {
+    use proxy_observability::capture_transport::InspectError;
     let Some(config) = endpoint else {
-        stats.publish(None);
-        return AgentLink::Unknown;
+        stats.publish(Err(InspectError::Unreachable));
+        return PollState::START;
     };
     let result = proxy_observability::capture_transport::query_spool_stats(
         &config,
         CAPTURE_SPOOL_POLL_DEADLINE,
     )
     .await;
-    stats.publish(result.as_ref().ok());
-    let (next, event) = advance_link(link, result.is_ok());
+    stats.publish(result.as_ref().map_err(|error| *error));
+    let (next, event, notice_event) =
+        advance_poll(state, result.as_ref().map(|_| ()).map_err(|e| *e));
     match (event, &result) {
         (Some(LinkEvent::WentDown), Err(error)) => tracing::warn!(
             %error,
-            "capture agent spool stats unavailable: spool gauges are stale and \
-             llmproxy_capture_agent_reachable is 0 (a refusal means the producer grant \
-             needs \"inspect\": true); request handling continues"
+            "capture agent unreachable: spool gauges are stale and \
+             llmproxy_capture_agent_reachable is 0; request handling continues"
         ),
-        (Some(LinkEvent::Recovered), _) => tracing::info!("capture agent spool stats recovered"),
+        (Some(LinkEvent::Recovered), _) => tracing::info!("capture agent reachable again"),
         _ => {}
+    }
+    match notice_event {
+        Some(NoticeEvent::Announce(InspectError::Unauthorized)) => tracing::info!(
+            "capture agent spool stats are off: the producer grant lacks \"inspect\": true; \
+             set it on the producer grant to enable them (record delivery is unaffected)"
+        ),
+        Some(NoticeEvent::Announce(InspectError::Unsupported)) => tracing::info!(
+            "capture agent spool stats are off: the agent closed on the inspection query, so \
+             it predates spool inspection; upgrade the capture agent (record delivery is \
+             unaffected)"
+        ),
+        Some(NoticeEvent::Announce(other)) => tracing::warn!(
+            error = %other,
+            "capture agent answered the spool stats query with an error; spool gauges are \
+             stale (record delivery is unaffected)"
+        ),
+        Some(NoticeEvent::Cleared) => tracing::info!("capture agent spool stats available again"),
+        None => {}
     }
     next
 }
@@ -618,14 +705,17 @@ async fn poll_capture_spool_once(
 async fn run_capture_spool_poller(
     stats: proxy_observability::stats::CaptureSpoolStats,
     endpoint: proxy_admin::CaptureAgentProvider,
+    period: Duration,
 ) {
-    let mut ticker = tokio::time::interval(CAPTURE_SPOOL_POLL_INTERVAL);
+    // First poll one period after boot, so an agent that starts just after the
+    // proxy does not produce a down/up log pair.
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     // A slow poll must not queue a burst of catch-up polls behind it.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut link = AgentLink::Unknown;
+    let mut state = PollState::START;
     loop {
         ticker.tick().await;
-        link = poll_capture_spool_once(&stats, endpoint(), link).await;
+        state = poll_capture_spool_once(&stats, endpoint(), state).await;
     }
 }
 
@@ -674,6 +764,7 @@ async fn run_serve(
     request_records_file: Option<PathBuf>,
     request_record_max_attempts: u16,
     request_records_agent: Option<proxy_observability::capture_transport::AgentTransportConfig>,
+    capture_spool_poll_interval: Duration,
 ) -> ExitCode {
     // Collected before `snapshot` moves into `WorkerPool::spawn` purely so
     // the startup log line below can name what got bound; each worker binds
@@ -1106,6 +1197,7 @@ async fn run_serve(
             tokio::spawn(run_capture_spool_poller(
                 proxy_observability::stats::CaptureSpoolStats::resolve(&stats_control),
                 capture_endpoint.clone(),
+                capture_spool_poll_interval,
             ))
         });
 
@@ -3001,6 +3093,52 @@ mod tests {
         assert_eq!(step(Up, true), (Up, None));
     }
 
+    #[test]
+    fn an_answering_agent_without_stats_is_reachable_and_noticed_once() {
+        use super::{advance_poll as step, AgentLink, NoticeEvent, PollState};
+        use proxy_observability::capture_transport::InspectError::*;
+        let up = PollState {
+            link: AgentLink::Up,
+            stats_notice: None,
+        };
+        for cause in [Unauthorized, Unsupported] {
+            let (state, link_event, notice) = step(up, Err(cause));
+            assert_eq!(state.link, AgentLink::Up, "{cause:?} must not read as down");
+            assert_eq!(link_event, None, "{cause:?} must not warn about an outage");
+            assert_eq!(notice, Some(NoticeEvent::Announce(cause)));
+            let (again, link_event, notice) = step(state, Err(cause));
+            assert_eq!((again, link_event, notice), (state, None, None));
+        }
+        let (down, link_event, _) = step(up, Err(Unreachable));
+        assert_eq!(down.link, AgentLink::Down);
+        assert_eq!(link_event, Some(super::LinkEvent::WentDown));
+    }
+
+    #[test]
+    fn stats_notice_is_logged_once_per_cause() {
+        use super::{advance_stats_notice as step, NoticeEvent::*};
+        use proxy_observability::capture_transport::InspectError::*;
+        assert_eq!(
+            step(None, Err(Unauthorized)),
+            (Some(Unauthorized), Some(Announce(Unauthorized)))
+        );
+        assert_eq!(
+            step(Some(Unauthorized), Err(Unauthorized)),
+            (Some(Unauthorized), None)
+        );
+        assert_eq!(
+            step(Some(Unauthorized), Err(Unreachable)),
+            (Some(Unauthorized), None)
+        );
+        assert_eq!(step(None, Err(Unreachable)), (None, None));
+        assert_eq!(
+            step(Some(Unauthorized), Err(Unsupported)),
+            (Some(Unsupported), Some(Announce(Unsupported)))
+        );
+        assert_eq!(step(Some(Unsupported), Ok(())), (None, Some(Cleared)));
+        assert_eq!(step(None, Ok(())), (None, None));
+    }
+
     #[tokio::test]
     async fn spool_poll_of_an_absent_agent_marks_it_unreachable_and_warns_once() {
         let control = proxy_observability::stats::StatsControl::new(1);
@@ -3014,14 +3152,22 @@ mod tests {
         };
         let link = tokio::time::timeout(
             Duration::from_secs(10),
-            super::poll_capture_spool_once(&stats, Some(endpoint), super::AgentLink::Up),
+            super::poll_capture_spool_once(
+                &stats,
+                Some(endpoint),
+                super::PollState {
+                    link: super::AgentLink::Up,
+                    stats_notice: None,
+                },
+            ),
         )
         .await
         .unwrap();
-        assert_eq!(link, super::AgentLink::Down);
+        assert_eq!(link.link, super::AgentLink::Down);
         let scrape = proxy_observability::stats::prometheus_render::render(&control.registry());
         assert!(
-            scrape.contains("envoy_llmproxy_capture_agent_reachable 0"),
+            scrape.contains("envoy_llmproxy_capture_agent_reachable 0")
+                && scrape.contains("envoy_llmproxy_capture_spool_stats_available 0"),
             "{scrape}"
         );
     }
@@ -3410,6 +3556,7 @@ mod tests {
             request_records_agent_node: None,
             request_records_producer: None,
             request_record_max_attempts: None,
+            capture_spool_poll_interval_ms: 10_000,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
             drain_strategy: DrainStrategyArg::Gradual,
             base_id: None,

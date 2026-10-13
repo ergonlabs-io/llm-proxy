@@ -11,6 +11,30 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- `GET /capture/spool/stats` and `GET /capture/spool/records?after=&limit=` show the
+  capture agent's spool. Records are end-user metadata, so they need the admin token
+  (`LLMPROXY_ADMIN_TOKEN`), like the spend read. Stats need no token; the proxy caches
+  the answer for 5 s and runs one agent query for any number of callers in that window.
+  Both answer `404` with no agent configured, `503` when the agent is unreachable,
+  `403` when the producer grant lacks `"inspect": true`, and `501` when the agent is too
+  old to answer inspection queries.
+- The capture agent producer grant has an `inspect` field (default `false`). A grant with
+  `"inspect": true` can read stats and the stored records of its own tenants only.
+- Prometheus gauges `llmproxy_capture_spool_retained_records`,
+  `llmproxy_capture_spool_pending_records`, `llmproxy_capture_spool_disk_bytes`,
+  `llmproxy_capture_spool_max_disk_bytes`, `llmproxy_capture_spool_quarantine_bytes`,
+  `llmproxy_capture_spool_durable_through_sequence` and `llmproxy_capture_spool_poisoned`,
+  polled from the agent every 10 s. `llmproxy_capture_spool_stats_available` is 1 only when
+  the last poll returned stats; the spool gauges keep their last values otherwise.
+  `llmproxy_capture_agent_reachable` is 0 only when the agent cannot be reached; an agent
+  that answers with a refusal still counts as reachable. These have no Envoy equivalent,
+  so they appear in `/stats/prometheus` only. The proxy logs once when the agent becomes
+  unreachable or recovers, and once when stats are off because the grant lacks
+  `"inspect": true` or the agent needs an upgrade.
+- The admin UI has a Capture tab with the spool stats and a paged table of stored records.
+
 ## [0.3.3] - 2026-10-11
 
 Follow-ups to tenant provider credentials: a configurable request body limit, a

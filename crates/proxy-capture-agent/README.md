@@ -39,7 +39,8 @@ Configuration fields are required except `spool.cache_bytes`, which defaults
 to 4 MiB, and the producer field `inspect`, which defaults to `false`. A grant
 with `"inspect": true` may send stats and records queries on its connection;
 records are limited to the grant's own tenants, and inspection never
-acknowledges or changes the spool. Grants without it are refused
+acknowledges or changes the spool. An inspect grant reads every stored record of
+its tenants, whichever producer wrote it. Grants without it are refused
 (`unauthorized`) and disconnected. Unknown fields fail at their full path. Config files
 are limited to 128 KiB; version and mode have exactly the values above. IDs are
 1–128 UTF-8 bytes; node/event IDs reject control characters so receipts fit their

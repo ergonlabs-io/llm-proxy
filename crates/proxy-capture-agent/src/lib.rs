@@ -3,9 +3,9 @@ pub mod config;
 
 use config::{Config, Producer};
 use proxy_capture_protocol::{
-    decode, encode, read_frame, write_frame, Frame, Hello, InspectOutcome, Kind, Outcome, Receipt,
-    RecordsQuery, RecordsReply, SpoolSnapshot, SpooledRecord, StatsQuery, StatsReply, Welcome,
-    MAX_INSPECT_RECORDS, MAX_INSPECT_RECORD_BYTES, VERSION,
+    decode, encode, read_frame, read_frame_or_eof, write_frame, Frame, Hello, InspectOutcome, Kind,
+    Outcome, Receipt, RecordsQuery, RecordsReply, SpoolSnapshot, SpooledRecord, StatsQuery,
+    StatsReply, Welcome, MAX_INSPECT_RECORDS, MAX_INSPECT_RECORD_BYTES, VERSION,
 };
 use proxy_capture_spool::{Error, MetadataSpool};
 use proxy_observability::records::RequestRecord;
@@ -261,9 +261,15 @@ async fn serve(
     .await
     .map_err(|_| io::Error::other("handshake deadline"))??;
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream))
-            .await
-            .map_err(|_| io::Error::other("idle deadline"))??;
+        // A clean close between frames is how a client says it is done (the
+        // proxy opens one connection per inspection query), not a failure.
+        let Some(frame) =
+            tokio::time::timeout(Duration::from_secs(30), read_frame_or_eof(&mut stream))
+                .await
+                .map_err(|_| io::Error::other("idle deadline"))??
+        else {
+            return Ok(());
+        };
         if matches!(frame.kind, Kind::StatsQuery | Kind::RecordsQuery) {
             if !serve_query(&mut stream, &jobs, &producer, frame).await? {
                 return Ok(());
@@ -312,20 +318,29 @@ async fn serve_query(
         write_inspect_reply(stream, &denied).await?;
         return Ok(false);
     }
+    // A payload that does not decode is a malformed query: answered `Invalid`
+    // with the connection kept, like an out-of-range one. Its cursor is unknown.
     let (query, after_sequence) = if stats {
-        let query: StatsQuery = decode(&frame.payload)?;
-        ((query.version == VERSION).then_some(Query::Stats), 0)
+        let query = decode::<StatsQuery>(&frame.payload)
+            .ok()
+            .filter(|query| query.version == VERSION)
+            .map(|_| Query::Stats);
+        (query, 0)
     } else {
-        let query: RecordsQuery = decode(&frame.payload)?;
-        let valid =
-            query.version == VERSION && (1..=MAX_INSPECT_RECORDS).contains(&query.max_records);
-        (
-            valid.then_some(Query::Records {
-                after_sequence: query.after_sequence,
-                max_records: query.max_records,
-            }),
-            query.after_sequence,
-        )
+        match decode::<RecordsQuery>(&frame.payload) {
+            Err(_) => (None, 0),
+            Ok(query) => {
+                let valid = query.version == VERSION
+                    && (1..=MAX_INSPECT_RECORDS).contains(&query.max_records);
+                (
+                    valid.then_some(Query::Records {
+                        after_sequence: query.after_sequence,
+                        max_records: query.max_records,
+                    }),
+                    query.after_sequence,
+                )
+            }
+        }
     };
     let Some(query) = query else {
         let invalid = InspectReply::rejected(stats, InspectOutcome::Invalid, after_sequence);
@@ -699,6 +714,9 @@ fn records_page(
     let Ok(stats) = spool.stats() else {
         return unavailable();
     };
+    // `replay` poisons the spool on a storage error, so an admin read that hits
+    // an I/O fault stops capture. That is the spool's existing fail-closed
+    // behavior; inspection adds no handling of its own for it.
     let Ok(replayed) = spool.replay(
         after_sequence,
         usize::from(max_records),
@@ -708,7 +726,12 @@ fn records_page(
     };
     // The cursor passes records of other tenants too, so a page that holds
     // none of this grant's records still makes progress.
-    let next_after_sequence = replayed.last().map_or(after_sequence, |row| row.sequence);
+    // When the page is empty the cursor must not sit below what was already
+    // acknowledged, or a reader would be sent back over deleted sequences.
+    let next_after_sequence = replayed.last().map_or(
+        after_sequence.max(stats.acknowledged_through_sequence),
+        |row| row.sequence,
+    );
     let mut records = Vec::new();
     for row in replayed {
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(&row.payload) else {
