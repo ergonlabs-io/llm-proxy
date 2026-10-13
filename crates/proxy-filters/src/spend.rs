@@ -805,11 +805,6 @@ struct Bucket {
     /// it is a function of the key, recomputed on restore.
     #[serde(skip)]
     period_end: Option<DateTime<Utc>>,
-    /// Whether a flush has reconciled this bucket with the store at a time
-    /// when its period had already ended. Not journaled: after a restart the
-    /// first flush simply does it again.
-    #[serde(skip)]
-    reconciled_after_end: bool,
 }
 
 /// How long a settled bucket stays readable in memory after its period ends.
@@ -847,15 +842,19 @@ impl Bucket {
         self.period_end.is_some_and(|end| end <= now)
     }
 
-    /// Nothing left to deliver or learn: the period has ended, every charge
-    /// is confirmed by the store (no pending delta, no frozen attempt), and a
-    /// reconciliation has happened since the period ended, so the figure held
-    /// here is final. A settled bucket is never visited by the flusher.
+    /// Nothing left to deliver or learn: the period has ended and every
+    /// charge is confirmed by the store (no pending delta, no frozen
+    /// attempt). A settled bucket is never visited by the flusher.
+    ///
+    /// The flusher asks this only right after a delivery it just applied, on
+    /// a tick whose clock is past the period end. That is what makes "at
+    /// least one reconciliation since the period ended" hold without a flag
+    /// to keep: the delivery that settles a bucket IS that reconciliation, so
+    /// the figure kept for reads includes whatever other replicas had added
+    /// by then. A bucket whose last sync predates the end is therefore
+    /// synced once more before it can settle.
     fn is_settled(&self, now: DateTime<Utc>) -> bool {
-        self.is_ended(now)
-            && self.pending_delta_micros == 0
-            && self.attempt.is_none()
-            && self.reconciled_after_end
+        self.is_ended(now) && self.pending_delta_micros == 0 && self.attempt.is_none()
     }
 }
 
@@ -1403,10 +1402,9 @@ impl Inner {
                         bucket.pending_delta_micros.saturating_sub(attempt.delta);
                     bucket.next_seq = attempt.seq.checked_add(1);
                     bucket.attempt = None;
-                    // Measured against the tick's start, so it can only
-                    // under-claim: a bucket reconciled after the boundary
-                    // inside a long tick is simply reconciled once more.
-                    bucket.reconciled_after_end = bucket.is_ended(now);
+                    // `now` is the tick's start, so this can only under-claim:
+                    // a bucket reconciled after the boundary inside a long
+                    // tick is simply reconciled once more next tick.
                     if bucket.is_settled(now) {
                         buckets.settle(&key);
                     }
@@ -4423,8 +4421,8 @@ mod tests {
     /// what the others spent); an ended period gets exactly one final
     /// reconciliation and then costs the store nothing.
     ///
-    /// Mutation: make `reconciled_after_end` always true, so the final
-    /// reconciliation is skipped and the bucket is never settled.
+    /// Mutation: drop `self.is_ended(now)` from `Bucket::is_settled`, so a
+    /// live idle bucket settles and stops syncing.
     #[test]
     fn an_ended_bucket_with_nothing_to_deliver_makes_no_store_call() {
         let store = ProbeStore::new();
