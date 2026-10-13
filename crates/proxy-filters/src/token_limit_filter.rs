@@ -45,7 +45,8 @@
 //! "warn once, ever" (an operator who starts reading logs after the first
 //! occurrence must still be able to see it), and why that repeat is cheap
 //! enough to keep on the same rare path rather than needing a background
-//! task.
+//! task. The warner tracks at most `UsageMissingWarner::MAX_TRACKED_KEYS`
+//! keys; past that, warnings fold into one line that names no key.
 //!
 //! # Fail open on a store error
 //!
@@ -499,10 +500,9 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
 /// answering and [`TokenLimitFilterInstance::record_if_present`] for the one
 /// call site.
 ///
-/// # Why a `Mutex<HashMap<..>>`, following `RouterStats`
+/// # Why a `Mutex<HashMap<..>>`
 ///
-/// Mirrors `proxy_http::stat_handles::RouterStats::warned_unknown_clusters`:
-/// a `Mutex`-guarded dedup structure touched only on the rare path (here,
+/// A `Mutex`-guarded dedup structure touched only on the rare path (here,
 /// "usage came back `None`"), never on a request that had usage to record.
 /// One instance is shared, via `Arc`, across every per-stream
 /// `TokenLimitFilterInstance` `TokenLimitInstanceFactory::create_filter`
@@ -511,23 +511,68 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
 ///
 /// # Once per key, but not once ever
 ///
-/// `RouterStats` warns once per unknown cluster name for the life of the
-/// process — right for a config-shaped fact that cannot change without a
-/// restart. This is different: usage can come back `None` for the whole
-/// life of a long-running process (a provider that never changed its
-/// response shape, or a usage-filter dialect misconfigured at boot and never
-/// fixed), and an operator who starts reading logs an hour in must still be
-/// able to see it. So this repeats — capped at once per key per
-/// [`Self::REPEAT_INTERVAL`] — rather than going silent again after the
-/// first occurrence.
+/// Usage can come back `None` for the whole life of a long-running process
+/// (a provider that never changed its response shape, or a usage-filter
+/// dialect misconfigured at boot and never fixed), and an operator who
+/// starts reading logs an hour in must still be able to see it. So this
+/// repeats — capped at once per key per [`Self::REPEAT_INTERVAL`] — rather
+/// than going silent after the first occurrence.
 ///
 /// The repeat costs one extra `Instant` read and comparison, on the same
 /// rare, already-locked path the dedup check itself is on — not a
-/// background task or a timer, both of which would add machinery the warner is meant to avoid. That is cheap enough to keep here; a plain "once ever" set
-/// (like `RouterStats`'s) would have been simpler still but would trade away
-/// exactly the visibility this exists to provide.
+/// background task or a timer, both of which would add machinery the
+/// warner is meant to avoid.
+///
+/// # Bounded by expiry, then by a cap
+///
+/// Keys come from tenants and credentials, so they keep arriving for the
+/// life of the process. An entry older than [`Self::REPEAT_INTERVAL`]
+/// behaves exactly like no entry (the key is due either way), so when the
+/// map is full the warner first drops expired entries, which changes no
+/// warning. If [`Self::MAX_TRACKED_KEYS`] keys all warned within the last
+/// interval, a new key is not tracked: its warning folds into one overflow
+/// line, itself repeated at most once per interval, that names no key. The
+/// fail-open stays loud (AGENTS.md "Fail-open controls") without the dedup
+/// state, or the log, growing with the number of callers. The sweep runs
+/// only when the map is full and the oldest entry could have expired, so a
+/// burst past the cap does not rescan the map on every request.
 struct UsageMissingWarner {
-    last_warned: Mutex<HashMap<LimitKey, Instant>>,
+    state: Mutex<WarnerState>,
+}
+
+#[derive(Default)]
+struct WarnerState {
+    last_warned: HashMap<LimitKey, Instant>,
+    /// No entry can expire before this instant, so a sweep before it would
+    /// free nothing. `None` until the first sweep.
+    next_sweep: Option<Instant>,
+    /// When the overflow line last fired.
+    overflow_warned_at: Option<Instant>,
+}
+
+impl WarnerState {
+    /// Drops entries older than [`UsageMissingWarner::REPEAT_INTERVAL`], if
+    /// any could have expired by `now`.
+    fn sweep_expired(&mut self, now: Instant) {
+        if self.next_sweep.is_some_and(|at| now < at) {
+            return;
+        }
+        let interval = UsageMissingWarner::REPEAT_INTERVAL;
+        self.last_warned
+            .retain(|_, last| now.saturating_duration_since(*last) < interval);
+        self.next_sweep = self
+            .last_warned
+            .values()
+            .min()
+            .map(|oldest| *oldest + interval);
+    }
+}
+
+fn is_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        Some(last) => now.saturating_duration_since(last) >= UsageMissingWarner::REPEAT_INTERVAL,
+        None => true,
+    }
 }
 
 impl UsageMissingWarner {
@@ -537,9 +582,13 @@ impl UsageMissingWarner {
     /// actually true.
     const REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 
+    /// How many keys the warner remembers at once, per filter config. See
+    /// "Bounded by expiry, then by a cap" above.
+    const MAX_TRACKED_KEYS: usize = 1024;
+
     fn new() -> Self {
         UsageMissingWarner {
-            last_warned: Mutex::new(HashMap::new()),
+            state: Mutex::new(WarnerState::default()),
         }
     }
 
@@ -556,23 +605,38 @@ impl UsageMissingWarner {
         // couldn't warn about a metering gap" into "the whole filter now
         // panics on every request", which is a worse outage than the one
         // this section exists to make visible.
-        let mut last_warned = self
-            .last_warned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let due = match last_warned.get(key) {
-            Some(&last) => now.saturating_duration_since(last) >= Self::REPEAT_INTERVAL,
-            None => true,
-        };
-        if !due {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let last = state.last_warned.get(key).copied();
+        if !is_due(last, now) {
             return;
         }
-        last_warned.insert(key.clone(), now);
+        if last.is_none() && state.last_warned.len() >= Self::MAX_TRACKED_KEYS {
+            state.sweep_expired(now);
+        }
+        if last.is_none() && state.last_warned.len() >= Self::MAX_TRACKED_KEYS {
+            if !is_due(state.overflow_warned_at, now) {
+                return;
+            }
+            state.overflow_warned_at = Some(now);
+            drop(state);
+            tracing::warn!(
+                tracked_keys = Self::MAX_TRACKED_KEYS,
+                "token_limit: the token budget for a request was NOT enforced and the \
+                 request was allowed uncharged -- usage could not be extracted from the \
+                 response. More budget keys hit this within the last minute than are \
+                 tracked individually, so this line stands for all of the untracked ones \
+                 and repeats at most once a minute. The most likely cause is that the \
+                 llmproxy.usage filter's configured `dialect` does not match this \
+                 provider's actual response shape; check that first."
+            );
+            return;
+        }
+        state.last_warned.insert(key.clone(), now);
         // Rust note: drop the guard before logging -- nothing below needs
         // it, and holding a lock across a macro call some future edit might
         // extend (e.g. to format something expensive) is worth avoiding on
         // principle even though `tracing::warn!` itself doesn't block.
-        drop(last_warned);
+        drop(state);
 
         tracing::warn!(
             budget_key = %key,
@@ -1699,6 +1763,87 @@ mod tests {
             "5 requests with unreadable usage on the SAME key must warn exactly once, not 5 \
              times -- repeats within the suppression window must be swallowed"
         );
+    }
+
+    const OVERFLOW_LINE: &str = "stands for all of the untracked ones";
+
+    #[test]
+    fn unreadable_usage_on_more_keys_than_tracked_folds_into_one_overflow_line() {
+        let store = store_with(10, Duration::from_secs(60));
+        let warner = Arc::new(UsageMissingWarner::new());
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        let keys = UsageMissingWarner::MAX_TRACKED_KEYS + 5;
+        for i in 0..keys {
+            let credential = format!("Bearer sk-{i}");
+            for _ in 0..2 {
+                let reply =
+                    run_request_with_shared_warner(&store, &warner, "r1", Some(&credential), None);
+                assert!(reply.is_none(), "key {i}: unreadable usage must fail open");
+            }
+        }
+
+        drop(guard);
+        let messages = capture
+            .messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let overflow: Vec<&String> = messages
+            .iter()
+            .filter(|m| m.contains(OVERFLOW_LINE))
+            .collect();
+        assert_eq!(
+            messages.len(),
+            UsageMissingWarner::MAX_TRACKED_KEYS + 1,
+            "one warning per tracked key plus one overflow line, none per repeat"
+        );
+        assert_eq!(overflow.len(), 1, "{overflow:?}");
+        assert!(
+            overflow[0].contains("NOT enforced"),
+            "the overflow line must still say the budget was not enforced: {:?}",
+            overflow[0]
+        );
+        let state = warner.state.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            state.last_warned.len(),
+            UsageMissingWarner::MAX_TRACKED_KEYS
+        );
+    }
+
+    #[test]
+    fn a_full_warner_drops_expired_keys_before_folding_a_new_one() {
+        // `now` is the warner's own parameter, so time moves without sleeping.
+        let warner = UsageMissingWarner::new();
+        let key = |i: usize| LimitKey::for_credential("r1", &format!("Bearer sk-{i}"));
+        let start = Instant::now();
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        for i in 0..UsageMissingWarner::MAX_TRACKED_KEYS {
+            warner.warn_if_due(&key(i), start);
+        }
+        // Full and nothing expired: a new key folds into the overflow line,
+        // which repeats only once per interval.
+        warner.warn_if_due(&key(100_000), start + Duration::from_secs(1));
+        warner.warn_if_due(&key(100_001), start + Duration::from_secs(2));
+        // Every tracked key has expired: a new key gets its own warning.
+        let later = start + UsageMissingWarner::REPEAT_INTERVAL;
+        warner.warn_if_due(&key(100_002), later);
+
+        drop(guard);
+        let messages = capture
+            .messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let tail: Vec<bool> = messages[UsageMissingWarner::MAX_TRACKED_KEYS..]
+            .iter()
+            .map(|m| m.contains(OVERFLOW_LINE))
+            .collect();
+        assert_eq!(tail, [true, false], "overflow once, then a per-key warning");
+        let state = warner.state.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(state.last_warned.len(), 1, "expired keys were dropped");
+        assert!(state.last_warned.contains_key(&key(100_002)));
     }
 
     // --- independent budgets -------------------------------------------------
