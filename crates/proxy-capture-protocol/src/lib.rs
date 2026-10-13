@@ -1,5 +1,10 @@
 //! Bounded capture transport framing and control messages.
 //! Callers validate message versions, identifiers, and handshake ordering.
+//!
+//! After the handshake a connection sends either metadata records or
+//! inspection queries. Queries read the agent's spool without changing it and
+//! need an inspect grant on the producer; an agent that predates them rejects
+//! the unknown frame kind and closes the connection.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io;
@@ -7,6 +12,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const VERSION: u16 = 1;
 pub const MAX_RECORD_BYTES: usize = 524288;
+/// Most records one [`RecordsQuery`] page may carry.
+pub const MAX_INSPECT_RECORDS: u16 = 100;
+/// Most decrypted record bytes one [`RecordsReply`] page may carry. The frame
+/// limit below leaves room for the JSON envelope around them.
+pub const MAX_INSPECT_RECORD_BYTES: usize = 1_048_576;
+const MAX_RECORDS_REPLY_BYTES: usize = 2 * MAX_INSPECT_RECORD_BYTES;
 const MAX_CONTROL_BYTES: usize = 1024;
 const MAGIC: &[u8; 4] = b"LMC1";
 
@@ -17,6 +28,23 @@ pub enum Kind {
     Welcome = 2,
     Record = 3,
     Receipt = 4,
+    StatsQuery = 5,
+    StatsReply = 6,
+    RecordsQuery = 7,
+    RecordsReply = 8,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 8] = [
+        Kind::Hello,
+        Kind::Welcome,
+        Kind::Record,
+        Kind::Receipt,
+        Kind::StatsQuery,
+        Kind::StatsReply,
+        Kind::RecordsQuery,
+        Kind::RecordsReply,
+    ];
 }
 
 #[derive(PartialEq, Eq)]
@@ -69,12 +97,92 @@ pub enum Outcome {
     Unavailable,
 }
 
-// Only records may be large; every control message shares the small limit.
+/// Asks for the agent's spool counters. Needs an inspect grant.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatsQuery {
+    pub version: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StatsReply {
+    pub version: u16,
+    pub outcome: InspectOutcome,
+    /// `Some` exactly when `outcome` is [`InspectOutcome::Ok`].
+    pub stats: Option<SpoolSnapshot>,
+}
+
+/// The spool's own counters plus the agent's lifetime totals since start.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpoolSnapshot {
+    pub node_id: String,
+    pub next_sequence: u64,
+    pub durable_through_sequence: u64,
+    pub acknowledged_through_sequence: u64,
+    pub pending_records: u64,
+    pub retained_records: u64,
+    pub database_bytes: u64,
+    pub disk_bytes: u64,
+    pub max_disk_bytes: u64,
+    pub quarantine_bytes: u64,
+    pub poisoned: bool,
+    pub durable_total: u64,
+    pub rejected_total: u64,
+    pub failures_total: u64,
+}
+
+/// Asks for durable records with sequences above `after_sequence`, oldest
+/// first. Needs an inspect grant; only records of the grant's tenants return.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordsQuery {
+    pub version: u16,
+    pub after_sequence: u64,
+    /// At most [`MAX_INSPECT_RECORDS`].
+    pub max_records: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordsReply {
+    pub version: u16,
+    pub outcome: InspectOutcome,
+    pub records: Vec<SpooledRecord>,
+    /// The cursor for the next page: the last sequence this page scanned,
+    /// including records filtered out for another tenant, so a sparse page
+    /// still advances. Equal to the query's `after_sequence` when nothing
+    /// newer is durable.
+    pub next_after_sequence: u64,
+    pub durable_through_sequence: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SpooledRecord {
+    pub sequence: u64,
+    /// The stored request record, as JSON. This crate does not depend on the
+    /// record schema; the agent validated it on admission.
+    pub record: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectOutcome {
+    Ok,
+    Unauthorized,
+    Invalid,
+    Unavailable,
+}
+
+// Only records and record pages may be large; every control message shares
+// the small limit.
 fn max_payload_bytes(kind: Kind) -> usize {
-    if kind == Kind::Record {
-        MAX_RECORD_BYTES
-    } else {
-        MAX_CONTROL_BYTES
+    match kind {
+        Kind::Record => MAX_RECORD_BYTES,
+        Kind::RecordsReply => MAX_RECORDS_REPLY_BYTES,
+        _ => MAX_CONTROL_BYTES,
     }
 }
 
@@ -96,6 +204,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Frame> {
         2 => Kind::Welcome,
         3 => Kind::Record,
         4 => Kind::Receipt,
+        5 => Kind::StatsQuery,
+        6 => Kind::StatsReply,
+        7 => Kind::RecordsQuery,
+        8 => Kind::RecordsReply,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -178,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_all_kinds_and_exact_limits() {
-        for kind in [Kind::Hello, Kind::Welcome, Kind::Record, Kind::Receipt] {
+        for kind in Kind::ALL {
             for size in [1, max_payload_bytes(kind)] {
                 let payload = vec![42; size];
                 let (mut writer, mut reader) = tokio::io::duplex(17);
@@ -228,14 +340,14 @@ mod tests {
     #[tokio::test]
     async fn invalid_headers_rejected_without_waiting_for_body() {
         let mut headers = vec![header(b"BAD!", 1, 1), header(b"LMC2", 1, 1)];
-        for kind in [0, 5, 255] {
+        for kind in [0, 9, 255] {
             headers.push(header(MAGIC, kind, 1));
         }
-        for kind in 1..=4 {
-            let maximum = if kind == 3 {
-                MAX_RECORD_BYTES
-            } else {
-                MAX_CONTROL_BYTES
+        for kind in 1..=8 {
+            let maximum = match kind {
+                3 => MAX_RECORD_BYTES,
+                8 => MAX_RECORDS_REPLY_BYTES,
+                _ => MAX_CONTROL_BYTES,
             };
             for length in [0, maximum as u32 + 1, u32::MAX] {
                 headers.push(header(MAGIC, kind, length));
@@ -268,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_writes_emit_no_header() {
-        for kind in [Kind::Hello, Kind::Welcome, Kind::Record, Kind::Receipt] {
+        for kind in Kind::ALL {
             for payload in [vec![], vec![0; max_payload_bytes(kind) + 1]] {
                 let (mut writer, mut reader) = tokio::io::duplex(16);
                 assert_eq!(
@@ -337,6 +449,70 @@ mod tests {
         assert!(decode::<Welcome>(br#"{"version":1,"node_id":"n","extra":true}"#).is_err());
         assert!(decode::<Hello>(br#"{"version":1,"node_id":"n"}"#).is_err());
         assert!(decode::<Hello>(br#"{"version":65536,"producer_id":"p"}"#).is_err());
+    }
+
+    #[test]
+    fn inspect_messages_roundtrip_with_snake_case_outcomes() {
+        for (outcome, name) in [
+            (InspectOutcome::Ok, "ok"),
+            (InspectOutcome::Unauthorized, "unauthorized"),
+            (InspectOutcome::Invalid, "invalid"),
+            (InspectOutcome::Unavailable, "unavailable"),
+        ] {
+            assert_eq!(encode(&outcome).unwrap(), format!("\"{name}\"").as_bytes());
+        }
+        let stats = StatsReply {
+            version: VERSION,
+            outcome: InspectOutcome::Ok,
+            stats: Some(SpoolSnapshot {
+                node_id: "node".into(),
+                next_sequence: 4,
+                durable_through_sequence: 3,
+                acknowledged_through_sequence: 0,
+                pending_records: 0,
+                retained_records: 3,
+                database_bytes: 1,
+                disk_bytes: 2,
+                max_disk_bytes: 3,
+                quarantine_bytes: 0,
+                poisoned: false,
+                durable_total: 3,
+                rejected_total: 1,
+                failures_total: 0,
+            }),
+        };
+        assert_eq!(
+            decode::<StatsReply>(&encode(&stats).unwrap()).unwrap(),
+            stats
+        );
+        let query = RecordsQuery {
+            version: VERSION,
+            after_sequence: 7,
+            max_records: MAX_INSPECT_RECORDS,
+        };
+        assert_eq!(
+            decode::<RecordsQuery>(&encode(&query).unwrap()).unwrap(),
+            query
+        );
+        let page = RecordsReply {
+            version: VERSION,
+            outcome: InspectOutcome::Ok,
+            records: vec![SpooledRecord {
+                sequence: 8,
+                record: serde_json::json!({"event_id": "e", "tenant_id": "t"}),
+            }],
+            next_after_sequence: 9,
+            durable_through_sequence: 9,
+        };
+        assert_eq!(
+            decode::<RecordsReply>(&encode(&page).unwrap()).unwrap(),
+            page
+        );
+        assert!(decode::<StatsQuery>(br#"{"version":1,"extra":true}"#).is_err());
+        assert!(
+            decode::<RecordsQuery>(br#"{"version":1,"after_sequence":0,"max_records":65536}"#)
+                .is_err()
+        );
     }
 
     #[test]
