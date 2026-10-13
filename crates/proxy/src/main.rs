@@ -1785,10 +1785,16 @@ fn live_scope_for(snapshot: &ConfigSnapshot) -> proxy_observability::stats::Live
 /// `reload`, just no longer duplicated for a second caller:
 /// 0. [`proxy_observability::stats::StatsControl::set_live_scope`] with the
 ///    snapshot's cluster and listener names, so series of removed ones stop
-///    being emitted and stop counting against their caps.
+///    being emitted and stop counting against their caps, and series absent
+///    from this snapshot and the previous one are drained for reuse. The
+///    grace period is one published snapshot, not a span of time: the xDS
+///    applier publishes only when the listener, cluster or route set changed
+///    (`proxy_xds::apply::same_published_resources`), so heartbeats, EDS
+///    updates and re-sent identical resources never count toward it.
 /// 1. [`proxy_http::stat_handles::StatHandles::resolve_missing`] over the
 ///    cluster keys, so a cluster this table has never seen has a handle
-///    resolved *before* traffic can possibly reach it.
+///    resolved *before* traffic can possibly reach it, and an entry step 0
+///    drained is dropped or re-resolved. Steps 2 and 3 do the same.
 /// 2. [`proxy_http::stat_handles::DownstreamStatHandles::resolve_missing`]
 ///    over the listener keys, so a listener this snapshot introduces has a
 ///    `downstream_cx_total` handle resolved before its accept loop can
@@ -1846,11 +1852,14 @@ async fn apply_snapshot(
     )>,
 ) {
     // Hide the series of clusters and listeners this snapshot no longer
-    // names, and let a returning one reappear with its old value, BEFORE the
-    // resolves below so their cap accounting sees the new scope. Tenants and
-    // models stay unrestricted: no snapshot field names them (they come from
-    // credentials and request bodies), so hiding them here would hide live
-    // series. Frees no memory; see the stats module doc.
+    // names, and let one that returns after a single absent snapshot
+    // reappear with its old value, BEFORE the resolves below so their cap
+    // accounting sees the new scope and they can replace drained handles.
+    // Tenants and models stay unrestricted: no snapshot field names them
+    // (they come from credentials and request bodies), so hiding them here
+    // would hide live series. A series absent from two consecutive snapshots
+    // is drained and its slot reused; see the stats module doc's "Series are
+    // retired, drained, then reused".
     stats_control.set_live_scope(live_scope_for(&snapshot));
     tables
         .router

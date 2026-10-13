@@ -130,26 +130,39 @@
 //! Only a series seen for the first time, or one folded into its overflow
 //! series, reaches the lock.
 //!
-//! ## Series are bounded and hidden, never freed
+//! ## Series are retired, drained, then reused
 //!
-//! A handle never moves and a registered series is never deallocated, because
-//! a worker may still hold the handle. Two mechanisms bound the damage:
+//! A handle never moves, and a slot is never compacted away. A slot is reused
+//! only once nothing can write its old series. Three mechanisms bound memory:
 //!
 //! - **Caps.** Each dynamic instrument has a ceiling on live series. The
 //!   check and the insert happen under one acquisition of the lock, against an
 //!   O(1) per-instrument count. The first overflow of an instrument logs one
 //!   warning naming the instrument and its ceiling, never a label value
 //!   (those can be client-controlled).
-//! - **Retirement by hiding.** [`StatsControl::set_live_scope`] tells the
-//!   registry which cluster, listener, tenant and model names the running
-//!   config still names. A series whose label is outside that set stops being
-//!   emitted by [`Registry::counters`]/[`Registry::histograms`] and stops
-//!   counting against its cap, so a live name that would have folded into the
-//!   overflow series gets its own again. A series that becomes live again
-//!   reappears with its old value. This does NOT reclaim memory: the series
-//!   keeps its slot, its shards and its dedup entry for the life of the
-//!   process. A process that churns through unbounded distinct names still
-//!   grows, only more slowly than the cap alone would allow.
+//! - **Hiding.** [`StatsControl::set_live_scope`] tells the registry which
+//!   cluster, listener, tenant and model names the running config still
+//!   names. A series whose label is outside that set stops being emitted by
+//!   [`Registry::counters`]/[`Registry::histograms`] and stops counting
+//!   against its cap, so a live name that would have folded into the
+//!   overflow series gets its own again. A hidden series still records, and
+//!   if the next scope names it again it reappears with its value, so a name
+//!   absent from a single config push loses nothing.
+//! - **Draining and reuse.** A series hidden by two consecutive scopes is
+//!   drained: one published snapshot bumps its slot's generation, so every
+//!   [`Handle`] to it goes stale at once and records nothing, and its dedup
+//!   entry goes, so a name that returns later starts a fresh series at zero.
+//!   The slot is freed once every snapshot published before the drain has
+//!   been dropped: only a reader holding one of those can still pass the
+//!   generation check and write the old series. A freed counter slot is
+//!   zeroed; a freed histogram slot gets fresh shards on reuse. A resolve
+//!   takes a freed slot before it grows, so storage is bounded by the peak
+//!   number of allocated series, not by every name ever seen.
+//!
+//! Holders that keep handles across config changes revalidate with
+//! [`Registry::is_current`]: a [`HandleMemo`] re-resolves a stale entry, and
+//! the per-name handle tables in `proxy_http::stat_handles` drop stale
+//! entries on each config apply.
 //!
 //! This is the same "control computes, workers `load`" shape
 //! `proxy_cluster::manager::ClusterManager` already uses for `HostSet`, and
@@ -203,7 +216,10 @@
 //! Handle values are stable across growth either way: a [`Handle`]/
 //! [`HistogramHandle`] resolved before a swap indexes the exact same logical
 //! counter/histogram after it, because growth only ever appends past the end
-//! of what already existed.
+//! of what already existed. Reusing a freed slot does not move an atomic
+//! either: it rewrites the slot's metadata in a new snapshot, and the
+//! generation check keeps every older handle out (see "Series are retired,
+//! drained, then reused" above).
 //!
 //! `Relaxed` ordering is unchanged everywhere on the increment/read path —
 //! growth publishing a new `Snapshot` doesn't change what a plain counter
@@ -343,7 +359,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 // Rust note: `ArcSwap<Snapshot>` is the same "control computes, workers
 // `load`" pattern `proxy_cluster::manager::ClusterManager` uses for
@@ -1482,7 +1498,20 @@ struct SeriesMeta {
     /// The generation of the series in this slot. Plain data, not an atomic:
     /// a writer checks it in the same snapshot whose storage it then writes,
     /// so the check and the write always describe one published view.
+    /// Draining a slot bumps it, and no handle carries the bumped value until
+    /// the slot is reused, so a matching handle always names an occupied
+    /// slot.
     gen: u32,
+    /// No series lives here: the slot was drained and is waiting to be freed
+    /// or reused. Not emitted and not counted.
+    vacant: bool,
+}
+
+/// A slot in one of the two index spaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Slot {
+    Counter(u32),
+    Histogram(u32),
 }
 
 impl Snapshot {
@@ -1554,12 +1583,26 @@ struct ControlState {
     live_counts: HashMap<&'static str, usize>,
     /// Instruments that already logged their overflow warning.
     overflow_warned: HashSet<&'static str>,
+    /// Slots the last live scope hid. A slot the next scope hides again is
+    /// drained; one it names again stays as it was.
+    hidden: HashSet<Slot>,
+    /// Drained slots, each with the sequence number of the snapshot that
+    /// drained it. Freed once no reader holds an earlier snapshot.
+    draining: Vec<(Slot, u64)>,
+    /// Freed slot indices, zeroed and ready for reuse.
+    free_counters: Vec<u32>,
+    free_histograms: Vec<u32>,
+    /// Replaced snapshots a reader may still hold, oldest first, with their
+    /// sequence numbers.
+    superseded: Vec<(u64, Weak<Snapshot>)>,
+    /// Sequence number of the published snapshot.
+    published_seq: u64,
 }
 
 /// Names the running config still names, per scope. `None` means the scope
 /// is unrestricted (every value is live); `Some(set)` hides any series
 /// carrying a label of that kind outside the set. See the module doc's
-/// "Series are bounded and hidden, never freed".
+/// "Series are retired, drained, then reused".
 ///
 /// Scopes map to attribute keys: `clusters` covers `cluster` and `provider`
 /// (a provider is the cluster actually dialled), `listeners` covers
@@ -1648,26 +1691,47 @@ impl<H: Copy> HandleMemo<H> {
         hasher.finish()
     }
 
-    fn get(&self, values: &[&str]) -> Option<H> {
-        let entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries
-            .buckets
-            .get(&Self::hash_values(values))?
-            .iter()
-            .find(|(stored, _)| stored.iter().map(String::as_str).eq(values.iter().copied()))
-            .map(|(_, handle)| *handle)
-    }
-
-    /// Remembers `handle`, unless the memo already holds `max_len` entries.
-    /// The bound keeps a worker's memo no larger than the cap behind it.
-    fn insert(&self, values: &[&str], handle: H, max_len: usize) {
+    /// The memoized handle for `values`, if it is still current. A stale
+    /// entry (its series was retired and its slot drained) is dropped, so the
+    /// caller re-resolves instead of recording into nothing forever.
+    fn get(&self, values: &[&str], is_current: impl Fn(H) -> bool) -> Option<H> {
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hash = Self::hash_values(values);
+        let bucket = entries.buckets.get_mut(&hash)?;
+        let position = bucket
+            .iter()
+            .position(|(stored, _)| stored.iter().map(String::as_str).eq(values.iter().copied()))?;
+        let handle = bucket[position].1;
+        if is_current(handle) {
+            return Some(handle);
+        }
+        bucket.swap_remove(position);
+        if bucket.is_empty() {
+            entries.buckets.remove(&hash);
+        }
+        entries.len -= 1;
+        None
+    }
+
+    /// Remembers `handle`, unless the memo already holds `max_len` current
+    /// entries. The bound keeps a worker's memo no larger than the cap behind
+    /// it; a full memo first drops its stale entries, so retired names do not
+    /// crowd out live ones.
+    fn insert(&self, values: &[&str], handle: H, max_len: usize, is_current: impl Fn(H) -> bool) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len >= max_len {
+            entries.buckets.retain(|_, bucket| {
+                bucket.retain(|(_, handle)| is_current(*handle));
+                !bucket.is_empty()
+            });
+            entries.len = entries.buckets.values().map(Vec::len).sum();
+        }
         if entries.len >= max_len {
             return;
         }
@@ -1806,18 +1870,36 @@ impl Registry {
             return handle;
         }
 
+        if control.free_counters.is_empty() {
+            self.reclaim(control);
+        }
         let old = self.published.load();
-        let handle = Handle {
-            index: next_index(old.counters.len()),
-            gen: 0,
-        };
-
         let mut counters = old.counters.clone();
-        counters.push(SeriesMeta {
-            instrument,
-            attrs: key.1.clone(),
-            gen: handle.gen,
-        });
+        let reused = control.free_counters.pop();
+        let handle = if let Some(index) = reused {
+            // A freed slot is already zeroed, and its generation was bumped
+            // when it drained, so no earlier handle matches it.
+            let meta = &mut counters[index as usize];
+            meta.instrument = instrument;
+            meta.attrs = key.1.clone();
+            meta.vacant = false;
+            Handle {
+                index,
+                gen: meta.gen,
+            }
+        } else {
+            let handle = Handle {
+                index: next_index(counters.len()),
+                gen: 0,
+            };
+            counters.push(SeriesMeta {
+                instrument,
+                attrs: key.1.clone(),
+                gen: handle.gen,
+                vacant: false,
+            });
+            handle
+        };
 
         // Growth: clone the outer Vec<Vec<Arc<..>>> (copies only Arc
         // pointers -- every existing AtomicU64 stays exactly where it is,
@@ -1829,7 +1911,7 @@ impl Registry {
         // instead of sharing the same atomics would lose any increment that
         // landed between the read and the swap, below.
         let mut counter_shards = old.counter_shards.clone();
-        if (handle.index as usize).is_multiple_of(COUNTER_BLOCK_LEN) {
+        if reused.is_none() && (handle.index as usize).is_multiple_of(COUNTER_BLOCK_LEN) {
             for worker_blocks in &mut counter_shards {
                 worker_blocks.push(Arc::new(
                     (0..COUNTER_BLOCK_LEN).map(|_| AtomicU64::new(0)).collect(),
@@ -1840,12 +1922,14 @@ impl Registry {
         if self.live.load().is_live(&key.1) {
             *control.live_counts.entry(instrument.name).or_default() += 1;
         }
-        self.published.store(Arc::new(Snapshot {
+        let next = Snapshot {
             counters,
             counter_shards,
             histograms: old.histograms.clone(),
             histogram_shards: old.histogram_shards.clone(),
-        }));
+        };
+        drop(old);
+        self.publish(control, next);
         control.lookup.insert(key, handle);
         handle
     }
@@ -1905,38 +1989,60 @@ impl Registry {
             return handle;
         }
 
+        if control.free_histograms.is_empty() {
+            self.reclaim(control);
+        }
         let old = self.published.load();
-        let handle = HistogramHandle {
-            index: next_index(old.histograms.len()),
-            gen: 0,
-        };
-
         let mut histograms = old.histograms.clone();
-        histograms.push(SeriesMeta {
-            instrument,
-            attrs: key.1.clone(),
-            gen: handle.gen,
-        });
-
         // Nineteen boundaries means twenty slots -- see the module doc's
         // "overflow bucket" section. One freshly-allocated
         // Arc<HistogramShard> per worker, appended -- never resizing a
         // shard that already has a handle.
         let num_buckets = num_boundaries + 1;
         let mut histogram_shards = old.histogram_shards.clone();
-        for worker_shards in &mut histogram_shards {
-            worker_shards.push(Arc::new(HistogramShard::new(num_buckets)));
-        }
+        let handle = if let Some(index) = control.free_histograms.pop() {
+            // A freed slot has no writer left, so its shards are replaced
+            // rather than zeroed: the new instrument may have a different
+            // bucket count.
+            let meta = &mut histograms[index as usize];
+            meta.instrument = instrument;
+            meta.attrs = key.1.clone();
+            meta.vacant = false;
+            for worker_shards in &mut histogram_shards {
+                worker_shards[index as usize] = Arc::new(HistogramShard::new(num_buckets));
+            }
+            HistogramHandle {
+                index,
+                gen: meta.gen,
+            }
+        } else {
+            let handle = HistogramHandle {
+                index: next_index(histograms.len()),
+                gen: 0,
+            };
+            histograms.push(SeriesMeta {
+                instrument,
+                attrs: key.1.clone(),
+                gen: handle.gen,
+                vacant: false,
+            });
+            for worker_shards in &mut histogram_shards {
+                worker_shards.push(Arc::new(HistogramShard::new(num_buckets)));
+            }
+            handle
+        };
 
         if self.live.load().is_live(&key.1) {
             *control.live_counts.entry(instrument.name).or_default() += 1;
         }
-        self.published.store(Arc::new(Snapshot {
+        let next = Snapshot {
             counters: old.counters.clone(),
             counter_shards: old.counter_shards.clone(),
             histograms,
             histogram_shards,
-        }));
+        };
+        drop(old);
+        self.publish(control, next);
         control.histogram_lookup.insert(key, handle);
         handle
     }
@@ -2043,13 +2149,14 @@ impl Registry {
     ) -> Handle {
         let mut values = [""; MEMO_MAX_LABELS];
         let values = Self::memo_values(attrs, &mut values);
-        if let Some(handle) = memo.get(values) {
+        let is_current = |handle| self.is_current(handle);
+        if let Some(handle) = memo.get(values, is_current) {
             return handle;
         }
         let (handle, folded) =
             self.resolve_capped_detailed(instrument, attrs, ceiling, overflow_attrs);
         if !folded {
-            memo.insert(values, handle, ceiling);
+            memo.insert(values, handle, ceiling, is_current);
         }
         handle
     }
@@ -2138,13 +2245,14 @@ impl Registry {
     ) -> HistogramHandle {
         let mut values = [""; MEMO_MAX_LABELS];
         let values = Self::memo_values(attrs, &mut values);
-        if let Some(handle) = memo.get(values) {
+        let is_current = |handle| self.is_current_histogram(handle);
+        if let Some(handle) = memo.get(values, is_current) {
             return handle;
         }
         let (handle, folded) =
             self.resolve_histogram_capped_detailed(instrument, attrs, ceiling, overflow_attrs);
         if !folded {
-            memo.insert(values, handle, ceiling);
+            memo.insert(values, handle, ceiling, is_current);
         }
         handle
     }
@@ -2187,20 +2295,151 @@ impl Registry {
     /// [`LiveScope`] and recounts the live series per instrument, in one
     /// acquisition, so a resolve can never see a count that disagrees with the
     /// scope.
+    ///
+    /// Also retires: a slot this scope hides that the previous scope hid too
+    /// is drained, and drained slots no reader can still write are freed. See
+    /// the module doc's "Series are retired, drained, then reused".
     fn set_live_scope(&self, scope: LiveScope) {
         let mut control = self
             .control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = self.published.load();
+        let state = self.published.load_full();
         let mut counts: HashMap<&'static str, usize> = HashMap::new();
-        for meta in state.counters.iter().chain(&state.histograms) {
+        let mut hidden = HashSet::new();
+        let counters = (0u32..).map(Slot::Counter).zip(&state.counters);
+        let histograms = (0u32..).map(Slot::Histogram).zip(&state.histograms);
+        for (slot, meta) in counters.chain(histograms) {
+            if meta.vacant {
+                continue;
+            }
             if scope.is_live(&meta.attrs) {
                 *counts.entry(meta.instrument.name).or_default() += 1;
+            } else {
+                hidden.insert(slot);
             }
         }
+        let to_drain: Vec<Slot> = hidden
+            .iter()
+            .filter(|slot| control.hidden.contains(slot))
+            .copied()
+            .collect();
+        for slot in &to_drain {
+            hidden.remove(slot);
+        }
+        control.hidden = hidden;
         control.live_counts = counts;
         self.live.store(Arc::new(scope));
+        if !to_drain.is_empty() {
+            self.drain(&mut control, &state, &to_drain);
+        }
+        drop(state);
+        self.reclaim(&mut control);
+    }
+
+    /// Ends the series in `slots`: one published snapshot bumps each slot's
+    /// generation (every outstanding handle goes stale at once), marks it
+    /// vacant and drops its attributes, and the dedup entry goes, so a name
+    /// that returns resolves a fresh series. The storage is freed later, by
+    /// [`Self::reclaim`].
+    fn drain(&self, control: &mut ControlState, state: &Snapshot, slots: &[Slot]) {
+        let mut counters = state.counters.clone();
+        let mut histograms = state.histograms.clone();
+        for &slot in slots {
+            let meta = match slot {
+                Slot::Counter(index) => &mut counters[index as usize],
+                Slot::Histogram(index) => &mut histograms[index as usize],
+            };
+            let key = (meta.instrument.name, std::mem::take(&mut meta.attrs));
+            meta.gen = meta.gen.wrapping_add(1);
+            meta.vacant = true;
+            match slot {
+                Slot::Counter(_) => {
+                    control.lookup.remove(&key);
+                }
+                Slot::Histogram(_) => {
+                    control.histogram_lookup.remove(&key);
+                }
+            }
+        }
+        self.publish(
+            control,
+            Snapshot {
+                counters,
+                counter_shards: state.counter_shards.clone(),
+                histograms,
+                histogram_shards: state.histogram_shards.clone(),
+            },
+        );
+        let drained_at = control.published_seq;
+        control
+            .draining
+            .extend(slots.iter().map(|&slot| (slot, drained_at)));
+    }
+
+    /// Frees every drained slot no reader can still write. The only write
+    /// that can reach a drained slot comes from a reader holding a snapshot
+    /// published before the drain, where the old generation still matched;
+    /// once no such snapshot is held, the slot's counter is zeroed and its
+    /// index joins the free list. Histogram shards are replaced on reuse
+    /// instead (see [`Self::insert_histogram`]).
+    fn reclaim(&self, control: &mut ControlState) {
+        if control.draining.is_empty() {
+            return;
+        }
+        // `superseded` is pruned on every publish and ordered by sequence,
+        // so its first entry is the oldest snapshot a reader may still hold.
+        let oldest_held = control
+            .superseded
+            .iter()
+            .find(|(_, snapshot)| snapshot.strong_count() > 0)
+            .map(|(seq, _)| *seq);
+        // Rust note: `strong_count` is a plain load. The fence orders the
+        // zeroing below after the last reader's release of its reference, so
+        // its final increment cannot land after the zero.
+        std::sync::atomic::fence(Ordering::Acquire);
+        let state = self.published.load();
+        let draining = std::mem::take(&mut control.draining);
+        for (slot, drained_at) in draining {
+            if oldest_held.is_some_and(|seq| seq < drained_at) {
+                control.draining.push((slot, drained_at));
+                continue;
+            }
+            match slot {
+                Slot::Counter(index) => {
+                    let (block, offset) = counter_position(index);
+                    for worker_blocks in &state.counter_shards {
+                        worker_blocks[block][offset].store(0, Ordering::Relaxed);
+                    }
+                    control.free_counters.push(index);
+                }
+                Slot::Histogram(index) => control.free_histograms.push(index),
+            }
+        }
+    }
+
+    /// Publishes `next`, and remembers the snapshot it replaces until no
+    /// reader holds it. Control side only, with `control` held, so sequence
+    /// numbers follow publication order.
+    ///
+    /// Rust note: `ArcSwap::swap` gives every outstanding `load()` guard of
+    /// the replaced snapshot its own reference before it returns (arc-swap's
+    /// "debt" repayment), so the `Weak` kept here counts every reader still
+    /// using it.
+    fn publish(&self, control: &mut ControlState, next: Snapshot) {
+        let replaced = self.published.swap(Arc::new(next));
+        control
+            .superseded
+            .push((control.published_seq, Arc::downgrade(&replaced)));
+        control.published_seq += 1;
+        drop(replaced);
+        control
+            .superseded
+            .retain(|(_, snapshot)| snapshot.strong_count() > 0);
+        // A snapshot pruned here is never checked again, so this is where
+        // the last reader's release must be acquired; `reclaim`'s own fence
+        // only covers the snapshots it still sees.
+        std::sync::atomic::fence(Ordering::Acquire);
     }
 
     /// Builds the sorted `(instrument.name, attrs)` dedup key shared by
@@ -2348,14 +2587,18 @@ impl Registry {
         let state = self.published.load_full();
         let live = self.live.load_full();
         let n = state.counters.len();
-        // Hidden series (see `LiveScope`) are skipped here and nowhere else:
-        // `value` on a handle still reads them, since a worker may hold one.
+        // Hidden series (see `LiveScope`) and vacant slots are skipped here
+        // and nowhere else: `value` on a current handle still reads a hidden
+        // series, since a worker may hold one.
         // Rust note: two closures each need the snapshot, and `move` gives the
         // first one ownership, so the filter gets its own `Arc` clone (a
         // refcount bump).
         let for_filter = Arc::clone(&state);
         (0..n)
-            .filter(move |&i| live.is_live(&for_filter.counters[i].attrs))
+            .filter(move |&i| {
+                let meta = &for_filter.counters[i];
+                !meta.vacant && live.is_live(&meta.attrs)
+            })
             .map(move |i| {
                 let block = i / COUNTER_BLOCK_LEN;
                 let slot = i % COUNTER_BLOCK_LEN;
@@ -2409,22 +2652,32 @@ impl Registry {
     /// justification as `value`. A stale `handle` reads as empty: no buckets,
     /// no observations.
     pub fn histogram_snapshot(&self, handle: HistogramHandle) -> HistogramSnapshot {
-        let state = self.published.load();
-        let Some(meta) = state.histogram(handle) else {
-            return HistogramSnapshot {
+        self.histogram_view(handle)
+            .map(|(snapshot, _)| snapshot)
+            .unwrap_or(HistogramSnapshot {
                 bucket_counts: Vec::new(),
                 sum: 0.0,
                 count: 0,
-            };
-        };
-        let num_buckets = meta
+            })
+    }
+
+    /// [`Self::histogram_snapshot`] with the instrument's bucket boundaries,
+    /// read from one published snapshot, or `None` if `handle` is stale. A
+    /// renderer lists handles from one snapshot and reads them later, so a
+    /// series drained in between must be skipped, not rendered as empty
+    /// buckets against its instrument's boundaries.
+    pub(crate) fn histogram_view(
+        &self,
+        handle: HistogramHandle,
+    ) -> Option<(HistogramSnapshot, &'static [f64])> {
+        let state = self.published.load();
+        let meta = state.histogram(handle)?;
+        let boundaries = meta
             .instrument
             .buckets
-            .expect("stats::Registry::histogram_snapshot: instrument has no bucket boundaries")
-            .len()
-            + 1;
+            .expect("stats::Registry::histogram_snapshot: instrument has no bucket boundaries");
 
-        let mut bucket_counts = vec![0u64; num_buckets];
+        let mut bucket_counts = vec![0u64; boundaries.len() + 1];
         let mut sum = 0.0f64;
         let mut count = 0u64;
         for worker_shards in &state.histogram_shards {
@@ -2435,11 +2688,14 @@ impl Registry {
             sum += f64::from_bits(shard.sum_bits.load(Ordering::Relaxed));
             count = count.wrapping_add(shard.count.load(Ordering::Relaxed));
         }
-        HistogramSnapshot {
-            bucket_counts,
-            sum,
-            count,
-        }
+        Some((
+            HistogramSnapshot {
+                bucket_counts,
+                sum,
+                count,
+            },
+            boundaries,
+        ))
     }
 
     /// Per-worker snapshots, **unsummed**. Compiled for tests only — same
@@ -2485,7 +2741,10 @@ impl Registry {
         let n = state.histograms.len();
         let for_filter = Arc::clone(&state);
         (0..n)
-            .filter(move |&i| live.is_live(&for_filter.histograms[i].attrs))
+            .filter(move |&i| {
+                let meta = &for_filter.histograms[i];
+                !meta.vacant && live.is_live(&meta.attrs)
+            })
             .map(move |i| {
                 let meta = &state.histograms[i];
                 (
@@ -2532,55 +2791,53 @@ impl Registry {
             "stats::Registry::percentile: p must be in [0, 100], got {p}"
         );
 
-        let snapshot = self.histogram_snapshot(handle);
-        if snapshot.count == 0 {
-            return 0.0;
+        match self.histogram_view(handle) {
+            Some((snapshot, boundaries)) => percentile_of(&snapshot, boundaries, p),
+            None => 0.0,
         }
-
-        let state = self.published.load();
-        // `count > 0` above means the handle was current a moment ago; a
-        // retirement in between reads as empty, like a stale handle.
-        let Some(meta) = state.histogram(handle) else {
-            return 0.0;
-        };
-        let boundaries = meta
-            .instrument
-            .buckets
-            .expect("stats::Registry::percentile: instrument has no bucket boundaries");
-
-        let last_nonzero = snapshot
-            .bucket_counts
-            .iter()
-            .rposition(|&c| c > 0)
-            .expect("count > 0 implies at least one non-empty bucket");
-
-        let target = (p / 100.0) * snapshot.count as f64;
-        let mut cumulative_before = 0u64;
-        for (i, &count) in snapshot.bucket_counts.iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let cumulative_after = cumulative_before + count;
-            let lower = if i == 0 { 0.0 } else { boundaries[i - 1] };
-            // Overflow bucket (i == boundaries.len()): no declared upper
-            // edge, so fall back to its lower edge -- see the doc above.
-            let upper = if i < boundaries.len() {
-                boundaries[i]
-            } else {
-                lower
-            };
-
-            if target <= cumulative_after as f64 || i == last_nonzero {
-                let fraction = ((target - cumulative_before as f64) / count as f64).clamp(0.0, 1.0);
-                return lower + fraction * (upper - lower);
-            }
-            cumulative_before = cumulative_after;
-        }
-        // Unreachable given count > 0 (the loop above always returns from
-        // the `last_nonzero` bucket at the latest), but a defensible
-        // fallback rather than a panic if it's ever reached.
-        *boundaries.last().unwrap_or(&0.0)
     }
+}
+
+/// [`Registry::percentile`] over an already-read snapshot, so a renderer can
+/// take several percentiles of one consistent read. `p` must be in
+/// `[0, 100]`; an empty snapshot gives `0.0`.
+pub(crate) fn percentile_of(snapshot: &HistogramSnapshot, boundaries: &[f64], p: f64) -> f64 {
+    if snapshot.count == 0 {
+        return 0.0;
+    }
+
+    let last_nonzero = snapshot
+        .bucket_counts
+        .iter()
+        .rposition(|&c| c > 0)
+        .expect("count > 0 implies at least one non-empty bucket");
+
+    let target = (p / 100.0) * snapshot.count as f64;
+    let mut cumulative_before = 0u64;
+    for (i, &count) in snapshot.bucket_counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let cumulative_after = cumulative_before + count;
+        let lower = if i == 0 { 0.0 } else { boundaries[i - 1] };
+        // Overflow bucket (i == boundaries.len()): no declared upper
+        // edge, so fall back to its lower edge -- see `Registry::percentile`'s doc.
+        let upper = if i < boundaries.len() {
+            boundaries[i]
+        } else {
+            lower
+        };
+
+        if target <= cumulative_after as f64 || i == last_nonzero {
+            let fraction = ((target - cumulative_before as f64) / count as f64).clamp(0.0, 1.0);
+            return lower + fraction * (upper - lower);
+        }
+        cumulative_before = cumulative_after;
+    }
+    // Unreachable given count > 0 (the loop above always returns from
+    // the `last_nonzero` bucket at the latest), but a defensible
+    // fallback rather than a panic if it's ever reached.
+    *boundaries.last().unwrap_or(&0.0)
 }
 
 /// The control-side owner of a [`Registry`]: the only type able to
@@ -2638,9 +2895,12 @@ impl StatsControl {
     /// Tells the registry which cluster, listener, tenant and model names the
     /// running config still names. Series outside the scope stop being
     /// emitted and stop counting against their caps; they reappear with their
-    /// old value if the scope names them again. Call it on every config
-    /// apply, before resolving the new snapshot's series. Frees no memory:
-    /// see the module doc's "Series are bounded and hidden, never freed".
+    /// old value if the next scope names them again. A series this scope and
+    /// the previous one both hide is drained, and its slot is freed for reuse
+    /// once no reader can still write it. Call it once per published config
+    /// snapshot, before resolving that snapshot's series: the grace period is
+    /// one call, not a span of time. See the module doc's "Series are
+    /// retired, drained, then reused".
     pub fn set_live_scope(&self, scope: LiveScope) {
         self.registry.set_live_scope(scope);
     }
@@ -3770,7 +4030,7 @@ mod tests {
     }
 
     #[test]
-    fn a_series_whose_cluster_leaves_the_config_is_hidden_and_reappears_with_its_old_value() {
+    fn a_series_absent_from_one_scope_is_hidden_and_reappears_with_its_old_value() {
         let control = StatsControl::new(1);
         let registry = control.registry();
         let gone = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "gone")]);
@@ -3808,6 +4068,188 @@ mod tests {
         };
         assert_eq!(value_of("gone"), Some(7), "old value plus the straggler");
         assert_eq!(registry.histograms().count(), 1);
+    }
+
+    #[test]
+    fn a_series_absent_from_two_scopes_is_freed_and_returns_at_zero() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let gone = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "gone")]);
+        let latency =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "gone")]);
+        registry.incr(WorkerId(0), gone, 5);
+        registry.observe(WorkerId(0), latency, 3.0);
+
+        let only_kept = || LiveScope {
+            clusters: names(&["kept"]),
+            ..LiveScope::default()
+        };
+        control.set_live_scope(only_kept());
+        control.set_live_scope(only_kept());
+        assert!(!registry.is_current(gone));
+        assert!(!registry.is_current_histogram(latency));
+        // Must not reach the series that replaces it; checked below.
+        registry.incr(WorkerId(0), gone, 2);
+
+        control.set_live_scope(LiveScope {
+            clusters: names(&["kept", "gone"]),
+            ..LiveScope::default()
+        });
+        let back = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "gone")]);
+        let back_latency =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "gone")]);
+        assert_ne!(back, gone, "a returning name gets a fresh series");
+        assert_eq!(emitted(&registry, "upstream_rq").len(), 1);
+        assert_eq!(registry.counters().map(|(_, _, v)| v).sum::<u64>(), 0);
+        assert_eq!(registry.histogram_snapshot(back_latency).count, 0);
+        registry.incr(WorkerId(0), back, 1);
+        assert_eq!(registry.value(back), 1);
+    }
+
+    #[test]
+    fn churning_tenant_names_reuses_slots_instead_of_growing() {
+        const ROUNDS: usize = 500;
+        const CEILING: usize = 16;
+        let control = StatsControl::new(2);
+        let registry = control.registry();
+        let memo = HandleMemo::<Handle>::new();
+        for round in 0..ROUNDS {
+            let tenant = format!("t{round}");
+            // The config apply order: scope first, then the round's traffic.
+            control.set_live_scope(LiveScope {
+                tenants: names(&[&tenant]),
+                ..LiveScope::default()
+            });
+            let handle = registry.resolve_capped_memo(
+                &memo,
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[("provider", "p"), ("type", "input"), ("tenant", &tenant)],
+                CEILING,
+                &[
+                    ("provider", "p"),
+                    ("type", "input"),
+                    ("tenant", TOKEN_OVERFLOW),
+                ],
+            );
+            registry.incr(WorkerId(round % 2), handle, round as u64 + 1);
+            assert_eq!(
+                registry.value(handle),
+                round as u64 + 1,
+                "a reused slot starts at zero"
+            );
+        }
+        // The live tenant plus the one hidden for a single scope; every
+        // earlier tenant's slot was drained, freed and reused.
+        let state = registry.published.load();
+        assert_eq!(state.counters.len(), 2, "slots grew with churn");
+        assert_eq!(registry.control.lock().unwrap().lookup.len(), 2);
+        // The memo filled with retired tenants long ago; sweeping them is
+        // what lets the live one in, so a repeat skips the lock.
+        let acquisitions = registry.capped_lock_acquisitions();
+        let last = format!("t{}", ROUNDS - 1);
+        registry.resolve_capped_memo(
+            &memo,
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[("provider", "p"), ("type", "input"), ("tenant", &last)],
+            CEILING,
+            &[
+                ("provider", "p"),
+                ("type", "input"),
+                ("tenant", TOKEN_OVERFLOW),
+            ],
+        );
+        assert_eq!(registry.capped_lock_acquisitions(), acquisitions);
+        let live = emitted(&registry, "llm.client.token.usage");
+        assert_eq!(live.len(), 1, "{live:?}");
+    }
+
+    #[test]
+    fn a_stale_handle_writes_nothing_into_the_series_that_reuses_its_slot() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let gone = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "gone")]);
+        let gone_latency =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "gone")]);
+        let scope = LiveScope {
+            clusters: names(&["next"]),
+            ..LiveScope::default()
+        };
+        control.set_live_scope(scope.clone());
+        control.set_live_scope(scope);
+
+        let next = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "next")]);
+        let next_latency =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "next")]);
+        assert_eq!(next.index, gone.index, "the freed slot is reused");
+        assert_eq!(next_latency.index, gone_latency.index);
+
+        registry.incr(WorkerId(0), gone, 100);
+        registry.observe(WorkerId(0), gone_latency, 3.0);
+        assert_eq!(registry.value(next), 0);
+        assert_eq!(registry.histogram_snapshot(next_latency).count, 0);
+        assert_eq!(registry.counters().map(|(_, _, v)| v).sum::<u64>(), 0);
+    }
+
+    #[test]
+    fn a_writer_holding_a_pre_drain_snapshot_keeps_the_slot_allocated() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let gone = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "gone")]);
+        // A writer that loaded the snapshot and has not yet written: it
+        // passed the generation check there, so its increment may still land.
+        let paused_writer = registry.published.load();
+        let scope = LiveScope {
+            clusters: names(&["a", "b"]),
+            ..LiveScope::default()
+        };
+        control.set_live_scope(scope.clone());
+        control.set_live_scope(scope.clone());
+        assert!(!registry.is_current(gone), "drained even while held");
+
+        let a = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "a")]);
+        assert_ne!(a.index, gone.index, "the slot is still draining");
+
+        drop(paused_writer);
+        control.set_live_scope(scope);
+        let b = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "b")]);
+        assert_eq!(b.index, gone.index, "freed once no reader holds it");
+    }
+
+    #[test]
+    fn a_stale_memo_entry_is_re_resolved() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let memo = HandleMemo::<Handle>::new();
+        let resolve = || {
+            registry.resolve_capped_memo(
+                &memo,
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[("provider", "p"), ("type", "input"), ("tenant", "acme")],
+                10,
+                &[
+                    ("provider", "p"),
+                    ("type", "input"),
+                    ("tenant", TOKEN_OVERFLOW),
+                ],
+            )
+        };
+        let before = resolve();
+        let without_p = LiveScope {
+            clusters: names(&["q"]),
+            ..LiveScope::default()
+        };
+        control.set_live_scope(without_p.clone());
+        control.set_live_scope(without_p);
+        control.set_live_scope(LiveScope::default());
+
+        let after = resolve();
+        assert_ne!(after, before);
+        registry.incr(WorkerId(0), after, 3);
+        assert_eq!(
+            registry.counters().map(|(_, _, v)| v).sum::<u64>(),
+            3,
+            "a memo returning the stale handle would drop every write"
+        );
     }
 
     #[test]

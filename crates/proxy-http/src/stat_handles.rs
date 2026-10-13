@@ -160,6 +160,14 @@ impl StatHandles {
     /// copying the index loses nothing, because the counter it points to
     /// still lives in the registry's own `Arc`'d storage, untouched by this
     /// swap.
+    ///
+    /// Also drops every entry whose handles went stale: the registry drained
+    /// that series after its name was absent from two consecutive configs
+    /// (see `proxy_observability::stats`' "Series are retired, drained, then
+    /// reused"). A stale handle records nothing, so a name that returns must
+    /// be resolved again rather than skipped as present. An absent name that
+    /// is not drained yet keeps its entry, so a request still finishing
+    /// against it counts into its hidden series.
     pub fn resolve_missing<'a>(
         &self,
         control: &StatsControl,
@@ -167,7 +175,9 @@ impl StatHandles {
     ) {
         let current = self.by_cluster.load();
         let mut next: HashMap<String, ClusterStatHandles> = (**current).clone();
-        let mut changed = false;
+        let registry = control.registry();
+        next.retain(|_, h| registry.is_current(h.rq) && registry.is_current_histogram(h.rq_time));
+        let mut changed = next.len() != current.len();
         for name in cluster_names {
             if next.contains_key(name) {
                 continue;
@@ -358,7 +368,8 @@ impl DownstreamStatHandles {
     /// holds, so a listener introduced after boot is counted from its first
     /// accepted connection instead of silently falling into the
     /// unknown-listener path below. See [`StatHandles::resolve_missing`]'s
-    /// doc for why copying the map here is safe and cheap.
+    /// doc for why copying the map here is safe and cheap, and why stale
+    /// entries are dropped first.
     pub fn resolve_missing<'a>(
         &self,
         control: &StatsControl,
@@ -366,7 +377,11 @@ impl DownstreamStatHandles {
     ) {
         let current = self.by_listener.load();
         let mut next: HashMap<String, ListenerStatHandles> = (**current).clone();
-        let mut changed = false;
+        let registry = control.registry();
+        next.retain(|_, h| {
+            registry.is_current(h.cx_total) && registry.is_current(h.global_cx_overflow)
+        });
+        let mut changed = next.len() != current.len();
         for name in listener_names {
             if next.contains_key(name) {
                 continue;
@@ -530,8 +545,8 @@ impl TokenUsageStatHandles {
 
     /// Resolves the sentinel-tenant buckets for every name in
     /// `provider_names` this table doesn't already have an entry for.
-    /// Called again on a SIGHUP reload, same as
-    /// [`StatHandles::resolve_missing`] -- see that doc.
+    /// Called again on a SIGHUP reload, and drops stale entries first, same
+    /// as [`StatHandles::resolve_missing`] -- see that doc.
     pub fn resolve_missing<'a>(
         &self,
         control: &StatsControl,
@@ -539,7 +554,13 @@ impl TokenUsageStatHandles {
     ) {
         let current = self.by_provider.load();
         let mut next: HashMap<String, TokenUsageHandles> = (**current).clone();
-        let mut changed = false;
+        let registry = control.registry();
+        next.retain(|_, h| {
+            [h.input, h.output, h.cached, h.cache_creation]
+                .into_iter()
+                .all(|handle| registry.is_current(handle))
+        });
+        let mut changed = next.len() != current.len();
         for name in provider_names {
             if next.contains_key(name) {
                 continue;
@@ -936,6 +957,49 @@ mod tests {
         handles.resolve_missing(&control, ["anthropic"]);
 
         assert!(worker_clone.for_cluster("anthropic").is_some());
+    }
+
+    #[test]
+    fn a_name_that_returns_after_its_series_was_freed_records_again() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let router = Arc::new(StatHandles::build(&control, ["gone"]));
+        let downstream = Arc::new(DownstreamStatHandles::build(&control, ["gone"]));
+        let token_usage = Arc::new(TokenUsageStatHandles::build(&control, ["gone"]));
+        let router_stats = RouterStats::new(registry.clone(), router.clone(), WorkerId(0));
+        let downstream_stats =
+            DownstreamStats::new(registry.clone(), downstream.clone(), WorkerId(0));
+        let token_stats = GenAiTokenStats::new(registry.clone(), token_usage.clone(), WorkerId(0));
+
+        // The config apply order: scope first, then the table refreshes.
+        let apply = |names: &[&str]| {
+            let set: HashSet<String> = names.iter().map(|n| n.to_string()).collect();
+            control.set_live_scope(proxy_observability::stats::LiveScope {
+                clusters: Some(set.clone()),
+                listeners: Some(set),
+                ..Default::default()
+            });
+            router.resolve_missing(&control, names.iter().copied());
+            downstream.resolve_missing(&control, names.iter().copied());
+            token_usage.resolve_missing(&control, names.iter().copied());
+        };
+        apply(&[]);
+        apply(&[]); // absent from two configs: drained and freed
+        apply(&["gone"]);
+
+        router_stats.record_attempt("gone");
+        downstream_stats.record_connection_accepted("gone");
+        token_stats.record_usage("gone", None, sample_tokens());
+        let total = |name: &str| -> u64 {
+            registry
+                .counters()
+                .filter(|(instrument, _, _)| instrument.name == name)
+                .map(|(_, _, value)| value)
+                .sum()
+        };
+        assert_eq!(total("upstream_rq"), 1, "a stale table entry drops writes");
+        assert_eq!(total("downstream_cx_total"), 1);
+        assert_eq!(total("llm.client.token.usage"), 40 + 10 + 7);
     }
 
     #[test]

@@ -115,7 +115,7 @@
 //! WP; this is the whole remaining gap, and it is far narrower than "the
 //! entire shape might be wrong".
 
-use super::{HistogramHandle, Instrument, Registry};
+use super::{percentile_of, HistogramHandle, Instrument, Registry};
 
 /// Percentiles Envoy's `/stats` text endpoint reports per histogram, in
 /// rendering order. The quantile *set* is confirmed against
@@ -169,7 +169,10 @@ pub fn render(registry: &Registry) -> String {
     }
     for (handle, instrument, attrs) in registry.histograms() {
         if let Some(name) = envoy_histogram_name(instrument, &attrs) {
-            lines.push((name, render_histogram_line(registry, handle)));
+            // `None`: the series was drained after `histograms()` listed it.
+            if let Some(line) = render_histogram_line(registry, handle) {
+                lines.push((name, line));
+            }
         }
     }
 
@@ -270,24 +273,28 @@ fn envoy_histogram_name(instrument: &Instrument, attrs: &[(String, String)]) -> 
 /// isolated here, and only here, so the one remaining unconfirmed detail
 /// (the module doc's `%g`-vs-`Display` note) stays contained to one
 /// function if it's ever tightened up further.
-fn render_histogram_line(registry: &Registry, handle: HistogramHandle) -> String {
-    let snapshot = registry.histogram_snapshot(handle);
+///
+/// Every percentile comes from one read, so the line describes one moment.
+/// `None` if `handle` went stale.
+fn render_histogram_line(registry: &Registry, handle: HistogramHandle) -> Option<String> {
+    let (snapshot, boundaries) = registry.histogram_view(handle)?;
     if snapshot.count == 0 {
         // Envoy's own `!used()` branch, in `ParentHistogramImpl`.
-        return "No recorded values".to_string();
+        return Some("No recorded values".to_string());
     }
-    ENVOY_STATS_TEXT_PERCENTILES
+    let line = ENVOY_STATS_TEXT_PERCENTILES
         .iter()
         .map(|(label, p)| {
             // `P<n>(interval,cumulative)`, space-joined. This registry has no
             // separate "interval since last flush" figure, only the lifetime
             // one, so both fields carry the same value -- a named divergence,
             // not an accident.
-            let value = registry.percentile(handle, *p);
+            let value = percentile_of(&snapshot, boundaries, *p);
             format!("{label}({value},{value})")
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    Some(line)
 }
 
 #[cfg(test)]
@@ -457,7 +464,7 @@ mod tests {
         registry.observe(WorkerId(0), h, 7.0);
         registry.observe(WorkerId(0), h, 800.0);
 
-        let line = render_histogram_line(&registry, h);
+        let line = render_histogram_line(&registry, h).unwrap();
 
         // "P<n>(interval,cumulative)" entries, space-joined -- confirmed
         // against `ParentHistogramImpl::quantileSummary()` in Envoy's own
@@ -502,7 +509,7 @@ mod tests {
         let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "x")]);
         let registry = control.registry();
 
-        let line = render_histogram_line(&registry, h);
+        let line = render_histogram_line(&registry, h).unwrap();
         assert_eq!(
             line, "No recorded values",
             "matches Envoy's own !histogram.used() branch -- see the module doc"

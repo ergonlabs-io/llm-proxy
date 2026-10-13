@@ -306,7 +306,10 @@ fn render_histogram_series(
     let boundaries = instrument
         .buckets
         .expect("a Histogram-kind Instrument always declares buckets -- Registry::resolve_histogram enforces this at resolve time");
-    let snapshot = registry.histogram_snapshot(handle);
+    // The series was drained after `histograms()` listed it: render nothing.
+    let Some((snapshot, _)) = registry.histogram_view(handle) else {
+        return;
+    };
     let bucket_name = format!("{name}_bucket");
 
     // `snapshot.bucket_counts` is non-cumulative (stats.rs's module doc) --
@@ -371,6 +374,29 @@ fn format_f64(value: f64) -> String {
 mod tests {
     use super::*;
     use crate::stats::{instruments, StatsControl, WorkerId};
+
+    #[test]
+    fn a_histogram_drained_after_it_was_listed_renders_nothing() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let h = control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "gone")]);
+        registry.observe(WorkerId(0), h, 3.0);
+        // A scrape lists the series, then two config applies drain it
+        // before the scrape reads it.
+        let listed: Vec<_> = registry.histograms().collect();
+        let scope = crate::stats::LiveScope {
+            clusters: Some(Default::default()),
+            ..Default::default()
+        };
+        control.set_live_scope(scope.clone());
+        control.set_live_scope(scope);
+
+        let mut out = String::new();
+        for (handle, instrument, attrs) in listed {
+            render_histogram_series(&mut out, &registry, handle, instrument, "x", &attrs);
+        }
+        assert_eq!(out, "", "a drained series must be skipped, not indexed");
+    }
 
     // ---- 1: metric name sanitization, including a leading digit ----------
 

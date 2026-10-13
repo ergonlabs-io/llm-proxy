@@ -244,7 +244,10 @@ pub fn map_metrics(registry: &Registry, resource: &Resource) -> ExportMetricsSer
     > = HashMap::new();
     let mut histogram_order: Vec<&'static str> = Vec::new();
     for (handle, instrument, attrs) in registry.histograms() {
-        let snapshot = registry.histogram_snapshot(handle);
+        // `None`: the series was drained after `histograms()` listed it.
+        let Some((snapshot, _)) = registry.histogram_view(handle) else {
+            continue;
+        };
         let explicit_bounds = instrument
             .buckets
             .expect("otlp::map_metrics: Histogram instrument with no bucket boundaries")
