@@ -101,8 +101,13 @@ Each connection has one in-flight record; a semaphore also bounds tasks. The
 single spool writer takes the first queued record, adds whatever else is
 already queued (eight at most), and commits that batch at once. It never waits
 for a fuller batch, because a connection sends nothing more until its receipt
-arrives. Records that arrive during one commit's fsync form the next batch, and
-collecting a batch is capped at 50 ms. Handshakes/receipts have two-second
+arrives. The one exception is the connections the previous commit answered:
+they send again only after it returned, so a batch missing any of them waits up
+to 2 ms for exactly those connections, which keeps concurrent producers in one
+batch instead of alternating half-size cohorts. A lone connection never waits,
+and open but idle connections are never waited for. Records that arrive during
+one commit's fsync form the next batch, and collecting a batch is capped at
+50 ms. Handshakes/receipts have two-second
 deadlines; idle reads expire after 30 seconds. Frame buffers, queue payloads
 and batching are each bounded, but JSON parsing/serialization and spool crypto
 add transient allocations. Enforce an independently provisioned process

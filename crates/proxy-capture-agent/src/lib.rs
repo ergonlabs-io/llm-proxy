@@ -11,21 +11,28 @@ use std::{
     io,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     time::{Duration, Instant},
 };
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{oneshot, Semaphore},
 };
 
 const MAX_CLIENTS: usize = 8;
 const DEADLINE: Duration = Duration::from_secs(2);
-/// Ceiling on how long the writer spends collecting one batch. Collection only
-/// takes jobs that are already queued (see `next_batch`), so this is an upper
-/// bound on a pathological pause, not a window the writer waits out.
+/// Ceiling on how long the writer spends collecting one batch, counted from its
+/// first job and including the settle wait below. With that wait at a few
+/// milliseconds this only binds if the writer thread is descheduled mid-batch.
 const MAX_BATCH_HOLD: Duration = Duration::from_millis(50);
+/// How long a partial batch waits for the producers the previous commit just
+/// answered. Those producers send again only after its receipt returns, by
+/// which time the writer has already drained the queue for the next commit, so
+/// they always miss it and run one commit behind the producers that sent while
+/// it was in fsync. Left alone, lockstep producers settle into alternating
+/// half-size cohorts. Waiting about one send round trip lets the cohorts merge.
+const COHORT_SETTLE: Duration = Duration::from_millis(2);
 
 #[derive(Default)]
 pub struct Health {
@@ -37,13 +44,17 @@ pub struct Health {
 struct Job {
     payload: Vec<u8>,
     producer: Producer,
+    /// The accepted connection that sent this job. A connection has one job in
+    /// flight, so the writer can tell which producers a commit answered. The
+    /// grant in `producer` cannot: several connections may share one.
+    connection: u64,
     reply: oneshot::Sender<Receipt>,
 }
 
 pub struct Agent {
     listener: UnixListener,
     config: Arc<Config>,
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::SyncSender<Job>,
     done: oneshot::Receiver<()>,
     pub health: Arc<Health>,
 }
@@ -75,7 +86,10 @@ impl Agent {
             return Err(error);
         }
         let config = Arc::new(config);
-        let (jobs, receiver) = mpsc::channel(MAX_CLIENTS);
+        // Rust note: a std `sync_channel` is bounded like tokio's `channel`, and
+        // its `Receiver` has the blocking `recv_timeout` the writer's settle wait
+        // needs, which tokio's receiver lacks outside an async task.
+        let (jobs, receiver) = mpsc::sync_channel(MAX_CLIENTS);
         let (done_tx, done) = oneshot::channel();
         let health = Arc::new(Health::default());
         let writer_health = health.clone();
@@ -83,7 +97,14 @@ impl Agent {
         if let Err(error) = std::thread::Builder::new()
             .name("metadata-spool".into())
             .spawn(move || {
-                writer(spool, receiver, &node_id, &writer_health, MAX_BATCH_HOLD);
+                writer(
+                    spool,
+                    receiver,
+                    &node_id,
+                    &writer_health,
+                    MAX_BATCH_HOLD,
+                    COHORT_SETTLE,
+                );
                 let _ = done_tx.send(());
             })
         {
@@ -106,6 +127,7 @@ impl Agent {
         tokio::pin!(shutdown);
         let clients = Arc::new(Semaphore::new(MAX_CLIENTS));
         let mut tasks = tokio::task::JoinSet::new();
+        let mut next_connection = 0u64;
         let outcome = loop {
             tokio::select! {
                 _ = &mut shutdown => break Ok(()),
@@ -118,9 +140,11 @@ impl Agent {
                     let config = self.config.clone();
                     let jobs = self.jobs.clone();
                     let health = self.health.clone();
+                    let connection = next_connection;
+                    next_connection += 1;
                     tasks.spawn(async move {
                         let _permit = permit;
-                        if serve(stream, &config, jobs).await.is_err() {
+                        if serve(stream, &config, jobs, connection).await.is_err() {
                             health.failures.fetch_add(1, Ordering::Relaxed);
                         }
                     });
@@ -144,7 +168,12 @@ impl Agent {
     }
 }
 
-async fn serve(mut stream: UnixStream, config: &Config, jobs: mpsc::Sender<Job>) -> io::Result<()> {
+async fn serve(
+    mut stream: UnixStream,
+    config: &Config,
+    jobs: mpsc::SyncSender<Job>,
+    connection: u64,
+) -> io::Result<()> {
     let uid = stream.peer_cred()?.uid();
     let first = tokio::time::timeout(DEADLINE, read_frame(&mut stream))
         .await
@@ -187,6 +216,7 @@ async fn serve(mut stream: UnixStream, config: &Config, jobs: mpsc::Sender<Job>)
         jobs.try_send(Job {
             payload: frame.payload,
             producer: producer.clone(),
+            connection,
             reply,
         })
         .map_err(|_| io::Error::other("writer unavailable"))?;
@@ -203,44 +233,98 @@ async fn serve(mut stream: UnixStream, config: &Config, jobs: mpsc::Sender<Job>)
     }
 }
 
-/// Blocks for the next job and returns it with whatever else is already queued,
-/// at most `MAX_CLIENTS` in all. `None` means every sender is gone and the
-/// queue is drained.
-///
-/// It never waits for jobs that have not arrived. A connection sends nothing
-/// more until its receipt returns, so with fewer than `MAX_CLIENTS` producers a
-/// batch cannot fill, and waiting for one would charge every record the whole
-/// window. Under load the queue refills while the previous batch is in fsync,
-/// so batches grow with the backlog without a timer. `max_hold` only caps
-/// collection time.
-fn next_batch(jobs: &mut mpsc::Receiver<Job>, max_hold: Duration) -> Option<Vec<Job>> {
-    // Rust note: `?` on an `Option` returns `None` early, the way it returns
-    // `Err` early from a function that returns `Result`.
-    let first = jobs.blocking_recv()?;
-    let started = Instant::now();
-    let mut batch = Vec::with_capacity(MAX_CLIENTS);
-    batch.push(first);
-    // The cap must stay within the spool's eight pending records: the spool
-    // refuses a larger append batch, and that refusal stops this writer.
-    while batch.len() < MAX_CLIENTS && started.elapsed() < max_hold {
-        // Rust note: `let ... else` binds on success and otherwise runs a block
-        // that must diverge (`break` here). `try_recv` never blocks; its two
-        // errors, queue empty and every sender dropped, both mean no job is
-        // ready now. The caller's next `blocking_recv` reports a closed channel.
-        let Ok(job) = jobs.try_recv() else { break };
-        batch.push(job);
+/// Forms the writer's commit batches from its queue.
+struct Batcher {
+    jobs: mpsc::Receiver<Job>,
+    max_hold: Duration,
+    settle: Duration,
+    /// Connections whose jobs were in the previous batch. The writer answers
+    /// every job in a batch before it asks for the next one, so these are the
+    /// producers the previous commit just answered, and the only ones a batch
+    /// ever waits for.
+    answered: Vec<u64>,
+}
+
+impl Batcher {
+    fn new(jobs: mpsc::Receiver<Job>, max_hold: Duration, settle: Duration) -> Self {
+        Self {
+            jobs,
+            max_hold,
+            settle,
+            answered: Vec::new(),
+        }
     }
-    Some(batch)
+
+    /// Blocks for the next job and returns it with the rest of its batch:
+    /// whatever else is already queued, at most `MAX_CLIENTS` in all. `None`
+    /// means every sender is gone and the queue is drained.
+    ///
+    /// The batch is committed as soon as nothing is queued, with one exception.
+    /// A connection sends nothing more until its receipt returns, so a lone
+    /// producer can never fill a batch, and waiting for one would charge every
+    /// record the whole window. But producers answered by the previous commit
+    /// send again only after it returned, so they miss the next batch and run
+    /// a commit behind the rest. So a batch missing any of them waits up to
+    /// `settle` (and never past `max_hold`) for those connections, and for no
+    /// one else. A lone producer is its own previous batch, so it never waits,
+    /// and connections that are open but idle are never waited for.
+    fn next_batch(&mut self) -> Option<Vec<Job>> {
+        // Rust note: `?` on an `Option` returns `None` early, the way it returns
+        // `Err` early from a function that returns `Result`.
+        let first = self.jobs.recv().ok()?;
+        let started = Instant::now();
+        let mut batch = Vec::with_capacity(MAX_CLIENTS);
+        batch.push(first);
+        let patience = self.settle.min(self.max_hold);
+        // The cap must stay within the spool's eight pending records: the spool
+        // refuses a larger append batch, and that refusal stops this writer.
+        while batch.len() < MAX_CLIENTS && started.elapsed() < self.max_hold {
+            match self.jobs.try_recv() {
+                Ok(job) => {
+                    batch.push(job);
+                    continue;
+                }
+                // Every sender is gone, so nothing more can arrive. The caller's
+                // next `next_batch` reports the closed channel.
+                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            // Nothing is queued. Commit now unless a connection the previous
+            // batch answered has not sent again.
+            let outstanding = self
+                .answered
+                .iter()
+                .any(|id| batch.iter().all(|job| job.connection != *id));
+            if !outstanding {
+                break;
+            }
+            // Rust note: `let ... else` binds on success and otherwise runs a
+            // block that must diverge, here `break` once patience is spent.
+            let Some(remaining) = patience.checked_sub(started.elapsed()) else {
+                break;
+            };
+            match self.jobs.recv_timeout(remaining) {
+                Ok(job) => batch.push(job),
+                // Out of patience, or every sender is gone.
+                Err(_) => break,
+            }
+        }
+        self.answered.clear();
+        self.answered.extend(batch.iter().map(|job| job.connection));
+        Some(batch)
+    }
 }
 
 fn writer(
     mut spool: MetadataSpool,
-    mut jobs: mpsc::Receiver<Job>,
+    jobs: mpsc::Receiver<Job>,
     node_id: &str,
     health: &Health,
     max_hold: Duration,
+    settle: Duration,
 ) {
-    while let Some(batch) = next_batch(&mut jobs, max_hold) {
+    let mut batcher = Batcher::new(jobs, max_hold, settle);
+    while let Some(batch) = batcher.next_batch() {
         let mut prepared = Vec::with_capacity(MAX_CLIENTS);
         let mut fatal = false;
         for job in batch {
