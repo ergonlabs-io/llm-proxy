@@ -55,12 +55,14 @@ struct Args {
     command: Option<Command>,
 
     /// Path to a bootstrap configuration (.yaml / .yml / .json / .pb).
-    /// Required for `serve`/`validate`/`translate`; unused by `keygen` and `init`.
+    /// `serve` and `validate` need exactly one of this or `--config`;
+    /// `translate` needs `--config`. Unused by `keygen` and `init`.
     #[arg(short = 'c', long = "config-path", value_name = "PATH")]
     config_path: Option<PathBuf>,
 
     /// Path to a simple llm-proxy config (schema/llmproxy-v0.schema.json).
-    /// Required for `serve`/`validate`/`translate`; unused by `keygen` and `init`.
+    /// `serve` and `validate` need exactly one of this or `-c`/`--config-path`;
+    /// `translate` needs this one. Unused by `keygen` and `init`.
     #[arg(long = "config", value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -154,13 +156,14 @@ struct Args {
     #[arg(short = 'l', long = "log-level", value_enum, default_value_t = LogLevel::Info)]
     log_level: LogLevel,
 
-    /// Identifies this instance to an xDS control plane. Accepted but not
-    /// yet used: dynamic configuration is not implemented.
+    /// Node id of this instance. Overrides the bootstrap `node.id`; the
+    /// result identifies the proxy to the xDS control plane and to
+    /// node-scoped filter state.
     #[arg(long = "service-node", value_name = "NAME")]
     service_node: Option<String>,
 
-    /// Identifies this instance's cluster to an xDS control plane. Accepted
-    /// but not yet used: dynamic configuration is not implemented.
+    /// Cluster of this instance. Overrides the bootstrap `node.cluster`;
+    /// the result identifies the proxy to the xDS control plane.
     #[arg(long = "service-cluster", value_name = "NAME")]
     service_cluster: Option<String>,
 }
