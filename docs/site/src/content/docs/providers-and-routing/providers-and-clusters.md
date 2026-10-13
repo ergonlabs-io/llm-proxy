@@ -3,7 +3,7 @@ title: Providers and clusters
 summary: How a configuration `provider` becomes an engine cluster, what
   identity (TLS, credentials, headers) travels with it, and how the `models`
   catalogue differs from `routes`.
-last_updated: 2026-08-26
+last_updated: 2026-10-12
 related:
   - ../configuration/configuration-file/
   - ../providers-and-routing/failover-and-aggregates/
@@ -23,9 +23,9 @@ rather than the route that picks it.
 ## One provider, one cluster, one endpoint
 
 Lowering derives a cluster's address from `base_url`: a literal IP becomes a
-`STATIC` cluster; a hostname becomes `LOGICAL_DNS`, re-resolved on a fixed
-5-second cadence that this schema version has no field to change
-(`crates/proxy-cluster/src/discovery.rs`'s `DEFAULT_DNS_REFRESH_RATE`). Either
+`STATIC` cluster; a hostname becomes `LOGICAL_DNS`, looked up again every 5
+seconds (this schema version has no field to change that; a bootstrap
+configuration does, see [DNS re-resolution](#dns-re-resolution)). Either
 way, a provider gets exactly one endpoint: the host and port parsed out of
 `base_url`. There is no field for a second address behind one provider name.
 
@@ -33,6 +33,54 @@ That matters for load balancing: with one endpoint, the load-balancing policy
 a cluster runs has nothing to choose between. See
 [Load balancing](../providers-and-routing/load-balancing/) for where a real
 choice of endpoints and policy is actually reachable.
+
+## DNS re-resolution
+
+A hostname is looked up when its cluster is built and then again every 5
+seconds for as long as the cluster exists, so a provider that moves to new
+addresses is picked up without a restart or a reload.
+
+- **Nothing changed:** nothing happens. The cluster keeps its current hosts
+  and their health state.
+- **Address rotation:** a provider's DNS often returns the same addresses in a
+  different order on every query. The cluster holds one address and stays on it
+  for as long as the answer still contains it, so rotating answers do not move
+  traffic between addresses or force new TCP and TLS handshakes. It moves to
+  the first address in the answer only when its own is gone.
+- **A lookup fails:** the cluster keeps serving the addresses it last resolved
+  and tries again after the same 5 seconds. The first failure is logged at
+  `warn` level, then the 2nd, 4th, 8th and so on (not every retry), and the
+  lookup that ends the outage is logged once at `info`.
+- **The first lookup fails at startup:** the cluster starts with no hosts, so
+  requests to it get a 503 and `/ready` waits for it, up to the 15-second
+  initial fetch timeout. The first retry that succeeds fills the cluster in;
+  no restart or reload is needed.
+
+A bootstrap configuration can tune this on a `STRICT_DNS` or `LOGICAL_DNS`
+cluster with the standard Envoy fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `dns_refresh_rate` | 5s | Time between lookups; must be above 1ms. |
+| `dns_jitter` | none | Upper bound of a random delay added to every lookup wait. |
+| `dns_failure_refresh_rate` | the refresh rate | Retry back-off after a failed lookup. `base_interval` is required; `max_interval` defaults to 10 times the base. Each consecutive failure doubles the wait, from the base up to the max, with jitter. |
+
+Other things to know, because they differ from what a similar Envoy
+configuration might lead you to expect:
+
+- `STRICT_DNS` serves every address in the answer: new addresses join and
+  vanished ones leave at the next lookup. `LOGICAL_DNS` serves one.
+- The endpoints of one cluster are looked up together. If any hostname fails,
+  the whole lookup counts as failed and the cluster keeps all the addresses it
+  had.
+- `respect_dns_ttl: true` is rejected at load, because the proxy's resolver does
+  not report record TTLs. Setting any of the fields above on a `STATIC` or
+  `EDS` cluster, where Envoy ignores them, is rejected too.
+- There is no per-lookup timeout: a resolver that hangs delays that cluster's
+  next refresh until the system resolver gives up.
+
+`internal-docs/envoy-divergences.md` records each of these departures from
+Envoy in detail.
 
 ## Provider types
 

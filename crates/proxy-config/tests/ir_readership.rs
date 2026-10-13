@@ -330,37 +330,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   (`eds.service_name`), which the text scan cannot tell apart \
                   from a read of this one. Re-verify this entry by hand.",
     },
-    // --- DNS re-resolution timing. Lowered by `lower.rs::convert_dns_refresh`;
-    //     the cluster manager's refresh task reads all four in the change that
-    //     follows this one, and `allowlist_has_no_stale_entries` fails the
-    //     moment a reader appears, so these four entries cannot outlive it.
-    AllowlistEntry {
-        struct_name: "DnsRefresh",
-        field_name: "refresh_rate",
-        kind: EntryKind::KnownInert,
-        reason: "Lowered from `dns_refresh_rate`; no runtime reader until the DNS \
-                  refresh task lands, which is the only consumer.",
-    },
-    AllowlistEntry {
-        struct_name: "DnsRefresh",
-        field_name: "jitter",
-        kind: EntryKind::KnownInert,
-        reason: "Lowered from `dns_jitter`; same single consumer as `refresh_rate`.",
-    },
-    AllowlistEntry {
-        struct_name: "DnsRefresh",
-        field_name: "failure_base_interval",
-        kind: EntryKind::KnownInert,
-        reason: "Lowered from `dns_failure_refresh_rate.base_interval`; same single \
-                  consumer as `refresh_rate`.",
-    },
-    AllowlistEntry {
-        struct_name: "DnsRefresh",
-        field_name: "failure_max_interval",
-        kind: EntryKind::KnownInert,
-        reason: "Lowered from `dns_failure_refresh_rate.max_interval`; same single \
-                  consumer as `refresh_rate`.",
-    },
 ];
 
 /// A `pub struct` block parsed out of `ir.rs`, with its `pub` field names.

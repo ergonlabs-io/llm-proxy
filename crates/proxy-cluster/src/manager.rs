@@ -18,7 +18,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use proxy_config::ir::{
@@ -26,7 +27,7 @@ use proxy_config::ir::{
 };
 use tokio::task::JoinHandle;
 
-use crate::discovery;
+use crate::discovery::{self, RefreshSchedule};
 use crate::health_check::HealthCheckEngine;
 use crate::host_set::{carry_over_health_flags, diff_host_sets, HostSet, HostSetDiff};
 use crate::load_balancer::{self, HostPicker, LbError};
@@ -179,6 +180,15 @@ struct ManagedCluster {
     /// stops, so without this a config reload leaks one sweep loop per
     /// cluster, forever.
     outlier_sweep: Mutex<Option<JoinHandle<()>>>,
+    /// The timer that re-resolves a `STRICT_DNS`/`LOGICAL_DNS` cluster
+    /// ([`run_dns_refresh`]); `None` for every other cluster. Set once, by
+    /// [`ClusterManager::start_dns_refresh`], after the cluster is behind its
+    /// `Arc` -- the task holds only a `Weak` to the cluster, so this field
+    /// cannot be filled at construction. Aborted on `Drop` for the same
+    /// reason as `probes`; the task also ends by itself when its `Weak` stops
+    /// upgrading, which covers the instant between the last `Arc` dropping
+    /// and the abort taking effect.
+    dns_refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for ManagedCluster {
@@ -206,6 +216,15 @@ impl Drop for ManagedCluster {
         // cluster that configures outlier detection.
         if let Ok(mut sweep) = self.outlier_sweep.lock() {
             if let Some(handle) = sweep.take() {
+                handle.abort();
+            }
+        }
+        // And the DNS refresh timer. Its `Weak` would stop upgrading anyway,
+        // so it would never resolve for a dead cluster again, but it would
+        // sit asleep until its next tick to find that out: a refresh interval
+        // per replaced cluster, and operators can set that to hours.
+        if let Ok(mut task) = self.dns_refresh_task.lock() {
+            if let Some(handle) = task.take() {
                 handle.abort();
             }
         }
@@ -274,6 +293,7 @@ impl ManagedCluster {
                     probes: Mutex::new(HashMap::new()),
                     outlier_detector,
                     outlier_sweep: Mutex::new(outlier_sweep),
+                    dns_refresh_task: Mutex::new(None),
                 })
             }
             ClusterKind::Aggregate { .. } => {
@@ -316,6 +336,9 @@ impl ManagedCluster {
                     // detection runs on the member cluster, same as probing.
                     outlier_detector: None,
                     outlier_sweep: Mutex::new(None),
+                    // An aggregate resolves nothing itself; its members
+                    // each run their own refresh.
+                    dns_refresh_task: Mutex::new(None),
                 })
             }
         }
@@ -357,6 +380,72 @@ impl ManagedCluster {
         }
     }
 
+    /// Run discovery and publish the result into this cluster's own
+    /// `host_set`, returning the diff against whatever it held before. This is
+    /// the one resolve path: the initial resolution in
+    /// [`ClusterManager::update_from_snapshot`], the manual
+    /// [`ClusterManager::refresh_cluster`], and the refresh timer
+    /// ([`run_dns_refresh`]) all end up here.
+    ///
+    /// Two shapes have nothing to resolve, and both return an explicit no-op
+    /// rather than a resolve of zero endpoints.
+    ///
+    /// An aggregate has no endpoints or discovery of its own.
+    ///
+    /// An EDS cluster's membership arrives through
+    /// [`ClusterManager::accept_eds_update`], and short-circuiting matters
+    /// here. A DNS refresh re-runs this; `discovery::resolve` returns an
+    /// EMPTY host set for `DiscoveryType::Eds`, so falling through would
+    /// diff the EDS-delivered membership against nothing and wipe it on the
+    /// next refresh.
+    ///
+    /// A changed host set is published; an unchanged one is not. DNS can only
+    /// change a host's address (its weight, priority and labels come from the
+    /// immutable config), so "unchanged" is exact here, and skipping the
+    /// publish keeps the live `Host`s -- their health flags, in-flight
+    /// counters and identity -- instead of replacing them every few seconds
+    /// with equal fresh ones.
+    async fn resolve_and_publish(&self, resolver: &dyn HostResolver) -> io::Result<HostSetDiff> {
+        let config = &self.config;
+        if matches!(config.kind, ClusterKind::Aggregate { .. })
+            || config.discovery == DiscoveryType::Eds
+        {
+            return Ok(HostSetDiff::default());
+        }
+        // Rust note: `load_full` hands back an owned `Arc<HostSet>`, where
+        // `load` returns a short-lived guard that must not be held across an
+        // `.await` -- and the lookup below can take as long as the
+        // platform's DNS timeouts.
+        let previous = self.host_set.load_full();
+        let resolved = discovery::resolve(config, resolver, &previous).await?;
+        drop(previous);
+
+        let mut diff = HostSetDiff::default();
+        // Rust note: `rcu` (read-copy-update) instead of `load` then `store`,
+        // for the reason spelled out in `health_check::apply_health_transition`:
+        // health checks and outlier ejection publish into this same cell from
+        // their own tasks, and a plain store here would overwrite a flag they
+        // set while the lookup was in flight. `rcu` re-runs the closure on the
+        // newest set if it loses a race, so it must stay pure and cheap --
+        // which is why it rebuilds the candidate from `resolved`'s hosts
+        // each time rather than consuming them.
+        self.host_set.rcu(|live| {
+            let candidate = HostSet::from_hosts(resolved.all_hosts());
+            diff = diff_host_sets(live, &candidate);
+            if diff.added.is_empty() && diff.removed.is_empty() {
+                return Arc::clone(live);
+            }
+            // `discovery::resolve` builds every `Host` fresh, with
+            // `HealthFlags::default()`, so without this a refresh that adds
+            // one address would silently re-mark every other host healthy --
+            // see `host_set::carry_over_health_flags`.
+            Arc::new(carry_over_health_flags(live, candidate, &diff))
+        });
+        self.initialized.store(true, Ordering::Release);
+        self.reconcile_probes(&diff);
+        Ok(diff)
+    }
+
     /// True for an aggregate cluster (`ClusterConfig::kind` is `Aggregate`).
     /// [`ClusterHandle::select_aggregate_member`] uses this to refuse
     /// recursing into a member that is itself an aggregate.
@@ -376,6 +465,94 @@ impl ManagedCluster {
 
 fn not_found(name: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("unknown cluster `{name}`"))
+}
+
+/// The refresh timer of one `STRICT_DNS`/`LOGICAL_DNS` cluster: wait, look the
+/// hostnames up, publish what changed, repeat -- until the cluster is gone.
+/// [`ClusterManager::start_dns_refresh`] spawns it; `wait` is the delay before
+/// the first lookup.
+///
+/// A failed lookup leaves the published host set alone (the last good one
+/// keeps serving, or the empty one a cluster whose first lookup failed started
+/// with) and retries after the schedule's failure backoff. The first failure
+/// of a streak logs at `warn`, then only every power of two (see
+/// [`discovery::should_warn`]); the lookup that ends a streak logs the
+/// recovery once. The streak counter behind that is a field of this task's own
+/// `schedule`, so none of the suppression state is shared and none of it is
+/// on a request path.
+async fn run_dns_refresh(
+    cluster: Weak<ManagedCluster>,
+    resolver: Arc<dyn HostResolver>,
+    mut schedule: RefreshSchedule,
+    mut wait: Duration,
+) {
+    loop {
+        tokio::time::sleep(wait).await;
+        // Hold a strong reference for the length of one lookup only. Sleeping
+        // while holding it would keep a replaced cluster alive; letting go
+        // before each sleep is what lets `Weak::upgrade` fail once the last
+        // real owner is gone, which ends this loop.
+        let Some(managed) = cluster.upgrade() else {
+            return;
+        };
+        let name = managed.config.name.as_str();
+        match managed.resolve_and_publish(resolver.as_ref()).await {
+            Ok(diff) => {
+                let (ended_streak, next_wait) = schedule.lookup_succeeded();
+                wait = next_wait;
+                if ended_streak > 0 {
+                    tracing::info!(
+                        cluster = %name,
+                        failed_lookups = ended_streak,
+                        "DNS lookup recovered"
+                    );
+                }
+                if !diff.added.is_empty() || !diff.removed.is_empty() {
+                    tracing::debug!(
+                        cluster = %name,
+                        added = ?diff.added,
+                        removed = ?diff.removed,
+                        "DNS answer changed the cluster's hosts"
+                    );
+                }
+            }
+            Err(err) => {
+                let (streak, next_wait) = schedule.lookup_failed();
+                wait = next_wait;
+                let hosts = managed.host_set.load().all_hosts().len();
+                // Rust note: `tracing` levels are fixed at each call site, so
+                // choosing `warn` versus `debug` at run time takes two macro
+                // calls carrying the same fields.
+                if !discovery::should_warn(streak) {
+                    tracing::debug!(
+                        cluster = %name,
+                        error = %err,
+                        consecutive_failures = streak,
+                        retry_in = ?wait,
+                        hosts,
+                        "DNS lookup failed again"
+                    );
+                } else if hosts == 0 {
+                    tracing::warn!(
+                        cluster = %name,
+                        error = %err,
+                        consecutive_failures = streak,
+                        retry_in = ?wait,
+                        "DNS lookup failed and the cluster has no hosts; retrying"
+                    );
+                } else {
+                    tracing::warn!(
+                        cluster = %name,
+                        error = %err,
+                        consecutive_failures = streak,
+                        retry_in = ?wait,
+                        hosts,
+                        "DNS lookup failed; keeping the last resolved hosts and retrying"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Owns every cluster's discovery state. `&self`-based throughout (the
@@ -450,7 +627,8 @@ impl ClusterManager {
     /// A cluster whose config is unchanged from the
     /// currently-published one is carried forward as the exact same
     /// `Arc<ManagedCluster>` -- host set, health-check engine, outlier
-    /// detector and its running task handles all survive untouched -- rather
+    /// detector, DNS refresh timer and their running task handles all survive
+    /// untouched -- rather
     /// than being rebuilt and re-resolved. "Unchanged" is `Arc::ptr_eq` OR
     /// `ClusterConfig`'s derived `PartialEq` (see that type's doc for why the
     /// derive, not a hand-written `eq`, is load-bearing here). Both halves
@@ -476,6 +654,13 @@ impl ClusterManager {
     /// A cluster whose config DID change still goes through the full
     /// rebuild-then-resolve path below, in `next`'s own resolve loop -- only
     /// freshly-built clusters ever reach it now.
+    ///
+    /// A freshly-built `STRICT_DNS`/`LOGICAL_DNS` cluster also gets its
+    /// refresh timer started there, right after its initial lookup (see
+    /// `start_dns_refresh`). The cluster it replaces keeps its own
+    /// timer until the last reference to it is dropped: a connection that
+    /// predates the reload can still route through the old cluster, and its
+    /// addresses should stay fresh for as long as it can.
     ///
     /// Every freshly-built cluster is
     /// resolved *before* the map is published (`self.clusters.store` below),
@@ -557,20 +742,70 @@ impl ClusterManager {
         // is no membership to carry over at construction time).
         for name in &freshly_built {
             let managed = &next[name];
-            if let Err(err) = self.resolve_cluster(managed).await {
+            let resolved = self.resolve_cluster(managed).await;
+            if let Err(err) = &resolved {
                 // Rust note: a discovery failure doesn't take the cluster
                 // manager down -- Envoy keeps serving the last-known-good
                 // (here: empty, since this is the first resolution) host set
-                // and logs. Real retry/backoff on DNS failure is a future
-                // refinement. Crucially, this is scoped
+                // and logs. A DNS cluster keeps retrying on its refresh
+                // timer, started just below, so the cluster fills in on the
+                // first lookup that succeeds. Crucially, this is scoped
                 // to the ONE cluster that failed -- every other entry in
                 // `next` already resolved (or failed) independently above,
                 // so one bad DNS answer never blocks or fails the reload.
-                tracing::warn!(cluster = %name, error = %err, "initial cluster discovery failed");
+                tracing::warn!(
+                    cluster = %name,
+                    error = %err,
+                    retrying = managed.config.discovery.dns_refresh().is_some(),
+                    "initial cluster discovery failed"
+                );
             }
+            self.start_dns_refresh(managed, resolved.is_ok());
         }
         self.clusters.store(Arc::new(next));
         rejected
+    }
+
+    /// Start the timer that re-resolves `managed`'s hostnames, if it has any:
+    /// a `STRICT_DNS` or `LOGICAL_DNS` cluster gets one, every other kind
+    /// (STATIC, EDS, aggregate) none. Without it a DNS cluster would keep the
+    /// addresses from its first lookup for the life of the process, and one
+    /// whose first lookup failed would stay empty.
+    ///
+    /// `initial_lookup_succeeded` is how the lookup that just ran in
+    /// [`Self::update_from_snapshot`] went; it decides the first wait (the
+    /// refresh rate, or the first failure backoff).
+    ///
+    /// The task is spawned on the runtime this runs on, which is the control
+    /// runtime: `update_from_snapshot` is called only by control-side code
+    /// (boot, the SIGHUP reload, the ADS apply path in `proxy/src/main.rs`),
+    /// never from a worker. Like the health-check probes and the outlier
+    /// sweep, a cluster with a refresh timer can only be built inside a
+    /// Tokio runtime.
+    fn start_dns_refresh(&self, managed: &Arc<ManagedCluster>, initial_lookup_succeeded: bool) {
+        let Some(refresh) = managed.config.discovery.dns_refresh() else {
+            return;
+        };
+        let mut schedule = RefreshSchedule::new(refresh);
+        let first_wait = if initial_lookup_succeeded {
+            schedule.lookup_succeeded().1
+        } else {
+            schedule.lookup_failed().1
+        };
+        // Rust note: the task gets a `Weak`, not a clone of the `Arc`. The
+        // `ManagedCluster` owns this task's `JoinHandle`, so a task that also
+        // owned the cluster would be a reference cycle: the cluster's
+        // refcount could never reach zero, `Drop` would never run, and the
+        // timer would outlive every reload that replaced its cluster.
+        let task = tokio::spawn(run_dns_refresh(
+            Arc::downgrade(managed),
+            Arc::clone(&self.resolver),
+            schedule,
+            first_wait,
+        ));
+        if let Some(previous) = managed.dns_refresh_task.lock().unwrap().replace(task) {
+            previous.abort();
+        }
     }
 
     /// Apply an externally-supplied endpoint set to an EDS-registered
@@ -604,22 +839,23 @@ impl ClusterManager {
         Ok(diff)
     }
 
-    /// Re-run discovery for one cluster and publish the resulting host set,
-    /// returning the diff against the previous one. A no-op (empty diff) for
-    /// EDS-sourced clusters, which have no self-driven resolution -- use
-    /// [`Self::accept_eds_update`] for those.
+    /// Re-run discovery for one cluster right now and publish the resulting
+    /// host set, returning the diff against the previous one. A no-op (empty
+    /// diff) for EDS-sourced clusters, which have no self-driven resolution
+    /// -- use [`Self::accept_eds_update`] for those.
     ///
-    /// Intended to be re-run on a timer ([`discovery::DEFAULT_DNS_REFRESH_RATE`])
-    /// for DNS-discovered clusters; no production timer calls it yet. Tests
-    /// call it directly to drive discovery deterministically instead of
-    /// waiting on a real timer.
+    /// This is the on-demand, by-name entry point, and it shares its resolve
+    /// path (`ManagedCluster::resolve_and_publish`) with the refresh timer.
+    /// The timer (`run_dns_refresh`) does not call it by name, on purpose: a
+    /// name resolves to whichever cluster is *currently published*, so an old
+    /// cluster's timer that kept refreshing "its" name after a reload would
+    /// refresh the replacement instead, and run next to the replacement's own
+    /// timer. The timer holds its own cluster.
     ///
-    /// This method's contract is unchanged -- it still
-    /// looks the cluster up by name in the CURRENTLY PUBLISHED registry and
-    /// resolves it there. [`Self::resolve_cluster`] is just this method's
-    /// former body, factored out so [`Self::update_from_snapshot`] can run
-    /// the identical resolution logic against a `ManagedCluster` that isn't
-    /// registered yet (see that method's doc for why).
+    /// It looks the cluster up by name in the CURRENTLY PUBLISHED registry
+    /// and resolves it there. [`Self::resolve_cluster`] is the same logic for
+    /// a `ManagedCluster` that isn't registered yet, which
+    /// [`Self::update_from_snapshot`] needs (see that method's doc for why).
     pub async fn refresh_cluster(&self, name: &str) -> io::Result<HostSetDiff> {
         let managed = self
             .clusters
@@ -630,45 +866,15 @@ impl ClusterManager {
         self.resolve_cluster(&managed).await
     }
 
-    /// Run discovery for `managed` and publish the result into ITS OWN
-    /// `host_set`, returning the diff against whatever it held before. Does
-    /// not touch `self.clusters` at all -- the caller decides whether/how
-    /// `managed` is registered ([`Self::refresh_cluster`] looks it up there
-    /// first; [`Self::update_from_snapshot`] calls this on a cluster that
-    /// hasn't been published yet).
+    /// Run discovery for `managed` with this manager's resolver and publish
+    /// the result into ITS OWN `host_set`, returning the diff against
+    /// whatever it held before. Does not touch `self.clusters` at all -- the
+    /// caller decides whether/how `managed` is registered
+    /// ([`Self::refresh_cluster`] looks it up there first;
+    /// [`Self::update_from_snapshot`] calls this on a cluster that hasn't
+    /// been published yet).
     async fn resolve_cluster(&self, managed: &ManagedCluster) -> io::Result<HostSetDiff> {
-        // Two shapes have nothing to resolve, and both return an explicit
-        // no-op rather than a resolve of zero endpoints (which would go
-        // through `discovery::resolve` and diff against an always-empty set
-        // for no reason).
-        //
-        // An aggregate has no endpoints or discovery of its own.
-        //
-        // An EDS cluster's membership arrives through
-        // [`ClusterManager::accept_eds_update`], and short-circuiting matters
-        // here. A DNS refresh re-runs this; `discovery::resolve` returns an
-        // EMPTY host set for `DiscoveryType::Eds`, so falling through would
-        // diff the EDS-delivered membership against nothing and wipe it on
-        // the next refresh.
-        let config = &managed.config;
-        if matches!(config.kind, ClusterKind::Aggregate { .. })
-            || config.discovery == DiscoveryType::Eds
-        {
-            return Ok(HostSetDiff::default());
-        }
-        let new_set = discovery::resolve(config, self.resolver.as_ref()).await?;
-        let old_set = managed.host_set.load();
-        let diff = diff_host_sets(&old_set, &new_set);
-        // `discovery::resolve` always builds fresh
-        // `Host`s with `HealthFlags::default()`, so without this a DNS
-        // refresh would silently re-mark every unchanged host healthy --
-        // see `host_set::carry_over_health_flags`.
-        let new_set = carry_over_health_flags(&old_set, new_set, &diff);
-        drop(old_set);
-        managed.host_set.store(Arc::new(new_set));
-        managed.initialized.store(true, Ordering::Release);
-        managed.reconcile_probes(&diff);
-        Ok(diff)
+        managed.resolve_and_publish(self.resolver.as_ref()).await
     }
 
     /// The router-facing handle for a cluster, or `None` if no cluster with
@@ -2695,5 +2901,939 @@ mod tests {
             !host.is_healthy(),
             "an unrelated cluster's config change must not clear an active-health-check flag"
         );
+    }
+
+    // ------------------------------------------------- DNS refresh timer --
+    //
+    // These run on tokio's paused clock (`start_paused`): sleeping in the test
+    // advances virtual time to the next timer, so a 5s refresh interval costs
+    // no wall time, and the resolver's recorded lookup times are the waits the
+    // timer really chose. Tests sleep to just past an interval (5.1s, say),
+    // never to its exact edge, where the test's own timer and the refresh
+    // timer would fire in the same tick in no guaranteed order.
+
+    use futures::future::BoxFuture;
+
+    /// A resolver whose answer per host the test scripts, which records every
+    /// lookup (host and tokio-clock time). `FakeResolver` cannot do either: it
+    /// has no way to make a host fail again once seeded, and keeps no record.
+    #[derive(Default)]
+    struct ScriptedResolver {
+        /// `None` is a failing lookup.
+        answers: Mutex<HashMap<String, Option<Vec<IpAddr>>>>,
+        calls: Mutex<Vec<(String, tokio::time::Instant)>>,
+        /// Runs inside every lookup before it answers: the test's way to make
+        /// something else happen while a lookup is in flight.
+        during_lookup: Mutex<Option<Box<dyn Fn() + Send>>>,
+    }
+
+    impl ScriptedResolver {
+        fn answer(&self, host: &str, ips: Vec<IpAddr>) {
+            self.answers
+                .lock()
+                .unwrap()
+                .insert(host.to_string(), Some(ips));
+        }
+
+        fn fail(&self, host: &str) {
+            self.answers.lock().unwrap().insert(host.to_string(), None);
+        }
+
+        fn lookups(&self, host: &str) -> Vec<tokio::time::Instant> {
+            let calls = self.calls.lock().unwrap();
+            calls
+                .iter()
+                .filter(|(h, _)| h == host)
+                .map(|(_, at)| *at)
+                .collect()
+        }
+
+        fn total_lookups(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+
+        /// Time between consecutive lookups of `host`.
+        fn gaps(&self, host: &str) -> Vec<Duration> {
+            self.lookups(host).windows(2).map(|w| w[1] - w[0]).collect()
+        }
+    }
+
+    impl HostResolver for ScriptedResolver {
+        fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((host.to_string(), tokio::time::Instant::now()));
+            if let Some(hook) = self.during_lookup.lock().unwrap().as_ref() {
+                hook();
+            }
+            let answer = self.answers.lock().unwrap().get(host).cloned().flatten();
+            Box::pin(
+                async move { answer.ok_or_else(|| io::Error::other("scripted lookup failure")) },
+            )
+        }
+    }
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, last])
+    }
+
+    fn dns_refresh(
+        rate_secs: u64,
+        jitter_secs: u64,
+        failure_base_ms: u64,
+        failure_max_ms: u64,
+    ) -> DnsRefresh {
+        DnsRefresh {
+            refresh_rate: Duration::from_secs(rate_secs),
+            jitter: Duration::from_secs(jitter_secs),
+            failure_base_interval: Duration::from_millis(failure_base_ms),
+            failure_max_interval: Duration::from_millis(failure_max_ms),
+        }
+    }
+
+    /// One DNS cluster with a single hostname endpoint on port 80.
+    fn dns_cluster(
+        name: &str,
+        host: &str,
+        discovery: fn(DnsRefresh) -> DiscoveryType,
+        refresh: DnsRefresh,
+    ) -> Arc<ClusterConfig> {
+        cluster_config(name, discovery(refresh), vec![endpoint(host, 80)])
+    }
+
+    fn snapshot_of(configs: Vec<Arc<ClusterConfig>>) -> HashMap<ClusterName, Arc<ClusterConfig>> {
+        configs.into_iter().map(|c| (c.name.clone(), c)).collect()
+    }
+
+    /// The addresses `name` currently serves, sorted.
+    fn live(
+        manager: &ClusterManager,
+        snapshot: &HashMap<ClusterName, Arc<ClusterConfig>>,
+        name: &str,
+    ) -> Vec<String> {
+        manager
+            .live_clusters_for(snapshot)
+            .into_iter()
+            .find(|c| c.name == name)
+            .map(|c| c.endpoints.iter().map(|e| e.address.to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The very `Arc<HostSet>` currently published for `name`, so a test can
+    /// tell "republished an equal set" from "left it alone".
+    fn published(manager: &ClusterManager, name: &str) -> Arc<HostSet> {
+        manager
+            .clusters
+            .load()
+            .get(name)
+            .expect("cluster is registered")
+            .host_set
+            .load_full()
+    }
+
+    /// Recorded waits are exact on the paused clock apart from the timer
+    /// wheel's whole-millisecond rounding, so allow a few.
+    const SLACK: Duration = Duration::from_millis(5);
+
+    fn assert_within(actual: Duration, low: Duration, high: Duration, what: &str) {
+        assert!(
+            actual + SLACK >= low && actual <= high + SLACK,
+            "{what}: {actual:?} not in [{low:?}, {high:?}]"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_address_added_in_dns_appears_after_one_refresh_and_a_removed_one_disappears() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1), ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        assert_eq!(
+            live(&manager, &snapshot, "dns-svc"),
+            ["10.0.0.1:80", "10.0.0.2:80"]
+        );
+
+        // DNS drops .1 and adds .3. Nothing moves before the refresh is due...
+        resolver.answer("svc.internal", vec![ip(2), ip(3)]);
+        tokio::time::sleep(Duration::from_millis(4900)).await;
+        assert_eq!(
+            live(&manager, &snapshot, "dns-svc"),
+            ["10.0.0.1:80", "10.0.0.2:80"]
+        );
+
+        // ...and one refresh interval after the first lookup both are in.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            live(&manager, &snapshot, "dns-svc"),
+            ["10.0.0.2:80", "10.0.0.3:80"]
+        );
+    }
+
+    /// The timer must not republish an unchanged answer: that would replace
+    /// every live `Host` -- health flags, in-flight counters -- with an equal
+    /// fresh one every few seconds, forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_that_changes_nothing_leaves_the_published_host_set_alone() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1), ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        let before = published(&manager, "dns-svc");
+
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert_eq!(resolver.lookups("svc.internal").len(), 3, "it did look up");
+        assert!(Arc::ptr_eq(&before, &published(&manager, "dns-svc")));
+
+        // The same records in another order are not a change either.
+        resolver.answer("svc.internal", vec![ip(2), ip(1)]);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(resolver.lookups("svc.internal").len() >= 4);
+        assert!(Arc::ptr_eq(&before, &published(&manager, "dns-svc")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cluster_whose_first_lookup_failed_fills_in_on_the_retry() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.fail("svc.internal");
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        // Published but empty and still warming: `/ready` semantics are
+        // exactly what they were before the timer existed.
+        assert!(manager.cluster("dns-svc").is_some());
+        assert!(live(&manager, &snapshot, "dns-svc").is_empty());
+        assert_eq!(manager.warming_clusters(), vec!["dns-svc".to_string()]);
+
+        // DNS comes back; the next retry picks it up with no reload.
+        resolver.answer("svc.internal", vec![ip(1)]);
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        assert_eq!(live(&manager, &snapshot, "dns-svc"), ["10.0.0.1:80"]);
+        assert!(manager.is_initialized("dns-svc"));
+        assert!(manager.warming_clusters().is_empty());
+    }
+
+    /// A lookup that succeeds with no records changes nothing, so the
+    /// "unchanged, don't republish" shortcut applies -- but the cluster has
+    /// still been resolved and must stop warming.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_answer_still_marks_the_cluster_initialized() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", Vec::new());
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        assert!(manager.is_initialized("dns-svc"));
+        assert!(live(&manager, &snapshot, "dns-svc").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_after_success_keeps_the_last_good_hosts_and_keeps_retrying() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1), ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+
+        resolver.fail("svc.internal");
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(
+            live(&manager, &snapshot, "dns-svc"),
+            ["10.0.0.1:80", "10.0.0.2:80"],
+            "an outage must not empty the cluster"
+        );
+        assert!(manager.is_initialized("dns-svc"));
+        assert!(resolver.lookups("svc.internal").len() >= 6, "kept retrying");
+
+        // And it heals: the next retry applies the new answer.
+        resolver.answer("svc.internal", vec![ip(3)]);
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        assert_eq!(live(&manager, &snapshot, "dns-svc"), ["10.0.0.3:80"]);
+    }
+
+    /// Envoy's default when `dns_failure_refresh_rate` is unset: failures
+    /// retry at the refresh rate, no growth.
+    #[tokio::test(start_paused = true)]
+    async fn failures_retry_at_the_refresh_rate_when_no_failure_rate_is_configured() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.fail("svc.internal");
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+
+        let gaps = resolver.gaps("svc.internal");
+        assert!(gaps.len() >= 11, "{gaps:?}");
+        for gap in gaps {
+            assert_within(gap, Duration::from_secs(5), Duration::from_secs(5), "retry");
+        }
+    }
+
+    /// With base 1s and max 6s the exponential step is 1, 2, 4, 6, 6, 6...
+    /// seconds and each wait lies in (step/2, step]. The max is deliberately
+    /// not a power-of-two multiple of the base, so reaching it takes the cap,
+    /// not just the doubling.
+    #[tokio::test(start_paused = true)]
+    async fn failure_backoff_grows_and_is_capped_at_the_max() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.fail("svc.internal");
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            dns_refresh(5, 0, 1000, 6000),
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        tokio::time::sleep(Duration::from_secs(100)).await;
+
+        let gaps = resolver.gaps("svc.internal");
+        assert!(gaps.len() >= 14, "{gaps:?}");
+        for (i, gap) in gaps.iter().enumerate() {
+            let step = Duration::from_secs([1, 2, 4, 6][i.min(3)]);
+            assert_within(*gap, step / 2, step, &format!("wait {i}"));
+        }
+        // Grown past anything the first wait could have been, and held at the
+        // cap rather than growing on.
+        assert!(gaps[3] > Duration::from_secs(3));
+        assert!(gaps[0] <= Duration::from_secs(1) + SLACK);
+        assert!(gaps.iter().all(|g| *g <= Duration::from_secs(6) + SLACK));
+    }
+
+    /// Success waits are the refresh rate plus a random share of `dns_jitter`.
+    #[tokio::test(start_paused = true)]
+    async fn jitter_spreads_the_refresh_waits_inside_its_bound() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            dns_refresh(5, 3, 5000, 5000),
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        tokio::time::sleep(Duration::from_secs(100)).await;
+
+        let gaps = resolver.gaps("svc.internal");
+        assert!(gaps.len() >= 12, "{gaps:?}");
+        for gap in &gaps {
+            assert_within(
+                *gap,
+                Duration::from_secs(5),
+                Duration::from_secs(8),
+                "refresh",
+            );
+        }
+        assert!(
+            gaps.iter().any(|g| *g != gaps[0]),
+            "a jittered wait is not the same every time: {gaps:?}"
+        );
+    }
+
+    /// Round-robin DNS reorders its answers. The logical host must stay on its
+    /// address while that address is still answered, and move only when it is
+    /// gone.
+    #[tokio::test(start_paused = true)]
+    async fn logical_dns_keeps_its_host_while_the_answer_still_contains_it() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1), ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::LogicalDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        assert_eq!(live(&manager, &snapshot, "dns-svc"), ["10.0.0.1:80"]);
+        let before = published(&manager, "dns-svc");
+
+        for answer in [
+            vec![ip(2), ip(1)],
+            vec![ip(1), ip(2)],
+            vec![ip(2), ip(3), ip(1)],
+        ] {
+            resolver.answer("svc.internal", answer);
+            tokio::time::sleep(Duration::from_millis(5100)).await;
+            assert_eq!(live(&manager, &snapshot, "dns-svc"), ["10.0.0.1:80"]);
+        }
+        assert!(
+            Arc::ptr_eq(&before, &published(&manager, "dns-svc")),
+            "rotating answers must not republish the host"
+        );
+
+        // .1 leaves the answer: now, and only now, the host moves.
+        resolver.answer("svc.internal", vec![ip(2), ip(3)]);
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        assert_eq!(live(&manager, &snapshot, "dns-svc"), ["10.0.0.2:80"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn removing_a_dns_cluster_stops_its_refresh_timer() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert_eq!(resolver.lookups("svc.internal").len(), 3);
+
+        manager.update_from_snapshot(&HashMap::new()).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            resolver.lookups("svc.internal").len(),
+            3,
+            "a removed cluster is not resolved any more"
+        );
+    }
+
+    /// The timer task is cancelled when its cluster is dropped, not left to
+    /// notice at its next tick. With a refresh rate of an hour the tick is far
+    /// away, so a task still alive right after the drop is a leak per reload.
+    ///
+    /// Observed through the resolver: the task owns a clone of the manager's
+    /// `Arc<dyn HostResolver>`, which goes away only when the task is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_dns_cluster_cancels_its_timer_task_at_once() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            dns_refresh(3600, 0, 3_600_000, 3_600_000),
+        )]);
+        assert_eq!(Arc::strong_count(&resolver), 2, "this test and the manager");
+
+        manager.update_from_snapshot(&snapshot).await;
+        assert_eq!(Arc::strong_count(&resolver), 3, "the timer task holds one");
+
+        manager.update_from_snapshot(&HashMap::new()).await;
+        // One scheduler turn lets the runtime process the abort.
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&resolver), 2, "the timer task is gone");
+    }
+
+    /// A reload that changes a DNS cluster rebuilds it. Its predecessor's timer
+    /// must stop, or two timers would resolve (and a stale one would republish
+    /// into a cluster nobody routes to).
+    #[tokio::test(start_paused = true)]
+    async fn replacing_a_dns_cluster_on_reload_stops_the_old_timer() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("old.internal", vec![ip(1)]);
+        resolver.answer("new.internal", vec![ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let old = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "old.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&old).await;
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert_eq!(resolver.lookups("old.internal").len(), 3);
+
+        // The operator moves the cluster to another hostname and a slower refresh.
+        let new = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "new.internal",
+            DiscoveryType::StrictDns,
+            dns_refresh(20, 0, 20_000, 20_000),
+        )]);
+        manager.update_from_snapshot(&new).await;
+        assert_eq!(live(&manager, &new, "dns-svc"), ["10.0.0.2:80"]);
+        tokio::time::sleep(Duration::from_secs(100)).await;
+
+        assert_eq!(
+            resolver.lookups("old.internal").len(),
+            3,
+            "the replaced cluster's timer is gone"
+        );
+        let gaps = resolver.gaps("new.internal");
+        assert!(gaps.len() >= 4, "{gaps:?}");
+        for gap in gaps {
+            assert_within(
+                gap,
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                "new timer",
+            );
+        }
+    }
+
+    /// A connection that predates a reload keeps routing through the cluster
+    /// it was built against (`routing_snapshot`), so that cluster keeps its
+    /// addresses fresh until the last reference to it is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_replaced_cluster_keeps_refreshing_until_its_last_reference_is_dropped() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("old.internal", vec![ip(1)]);
+        resolver.answer("new.internal", vec![ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let old = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "old.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&old).await;
+        let older_generation = manager.routing_snapshot();
+
+        let new = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "new.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&new).await;
+        tokio::time::sleep(Duration::from_secs(21)).await;
+        assert_eq!(
+            resolver.lookups("old.internal").len(),
+            5,
+            "still referenced, so still refreshed"
+        );
+
+        drop(older_generation);
+        let after_drop = resolver.lookups("old.internal").len();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(resolver.lookups("old.internal").len(), after_drop);
+        assert!(
+            resolver.lookups("new.internal").len() >= 13,
+            "the current cluster is unaffected"
+        );
+    }
+
+    /// A SIGHUP re-lowers every cluster into fresh, content-equal configs. Such
+    /// a cluster is carried forward, so its timer must neither restart nor
+    /// double.
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_reload_keeps_the_running_timer() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let config = || {
+            snapshot_of(vec![dns_cluster(
+                "dns-svc",
+                "svc.internal",
+                DiscoveryType::StrictDns,
+                DnsRefresh::ENVOY_DEFAULT,
+            )])
+        };
+        manager.update_from_snapshot(&config()).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        manager.update_from_snapshot(&config()).await;
+        assert_eq!(
+            resolver.lookups("svc.internal").len(),
+            1,
+            "carried forward, so not resolved again"
+        );
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(
+            resolver.lookups("svc.internal").len(),
+            2,
+            "the next lookup stays on the original schedule (t=5s), not t=8s"
+        );
+
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        for gap in resolver.gaps("svc.internal") {
+            assert_within(
+                gap,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                "one timer",
+            );
+        }
+    }
+
+    /// Only DNS clusters resolve on a timer, and a refresh must never reach an
+    /// EDS cluster: resolving it yields an empty set that would wipe the
+    /// membership its stream delivered.
+    #[tokio::test(start_paused = true)]
+    async fn only_dns_clusters_get_a_refresh_timer() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![
+            cluster_config_eds("eds-svc"),
+            cluster_config(
+                "static-svc",
+                DiscoveryType::Static,
+                vec![endpoint("10.0.0.9", 80)],
+            ),
+            aggregate_config("agg", &["static-svc"]),
+            dns_cluster(
+                "dns-svc",
+                "svc.internal",
+                DiscoveryType::LogicalDns,
+                DnsRefresh::ENVOY_DEFAULT,
+            ),
+        ]);
+        manager.update_from_snapshot(&snapshot).await;
+        manager
+            .accept_eds_update("eds-svc", &[endpoint("10.0.0.5", 80)])
+            .unwrap();
+
+        // Which clusters own a refresh task. A stray one on a non-DNS cluster
+        // would be invisible through the resolver, which these never reach.
+        let has_task = |name: &str| {
+            let managed = manager.clusters.load().get(name).unwrap().clone();
+            let task = managed.dns_refresh_task.lock().unwrap();
+            task.is_some()
+        };
+        for name in ["eds-svc", "static-svc", "agg"] {
+            assert!(!has_task(name), "{name} has no hostnames to refresh");
+        }
+        assert!(has_task("dns-svc"));
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            resolver.total_lookups(),
+            resolver.lookups("svc.internal").len(),
+            "only the DNS cluster's hostname is ever looked up"
+        );
+        assert_eq!(live(&manager, &snapshot, "eds-svc"), ["10.0.0.5:80"]);
+
+        // The by-name path shares the guard.
+        let diff = manager.refresh_cluster("eds-svc").await.unwrap();
+        assert_eq!(diff, HostSetDiff::default());
+        assert_eq!(live(&manager, &snapshot, "eds-svc"), ["10.0.0.5:80"]);
+    }
+
+    /// A health check can mark a host while a lookup is in flight. The publish
+    /// must build on the set as it is when the lookup returns, or the mark is
+    /// silently undone -- and a health check only publishes on an edge, so
+    /// nothing would set it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_health_flag_set_during_the_lookup_survives_the_publish() {
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1), ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+
+        // During the next lookup the health checker fails .2 (published with
+        // `rcu`, as `health_check::apply_health_transition` does), while DNS
+        // answers with a new address too.
+        let host_set = Arc::clone(&manager.clusters.load().get("dns-svc").unwrap().host_set);
+        let failing = SocketAddr::new(ip(2), 80);
+        *resolver.during_lookup.lock().unwrap() = Some(Box::new(move || {
+            host_set.rcu(|current| {
+                let hosts: Vec<Arc<Host>> = current
+                    .all_hosts()
+                    .into_iter()
+                    .map(|h| {
+                        if h.address != failing {
+                            return h;
+                        }
+                        Arc::new(Host {
+                            address: h.address,
+                            hostname: h.hostname.clone(),
+                            metadata: h.metadata.clone(),
+                            weight: h.weight,
+                            priority: h.priority,
+                            health_flags: HealthFlags {
+                                failed_active_hc: true,
+                                failed_outlier_check: false,
+                            },
+                            active_requests: std::sync::atomic::AtomicU64::new(0),
+                        })
+                    })
+                    .collect();
+                Arc::new(HostSet::from_hosts(hosts))
+            });
+        }));
+        resolver.answer("svc.internal", vec![ip(1), ip(2), ip(3)]);
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        *resolver.during_lookup.lock().unwrap() = None;
+
+        let flags: Vec<(String, bool)> = {
+            let mut flags: Vec<_> = published(&manager, "dns-svc")
+                .all_hosts()
+                .iter()
+                .map(|h| (h.address.to_string(), h.is_healthy()))
+                .collect();
+            flags.sort();
+            flags
+        };
+        assert_eq!(
+            flags,
+            vec![
+                ("10.0.0.1:80".to_string(), true),
+                ("10.0.0.2:80".to_string(), false),
+                ("10.0.0.3:80".to_string(), true),
+            ]
+        );
+    }
+
+    /// Fails the first `failures` lookups, then answers through the platform
+    /// resolver. Production never gets the injected failures (a real outage
+    /// cannot be summoned on demand); everything after them is the real thing.
+    struct FailsThenResolves {
+        failures_left: Mutex<usize>,
+        real: crate::resolver::TokioResolver,
+    }
+
+    impl HostResolver for FailsThenResolves {
+        fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            let inject = {
+                let mut left = self.failures_left.lock().unwrap();
+                let inject = *left > 0;
+                *left = left.saturating_sub(1);
+                inject
+            };
+            if inject {
+                return Box::pin(async { Err(io::Error::other("injected outage")) });
+            }
+            self.real.resolve(host)
+        }
+    }
+
+    /// The timer on a real multi-thread runtime, the real clock and the real
+    /// `TokioResolver` (`getaddrinfo` on the blocking pool), not a scripted
+    /// resolver on a paused clock: after the first lookups fail, the cluster
+    /// fills in by itself. The hostname is a numeric address, which
+    /// `getaddrinfo` answers without touching the network, so the test needs no
+    /// DNS; the 20ms intervals only make it quick, and it waits for the
+    /// outcome rather than asserting how long it took.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cluster_heals_through_the_platform_resolver_on_a_real_runtime() {
+        let resolver = Arc::new(FailsThenResolves {
+            failures_left: Mutex::new(2),
+            real: crate::resolver::TokioResolver,
+        });
+        let manager = ClusterManager::with_default_transport(resolver);
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "dns-svc",
+            "127.0.0.1",
+            DiscoveryType::StrictDns,
+            DnsRefresh {
+                refresh_rate: Duration::from_millis(20),
+                jitter: Duration::ZERO,
+                failure_base_interval: Duration::from_millis(20),
+                failure_max_interval: Duration::from_millis(20),
+            },
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        // The first lookup (in `update_from_snapshot`) was an injected failure.
+        assert!(!manager.is_initialized("dns-svc"));
+
+        wait_until(Duration::from_secs(20), || {
+            manager.is_initialized("dns-svc")
+        })
+        .await;
+        assert_eq!(live(&manager, &snapshot, "dns-svc"), ["127.0.0.1:80"]);
+    }
+
+    // ---------------------------------------------- DNS refresh logging --
+
+    /// Records every tracing event this crate emits: level plus the rendered
+    /// message and fields.
+    #[derive(Default)]
+    struct EventCapture {
+        events: Mutex<Vec<(tracing::Level, String)>>,
+    }
+
+    impl EventCapture {
+        /// The rendered events at `level` that name `cluster`.
+        fn rendered(&self, cluster: &str, level: tracing::Level) -> Vec<String> {
+            let tag = format!("cluster={cluster} ");
+            let events = self.events.lock().unwrap();
+            events
+                .iter()
+                .filter(|(l, text)| *l == level && format!("{text} ").contains(&tag))
+                .map(|(_, text)| text.clone())
+                .collect()
+        }
+
+        fn count(&self, cluster: &str, level: tracing::Level) -> usize {
+            self.rendered(cluster, level).len()
+        }
+    }
+
+    /// Rust note: `tracing::Subscriber` receives every emitted event.
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if !event.metadata().target().starts_with("proxy_cluster") {
+                return;
+            }
+            struct Render(String);
+            impl tracing::field::Visit for Render {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if !self.0.is_empty() {
+                        self.0.push(' ');
+                    }
+                    self.0.push_str(&format!("{}={value:?}", field.name()));
+                }
+            }
+            let mut render = Render(String::new());
+            event.record(&mut render);
+            self.events
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), render.0));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The one capture for this test process, installed as the GLOBAL default
+    /// subscriber the first time a logging test asks for it. Each logging test
+    /// uses a cluster name of its own and reads back only events naming it, so
+    /// the other tests logging into the same capture do not matter.
+    ///
+    /// Rust note: not `tracing::subscriber::set_default`, which would scope the
+    /// capture to one thread. `cargo test` runs tests as parallel threads of
+    /// one process, and `tracing` caches whether each log call site is enabled
+    /// process-wide: a call site first reached by a thread with no subscriber
+    /// is cached as disabled, and the scoped capture then never sees it when
+    /// the logging test reaches it (the "recovered" line and one warning went
+    /// missing exactly that way). A global default is every thread's fallback,
+    /// so no call site can be cached as disabled. `cargo nextest`, which `make
+    /// tq` uses, runs one test per process and would not have hit this.
+    fn capture() -> Arc<EventCapture> {
+        static CAPTURE: std::sync::OnceLock<Arc<EventCapture>> = std::sync::OnceLock::new();
+        Arc::clone(CAPTURE.get_or_init(|| {
+            let capture = Arc::new(EventCapture::default());
+            tracing::subscriber::set_global_default(Arc::clone(&capture))
+                .expect("this test binary installs no other global subscriber");
+            capture
+        }))
+    }
+
+    /// 40 failed lookups in a row log six warnings -- the first, then the 2nd,
+    /// 4th, 8th, 16th and 32nd -- not forty; recovery logs once; and nothing
+    /// logs after that.
+    #[tokio::test(start_paused = true)]
+    async fn a_dns_outage_warns_loudly_then_rarely_and_recovery_is_logged_once() {
+        use tracing::Level;
+        let capture = capture();
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.fail("svc.internal");
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "log-outage",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        // Lookups happen at t = 0, 5, ..., 195s: the 40th is the last in range.
+        tokio::time::sleep(Duration::from_millis(195_500)).await;
+        assert_eq!(resolver.lookups("svc.internal").len(), 40);
+
+        let warnings = capture.rendered("log-outage", Level::WARN);
+        assert_eq!(warnings.len(), 6, "{warnings:#?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("has no hosts")),
+            "an outage with nothing to fall back on says so: {warnings:#?}"
+        );
+        assert_eq!(capture.count("log-outage", Level::INFO), 0);
+
+        resolver.answer("svc.internal", vec![ip(1)]);
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        let recovered = capture.rendered("log-outage", Level::INFO);
+        assert_eq!(recovered.len(), 1, "recovery, once: {recovered:?}");
+        assert!(recovered[0].contains("failed_lookups=40"), "{recovered:?}");
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(capture.count("log-outage", Level::INFO), 1);
+        assert_eq!(
+            capture.count("log-outage", Level::WARN),
+            6,
+            "no repeats once healthy"
+        );
+    }
+
+    /// With hosts to fall back on, the warning says the last resolved hosts
+    /// stay in service.
+    #[tokio::test(start_paused = true)]
+    async fn an_outage_after_success_warns_that_the_last_hosts_are_kept() {
+        use tracing::Level;
+        let capture = capture();
+        let resolver = Arc::new(ScriptedResolver::default());
+        resolver.answer("svc.internal", vec![ip(1), ip(2)]);
+        let manager = ClusterManager::with_default_transport(resolver.clone());
+        let snapshot = snapshot_of(vec![dns_cluster(
+            "log-kept",
+            "svc.internal",
+            DiscoveryType::StrictDns,
+            DnsRefresh::ENVOY_DEFAULT,
+        )]);
+        manager.update_from_snapshot(&snapshot).await;
+        assert_eq!(
+            capture.count("log-kept", Level::WARN),
+            0,
+            "healthy is silent"
+        );
+
+        resolver.fail("svc.internal");
+        // Three failed lookups (t = 5, 10, 15s): warn on the 1st and 2nd.
+        tokio::time::sleep(Duration::from_millis(15_500)).await;
+        let warnings = capture.rendered("log-kept", Level::WARN);
+        assert_eq!(warnings.len(), 2, "{warnings:#?}");
+        for warning in &warnings {
+            assert!(
+                warning.contains("keeping the last resolved hosts"),
+                "{warning}"
+            );
+            assert!(warning.contains("hosts=2"), "{warning}");
+        }
     }
 }
