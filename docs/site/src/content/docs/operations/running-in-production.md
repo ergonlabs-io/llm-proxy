@@ -317,6 +317,26 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   `BudgetStore`, not `ControlPlaneStore`, and only an in-process
   implementation exists — this is unaffected by everything above. See
   [Token rate limiting](../limits-and-budgets/token-rate-limiting/).
+- **The rate card is not shared.** `PUT /pricing` replaces the rate card in the
+  memory of the one replica that receives it. The handler calls only
+  `PricingRegistry::replace_json` (`handle_set_pricing` in
+  `crates/proxy-admin/src/server.rs`, and
+  `crates/proxy-filters/src/usage_filter.rs`). It writes nothing to the shared
+  store, and it does not reach other replicas. A restart loads the rate card
+  from the configuration again. A `SIGHUP` reload does not change it.
+
+  To change the rate card of a deployment, send the same `PUT /pricing` request
+  to every replica. Change the configuration too, so that a restart keeps the
+  change. In bootstrap mode, the configuration is the `pricing_json` field of
+  the `llmproxy.usage` filter. Replicas with different rate cards price the same
+  request differently. To find them, compare `rate_card_version` in
+  `GET /pricing` on each replica, or the `%LLM_RATE_CARD_VERSION%` values in the
+  access logs.
+
+  `PUT /pricing` does not change the `pricing` list of `llmproxy.spend_limit`.
+  The spend filter uses that list only for a request that the rate card does not
+  price. The fields and the limits of `PUT /pricing` are in
+  [`pricing`](../configuration/configuration-file/#pricing-pricing).
 
 ## Verifying a Redis-backed store
 

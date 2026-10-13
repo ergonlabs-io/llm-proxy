@@ -1,13 +1,20 @@
 ---
 title: Spend policies and recovery
-description: Stable key ceilings, migration, shared Redis accounting, and crash recovery.
+description: Key and tenant ceilings, migration, shared Redis accounting, and crash recovery.
 ---
 
-Spend enforcement uses `(key_id, UTC budget period)` across every model and
-selected provider. Tenant and user remain ownership/reporting context. A key
-budget never grants model access. Missing budget means unlimited; an explicit
-zero denies the first request. Charges use integer micro-dollars and the rate
-card for the provider actually dialled, including after fallback.
+Spend enforcement uses two kinds of ceiling, and either one can refuse a
+request. A key budget counts the spend of one stable `key_id`. A tenant budget
+counts the spend of every key of one tenant. Each ceiling uses its own UTC
+budget period and counts spend across every model and selected provider. There
+is no per-user budget. A key budget never grants model access.
+
+Missing budget means unlimited; an explicit zero denies the first request.
+Charges use integer micro-dollars and the rate card for the provider actually
+dialled, including after fallback. A request that neither the rate card nor the
+`pricing` list of `llmproxy.spend_limit` prices adds $0 to every budget. The
+proxy does not log a warning for it. The spend reports count these requests in
+`unpriced_requests`.
 
 ## Key lifecycle and API version
 
@@ -47,12 +54,18 @@ legacy rows as version `1`, and reject unknown versions. Existing tenant totals
 stay in their original rows; they cannot establish per-key spend without
 separate attribution evidence.
 
-A spend filter refuses to start with legacy tenant budgets unless its
-`typed_config` explicitly includes:
+A spend filter refuses to start when the store holds any tenant budget, unless
+its `typed_config` explicitly includes:
 
 ```yaml
 legacy_tenant_budget_cutover: START_KEYS_FRESH
 ```
+
+Without it, the load error names `typed_config.legacy_tenant_budget_cutover`
+and reads `legacy tenant budgets require an explicit START_KEYS_FRESH cutover;
+retain history and configure key budgets before serving`. A tenant budget that
+you set at runtime with `PUT /tenants/{id}/budget` counts too. The next start
+fails until you set the policy.
 
 This selects a deliberate fresh-key cutover while retaining legacy history.
 Stop traffic, retain a backup of the original store, record the cutover time,
@@ -62,11 +75,35 @@ total is copied to any key. Historical per-key seeding requires separately
 verified attribution and an operator-controlled store correction; this policy
 does not infer it.
 
-Legacy tenant budget/spend endpoints remain available for historical
-compatibility. Their budget rows are **not enforced** by `spend_limit`; optional
-aggregate tenant/user ceilings are outside this policy. With configured key
-budgets, a request lacking authenticated key identity returns `403` rather
-than bypassing enforcement.
+## Tenant budgets
+
+A tenant budget stays enforced after the cutover. The filter reads the cutover
+value only when it starts, and the value does not disable a tenant budget.
+`PUT /tenants/{id}/budget` sets or clears a tenant budget with the same body as
+a key budget. `GET /tenants/{id}/spend` returns the tenant ledger. The ledger
+adds the spend of every key of the tenant, in the tenant budget's own period.
+
+A request gets `429` when its key ceiling or its tenant ceiling is reached.
+Clearing one ceiling does not change the spend or the ceiling of the other. A
+budget counts only the requests in its credential scope; see
+[Budgets](../authentication/tenant-provider-credentials/#budgets).
+`%RESPONSE_CODE_DETAILS%` shows `spend_budget_exceeded` for the `429`.
+
+When any key budget or tenant budget is configured, a request without an
+authenticated key identity returns `403`. A request that has a key but no
+tenant also returns `403` when any tenant budget is configured.
+`%RESPONSE_CODE_DETAILS%` shows `spend_identity_missing` for both.
+
+These tests in `crates/proxy-filters/src/spend_limit_filter.rs` prove the
+behavior: `legacy_tenant_budgets_require_explicit_cutover_even_when_zero` (the
+start refusal and the cutover),
+`tenant_budget_aggregates_keys_with_independent_periods` (the tenant ledger and
+the separate ceilings), `tenant_zero_budget_applies_without_any_key_budget` (a
+tenant ceiling alone refuses), and
+`missing_identity_cannot_bypass_a_tenant_budget` (the `403`). The end-to-end
+test `tenant_budget_aggregates_multiple_keys_and_enforces_both_scopes` in
+`testing/diffrig/tests/admin_e2e.rs` runs two keys against one tenant ceiling on
+the real binary.
 
 ## Redis and crash recovery
 

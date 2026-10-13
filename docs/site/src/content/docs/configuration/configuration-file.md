@@ -40,6 +40,7 @@ applied before parsing.
 | `routes` | array of `Route` | yes | — | Ordered routing rules. The first rule whose `model` pattern matches wins; there is no specificity reordering. At least one route is required. |
 | `limits` | array of `Limit` | no | `[]` | Rate limits and quotas. See "What `limits` actually enforces" below — most combinations are recorded but not enforced. |
 | `observability` | `Observability` object | no | none (no access log) | Access logging. See "A schema/code note worth knowing" below for the current state of admin-endpoint metrics. |
+| `pricing` | `Pricing` object | no | none (no request has a price) | The rate card. It prices each completed request in integer nanodollars, using all four token buckets. The proxy reads it once, at startup. A restart loads a change. A `SIGHUP` reload does not. See "`pricing` (`Pricing`)" below. |
 
 A request matching no `routes` entry and no `models` entry gets a 404 with a
 JSON error body listing known models.
@@ -225,6 +226,140 @@ A streamed response and a realtime session are both logged once, at stream
 end, with usage totals — not per chunk. See
 [Getting started](../getting-started/quickstart/) for what one line actually
 contains.
+
+## `pricing` (`Pricing`)
+
+`pricing` is the rate card. With it, the proxy prices each completed request in
+integer nanodollars, using all four token buckets: input, cache read, cache
+write, and output. One nanodollar is one billionth of a US dollar, so a price of
+2.50 USD per million tokens is `2500` nanodollars per token. Without `pricing`,
+no request has a price, `%LLM_LIST_COST%` is `-`, and `GET /pricing` returns
+`503`.
+
+| Field | Type | Required | Default | What it does |
+|---|---|---|---|---|
+| `price_list` | `PriceList` | one of `price_list`/`price_list_file` | — | The price list, written inline. |
+| `price_list_file` | string (path) | one of `price_list`/`price_list_file` | — | A file that holds one price list, in YAML or JSON, with the same fields as `price_list`. The proxy reads it once, at startup, and the load emits the warning that "When a change takes effect" below describes. |
+| `catalog` | object | no | none | Public source information, such as where the prices came from. `GET /pricing` returns it. The proxy never uses it to price a request. |
+
+Set exactly one of `price_list` and `price_list_file`. Setting neither, or both,
+is a load error at `pricing`: `set exactly one of price_list_file or
+price_list`, or the same text with `, not both`. A field error names the full
+path of the field, for example `pricing.price_list.entries[0].tier_mode`. A
+`price_list_file` that the proxy cannot read is a load error that names the file.
+
+| `PriceList` field | Type | Required | Default | What it does |
+|---|---|---|---|---|
+| `version` | string | no | none | A label for the list. The recorded version is the label, a `+`, and 12 hex digits of a hash of the entries, for example `2026-10+3c2805867b2e`. With no label, the recorded version is the hash alone. Editing a price changes the hash, so the version changes even when you keep the label. |
+| `effective_from` | string, RFC 3339 timestamp | yes | — | A date for the list. The proxy checks the format and shows the value in `GET /pricing`. It does not compare the value with the time of a request. A list applies from the moment the proxy loads it. |
+| `entries` | array of `PriceEntry`, at least 1 | yes | — | The prices. Each pair of `provider_type` and `model` may appear once. A duplicate pair is a load error. |
+
+| `PriceEntry` field | Type | Required | Default | What it does |
+|---|---|---|---|---|
+| `provider_type` | string | yes | — | The provider type that the price applies to, for example `openai`, `anthropic`, or `openrouter`. It matches the `type` of the provider that served the request, whether you set the `type` or the proxy inferred it from the provider name (see `providers.<name>`). Must not be empty. |
+| `model` | string | yes | — | The model name. The match is exact and case-sensitive, with no globs. The proxy checks it against the selected model: the upstream model name for the provider that served the request, or the requested model when no mapping applies (`%LLM_SELECTED_MODEL%`). Must not be empty. |
+| `tier_mode` | enum: `whole_request`, `graduated` | yes | — | How `tiers` price a request. There is no default, because the two modes give different prices for the same request. See "Tiers" below. |
+| `tiers` | array of `PricingTier`, at least 1 | yes | — | The price bands. |
+| `cached_input_unpriced` | boolean | no | `false` | When `true`, a request that reports cache-read tokens has no price. When `false`, those tokens cost `cached_input_nanodollars_per_token` each, even when that rate is `0`. |
+| `cache_write_unpriced` | boolean | no | `false` | The same, for cache-write tokens. |
+
+| `PricingTier` field | Type | Required | Default | What it does |
+|---|---|---|---|---|
+| `up_to` | integer, 0 or more | no | open-ended | The largest input context size, in tokens, that this band covers. The value is inclusive. Leave it out on the last band. |
+| `input_nanodollars_per_token` | integer, 0 or more | yes | — | The price of one input token. |
+| `cached_input_nanodollars_per_token` | integer, 0 or more | yes | — | The price of one cache-read token. |
+| `cache_write_nanodollars_per_token` | integer, 0 or more | yes | — | The price of one cache-write token. |
+| `output_nanodollars_per_token` | integer, 0 or more | yes | — | The price of one output token. |
+
+### Tiers
+
+The proxy picks a band from the input context size of the request: the input
+tokens plus the cache-read tokens plus the cache-write tokens. Output tokens do
+not count. The first band whose `up_to` is at least the context size is the
+selected band. The band with no `up_to` takes every larger size. A load error
+names the path when the `up_to` values do not strictly increase, or when the
+open-ended band is missing, repeated, or not last.
+
+- `whole_request`: The selected band prices every token bucket of the whole
+  request.
+- `graduated`: The proxy prices each slice of the context size at the input rate
+  of the band that holds the slice. The slices cover all context tokens,
+  including the cache-read and cache-write tokens. The proxy then prices the
+  cache-read, cache-write, and output tokens at the rates of the selected band.
+  So it prices a cache-read or cache-write token twice: once in its slice, at an
+  input rate, and once at its cache rate. If the model reports cache tokens, use
+  `whole_request`.
+
+### Example
+
+```yaml
+version: 0
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+routes:
+  - model: "*"
+    provider: openai
+pricing:
+  price_list:
+    version: "2026-10"
+    effective_from: "2026-10-01T00:00:00Z"
+    entries:
+      - provider_type: openai
+        model: example-model
+        tier_mode: whole_request
+        tiers:
+          - up_to: 200000
+            input_nanodollars_per_token: 1000
+            cached_input_nanodollars_per_token: 100
+            cache_write_nanodollars_per_token: 1250
+            output_nanodollars_per_token: 4000
+          - input_nanodollars_per_token: 2000
+            cached_input_nanodollars_per_token: 200
+            cache_write_nanodollars_per_token: 2500
+            output_nanodollars_per_token: 8000
+```
+
+A request for `example-model` with 2000 input tokens and 500 output tokens falls
+in the first band. It costs 2000 × 1000 + 500 × 4000 = 4,000,000 nanodollars,
+and `%LLM_LIST_COST%` shows `4000000`. A request with 250000 input tokens and
+1000 output tokens falls in the second band, which prices the whole request:
+250000 × 2000 + 1000 × 8000 = 508,000,000 nanodollars.
+
+A request for any other model has no price: `%LLM_LIST_COST%` and
+`%LLM_RATE_CARD_VERSION%` show `-`. Both operators are in the
+[access log reference](../observability/access-logs/#the-operator-set).
+
+### When a change takes effect
+
+The proxy reads `pricing` once, when it starts. A restart loads a changed
+`pricing` section or a changed `price_list_file`. A `SIGHUP` reload does not
+change the rate card of a running proxy. The reload succeeds, and the proxy
+keeps the rate card that it loaded at start. Restart the proxy to apply a
+change.
+
+Two texts suggest that a reload applies a change. The schema describes
+`pricing` as "Updating a file source requires config reload." The load warning
+on `pricing.price_list_file` reads "the price list is read once at startup;
+update it with a config reload". Neither is right today.
+
+`PUT /pricing` on the admin API replaces the rate card of the one proxy that
+receives it, without a restart. The new rate card replaces the whole old one, so
+a model that the new card does not list has no price. The change lives in memory
+only. A restart loses it, and it does not reach other replicas. To keep a
+change, edit `pricing` as well. See
+[Running in production](../operations/running-in-production/#what-stays-local-even-with-a-shared-store).
+
+`PUT /pricing` has these limits:
+
+- It needs the admin token (`LLMPROXY_ADMIN_TOKEN`) as a bearer token.
+- It returns `503` when the filter chain has no `llmproxy.auth` filter. In the
+  dialect, that means no `auth` section.
+- It returns `413` for a request body larger than 65536 bytes. The rate card in
+  `examples/llmproxy-openrouter.yaml` is larger than this.
+
+`GET /pricing` needs no token. It returns the active rate card, its
+`rate_card_version`, and the `catalog` if one is set.
 
 ## The `models` catalogue
 

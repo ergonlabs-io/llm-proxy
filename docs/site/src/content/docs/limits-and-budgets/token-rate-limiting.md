@@ -7,6 +7,7 @@ last_updated: 2026-09-07
 related:
   - ../authentication/virtual-keys/
   - ../configuration/configuration-file/
+  - ../observability/access-logs/
   - ../observability/metrics-and-stats/
 ---
 
@@ -152,10 +153,14 @@ outcome than a visible failure
   numbers a live budget check would see at that instant. There is no way to
   ask it for last hour's or last week's usage. A historical export is a
   separate, not-yet-built feature.
-- **No cost.** The response has no dollar or currency field. Converting
-  tokens to cost needs a price-per-token rate card, which does not exist yet
-  (not built). If you need cost today, multiply `used` by your own rate outside
-  the proxy.
+- **No cost.** The response has no dollar or currency field. The rate card
+  prices each completed request, and the access log shows the price in
+  nanodollars as `%LLM_LIST_COST%`. To total the cost of one tenant, sum
+  `%LLM_LIST_COST%` by `%LLM_TENANT%` in your log pipeline. The rate card is the
+  `pricing` section of the configuration file; see
+  [`pricing`](../configuration/configuration-file/#pricing-pricing). The
+  operators are in the
+  [access log reference](../observability/access-logs/#the-operator-set).
 
 ## Bootstrap configuration
 
