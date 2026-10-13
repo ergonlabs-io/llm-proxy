@@ -182,6 +182,7 @@ async fn start_probed(
             ui: None,
             lifecycle: None,
             credential_probe: probe,
+            capture_agent: None,
         },
     )
     .await

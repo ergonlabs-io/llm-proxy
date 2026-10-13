@@ -32,6 +32,10 @@ pub struct Producer {
     pub producer_id: String,
     pub uid: u32,
     pub tenants: Vec<String>,
+    /// May query the spool's counters and read back records of its own
+    /// tenants. Unset means no: a grant that only submits cannot read.
+    #[serde(default)]
+    pub inspect: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +96,10 @@ impl Config {
             "spool",
         )?;
         for (name, fields) in [
-            ("producers", &["producer_id", "uid", "tenants"][..]),
+            (
+                "producers",
+                &["producer_id", "uid", "tenants", "inspect"][..],
+            ),
             ("keys", &["key_id", "key_file"][..]),
         ] {
             if let Some(entries) = value[name].as_array() {
@@ -282,6 +289,24 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("producers[1].uid"));
+    }
+    #[test]
+    fn inspect_defaults_to_false_and_unknown_producer_fields_stay_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(&path, valid().to_string()).unwrap();
+        assert!(!Config::load(&path).unwrap().producers[0].inspect);
+        let mut input = valid();
+        input["producers"][0]["inspect"] = true.into();
+        std::fs::write(&path, input.to_string()).unwrap();
+        assert!(Config::load(&path).unwrap().producers[0].inspect);
+        let mut input = valid();
+        input["producers"][0]["inspect_all"] = true.into();
+        std::fs::write(&path, input.to_string()).unwrap();
+        assert!(Config::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("agent.producers[0].inspect_all"));
     }
     #[test]
     fn strict_config_reports_full_unknown_paths_and_rejects_trailing_data() {

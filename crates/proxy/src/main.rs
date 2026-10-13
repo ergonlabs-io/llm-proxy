@@ -546,6 +546,89 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     ))
 }
 
+/// How often the spool poller asks the capture agent for its counters.
+const CAPTURE_SPOOL_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Per-poll budget; a slower agent counts as unreachable for that tick.
+const CAPTURE_SPOOL_POLL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// What the poller last learned about the agent, so a log line is written on a
+/// change and never on every tick (AGENTS.md "Fail-open controls": suppress
+/// repeats, or the log becomes the incident).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentLink {
+    /// No successful or failed poll yet, or no endpoint configured.
+    Unknown,
+    Up,
+    Down,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LinkEvent {
+    WentDown,
+    Recovered,
+}
+
+/// Unknown then down still warns: an agent that was never reachable is the
+/// loudest case. Unknown then up is silent because nothing changed for the
+/// operator.
+fn advance_link(prev: AgentLink, reachable: bool) -> (AgentLink, Option<LinkEvent>) {
+    match (prev, reachable) {
+        (AgentLink::Up, true) | (AgentLink::Unknown, true) => (AgentLink::Up, None),
+        (AgentLink::Down, true) => (AgentLink::Up, Some(LinkEvent::Recovered)),
+        (AgentLink::Down, false) => (AgentLink::Down, None),
+        (AgentLink::Up, false) | (AgentLink::Unknown, false) => {
+            (AgentLink::Down, Some(LinkEvent::WentDown))
+        }
+    }
+}
+
+/// One poll: queries the agent, publishes the gauges, logs on transitions.
+/// Fail-open by design: the proxy keeps serving while the agent is down; the
+/// `llmproxy_capture_agent_reachable` gauge and the transition logs make that
+/// visible. Logged errors are fixed phrases, never record contents.
+async fn poll_capture_spool_once(
+    stats: &proxy_observability::stats::CaptureSpoolStats,
+    endpoint: Option<proxy_observability::capture_transport::AgentTransportConfig>,
+    link: AgentLink,
+) -> AgentLink {
+    let Some(config) = endpoint else {
+        stats.publish(None);
+        return AgentLink::Unknown;
+    };
+    let result = proxy_observability::capture_transport::query_spool_stats(
+        &config,
+        CAPTURE_SPOOL_POLL_DEADLINE,
+    )
+    .await;
+    stats.publish(result.as_ref().ok());
+    let (next, event) = advance_link(link, result.is_ok());
+    match (event, &result) {
+        (Some(LinkEvent::WentDown), Err(error)) => tracing::warn!(
+            %error,
+            "capture agent spool stats unavailable: spool gauges are stale and \
+             llmproxy_capture_agent_reachable is 0 (a refusal means the producer grant \
+             needs \"inspect\": true); request handling continues"
+        ),
+        (Some(LinkEvent::Recovered), _) => tracing::info!("capture agent spool stats recovered"),
+        _ => {}
+    }
+    next
+}
+
+async fn run_capture_spool_poller(
+    stats: proxy_observability::stats::CaptureSpoolStats,
+    endpoint: proxy_admin::CaptureAgentProvider,
+) {
+    let mut ticker = tokio::time::interval(CAPTURE_SPOOL_POLL_INTERVAL);
+    // A slow poll must not queue a burst of catch-up polls behind it.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut link = AgentLink::Unknown;
+    loop {
+        ticker.tick().await;
+        link = poll_capture_spool_once(&stats, endpoint(), link).await;
+    }
+}
+
 /// How long `run_serve` waits for every worker to report its initial listener
 /// bind outcome before giving up and treating startup as failed. Generous:
 /// binding a handful of sockets should take microseconds, but a heavily
@@ -747,6 +830,7 @@ async fn run_serve(
             }
         }
     };
+    let legacy_agent = request_records_agent.clone();
     let collector = match (request_records_file, request_records_agent) {
         (Some(path), None) => Some(proxy_observability::metadata::MetadataDelivery::start(
             &path,
@@ -905,6 +989,23 @@ async fn run_serve(
     // -- see that type's doc in `proxy-core`'s `runtime.rs`.
     let snapshot_handles = Arc::new(SnapshotHandles::new());
 
+    // The capture agent endpoint, resolved fresh by the admin endpoints and the
+    // spool poller. The CLI endpoint is fixed for the process; the declarative
+    // one is read from a live config handle so a reload that moves the agent
+    // is followed without a restart.
+    let capture_endpoint: proxy_admin::CaptureAgentProvider = match legacy_agent.clone() {
+        Some(config) => Arc::new(move || Some(config.clone())),
+        None => {
+            let live = snapshot_handles.register(snapshot.clone());
+            Arc::new(move || {
+                live.load()
+                    .end_user_capture
+                    .as_ref()
+                    .map(|capture| capture.endpoint.clone())
+            })
+        }
+    };
+
     // `/ready`'s readiness probe, built here (not inside
     // `start_admin`) because it needs `cluster_manager`, which `start_admin`
     // deliberately has no dependency on -- `proxy-admin` only ever sees the
@@ -982,6 +1083,7 @@ async fn run_serve(
                 proxy_http::credential_probe::ClusterCredentialProbe::new(cluster_manager.clone()),
             )),
             lifecycle: lifecycle.clone(),
+            capture_agent: Some(capture_endpoint.clone()),
         },
     )
     .await
@@ -995,6 +1097,17 @@ async fn run_serve(
     if let Some(server) = &admin_server {
         tracing::info!(addr = %server.local_addr(), "admin server listening");
     }
+
+    // Mirror the capture agent's spool counters into gauges. Started only when
+    // an agent endpoint exists at boot; a reload that first introduces one is
+    // not polled until restart (the admin endpoints do follow it).
+    let capture_spool_poller = (legacy_agent.is_some() || snapshot.end_user_capture.is_some())
+        .then(|| {
+            tokio::spawn(run_capture_spool_poller(
+                proxy_observability::stats::CaptureSpoolStats::resolve(&stats_control),
+                capture_endpoint.clone(),
+            ))
+        });
 
     // Rust note: `WorkerPool::spawn` takes `worker_main` by value and clones
     // it once per worker thread (see its doc comment), so `bind_tx` -- an
@@ -1319,6 +1432,9 @@ async fn run_serve(
     // stopping them first dropped every record from the window.
     if let Some(supervisor) = &capture_supervisor {
         supervisor.stop_admissions();
+    }
+    if let Some(poller) = &capture_spool_poller {
+        poller.abort();
     }
 
     tracing::info!("drain finished: flushing capture, metadata, trace and metric exports");
@@ -2585,6 +2701,7 @@ struct AdminStartRuntime<'a> {
     cluster_state: Option<proxy_admin::ClusterStateProvider>,
     credential_probe: Option<Arc<dyn proxy_http::credential_probe::TenantCredentialProbe>>,
     lifecycle: Arc<LifecycleState>,
+    capture_agent: Option<proxy_admin::CaptureAgentProvider>,
 }
 
 async fn start_admin(
@@ -2628,6 +2745,7 @@ async fn start_admin(
             ui,
             lifecycle: Some(runtime.lifecycle),
             credential_probe: runtime.credential_probe,
+            capture_agent: runtime.capture_agent,
         },
     )
     .await
@@ -2871,6 +2989,42 @@ impl ControlSignals {
 /// inspecting `proxy-admin` in isolation.
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn agent_link_logs_only_on_transitions() {
+        use super::{advance_link as step, AgentLink::*, LinkEvent::*};
+        assert_eq!(step(Unknown, false), (Down, Some(WentDown)));
+        assert_eq!(step(Unknown, true), (Up, None));
+        assert_eq!(step(Up, false), (Down, Some(WentDown)));
+        assert_eq!(step(Down, false), (Down, None), "repeats are suppressed");
+        assert_eq!(step(Down, true), (Up, Some(Recovered)));
+        assert_eq!(step(Up, true), (Up, None));
+    }
+
+    #[tokio::test]
+    async fn spool_poll_of_an_absent_agent_marks_it_unreachable_and_warns_once() {
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let stats = proxy_observability::stats::CaptureSpoolStats::resolve(&control);
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = proxy_observability::capture_transport::AgentTransportConfig {
+            socket_path: dir.path().join("absent.sock"),
+            expected_agent_uid: 0,
+            expected_node_id: "node".into(),
+            producer_id: "proxy".into(),
+        };
+        let link = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::poll_capture_spool_once(&stats, Some(endpoint), super::AgentLink::Up),
+        )
+        .await
+        .unwrap();
+        assert_eq!(link, super::AgentLink::Down);
+        let scrape = proxy_observability::stats::prometheus_render::render(&control.registry());
+        assert!(
+            scrape.contains("envoy_llmproxy_capture_agent_reachable 0"),
+            "{scrape}"
+        );
+    }
     use super::*;
 
     fn empty_snapshot() -> Arc<ConfigSnapshot> {
@@ -2945,6 +3099,7 @@ mod tests {
                 cluster_state: None,
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
+                capture_agent: None,
             },
         )
         .await
@@ -2976,6 +3131,7 @@ mod tests {
                 cluster_state: None,
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
+                capture_agent: None,
             },
         )
         .await
@@ -3012,6 +3168,7 @@ mod tests {
                 cluster_state: None,
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
+                capture_agent: None,
             },
         )
         .await

@@ -3,7 +3,9 @@ pub mod config;
 
 use config::{Config, Producer};
 use proxy_capture_protocol::{
-    decode, encode, read_frame, write_frame, Hello, Kind, Outcome, Receipt, Welcome, VERSION,
+    decode, encode, read_frame, write_frame, Frame, Hello, InspectOutcome, Kind, Outcome, Receipt,
+    RecordsQuery, RecordsReply, SpoolSnapshot, SpooledRecord, StatsQuery, StatsReply, Welcome,
+    MAX_INSPECT_RECORDS, MAX_INSPECT_RECORD_BYTES, VERSION,
 };
 use proxy_capture_spool::{Error, MetadataSpool};
 use proxy_observability::records::RequestRecord;
@@ -51,10 +53,62 @@ struct Job {
     reply: oneshot::Sender<Receipt>,
 }
 
+/// What the bounded queue to the writer thread carries. Inspection shares the
+/// queue so a flood of queries cannot grow an unbounded backlog either, and so
+/// the spool is only ever touched from the writer thread.
+// Rust note: an enum holds one of several shapes in one type, so a single
+// channel can carry both kinds of work and `match` must handle each.
+enum Work {
+    Record(Job),
+    Inspect(InspectJob),
+}
+
+/// A read-only question about the spool. Answering it never changes the spool.
+struct InspectJob {
+    query: Query,
+    /// Tenants of the asking grant; records of any other tenant are not returned.
+    tenants: Vec<String>,
+    reply: oneshot::Sender<InspectReply>,
+}
+
+enum Query {
+    Stats,
+    Records {
+        after_sequence: u64,
+        max_records: u16,
+    },
+}
+
+enum InspectReply {
+    Stats(StatsReply),
+    Records(RecordsReply),
+}
+
+impl InspectReply {
+    /// The reply for a query that was not answered from the spool.
+    fn rejected(stats: bool, outcome: InspectOutcome, after_sequence: u64) -> Self {
+        if stats {
+            Self::Stats(StatsReply {
+                version: VERSION,
+                outcome,
+                stats: None,
+            })
+        } else {
+            Self::Records(RecordsReply {
+                version: VERSION,
+                outcome,
+                records: Vec::new(),
+                next_after_sequence: after_sequence,
+                durable_through_sequence: 0,
+            })
+        }
+    }
+}
+
 pub struct Agent {
     listener: UnixListener,
     config: Arc<Config>,
-    jobs: mpsc::SyncSender<Job>,
+    jobs: mpsc::SyncSender<Work>,
     done: oneshot::Receiver<()>,
     pub health: Arc<Health>,
 }
@@ -94,6 +148,7 @@ impl Agent {
         let health = Arc::new(Health::default());
         let writer_health = health.clone();
         let node_id = config.node_id.clone();
+        let max_disk_bytes = config.spool.max_disk_bytes;
         if let Err(error) = std::thread::Builder::new()
             .name("metadata-spool".into())
             .spawn(move || {
@@ -101,6 +156,7 @@ impl Agent {
                     spool,
                     receiver,
                     &node_id,
+                    max_disk_bytes,
                     &writer_health,
                     MAX_BATCH_HOLD,
                     COHORT_SETTLE,
@@ -171,7 +227,7 @@ impl Agent {
 async fn serve(
     mut stream: UnixStream,
     config: &Config,
-    jobs: mpsc::SyncSender<Job>,
+    jobs: mpsc::SyncSender<Work>,
     connection: u64,
 ) -> io::Result<()> {
     let uid = stream.peer_cred()?.uid();
@@ -208,17 +264,23 @@ async fn serve(
         let frame = tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream))
             .await
             .map_err(|_| io::Error::other("idle deadline"))??;
+        if matches!(frame.kind, Kind::StatsQuery | Kind::RecordsQuery) {
+            if !serve_query(&mut stream, &jobs, &producer, frame).await? {
+                return Ok(());
+            }
+            continue;
+        }
         if frame.kind != Kind::Record {
             return Err(io::Error::other("expected metadata record"));
         }
         let (reply, received) = oneshot::channel();
         // One bounded event per connection, with no unbounded waiter/task backlog.
-        jobs.try_send(Job {
+        jobs.try_send(Work::Record(Job {
             payload: frame.payload,
             producer: producer.clone(),
             connection,
             reply,
-        })
+        }))
         .map_err(|_| io::Error::other("writer unavailable"))?;
         let receipt = tokio::time::timeout(DEADLINE, received)
             .await
@@ -233,9 +295,85 @@ async fn serve(
     }
 }
 
+/// Answers one inspection frame. Returns whether the connection stays open:
+/// a grant without `inspect` is told so and then dropped, while a malformed or
+/// out-of-range query is answered `Invalid` and the connection kept.
+async fn serve_query(
+    stream: &mut UnixStream,
+    jobs: &mpsc::SyncSender<Work>,
+    producer: &Producer,
+    frame: Frame,
+) -> io::Result<bool> {
+    let stats = frame.kind == Kind::StatsQuery;
+    // Authorize before decoding: an ungranted producer learns nothing from the
+    // validity of its query.
+    if !producer.inspect {
+        let denied = InspectReply::rejected(stats, InspectOutcome::Unauthorized, 0);
+        write_inspect_reply(stream, &denied).await?;
+        return Ok(false);
+    }
+    let (query, after_sequence) = if stats {
+        let query: StatsQuery = decode(&frame.payload)?;
+        ((query.version == VERSION).then_some(Query::Stats), 0)
+    } else {
+        let query: RecordsQuery = decode(&frame.payload)?;
+        let valid =
+            query.version == VERSION && (1..=MAX_INSPECT_RECORDS).contains(&query.max_records);
+        (
+            valid.then_some(Query::Records {
+                after_sequence: query.after_sequence,
+                max_records: query.max_records,
+            }),
+            query.after_sequence,
+        )
+    };
+    let Some(query) = query else {
+        let invalid = InspectReply::rejected(stats, InspectOutcome::Invalid, after_sequence);
+        write_inspect_reply(stream, &invalid).await?;
+        return Ok(true);
+    };
+    let (reply, received) = oneshot::channel();
+    let queued = jobs.try_send(Work::Inspect(InspectJob {
+        query,
+        tenants: producer.tenants.clone(),
+        reply,
+    }));
+    let answer = if queued.is_err() {
+        InspectReply::rejected(stats, InspectOutcome::Unavailable, after_sequence)
+    } else {
+        match tokio::time::timeout(DEADLINE, received).await {
+            Err(_) => return Err(io::Error::other("inspect deadline")),
+            Ok(Ok(answer)) => answer,
+            // The writer stopped and dropped the job.
+            Ok(Err(_)) => {
+                InspectReply::rejected(stats, InspectOutcome::Unavailable, after_sequence)
+            }
+        }
+    };
+    write_inspect_reply(stream, &answer).await?;
+    Ok(true)
+}
+
+async fn write_inspect_reply(stream: &mut UnixStream, reply: &InspectReply) -> io::Result<()> {
+    let (kind, payload) = match reply {
+        InspectReply::Stats(reply) => (Kind::StatsReply, encode(reply)?),
+        InspectReply::Records(reply) => (Kind::RecordsReply, encode(reply)?),
+    };
+    tokio::time::timeout(DEADLINE, write_frame(stream, kind, &payload))
+        .await
+        .map_err(|_| io::Error::other("inspect reply deadline"))?
+}
+
+/// One round of writer work: records to commit, and inspections to answer once
+/// they have been.
+struct Batch {
+    records: Vec<Job>,
+    inspects: Vec<InspectJob>,
+}
+
 /// Forms the writer's commit batches from its queue.
 struct Batcher {
-    jobs: mpsc::Receiver<Job>,
+    jobs: mpsc::Receiver<Work>,
     max_hold: Duration,
     settle: Duration,
     /// Connections whose jobs were in the previous batch. The writer answers
@@ -246,7 +384,7 @@ struct Batcher {
 }
 
 impl Batcher {
-    fn new(jobs: mpsc::Receiver<Job>, max_hold: Duration, settle: Duration) -> Self {
+    fn new(jobs: mpsc::Receiver<Work>, max_hold: Duration, settle: Duration) -> Self {
         Self {
             jobs,
             max_hold,
@@ -259,6 +397,11 @@ impl Batcher {
     /// whatever else is already queued, at most `MAX_CLIENTS` in all. `None`
     /// means every sender is gone and the queue is drained.
     ///
+    /// An inspection ends collection: it is returned with the records gathered
+    /// so far, which the writer commits first, so a query sees every record
+    /// acknowledged before it was sent and never waits on a settle window. An
+    /// inspection alone is returned at once and leaves the settle cohort alone.
+    ///
     /// The batch is committed as soon as nothing is queued, with one exception.
     /// A connection sends nothing more until its receipt returns, so a lone
     /// producer can never fill a batch, and waiting for one would charge every
@@ -268,21 +411,34 @@ impl Batcher {
     /// `settle` (and never past `max_hold`) for those connections, and for no
     /// one else. A lone producer is its own previous batch, so it never waits,
     /// and connections that are open but idle are never waited for.
-    fn next_batch(&mut self) -> Option<Vec<Job>> {
+    fn next_batch(&mut self) -> Option<Batch> {
         // Rust note: `?` on an `Option` returns `None` early, the way it returns
         // `Err` early from a function that returns `Result`.
-        let first = self.jobs.recv().ok()?;
+        let first = match self.jobs.recv().ok()? {
+            Work::Record(job) => job,
+            Work::Inspect(inspect) => {
+                return Some(Batch {
+                    records: Vec::new(),
+                    inspects: vec![inspect],
+                })
+            }
+        };
         let started = Instant::now();
         let mut batch = Vec::with_capacity(MAX_CLIENTS);
+        let mut inspects = Vec::new();
         batch.push(first);
         let patience = self.settle.min(self.max_hold);
         // The cap must stay within the spool's eight pending records: the spool
         // refuses a larger append batch, and that refusal stops this writer.
         while batch.len() < MAX_CLIENTS && started.elapsed() < self.max_hold {
             match self.jobs.try_recv() {
-                Ok(job) => {
+                Ok(Work::Record(job)) => {
                     batch.push(job);
                     continue;
+                }
+                Ok(Work::Inspect(inspect)) => {
+                    inspects.push(inspect);
+                    break;
                 }
                 // Every sender is gone, so nothing more can arrive. The caller's
                 // next `next_batch` reports the closed channel.
@@ -304,30 +460,44 @@ impl Batcher {
                 break;
             };
             match self.jobs.recv_timeout(remaining) {
-                Ok(job) => batch.push(job),
+                Ok(Work::Record(job)) => batch.push(job),
+                Ok(Work::Inspect(inspect)) => {
+                    inspects.push(inspect);
+                    break;
+                }
                 // Out of patience, or every sender is gone.
                 Err(_) => break,
             }
         }
         self.answered.clear();
         self.answered.extend(batch.iter().map(|job| job.connection));
-        Some(batch)
+        Some(Batch {
+            records: batch,
+            inspects,
+        })
     }
 }
 
 fn writer(
     mut spool: MetadataSpool,
-    jobs: mpsc::Receiver<Job>,
+    jobs: mpsc::Receiver<Work>,
     node_id: &str,
+    max_disk_bytes: u64,
     health: &Health,
     max_hold: Duration,
     settle: Duration,
 ) {
     let mut batcher = Batcher::new(jobs, max_hold, settle);
-    while let Some(batch) = batcher.next_batch() {
+    while let Some(Batch { records, inspects }) = batcher.next_batch() {
+        if records.is_empty() {
+            for job in inspects {
+                answer_inspect(&spool, node_id, max_disk_bytes, health, job);
+            }
+            continue;
+        }
         let mut prepared = Vec::with_capacity(MAX_CLIENTS);
         let mut fatal = false;
-        for job in batch {
+        for job in records {
             let mut receipt = Receipt {
                 version: VERSION,
                 node_id: node_id.to_owned(),
@@ -460,10 +630,108 @@ fn writer(
             }
             fatal |= !committed;
         }
+        // After the commit, so a query sees the records it was queued behind. On
+        // a fatal round the spool is no longer trusted and the jobs are dropped,
+        // which the connection reports as `Unavailable`.
+        if !fatal {
+            for job in inspects {
+                answer_inspect(&spool, node_id, max_disk_bytes, health, job);
+            }
+        }
         if fatal {
             break;
         }
     }
+}
+
+/// Answers an inspection on the writer thread. Reads only: nothing here
+/// appends, commits or acknowledges, and record contents are never logged.
+fn answer_inspect(
+    spool: &MetadataSpool,
+    node_id: &str,
+    max_disk_bytes: u64,
+    health: &Health,
+    job: InspectJob,
+) {
+    let reply = match &job.query {
+        Query::Stats => InspectReply::Stats(match spool.stats() {
+            Ok(stats) => StatsReply {
+                version: VERSION,
+                outcome: InspectOutcome::Ok,
+                stats: Some(SpoolSnapshot {
+                    node_id: node_id.to_owned(),
+                    next_sequence: stats.next_sequence,
+                    durable_through_sequence: stats.durable_through_sequence,
+                    acknowledged_through_sequence: stats.acknowledged_through_sequence,
+                    pending_records: stats.pending_records,
+                    retained_records: stats.retained_records,
+                    database_bytes: stats.database_bytes,
+                    disk_bytes: stats.disk_bytes,
+                    max_disk_bytes,
+                    quarantine_bytes: stats.quarantine_bytes,
+                    poisoned: stats.poisoned,
+                    durable_total: health.durable.load(Ordering::Relaxed),
+                    rejected_total: health.rejected.load(Ordering::Relaxed),
+                    failures_total: health.failures.load(Ordering::Relaxed),
+                }),
+            },
+            Err(_) => StatsReply {
+                version: VERSION,
+                outcome: InspectOutcome::Unavailable,
+                stats: None,
+            },
+        }),
+        Query::Records {
+            after_sequence,
+            max_records,
+        } => records_page(spool, &job.tenants, *after_sequence, *max_records),
+    };
+    let _ = job.reply.send(reply);
+}
+
+fn records_page(
+    spool: &MetadataSpool,
+    tenants: &[String],
+    after_sequence: u64,
+    max_records: u16,
+) -> InspectReply {
+    let unavailable = || InspectReply::rejected(false, InspectOutcome::Unavailable, after_sequence);
+    let Ok(stats) = spool.stats() else {
+        return unavailable();
+    };
+    let Ok(replayed) = spool.replay(
+        after_sequence,
+        usize::from(max_records),
+        MAX_INSPECT_RECORD_BYTES,
+    ) else {
+        return unavailable();
+    };
+    // The cursor passes records of other tenants too, so a page that holds
+    // none of this grant's records still makes progress.
+    let next_after_sequence = replayed.last().map_or(after_sequence, |row| row.sequence);
+    let mut records = Vec::new();
+    for row in replayed {
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&row.payload) else {
+            return unavailable();
+        };
+        let allowed = record
+            .get("tenant_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|tenant| tenants.iter().any(|granted| granted == tenant));
+        if allowed {
+            records.push(SpooledRecord {
+                sequence: row.sequence,
+                record,
+            });
+        }
+    }
+    InspectReply::Records(RecordsReply {
+        version: VERSION,
+        outcome: InspectOutcome::Ok,
+        records,
+        next_after_sequence,
+        durable_through_sequence: stats.durable_through_sequence,
+    })
 }
 
 fn supported_shape(source: &serde_json::Value, canonical: &serde_json::Value) -> bool {
@@ -489,3 +757,6 @@ fn supported_shape(source: &serde_json::Value, canonical: &serde_json::Value) ->
 
 #[cfg(test)]
 mod writer_tests;
+
+#[cfg(test)]
+mod inspect_tests;

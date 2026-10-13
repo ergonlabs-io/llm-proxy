@@ -78,6 +78,14 @@
 //! with no extra effect, any other query parameter is a 400). Without a wired
 //! lifecycle they answer 404. See `internal-docs/envoy-divergences.md`.
 //!
+//! Capture-agent inspection: `GET /capture/spool/stats` (ungated spool
+//! counters) and `GET /capture/spool/records?after=&limit=` (stored request
+//! records; **gated like the spend read**, since they are end-user metadata).
+//! Both open a fresh handshaken connection to the capture agent per request
+//! under a 2 s deadline, and answer 404 when no agent endpoint is configured,
+//! 503 when it is unreachable, and (records only) 403 when the agent's
+//! producer grant lacks `"inspect": true`.
+//!
 //! Everything else 404s, naming the endpoints that exist. `/quitquitquit`,
 //! `/logging`, and `/listeners` (Envoy admin endpoints) are not part of this
 //! API and stay 404.
@@ -140,6 +148,6 @@ pub mod server;
 
 pub use dump::{LiveCluster, LiveEndpoint};
 pub use server::{
-    serve, AdminError, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe,
-    UiAssets,
+    serve, AdminError, AdminRuntime, AdminServer, CaptureAgentProvider, ClusterStateProvider,
+    Readiness, ReadinessProbe, UiAssets,
 };

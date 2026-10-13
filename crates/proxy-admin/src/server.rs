@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -58,6 +58,9 @@ use proxy_http::credential_probe::{
 };
 use proxy_http::filter::SharedFactoryState;
 use proxy_http::tenant_credentials::CredentialSource;
+use proxy_observability::capture_transport::{
+    query_spool_records, query_spool_stats, AgentTransportConfig, InspectError,
+};
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -110,6 +113,10 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}/spend",
     "/pricing",
     "/chains/{stat_prefix}/pricing",
+    // Capture-agent spool inspection. Stats is an ungated read like `/stats`;
+    // records are end-user metadata, so that read is bearer-gated like spend.
+    "/capture/spool/stats (spool counters of the capture agent)",
+    "/capture/spool/records?after=<sequence>&limit=<1..=100> (bearer-gated page of stored records)",
 ];
 
 /// Hard cap on a write request's body. An admin write endpoint has no
@@ -183,6 +190,16 @@ pub type ReadinessProbe = Arc<dyn Fn() -> Readiness + Send + Sync>;
 pub type ClusterStateProvider =
     Arc<dyn Fn(&proxy_config::ir::ConfigSnapshot) -> Vec<LiveCluster> + Send + Sync>;
 
+/// Supplies the capture agent endpoint as of this request, `None` when no
+/// agent is configured. A closure rather than a value because a declarative
+/// config reload can move the endpoint; the admin crate stays free of the
+/// binary's config plumbing, like [`ClusterStateProvider`].
+pub type CaptureAgentProvider = Arc<dyn Fn() -> Option<AgentTransportConfig> + Send + Sync>;
+
+/// Bound on one inspection round trip to the capture agent. The agent reads
+/// and decrypts a page under this budget; a slower answer reads as down.
+const CAPTURE_QUERY_DEADLINE: Duration = Duration::from_secs(2);
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("admin server failed to bind {addr}: {source}")]
@@ -231,6 +248,10 @@ pub struct AdminRuntime {
     /// decision 10). `None` refuses every save that asks for verification,
     /// so an unwired probe never reports a key as verified.
     pub credential_probe: Option<Arc<dyn proxy_http::credential_probe::TenantCredentialProbe>>,
+    /// Resolves the capture agent endpoint for `/capture/spool/*`. `None`, or
+    /// a provider that returns `None`, makes those endpoints answer 404 with
+    /// a hint, the same honesty rule as the unwired `/stats`.
+    pub capture_agent: Option<CaptureAgentProvider>,
 }
 
 /// One static file served under `/ui/`.
@@ -566,6 +587,9 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
                 ),
             };
         }
+        "/capture/spool/stats" => {
+            return handle_capture_stats(runtime.capture_agent.as_ref()).await;
+        }
         _ => {}
     }
 
@@ -578,6 +602,10 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
     // `/stats`, ...), which is why they are routed here instead of there.
     // See `lib.rs`'s module doc for the one-line rule and `WriteRoute`'s doc
     // for how a GET fits a type named for writes. ----
+    // The gated records read has its own handler, but passes the same gate.
+    if req.uri().path() == "/capture/spool/records" {
+        return handle_capture_records(&req, runtime).await;
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // Rust note: leading `/` stripped, then split on `/` WITHOUT filtering
@@ -600,34 +628,9 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         );
     }
 
-    // Gate 1: is the write API enabled at all? Unset (or empty/whitespace)
-    // `LLMPROXY_ADMIN_TOKEN` means "not configured", never "open" -- see
-    // AGENTS.md "Fail-open controls" ("a security control that fails open must be
-    // loud"). This is the fail-CLOSED default, and it must never be
-    // reachable by falling through any other branch above it.
-    let Some(token) = admin_token else {
-        tracing::warn!(
-            endpoint = %path,
-            "admin write refused: LLMPROXY_ADMIN_TOKEN is not set, so admin write endpoints are disabled"
-        );
-        return text(
-            StatusCode::FORBIDDEN,
-            "admin write endpoints are disabled because LLMPROXY_ADMIN_TOKEN is not set",
-        );
-    };
-
-    // Gate 2: does the caller present the configured token? RFC 7235
-    // requires a `www-authenticate` challenge on a 401 -- `auth_filter.rs`'s
-    // `AuthFilterInstance::deny` does the same thing for the exact same
-    // reason.
-    let presented = extract_bearer(req.headers());
-    let authorized = match &presented {
-        Some(candidate) => secrets_match(candidate.as_bytes(), token.as_bytes()),
-        None => false,
-    };
-    if !authorized {
-        tracing::warn!(endpoint = %path, "admin write refused: missing or invalid bearer token");
-        return unauthorized("missing or invalid bearer token");
+    // Gates 1 and 2: see `admin_gate`.
+    if let Some(refusal) = admin_gate(&path, admin_token, req.headers()) {
+        return refusal;
     }
 
     // Lifecycle routes need no ControlPlane, so they leave after the same two
@@ -1336,6 +1339,147 @@ async fn read_limited_body(body: Incoming, cap: usize) -> Result<Bytes, Response
             }
         }
     }
+}
+
+/// The shared admin gate, for every write and every sensitive read. `Some`
+/// is the refusal to return; `None` means the caller may proceed.
+///
+/// Gate 1: is the API enabled at all? Unset (or empty/whitespace)
+/// `LLMPROXY_ADMIN_TOKEN` means "not configured", never "open" -- see
+/// AGENTS.md "Fail-open controls". This is the fail-CLOSED default, and it
+/// must never be reachable by falling through any other branch.
+///
+/// Gate 2: does the caller present the configured token? RFC 7235 requires a
+/// `www-authenticate` challenge on a 401 -- `auth_filter.rs`'s
+/// `AuthFilterInstance::deny` does the same thing for the same reason.
+fn admin_gate(
+    path: &str,
+    admin_token: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<Response<Full<Bytes>>> {
+    let Some(token) = admin_token else {
+        tracing::warn!(
+            endpoint = %path,
+            "admin write refused: LLMPROXY_ADMIN_TOKEN is not set, so admin write endpoints are disabled"
+        );
+        return Some(text(
+            StatusCode::FORBIDDEN,
+            "admin write endpoints are disabled because LLMPROXY_ADMIN_TOKEN is not set",
+        ));
+    };
+    let authorized = match extract_bearer(headers) {
+        Some(candidate) => secrets_match(candidate.as_bytes(), token.as_bytes()),
+        None => false,
+    };
+    if !authorized {
+        tracing::warn!(endpoint = %path, "admin write refused: missing or invalid bearer token");
+        return Some(unauthorized("missing or invalid bearer token"));
+    }
+    None
+}
+
+const CAPTURE_NOT_CONFIGURED: &str = "no capture agent is configured for this proxy; \
+     /capture/spool/* needs a capture agent endpoint";
+
+/// `GET /capture/spool/stats`: the agent's spool counters. Ungated like
+/// `/stats`: counts and byte sizes only, no record contents.
+async fn handle_capture_stats(provider: Option<&CaptureAgentProvider>) -> Response<Full<Bytes>> {
+    let Some(config) = provider.and_then(|p| p()) else {
+        return text(StatusCode::NOT_FOUND, CAPTURE_NOT_CONFIGURED);
+    };
+    match query_spool_stats(&config, CAPTURE_QUERY_DEADLINE).await {
+        Ok(snapshot) => json(StatusCode::OK, &snapshot),
+        Err(error) => capture_error(error),
+    }
+}
+
+/// `GET /capture/spool/records?after=&limit=`: one page of stored records.
+/// Gated like the spend read because records are end-user metadata.
+async fn handle_capture_records(
+    req: &Request<Incoming>,
+    runtime: &AdminRuntime,
+) -> Response<Full<Bytes>> {
+    if req.method() != Method::GET {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "/capture/spool/records only accepts GET",
+        );
+    }
+    if let Some(refusal) = admin_gate(
+        req.uri().path(),
+        runtime.admin_token.as_deref(),
+        req.headers(),
+    ) {
+        return refusal;
+    }
+    let (after, limit) = match parse_records_query(req.uri().query()) {
+        Ok(parsed) => parsed,
+        Err(message) => return bad_request(message),
+    };
+    let Some(config) = runtime.capture_agent.as_ref().and_then(|p| p()) else {
+        return text(StatusCode::NOT_FOUND, CAPTURE_NOT_CONFIGURED);
+    };
+    match query_spool_records(&config, after, limit, CAPTURE_QUERY_DEADLINE).await {
+        // Record contents go to the authorized caller only, never to a log.
+        Ok(reply) => json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "records": reply.records,
+                "next_after_sequence": reply.next_after_sequence,
+                "durable_through_sequence": reply.durable_through_sequence,
+            }),
+        ),
+        Err(error) => capture_error(error),
+    }
+}
+
+/// `after` (default 0) and `limit` (1..=100, default 50). Unknown or repeated
+/// parameters are a 400, not ignored. No percent-decoding: every valid value
+/// is plain digits.
+fn parse_records_query(query: Option<&str>) -> Result<(u64, u16), &'static str> {
+    const MAX_LIMIT: u16 = 100;
+    let (mut after, mut limit) = (None, None);
+    for param in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let (name, value) = param.split_once('=').unwrap_or((param, ""));
+        match name {
+            "after" if after.is_none() => {
+                after = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "after must be an unsigned integer sequence")?,
+                );
+            }
+            "limit" if limit.is_none() => {
+                limit = Some(
+                    value
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|n| (1..=MAX_LIMIT).contains(n))
+                        .ok_or("limit must be an integer from 1 to 100")?,
+                );
+            }
+            _ => return Err("unsupported or repeated query parameter; use after and limit"),
+        }
+    }
+    Ok((after.unwrap_or(0), limit.unwrap_or(50)))
+}
+
+/// Maps an inspection failure to a response. The error text is a fixed
+/// phrase: it can never carry record contents.
+fn capture_error(error: InspectError) -> Response<Full<Bytes>> {
+    let (status, hint) = match error {
+        InspectError::Unauthorized => (
+            StatusCode::FORBIDDEN,
+            "the capture agent refused the query; the proxy's producer grant needs \"inspect\": true",
+        ),
+        InspectError::Unreachable | InspectError::Unavailable | InspectError::Invalid => {
+            (StatusCode::SERVICE_UNAVAILABLE, "capture agent unavailable")
+        }
+    };
+    json(
+        status,
+        &serde_json::json!({ "error": format!("{hint} ({error})") }),
+    )
 }
 
 /// Extracts the bearer credential from `Authorization: Bearer <token>`.

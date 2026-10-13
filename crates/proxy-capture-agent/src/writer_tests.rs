@@ -34,19 +34,20 @@ fn payload(event_id: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn new_job(connection: u64, payload: Vec<u8>) -> (Job, oneshot::Receiver<Receipt>) {
+fn new_job(connection: u64, payload: Vec<u8>) -> (Work, oneshot::Receiver<Receipt>) {
     let (reply, receipt) = oneshot::channel();
     let producer = Producer {
         producer_id: "producer".into(),
         uid: 0,
         tenants: vec!["default".into()],
+        inspect: false,
     };
-    let job = Job {
+    let job = Work::Record(Job {
         payload,
         producer,
         connection,
         reply,
-    };
+    });
     (job, receipt)
 }
 
@@ -76,12 +77,22 @@ fn open_spool(directory: &Path) -> MetadataSpool {
 /// Starts the real writer on its own OS thread, as `Agent::start` does.
 fn spawn_writer(
     directory: &Path,
-    queue: mpsc::Receiver<Job>,
+    queue: mpsc::Receiver<Work>,
     max_hold: Duration,
     settle: Duration,
 ) -> JoinHandle<()> {
     let spool = open_spool(directory);
-    std::thread::spawn(move || writer(spool, queue, "node", &Health::default(), max_hold, settle))
+    std::thread::spawn(move || {
+        writer(
+            spool,
+            queue,
+            "node",
+            4 * 1_048_576,
+            &Health::default(),
+            max_hold,
+            settle,
+        )
+    })
 }
 
 /// Event IDs in the spool in sequence order, read after the writer has stopped
@@ -119,7 +130,7 @@ fn bounded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
 /// of a first record the test has already put on the queue.
 fn lockstep_producer(
     connection: u64,
-    jobs: mpsc::SyncSender<Job>,
+    jobs: mpsc::SyncSender<Work>,
     queued: Option<oneshot::Receiver<Receipt>>,
     pause: Duration,
 ) -> JoinHandle<()> {
@@ -254,8 +265,8 @@ fn collection_takes_only_what_is_already_queued_up_to_the_cap() {
         let mut order = Vec::new();
         for _ in 0..3 {
             let batch = batcher.next_batch().expect("jobs are queued");
-            sizes.push(batch.len());
-            order.extend(batch.into_iter().map(|job| job.payload));
+            sizes.push(batch.records.len());
+            order.extend(batch.records.into_iter().map(|job| job.payload));
         }
         (sizes, order)
     });
@@ -277,7 +288,7 @@ fn max_hold_caps_collection_even_when_more_jobs_are_queued() {
     // Jobs are queued, so this call cannot block; a zero hold leaves no time to
     // collect the two behind the first.
     let batch = batcher.next_batch().expect("jobs are queued");
-    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.records.len(), 1);
 }
 
 #[test]
@@ -288,7 +299,7 @@ fn max_hold_also_caps_the_settle_wait() {
     // Connection 1 was answered by the previous commit and never sends again.
     batcher.answered = vec![1];
     jobs.try_send(new_job(0, vec![0]).0).unwrap();
-    let batch = bounded(move || batcher.next_batch().expect("a job is queued").len());
+    let batch = bounded(move || batcher.next_batch().expect("a job is queued").records.len());
     assert_eq!(batch, 1);
     drop(jobs);
 }
@@ -321,8 +332,8 @@ fn lockstep_producers_converge_to_full_batches() {
     let sizes = bounded(move || {
         let mut sizes = Vec::new();
         while let Some(batch) = batcher.next_batch() {
-            sizes.push(batch.len());
-            for job in batch {
+            sizes.push(batch.records.len());
+            for job in batch.records {
                 let _ = job.reply.send(durable());
             }
         }
@@ -332,4 +343,46 @@ fn lockstep_producers_converge_to_full_batches() {
     for producer in producers {
         producer.join().unwrap();
     }
+}
+
+fn inspect_work() -> Work {
+    let (reply, _receipt) = oneshot::channel();
+    Work::Inspect(InspectJob {
+        query: Query::Stats,
+        tenants: Vec::new(),
+        reply,
+    })
+}
+
+#[test]
+fn an_inspection_ends_collection_and_an_inspection_alone_keeps_the_cohort() {
+    let (jobs, queue) = mpsc::sync_channel(MAX_CLIENTS);
+    let mut batcher = Batcher::new(queue, HOUR, HOUR);
+    // Connection 9 was answered by the previous commit. A lone inspection must
+    // neither wait for it nor forget it.
+    batcher.answered = vec![9];
+    jobs.try_send(new_job(0, vec![0]).0).unwrap();
+    jobs.try_send(inspect_work()).unwrap();
+    jobs.try_send(new_job(1, vec![1]).0).unwrap();
+    jobs.try_send(inspect_work()).unwrap();
+    jobs.try_send(inspect_work()).unwrap();
+    let (first, second, answered) = bounded(move || {
+        // The record gathered before the inspection comes with it; the record
+        // queued behind it waits for the next round.
+        let first = batcher.next_batch().unwrap();
+        let second = batcher.next_batch().unwrap();
+        let third = batcher.next_batch().unwrap();
+        assert!(third.records.is_empty());
+        let answered = batcher.answered.clone();
+        (
+            (first.records.len(), first.inspects.len()),
+            (second.records.len(), second.inspects.len()),
+            answered,
+        )
+    });
+    assert_eq!(first, (1, 1));
+    assert_eq!(second, (1, 1));
+    // The last round was inspection-only, so the cohort is the record round's.
+    assert_eq!(answered, [1]);
+    drop(jobs);
 }

@@ -84,6 +84,7 @@ impl Fixture {
                 producer_id: "producer".into(),
                 uid: self.uid,
                 tenants: vec!["default".into()],
+                inspect: false,
             }],
             spool: Spool {
                 directory: self.root.join("spool"),

@@ -435,6 +435,7 @@ async fn start_full_with_readiness(
             ui: None,
             lifecycle: None,
             credential_probe: None,
+            capture_agent: None,
         },
     )
     .await
@@ -464,6 +465,7 @@ async fn start_with_cluster_state(
             ui: None,
             lifecycle: None,
             credential_probe: None,
+            capture_agent: None,
         },
     )
     .await
@@ -1045,6 +1047,7 @@ async fn start_lifecycle(
             ui: None,
             lifecycle: Some(Arc::clone(&state)),
             credential_probe: None,
+            capture_agent: None,
         },
     )
     .await
@@ -2976,6 +2979,7 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             ui: Some(Arc::new(ui)),
             lifecycle: None,
             credential_probe: None,
+            capture_agent: None,
         },
     )
     .await
@@ -3145,6 +3149,7 @@ async fn key_rotation_conflicts_and_api_version_are_explicit() {
 }
 
 mod budget_scope;
+mod capture_spool;
 mod credentials;
 mod pricing;
 mod tenant_budget_cutover;

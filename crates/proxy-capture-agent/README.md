@@ -36,7 +36,11 @@ Prepare the socket directory with mode 0700 and provision an external, regular
 ```
 
 Configuration fields are required except `spool.cache_bytes`, which defaults
-to 4 MiB. Unknown fields fail at their full path. Config files
+to 4 MiB, and the producer field `inspect`, which defaults to `false`. A grant
+with `"inspect": true` may send stats and records queries on its connection;
+records are limited to the grant's own tenants, and inspection never
+acknowledges or changes the spool. Grants without it are refused
+(`unauthorized`) and disconnected. Unknown fields fail at their full path. Config files
 are limited to 128 KiB; version and mode have exactly the values above. IDs are
 1–128 UTF-8 bytes; node/event IDs reject control characters so receipts fit their
 encoded control-frame bound. Grants allow at most 256 producers, unique producer IDs and

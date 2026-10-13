@@ -772,3 +772,248 @@ fn metadata_agent_cli_rejects_dual_modes_and_missing_authentication() {
             .success());
     }
 }
+
+/// GET with extra request headers; returns `(status line, body)`. Bounded by
+/// the same 2 s socket timeouts as `get`.
+fn get_with(port: u16, path: &str, headers: &[(&str, &str)]) -> (String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: test.local\r\n{extra}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+    (
+        head.lines().next().unwrap_or("").to_string(),
+        body.to_string(),
+    )
+}
+
+/// Real agent (in-process, as in the outage test), real proxy binary with an
+/// admin token, and a mock upstream. Field order is drop order: the proxy
+/// dies first, then the agent, upstream and temp directory, on every path.
+struct InspectRig {
+    proxy: Proxy,
+    _agent: Collector,
+    _upstream: Mock,
+    _temp: tempfile::TempDir,
+    listener: u16,
+    admin: u16,
+}
+
+const ADMIN_TOKEN: &str = "inspect-e2e-token";
+
+fn inspect_rig(inspect: bool) -> InspectRig {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = temp.path().join("agent.sock");
+    let key = temp.path().join("key");
+    std::fs::write(&key, [9; 32]).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let uid = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::net::UnixStream::pair()
+                .unwrap()
+                .0
+                .peer_cred()
+                .unwrap()
+                .uid()
+        });
+    let config = serde_json::json!({"version":1,"mode":"metadata_spool_only","socket_path":socket,"node_id":"test-node",
+        "producers":[{"producer_id":"test-proxy","uid":uid,"tenants":["default"],"inspect":inspect}],
+        "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,"max_disk_bytes":4194304,"cache_bytes":4194304},
+        "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]});
+    let agent = collector(serde_json::from_value(config).unwrap());
+    let upstream = mock();
+    let listener = port();
+    let admin = port();
+    let bootstrap = temp.path().join("proxy.yaml");
+    std::fs::write(
+        &bootstrap,
+        declarative_bootstrap_without_capture(listener, admin, upstream.address.port()),
+    )
+    .unwrap();
+    let mut proxy = Proxy(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&bootstrap)
+            .args([
+                "--concurrency",
+                "1",
+                "--drain-time-s",
+                "0",
+                "--request-records-agent",
+            ])
+            .arg(&socket)
+            .args([
+                "--request-records-agent-uid",
+                &uid.to_string(),
+                "--request-records-agent-node",
+                "test-node",
+                "--request-records-producer",
+                "test-proxy",
+            ])
+            .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait(|| {
+        assert!(
+            proxy.0.try_wait().unwrap().is_none(),
+            "proxy exited before binding"
+        );
+        TcpStream::connect(("127.0.0.1", admin)).is_ok()
+            && TcpStream::connect(("127.0.0.1", listener)).is_ok()
+    });
+    InspectRig {
+        proxy,
+        _agent: agent,
+        _upstream: upstream,
+        _temp: temp,
+        listener,
+        admin,
+    }
+}
+
+/// The plain bootstrap of the outage test, shared here: no node metadata, the
+/// agent is named on the command line.
+fn declarative_bootstrap_without_capture(listener: u16, admin: u16, upstream: u16) -> String {
+    declarative_bootstrap(listener, admin, upstream, &serde_json::json!({})).replace(
+        "node:\n  id: test-proxy\n  cluster: test\n  metadata:\n    \"io.llmproxy.capture\": {}\n",
+        "",
+    )
+}
+
+#[test]
+fn spool_inspection_pages_records_and_gates_them_behind_the_admin_token() {
+    let rig = inspect_rig(true);
+    let ids = ["inspect-req-1", "inspect-req-2", "inspect-req-3"];
+    for id in ids {
+        let (status, _) = get_with(rig.listener, "/x", &[("x-request-id", id)]);
+        assert!(status.contains(" 200"), "{status}");
+    }
+    let bearer = format!("Bearer {ADMIN_TOKEN}");
+    let auth = [("authorization", bearer.as_str())];
+
+    // Poll until the agent reports all three durable; the ungated stats read.
+    let mut stats = serde_json::Value::Null;
+    wait(|| {
+        let (status, body) = get_with(rig.admin, "/capture/spool/stats", &[]);
+        if !status.contains(" 200") {
+            return false;
+        }
+        stats = serde_json::from_str(&body).unwrap();
+        stats["durable_total"].as_u64().unwrap_or(0) >= 3
+            && stats["retained_records"].as_u64().unwrap_or(0) >= 3
+    });
+    assert!(stats["retained_records"].as_u64().unwrap() >= 3, "{stats}");
+    assert!(stats["durable_total"].as_u64().unwrap() >= 3, "{stats}");
+
+    // Page through with limit=2: 2 records, then the remainder.
+    let page = |after: u64| -> serde_json::Value {
+        let (status, body) = get_with(
+            rig.admin,
+            &format!("/capture/spool/records?after={after}&limit=2"),
+            &auth,
+        );
+        assert!(status.contains(" 200"), "{status} {body}");
+        serde_json::from_str(&body).unwrap()
+    };
+    let first = page(0);
+    let first_records = first["records"].as_array().unwrap();
+    assert_eq!(first_records.len(), 2, "{first}");
+    let cursor = first["next_after_sequence"].as_u64().unwrap();
+    let second = page(cursor);
+    let second_records = second["records"].as_array().unwrap();
+    assert_eq!(second_records.len(), 1, "{second}");
+    let third = page(second["next_after_sequence"].as_u64().unwrap());
+    assert!(third["records"].as_array().unwrap().is_empty(), "{third}");
+
+    let all: Vec<&serde_json::Value> = first_records.iter().chain(second_records).collect();
+    let sequences: Vec<u64> = all
+        .iter()
+        .map(|r| r["sequence"].as_u64().unwrap())
+        .collect();
+    assert!(
+        sequences.windows(2).all(|w| w[0] < w[1]),
+        "sequences must strictly increase without duplicates: {sequences:?}"
+    );
+    // The proxy mints its own request ids (a client x-request-id is not
+    // adopted), so identity is checked by shape and uniqueness plus the
+    // fields of the requests actually sent.
+    let mut seen: Vec<&str> = all
+        .iter()
+        .map(|r| r["record"]["request_id"].as_str().unwrap())
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), ids.len(), "one distinct record per request");
+    assert!(seen
+        .iter()
+        .all(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())));
+    assert!(all.iter().all(|r| r["record"]["method"] == "GET"
+        && r["record"]["status"] == 200
+        && r["record"]["selected_cluster"] == "backend"));
+    assert!(all.iter().all(|r| r["record"]["tenant_id"] == "default"));
+
+    // No token: refused, and the body carries no record field values.
+    let (status, body) = get_with(rig.admin, "/capture/spool/records?limit=2", &[]);
+    assert!(status.contains(" 401"), "{status}");
+    for id in ids {
+        assert!(!body.contains(id), "refusal leaked a record value: {body}");
+    }
+    for record in &all {
+        let id = record["record"]["request_id"].as_str().unwrap();
+        assert!(!body.contains(id), "refusal leaked a record value: {body}");
+    }
+    assert!(
+        !body.contains("tenant_id") && !body.contains("sequence"),
+        "{body}"
+    );
+    let (status, _) = get_with(
+        rig.admin,
+        "/capture/spool/records?limit=2",
+        &[("authorization", "Bearer wrong")],
+    );
+    assert!(status.contains(" 401"), "{status}");
+
+    // The poller's first tick is immediate, so the gauges are already live.
+    wait(|| {
+        get(rig.admin, "/stats/prometheus").contains("envoy_llmproxy_capture_agent_reachable 1")
+    });
+    drop(rig.proxy);
+}
+
+#[test]
+fn spool_inspection_without_an_inspect_grant_is_forbidden() {
+    let rig = inspect_rig(false);
+    let bearer = format!("Bearer {ADMIN_TOKEN}");
+    let (status, body) = get_with(
+        rig.admin,
+        "/capture/spool/records?limit=2",
+        &[("authorization", bearer.as_str())],
+    );
+    assert!(status.contains(" 403"), "{status} {body}");
+    let (status, _) = get_with(rig.admin, "/capture/spool/stats", &[]);
+    assert!(status.contains(" 403"), "{status}");
+    wait(|| {
+        get(rig.admin, "/stats/prometheus").contains("envoy_llmproxy_capture_agent_reachable 0")
+    });
+}

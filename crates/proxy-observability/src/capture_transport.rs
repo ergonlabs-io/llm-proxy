@@ -1,6 +1,8 @@
 //! Local metadata transport, invoked only by the dedicated collector thread.
 use proxy_capture_protocol::{
-    decode, encode, read_frame, write_frame, Hello, Kind, Outcome, Receipt, Welcome, VERSION,
+    decode, encode, read_frame, write_frame, Hello, InspectOutcome, Kind, Outcome, Receipt,
+    RecordsQuery, RecordsReply, SpoolSnapshot, StatsQuery, StatsReply, Welcome,
+    MAX_INSPECT_RECORDS, VERSION,
 };
 use std::{
     io::{self, Write},
@@ -188,6 +190,109 @@ async fn connect(config: &AgentTransportConfig) -> io::Result<UnixStream> {
         ));
     }
     Ok(stream)
+}
+
+/// Why an inspection query to the capture agent failed. Messages never carry
+/// record contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InspectError {
+    /// Connect, handshake, I/O, or deadline failure; the agent may be down.
+    #[error("capture agent unreachable")]
+    Unreachable,
+    /// The agent refused the producer: its grant lacks `inspect`.
+    #[error("capture agent refused the inspection query")]
+    Unauthorized,
+    /// The agent rejected the query, or sent a reply that breaks the protocol.
+    #[error("capture agent rejected or sent an invalid inspection exchange")]
+    Invalid,
+    /// The agent is up but could not read its spool.
+    #[error("capture agent spool unavailable")]
+    Unavailable,
+}
+
+fn inspect_failure(outcome: InspectOutcome) -> InspectError {
+    match outcome {
+        // `Ok` never reaches here; treat a caller bug as a protocol error.
+        InspectOutcome::Ok | InspectOutcome::Invalid => InspectError::Invalid,
+        InspectOutcome::Unauthorized => InspectError::Unauthorized,
+        InspectOutcome::Unavailable => InspectError::Unavailable,
+    }
+}
+
+/// One fresh, handshaken connection per query: sends `query_kind` and returns
+/// the payload of the single reply frame, all within `deadline`.
+async fn inspect_exchange(
+    config: &AgentTransportConfig,
+    deadline: Duration,
+    query_kind: Kind,
+    reply_kind: Kind,
+    query: Vec<u8>,
+) -> Result<Vec<u8>, InspectError> {
+    let exchange = async {
+        let mut stream = connect(config).await?;
+        write_frame(&mut stream, query_kind, &query).await?;
+        let frame = read_frame(&mut stream).await?;
+        Ok::<_, io::Error>(frame)
+    };
+    let frame = tokio::time::timeout(deadline, exchange)
+        .await
+        .map_err(|_| InspectError::Unreachable)?
+        .map_err(|_| InspectError::Unreachable)?;
+    if frame.kind != reply_kind {
+        return Err(InspectError::Invalid);
+    }
+    Ok(frame.payload)
+}
+
+/// Reads the agent's spool counters. Needs an `inspect` grant.
+pub async fn query_spool_stats(
+    config: &AgentTransportConfig,
+    deadline: Duration,
+) -> Result<SpoolSnapshot, InspectError> {
+    let query = encode(&StatsQuery { version: VERSION }).map_err(|_| InspectError::Invalid)?;
+    let payload =
+        inspect_exchange(config, deadline, Kind::StatsQuery, Kind::StatsReply, query).await?;
+    let reply: StatsReply = decode(&payload).map_err(|_| InspectError::Invalid)?;
+    match (reply.version == VERSION, reply.outcome, reply.stats) {
+        (true, InspectOutcome::Ok, Some(stats)) => Ok(stats),
+        (true, InspectOutcome::Ok, None) | (false, _, _) => Err(InspectError::Invalid),
+        (true, outcome, _) => Err(inspect_failure(outcome)),
+    }
+}
+
+/// Reads one page of durable records above `after_sequence`, scoped by the
+/// agent to the grant's tenants. Needs an `inspect` grant.
+pub async fn query_spool_records(
+    config: &AgentTransportConfig,
+    after_sequence: u64,
+    max_records: u16,
+    deadline: Duration,
+) -> Result<RecordsReply, InspectError> {
+    if max_records == 0 || max_records > MAX_INSPECT_RECORDS {
+        return Err(InspectError::Invalid);
+    }
+    let query = encode(&RecordsQuery {
+        version: VERSION,
+        after_sequence,
+        max_records,
+    })
+    .map_err(|_| InspectError::Invalid)?;
+    let payload = inspect_exchange(
+        config,
+        deadline,
+        Kind::RecordsQuery,
+        Kind::RecordsReply,
+        query,
+    )
+    .await?;
+    let reply: RecordsReply = decode(&payload).map_err(|_| InspectError::Invalid)?;
+    if reply.version != VERSION {
+        return Err(InspectError::Invalid);
+    }
+    match reply.outcome {
+        InspectOutcome::Ok => Ok(reply),
+        other => Err(inspect_failure(other)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

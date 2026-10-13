@@ -7,6 +7,7 @@ import { Clusters } from './components/Clusters'
 import { Tenants } from './components/Tenants'
 import { Keys } from './components/Keys'
 import { Pricing } from './components/Pricing'
+import { Capture } from './components/Capture'
 import { loadConn, saveConn, scopedWritePath, type AdminConn } from './lib/api'
 
 const TABS = [
@@ -15,6 +16,7 @@ const TABS = [
   { id: 'tenants', label: 'Tenants' },
   { id: 'keys', label: 'Keys' },
   { id: 'pricing', label: 'Pricing' },
+  { id: 'capture', label: 'Capture' },
 ]
 
 export default function App() {
@@ -77,6 +79,7 @@ export default function App() {
         {tab === 'tenants' && <Tenants conn={conn} />}
         {tab === 'keys' && <Keys conn={conn} />}
         {tab === 'pricing' && <Pricing conn={conn} />}
+        {tab === 'capture' && <Capture conn={conn} />}
       </main>
     </div>
   )

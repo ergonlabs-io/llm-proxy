@@ -836,6 +836,69 @@ pub mod instruments {
         buckets: None,
     };
 
+    // Rust note: a declarative macro stamps out the eight near-identical
+    // attribute-less gauge definitions below; each expands to a `pub const`.
+    macro_rules! spool_gauge {
+        ($const_name:ident, $name:literal, $unit:literal, $doc:literal) => {
+            #[doc = $doc]
+            pub const $const_name: Instrument = Instrument {
+                name: $name,
+                kind: InstrumentKind::UpDownCounter,
+                unit: $unit,
+                attribute_keys: &[],
+                buckets: None,
+            };
+        };
+    }
+    spool_gauge!(
+        CAPTURE_SPOOL_RETAINED,
+        "llmproxy_capture_spool_retained_records",
+        "{record}",
+        "Records the capture agent's spool currently retains, as last polled."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_PENDING,
+        "llmproxy_capture_spool_pending_records",
+        "{record}",
+        "Durable spool records not yet acknowledged downstream, as last polled."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_DISK_BYTES,
+        "llmproxy_capture_spool_disk_bytes",
+        "By",
+        "Disk bytes the capture agent's spool uses, as last polled."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_MAX_DISK_BYTES,
+        "llmproxy_capture_spool_max_disk_bytes",
+        "By",
+        "Configured disk ceiling of the capture agent's spool."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_QUARANTINE_BYTES,
+        "llmproxy_capture_spool_quarantine_bytes",
+        "By",
+        "Bytes the capture agent's spool has quarantined, as last polled."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_DURABLE_THROUGH,
+        "llmproxy_capture_spool_durable_through_sequence",
+        "1",
+        "Highest sequence the capture agent's spool has made durable."
+    );
+    spool_gauge!(
+        CAPTURE_SPOOL_POISONED,
+        "llmproxy_capture_spool_poisoned",
+        "1",
+        "1 when the capture agent's spool reports itself poisoned, else 0."
+    );
+    spool_gauge!(
+        CAPTURE_AGENT_REACHABLE,
+        "llmproxy_capture_agent_reachable",
+        "1",
+        "1 when the last poll of the capture agent succeeded, else 0."
+    );
+
     /// Records successfully delivered by the collector thread: append-write in
     /// legacy mode, authenticated durable-local receipt in agent mode.
     pub const METADATA_WRITTEN: Instrument = Instrument {
@@ -910,6 +973,69 @@ pub fn record_tenant_credential_request(
         ],
     );
     registry.incr(worker, handle, 1);
+}
+
+/// Gauges mirroring the capture agent's spool, set by one periodic poller
+/// (never the request path). The registry only offers deltas, so `publish`
+/// remembers the last values it set and applies the difference; the mutex is
+/// uncontended because only the poller calls it.
+///
+/// Unreachable choice: `publish(None)` sets only
+/// `llmproxy_capture_agent_reachable` to 0 and keeps the last spool values.
+/// Zeroing them would read as "spool empty and healthy" during an outage;
+/// stale values plus `reachable 0` say "unknown since the last good poll".
+/// Before the first successful poll every gauge is 0, including reachable.
+pub struct CaptureSpoolStats {
+    registry: Arc<Registry>,
+    gauges: [Handle; 8],
+    last: Mutex<[u64; 8]>,
+}
+
+impl CaptureSpoolStats {
+    pub fn resolve(control: &StatsControl) -> Self {
+        Self {
+            registry: control.registry(),
+            gauges: [
+                &instruments::CAPTURE_SPOOL_RETAINED,
+                &instruments::CAPTURE_SPOOL_PENDING,
+                &instruments::CAPTURE_SPOOL_DISK_BYTES,
+                &instruments::CAPTURE_SPOOL_MAX_DISK_BYTES,
+                &instruments::CAPTURE_SPOOL_QUARANTINE_BYTES,
+                &instruments::CAPTURE_SPOOL_DURABLE_THROUGH,
+                &instruments::CAPTURE_SPOOL_POISONED,
+                &instruments::CAPTURE_AGENT_REACHABLE,
+            ]
+            .map(|instrument| control.resolve(instrument, &[])),
+            last: Mutex::new([0; 8]),
+        }
+    }
+
+    /// `Some` is a successful poll; `None` means the agent was unreachable.
+    pub fn publish(&self, snapshot: Option<&proxy_capture_protocol::SpoolSnapshot>) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = *last;
+        match snapshot {
+            Some(s) => {
+                next = [
+                    s.retained_records,
+                    s.pending_records,
+                    s.disk_bytes,
+                    s.max_disk_bytes,
+                    s.quarantine_bytes,
+                    s.durable_through_sequence,
+                    u64::from(s.poisoned),
+                    1,
+                ];
+            }
+            None => next[7] = 0,
+        }
+        for ((handle, old), new) in self.gauges.iter().zip(last.iter()).zip(next.iter()) {
+            // Wrapping difference as i64: `add` applies it back as u64 wrapping.
+            self.registry
+                .add(WorkerId(0), *handle, new.wrapping_sub(*old) as i64);
+        }
+        *last = next;
+    }
 }
 
 /// Pre-resolved operational signals for the best-effort request-record
@@ -2393,6 +2519,66 @@ impl StatsControl {
 mod tests {
     use super::*;
     use std::thread;
+
+    // ---- capture spool gauges ------------------------------------------
+
+    fn spool_snapshot(retained: u64, poisoned: bool) -> proxy_capture_protocol::SpoolSnapshot {
+        proxy_capture_protocol::SpoolSnapshot {
+            node_id: "node".into(),
+            next_sequence: 10,
+            durable_through_sequence: 9,
+            acknowledged_through_sequence: 4,
+            pending_records: 5,
+            retained_records: retained,
+            database_bytes: 1,
+            disk_bytes: 4096,
+            max_disk_bytes: 8192,
+            quarantine_bytes: 7,
+            poisoned,
+            durable_total: 9,
+            rejected_total: 0,
+            failures_total: 0,
+        }
+    }
+
+    #[test]
+    fn capture_spool_publish_sets_absolute_values_and_keeps_them_when_unreachable() {
+        let control = StatsControl::new(1);
+        let stats = CaptureSpoolStats::resolve(&control);
+        let registry = control.registry();
+        let value =
+            |instrument: &'static Instrument| registry.value(control.resolve(instrument, &[]));
+
+        stats.publish(Some(&spool_snapshot(8, false)));
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 8);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_PENDING), 5);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_DISK_BYTES), 4096);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_MAX_DISK_BYTES), 8192);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_QUARANTINE_BYTES), 7);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_DURABLE_THROUGH), 9);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 0);
+        assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1);
+
+        // A decrease, a flag flip, and a repeat must all land as absolutes.
+        stats.publish(Some(&spool_snapshot(3, true)));
+        stats.publish(Some(&spool_snapshot(3, true)));
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 1);
+
+        stats.publish(None);
+        assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 0);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 1);
+
+        stats.publish(Some(&spool_snapshot(2, false)));
+        assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1);
+        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 2);
+
+        // `/stats` omits names Envoy never had; the scrape is the operator surface.
+        let scrape = prometheus_render::render(&registry);
+        assert!(scrape.contains("envoy_llmproxy_capture_spool_retained_records 2"));
+        assert!(scrape.contains("envoy_llmproxy_capture_agent_reachable 1"));
+    }
 
     // ---- 1: resolve identity -------------------------------------------
 
