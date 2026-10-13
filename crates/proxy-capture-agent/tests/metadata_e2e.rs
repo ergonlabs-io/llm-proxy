@@ -17,9 +17,9 @@ use proxy_observability::{
 use std::{
     io,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -117,26 +117,61 @@ impl Fixture {
     }
 
     async fn connect(&self) -> UnixStream {
-        let mut stream = timeout(WAIT, UnixStream::connect(self.root.join("agent.sock")))
+        let stream = timeout(WAIT, UnixStream::connect(self.root.join("agent.sock")))
             .await
             .unwrap()
             .unwrap();
-        send(
-            &mut stream,
-            Kind::Hello,
-            &encode(&Hello {
-                version: VERSION,
-                producer_id: "producer".into(),
-            })
-            .unwrap(),
-        )
-        .await;
-        let frame = frame(&mut stream).await.unwrap();
-        assert_eq!(frame.kind, Kind::Welcome);
-        let welcome: Welcome = decode(&frame.payload).unwrap();
-        assert_eq!(welcome.version, VERSION);
-        assert_eq!(welcome.node_id, "node");
-        stream
+        handshake(stream).await
+    }
+}
+
+async fn handshake(mut stream: UnixStream) -> UnixStream {
+    send(
+        &mut stream,
+        Kind::Hello,
+        &encode(&Hello {
+            version: VERSION,
+            producer_id: "producer".into(),
+        })
+        .unwrap(),
+    )
+    .await;
+    let frame = frame(&mut stream).await.unwrap();
+    assert_eq!(frame.kind, Kind::Welcome);
+    let welcome: Welcome = decode(&frame.payload).unwrap();
+    assert_eq!(welcome.version, VERSION);
+    assert_eq!(welcome.node_id, "node");
+    stream
+}
+
+/// Connects to an agent running as a child process, retrying until its listener
+/// is up. The socket file appears at `bind(2)`, but the agent only starts
+/// accepting at the separate `listen(2)` that follows, so the file existing does
+/// not mean the agent is ready: a connect in that gap is refused, and a loaded
+/// machine can stretch the gap to milliseconds. Bounded by a deadline, and fails
+/// early if the child exits.
+async fn connect_when_listening(socket: &Path, child: &mut ChildGuard) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match UnixStream::connect(socket).await {
+            Ok(stream) => return stream,
+            // Not bound yet (no file), or bound but not yet listening (refused).
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => panic!("cannot connect to the agent: {error}"),
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "agent exited before listening"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "agent was not listening before the deadline"
+        );
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -894,15 +929,8 @@ bounded_test!(
                     .spawn()
                     .unwrap(),
             );
-            poll(|| {
-                assert!(
-                    child.0.try_wait().unwrap().is_none(),
-                    "agent exited before binding"
-                );
-                fixture.root.join("agent.sock").exists()
-            })
-            .await;
-            let mut stream = fixture.connect().await;
+            let socket = fixture.root.join("agent.sock");
+            let mut stream = handshake(connect_when_listening(&socket, &mut child).await).await;
             let payload = encode(&record("process-event")).unwrap();
             assert_eq!(
                 receipt(&mut stream, &payload).await.outcome,
