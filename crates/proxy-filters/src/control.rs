@@ -299,6 +299,20 @@ pub struct FlushToken<'a> {
 /// counter store sized for a bounded set of live windows becomes an unbounded
 /// event log the moment history lands in it, with a retention question, a
 /// cardinality question, and a privacy question nobody scoped.
+///
+/// # Policy calls and spend calls must not queue behind each other
+///
+/// The policy poller calls [`Self::policy_generation`] and [`Self::load`] (the
+/// whole policy state in one call) and the admin API calls the tier-2 writes.
+/// The spend flusher calls [`Self::add_spend`] once per bucket in sequence,
+/// plus [`Self::last_flush_seq`], and bind-time prefetch calls
+/// [`Self::load_spend`]. A store that funnels both groups through one shared
+/// resource (a connection, a lock) lets each delay the other: a long flush
+/// delays a revocation pickup, a large load delays reconciliation. ADR-0006
+/// §4 keeps the two on separate intervals for the same reason, and a store
+/// with such a resource gives the spend group its own, as
+/// [`crate::control_redis::RedisControlPlaneStore`] does with a connection per
+/// group.
 pub trait ControlPlaneStore: Send + Sync {
     /// The snapshot-build read: everything a rebuild needs, in one call.
     fn load(&self) -> Result<StoredControlPlane, StoreError>;
@@ -2490,6 +2504,10 @@ impl ControlPlane {
     /// restart-resume -- wired to nothing, and a monthly ceiling would reset
     /// to zero on every process restart: a budget an operator could escape by
     /// bouncing the proxy. See `spend_limit_filter`'s module doc.
+    ///
+    /// Sharing the store does not make the flusher and the policy poller share
+    /// a bottleneck: see [`ControlPlaneStore`]'s "Policy calls and spend calls
+    /// must not queue behind each other".
     pub fn store(&self) -> Arc<dyn ControlPlaneStore> {
         Arc::clone(&self.store)
     }

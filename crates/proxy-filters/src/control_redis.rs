@@ -23,7 +23,9 @@
 //! depends on `redis` with its default (sync) transport and no
 //! `tokio-comp`/`aio` feature -- see the workspace `Cargo.toml`'s `redis`
 //! entry. Threading an async runtime through a trait that has none would buy
-//! nothing for a connection nothing on the hot path ever holds.
+//! nothing for a connection nothing on the hot path ever holds. There are
+//! two of them, one per [`Lane`], so those two callers never queue behind each
+//! other; see [`RedisControlPlaneStore`].
 //!
 //! # Key layout
 //!
@@ -54,6 +56,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use redis::{Client, Connection, Script};
 
@@ -70,6 +73,31 @@ use crate::spend::{PeriodKey, TenantBudget};
 /// Namespace prefix used when a caller does not supply one -- see
 /// [`RedisControlPlaneStore::open`].
 const DEFAULT_NAMESPACE: &str = "llmproxy";
+
+/// How long a connect, a read, or a write may block, on either [`Lane`]. A
+/// store that cannot answer within this fails the one call and reconnects on
+/// the next, rather than holding its lane indefinitely.
+const IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Which of the store's two connections a call runs on. Every trait method
+/// names one, so a slow call can only ever queue behind calls of its own kind.
+///
+/// Rust note: a closed `enum` rather than, say, a `HashMap` of connections
+/// keyed by a string: the set of lanes is fixed, so a `match` over it (in
+/// [`RedisControlPlaneStore::with_connection`]) is checked by the compiler to
+/// give every lane a connection, and a typo at a call site cannot compile.
+#[derive(Clone, Copy, Debug)]
+enum Lane {
+    /// Tier 2 (ADR-0006 §1): the generation poll, `load`, and every admin
+    /// write. A revoked key reaches this replica through a call on this lane,
+    /// so nothing slow may be allowed to queue ahead of it.
+    Control,
+    /// Tier 3: spend reconciliation. `add_spend` (one script call per bucket,
+    /// in sequence), the `last_flush_seq` that seeds it, the `load_spend`
+    /// reads that fill buckets at bind time, and the operator's
+    /// `overwrite_spend`.
+    Spend,
+}
 
 /// [`ControlPlaneStore::add_spend`]'s Lua script, verbatim from ADR-0006
 /// §2's worked example.
@@ -257,20 +285,48 @@ fn unescape_component(escaped: &str) -> Option<String> {
 /// stamp, both of which this store's [`Self::add_spend`] and
 /// [`Self::policy_generation`] exist to serve.
 ///
-/// # One connection, `std::sync::Mutex`-guarded, reconnected on failure
+/// # Two connections (one per [`Lane`]), `std::sync::Mutex`-guarded, reconnected on failure
 ///
 /// Rust note: the same interior-mutability shape `InMemoryControlPlaneStore`
 /// uses (`&self` writes, a `Mutex` inside) -- but for a different reason.
 /// There, the mutex guards actual mutable state; here it only ever guards
-/// ONE `redis::Connection`, because a sync `redis-rs` `Connection` is not
-/// safe to share across threads on its own (nothing stops two threads from
-/// interleaving their bytes on the same socket). Every store method borrows
-/// the connection for exactly the duration of its own round trip and never
-/// holds the lock across a call into another method -- see
+/// ONE `redis::Connection` per lane, because a sync `redis-rs` `Connection`
+/// is not safe to share across threads on its own (nothing stops two threads
+/// from interleaving their bytes on the same socket). Every store method
+/// borrows its lane's connection for exactly the duration of its own round
+/// trip and never holds the lock across a call into another method -- see
 /// [`Self::with_connection`].
+///
+/// # Why two: policy calls and spend calls must not queue behind each other
+///
+/// The policy poller (`policy_generation`, `load`, and the admin writes) and
+/// the spend flusher (`add_spend`, once per bucket, in sequence) share this
+/// one store, and their calls differ by orders of magnitude in how long they
+/// hold a connection. On a single connection each had to wait its turn behind
+/// the other: a revocation pickup behind a long flush, a reconciliation
+/// behind a `load` that reads the whole policy state in one `MULTI`/`EXEC`,
+/// and, when Redis was slow, either one behind a full [`IO_TIMEOUT`] per
+/// call. ADR-0006 §4 keeps the policy poll and spend reconciliation on
+/// separate intervals because they answer different questions and one must
+/// not set the other's pace; separate connections give them the same
+/// independence at the I/O level.
+///
+/// A Redis that stops answering still stalls both lanes, since both talk to
+/// it. What a lane buys is that a slow or long CALL on one cannot delay calls
+/// on the other, and that an error on one (which drops that lane's
+/// connection, see [`Self::with_connection`]) leaves the other's connection
+/// alone. The cost is that a replica holds up to two Redis connections.
 pub struct RedisControlPlaneStore {
     client: Client,
-    conn: Mutex<Option<Connection>>,
+    /// The [`Lane::Control`] connection, opened on first use.
+    control_conn: Mutex<Option<Connection>>,
+    /// The [`Lane::Spend`] connection, opened on first use.
+    spend_conn: Mutex<Option<Connection>>,
+    /// Connect, read, and write timeout of both lanes: [`IO_TIMEOUT`] in
+    /// production. A field rather than the constant read in place so the
+    /// lane tests can hold a call in flight far longer than that without
+    /// racing the timeout.
+    io_timeout: Duration,
     namespace: String,
     add_spend_script: Script,
     revoke_key_script: Script,
@@ -301,7 +357,9 @@ impl RedisControlPlaneStore {
         let client = Client::open(url).map_err(store_err)?;
         Ok(RedisControlPlaneStore {
             client,
-            conn: Mutex::new(None),
+            control_conn: Mutex::new(None),
+            spend_conn: Mutex::new(None),
+            io_timeout: IO_TIMEOUT,
             namespace: namespace.into(),
             add_spend_script: Script::new(ADD_SPEND_LUA),
             revoke_key_script: Script::new(REVOKE_KEY_LUA),
@@ -310,10 +368,11 @@ impl RedisControlPlaneStore {
         })
     }
 
-    /// Runs `f` against a live connection, opening one first if none is
-    /// currently held, and drops the connection on ANY error `f` returns so
-    /// the NEXT call reopens fresh rather than retrying a socket that may
-    /// already be dead.
+    /// Runs `f` against `lane`'s live connection, opening one first if that
+    /// lane holds none, and drops the connection on ANY error `f` returns so
+    /// the NEXT call on that lane reopens fresh rather than retrying a socket
+    /// that may already be dead. The other lane's connection is never touched:
+    /// it has its own lock and its own reconnect state.
     ///
     /// # Why "any error", not just ones that look like a dead socket
     ///
@@ -330,14 +389,18 @@ impl RedisControlPlaneStore {
     /// the actual cause".
     fn with_connection<T>(
         &self,
+        lane: Lane,
         f: impl FnOnce(&mut Connection) -> redis::RedisResult<T>,
     ) -> Result<T, StoreError> {
-        let mut guard = self
-            .conn
+        let slot = match lane {
+            Lane::Control => &self.control_conn,
+            Lane::Spend => &self.spend_conn,
+        };
+        let mut guard = slot
             .lock()
             .expect("redis control-plane store connection mutex poisoned");
         if guard.is_none() {
-            let timeout = std::time::Duration::from_secs(1);
+            let timeout = self.io_timeout;
             let conn = self
                 .client
                 .get_connection_with_timeout(timeout)
@@ -436,17 +499,18 @@ impl RedisControlPlaneStore {
     }
 }
 
-/// The four replies [`RedisControlPlaneStore::load`]'s single pipeline comes
+/// The five replies [`RedisControlPlaneStore::load`]'s single pipeline comes
 /// back with, in the order the commands were queued: the tenant set, then
-/// the keys, policies and budgets hashes as raw `encode_json` bytes.
+/// the keys, policies, budgets and tenant credentials hashes as raw
+/// `encode_json` bytes.
 ///
 /// Rust note: this annotation is not decoration. `redis`'s `query` is
 /// generic over `FromRedisValue`, and a pipeline's reply decodes into a
 /// TUPLE -- so the element types are what tells inference to read reply 1
-/// as a `Vec<String>` and replies 2-4 as maps, and there is no other
+/// as a `Vec<String>` and replies 2-5 as maps, and there is no other
 /// expression in `load` to infer them from. Written inline it is also
 /// exactly the shape clippy's `type_complexity` lint exists to catch, hence
-/// the alias rather than a four-line type ascription at the binding.
+/// the alias rather than a multi-line type ascription at the binding.
 type LoadReply = (
     Vec<String>,
     HashMap<String, Vec<u8>>,
@@ -456,12 +520,26 @@ type LoadReply = (
 );
 
 impl ControlPlaneStore for RedisControlPlaneStore {
-    /// One pipeline: `SMEMBERS tenants`, `HGETALL keys`, `HGETALL policies`,
-    /// `HGETALL budgets` -- run inside `MULTI`/`EXEC` (`.atomic()`) so a
-    /// rebuild sees one consistent point-in-time snapshot, the same property
-    /// `RedbControlPlaneStore::load`'s single read transaction gives for
-    /// free.
+    /// One pipeline: `SMEMBERS tenants`, then `HGETALL` of keys, policies,
+    /// budgets and tenant credentials -- run inside `MULTI`/`EXEC`
+    /// (`.atomic()`) so a rebuild sees one consistent point-in-time snapshot,
+    /// the same property `RedbControlPlaneStore::load`'s single read
+    /// transaction gives for free. Runs on [`Lane::Control`].
+    ///
+    /// # The log line
+    ///
+    /// One `info` per successful load, because this call reads the WHOLE
+    /// policy state, so its cost grows with the state and nothing else made
+    /// that visible. `fetch_ms` is the time to get the replies off the wire,
+    /// including any wait for the control connection (an admin write queued
+    /// ahead of the load shows up there); `duration_ms` adds decoding the
+    /// rows. The counts are per kind of row, and `payload_bytes` is the
+    /// combined length of the field names, set members and values read,
+    /// without the protocol framing. The line carries counts and lengths
+    /// ONLY: the rows hold key digests and sealed tenant credentials, which
+    /// must never reach a log (AGENTS.md "Fail-open controls").
     fn load(&self) -> Result<StoredControlPlane, StoreError> {
+        let started = Instant::now();
         let tenants_key = self.tenants_key();
         let keys_key = self.keys_key();
         let policies_key = self.policies_key();
@@ -470,7 +548,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let credentials_key = self.tenant_credentials_key();
 
         let (tenants_raw, keys_raw, policies_raw, budgets_raw, credentials_raw): LoadReply =
-            self.with_connection(|conn| {
+            self.with_connection(Lane::Control, |conn| {
                 redis::pipe()
                     .atomic()
                     .cmd("SMEMBERS")
@@ -485,6 +563,26 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     .arg(&credentials_key)
                     .query(conn)
             })?;
+        let fetched = started.elapsed();
+
+        // Sized before the decode loops below consume the maps.
+        let hash_bytes = |hash: &HashMap<String, Vec<u8>>| -> usize {
+            hash.iter()
+                .map(|(field, value)| field.len() + value.len())
+                .sum()
+        };
+        let payload_bytes = tenants_raw.iter().map(String::len).sum::<usize>()
+            + hash_bytes(&keys_raw)
+            + hash_bytes(&policies_raw)
+            + hash_bytes(&budgets_raw)
+            + hash_bytes(&credentials_raw);
+        let (n_tenants, n_keys, n_policies, n_budgets, n_credentials) = (
+            tenants_raw.len(),
+            keys_raw.len(),
+            policies_raw.len(),
+            budgets_raw.len(),
+            credentials_raw.len(),
+        );
 
         let tenants = tenants_raw.into_iter().map(TenantId::new).collect();
 
@@ -528,6 +626,18 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             tenant_credentials.push(decode_tenant_credential_row(&tenant, &provider, &bytes)?);
         }
 
+        tracing::info!(
+            duration_ms = started.elapsed().as_millis() as u64,
+            fetch_ms = fetched.as_millis() as u64,
+            tenants = n_tenants,
+            keys = n_keys,
+            policies = n_policies,
+            budgets = n_budgets,
+            tenant_credentials = n_credentials,
+            payload_bytes,
+            "loaded control-plane state from redis"
+        );
+
         Ok(StoredControlPlane {
             tenants,
             keys,
@@ -539,15 +649,16 @@ impl ControlPlaneStore for RedisControlPlaneStore {
 
     fn policy_generation(&self) -> Result<u64, StoreError> {
         let key = self.generation_key();
-        let value: Option<u64> =
-            self.with_connection(|conn| redis::cmd("GET").arg(&key).query(conn))?;
+        let value: Option<u64> = self.with_connection(Lane::Control, |conn| {
+            redis::cmd("GET").arg(&key).query(conn)
+        })?;
         Ok(value.unwrap_or(0))
     }
 
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
         let tenants_key = self.tenants_key();
         let generation_key = self.generation_key();
-        self.with_connection(|conn| {
+        self.with_connection(Lane::Control, |conn| {
             redis::pipe()
                 .atomic()
                 .cmd("SADD")
@@ -567,7 +678,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         // tenant row is the existing, deliberate behaviour. Credential rows
         // go in the same script (see [`DELETE_TENANT_LUA`]).
         let prefix = format!("{}|", escape_component(tenant.as_str()));
-        self.with_connection(|conn| {
+        self.with_connection(Lane::Control, |conn| {
             self.delete_tenant_script
                 .key(self.tenants_key())
                 .key(self.policies_key())
@@ -592,7 +703,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let value = encode_json(&EncodedTenantCredentialRow::from(rec));
         // No tenant-existence check, same as redb. HSET is last-writer-wins,
         // which is the required create-or-replace.
-        self.with_connection(|conn| {
+        self.with_connection(Lane::Control, |conn| {
             redis::pipe()
                 .atomic()
                 .cmd("HSET")
@@ -613,7 +724,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         provider: &str,
     ) -> Result<(), StoreError> {
         let field = Self::credential_field(tenant.as_str(), provider);
-        let removed: i64 = self.with_connection(|conn| {
+        let removed: i64 = self.with_connection(Lane::Control, |conn| {
             self.delete_tenant_credential_script
                 .key(self.tenant_credentials_key())
                 .key(self.generation_key())
@@ -634,7 +745,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             tenant: rec.tenant.as_str().into(),
             revoked: rec.revoked,
         };
-        let result: i64 = self.with_connection(|conn| {
+        let result: i64 = self.with_connection(Lane::Control, |conn| {
             Script::new(PUT_KEY_LUA)
                 .key(self.keys_key())
                 .key(self.generation_key())
@@ -660,7 +771,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError> {
         let keys_key = self.keys_key();
         let generation_key = self.generation_key();
-        let found: i64 = self.with_connection(|conn| {
+        let found: i64 = self.with_connection(Lane::Control, |conn| {
             self.revoke_key_script
                 .key(&keys_key)
                 .key(&generation_key)
@@ -679,7 +790,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let generation_key = self.generation_key();
         let encoded: EncodedModelAccess = access.into();
         let bytes = encode_json(&encoded);
-        self.with_connection(|conn| {
+        self.with_connection(Lane::Control, |conn| {
             redis::pipe()
                 .atomic()
                 .cmd("HSET")
@@ -705,7 +816,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             Some(budget) => {
                 let encoded: EncodedTenantBudget = budget.into();
                 let bytes = encode_json(&encoded);
-                self.with_connection(|conn| {
+                self.with_connection(Lane::Control, |conn| {
                     redis::pipe()
                         .atomic()
                         .cmd("HSET")
@@ -719,7 +830,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                         .query::<()>(conn)
                 })
             }
-            None => self.with_connection(|conn| {
+            None => self.with_connection(Lane::Control, |conn| {
                 redis::pipe()
                     .atomic()
                     .cmd("HDEL")
@@ -747,7 +858,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     ) -> Result<u64, StoreError> {
         let spend_key = self.spend_key(stat_prefix, tenant.as_str(), period.as_str());
         let seq_key = self.seq_key(stat_prefix, tenant.as_str(), period.as_str());
-        self.with_connection(|conn| {
+        self.with_connection(Lane::Spend, |conn| {
             self.add_spend_script
                 .key(&spend_key)
                 .key(&seq_key)
@@ -769,7 +880,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         total_micros: u64,
     ) -> Result<(), StoreError> {
         let spend_key = self.spend_key(stat_prefix, tenant.as_str(), period.as_str());
-        self.with_connection(|conn| {
+        self.with_connection(Lane::Spend, |conn| {
             redis::cmd("SET")
                 .arg(&spend_key)
                 .arg(total_micros)
@@ -785,8 +896,9 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         node_id: &str,
     ) -> Result<u64, StoreError> {
         let seq_key = self.seq_key(stat_prefix, tenant.as_str(), period.as_str());
-        let value: Option<u64> =
-            self.with_connection(|conn| redis::cmd("HGET").arg(&seq_key).arg(node_id).query(conn))?;
+        let value: Option<u64> = self.with_connection(Lane::Spend, |conn| {
+            redis::cmd("HGET").arg(&seq_key).arg(node_id).query(conn)
+        })?;
         Ok(value.unwrap_or(0))
     }
 
@@ -797,11 +909,17 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         period: &PeriodKey,
     ) -> Result<u64, StoreError> {
         let spend_key = self.spend_key(stat_prefix, tenant.as_str(), period.as_str());
-        let value: Option<u64> =
-            self.with_connection(|conn| redis::cmd("GET").arg(&spend_key).query(conn))?;
+        let value: Option<u64> = self.with_connection(Lane::Spend, |conn| {
+            redis::cmd("GET").arg(&spend_key).query(conn)
+        })?;
         Ok(value.unwrap_or(0))
     }
 }
+
+// Tests that run in every `make tq`, against an in-process fake Redis; the
+// `#[ignore]`d tests in `tests` below need a real one.
+#[cfg(test)]
+mod fake_redis_tests;
 
 #[cfg(test)]
 mod tests {
