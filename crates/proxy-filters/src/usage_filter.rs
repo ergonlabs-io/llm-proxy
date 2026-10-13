@@ -433,9 +433,19 @@ impl PricingRegistry {
     }
 
     /// `PUT /pricing`: validates `json`, then publishes it. With a store the
-    /// card is written first and installed here only if the write succeeded,
-    /// so this replica never prices with a card the store lacks. Without one it
-    /// is installed in this process only.
+    /// card is written first, and a refused write installs nothing, so this
+    /// replica never prices with a card the store lacks. Without a store the
+    /// card is installed in this process only.
+    ///
+    /// With a store this does not install `card` itself. `link` registered
+    /// this registry as a watcher whenever `control_plane` is set, and
+    /// `ControlPlane::put_rate_card` delivers the written card and then the
+    /// store's current card to that watcher. A second replica can write
+    /// between this put and that read-back; installing the local card
+    /// afterwards would overwrite the store's card here, and later polls would
+    /// not notice because the watcher already delivered it. The watcher's
+    /// delivery is therefore authoritative, and `note` says so when it shows
+    /// a different card than the one written.
     pub fn publish_json(&self, json: &str) -> Result<Published, PublishError> {
         let card = parse_card_json(json).map_err(|e| PublishError::Invalid(e.to_string()))?;
         check_effective_from(&card, SystemTime::now(), Duration::ZERO)
@@ -449,6 +459,7 @@ impl PricingRegistry {
             .expect("pricing config lock poisoned")
             .control_plane
             .clone();
+        let has_store = store.is_some();
         let (persisted, note) = match store {
             Some(store) => {
                 let row = StoredRateCard {
@@ -459,7 +470,18 @@ impl PricingRegistry {
                 store
                     .put_rate_card(&row)
                     .map_err(|e| PublishError::Store(e.to_string()))?;
-                if store.store_is_durable() {
+                if self
+                    .snapshot()
+                    .is_some_and(|c| c.list.version().to_string() != version)
+                {
+                    // Another replica's write landed between our put and the
+                    // read-back, so the store's card is what is active here.
+                    (
+                        store.store_is_durable(),
+                        "written, but a concurrent publish to the same store superseded it; \
+                         this replica now serves the store's card",
+                    )
+                } else if store.store_is_durable() {
                     (
                         true,
                         "stored in the control-plane store; replicas that share it install it on \
@@ -477,7 +499,9 @@ impl PricingRegistry {
                 "applied to this process only; a restart loads the configured rate card",
             ),
         };
-        self.install(card);
+        if !has_store {
+            self.install(card);
+        }
         Ok(Published {
             rate_card_version: version,
             persisted,

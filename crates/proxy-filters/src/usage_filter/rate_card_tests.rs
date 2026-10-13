@@ -605,3 +605,157 @@ fn dollar_enforcement_agrees_with_graduated_pricing_of_cache_tokens() {
         Some(980)
     );
 }
+
+// --- concurrent publish ----------------------------------------------------
+
+/// Delegates to a shared store, but right after the first rate card write it
+/// performs another replica's write of `rival`, which is the interleaving
+/// `ControlPlane::put_rate_card` cannot rule out: B writes after A's put and
+/// before A's read-back.
+struct RivalWritesAfterFirstPut {
+    inner: SharedMemoryStore,
+    rival: StoredRateCard,
+    pending: std::sync::atomic::AtomicBool,
+}
+
+// Rust note: the trait has no default for most methods, so a wrapper must
+// forward every one; only `put_rate_card` adds behaviour.
+impl ControlPlaneStore for RivalWritesAfterFirstPut {
+    fn load(&self) -> Result<crate::control::StoredControlPlane, crate::control::StoreError> {
+        self.inner.load()
+    }
+    fn policy_generation(&self) -> Result<u64, crate::control::StoreError> {
+        self.inner.policy_generation()
+    }
+    fn create_tenant(&self, t: &crate::auth::TenantId) -> Result<(), crate::control::StoreError> {
+        self.inner.create_tenant(t)
+    }
+    fn delete_tenant(&self, t: &crate::auth::TenantId) -> Result<(), crate::control::StoreError> {
+        self.inner.delete_tenant(t)
+    }
+    fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), crate::control::StoreError> {
+        self.inner.put_key(rec)
+    }
+    fn revoke_key(&self, k: &crate::auth::KeyId) -> Result<(), crate::control::StoreError> {
+        self.inner.revoke_key(k)
+    }
+    fn set_policy(
+        &self,
+        t: &crate::auth::TenantId,
+        a: &crate::model_authz::ModelAccess,
+    ) -> Result<(), crate::control::StoreError> {
+        self.inner.set_policy(t, a)
+    }
+    fn set_budget(
+        &self,
+        t: &crate::auth::TenantId,
+        b: Option<&crate::spend::TenantBudget>,
+    ) -> Result<(), crate::control::StoreError> {
+        self.inner.set_budget(t, b)
+    }
+    fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), crate::control::StoreError> {
+        self.inner.put_rate_card(card)?;
+        if self
+            .pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner.put_rate_card(&self.rival)?;
+        }
+        Ok(())
+    }
+    fn put_rate_card_if_absent(
+        &self,
+        card: &StoredRateCard,
+    ) -> Result<bool, crate::control::StoreError> {
+        self.inner.put_rate_card_if_absent(card)
+    }
+    fn is_durable(&self) -> bool {
+        true
+    }
+    fn add_spend(
+        &self,
+        s: &str,
+        t: &crate::auth::TenantId,
+        p: &crate::spend::PeriodKey,
+        d: u64,
+        token: crate::control::FlushToken<'_>,
+    ) -> Result<u64, crate::control::StoreError> {
+        self.inner.add_spend(s, t, p, d, token)
+    }
+    fn overwrite_spend(
+        &self,
+        s: &str,
+        t: &crate::auth::TenantId,
+        p: &crate::spend::PeriodKey,
+        total: u64,
+    ) -> Result<(), crate::control::StoreError> {
+        self.inner.overwrite_spend(s, t, p, total)
+    }
+    fn last_flush_seq(
+        &self,
+        s: &str,
+        t: &crate::auth::TenantId,
+        p: &crate::spend::PeriodKey,
+        node: &str,
+    ) -> Result<u64, crate::control::StoreError> {
+        self.inner.last_flush_seq(s, t, p, node)
+    }
+    fn load_spend(
+        &self,
+        s: &str,
+        t: &crate::auth::TenantId,
+        p: &crate::spend::PeriodKey,
+    ) -> Result<u64, crate::control::StoreError> {
+        self.inner.load_spend(s, t, p)
+    }
+}
+
+/// Replica B writes between A's put and A's read-back. The store holds B, so
+/// A must serve B: installing A's own card after the put would leave it on a
+/// card the store no longer has, with every later poll skipping it.
+#[test]
+fn a_concurrent_publish_from_another_replica_wins_on_the_publishing_replica() {
+    let (store, _) = SharedMemoryStore::new();
+    let card_b = context(&card_json("card-b", 20));
+    let wrapper = RivalWritesAfterFirstPut {
+        inner: store.handle(),
+        rival: StoredRateCard {
+            chain: CHAIN.into(),
+            version: card_b.list.version().to_string(),
+            card_json: card_b.to_wire_json(),
+        },
+        pending: std::sync::atomic::AtomicBool::new(true),
+    };
+    let cp_a = Arc::new(
+        ControlPlane::new(
+            Box::new(wrapper),
+            HmacSecret::new(b"rate-card-test-secret"),
+            KeySet::new(),
+        )
+        .expect("an in-memory store boots"),
+    );
+    let cp_b = control_plane(&store);
+    let (a, b) = (registry(), registry());
+    apply(&a, None, Some(&cp_a)).unwrap();
+    apply(&b, None, Some(&cp_b)).unwrap();
+
+    let published = a.publish_json(&card_json("card-a", 10)).unwrap();
+
+    let want_b = card_b.list.version().to_string();
+    assert_eq!(
+        published.rate_card_version,
+        version_of(&card_json("card-a", 10))
+    );
+    assert!(
+        published.note.contains("superseded"),
+        "the response says the write did not stay: {}",
+        published.note
+    );
+    assert_eq!(active(&a), Some(want_b.clone()), "the store's card wins");
+    assert_ne!(active(&a), Some(published.rate_card_version));
+
+    cp_a.poll_once().unwrap();
+    cp_b.poll_once().unwrap();
+    assert_eq!(active(&a), Some(want_b.clone()));
+    assert_eq!(active(&b), Some(want_b));
+}
