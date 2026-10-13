@@ -62,3 +62,6 @@ admin-ui/dist/
 
 # Python bytecode from running scripts/*.py (check-deps, check-citations, ...).
 __pycache__/
+
+# macOS Finder metadata
+.DS_Store
