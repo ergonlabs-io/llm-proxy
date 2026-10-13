@@ -30,10 +30,35 @@ struct Row {
     bucket: Bucket,
 }
 
+/// Borrowed twin of [`Checkpoint`], used only to WRITE. A save serialises the
+/// rows it was handed instead of cloning each bucket a second time, which
+/// would make "the flush copies the map once" false in spirit: the copy under
+/// the request-path mutex would be followed by another on the flusher thread.
+///
+/// Field names and order match `Checkpoint`, which is what `open` reads back;
+/// every test below that saves and reopens pins that they stay in step.
+#[derive(Serialize)]
+struct CheckpointRef<'a> {
+    version: u32,
+    stat_prefix: &'a str,
+    node_id: &'a str,
+    rows: Vec<RowRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct RowRef<'a> {
+    subject: &'a str,
+    period: &'a str,
+    bucket: &'a Bucket,
+}
+
 pub(super) struct Journal {
     db: Database,
     stat_prefix: String,
     node_id: String,
+    /// Durable commits since open, so a test can pin "one per flush tick".
+    #[cfg(test)]
+    commits: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     fail_writes: std::sync::atomic::AtomicBool,
 }
@@ -52,6 +77,8 @@ impl Journal {
             db,
             stat_prefix: stat_prefix.into(),
             node_id: node_id.into(),
+            #[cfg(test)]
+            commits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_writes: std::sync::atomic::AtomicBool::new(false),
         };
@@ -107,16 +134,16 @@ impl Journal {
                 "test: journal commit failed".into(),
             ));
         }
-        let checkpoint = Checkpoint {
+        let checkpoint = CheckpointRef {
             version: 1,
-            stat_prefix: self.stat_prefix.clone(),
-            node_id: self.node_id.clone(),
+            stat_prefix: &self.stat_prefix,
+            node_id: &self.node_id,
             rows: buckets
                 .iter()
-                .map(|((subject, period), bucket)| Row {
-                    subject: subject.as_str().into(),
-                    period: period.as_str().into(),
-                    bucket: bucket.clone(),
+                .map(|((subject, period), bucket)| RowRef {
+                    subject: subject.as_str(),
+                    period: period.as_str(),
+                    bucket,
                 })
                 .collect(),
         };
@@ -127,7 +154,37 @@ impl Journal {
             .map_err(store_err)?
             .insert("checkpoint", bytes.as_slice())
             .map_err(store_err)?;
-        txn.commit().map_err(store_err)
+        txn.commit().map_err(store_err)?;
+        #[cfg(test)]
+        self.commits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// What the last commit holds, read back through a fresh read
+    /// transaction: the on-disk truth, not the in-memory map it was built
+    /// from. Going through `Checkpoint` also proves what `save` wrote is
+    /// something `open` can read.
+    #[cfg(test)]
+    pub(super) fn saved_rows(&self) -> Vec<(TenantId, PeriodKey, Bucket)> {
+        let txn = self.db.begin_read().expect("journal read transaction");
+        let table = txn.open_table(CHECKPOINT).expect("journal table");
+        let Some(raw) = table.get("checkpoint").expect("journal read") else {
+            return Vec::new();
+        };
+        let checkpoint: Checkpoint =
+            serde_json::from_slice(raw.value()).expect("journal checkpoint decodes");
+        checkpoint
+            .rows
+            .into_iter()
+            .map(|row| {
+                (
+                    TenantId::new(row.subject),
+                    PeriodKey(row.period),
+                    row.bucket,
+                )
+            })
+            .collect()
     }
 }
 
@@ -398,6 +455,213 @@ mod tests {
         txn.commit().unwrap();
         drop(journal);
         assert!(Journal::open(&path, "chain", "node").is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    // --- the shape of a flush tick, journal side --------------------------
+
+    use crate::spend::tests::ProbeStore;
+    use crate::spend::{Charge, MicroUsd};
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+
+    fn journaled_accumulator(store: &Arc<ProbeStore>, path: &Path) -> SpendAccumulator {
+        SpendAccumulator::new(
+            "chain".into(),
+            Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+            "node".into(),
+        )
+        .with_recovery_journal(path)
+        .unwrap()
+    }
+
+    fn charge(accumulator: &SpendAccumulator, subject: &TenantId, micros: u64) {
+        accumulator.record_now(
+            subject,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(micros)),
+            None,
+            None,
+        );
+    }
+
+    /// A tick used to copy the whole map three times under the request-path
+    /// mutex and commit the journal three times, each commit an fsync. It
+    /// takes one copy and makes one commit, and the first tick (which seeds
+    /// sequences for new buckets) costs the same as a steady one.
+    ///
+    /// Mutation: add a second `self.checkpoint(...)` after the deliveries in
+    /// `Inner::flush_now`.
+    #[test]
+    fn a_flush_tick_copies_the_buckets_once_and_commits_the_journal_once() {
+        let path = path();
+        let store = ProbeStore::new();
+        {
+            let accumulator = journaled_accumulator(&store, &path);
+            for name in ["a", "b", "c"] {
+                charge(&accumulator, &TenantId::new(name), 5);
+            }
+            let journal = accumulator.inner.journal.as_ref().unwrap();
+            // Opening replays through one tick already; count from here.
+            let copies_before = accumulator.inner.snapshots_taken.load(Relaxed);
+            let commits_before = journal.commits.load(Relaxed);
+
+            accumulator.flush_now().unwrap();
+            assert_eq!(
+                accumulator.inner.snapshots_taken.load(Relaxed) - copies_before,
+                1,
+                "a tick copies the map once, under the mutex, for the journal"
+            );
+            assert_eq!(journal.commits.load(Relaxed) - commits_before, 1);
+
+            accumulator.flush_now().unwrap();
+            assert_eq!(
+                accumulator.inner.snapshots_taken.load(Relaxed) - copies_before,
+                2
+            );
+            assert_eq!(
+                journal.commits.load(Relaxed) - commits_before,
+                2,
+                "one durable commit per tick, however many buckets it carries"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The checkpoint now predates the deliveries, so the pending gauges are
+    /// reduced by what the store confirms; otherwise a healthy replica would
+    /// read "pending" for a whole interval after it had already delivered.
+    /// Walk one row through an outage and a recovery, including a delivery
+    /// that confirms only part of what the journal holds.
+    ///
+    /// Mutation: drop the gauge subtraction at the end of `flush_now`.
+    #[test]
+    fn the_pending_gauges_count_journaled_spend_the_store_has_not_confirmed() {
+        let path = path();
+        let store = ProbeStore::new();
+        let subject = TenantId::new("subject");
+        let period = Period::Daily.key_for_now();
+        {
+            let accumulator = journaled_accumulator(&store, &path);
+            let gauges = |accumulator: &SpendAccumulator| {
+                let report = accumulator.report(&subject, &period);
+                (
+                    report.journal_pending_micro_usd,
+                    report.journal_pending_rows,
+                )
+            };
+
+            charge(&accumulator, &subject, 9);
+            store.fail_add_spend.store(true, SeqCst);
+            accumulator.flush_now().unwrap_err();
+            assert_eq!(gauges(&accumulator), (9, 1), "journaled and undelivered");
+
+            // More spend accrues while the store is down; the frozen
+            // attempt still carries only the 9.
+            charge(&accumulator, &subject, 4);
+            accumulator.flush_now().unwrap_err();
+            assert_eq!(gauges(&accumulator), (13, 1));
+
+            // The store returns. The retry delivers the frozen 9 and the
+            // 4 recorded since is still journaled and still unconfirmed.
+            store.fail_add_spend.store(false, SeqCst);
+            accumulator.flush_now().unwrap();
+            assert_eq!(
+                gauges(&accumulator),
+                (4, 1),
+                "a partial confirmation must leave the remainder counted, and its row"
+            );
+
+            accumulator.flush_now().unwrap();
+            assert_eq!(gauges(&accumulator), (0, 0));
+            assert_eq!(
+                store.inner.load_spend("chain", &subject, &period).unwrap(),
+                13
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The commit moved from before the sequence seeding to after it, so the
+    /// property the old first commit existed for is pinned on its own: spend
+    /// accrued while the store cannot even answer a sequence read is still on
+    /// disk when the tick gives up.
+    ///
+    /// Mutation: return early from `flush_now` when a sequence read fails,
+    /// before the checkpoint.
+    #[test]
+    fn spend_accrued_while_the_store_cannot_seed_a_sequence_is_still_journaled() {
+        let path = path();
+        let store = ProbeStore::new();
+        let subject = TenantId::new("subject");
+        let period = Period::Daily.key_for_now();
+        {
+            let accumulator = journaled_accumulator(&store, &path);
+            charge(&accumulator, &subject, 9);
+            store.fail_last_flush_seq.store(true, SeqCst);
+
+            accumulator.flush_now().unwrap_err();
+
+            let rows = accumulator.inner.journal.as_ref().unwrap().saved_rows();
+            assert_eq!(rows.len(), 1);
+            let (_, _, bucket) = &rows[0];
+            assert_eq!(bucket.pending_delta_micros, 9);
+            assert!(bucket.attempt.is_none(), "no sequence, so nothing frozen");
+            assert_eq!(store.add_spend_calls(), 0, "and nothing was sent");
+
+            store.fail_last_flush_seq.store(false, SeqCst);
+            accumulator.flush_now().unwrap();
+            assert_eq!(
+                store.inner.load_spend("chain", &subject, &period).unwrap(),
+                9
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The one placement of the commit that is load-bearing: the frozen
+    /// `(seq, delta)` is on disk when the store is first called. If a delivery
+    /// could land before its attempt was durable, a crash would let the
+    /// restarted replica freeze a fresh attempt for charges the store already
+    /// holds, and charge them twice.
+    ///
+    /// Mutation: move the checkpoint in `flush_now` to after the delivery
+    /// loop.
+    #[test]
+    fn the_frozen_attempt_is_durable_before_the_first_remote_write() {
+        let path = path();
+        let store = ProbeStore::new();
+        let subject = TenantId::new("subject");
+        let accumulator = Arc::new(journaled_accumulator(&store, &path));
+        charge(&accumulator, &subject, 9);
+        let durable_at_send = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            // A `Weak`, not an `Arc`: the store would otherwise own the
+            // accumulator that owns the store, and neither would ever drop.
+            let accumulator = Arc::downgrade(&accumulator);
+            let durable_at_send = Arc::clone(&durable_at_send);
+            *store.before_add_spend.lock().unwrap() = Some(Box::new(move || {
+                let accumulator = accumulator.upgrade().expect("flush runs inside the test");
+                let rows = accumulator.inner.journal.as_ref().unwrap().saved_rows();
+                durable_at_send.lock().unwrap().push(
+                    rows.iter()
+                        .map(|(_, _, bucket)| bucket.attempt.map(|a| (a.seq, a.delta)))
+                        .collect::<Vec<_>>(),
+                );
+            }));
+        }
+
+        accumulator.flush_now().unwrap();
+
+        assert_eq!(
+            *durable_at_send.lock().unwrap(),
+            vec![vec![Some((1, 9))]],
+            "at the moment the store was called, the journal already held attempt 1 / 9"
+        );
+        // The hook borrows the accumulator weakly; remove it before `Drop`'s
+        // final flush calls the store again with no accumulator to upgrade.
+        *store.before_add_spend.lock().unwrap() = None;
+        drop(accumulator);
         std::fs::remove_file(path).unwrap();
     }
 }

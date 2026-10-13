@@ -779,6 +779,30 @@ struct Bucket {
     unpriced_pairs_truncated: bool,
 }
 
+impl Bucket {
+    /// Freezes the payload the next delivery of this row sends, returning it.
+    /// An attempt that is already frozen is returned unchanged: it may have
+    /// landed in the store with only its response lost, so it must be retried
+    /// byte for byte under its own sequence, and charges recorded since stay
+    /// in `pending_delta_micros` for the delivery after it.
+    fn freeze(&mut self, seq: u64) -> FlushAttempt {
+        *self.attempt.get_or_insert(FlushAttempt {
+            seq,
+            delta: self.pending_delta_micros,
+        })
+    }
+}
+
+/// One frozen delivery to the store: the sequence number it is sent under
+/// and the delta it carries. It is journaled before it is sent, and cleared
+/// only when the store confirms it.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FlushAttempt {
+    seq: u64,
+    delta: u64,
+}
+
 /// The state a [`SpendAccumulator`] and its flusher thread both need
 /// access to. Split out from `SpendAccumulator` itself so the thread can
 /// hold its own `Arc` clone of ONLY this, not of `SpendAccumulator` --
@@ -792,19 +816,20 @@ struct Bucket {
 /// the thread's clone of `Inner` never keeps `SpendAccumulator` itself
 /// alive, and dropping the last external `Arc<SpendAccumulator>` runs
 /// `Drop` immediately regardless of whether the thread is still running.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FlushAttempt {
-    seq: u64,
-    delta: u64,
-}
-
 struct Inner {
     flush_lock: Mutex<()>,
     journal: Option<recovery::Journal>,
     journal_checkpoint_millis: AtomicI64,
+    /// Spend the journal holds that the store has not yet confirmed: set from
+    /// each checkpoint, then reduced by what that same tick's deliveries
+    /// confirmed. See [`Inner::flush_now`] for why it is reduced and not
+    /// simply left at the checkpoint's value.
     journal_pending_micros: AtomicU64,
     journal_pending_rows: AtomicU64,
+    /// Counts the whole-map copies a flush takes for the journal, so a test
+    /// can pin "at most one per tick, none without a journal".
+    #[cfg(test)]
+    snapshots_taken: AtomicU64,
     memory_only_requests: std::sync::atomic::AtomicBool,
     stat_prefix: String,
     store: Arc<dyn ControlPlaneStore>,
@@ -904,6 +929,70 @@ impl Inner {
             })
     }
 
+    /// How long since the last flush in which EVERY bucket was written --
+    /// or since construction, if there has never been one. See
+    /// [`SpendAccumulator::reconciliation_age`], which is this method's
+    /// public face and carries the reasoning.
+    ///
+    /// Lives on `Inner` (not only on [`SpendAccumulator`]) because the
+    /// flusher thread holds an `Arc<Inner>` and nothing else -- see
+    /// [`Inner`]'s own doc for why it cannot hold the accumulator.
+    fn reconciliation_age(&self, now: DateTime<Utc>) -> Duration {
+        let since_millis = match self.last_flush_millis.load(Ordering::Relaxed) {
+            NEVER_FLUSHED => self.created_at_millis,
+            millis => millis,
+        };
+        let elapsed = now.timestamp_millis().saturating_sub(since_millis);
+        Duration::from_millis(u64::try_from(elapsed).unwrap_or(0))
+    }
+
+    /// Copies every bucket for a journal checkpoint, or returns `None` when
+    /// no journal is configured so the common configuration never pays for
+    /// the copy. This is the only place a flush clones the map, and a flush
+    /// calls it once. The copy is made under the buckets mutex because a
+    /// consistent view is the point: serialising and fsyncing it (the slow
+    /// part) then happens with the mutex released.
+    fn journal_snapshot(&self) -> Option<HashMap<(TenantId, PeriodKey), Bucket>> {
+        self.journal.as_ref()?;
+        #[cfg(test)]
+        self.snapshots_taken.fetch_add(1, Ordering::Relaxed);
+        Some(
+            self.buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned")
+                .clone(),
+        )
+    }
+
+    /// Commits `buckets` to the journal and publishes the checkpoint gauges
+    /// (`journal_pending_micros`, `journal_pending_rows`,
+    /// `journal_checkpoint_millis`) from the same rows, so the gauges
+    /// describe exactly what was made durable.
+    fn checkpoint(
+        &self,
+        journal: &recovery::Journal,
+        buckets: &HashMap<(TenantId, PeriodKey), Bucket>,
+    ) -> Result<(), StoreError> {
+        journal.save(buckets)?;
+        self.journal_pending_micros.store(
+            buckets.values().fold(0u64, |sum, row| {
+                sum.saturating_add(row.pending_delta_micros)
+            }),
+            Ordering::Relaxed,
+        );
+        self.journal_pending_rows.store(
+            buckets
+                .values()
+                .filter(|row| row.pending_delta_micros != 0)
+                .count() as u64,
+            Ordering::Relaxed,
+        );
+        // Published last, after a durable transaction; callers can gate a crash drill on it.
+        self.journal_checkpoint_millis
+            .store(Utc::now().timestamp_millis(), Ordering::Release);
+        Ok(())
+    }
+
     /// Flushes every in-memory bucket to the store as a DELTA, and adopts
     /// the total the store returns.
     ///
@@ -937,6 +1026,36 @@ impl Inner {
     /// is configured. Without it an outage backlog is volatile. Neither bound
     /// assumes a flush thread can make progress during a store or disk failure.
     ///
+    /// # What a tick does, and what it holds the request-path mutex for
+    ///
+    /// 1. One pass under the buckets mutex lists every bucket and freezes the
+    ///    ones whose sequence is already seeded. Nothing is copied but the
+    ///    keys.
+    /// 2. Buckets that have never flushed in this process seed their sequence
+    ///    from the store, one read each, with the mutex released.
+    /// 3. With a journal, ONE copy of the map is made and ONE durable commit
+    ///    freezes every `(seq, delta)` pair before any remote write. Without
+    ///    a journal there is no copy at all.
+    /// 4. Each frozen attempt is delivered, taking the mutex only for the
+    ///    instant it applies that bucket's result.
+    ///
+    /// The commit sits after the freeze and before the first delivery, which
+    /// is the only position that is load-bearing: if a delivery landed and
+    /// the process died before the attempt was durable, the restarted replica
+    /// would freeze a NEW attempt for charges the store already holds and
+    /// charge them twice. Nothing is written after the deliveries. The commit
+    /// at the start of the next tick records their results, and until then a
+    /// crash only replays attempts the store deduplicates. A commit that fails
+    /// stops the tick before any remote write, exactly as before.
+    ///
+    /// The checkpoint gauges are the one thing that would otherwise show that
+    /// missing second commit, because the commit predates the deliveries. So a
+    /// confirmed delivery also subtracts what it delivered from
+    /// `journal_pending_micros` and `journal_pending_rows`: they read "spend
+    /// the journal holds that the store has not confirmed", which is what a
+    /// restart would actually have to apply, and a healthy replica reads
+    /// zero straight after a tick instead of one interval later.
+    ///
     /// Best-effort across buckets: one tenant's write failing does not stop
     /// the rest, but the first failure is returned so the caller (the
     /// flusher thread's warning, or a test) can tell the flush was not fully
@@ -947,94 +1066,48 @@ impl Inner {
     /// or total failure must leave it exactly where it was: a report that
     /// claimed a flush just succeeded when it did not would be a durability
     /// lie.
-    /// How long since the last flush in which EVERY bucket was written --
-    /// or since construction, if there has never been one. See
-    /// [`SpendAccumulator::reconciliation_age`], which is this method's
-    /// public face and carries the reasoning.
-    ///
-    /// Lives on `Inner` (not only on [`SpendAccumulator`]) because the
-    /// flusher thread holds an `Arc<Inner>` and nothing else -- see
-    /// [`Inner`]'s own doc for why it cannot hold the accumulator.
-    fn reconciliation_age(&self, now: DateTime<Utc>) -> Duration {
-        let since_millis = match self.last_flush_millis.load(Ordering::Relaxed) {
-            NEVER_FLUSHED => self.created_at_millis,
-            millis => millis,
-        };
-        let elapsed = now.timestamp_millis().saturating_sub(since_millis);
-        Duration::from_millis(u64::try_from(elapsed).unwrap_or(0))
-    }
-
-    fn checkpoint(
-        &self,
-        buckets: &HashMap<(TenantId, PeriodKey), Bucket>,
-    ) -> Result<(), StoreError> {
-        if let Some(journal) = &self.journal {
-            journal.save(buckets)?;
-            self.journal_pending_micros.store(
-                buckets.values().fold(0u64, |sum, row| {
-                    sum.saturating_add(row.pending_delta_micros)
-                }),
-                Ordering::Relaxed,
-            );
-            self.journal_pending_rows.store(
-                buckets
-                    .values()
-                    .filter(|row| row.pending_delta_micros != 0)
-                    .count() as u64,
-                Ordering::Relaxed,
-            );
-            // Published last, after a durable transaction; callers can gate a crash drill on it.
-            self.journal_checkpoint_millis
-                .store(Utc::now().timestamp_millis(), Ordering::Release);
-        }
-        Ok(())
-    }
-
     fn flush_now(&self) -> Result<(), StoreError> {
         // Serialize deliveries, but never hold the request buckets lock across I/O.
         let _flush = self
             .flush_lock
             .lock()
             .expect("spend flusher mutex poisoned");
-        let snapshot = || {
-            self.buckets
-                .lock()
-                .expect("spend accumulator mutex poisoned")
-                .clone()
-        };
-        let initial = snapshot();
-        // Capture accumulated outage spend even when Redis cannot seed a sequence.
-        self.checkpoint(&initial)?;
         let mut first_err = None;
-        let mut attempts = Vec::new();
-        for (tenant, period_key) in initial.keys() {
-            let existing = self
+
+        // Step 1. Rust note: `iter_mut` over the map yields `(&key, &mut
+        // bucket)` pairs, so a bucket is read and frozen in the same visit
+        // with no second hash lookup. The keys are cloned because the guard
+        // must be dropped before any I/O, and a borrow into the map cannot
+        // outlive it.
+        let mut attempts: Vec<((TenantId, PeriodKey), FlushAttempt)> = Vec::new();
+        let mut unseeded: Vec<(TenantId, PeriodKey)> = Vec::new();
+        {
+            let mut buckets = self
                 .buckets
                 .lock()
-                .expect("spend accumulator mutex poisoned")
-                .get(&(tenant.clone(), period_key.clone()))
-                .expect("known bucket")
-                .next_seq;
-            let seq = match existing {
-                Some(u64::MAX) => {
-                    first_err.get_or_insert_with(|| {
-                        StoreError::Unavailable("spend flush sequence exhausted".into())
-                    });
-                    continue;
+                .expect("spend accumulator mutex poisoned");
+            for (key, bucket) in buckets.iter_mut() {
+                match bucket.next_seq {
+                    Some(u64::MAX) => {
+                        first_err.get_or_insert_with(sequence_exhausted);
+                    }
+                    Some(seq) => attempts.push((key.clone(), bucket.freeze(seq))),
+                    None => unseeded.push(key.clone()),
                 }
-                Some(seq) => seq,
-                None => match self.store.last_flush_seq(
-                    &self.stat_prefix,
-                    tenant,
-                    period_key,
-                    &self.node_id,
-                ) {
+            }
+        }
+
+        // Step 2.
+        for key in unseeded {
+            let seq =
+                match self
+                    .store
+                    .last_flush_seq(&self.stat_prefix, &key.0, &key.1, &self.node_id)
+                {
                     Ok(last) => match last.checked_add(1) {
                         Some(seq) => seq,
                         None => {
-                            first_err.get_or_insert_with(|| {
-                                StoreError::Unavailable("spend flush sequence exhausted".into())
-                            });
+                            first_err.get_or_insert_with(sequence_exhausted);
                             continue;
                         }
                     },
@@ -1042,29 +1115,39 @@ impl Inner {
                         first_err.get_or_insert(err);
                         continue;
                     }
-                },
-            };
+                };
             let mut buckets = self
                 .buckets
                 .lock()
                 .expect("spend accumulator mutex poisoned");
-            let bucket = buckets
-                .get_mut(&(tenant.clone(), period_key.clone()))
-                .expect("known bucket");
+            let bucket = buckets.get_mut(&key).expect("known bucket");
             bucket.next_seq = Some(seq);
-            let attempt = *bucket.attempt.get_or_insert(FlushAttempt {
-                seq,
-                delta: bucket.pending_delta_micros,
-            });
-            attempts.push((tenant.clone(), period_key.clone(), attempt));
+            let attempt = bucket.freeze(seq);
+            drop(buckets);
+            attempts.push((key, attempt));
         }
-        // Freeze all token/payload pairs in ONE durable transaction before Redis writes.
-        self.checkpoint(&snapshot())?;
-        for (tenant, period_key, attempt) in attempts {
+
+        // Step 3. A bucket whose seeding failed has no attempt but is still
+        // in the copy, so its accrued spend is journaled during an outage
+        // that stops the store answering even a sequence read.
+        let snapshot = match &self.journal {
+            Some(journal) => {
+                let rows = self
+                    .journal_snapshot()
+                    .expect("a configured journal always yields a snapshot");
+                self.checkpoint(journal, &rows)?;
+                Some(rows)
+            }
+            None => None,
+        };
+
+        // Step 4.
+        let (mut confirmed_micros, mut cleared_rows) = (0u64, 0u64);
+        for (key, attempt) in attempts {
             match self.store.add_spend(
                 &self.stat_prefix,
-                &tenant,
-                &period_key,
+                &key.0,
+                &key.1,
                 attempt.delta,
                 FlushToken {
                     node_id: &self.node_id,
@@ -1072,13 +1155,21 @@ impl Inner {
                 },
             ) {
                 Ok(total) => {
+                    if let Some(rows) = &snapshot {
+                        // What the journal holds for this row is its pending at
+                        // the copy, which is at least the attempt's delta.
+                        let journaled = rows.get(&key).map_or(0, |row| row.pending_delta_micros);
+                        confirmed_micros =
+                            confirmed_micros.saturating_add(attempt.delta.min(journaled));
+                        if attempt.delta > 0 && journaled <= attempt.delta {
+                            cleared_rows += 1;
+                        }
+                    }
                     let mut buckets = self
                         .buckets
                         .lock()
                         .expect("spend accumulator mutex poisoned");
-                    let bucket = buckets
-                        .get_mut(&(tenant, period_key))
-                        .expect("known bucket");
+                    let bucket = buckets.get_mut(&key).expect("known bucket");
                     bucket.base_micros = total;
                     bucket.pending_delta_micros =
                         bucket.pending_delta_micros.saturating_sub(attempt.delta);
@@ -1090,8 +1181,21 @@ impl Inner {
                 }
             }
         }
-        if let Err(err) = self.checkpoint(&snapshot()) {
-            first_err.get_or_insert(err);
+        if snapshot.is_some() {
+            // Only this thread writes the gauges (it holds `flush_lock`), so
+            // a load-then-store is not a lost update.
+            self.journal_pending_micros.store(
+                self.journal_pending_micros
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(confirmed_micros),
+                Ordering::Relaxed,
+            );
+            self.journal_pending_rows.store(
+                self.journal_pending_rows
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(cleared_rows),
+                Ordering::Relaxed,
+            );
         }
         match first_err {
             Some(err) => Err(err),
@@ -1102,6 +1206,13 @@ impl Inner {
             }
         }
     }
+}
+
+/// The error for a row whose flush sequence has run out of `u64`. Unreachable
+/// in practice, but a wrap would replay an accepted token and silently drop
+/// real spend, so it is an error, not an overflow.
+fn sequence_exhausted() -> StoreError {
+    StoreError::Unavailable("spend flush sequence exhausted".into())
 }
 
 /// The flusher thread's stop condition, plus the [`Condvar`] that lets it
@@ -1244,6 +1355,8 @@ impl SpendAccumulator {
                 journal_checkpoint_millis: AtomicI64::new(NEVER_FLUSHED),
                 journal_pending_micros: AtomicU64::new(0),
                 journal_pending_rows: AtomicU64::new(0),
+                #[cfg(test)]
+                snapshots_taken: AtomicU64::new(0),
                 memory_only_requests: std::sync::atomic::AtomicBool::new(false),
                 stat_prefix,
                 store,
@@ -3623,6 +3736,205 @@ mod tests {
             accumulator.reconciliation_policy(),
             ReconciliationPolicy::default(),
             "`new` is `with_reconciliation` at the default policy, not a second set of values"
+        );
+    }
+
+    // --- the shape of a flush tick ----------------------------------------
+    //
+    // These pin what a tick costs, not only what it delivers: how many times
+    // it copies the bucket map, how often it commits the journal, and which
+    // store calls it makes. A suite that only checked delivered totals would
+    // stay green if a tick quietly went back to three copies and three
+    // fsyncs.
+
+    /// A store double for the flush-shape tests. It delegates to an in-memory
+    /// store, counts the calls the flusher makes, fails on demand, and can run
+    /// a closure on either side of an `add_spend` so a test can interleave
+    /// something with a delivery that is genuinely in flight.
+    ///
+    /// `pub(super)` so `recovery.rs`'s journal tests drive the same double.
+    pub(super) struct ProbeStore {
+        pub(super) inner: InMemoryControlPlaneStore,
+        pub(super) add_spend_calls: std::sync::atomic::AtomicUsize,
+        pub(super) last_flush_seq_calls: std::sync::atomic::AtomicUsize,
+        pub(super) load_spend_calls: std::sync::atomic::AtomicUsize,
+        /// `add_spend` fails without applying anything.
+        pub(super) fail_add_spend: std::sync::atomic::AtomicBool,
+        /// `add_spend` applies its delta and THEN reports failure, once: the
+        /// write landed and the response did not.
+        pub(super) lose_next_response: std::sync::atomic::AtomicBool,
+        /// `last_flush_seq` fails: the store cannot even seed a sequence.
+        pub(super) fail_last_flush_seq: std::sync::atomic::AtomicBool,
+        /// Runs at the start of every `add_spend`, before it applies.
+        pub(super) before_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Runs after an `add_spend` has applied, before it returns.
+        pub(super) after_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl ProbeStore {
+        pub(super) fn new() -> Arc<Self> {
+            Arc::new(ProbeStore {
+                inner: InMemoryControlPlaneStore::default(),
+                add_spend_calls: Default::default(),
+                last_flush_seq_calls: Default::default(),
+                load_spend_calls: Default::default(),
+                fail_add_spend: Default::default(),
+                lose_next_response: Default::default(),
+                fail_last_flush_seq: Default::default(),
+                before_add_spend: Mutex::new(None),
+                after_add_spend: Mutex::new(None),
+            })
+        }
+
+        pub(super) fn add_spend_calls(&self) -> usize {
+            self.add_spend_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ControlPlaneStore for ProbeStore {
+        fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
+            self.inner.load()
+        }
+        fn policy_generation(&self) -> Result<u64, StoreError> {
+            self.inner.policy_generation()
+        }
+        fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+            self.inner.create_tenant(tenant)
+        }
+        fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+            self.inner.delete_tenant(tenant)
+        }
+        fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
+            self.inner.put_key(rec)
+        }
+        fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
+            self.inner.revoke_key(key_id)
+        }
+        fn set_policy(
+            &self,
+            tenant: &TenantId,
+            access: &crate::model_authz::ModelAccess,
+        ) -> Result<(), StoreError> {
+            self.inner.set_policy(tenant, access)
+        }
+        fn set_budget(
+            &self,
+            tenant: &TenantId,
+            budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_budget(tenant, budget)
+        }
+        fn add_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            delta_micros: u64,
+            token: FlushToken<'_>,
+        ) -> Result<u64, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.add_spend_calls.fetch_add(1, SeqCst);
+            if let Some(hook) = self.before_add_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.fail_add_spend.load(SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: add_spend refused".to_string(),
+                ));
+            }
+            let total = self
+                .inner
+                .add_spend(stat_prefix, tenant, period, delta_micros, token)?;
+            if let Some(hook) = self.after_add_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.lose_next_response.swap(false, SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: the write landed, the response did not".to_string(),
+                ));
+            }
+            Ok(total)
+        }
+        fn overwrite_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            total_micros: u64,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .overwrite_spend(stat_prefix, tenant, period, total_micros)
+        }
+        fn last_flush_seq(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            node_id: &str,
+        ) -> Result<u64, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.last_flush_seq_calls.fetch_add(1, SeqCst);
+            if self.fail_last_flush_seq.load(SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: last_flush_seq refused".to_string(),
+                ));
+            }
+            self.inner
+                .last_flush_seq(stat_prefix, tenant, period, node_id)
+        }
+        fn load_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+        ) -> Result<u64, StoreError> {
+            self.load_spend_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.load_spend(stat_prefix, tenant, period)
+        }
+    }
+
+    fn accumulator_over(store: &Arc<ProbeStore>) -> SpendAccumulator {
+        SpendAccumulator::new(
+            "test-chain".to_string(),
+            Arc::clone(store) as Arc<dyn ControlPlaneStore>,
+            Period::Daily,
+            "test-node".to_string(),
+        )
+    }
+
+    /// Without a journal there is nobody to hand a copy of the map to, so a
+    /// tick must not make one. This is the common configuration; paying
+    /// request-path-mutex time for a copy nothing reads is the waste the
+    /// flush used to commit three times per tick.
+    ///
+    /// Mutation: have `journal_snapshot` clone before it checks for a
+    /// journal.
+    #[test]
+    fn a_flush_tick_without_a_journal_copies_no_bucket() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        let now = dt(2026, 9, 3, 12, 0, 0);
+        for tenant in ["tenant-a", "tenant-b", "tenant-c"] {
+            record_micros(&accumulator, &TenantId::new(tenant), now, 1_000);
+        }
+
+        accumulator.flush_now().unwrap();
+        accumulator.flush_now().unwrap();
+
+        assert_eq!(
+            accumulator
+                .inner
+                .snapshots_taken
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no journal is configured, so no flush may copy the map"
+        );
+        assert_eq!(
+            store.add_spend_calls(),
+            6,
+            "and the tick still delivered: 3 buckets x 2 ticks, zero deltas included"
         );
     }
 }
