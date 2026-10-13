@@ -52,7 +52,7 @@ use proxy_filters::model_authz::{ModelAccess, ModelPattern};
 use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 use proxy_filters::tenant_credential_crypto::TenantSecret;
-use proxy_filters::usage_filter::PricingRegistry;
+use proxy_filters::usage_filter::{PricingRegistry, PublishError};
 use proxy_http::credential_probe::{
     CredentialProbeOutcome, CredentialProbeRequest, TenantCredentialProbe,
 };
@@ -119,7 +119,20 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
 /// body of unbounded size in memory -- a trivial DoS against a port that is,
 /// deliberately, reachable without a config file naming an operator's IP
 /// allowlist.
-const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
+pub(super) const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
+
+/// Body cap for `PUT /pricing` alone. A rate card is machine-generated and
+/// large: the shipped OpenRouter card (438 entries) is 142 KB as compact JSON,
+/// 268 KB with its source catalog, and 401 KB pretty-printed, which is what the
+/// admin UI's upload box and a hand-edited file send. The generic cap above
+/// rejected all of them. 4 MiB leaves about ten times the largest of those, so
+/// a catalog several times today's size still fits.
+///
+/// The cap stays finite for the reason the generic one exists: the bearer
+/// gate has already passed by the time the body is read, so only a token
+/// holder can make the server buffer this much, and the buffer is released
+/// when the request ends. Every other route keeps [`MAX_ADMIN_BODY_BYTES`].
+pub(super) const MAX_PRICING_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// What `/ready` should report, as decided by whoever injects the
 /// [`ReadinessProbe`] -- this crate never asks a `ClusterManager` itself
@@ -623,6 +636,18 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         return handle_lifecycle(action, runtime.lifecycle.as_deref(), req.uri().query());
     }
 
+    // `PUT /pricing` needs the chain's rate card registry, not a control
+    // plane: without `llmproxy.auth` it still works, for this process only,
+    // and says so. It also has its own body cap, so it leaves before the
+    // control-plane gate and the generic body read below.
+    if matches!(route, WriteRoute::Pricing | WriteRoute::ScopedPricing(_)) {
+        let body = match read_limited_body(req.into_body(), MAX_PRICING_BODY_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(resp) => return resp,
+        };
+        return handle_set_pricing(factory_state, route.stat_prefix(), &body);
+    }
+
     // Gate 3: does the control plane exist, and is it unambiguous which one
     // this write means?
     //
@@ -691,7 +716,7 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         }
     };
 
-    let body = match read_limited_body(req.into_body()).await {
+    let body = match read_limited_body(req.into_body(), MAX_ADMIN_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(resp) => return resp,
     };
@@ -751,11 +776,11 @@ async fn handle(req: Request<Incoming>, runtime: &AdminRuntime) -> Response<Full
         | WriteRoute::ScopedTenantCredentialDelete(_, id, provider) => {
             handle_delete_tenant_credential(&control_plane, id, provider)
         }
-        WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => {
-            handle_set_pricing(factory_state, stat_prefix_opt, &body)
-        }
         WriteRoute::HealthCheckFail | WriteRoute::HealthCheckOk | WriteRoute::DrainListeners => {
             unreachable!("lifecycle routes return before the control-plane gate")
+        }
+        WriteRoute::Pricing | WriteRoute::ScopedPricing(_) => {
+            unreachable!("pricing routes return before the control-plane gate")
         }
     }
 }
@@ -1158,15 +1183,24 @@ fn handle_set_pricing(
             "llmproxy.usage is not initialized on this chain",
         );
     };
-    match std::str::from_utf8(body)
-        .map_err(|e| e.to_string())
-        .and_then(|json| registry.replace_json(json).map_err(|e| e.to_string()))
-    {
-        Ok(version) => json(
+    let Ok(document) = std::str::from_utf8(body) else {
+        return text(StatusCode::BAD_REQUEST, "the rate card is not valid UTF-8");
+    };
+    match registry.publish_json(document) {
+        Ok(published) => json(
             StatusCode::OK,
-            &serde_json::json!({ "rate_card_version": version }),
+            &serde_json::json!({
+                "rate_card_version": published.rate_card_version,
+                "persisted": published.persisted,
+                "note": published.note,
+            }),
         ),
-        Err(error) => text(StatusCode::BAD_REQUEST, &error),
+        Err(PublishError::Invalid(error)) => text(StatusCode::BAD_REQUEST, &error),
+        // The store did not take the card, so nothing changed anywhere.
+        Err(PublishError::Store(error)) => text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("the rate card was not changed: the control-plane store refused it: {error}"),
+        ),
     }
 }
 
@@ -1249,8 +1283,8 @@ fn resolve_spend_state_by_name(
         .map(|shared| Arc::clone(shared.accumulator()))
 }
 
-/// Reads `body` up to [`MAX_ADMIN_BODY_BYTES`], returning the collected
-/// bytes or a ready-to-send 413.
+/// Reads `body` up to `cap` bytes ([`MAX_ADMIN_BODY_BYTES`] for every route
+/// but pricing), returning the collected bytes or a ready-to-send 413.
 ///
 /// Rust note: `http_body_util::Limited` wraps any `Body` and turns "read
 /// past the cap" into an error rather than continuing to buffer -- the
@@ -1264,8 +1298,8 @@ fn resolve_spend_state_by_name(
 // flags as "large" (a ready-to-send error response, by design) costs nothing
 // worth boxing for on a path this cold.
 #[allow(clippy::result_large_err)]
-async fn read_limited_body(body: Incoming) -> Result<Bytes, Response<Full<Bytes>>> {
-    match Limited::new(body, MAX_ADMIN_BODY_BYTES).collect().await {
+async fn read_limited_body(body: Incoming, cap: usize) -> Result<Bytes, Response<Full<Bytes>>> {
+    match Limited::new(body, cap).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(err) => {
             if err
@@ -1274,9 +1308,7 @@ async fn read_limited_body(body: Incoming) -> Result<Bytes, Response<Full<Bytes>
             {
                 Err(text(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    &format!(
-                        "request body exceeds the {MAX_ADMIN_BODY_BYTES}-byte admin write cap"
-                    ),
+                    &format!("request body exceeds the {cap}-byte cap for this endpoint"),
                 ))
             } else {
                 Err(text(

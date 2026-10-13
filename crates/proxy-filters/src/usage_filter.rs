@@ -22,9 +22,9 @@
 //! The old `DataSource` shape remains accepted for one release through
 //! [`LegacyUsageFilterFactory`].
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
 use http::HeaderMap;
@@ -41,28 +41,82 @@ use proxy_http::stream_info::GenAiSystem;
 use proxy_http::{LlmListCost, LlmTokenUsage};
 use serde::{Deserialize, Serialize};
 
+use crate::auth_filter;
+use crate::control::{ControlPlane, StoredRateCard};
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
 
 /// Canonical type URL for the owned usage configuration.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
 
-/// Shared live rate-card state. A request clones the current pricing context
-/// when its filter instance is created, so an admin update can never re-price
-/// a response already in flight.
+/// How far ahead of this process's clock a card read back from the store may
+/// be dated before it is refused. The writer already checked the date against
+/// its own clock, so without this a replica whose clock runs a few seconds
+/// behind the writer's would refuse a card dated "now" and stay on the old one
+/// until the next unrelated change. NTP-level skew is the case ADR-0006
+/// section 6 accepts; five minutes covers it with room to spare.
+const STORED_CARD_CLOCK_SKEW: Duration = Duration::from_secs(300);
+
+/// Shared live rate-card state for one filter chain. A request clones the
+/// current pricing context when its filter instance is created, so an admin
+/// update can never re-price a response already in flight.
+///
+/// # Where the card comes from
+///
+/// With a control-plane store on the chain (`llmproxy.auth`), the stored card
+/// is the source of truth (ADR-0006 section 1 puts price in tier 2). The
+/// configured card only seeds an empty store, a `PUT /pricing` writes the
+/// store, and the control plane's poll delivers other replicas' writes here.
+/// Without one, the configuration is the only durable source: a reload that
+/// changes the configured card installs it, and a `PUT` lasts until restart.
 pub struct PricingRegistry {
+    /// The chain's `stat_prefix`: the key its card is stored under.
+    chain: String,
+    /// The card requests are priced with. Read per request, so it stays a
+    /// plain lock around a clone; everything below is touched only when
+    /// configuration is applied or a card is published.
     current: RwLock<Option<PricingContext>>,
+    config: Mutex<ConfigState>,
+}
+
+#[derive(Default)]
+struct ConfigState {
+    /// What the last `apply_config` was given. `None` until a usage filter has
+    /// applied its configuration; `Some(None)` is "configured, with no card".
+    /// Remembering it is how a reload tells "the configuration changed" from
+    /// "the same configuration, built again by the next worker".
+    configured: Option<Option<PricingContext>>,
+    /// The chain's store, once linked.
+    control_plane: Option<Arc<ControlPlane>>,
+}
+
+/// What a `PUT /pricing` did, for the response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    pub rate_card_version: String,
+    /// Whether the card survives a restart of this process.
+    pub persisted: bool,
+    /// One sentence for the operator on where the card now lives.
+    pub note: &'static str,
+}
+
+/// Why a `PUT /pricing` did not publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    /// The document is not a usable rate card (the caller's fault).
+    Invalid(String),
+    /// The store refused or could not take the card. The card was not
+    /// installed anywhere, so this replica and the store still agree.
+    Store(String),
 }
 
 impl PricingRegistry {
-    fn new(initial: Option<PricingContext>) -> Self {
+    pub(crate) fn new(chain: impl Into<String>) -> Self {
         Self {
-            current: RwLock::new(initial),
+            chain: chain.into(),
+            current: RwLock::new(None),
+            config: Mutex::new(ConfigState::default()),
         }
-    }
-
-    pub(crate) fn new_for_spend() -> Self {
-        Self::new(None)
     }
 
     fn snapshot(&self) -> Option<PricingContext> {
@@ -76,25 +130,17 @@ impl PricingRegistry {
         self.snapshot()
     }
 
+    /// The chain's `stat_prefix`, which is also its key in the store.
+    pub fn chain(&self) -> &str {
+        &self.chain
+    }
+
     /// Capture one immutable, public JSON view of the active pricing state.
     /// Cloning the context while holding one read lock keeps the rate card,
     /// provider mapping, and source catalog on the same registry revision.
     pub fn json_view(&self) -> Option<PricingJsonView> {
         let pricing = self.snapshot()?;
         Some(PricingJsonView::from(pricing))
-    }
-
-    /// Seed a registry created by a preceding spend filter. Filter factories
-    /// are built in chain order, while spend enforcement must precede usage
-    /// extraction on the encode path.
-    pub(crate) fn install_if_empty(&self, initial: Option<PricingContext>) {
-        let mut current = self
-            .current
-            .write()
-            .expect("pricing registry lock poisoned");
-        if current.is_none() {
-            *current = initial;
-        }
     }
 
     /// Compute a dollar-enforcement charge from the current list card. Round
@@ -116,28 +162,373 @@ impl PricingRegistry {
         model: Option<&str>,
         usage: &TokenUsage,
     ) -> Option<u64> {
-        let pricing = pricing?;
-        let cluster = cluster?;
-        let model = model?;
-        let provider = pricing.providers.get(cluster)?;
-        pricing
+        pricing?
             .list
-            .list_cost_nanodollars(provider, model, usage)
+            .list_cost_for_cluster(cluster?, model?, usage)
             .map(|nano| nano.saturating_add(999) / 1000)
     }
 
-    /// Replace the card after validating the same wire shape used at startup.
-    pub fn replace_json(&self, json: &str) -> Result<String, ConfigError> {
-        let wire: PricingWire = serde_json::from_str(json)
-            .map_err(|e| invalid_config(format!("pricing update is invalid JSON: {e}")))?;
-        let parsed = parse_pricing(wire)?;
-        let version = parsed.list.version().as_str().to_string();
+    /// Why a request the rate card could not price was left unpriced, in words
+    /// an operator can act on. Runs only on the unpriced path.
+    pub(crate) fn explain_unpriced(
+        pricing: Option<&PricingContext>,
+        cluster: Option<&str>,
+        model: Option<&str>,
+    ) -> String {
+        let Some(pricing) = pricing else {
+            return "no rate card is installed on this chain".to_string();
+        };
+        let Some(cluster) = cluster else {
+            return "the request reached no upstream cluster".to_string();
+        };
+        let Some(model) = model else {
+            return "the request names no model".to_string();
+        };
+        let Some(provider) = pricing.list.provider_for(cluster) else {
+            return format!("the rate card's providers map does not name cluster `{cluster}`");
+        };
+        if pricing.list.lookup(provider, model).is_none() {
+            return format!(
+                "the rate card has no entry for provider type `{provider}` and this model"
+            );
+        }
+        "the rate card cannot price the cache tokens this request reported".to_string()
+    }
+
+    fn install(&self, card: PricingContext) {
         *self
             .current
             .write()
-            .expect("pricing registry lock poisoned") = Some(parsed);
-        Ok(version)
+            .expect("pricing registry lock poisoned") = Some(card);
     }
+
+    /// Applies one usage filter's configuration. Called by every worker's
+    /// `create`, so the first call is boot and the rest are either the same
+    /// configuration built again (no-ops) or a reload that changed it.
+    ///
+    /// `store` is the chain's control plane when the chain has `llmproxy.auth`.
+    /// `field_path` names the configuration field an error is reported at.
+    pub(crate) fn apply_config(
+        self: &Arc<Self>,
+        card: Option<PricingContext>,
+        store: Option<Arc<ControlPlane>>,
+        field_path: &str,
+    ) -> Result<(), ConfigError> {
+        let mut state = self.config.lock().expect("pricing config lock poisoned");
+        let first = state.configured.is_none();
+        let changed = first || state.configured.as_ref() != Some(&card);
+        if changed {
+            if let Some(card) = &card {
+                check_effective_from(card, SystemTime::now(), Duration::ZERO).map_err(
+                    |reason| ConfigError::InvalidValue {
+                        field_path: field_path.to_string(),
+                        reason,
+                    },
+                )?;
+            }
+        }
+        state.configured = Some(card);
+        let newly_linked = self.link(&mut state, store);
+        if changed || newly_linked {
+            self.reconcile(&state, first, field_path)?;
+        }
+        Ok(())
+    }
+
+    /// Links the chain's store after the fact. `llmproxy.auth` calls this when
+    /// the usage filter happened to be built first, so persistence does not
+    /// depend on the order filters are listed in.
+    pub(crate) fn attach_control_plane(
+        self: &Arc<Self>,
+        store: &Arc<ControlPlane>,
+        field_path: &str,
+    ) -> Result<(), ConfigError> {
+        let mut state = self.config.lock().expect("pricing config lock poisoned");
+        let newly_linked = self.link(&mut state, Some(Arc::clone(store)));
+        if newly_linked && state.configured.is_some() {
+            self.reconcile(&state, false, field_path)?;
+        }
+        Ok(())
+    }
+
+    /// Starts listening to the store for this chain. True if this call linked
+    /// it. The first delivery happens inside the call and installs the stored
+    /// card, if the store has one.
+    fn link(self: &Arc<Self>, state: &mut ConfigState, store: Option<Arc<ControlPlane>>) -> bool {
+        let Some(store) = store else {
+            return false;
+        };
+        if state.control_plane.is_some() {
+            return false;
+        }
+        // Rust note: the store's watch list holds this closure for as long as
+        // the store lives, so it captures a `Weak`. A strong `Arc` here would
+        // make the store keep the registry alive and the registry keep the
+        // store alive, and neither would ever be freed.
+        let weak = Arc::downgrade(self);
+        store.watch_rate_card(&self.chain, move |stored| {
+            if let Some(registry) = weak.upgrade() {
+                registry.install_stored(stored);
+            }
+        });
+        state.control_plane = Some(store);
+        true
+    }
+
+    /// Settles which card is in force after configuration was applied.
+    fn reconcile(
+        &self,
+        state: &ConfigState,
+        first: bool,
+        field_path: &str,
+    ) -> Result<(), ConfigError> {
+        let configured = state.configured.as_ref().and_then(Option::as_ref);
+        let Some(store) = &state.control_plane else {
+            // No store: the configuration is the only durable source, so a
+            // changed configuration replaces whatever is active.
+            self.install_from_config(configured, first);
+            return Ok(());
+        };
+        match store.rate_card(&self.chain) {
+            Some(stored) => {
+                // The store wins, at boot and on every reload: otherwise each
+                // restart would quietly undo a card an operator published.
+                let active = self.snapshot();
+                match (&active, configured) {
+                    (Some(active), Some(configured)) if active != configured => tracing::info!(
+                        chain = %self.chain,
+                        stored_version = %stored.version,
+                        configured_version = %configured.list.version(),
+                        "the configured pricing differs from the rate card in the control-plane \
+                         store; the stored card stays in force (publish with PUT /pricing to \
+                         replace it)"
+                    ),
+                    (None, Some(configured)) => {
+                        // The watcher refused the stored card and already said
+                        // why. Pricing nothing would turn every budgeted request
+                        // into a free one, so this process falls back to the
+                        // configured card and leaves the store alone.
+                        tracing::warn!(
+                            chain = %self.chain,
+                            "the stored rate card could not be installed; pricing with the \
+                             configured card in this process only"
+                        );
+                        self.install(configured.clone());
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                let Some(configured) = configured else {
+                    return Ok(());
+                };
+                let row = StoredRateCard {
+                    chain: self.chain.clone(),
+                    version: configured.list.version().to_string(),
+                    card_json: configured.to_wire_json(),
+                };
+                store
+                    .seed_rate_card(&row)
+                    .map_err(|error| ConfigError::InvalidValue {
+                        field_path: field_path.to_string(),
+                        reason: format!(
+                            "the configured rate card could not be seeded into the \
+                             control-plane store: {error}"
+                        ),
+                    })?;
+                // The store's watcher installed the seeded card, or the card a
+                // racing replica seeded first. Only a row this build cannot
+                // read leaves nothing installed.
+                if self.snapshot().is_none() {
+                    tracing::warn!(
+                        chain = %self.chain,
+                        "the control-plane store holds a rate card this build cannot read; \
+                         pricing with the configured card in this process only"
+                    );
+                    self.install(configured.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn install_from_config(&self, configured: Option<&PricingContext>, first: bool) {
+        match configured {
+            Some(card) => {
+                let previous = self.snapshot();
+                if previous.as_ref() != Some(card) {
+                    if !first {
+                        tracing::info!(
+                            chain = %self.chain,
+                            version = %card.list.version(),
+                            replaced_version = previous.as_ref().map(|p| p.list.version().to_string()),
+                            "the configured pricing changed; installing it as the rate card"
+                        );
+                    }
+                    self.install(card.clone());
+                }
+            }
+            None if !first => {
+                let mut current = self
+                    .current
+                    .write()
+                    .expect("pricing registry lock poisoned");
+                if current.take().is_some() {
+                    tracing::warn!(
+                        chain = %self.chain,
+                        "pricing was removed from the configuration; the rate card is cleared \
+                         and requests are unpriced until one is published"
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Installs a card read from the store. A card that cannot be used is
+    /// refused loudly and the previous card stays: the store's watch hands a
+    /// card over once, so this logs once per bad card.
+    fn install_stored(&self, stored: &StoredRateCard) {
+        let card = match parse_card_json(&stored.card_json) {
+            Ok(card) => card,
+            Err(error) => {
+                tracing::warn!(
+                    chain = %self.chain,
+                    stored_version = %stored.version,
+                    %error,
+                    "the rate card in the control-plane store is not usable; keeping the \
+                     current rate card"
+                );
+                return;
+            }
+        };
+        if let Err(reason) = check_effective_from(&card, SystemTime::now(), STORED_CARD_CLOCK_SKEW)
+        {
+            tracing::warn!(
+                chain = %self.chain,
+                stored_version = %stored.version,
+                %reason,
+                "the rate card in the control-plane store is not usable; keeping the current \
+                 rate card"
+            );
+            return;
+        }
+        let mut current = self
+            .current
+            .write()
+            .expect("pricing registry lock poisoned");
+        if current.as_ref() == Some(&card) {
+            return;
+        }
+        let previous = current.as_ref().map(|p| p.list.version().to_string());
+        let version = card.list.version().to_string();
+        *current = Some(card);
+        drop(current);
+        tracing::info!(
+            chain = %self.chain,
+            version = %version,
+            previous_version = previous,
+            "installed the rate card from the control-plane store"
+        );
+    }
+
+    /// `PUT /pricing`: validates `json`, then publishes it. With a store the
+    /// card is written first and installed here only if the write succeeded,
+    /// so this replica never prices with a card the store lacks. Without one it
+    /// is installed in this process only.
+    pub fn publish_json(&self, json: &str) -> Result<Published, PublishError> {
+        let card = parse_card_json(json).map_err(|e| PublishError::Invalid(e.to_string()))?;
+        check_effective_from(&card, SystemTime::now(), Duration::ZERO)
+            .map_err(PublishError::Invalid)?;
+        let version = card.list.version().to_string();
+        // Clone the handle out: the store call below must not run under this
+        // lock, because it calls back into this registry's watcher.
+        let store = self
+            .config
+            .lock()
+            .expect("pricing config lock poisoned")
+            .control_plane
+            .clone();
+        let (persisted, note) = match store {
+            Some(store) => {
+                let row = StoredRateCard {
+                    chain: self.chain.clone(),
+                    version: version.clone(),
+                    card_json: card.to_wire_json(),
+                };
+                store
+                    .put_rate_card(&row)
+                    .map_err(|e| PublishError::Store(e.to_string()))?;
+                if store.store_is_durable() {
+                    (
+                        true,
+                        "stored in the control-plane store; replicas that share it install it on \
+                         their next policy poll",
+                    )
+                } else {
+                    (
+                        false,
+                        "held in this process's in-memory control-plane store; a restart loses it",
+                    )
+                }
+            }
+            None => (
+                false,
+                "applied to this process only; a restart loads the configured rate card",
+            ),
+        };
+        self.install(card);
+        Ok(Published {
+            rate_card_version: version,
+            persisted,
+            note,
+        })
+    }
+}
+
+/// Refuses a card dated after `now + tolerance`. `effective_from` is
+/// informational: a card applies from the moment it is installed, and nothing
+/// selects a card by time. Accepting a future date would therefore price
+/// requests early while the document says otherwise, so it is an error.
+fn check_effective_from(
+    card: &PricingContext,
+    now: SystemTime,
+    tolerance: Duration,
+) -> Result<(), String> {
+    let effective = card.list.effective_from();
+    match effective.duration_since(now + tolerance) {
+        Ok(ahead) if !ahead.is_zero() => {
+            let when: chrono::DateTime<chrono::Utc> = effective.into();
+            Err(format!(
+                "price_list.effective_from {} is in the future; a rate card applies from the \
+                 moment it is installed and is not scheduled, so date it now or earlier",
+                when.to_rfc3339()
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The chain's registry, created empty on first use. `llmproxy.spend_limit`
+/// is built before this filter and reads the same registry, so both go through
+/// here and agree on the key.
+pub(crate) fn registry_for_chain(
+    ctx: &FactoryContext,
+) -> Result<Arc<PricingRegistry>, ConfigError> {
+    ctx.shared
+        .get_or_try_init(&ctx.scope, &ctx.stat_prefix, TYPE_URL, || {
+            Ok(Arc::new(PricingRegistry::new(ctx.stat_prefix.clone()))
+                as Arc<dyn std::any::Any + Send + Sync>)
+        })?
+        .downcast::<PricingRegistry>()
+        .map_err(|_| invalid_config("pricing registry type collision"))
+}
+
+/// This chain's control plane, if `llmproxy.auth` has been built for it yet.
+fn control_plane_of(ctx: &FactoryContext) -> Option<Arc<ControlPlane>> {
+    ctx.get(auth_filter::TYPE_URL)?
+        .downcast::<ControlPlane>()
+        .ok()
 }
 
 /// Borrowed type URL accepted for one release after the move to an owned, versioned message.
@@ -189,17 +580,12 @@ impl HttpFilterFactory for UsageFilterFactory {
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
         let parsed = parse_owned_factory_config(config)?;
-        let initial = parsed.pricing.clone();
-        let registry =
-            ctx.shared
-                .get_or_try_init(&ctx.scope, &ctx.stat_prefix, TYPE_URL, || {
-                    Ok(Arc::new(PricingRegistry::new(initial.clone()))
-                        as Arc<dyn std::any::Any + Send + Sync>)
-                })?;
-        let registry = registry
-            .downcast::<PricingRegistry>()
-            .map_err(|_| invalid_config("pricing registry type collision"))?;
-        registry.install_if_empty(initial);
+        let registry = registry_for_chain(ctx)?;
+        registry.apply_config(
+            parsed.pricing,
+            control_plane_of(ctx),
+            "typed_config.pricing_json",
+        )?;
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
             registry,
@@ -299,20 +685,44 @@ struct PricingWire {
     catalog: Option<serde_json::Value>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PricingContext {
+    /// The prices and the dialled-cluster -> provider-type map that decides
+    /// which entry applies, versioned together.
     list: Arc<PriceList>,
-    /// Actual dialled cluster -> configured provider type.  A route can point
-    /// at an aggregate/fallback, so this must not be inferred from dialect.
-    providers: HashMap<String, String>,
     catalog: Option<Arc<serde_json::Value>>,
+}
+
+impl PricingContext {
+    /// The wire document `PUT /pricing` accepts, rendered from the parsed
+    /// card: what the store keeps. Rendering it from the parsed card, not
+    /// keeping the caller's text, means every source (configuration, a `PUT`,
+    /// the legacy carrier) stores the same compact shape, and anything stored
+    /// parses back to this exact card.
+    fn to_wire_json(&self) -> String {
+        let view = PricingJsonView::from(self.clone());
+        serde_json::json!({
+            "price_list": view.price_list,
+            "providers": view.providers,
+            "catalog": view.catalog,
+        })
+        .to_string()
+    }
+}
+
+/// Parses a pricing document in the wire shape used by configuration, `PUT
+/// /pricing`, and the store.
+fn parse_card_json(json: &str) -> Result<PricingContext, ConfigError> {
+    let wire: PricingWire = serde_json::from_str(json)
+        .map_err(|e| invalid_config(format!("pricing update is invalid JSON: {e}")))?;
+    parse_pricing(wire)
 }
 
 #[derive(Serialize)]
 pub struct PricingJsonView {
     rate_card_version: String,
     price_list: PriceListJsonView,
-    providers: HashMap<String, String>,
+    providers: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     catalog: Option<serde_json::Value>,
 }
@@ -381,7 +791,7 @@ impl From<PricingContext> for PricingJsonView {
                 effective_from: effective_from.to_rfc3339(),
                 entries,
             },
-            providers: pricing.providers,
+            providers: pricing.list.cluster_providers().clone(),
             catalog: pricing.catalog.map(|catalog| (*catalog).clone()),
         }
     }
@@ -469,8 +879,8 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
             wire.price_list.version.as_deref(),
             effective_from,
             entries,
+            wire.providers.into_iter().collect(),
         )),
-        providers: wire.providers,
         catalog: wire.catalog.map(Arc::new),
     })
 }
@@ -552,13 +962,23 @@ impl HttpFilterFactory for LegacyUsageFilterFactory {
     fn create(
         &self,
         config: &DynamicMessage,
-        _ctx: &FactoryContext,
+        ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
         warn_legacy_config();
         let parsed = parse_legacy_factory_config(config)?;
+        // The same registry the current carrier uses, so `PUT /pricing`, the
+        // store and the spend filter all see this chain's card. A private
+        // registry here left `/pricing` answering 503 for the whole chain and
+        // gave the spend filter an empty card.
+        let registry = registry_for_chain(ctx)?;
+        registry.apply_config(
+            parsed.pricing,
+            control_plane_of(ctx),
+            "typed_config.inline_string",
+        )?;
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
-            registry: Arc::new(PricingRegistry::new(parsed.pricing)),
+            registry,
         }))
     }
 
@@ -742,7 +1162,7 @@ impl UsageFilterInstance {
         stream_info.llm.list_cost = usage.and_then(|usage| {
             let pricing = self.pricing.as_ref()?;
             let cluster = stream_info.upstream_cluster.as_deref()?;
-            let provider_type = pricing.providers.get(cluster)?;
+            let provider_type = pricing.list.provider_for(cluster)?;
             let model = stream_info
                 .selected_model
                 .as_deref()
@@ -873,6 +1293,9 @@ impl HttpFilter for UsageFilterInstance {
 }
 
 #[cfg(test)]
+mod rate_card_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -995,11 +1418,11 @@ mod tests {
                     output_nanodollars_per_token: 100,
                 }],
             }],
+            BTreeMap::from([("provider:openai".to_string(), "openai".to_string())]),
         );
         UsageFilterInstance {
             pricing: Some(PricingContext {
                 list: Arc::new(list),
-                providers: HashMap::from([("provider:openai".into(), "openai".into())]),
                 catalog: None,
             }),
             ..filter_for(Dialect::OpenAi)
@@ -1518,9 +1941,9 @@ mod tests {
 
     #[test]
     fn live_rate_card_update_does_not_reprice_an_existing_request_snapshot() {
-        let registry = PricingRegistry::new(None);
+        let registry = PricingRegistry::new("chain");
         let first = registry
-            .replace_json(
+            .publish_json(
                 r#"{
                   "price_list": {"version":"v1","effective_from":"2026-09-25T00:00:00Z",
                     "entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request",
@@ -1529,10 +1952,11 @@ mod tests {
                   "providers":{"provider:p1":"openai"}
                 }"#,
             )
-            .expect("first card validates");
+            .expect("first card validates")
+            .rate_card_version;
         let in_flight = registry.snapshot().expect("first card snapshot");
         let second = registry
-            .replace_json(
+            .publish_json(
                 r#"{
                   "price_list": {"version":"v2","effective_from":"2026-09-25T01:00:00Z",
                     "entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request",
@@ -1541,7 +1965,8 @@ mod tests {
                   "providers":{"provider:p1":"openai"}
                 }"#,
             )
-            .expect("second card validates");
+            .expect("second card validates")
+            .rate_card_version;
         assert_ne!(first, second);
         assert_eq!(in_flight.list.version().as_str(), first);
         assert_eq!(registry.snapshot().unwrap().list.version().as_str(), second);
@@ -1549,9 +1974,9 @@ mod tests {
 
     #[test]
     fn pricing_json_view_exposes_exact_active_rates_mappings_and_catalog() {
-        let registry = PricingRegistry::new(None);
+        let registry = PricingRegistry::new("chain");
         let version = registry
-            .replace_json(
+            .publish_json(
                 r#"{
                   "price_list": {"version":"catalog-469","effective_from":"2026-10-08T12:34:56Z",
                     "entries":[{"provider_type":"anthropic","model":"claude-sonnet","tier_mode":"graduated",
@@ -1563,12 +1988,13 @@ mod tests {
                   "catalog":{"source":"public","unsupported":{"model-x":"non-integer nanodollar rate"}}
                 }"#,
             )
-            .expect("card validates");
+            .expect("card validates")
+            .rate_card_version;
 
         let value = serde_json::to_value(registry.json_view().expect("active view")).unwrap();
         assert_eq!(value["rate_card_version"], version);
         assert_eq!(value["price_list"]["version"], "catalog-469");
-        let replacement = registry.replace_json(&serde_json::json!({"price_list": value["price_list"], "providers": value["providers"], "catalog": value["catalog"]}).to_string()).unwrap();
+        let replacement = registry.publish_json(&serde_json::json!({"price_list": value["price_list"], "providers": value["providers"], "catalog": value["catalog"]}).to_string()).unwrap().rate_card_version;
         assert_eq!(
             replacement, version,
             "GET/PUT must preserve the card version"

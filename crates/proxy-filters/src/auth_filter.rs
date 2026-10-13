@@ -1065,6 +1065,17 @@ impl HttpFilterFactory for AuthFilterFactory {
             })?
             .downcast::<ControlPlane>()
             .expect("auth control-plane singleton is always a ControlPlane");
+        // The chain's rate card lives in this store. If the usage filter was
+        // built before this one (the lowering does not fix their relative
+        // order), it could not find the store, so link it from this side.
+        // Idempotent: a registry that is already linked ignores the call.
+        if let Some(registry) = ctx.get(crate::usage_filter::TYPE_URL).and_then(|registry| {
+            registry
+                .downcast::<crate::usage_filter::PricingRegistry>()
+                .ok()
+        }) {
+            registry.attach_control_plane(&control_plane, "typed_config")?;
+        }
         let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
             HmacSecret::new(&secret_bytes),
             control_plane.handle(),

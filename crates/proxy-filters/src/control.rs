@@ -2487,6 +2487,20 @@ pub struct ControlPlane {
     /// sealed.
     credential_keys: Option<CredentialKeys>,
     credential_warnings: CredentialWarnings,
+    /// The rate cards of the last successful load, by chain. Not part of
+    /// [`ControlPlaneSnapshot`]: the data plane never reads cards here, it
+    /// reads the chain's own registry, which a watch below keeps current.
+    rate_cards: Mutex<HashMap<String, StoredRateCard>>,
+    rate_card_watches: Mutex<Vec<RateCardWatch>>,
+}
+
+/// Who wants to hear when a chain's stored rate card changes.
+struct RateCardWatch {
+    chain: String,
+    /// The card this watcher was last given, so an unrelated generation bump
+    /// (a key minted, say) does not hand it the same card again.
+    last_delivered: Option<StoredRateCard>,
+    callback: Box<dyn Fn(&StoredRateCard) + Send + Sync>,
 }
 
 impl ControlPlane {
@@ -2540,7 +2554,8 @@ impl ControlPlane {
         // (`last_generation` starts `None`), which is one redundant rebuild,
         // not a missed revocation.
         let generation = store.policy_generation().ok();
-        let loaded = store.load()?;
+        let mut loaded = store.load()?;
+        let rate_cards = Self::take_rate_cards(&mut loaded);
         let snapshot = Self::build_snapshot(
             &bootstrap_keys,
             credential_keys.as_ref(),
@@ -2563,6 +2578,8 @@ impl ControlPlane {
             poller: Mutex::new(None),
             credential_keys,
             credential_warnings,
+            rate_cards: Mutex::new(rate_cards),
+            rate_card_watches: Mutex::new(Vec::new()),
         })
     }
 
@@ -2609,6 +2626,7 @@ impl ControlPlane {
                     .last_reconciled_at
                     .lock()
                     .expect("control plane mutex poisoned") = Instant::now();
+                self.notify_rate_card_watches();
             }
             Err(err) => {
                 tracing::warn!(
@@ -2659,6 +2677,7 @@ impl ControlPlane {
             .last_reconciled_at
             .lock()
             .expect("control plane mutex poisoned") = Instant::now();
+        self.notify_rate_card_watches();
         Ok(true)
     }
 
@@ -3059,6 +3078,109 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Moves the rate cards out of a load into a by-chain map, before the
+    /// rest of the load is consumed to build the snapshot.
+    fn take_rate_cards(loaded: &mut StoredControlPlane) -> HashMap<String, StoredRateCard> {
+        std::mem::take(&mut loaded.rate_cards)
+            .into_iter()
+            .map(|card| (card.chain.clone(), card))
+            .collect()
+    }
+
+    /// The rate card the store held for `chain` at the last load, if any.
+    pub fn rate_card(&self, chain: &str) -> Option<StoredRateCard> {
+        self.rate_cards
+            .lock()
+            .expect("control plane mutex poisoned")
+            .get(chain)
+            .cloned()
+    }
+
+    /// Whether the store behind this control plane survives a restart. See
+    /// [`ControlPlaneStore::is_durable`].
+    pub fn store_is_durable(&self) -> bool {
+        self.store.is_durable()
+    }
+
+    /// Calls `callback` with `chain`'s rate card now, if the store has one,
+    /// and again every time a load brings a different card for that chain.
+    /// Loads happen on this replica's policy poll (a generation bump from any
+    /// replica), after one of its own writes, and on `rebuild`. The callback
+    /// runs on whichever thread did the load while a lock is held, so it must
+    /// be quick and must not call back into this control plane.
+    ///
+    /// The initial delivery and the registration are one step under the
+    /// watches lock, so a card cannot arrive between them and be missed or
+    /// delivered out of order.
+    pub fn watch_rate_card(
+        &self,
+        chain: &str,
+        callback: impl Fn(&StoredRateCard) + Send + Sync + 'static,
+    ) {
+        let mut watches = self
+            .rate_card_watches
+            .lock()
+            .expect("control plane mutex poisoned");
+        let current = self.rate_card(chain);
+        if let Some(card) = &current {
+            callback(card);
+        }
+        watches.push(RateCardWatch {
+            chain: chain.to_string(),
+            last_delivered: current,
+            callback: Box::new(callback),
+        });
+    }
+
+    fn notify_rate_card_watches(&self) {
+        let mut watches = self
+            .rate_card_watches
+            .lock()
+            .expect("control plane mutex poisoned");
+        for watch in watches.iter_mut() {
+            let Some(card) = self.rate_card(&watch.chain) else {
+                continue;
+            };
+            if watch.last_delivered.as_ref() != Some(&card) {
+                (watch.callback)(&card);
+                watch.last_delivered = Some(card);
+            }
+        }
+    }
+
+    /// Replaces `card.chain`'s rate card, bumping the generation so the other
+    /// replicas pick it up on their next poll (ADR-0006 section 3), then
+    /// republishes. The card is also recorded and delivered to this
+    /// replica's watchers directly, so the write takes effect here even if
+    /// the read-back that `rebuild` does fails.
+    pub fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
+        self.store.put_rate_card(card)?;
+        self.record_rate_card(card);
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Writes `card` only if the store has no card for its chain. `Ok(true)`
+    /// means it was written. `Ok(false)` means another card was already there
+    /// (this replica's load predates it), and the republish that follows
+    /// brings that card to the watchers, so the store's card wins.
+    pub fn seed_rate_card(&self, card: &StoredRateCard) -> Result<bool, StoreError> {
+        let wrote = self.store.put_rate_card_if_absent(card)?;
+        if wrote {
+            self.record_rate_card(card);
+        }
+        self.rebuild();
+        Ok(wrote)
+    }
+
+    fn record_rate_card(&self, card: &StoredRateCard) {
+        self.rate_cards
+            .lock()
+            .expect("control plane mutex poisoned")
+            .insert(card.chain.clone(), card.clone());
+        self.notify_rate_card_watches();
+    }
+
     /// Seeds `bootstrap` (`llmproxy.model_authz`'s `typed_config.policies`,
     /// parsed by `model_authz_filter::parse_config`) into the store, then
     /// republishes -- store-wins on a tenant collision, the identical rule
@@ -3131,7 +3253,12 @@ impl ControlPlane {
         Ok(())
     }
 
-    fn snapshot_from(&self, loaded: StoredControlPlane) -> ControlPlaneSnapshot {
+    fn snapshot_from(&self, mut loaded: StoredControlPlane) -> ControlPlaneSnapshot {
+        let cards = Self::take_rate_cards(&mut loaded);
+        *self
+            .rate_cards
+            .lock()
+            .expect("control plane mutex poisoned") = cards;
         Self::build_snapshot(
             &self.bootstrap_keys,
             self.credential_keys.as_ref(),
@@ -3409,6 +3536,129 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
     })))
+}
+
+/// A store several [`ControlPlane`]s can share in a test, standing in for a
+/// shared durable store (Redis) without a server: every handle forwards to one
+/// [`InMemoryControlPlaneStore`], so a write through one is visible to a poll
+/// through another, which is the property replica propagation depends on.
+/// Reports itself durable because it plays the part of a store that is.
+#[cfg(test)]
+pub(crate) struct SharedMemoryStore {
+    pub(crate) inner: Arc<InMemoryControlPlaneStore>,
+    /// Makes rate card writes fail, to test what a refused write leaves behind.
+    pub(crate) refuse_rate_cards: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl SharedMemoryStore {
+    pub(crate) fn new() -> (Self, Arc<InMemoryControlPlaneStore>) {
+        let inner = Arc::new(InMemoryControlPlaneStore::default());
+        (
+            SharedMemoryStore {
+                inner: Arc::clone(&inner),
+                refuse_rate_cards: Arc::default(),
+            },
+            inner,
+        )
+    }
+
+    /// Another handle on the same underlying store.
+    pub(crate) fn handle(&self) -> Self {
+        SharedMemoryStore {
+            inner: Arc::clone(&self.inner),
+            refuse_rate_cards: Arc::clone(&self.refuse_rate_cards),
+        }
+    }
+
+    fn check_rate_cards(&self) -> Result<(), StoreError> {
+        if self.refuse_rate_cards.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable("refused by the test".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ControlPlaneStore for SharedMemoryStore {
+    fn load(&self) -> Result<StoredControlPlane, StoreError> {
+        self.inner.load()
+    }
+    fn policy_generation(&self) -> Result<u64, StoreError> {
+        self.inner.policy_generation()
+    }
+    fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+        self.inner.create_tenant(tenant)
+    }
+    fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+        self.inner.delete_tenant(tenant)
+    }
+    fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
+        self.inner.put_key(rec)
+    }
+    fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError> {
+        self.inner.revoke_key(key_id)
+    }
+    fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
+        self.inner.set_policy(tenant, access)
+    }
+    fn set_budget(
+        &self,
+        tenant: &TenantId,
+        budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError> {
+        self.inner.set_budget(tenant, budget)
+    }
+    fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
+        self.check_rate_cards()?;
+        self.inner.put_rate_card(card)
+    }
+    fn put_rate_card_if_absent(&self, card: &StoredRateCard) -> Result<bool, StoreError> {
+        self.check_rate_cards()?;
+        self.inner.put_rate_card_if_absent(card)
+    }
+    fn is_durable(&self) -> bool {
+        true
+    }
+    fn add_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        delta_micros: u64,
+        token: FlushToken<'_>,
+    ) -> Result<u64, StoreError> {
+        self.inner
+            .add_spend(stat_prefix, tenant, period, delta_micros, token)
+    }
+    fn overwrite_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        total_micros: u64,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .overwrite_spend(stat_prefix, tenant, period, total_micros)
+    }
+    fn last_flush_seq(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+        node_id: &str,
+    ) -> Result<u64, StoreError> {
+        self.inner
+            .last_flush_seq(stat_prefix, tenant, period, node_id)
+    }
+    fn load_spend(
+        &self,
+        stat_prefix: &str,
+        tenant: &TenantId,
+        period: &PeriodKey,
+    ) -> Result<u64, StoreError> {
+        self.inner.load_spend(stat_prefix, tenant, period)
+    }
 }
 
 /// Captures `tracing` events for tests that assert on what a log line says,

@@ -4,6 +4,7 @@
 //! request-time list price but does not enforce a budget.  Money stays in
 //! integer nanodollars and an unpriced model is `None`, never a free zero.
 
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use ring::digest::{digest, SHA256};
@@ -65,16 +66,32 @@ impl std::fmt::Display for PriceListVersion {
 
 /// A list's version combines its optional human label and a content hash, so
 /// editing rates while forgetting to bump a label cannot corrupt auditability.
+///
+/// The hash covers everything that decides what a request costs: the price
+/// entries AND the map from a dialled cluster to its provider type, because
+/// that map picks which entry applies. Two replicas with the same prices and
+/// different maps would otherwise report one version and charge differently.
+/// `effective_from` is left out on purpose: it never selects a price (a card
+/// applies from the moment it is installed, and a future date is rejected), so
+/// re-dating an identical list is not a change in what anything costs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriceList {
     label: Option<String>,
     version: PriceListVersion,
     effective_from: SystemTime,
     entries: Vec<PriceEntry>,
+    /// Dialled cluster name -> configured provider type. A route can point at
+    /// an aggregate or fallback, so this is never inferred from the dialect.
+    cluster_providers: BTreeMap<String, String>,
 }
 
 impl PriceList {
-    pub fn new(label: Option<&str>, effective_from: SystemTime, entries: Vec<PriceEntry>) -> Self {
+    pub fn new(
+        label: Option<&str>,
+        effective_from: SystemTime,
+        entries: Vec<PriceEntry>,
+        cluster_providers: BTreeMap<String, String>,
+    ) -> Self {
         let mut canonical: Vec<&PriceEntry> = entries.iter().collect();
         canonical.sort_by(|a, b| {
             (a.provider_type.as_str(), a.model.as_str())
@@ -99,6 +116,17 @@ impl PriceList {
             }
             bytes.push(0xff);
         }
+        // The provider map, after the entries. 0xfd and 0xfe are never part of
+        // valid UTF-8, so no cluster or provider name can imitate a separator.
+        // A BTreeMap iterates in key order, so the bytes do not depend on the
+        // order the operator wrote the map in.
+        bytes.push(0xfe);
+        for (cluster, provider) in &cluster_providers {
+            bytes.extend_from_slice(cluster.as_bytes());
+            bytes.push(0xfd);
+            bytes.extend_from_slice(provider.as_bytes());
+            bytes.push(0xfd);
+        }
         let hash = digest(&SHA256, &bytes).as_ref()[..6]
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -112,7 +140,17 @@ impl PriceList {
             version: PriceListVersion(version),
             effective_from,
             entries,
+            cluster_providers,
         }
+    }
+
+    pub fn cluster_providers(&self) -> &BTreeMap<String, String> {
+        &self.cluster_providers
+    }
+
+    /// The provider type the rate card prices `cluster` as, if it names one.
+    pub fn provider_for(&self, cluster: &str) -> Option<&str> {
+        self.cluster_providers.get(cluster).map(String::as_str)
     }
 
     pub fn label(&self) -> Option<&str> {
@@ -132,6 +170,17 @@ impl PriceList {
         self.entries
             .iter()
             .find(|entry| entry.provider_type == provider_type && entry.model == model)
+    }
+
+    /// As [`Self::list_cost_nanodollars`], for the cluster a request actually
+    /// dialled. `None` also covers a cluster the card's map does not name.
+    pub fn list_cost_for_cluster(
+        &self,
+        cluster: &str,
+        model: &str,
+        usage: &TokenUsage,
+    ) -> Option<u64> {
+        self.list_cost_nanodollars(self.provider_for(cluster)?, model, usage)
     }
 
     /// `None` means unknown/unpriced, never a fabricated zero amount.
@@ -352,7 +401,12 @@ mod tests {
         let mut model = entry(TierMode::WholeRequest, vec![tier(None, 150, 0, 0, 600)]);
         model.cached_input_unpriced = true;
         model.cache_write_unpriced = true;
-        let list = PriceList::new(Some("test"), SystemTime::UNIX_EPOCH, vec![model.clone()]);
+        let list = PriceList::new(
+            Some("test"),
+            SystemTime::UNIX_EPOCH,
+            vec![model.clone()],
+            BTreeMap::new(),
+        );
         assert_eq!(
             list.list_cost_nanodollars("openai", "gpt-5", &usage(2, 0, 0, 3)),
             Some(2100)
@@ -367,7 +421,12 @@ mod tests {
         );
         model.cached_input_unpriced = false;
         model.cache_write_unpriced = false;
-        let free_cache = PriceList::new(Some("test"), SystemTime::UNIX_EPOCH, vec![model]);
+        let free_cache = PriceList::new(
+            Some("test"),
+            SystemTime::UNIX_EPOCH,
+            vec![model],
+            BTreeMap::new(),
+        );
         assert_ne!(list.version(), free_cache.version());
         assert_eq!(
             free_cache.list_cost_nanodollars("openai", "gpt-5", &usage(2, 1, 0, 3)),
@@ -381,6 +440,7 @@ mod tests {
             Some("v1"),
             SystemTime::UNIX_EPOCH,
             vec![entry(TierMode::WholeRequest, vec![tier(None, 1, 2, 3, 4)])],
+            BTreeMap::new(),
         );
         assert_eq!(
             first.list_cost_nanodollars("openai", "missing", &usage(1, 2, 3, 4)),
@@ -390,7 +450,67 @@ mod tests {
             Some("v1"),
             SystemTime::UNIX_EPOCH,
             vec![entry(TierMode::WholeRequest, vec![tier(None, 2, 2, 3, 4)])],
+            BTreeMap::new(),
         );
         assert_ne!(first.version(), changed.version());
+    }
+
+    fn providers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(cluster, provider)| (cluster.to_string(), provider.to_string()))
+            .collect()
+    }
+
+    fn list_with(pairs: &[(&str, &str)]) -> PriceList {
+        PriceList::new(
+            Some("v1"),
+            SystemTime::UNIX_EPOCH,
+            vec![entry(TierMode::WholeRequest, vec![tier(None, 1, 2, 3, 4)])],
+            providers(pairs),
+        )
+    }
+
+    /// Same prices, different cluster-to-provider map: the map decides which
+    /// entry prices a request, so the version must name it.
+    #[test]
+    fn the_version_changes_when_only_the_provider_map_changes() {
+        let base = list_with(&[("provider:a", "openai")]);
+        assert_ne!(
+            base.version(),
+            list_with(&[("provider:a", "anthropic")]).version(),
+            "a different provider type for the same cluster"
+        );
+        assert_ne!(
+            base.version(),
+            list_with(&[("provider:a", "openai"), ("provider:b", "openai")]).version(),
+            "an extra cluster"
+        );
+        assert_ne!(
+            base.version(),
+            list_with(&[("provider:b", "openai")]).version(),
+            "a renamed cluster"
+        );
+        assert_eq!(
+            list_with(&[("a", "x"), ("b", "y")]).version(),
+            list_with(&[("b", "y"), ("a", "x")]).version(),
+            "the order the map was written in is not content"
+        );
+        assert_ne!(
+            list_with(&[("ab", "c")]).version(),
+            list_with(&[("a", "bc")]).version(),
+            "a name boundary moved"
+        );
+    }
+
+    #[test]
+    fn a_cluster_the_map_does_not_name_is_unpriced() {
+        let list = list_with(&[("provider:a", "openai")]);
+        let u = usage(1, 0, 0, 1);
+        assert_eq!(
+            list.list_cost_for_cluster("provider:a", "gpt-5", &u),
+            Some(5)
+        );
+        assert_eq!(list.list_cost_for_cluster("provider:z", "gpt-5", &u), None);
     }
 }

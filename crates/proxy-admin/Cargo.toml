@@ -40,6 +40,10 @@ tracing = { workspace = true }
 # their own helper signatures -- `proxy-filters` (a real dependency above)
 # does not re-export `arc_swap` itself.
 arc-swap = { workspace = true }
+# `PUT /pricing` tests build the chain's rate card registry through the real
+# usage filter factory, which takes its configuration as a dynamic proto message.
+proxy-api = { workspace = true }
+prost-reflect = { workspace = true }
 
 [lints]
 workspace = true

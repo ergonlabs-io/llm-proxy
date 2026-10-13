@@ -441,19 +441,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         // factory may be built later because spend must precede usage in the
         // encode chain, so this creates an empty slot that usage fills once it
         // parses the listener pricing config.
-        let pricing_registry = ctx
-            .shared
-            .get_or_try_init(
-                &ctx.scope,
-                &ctx.stat_prefix,
-                crate::usage_filter::TYPE_URL,
-                || {
-                    Ok(Arc::new(PricingRegistry::new_for_spend())
-                        as Arc<dyn std::any::Any + Send + Sync>)
-                },
-            )?
-            .downcast::<PricingRegistry>()
-            .expect("usage pricing singleton is always a PricingRegistry");
+        let pricing_registry = crate::usage_filter::registry_for_chain(ctx)?;
 
         // One `SpendAccumulator` (+ its usage-missing warner) per (filter
         // config, listener) -- same singleton lifetime/reasoning as
@@ -514,6 +502,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                 Ok(Arc::new(SharedSpendLimitState {
                     accumulator,
                     usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+                    unpriced_warner: Arc::new(UnpricedWarner::new(ctx.stat_prefix.clone())),
                 }) as Arc<dyn std::any::Any + Send + Sync>)
             })?
             .downcast::<SharedSpendLimitState>()
@@ -524,6 +513,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
             pricing_registry,
             accumulator: Arc::clone(&shared.accumulator),
             usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
+            unpriced_warner: Arc::clone(&shared.unpriced_warner),
             snapshot: control_plane.handle(),
         }))
     }
@@ -542,6 +532,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
 pub struct SharedSpendLimitState {
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    unpriced_warner: Arc<UnpricedWarner>,
 }
 
 impl SharedSpendLimitState {
@@ -563,6 +554,7 @@ impl SharedSpendLimitState {
         SharedSpendLimitState {
             accumulator,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            unpriced_warner: Arc::new(UnpricedWarner::new(String::new())),
         }
     }
 }
@@ -572,6 +564,7 @@ struct SpendLimitInstanceFactory {
     pricing_registry: Arc<PricingRegistry>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    unpriced_warner: Arc<UnpricedWarner>,
     /// One handle per (filter config, listener), shared by every per-stream
     /// instance -- same pattern as `model_authz_filter`'s
     /// `ModelAuthzInstanceFactory::snapshot`.
@@ -585,6 +578,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             pricing_snapshot: self.pricing_registry.snapshot_context(),
             accumulator: Arc::clone(&self.accumulator),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
+            unpriced_warner: Arc::clone(&self.unpriced_warner),
             snapshot: Arc::clone(&self.snapshot),
             key_id: None,
             tenant: None,
@@ -647,6 +641,80 @@ impl UsageMissingWarner {
     }
 }
 
+/// Most distinct unpriced model names one chain remembers. Model names are
+/// chosen by the client, so an unbounded set would let a caller grow this
+/// process's memory by sending made-up models.
+const MAX_UNPRICED_MODELS_REMEMBERED: usize = 256;
+
+/// Longest model name copied into the set or a log line.
+const MAX_UNPRICED_MODEL_CHARS: usize = 128;
+
+/// Warns, once per model per chain, when a dollar budget counted a request as
+/// $0 because nothing prices its model. Repeats are suppressed, or the log
+/// becomes the incident; the set of remembered names is capped, and hitting the
+/// cap logs one summary line instead of one line per further name.
+struct UnpricedWarner {
+    chain: String,
+    seen: Mutex<UnpricedSeen>,
+}
+
+#[derive(Default)]
+struct UnpricedSeen {
+    models: std::collections::HashSet<String>,
+    cap_reported: bool,
+}
+
+impl UnpricedWarner {
+    fn new(chain: String) -> Self {
+        UnpricedWarner {
+            chain,
+            seen: Mutex::new(UnpricedSeen::default()),
+        }
+    }
+
+    /// `reason` runs only when a line is actually written.
+    fn note(&self, model: Option<&str>, cluster: Option<&str>, reason: impl FnOnce() -> String) {
+        let name: String = model
+            .unwrap_or("(no model)")
+            .chars()
+            .take(MAX_UNPRICED_MODEL_CHARS)
+            .collect();
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.models.contains(&name) {
+            return;
+        }
+        if seen.models.len() >= MAX_UNPRICED_MODELS_REMEMBERED {
+            let first_time = !seen.cap_reported;
+            seen.cap_reported = true;
+            drop(seen);
+            if first_time {
+                tracing::warn!(
+                    chain = %self.chain,
+                    remembered = MAX_UNPRICED_MODELS_REMEMBERED,
+                    "spend_limit: more distinct unpriced model names than this chain remembers; \
+                     further ones are still charged $0 against dollar budgets and counted in \
+                     unpriced_requests, but are no longer named here"
+                );
+            }
+            return;
+        }
+        seen.models.insert(name.clone());
+        drop(seen);
+        // Debug formatting for the client-chosen name, so control characters
+        // in it cannot forge a log line. Nothing credential-shaped is in this
+        // line: the chain, cluster and model names and the reason.
+        tracing::warn!(
+            chain = %self.chain,
+            model = ?name,
+            cluster = ?cluster,
+            reason = %reason(),
+            "spend_limit: a request under a dollar budget was charged $0 because no price \
+             applies to it, so the budget did not count it. Add the model to the rate card \
+             (PUT /pricing) or to this filter's `pricing` list. Logged once per model."
+        );
+    }
+}
+
 /// Per-stream instance. Plain fields, no `Rc`/`RefCell` (never leaves the
 /// worker thread that owns the stream) -- `price_table`/`accumulator`/
 /// `usage_missing_warner`/`snapshot` are the cross-thread-shared pieces, each
@@ -656,6 +724,7 @@ struct SpendLimitFilterInstance {
     pricing_snapshot: Option<crate::usage_filter::PricingContext>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    unpriced_warner: Arc<UnpricedWarner>,
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
     /// Authenticated key and its reporting period, captured at admission.
     key_id: Option<KeyId>,
@@ -741,6 +810,24 @@ impl SpendLimitFilterInstance {
             self.price_table
                 .cost_of(cluster.as_deref(), model.as_deref(), &usage)
         });
+
+        // A configured dollar budget just counted this request as $0 because
+        // nothing prices it. That is fail-open by design (a metering gap must
+        // not refuse traffic), so it has to be loud (AGENTS.md "Fail-open
+        // controls"). Only where a budget actually applies: an unbudgeted
+        // subject's unpriced request bypasses nothing. The warner's state is
+        // touched here and nowhere on the priced path.
+        if self.budget_applies && matches!(charge, Charge::Unpriced) {
+            let priced_model = selected_model.as_deref().or(model.as_deref());
+            self.unpriced_warner
+                .note(priced_model, cluster.as_deref(), || {
+                    PricingRegistry::explain_unpriced(
+                        self.pricing_snapshot.as_ref(),
+                        cluster.as_deref(),
+                        priced_model,
+                    )
+                });
+        }
 
         let now = Utc::now();
         // ADR-0007 decision 8: spend is added to a budget only when the
@@ -1551,6 +1638,7 @@ mod tests {
         price_table: Arc<PriceTable>,
         accumulator: Arc<SpendAccumulator>,
         usage_missing_warner: Arc<UsageMissingWarner>,
+        unpriced_warner: Arc<UnpricedWarner>,
         pricing_registry: Arc<PricingRegistry>,
         snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
     }
@@ -1561,6 +1649,7 @@ mod tests {
                 price_table: Arc::clone(&self.price_table),
                 accumulator: Arc::clone(&self.accumulator),
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
+                unpriced_warner: Arc::clone(&self.unpriced_warner),
                 pricing_snapshot: self.pricing_registry.snapshot_context(),
                 snapshot: Arc::clone(&self.snapshot),
                 key_id: None,
@@ -1595,7 +1684,8 @@ mod tests {
             price_table: Arc::new(price_table),
             accumulator,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
-            pricing_registry: Arc::new(PricingRegistry::new_for_spend()),
+            unpriced_warner: Arc::new(UnpricedWarner::new("test-chain".to_string())),
+            pricing_registry: Arc::new(PricingRegistry::new("test-chain")),
             snapshot: control_plane.handle(),
         }
     }
@@ -1629,7 +1719,8 @@ mod tests {
             price_table: Arc::new(price_table),
             accumulator,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
-            pricing_registry: Arc::new(PricingRegistry::new_for_spend()),
+            unpriced_warner: Arc::new(UnpricedWarner::new("test-chain".to_string())),
+            pricing_registry: Arc::new(PricingRegistry::new("test-chain")),
             snapshot: control_plane.handle(),
         }
     }
@@ -1757,6 +1848,231 @@ mod tests {
             harness.accumulator.unreconciled_admissions(),
             0,
             "a refused request was not admitted, stale or not"
+        );
+    }
+
+    // --- unpriced requests under a dollar budget are loud ---------------------
+
+    fn dollar_budget() -> TenantBudget {
+        TenantBudget {
+            max_micros: MicroUsd::from_micros(1_000_000),
+            period: Period::Daily,
+            credential_source: CredentialSource::Platform,
+        }
+    }
+
+    /// Warnings about a request charged $0, as the one line an operator reads.
+    fn unpriced_warnings(capture: &crate::control::log_capture::Capture) -> Vec<String> {
+        capture
+            .rendered_at_or_above(tracing::Level::WARN)
+            .into_iter()
+            .filter(|line| line.contains("charged $0"))
+            .collect()
+    }
+
+    #[test]
+    fn an_unpriced_model_under_a_budget_warns_once_per_model() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        for _ in 0..3 {
+            run_request(
+                &harness,
+                "tenant-a",
+                Some(("cluster-a", "mystery")),
+                Some(10),
+            );
+        }
+        run_request(
+            &harness,
+            "tenant-a",
+            Some(("cluster-a", "second")),
+            Some(10),
+        );
+        drop(guard);
+
+        let lines = unpriced_warnings(&capture);
+        assert_eq!(
+            lines.len(),
+            2,
+            "one per model, repeats suppressed: {lines:?}"
+        );
+        assert!(lines[0].contains("mystery") && lines[0].contains("cluster-a"));
+        assert!(
+            lines[0].contains("test-chain"),
+            "names the chain: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("no rate card is installed"),
+            "says why: {}",
+            lines[0]
+        );
+        assert!(lines[1].contains("second"));
+    }
+
+    /// AGENTS.md "Fail-open controls": warn only where the control was meant
+    /// to apply. No budget means the $0 charge bypassed nothing.
+    #[test]
+    fn an_unpriced_model_without_a_budget_stays_silent() {
+        let cp = control_plane_with(&[]);
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        run_request(
+            &harness,
+            "tenant-none",
+            Some(("cluster-a", "mystery")),
+            Some(10),
+        );
+        drop(guard);
+
+        assert!(unpriced_warnings(&capture).is_empty());
+        assert!(harness
+            .unpriced_warner
+            .seen
+            .lock()
+            .unwrap()
+            .models
+            .is_empty());
+    }
+
+    /// The healthy path never touches the warner's state.
+    #[test]
+    fn a_priced_request_neither_warns_nor_touches_the_suppression_state() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let mut table = PriceTable::new();
+        table.insert(
+            "cluster-a",
+            "priced",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(1_000_000),
+                ..Default::default()
+            },
+        );
+        let harness = filter_with(&cp, table, Period::Monthly);
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        run_request(
+            &harness,
+            "tenant-a",
+            Some(("cluster-a", "priced")),
+            Some(10),
+        );
+        drop(guard);
+
+        assert!(unpriced_warnings(&capture).is_empty());
+        let seen = harness.unpriced_warner.seen.lock().unwrap();
+        assert!(seen.models.is_empty() && !seen.cap_reported);
+    }
+
+    #[test]
+    fn the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let extra = 20;
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        for n in 0..MAX_UNPRICED_MODELS_REMEMBERED + extra {
+            run_request(
+                &harness,
+                "tenant-a",
+                Some(("cluster-a", &format!("model-{n}"))),
+                Some(1),
+            );
+        }
+        drop(guard);
+
+        assert_eq!(
+            harness.unpriced_warner.seen.lock().unwrap().models.len(),
+            MAX_UNPRICED_MODELS_REMEMBERED,
+            "client-chosen names must not grow the set without bound"
+        );
+        let lines: Vec<_> = unpriced_warnings(&capture)
+            .into_iter()
+            .filter(|line| !line.contains("more distinct unpriced model names"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            MAX_UNPRICED_MODELS_REMEMBERED,
+            "one per remembered model"
+        );
+        let summaries: Vec<_> = capture
+            .rendered_at_or_above(tracing::Level::WARN)
+            .into_iter()
+            .filter(|line| line.contains("more distinct unpriced model names"))
+            .collect();
+        assert_eq!(summaries.len(), 1, "one summary, however many more arrive");
+    }
+
+    /// Check what the line renders: a forged newline in a client-chosen model
+    /// name stays on one line, and no credential or key identity is in it.
+    #[test]
+    fn the_unpriced_warning_renders_no_credentials_and_cannot_be_forged() {
+        // A tenant-scoped budget, so the request below (tenant mode, holding a
+        // tenant credential) is one the budget actually applies to.
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                credential_source: CredentialSource::Tenant,
+                ..dollar_budget()
+            },
+        )]);
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let mut filter = harness.new_instance();
+        let mut cb = TestCallbacks::new();
+        cb.set_tenant("tenant-a");
+        cb.set_tenant_mode();
+        cb.set_credential_source(Some(CredentialSource::Tenant));
+        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        cb.set_upstream("cluster-a", "evil\nWARN forged line");
+        cb.set_usage(usage(5));
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        filter.encode_data(&mut cb, &mut Bytes::new(), true);
+        drop(guard);
+
+        let lines = unpriced_warnings(&capture);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(
+            !line.contains('\n'),
+            "the name cannot start a second line: {line:?}"
+        );
+        assert!(line.contains("forged"), "the name is still shown");
+        for secret in ["test-secret", "key-tenant-a", "tenant-a"] {
+            assert!(
+                !line.contains(secret),
+                "{secret} must not be in the line: {line}"
+            );
+        }
+    }
+
+    /// Once the card prices the model, the same request stops warning.
+    #[test]
+    fn a_published_card_ends_the_warning_for_the_models_it_prices() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        harness
+            .pricing_registry
+            .publish_json(
+                r#"{"price_list":{"effective_from":"2026-01-01T00:00:00Z","entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":1000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":1000}]}]},"providers":{"cluster-a":"openai"}}"#,
+            )
+            .unwrap();
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        run_request(&harness, "tenant-a", Some(("cluster-a", "gpt-5")), Some(10));
+        run_request(&harness, "tenant-a", Some(("cluster-a", "gpt-6")), Some(10));
+        drop(guard);
+
+        let lines = unpriced_warnings(&capture);
+        assert_eq!(lines.len(), 1, "only the unpriced model warns: {lines:?}");
+        assert!(lines[0].contains("gpt-6"));
+        assert!(
+            lines[0].contains("no entry for provider type `openai`"),
+            "the reason names what is missing: {}",
+            lines[0]
         );
     }
 

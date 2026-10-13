@@ -1658,6 +1658,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "prost-reflect",
+ "proxy-api",
  "proxy-config",
  "proxy-core",
  "proxy-filters",

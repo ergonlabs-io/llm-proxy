@@ -3144,3 +3144,4 @@ async fn key_rotation_conflicts_and_api_version_are_explicit() {
 
 mod budget_scope;
 mod credentials;
+mod pricing;
