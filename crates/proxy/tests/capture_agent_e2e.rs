@@ -507,13 +507,29 @@ fn mock() -> Mock {
         while !halted.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // On macOS an accepted socket inherits the listener's
+                    // O_NONBLOCK. Left set, a request that has not arrived yet
+                    // reads as WouldBlock, the mock answers and closes with
+                    // the request unread, and the kernel resets the
+                    // connection under the proxy (UC, 502).
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let _ = stream.read(&mut [0; 4096]);
+                    // Read the whole head (requests here carry no body) so
+                    // dropping `stream` never closes it with request bytes
+                    // unread.
+                    let mut head = Vec::new();
+                    let mut chunk = [0; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        }
+                    }
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
