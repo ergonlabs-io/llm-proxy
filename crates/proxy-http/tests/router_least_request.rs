@@ -12,20 +12,24 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Empty, Full};
+use hyper_util::rt::TokioIo;
 use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_cluster::{ClusterEntry, LoadBalancerContext};
 use proxy_config::ir::{
     ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, ForwardAction,
     ForwardTarget, LbPolicy, PathMatch, RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR,
-    RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
+    RouteEntry, RouteMatcher, RouteTable, UpgradeConfig, VirtualHostIR,
 };
+use proxy_http::codec::{serve_http1, Http1Options};
 use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{
@@ -48,13 +52,7 @@ struct Harness {
 impl Harness {
     /// In-flight count of the host at `addr`, as the load balancer reads it.
     fn count(&self, addr: SocketAddr) -> u64 {
-        let ctx = LoadBalancerContext {
-            host_override: Some(addr),
-            ..Default::default()
-        };
-        let sel = self.entry.select_host(&ctx).expect("host exists");
-        assert_eq!(sel.host.address, addr, "override must resolve to `addr`");
-        sel.host.active_request_count()
+        count_of(self.entry.as_ref(), addr)
     }
 
     async fn send(&self) -> HttpResponseParts {
@@ -62,6 +60,16 @@ impl Harness {
             .await
             .expect("router answers within the step timeout")
     }
+}
+
+fn count_of(entry: &dyn ClusterEntry, addr: SocketAddr) -> u64 {
+    let ctx = LoadBalancerContext {
+        host_override: Some(addr),
+        ..Default::default()
+    };
+    let sel = entry.select_host(&ctx).expect("host exists");
+    assert_eq!(sel.host.address, addr, "override must resolve to `addr`");
+    sel.host.active_request_count()
 }
 
 fn request() -> HttpRequestParts {
@@ -83,6 +91,14 @@ fn request() -> HttpRequestParts {
 }
 
 async fn build(addrs: &[SocketAddr], retry_policy: Option<RetryPolicyIR>) -> Harness {
+    build_with(addrs, retry_policy, Vec::new()).await
+}
+
+async fn build_with(
+    addrs: &[SocketAddr],
+    retry_policy: Option<RetryPolicyIR>,
+    upgrade_configs: Vec<UpgradeConfig>,
+) -> Harness {
     let manager = Arc::new(ClusterManager::with_default_transport(Arc::new(
         FakeResolver::new(),
     )));
@@ -158,7 +174,7 @@ async fn build(addrs: &[SocketAddr], retry_policy: Option<RetryPolicyIR>) -> Har
     let handles = Arc::new(StatHandles::build(&control, ["up"]));
     let stats = Arc::new(RouterStats::new(control.registry(), handles, WorkerId(0)));
     let terminal: Arc<dyn TerminalFilterInstanceFactory> =
-        Arc::new(RouterFilterFactory::new(manager, stats));
+        Arc::new(RouterFilterFactory::new(manager, stats).with_upgrade_configs(upgrade_configs));
     Harness {
         router: FilterChainHandler::new(
             Vec::new(),
@@ -341,6 +357,252 @@ async fn fast_responses_return_the_count_to_zero() {
                     .unwrap();
             }
             assert_eq!((h.count(a), h.count(b)), (0, 0));
+        })
+        .await;
+}
+
+fn websocket_enabled() -> Vec<UpgradeConfig> {
+    vec![UpgradeConfig {
+        upgrade_type: "websocket".to_string(),
+        enabled: true,
+    }]
+}
+
+/// Poll `cond` until true, bounded by `STEP`; no fixed sleep window.
+async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    tokio::time::timeout(STEP, async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+}
+
+/// Upstream that answers `101` and echoes raw bytes until the peer closes.
+async fn spawn_upgrade_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_head(&mut stream).await;
+        let head =
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        if stream.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let mut buf = [0u8; 1024];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_accepted_upgrade_holds_the_count_for_the_tunnel_lifetime() {
+    LocalSet::new()
+        .run_until(async {
+            let up = spawn_upgrade_echo_upstream().await;
+            let h = build_with(&[up], None, websocket_enabled()).await;
+            let entry = h.entry.clone();
+            // The real codec is needed: only `serve_http1` spawns the tunnel
+            // bridge that owns the guard.
+            let handler: Rc<dyn StreamHandler> = Rc::new(h.router);
+
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            tokio::task::spawn_local(async move {
+                let _ = serve_http1(
+                    server_io,
+                    handler,
+                    Http1Options {
+                        keep_alive: true,
+                        header_read_timeout: None,
+                    },
+                    std::future::pending::<()>(),
+                    DownstreamInfo::loopback(),
+                )
+                .await;
+            });
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(client_io))
+                    .await
+                    .expect("client handshake");
+            tokio::task::spawn_local(async move {
+                let _ = conn.with_upgrades().await;
+            });
+
+            let req = http::Request::builder()
+                .uri("/v1/chat")
+                .header(http::header::HOST, "test.local")
+                .header(http::header::UPGRADE, "websocket")
+                .header(http::header::CONNECTION, "Upgrade")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let mut response = tokio::time::timeout(STEP, sender.send_request(req))
+                .await
+                .expect("101 within step")
+                .expect("send_request");
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            let upgraded = tokio::time::timeout(STEP, hyper::upgrade::on(&mut response))
+                .await
+                .expect("upgrade resolves")
+                .expect("upgraded stream");
+            let mut tunnel = TokioIo::new(upgraded);
+
+            // An echo round trip proves the bridge task is running, so the
+            // count below is read while the tunnel owns the guard.
+            tunnel.write_all(b"ping").await.unwrap();
+            let mut reply = [0u8; 4];
+            tokio::time::timeout(STEP, tunnel.read_exact(&mut reply))
+                .await
+                .expect("echo within step")
+                .expect("echo ok");
+            assert_eq!(&reply, b"ping");
+            assert_eq!(
+                count_of(entry.as_ref(), up),
+                1,
+                "open tunnel holds one count"
+            );
+
+            drop(tunnel);
+            eventually("tunnel close releases the count", || {
+                count_of(entry.as_ref(), up) == 0
+            })
+            .await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_declined_upgrade_holds_the_count_until_the_response_body_ends() {
+    LocalSet::new()
+        .run_until(async {
+            let (up, release) = spawn_holding_upstream().await;
+            let h = build_with(&[up], None, websocket_enabled()).await;
+
+            let mut req = request();
+            req.head.method = Method::GET;
+            req.head
+                .headers
+                .insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+            req.head.headers.insert(
+                http::header::CONNECTION,
+                HeaderValue::from_static("Upgrade"),
+            );
+            // Rust note: a hand-built request never reaches the wire; this only
+            // yields the `OnUpgrade` handle the router requires.
+            let mut synthetic = http::Request::builder().body(()).unwrap();
+            req.on_upgrade = Some(hyper::upgrade::on(&mut synthetic));
+
+            let resp = tokio::time::timeout(STEP, h.router.handle(req))
+                .await
+                .expect("router answers");
+            assert_eq!(resp.head.status, StatusCode::OK, "upstream declined");
+            assert_eq!(h.count(up), 1, "declined response body holds the guard");
+
+            release.send(true).unwrap();
+            tokio::time::timeout(STEP, resp.body.collect())
+                .await
+                .expect("body completes")
+                .expect("body ok");
+            assert_eq!(h.count(up), 0);
+        })
+        .await;
+}
+
+/// Hedged GET: the original attempt (first connection accepted by either
+/// upstream) never answers; the hedge on the other host does, once the test
+/// has read both counts.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hedge_counts_each_attempted_host_once_and_releases_both() {
+    LocalSet::new()
+        .run_until(async {
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let (go_tx, go_rx) = tokio::sync::watch::channel(false);
+            let mut addrs = Vec::new();
+            for _ in 0..2 {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addrs.push(listener.local_addr().unwrap());
+                let accepted = accepted.clone();
+                let go_rx = go_rx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let attempt = accepted.fetch_add(1, Ordering::SeqCst);
+                        let mut go_rx = go_rx.clone();
+                        tokio::spawn(async move {
+                            read_head(&mut stream).await;
+                            if attempt == 0 {
+                                // Original: hold the connection until the
+                                // proxy cancels it (read sees EOF/reset).
+                                let mut b = [0u8; 1];
+                                let _ = stream.read(&mut b).await;
+                                return;
+                            }
+                            let _ = go_rx.wait_for(|go| *go).await;
+                            let _ = stream
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                                )
+                                .await;
+                        });
+                    }
+                });
+            }
+            let policy = RetryPolicyIR {
+                retry_on: RetryOn::parse("5xx"),
+                num_retries: 1,
+                per_try_timeout: Some(Duration::from_millis(50)),
+                hedge_on_per_try_timeout: true,
+                retriable_status_codes: Vec::new(),
+                retry_back_off: RetryBackOff {
+                    base_interval: Duration::from_micros(1),
+                    max_interval: Duration::from_micros(5),
+                },
+                host_selection_retry_max_attempts: 1,
+                avoid_previous_hosts: false,
+            };
+            let h = build(&addrs, Some(policy)).await;
+            let mut req = request();
+            req.head.method = Method::GET;
+
+            let probe = async {
+                eventually("both attempts dispatched", || {
+                    accepted.load(Ordering::SeqCst) == 2
+                })
+                .await;
+                // Original is in the hedge task, hedge in the router loop.
+                eventually("each attempted host counts exactly one", || {
+                    h.count(addrs[0]) == 1 && h.count(addrs[1]) == 1
+                })
+                .await;
+                go_tx.send(true).unwrap();
+            };
+            let (resp, ()) = tokio::join!(
+                async {
+                    tokio::time::timeout(STEP, h.router.handle(req))
+                        .await
+                        .expect("hedge answers")
+                },
+                probe
+            );
+            assert_eq!(resp.head.status, StatusCode::OK);
+            tokio::time::timeout(STEP, resp.body.collect())
+                .await
+                .expect("body completes")
+                .expect("body ok");
+            eventually("winner and cancelled loser both release", || {
+                h.count(addrs[0]) == 0 && h.count(addrs[1]) == 0
+            })
+            .await;
         })
         .await;
 }
