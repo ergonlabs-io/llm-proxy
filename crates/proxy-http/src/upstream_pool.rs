@@ -2655,7 +2655,7 @@ mod tests {
                 let second = tokio::task::spawn_local({
                     let (cache, key) = (cache.clone(), key.clone());
                     let live = plaintext_pool(host.addr);
-                    async move { cache.get_or_connect(key, &live).await.map(|_| ()) }
+                    async move { cache.get_or_connect(key, &live).await }
                 });
                 settle("checkout 2 to queue on the slot", || {
                     cache.slots.borrow().values().map(Rc::strong_count).max() == Some(3)
@@ -2664,16 +2664,29 @@ mod tests {
 
                 gate.notify_one();
                 first.await.unwrap().expect_err("checkout 1's dial fails");
-                second
+                let second = second
                     .await
                     .unwrap()
                     .expect("checkout 2 dials and succeeds");
                 assert_eq!(cache.slots.borrow().len(), 1, "checkout 2's slot is kept");
 
-                cache
+                // The h2 handshake returns before the upstream has accepted
+                // the socket, so `accepted()` may still lag a fresh dial. A
+                // served request proves its connection was accepted, which
+                // makes the count below exact whichever way the third
+                // checkout goes.
+                second
+                    .send(get_request())
+                    .await
+                    .expect("request on checkout 2");
+                let third = cache
                     .get_or_connect(key, &plaintext_pool(host.addr))
                     .await
                     .expect("third checkout");
+                third
+                    .send(get_request())
+                    .await
+                    .expect("request on the third checkout");
                 assert_eq!(
                     host.accepted(),
                     1,
