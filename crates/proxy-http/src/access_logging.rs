@@ -1155,7 +1155,7 @@ mod tests {
             lines: lines.clone(),
         });
         let sink: Arc<dyn AccessLogWriter> =
-            Arc::new(proxy_observability::sink::QueuedSink::new("gated", inner));
+            Arc::new(proxy_observability::sink::QueuedSink::new("gated", inner).unwrap());
 
         for _ in 0..3 {
             tokio::time::timeout(

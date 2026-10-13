@@ -432,7 +432,10 @@ pub struct QueuedSink {
 
 impl QueuedSink {
     /// Wrap `inner`, labelling warnings with `label` (e.g. `"stdout"`).
-    pub fn new(label: impl Into<String>, inner: Arc<dyn AccessLogWriter>) -> Self {
+    ///
+    /// Errors if the writer thread cannot be spawned (resource exhaustion);
+    /// callers surface it as a config error rather than panicking.
+    pub fn new(label: impl Into<String>, inner: Arc<dyn AccessLogWriter>) -> io::Result<Self> {
         Self::with_capacity(label, inner, QUEUE_MAX_BYTES)
     }
 
@@ -441,7 +444,7 @@ impl QueuedSink {
         label: impl Into<String>,
         inner: Arc<dyn AccessLogWriter>,
         max_bytes: usize,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let shared = Arc::new(QueueShared {
             state: Mutex::new(QueueState::default()),
             wake: Condvar::new(),
@@ -456,14 +459,13 @@ impl QueuedSink {
         // which is what lets it drain the remainder.
         std::thread::Builder::new()
             .name("access-log-writer".to_string())
-            .spawn(move || writer_loop(&worker, inner.as_ref()))
-            .expect("spawn access-log-writer thread");
+            .spawn(move || writer_loop(&worker, inner.as_ref()))?;
         {
             let mut live = LIVE_QUEUES.lock().unwrap();
             live.retain(|w| w.strong_count() > 0);
             live.push(Arc::downgrade(&shared));
         }
-        Self { shared }
+        Ok(Self { shared })
     }
 
     /// Lines dropped by this sink because its queue was full.
@@ -567,40 +569,44 @@ impl Drop for QueuedSink {
 /// One shared queued sink per process for stdout and for stderr: they are
 /// process-wide resources, so a second writer thread would only add
 /// interleaving. `None` for file sinks.
-fn shared_stdio(sink: &AccessLogSink) -> Option<Arc<dyn AccessLogWriter>> {
+fn shared_stdio(sink: &AccessLogSink) -> io::Result<Option<Arc<dyn AccessLogWriter>>> {
     static STDOUT: OnceLock<Arc<QueuedSink>> = OnceLock::new();
     static STDERR: OnceLock<Arc<QueuedSink>> = OnceLock::new();
-    match sink {
-        AccessLogSink::Stdout => Some(
-            STDOUT
-                .get_or_init(|| Arc::new(QueuedSink::new("stdout", Arc::new(StdoutSink::new()))))
-                .clone(),
-        ),
-        AccessLogSink::Stderr => Some(
-            STDERR
-                .get_or_init(|| Arc::new(QueuedSink::new("stderr", Arc::new(StderrSink::new()))))
-                .clone(),
-        ),
-        AccessLogSink::File { .. } => None,
+    // Rust note: `OnceLock::get_or_init` cannot take a fallible closure, so
+    // build first and let `get_or_init` keep whichever value won a race; the
+    // loser's `QueuedSink` drops and its writer thread exits.
+    fn shared(
+        cell: &'static OnceLock<Arc<QueuedSink>>,
+        label: &str,
+        inner: impl FnOnce() -> Arc<dyn AccessLogWriter>,
+    ) -> io::Result<Arc<dyn AccessLogWriter>> {
+        if let Some(existing) = cell.get() {
+            return Ok(existing.clone());
+        }
+        let built = Arc::new(QueuedSink::new(label, inner())?);
+        Ok(cell.get_or_init(|| built).clone())
     }
+    Ok(match sink {
+        AccessLogSink::Stdout => Some(shared(&STDOUT, "stdout", || Arc::new(StdoutSink::new()))?),
+        AccessLogSink::Stderr => Some(shared(&STDERR, "stderr", || Arc::new(StderrSink::new()))?),
+        AccessLogSink::File { .. } => None,
+    })
 }
 
 // -------------------------------------------------------------- build_sink --
 
 /// Build a single writer for `sink`, queued so callers never block on I/O
-/// (stdout/stderr share one process-wide queue). AGENTS.md invariant 1: every
+/// (stdout/stderr share one process-wide queue; file sinks share one per
+/// canonical path, see [`SinkRegistry`]). AGENTS.md invariant 1: every
 /// [`AccessLogSink`] variant is matched explicitly, so adding a variant
 /// without updating this function is a compile error, not a silent
 /// stdout-fallback.
 pub fn build_sink(sink: &AccessLogSink) -> io::Result<Arc<dyn AccessLogWriter>> {
     Ok(match sink {
         AccessLogSink::Stdout | AccessLogSink::Stderr => {
-            shared_stdio(sink).expect("stdio variants always have a shared sink")
+            shared_stdio(sink)?.expect("stdio variants always have a shared sink")
         }
-        AccessLogSink::File { path } => Arc::new(QueuedSink::new(
-            path.clone(),
-            Arc::new(FileSink::new(path)?),
-        )),
+        AccessLogSink::File { path } => shared_file(path)?,
     })
 }
 
@@ -625,46 +631,65 @@ fn canonical_key(path: &Path) -> PathBuf {
     }
 }
 
-/// De-duplicates sinks by destination so that two access-log configs naming
-/// the same file share one [`FileSink`] (one `BufWriter`, one `Mutex`)
-/// instead of interleaving partial lines through two independent buffers.
+type FileSinkMap = HashMap<PathBuf, Weak<QueuedSink>>;
+
+/// Process-wide file sinks by canonical path. `Weak`, so a path's sink (and
+/// its writer thread) goes away when the last access logger using it drops;
+/// dead entries are pruned on insert, bounding the map by live paths.
+fn file_sinks() -> &'static Mutex<FileSinkMap> {
+    static FILE_SINKS: OnceLock<Mutex<FileSinkMap>> = OnceLock::new();
+    FILE_SINKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The one [`QueuedSink`] for `path` in this process, created on first use.
 ///
-/// Rust note: `Mutex<HashMap<...>>` guards the *registry* (inserting a new
-/// entry); each `FileSink` inside has its own `Mutex` guarding writes. Two
-/// different locks for two different concerns — registration is rare
-/// (config-load time), writes are per-request.
+/// Every worker, HCM filter chain and config generation builds its own
+/// handler, so without this each would spawn its own writer thread and queue
+/// and append through a separate `BufWriter`. Sharing makes the 8 MiB queue
+/// bound per path. The file is opened outside the lock; if another thread
+/// registered the path meanwhile, ours is discarded (its thread exits on drop).
+fn shared_file(path: &str) -> io::Result<Arc<QueuedSink>> {
+    let key = canonical_key(Path::new(path));
+    if let Some(live) = file_sinks()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(Weak::upgrade)
+    {
+        return Ok(live);
+    }
+    let fresh = Arc::new(QueuedSink::new(
+        path.to_string(),
+        Arc::new(FileSink::new(path)?),
+    )?);
+    let mut map = file_sinks().lock().unwrap();
+    if let Some(live) = map.get(&key).and_then(Weak::upgrade) {
+        return Ok(live);
+    }
+    map.retain(|_, w| w.strong_count() > 0);
+    map.insert(key, Arc::downgrade(&fresh));
+    Ok(fresh)
+}
+
+/// Entry point for building writers from access-log config. Two configs
+/// naming the same file share one process-wide [`QueuedSink`] (one writer
+/// thread, one queue, one `BufWriter`) no matter which registry, worker,
+/// filter chain or config generation built them, instead of interleaving
+/// partial lines through independent buffers. The registry itself is
+/// stateless; the dedup map is process-wide.
 pub struct SinkRegistry {
-    files: Mutex<HashMap<PathBuf, Arc<QueuedSink>>>,
+    _private: (),
 }
 
 impl SinkRegistry {
     pub fn new() -> Self {
-        Self {
-            files: Mutex::new(HashMap::new()),
-        }
+        Self { _private: () }
     }
 
-    /// Build (or reuse) the writer for `sink`. Stdout/stderr are cheap and
-    /// not deduplicated — only file destinations need shared buffering.
+    /// Build (or reuse) the writer for `sink`. Stdout/stderr share one
+    /// process-wide queue each; files share one per canonical path.
     pub fn build(&self, sink: &AccessLogSink) -> io::Result<Arc<dyn AccessLogWriter>> {
-        match sink {
-            AccessLogSink::Stdout | AccessLogSink::Stderr => {
-                Ok(shared_stdio(sink).expect("stdio variants always have a shared sink"))
-            }
-            AccessLogSink::File { path } => {
-                let key = canonical_key(Path::new(path));
-                let mut files = self.files.lock().unwrap();
-                if let Some(existing) = files.get(&key) {
-                    return Ok(existing.clone());
-                }
-                let sink = Arc::new(QueuedSink::new(
-                    path.clone(),
-                    Arc::new(FileSink::new(path)?),
-                ));
-                files.insert(key, sink.clone());
-                Ok(sink)
-            }
-        }
+        build_sink(sink)
     }
 }
 
@@ -764,7 +789,7 @@ mod tests {
             lines: lines.clone(),
         });
         (
-            QueuedSink::with_capacity("gated", inner, max_bytes),
+            QueuedSink::with_capacity("gated", inner, max_bytes).unwrap(),
             open,
             lines,
         )
@@ -841,7 +866,7 @@ mod tests {
     #[test]
     fn queued_sink_flush_waits_for_every_queued_line() {
         let path = temp_path("queued-flush");
-        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap()));
+        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap())).unwrap();
         for i in 0..1000 {
             sink.write_line(&format!("line {i}\n"));
         }
@@ -857,7 +882,7 @@ mod tests {
         // Shutdown case: workers drop their handlers (and sinks) before the
         // main thread flushes. Lines queued before the drop must still land.
         let path = temp_path("queued-dropped");
-        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap()));
+        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap())).unwrap();
         for i in 0..100 {
             sink.write_line(&format!("{i}\n"));
         }
@@ -884,7 +909,7 @@ mod tests {
     fn queued_sink_reopen_is_ordered_after_earlier_lines() {
         let path = temp_path("queued-rotate");
         let renamed = temp_path("queued-rotate-renamed");
-        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap()));
+        let sink = QueuedSink::new("file", Arc::new(FileSink::new(&path).unwrap())).unwrap();
 
         sink.write_line("before rotate\n");
         sink.flush();
@@ -914,7 +939,7 @@ mod tests {
                 Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope"))
             }
         }
-        let sink = QueuedSink::new("failing", Arc::new(FailingReopen));
+        let sink = QueuedSink::new("failing", Arc::new(FailingReopen)).unwrap();
         assert_eq!(
             sink.reopen().unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
@@ -951,6 +976,92 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&other_path).unwrap();
+    }
+
+    fn file_sink_cfg(path: &Path) -> AccessLogSink {
+        AccessLogSink::File {
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Whether `path` has a live entry in the process-wide map.
+    fn is_live(path: &Path) -> bool {
+        file_sinks()
+            .lock()
+            .unwrap()
+            .get(&canonical_key(path))
+            .is_some_and(|w| w.strong_count() > 0)
+    }
+
+    #[test]
+    fn independent_registries_share_one_sink_per_path() {
+        let path = temp_path("shared-across-registries");
+        let other = temp_path("shared-across-registries-other");
+        // Two registries stand in for two workers / chains / generations.
+        let a = SinkRegistry::new().build(&file_sink_cfg(&path)).unwrap();
+        let b = SinkRegistry::new().build(&file_sink_cfg(&path)).unwrap();
+        let c = SinkRegistry::new().build(&file_sink_cfg(&other)).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "same path must share one writer");
+        assert!(!Arc::ptr_eq(&a, &c), "different paths must not share");
+
+        for i in 0..50 {
+            a.write_line(&format!("a{i}\n"));
+            b.write_line(&format!("b{i}\n"));
+        }
+        a.flush();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let expected: String = (0..50).map(|i| format!("a{i}\nb{i}\n")).collect();
+        assert_eq!(text, expected, "one queue keeps submission order intact");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&other).unwrap();
+    }
+
+    #[test]
+    fn relative_and_absolute_spellings_share() {
+        let rel = PathBuf::from(format!(
+            "relabs-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let abs = std::env::current_dir().unwrap().join(&rel);
+        let a = SinkRegistry::new().build(&file_sink_cfg(&rel)).unwrap();
+        let b = SinkRegistry::new().build(&file_sink_cfg(&abs)).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "relative and absolute must share");
+        drop((a, b));
+        std::fs::remove_file(&abs).unwrap();
+    }
+
+    #[test]
+    fn dead_entry_is_replaced_and_pruned() {
+        let path = temp_path("dead-entry");
+        let other = temp_path("dead-entry-other");
+        let first = SinkRegistry::new().build(&file_sink_cfg(&path)).unwrap();
+        assert!(is_live(&path));
+        drop(first);
+        assert!(!is_live(&path), "last holder dropped, entry is dead");
+
+        // Building another path prunes the dead entry; building the same
+        // path again yields a fresh, working sink.
+        let o = SinkRegistry::new().build(&file_sink_cfg(&other)).unwrap();
+        assert!(
+            !file_sinks()
+                .lock()
+                .unwrap()
+                .contains_key(&canonical_key(&path)),
+            "dead entry pruned on insert"
+        );
+        let again = SinkRegistry::new().build(&file_sink_cfg(&path)).unwrap();
+        again.write_line("fresh\n");
+        again.flush();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("fresh\n"));
+
+        drop((o, again));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&other).unwrap();
     }
 
     #[test]
