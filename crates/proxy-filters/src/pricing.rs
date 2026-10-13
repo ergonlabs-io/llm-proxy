@@ -257,7 +257,8 @@ fn list_cost_nanodollars(entry: &PriceEntry, usage: &TokenUsage) -> u64 {
     // its own bucket's rate in the band its position falls in, so every token
     // is priced exactly once. Output is not part of the context; it is priced
     // at the band the whole context selected.
-    let buckets: [(u64, fn(&Tier) -> u64); 3] = [
+    type Rate = fn(&Tier) -> u64;
+    let buckets: [(u64, Rate); 3] = [
         (usage.cached_tokens, |t| {
             t.cached_input_nanodollars_per_token
         }),
