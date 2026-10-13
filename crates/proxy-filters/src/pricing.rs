@@ -210,15 +210,6 @@ fn context_tokens(usage: &TokenUsage) -> u64 {
         .saturating_add(usage.cache_creation_tokens)
 }
 
-fn rate_for_basis(basis: TierBasis, tier: &Tier) -> u64 {
-    match basis {
-        TierBasis::InputTokens => tier.input_nanodollars_per_token,
-        TierBasis::CachedTokens => tier.cached_input_nanodollars_per_token,
-        TierBasis::CacheCreationTokens => tier.cache_write_nanodollars_per_token,
-        TierBasis::OutputTokens => tier.output_nanodollars_per_token,
-    }
-}
-
 fn tier_for(tiers: &[Tier], quantity: u64) -> Option<&Tier> {
     tiers
         .iter()
@@ -260,51 +251,37 @@ fn list_cost_nanodollars(entry: &PriceEntry, usage: &TokenUsage) -> u64 {
         return all_buckets(usage, selected);
     }
 
-    let mut lower = 0u64;
-    let mut remaining = quantity;
-    let mut basis_cost = 0u64;
-    for tier in &entry.tiers {
-        if remaining == 0 {
-            break;
+    // Graduated: the context is laid out in prompt order and cut into bands
+    // like tax brackets. Providers cache prefixes, so cache-read tokens come
+    // first, then cache-write tokens, then the uncached input. Each token costs
+    // its own bucket's rate in the band its position falls in, so every token
+    // is priced exactly once. Output is not part of the context; it is priced
+    // at the band the whole context selected.
+    let buckets: [(u64, fn(&Tier) -> u64); 3] = [
+        (usage.cached_tokens, |t| {
+            t.cached_input_nanodollars_per_token
+        }),
+        (usage.cache_creation_tokens, |t| {
+            t.cache_write_nanodollars_per_token
+        }),
+        (usage.input_tokens, |t| t.input_nanodollars_per_token),
+    ];
+    let mut cost = usage
+        .output_tokens
+        .saturating_mul(selected.output_nanodollars_per_token);
+    let mut position = 0u64;
+    for (tokens, rate) in buckets {
+        let end = position.saturating_add(tokens);
+        let mut band_start = 0u64;
+        for tier in &entry.tiers {
+            let band_end = tier.up_to.unwrap_or(u64::MAX);
+            let overlap = end.min(band_end).saturating_sub(position.max(band_start));
+            cost = cost.saturating_add(overlap.saturating_mul(rate(tier)));
+            band_start = band_end;
         }
-        let upper = tier.up_to.unwrap_or(u64::MAX);
-        let in_band = remaining.min(upper.saturating_sub(lower));
-        basis_cost = basis_cost
-            .saturating_add(in_band.saturating_mul(rate_for_basis(entry.tier_basis, tier)));
-        remaining = remaining.saturating_sub(in_band);
-        lower = upper;
+        position = end;
     }
-    let non_basis = match entry.tier_basis {
-        TierBasis::InputTokens => all_buckets(
-            &TokenUsage {
-                input_tokens: 0,
-                ..*usage
-            },
-            selected,
-        ),
-        TierBasis::CachedTokens => all_buckets(
-            &TokenUsage {
-                cached_tokens: 0,
-                ..*usage
-            },
-            selected,
-        ),
-        TierBasis::CacheCreationTokens => all_buckets(
-            &TokenUsage {
-                cache_creation_tokens: 0,
-                ..*usage
-            },
-            selected,
-        ),
-        TierBasis::OutputTokens => all_buckets(
-            &TokenUsage {
-                output_tokens: 0,
-                ..*usage
-            },
-            selected,
-        ),
-    };
-    basis_cost.saturating_add(non_basis)
+    cost
 }
 
 #[cfg(test)]
@@ -380,6 +357,61 @@ mod tests {
             2_000_000
         );
     }
+    fn two_bands() -> Vec<Tier> {
+        vec![
+            tier(Some(1000), 1000, 100, 1200, 5000),
+            tier(None, 2000, 200, 2400, 10000),
+        ]
+    }
+
+    /// Cache-read fills the first 800 context tokens, input the next 500 (200
+    /// in band one, 300 in band two), and output follows the band the 1300
+    /// context tokens selected. Priced once: the old code charged the cache
+    /// tokens again at the cache rate on top of slicing them at the input rate.
+    #[test]
+    fn graduated_prices_every_token_once_in_prompt_order() {
+        let entry = entry(TierMode::Graduated, two_bands());
+        assert_eq!(
+            list_cost_nanodollars(&entry, &usage(500, 800, 0, 10)),
+            800 * 100 + 200 * 1000 + 300 * 2000 + 10 * 10000
+        );
+        assert_eq!(
+            list_cost_nanodollars(&entry, &usage(500, 800, 0, 10)),
+            980_000
+        );
+    }
+
+    #[test]
+    fn graduated_crosses_a_band_inside_each_bucket() {
+        let entry = entry(TierMode::Graduated, two_bands());
+        // cache-read 1500: 1000 at band one, 500 at band two.
+        assert_eq!(
+            list_cost_nanodollars(&entry, &usage(0, 1500, 0, 0)),
+            1000 * 100 + 500 * 200
+        );
+        // cache-write starts at 600: 400 in band one, 300 in band two.
+        assert_eq!(
+            list_cost_nanodollars(&entry, &usage(0, 600, 700, 0)),
+            600 * 100 + 400 * 1200 + 300 * 2400
+        );
+        // input starts at 900 + 50: 50 in band one, 250 in band two; output
+        // at the selected band two.
+        assert_eq!(
+            list_cost_nanodollars(&entry, &usage(300, 900, 50, 4)),
+            900 * 100 + 50 * 1200 + 50 * 1000 + 250 * 2000 + 4 * 10000
+        );
+    }
+
+    #[test]
+    fn graduated_with_one_band_matches_whole_request() {
+        let tiers = vec![tier(None, 7, 3, 9, 11)];
+        let u = usage(40, 30, 20, 10);
+        assert_eq!(
+            list_cost_nanodollars(&entry(TierMode::Graduated, tiers.clone()), &u),
+            list_cost_nanodollars(&entry(TierMode::WholeRequest, tiers), &u)
+        );
+    }
+
     #[test]
     fn context_length_selects_the_band_inclusively_across_cache_buckets() {
         let entry = entry(

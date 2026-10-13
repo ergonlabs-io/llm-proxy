@@ -573,3 +573,35 @@ fn the_legacy_carrier_registers_its_registry_so_pricing_can_reach_it() {
     );
     assert!(registry.publish_json(&card_json("put", 11)).is_ok());
 }
+
+/// Dollar enforcement and the recorded list cost both come from the one
+/// pricing function, so a graduated card with cache tokens agrees in both.
+#[test]
+fn dollar_enforcement_agrees_with_graduated_pricing_of_cache_tokens() {
+    let tier = |up_to: serde_json::Value, i: u64, c: u64, w: u64, o: u64| {
+        serde_json::json!({"up_to": up_to, "input_nanodollars_per_token": i,
+            "cached_input_nanodollars_per_token": c, "cache_write_nanodollars_per_token": w,
+            "output_nanodollars_per_token": o})
+    };
+    let card = serde_json::json!({
+        "price_list": {"effective_from": "2026-01-01T00:00:00Z", "entries": [{
+            "provider_type": "openai", "model": "gpt-5", "tier_mode": "graduated",
+            "tiers": [tier(1000.into(), 1000, 100, 1200, 5000),
+                      tier(serde_json::Value::Null, 2000, 200, 2400, 10000)]}]},
+        "providers": {"provider:openai": "openai"}
+    })
+    .to_string();
+    let r = registry();
+    r.publish_json(&card).unwrap();
+    let usage = TokenUsage {
+        input_tokens: 500,
+        cached_tokens: 800,
+        cache_creation_tokens: 0,
+        output_tokens: 10,
+    };
+    // 980,000 nanodollars, rounded up to micro-dollars.
+    assert_eq!(
+        r.cost_micro_usd(Some("provider:openai"), Some("gpt-5"), &usage),
+        Some(980)
+    );
+}

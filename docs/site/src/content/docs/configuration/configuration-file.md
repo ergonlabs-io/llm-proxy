@@ -282,13 +282,14 @@ open-ended band is missing, repeated, or not last.
 
 - `whole_request`: The selected band prices every token bucket of the whole
   request.
-- `graduated`: The proxy prices each slice of the context size at the input rate
-  of the band that holds the slice. The slices cover all context tokens,
-  including the cache-read and cache-write tokens. The proxy then prices the
-  cache-read, cache-write, and output tokens at the rates of the selected band.
-  So it prices a cache-read or cache-write token twice: once in its slice, at an
-  input rate, and once at its cache rate. If the model reports cache tokens, use
-  `whole_request`.
+- `graduated`: The proxy lays the context out in prompt order: cache-read tokens
+  first, then cache-write tokens, then input tokens. It cuts that sequence into
+  the bands. Each token costs its own rate in the band that holds its position,
+  so every token is priced once. Output tokens are not part of the context. They
+  cost the output rate of the band that the whole context size selects. For
+  example, with a band up to 1000 tokens and then an open band, 800 cache-read
+  tokens and 500 input tokens put the cache-read tokens and the first 200 input
+  tokens in the first band, and the last 300 input tokens in the second band.
 
 ### Example
 
