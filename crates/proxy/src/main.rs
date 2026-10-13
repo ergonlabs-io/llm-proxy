@@ -1552,6 +1552,20 @@ fn publish_to_workers(
     version
 }
 
+/// The names `snapshot` still configures, as the stats registry's live scope.
+/// Clusters and listeners are restricted to the snapshot's own; tenants and
+/// models stay unrestricted because no snapshot field names them (they come
+/// from credentials and request bodies), so restricting them here would hide
+/// live series.
+fn live_scope_for(snapshot: &ConfigSnapshot) -> proxy_observability::stats::LiveScope {
+    proxy_observability::stats::LiveScope {
+        clusters: Some(snapshot.clusters.keys().cloned().collect()),
+        listeners: Some(snapshot.listeners.keys().cloned().collect()),
+        tenants: None,
+        models: None,
+    }
+}
+
 /// Applies an already-built [`ConfigSnapshot`] to every piece of running
 /// state, in the one order that is safe. This is the shared apply path:
 /// `reload` below (the SIGHUP producer) is the first
@@ -1561,6 +1575,9 @@ fn publish_to_workers(
 ///
 /// Order of operations, and why -- unchanged from what used to be inline in
 /// `reload`, just no longer duplicated for a second caller:
+/// 0. [`proxy_observability::stats::StatsControl::set_live_scope`] with the
+///    snapshot's cluster and listener names, so series of removed ones stop
+///    being emitted and stop counting against their caps.
 /// 1. [`proxy_http::stat_handles::StatHandles::resolve_missing`] over the
 ///    cluster keys, so a cluster this table has never seen has a handle
 ///    resolved *before* traffic can possibly reach it.
@@ -1620,6 +1637,13 @@ async fn apply_snapshot(
         proxy_cluster::manager::ClusterBuildError,
     )>,
 ) {
+    // Hide the series of clusters and listeners this snapshot no longer
+    // names, and let a returning one reappear with its old value, BEFORE the
+    // resolves below so their cap accounting sees the new scope. Tenants and
+    // models stay unrestricted: no snapshot field names them (they come from
+    // credentials and request bodies), so hiding them here would hide live
+    // series. Frees no memory; see the stats module doc.
+    stats_control.set_live_scope(live_scope_for(&snapshot));
     tables
         .router
         .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
@@ -3051,6 +3075,15 @@ mod tests {
         );
         manager.update_from_snapshot(&snapshot).await;
         Arc::new(manager)
+    }
+
+    #[test]
+    fn the_live_scope_restricts_clusters_and_listeners_but_not_tenants_or_models() {
+        let scope = live_scope_for(&ConfigSnapshot::default());
+        assert_eq!(scope.clusters, Some(Default::default()));
+        assert_eq!(scope.listeners, Some(Default::default()));
+        assert_eq!(scope.tenants, None);
+        assert_eq!(scope.models, None);
     }
 
     fn bound_lifecycle() -> Arc<LifecycleState> {

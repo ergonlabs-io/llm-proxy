@@ -57,10 +57,11 @@
 //! it comes from a caller's credential
 //! (`proxy_http::stream_info::AuthInfo::tenant`), so it isn't known until a
 //! request actually authenticates. [`GenAiTokenStats::record_usage`] resolves
-//! it per call, via [`proxy_observability::stats::Registry::resolve_capped`]
+//! it per call, via [`proxy_observability::stats::Registry::resolve_capped_memo`]
 //! -- reachable from a worker's plain `Arc<Registry>`, unlike the general
 //! `resolve`, and capped so a caller cannot grow the registry without bound
-//! (see that method's doc). [`TokenUsageStatHandles`] still pre-resolves,
+//! (see that method's doc). A per-worker memo serves a tenant already seen,
+//! so only a new tenant takes the registry's lock. [`TokenUsageStatHandles`] still pre-resolves,
 //! at boot, the ONE tenant value that IS known ahead of time for every
 //! provider: "no tenant at all"
 //! (`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`) -- unauthenticated
@@ -73,8 +74,8 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use proxy_observability::access_log::LlmTokens;
 use proxy_observability::stats::{
-    instruments, record_tenant_credential_request, Handle, HistogramHandle, Registry, StatsControl,
-    WorkerId,
+    instruments, record_tenant_credential_request, Handle, HandleMemo, HistogramHandle, Registry,
+    StatsControl, WorkerId,
 };
 
 /// One cluster's pre-resolved handles: the `upstream_rq` counter and the
@@ -570,6 +571,11 @@ pub struct GenAiTokenStats {
     handles: Arc<TokenUsageStatHandles>,
     worker: WorkerId,
     warned_unknown_providers: Mutex<HashSet<String>>,
+    /// Worker-local memo of `(provider, type, tenant)` -> handle, in front of
+    /// `resolve_capped`. A tenant seen before records without the registry's
+    /// process-wide lock; a tenant folded into the overflow series is never
+    /// memoized, so it is retried once retirement frees a slot.
+    tenant_memo: HandleMemo<Handle>,
 }
 
 /// Upper bound for each GenAI latency histogram's model-labelled series.
@@ -587,11 +593,21 @@ pub const GEN_AI_LATENCY_MODEL_CARDINALITY_OVERFLOW: &str = "-cardinality-overfl
 pub struct GenAiLatencyStats {
     registry: Arc<Registry>,
     worker: WorkerId,
+    /// Worker-local memos in front of `resolve_histogram_capped`, one per
+    /// instrument, so a model seen before records without the registry's
+    /// process-wide lock. See `proxy_observability::stats::HandleMemo`.
+    ttft_memo: HandleMemo<HistogramHandle>,
+    tpot_memo: HandleMemo<HistogramHandle>,
 }
 
 impl GenAiLatencyStats {
     pub fn new(registry: Arc<Registry>, worker: WorkerId) -> Self {
-        Self { registry, worker }
+        Self {
+            registry,
+            worker,
+            ttft_memo: HandleMemo::new(),
+            tpot_memo: HandleMemo::new(),
+        }
     }
 
     /// Records the semconv-v1.27 TTFT histogram whenever the response
@@ -623,7 +639,8 @@ impl GenAiLatencyStats {
         ];
 
         if let Some(ttft) = time_to_first_body_byte {
-            let handle = self.registry.resolve_histogram_capped(
+            let handle = self.registry.resolve_histogram_capped_memo(
+                &self.ttft_memo,
                 &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
                 &attrs,
                 GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
@@ -642,7 +659,8 @@ impl GenAiLatencyStats {
         let Some(after_first) = stream_duration.checked_sub(ttft) else {
             return;
         };
-        let handle = self.registry.resolve_histogram_capped(
+        let handle = self.registry.resolve_histogram_capped_memo(
+            &self.tpot_memo,
             &instruments::GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN,
             &attrs,
             GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
@@ -667,6 +685,7 @@ impl GenAiTokenStats {
             handles,
             worker,
             warned_unknown_providers: Mutex::new(HashSet::new()),
+            tenant_memo: HandleMemo::new(),
         }
     }
 
@@ -710,11 +729,10 @@ impl GenAiTokenStats {
     }
 
     /// The dynamic half of tenant resolution -- called once per
-    /// [`Self::record_usage`] when `tenant` is `Some`, never cached across
-    /// calls in THIS type (there is nothing here to cache: `Registry`'s own
-    /// dedup map, behind `resolve_capped`, already makes a repeat call for
-    /// the same `(provider, tenant)` cheap and idempotent -- see that
-    /// method's doc). `provider` is assumed already known (`record_usage`
+    /// [`Self::record_usage`] when `tenant` is `Some`. A series this worker
+    /// has seen is served from `tenant_memo`; only a new one (or one folded
+    /// into the overflow series) reaches `Registry::resolve_capped` and its
+    /// process-wide lock. `provider` is assumed already known (`record_usage`
     /// checks that first), so every bucket resolved here is real, budgeted
     /// growth or a reuse of the shared overflow series -- never wasted on a
     /// provider this process doesn't serve.
@@ -737,7 +755,8 @@ impl GenAiTokenStats {
                     instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW,
                 ),
             ];
-            self.registry.resolve_capped(
+            self.registry.resolve_capped_memo(
+                &self.tenant_memo,
                 &instruments::LLM_CLIENT_TOKEN_USAGE,
                 &[("provider", provider), ("type", bucket), ("tenant", tenant)],
                 instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING,
@@ -1335,5 +1354,91 @@ mod tests {
             a, overflow,
             "an overflowing tenant must resolve to the shared series"
         );
+    }
+
+    /// The recorder's memo is what keeps a tenant's second request off the
+    /// registry's process-wide lock: `capped_lock_acquisitions` is the same
+    /// counter every capped resolution increments in production.
+    #[test]
+    fn a_warm_tenant_series_takes_no_registry_lock() {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["openai"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles, WorkerId(0));
+
+        stats.record_usage("openai", Some("acme"), sample_tokens());
+        let after_cold = registry.capped_lock_acquisitions();
+        assert!(after_cold > 0, "the first request resolves its series");
+
+        for _ in 0..5 {
+            stats.record_usage("openai", Some("acme"), sample_tokens());
+        }
+        assert_eq!(
+            registry.capped_lock_acquisitions(),
+            after_cold,
+            "a warm series must not touch the registry's lock"
+        );
+        let total: u64 = registry
+            .counters()
+            .filter(|(_, attrs, _)| attrs.iter().any(|(k, v)| k == "tenant" && v == "acme"))
+            .filter(|(_, attrs, _)| attrs.iter().any(|(k, v)| k == "type" && v == "input"))
+            .map(|(_, _, value)| value)
+            .sum();
+        assert_eq!(total, 6 * 40, "the memoized handle still counts");
+    }
+
+    #[test]
+    fn a_warm_model_series_takes_no_registry_lock() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let stats = GenAiLatencyStats::new(registry.clone(), WorkerId(0));
+        let record = || {
+            stats.record(
+                "chat",
+                "gpt-4o",
+                "openai",
+                Some(Duration::from_millis(100)),
+                Duration::from_secs(1),
+                Some(5),
+            )
+        };
+
+        record();
+        let after_cold = registry.capped_lock_acquisitions();
+        assert_eq!(after_cold, 2, "TTFT and TPOT each resolve once");
+        record();
+        record();
+        assert_eq!(registry.capped_lock_acquisitions(), after_cold);
+        let (_, ttft) = latency_histogram(&registry, "gen_ai.server.time_to_first_token");
+        assert_eq!(ttft.count, 3);
+    }
+
+    #[test]
+    fn a_tenant_folded_into_the_overflow_series_is_retried_after_its_slot_frees() {
+        let control = StatsControl::new(1);
+        let handles = Arc::new(TokenUsageStatHandles::build(&control, ["gone", "kept"]));
+        let registry = control.registry();
+        let stats = GenAiTokenStats::new(registry.clone(), handles, WorkerId(0));
+        let ceiling = instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CEILING;
+
+        // Fill every slot with tenants of the soon-to-be-removed provider.
+        for i in 0..ceiling {
+            stats.record_usage("gone", Some(&format!("t{i}")), sample_tokens());
+        }
+        stats.record_usage("kept", Some("late"), sample_tokens());
+        let tenant_series = |tenant: &str| {
+            registry
+                .counters()
+                .filter(|(_, attrs, _)| attrs.iter().any(|(k, v)| k == "tenant" && v == tenant))
+                .count()
+        };
+        assert_eq!(tenant_series("late"), 0, "folded while the cap is full");
+
+        control.set_live_scope(proxy_observability::stats::LiveScope {
+            clusters: Some(["kept".to_string()].into()),
+            ..Default::default()
+        });
+        stats.record_usage("kept", Some("late"), sample_tokens());
+        assert_eq!(tenant_series("late"), 4, "late now has its own series");
     }
 }

@@ -48,6 +48,8 @@ proxy-capture-protocol = { path = "../proxy-capture-protocol" }
 
 [dev-dependencies]
 tempfile = { version = "=3.27.0", default-features = false }
+# Captures the once-only series-cap warning in stats.rs tests.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

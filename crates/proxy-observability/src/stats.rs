@@ -104,7 +104,7 @@
 //! ```text
 //! struct Registry {
 //!     published: ArcSwap<Snapshot>,   // hot path: lock-free load
-//!     control: Mutex<ControlState>,   // touched ONLY by resolve/resolve_histogram
+//!     control: Mutex<ControlState>,   // resolution only; never held while counting
 //! }
 //! ```
 //!
@@ -117,8 +117,39 @@
 //! versa. Growth builds a whole new `Snapshot` and swaps it in;
 //! `incr`/`value`/`observe`/etc. do one lock-free `published.load()` and read
 //! everything out of the `Arc<Snapshot>` they get back. `ControlState`
-//! (private) holds only the dedup maps (`lookup`, `histogram_lookup`) —
-//! nothing on the request path ever takes that lock.
+//! (private) holds the dedup maps (`lookup`, `histogram_lookup`), the
+//! per-instrument live-series counts the cardinality caps read, and the
+//! once-per-instrument overflow warnings.
+//!
+//! Recording to an already-resolved handle never takes that lock. Resolving a
+//! dynamic series does: [`Registry::resolve_capped`] and
+//! [`Registry::resolve_histogram_capped`] lock it on every call, and a request
+//! reaches them for the tenant, model and credential series. A recorder
+//! therefore keeps a per-worker [`HandleMemo`] in front of them, so a warm
+//! series costs one uncontended memo lookup instead of a process-wide lock.
+//! Only a series seen for the first time, or one folded into its overflow
+//! series, reaches the lock.
+//!
+//! ## Series are bounded and hidden, never freed
+//!
+//! A handle never moves and a registered series is never deallocated, because
+//! a worker may still hold the handle. Two mechanisms bound the damage:
+//!
+//! - **Caps.** Each dynamic instrument has a ceiling on live series. The
+//!   check and the insert happen under one acquisition of the lock, against an
+//!   O(1) per-instrument count. The first overflow of an instrument logs one
+//!   warning naming the instrument and its ceiling, never a label value
+//!   (those can be client-controlled).
+//! - **Retirement by hiding.** [`StatsControl::set_live_scope`] tells the
+//!   registry which cluster, listener, tenant and model names the running
+//!   config still names. A series whose label is outside that set stops being
+//!   emitted by [`Registry::counters`]/[`Registry::histograms`] and stops
+//!   counting against its cap, so a live name that would have folded into the
+//!   overflow series gets its own again. A series that becomes live again
+//!   reappears with its old value. This does NOT reclaim memory: the series
+//!   keeps its slot, its shards and its dedup entry for the life of the
+//!   process. A process that churns through unbounded distinct names still
+//!   grows, only more slowly than the cap alone would allow.
 //!
 //! This is the same "control computes, workers `load`" shape
 //! `proxy_cluster::manager::ClusterManager` already uses for `HostSet`, and
@@ -288,10 +319,11 @@
 //! nothing needs `Handle` and `HistogramHandle` to be interchangeable. As a
 //! second line of defense — because a *kind* mismatch is still possible even
 //! with separate handle types, e.g. calling `resolve` on a `Histogram`
-//! instrument — both `resolve` and `resolve_histogram` assert the
-//! instrument's `InstrumentKind` up front and panic loudly (control-side
-//! only, so this can never fire on the request path) rather than silently
-//! handing back a handle that the wrong storage shape backs.
+//! instrument — `resolve`, `resolve_histogram` and their capped variants
+//! assert the instrument's `InstrumentKind` up front and panic loudly rather
+//! than silently handing back a handle that the wrong storage shape backs.
+//! Every call site passes a `'static` instrument it chose itself, so a request
+//! cannot trigger the panic.
 //!
 //! ## One unit mismatch, recorded but not solved here
 //!
@@ -308,7 +340,8 @@
 //! here so whoever writes that renderer finds the warning instead of
 //! rediscovering the bug.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1123,6 +1156,10 @@ type ResolveKey = (&'static str, Vec<(String, String)>);
 /// wasting much unused space behind a rarely-resolved instrument.
 const COUNTER_BLOCK_LEN: usize = 64;
 
+/// The most labels a [`HandleMemo`] key can hold. Every dynamic instrument has
+/// three or fewer; a larger one fails loudly at its first call.
+const MEMO_MAX_LABELS: usize = 8;
+
 /// One worker shard's histogram state for one handle. Bucket counts are
 /// **non-cumulative** (see the module doc); `sum` and `count` are running
 /// totals updated alongside the bucket bump on every [`Registry::observe`]
@@ -1279,10 +1316,11 @@ impl Snapshot {
     }
 }
 
-/// Control-side-only state behind [`Registry::control`]'s `Mutex`: the dedup
-/// maps [`Registry::resolve`]/[`Registry::resolve_histogram`] check before
-/// growing anything. Nothing on the request path ever locks this -- see the
-/// module doc's "Resolution survives a config swap" section.
+/// State behind [`Registry::control`]'s `Mutex`: the dedup maps resolution
+/// checks before growing anything, and the cap bookkeeping that must change in
+/// the same acquisition. Recording to a resolved handle never locks this; a
+/// capped resolution does (see the module doc), which is why a per-worker
+/// [`HandleMemo`] sits in front of it.
 #[derive(Default)]
 struct ControlState {
     /// Dedup key -> already-resolved `Handle`, so resolving the same
@@ -1298,6 +1336,139 @@ struct ControlState {
     lookup: HashMap<ResolveKey, Handle>,
     /// Same role as `lookup`, for histograms.
     histogram_lookup: HashMap<ResolveKey, HistogramHandle>,
+    /// Live (not hidden by the [`LiveScope`]) series per instrument name,
+    /// counters and histograms alike (names are unique across kinds). The
+    /// cap checks read this in O(1) under the same acquisition that inserts,
+    /// so two concurrent resolves can never both pass a check that only one
+    /// slot satisfies.
+    live_counts: HashMap<&'static str, usize>,
+    /// Instruments that already logged their overflow warning.
+    overflow_warned: HashSet<&'static str>,
+}
+
+/// Names the running config still names, per scope. `None` means the scope
+/// is unrestricted (every value is live); `Some(set)` hides any series
+/// carrying a label of that kind outside the set. See the module doc's
+/// "Series are bounded and hidden, never freed".
+///
+/// Scopes map to attribute keys: `clusters` covers `cluster` and `provider`
+/// (a provider is the cluster actually dialled), `listeners` covers
+/// `listener`, `tenants` covers `tenant`, and `models` covers
+/// `gen_ai.request.model`. The reserved fold labels
+/// ([`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`] and the
+/// `-cardinality-overflow-` value) are never hidden, since no config names
+/// them.
+#[derive(Debug, Clone, Default)]
+pub struct LiveScope {
+    pub clusters: Option<HashSet<String>>,
+    pub listeners: Option<HashSet<String>>,
+    pub tenants: Option<HashSet<String>>,
+    pub models: Option<HashSet<String>>,
+}
+
+impl LiveScope {
+    fn is_live(&self, attrs: &[(String, String)]) -> bool {
+        attrs.iter().all(|(key, value)| {
+            let set = match key.as_str() {
+                "cluster" | "provider" => &self.clusters,
+                "listener" => &self.listeners,
+                "tenant" => &self.tenants,
+                "gen_ai.request.model" => &self.models,
+                _ => return true,
+            };
+            match set {
+                None => true,
+                Some(live) => {
+                    live.contains(value)
+                        || value == instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT
+                        || value == instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW
+                }
+            }
+        })
+    }
+}
+
+/// A worker-local memo from a dynamic series' label values to its handle,
+/// placed in front of [`Registry::resolve_capped_memo`] /
+/// [`Registry::resolve_histogram_capped_memo`] so a warm series skips the
+/// registry's process-wide lock. One memo serves one instrument (its key is
+/// the label values alone), and it holds only genuine series, never a name
+/// that folded into the overflow series: a folded name must be retried, since
+/// retirement can free its slot.
+///
+/// Rust note: the inner `Mutex` is for `Sync`, not for contention. Each
+/// recorder owns its memo and is used by one worker, so the lock is always
+/// uncontended and costs an atomic swap, not a wait on other workers.
+pub struct HandleMemo<H> {
+    entries: Mutex<MemoEntries<H>>,
+}
+
+/// One memoized series: its label values and its handle.
+type MemoEntry<H> = (Box<[String]>, H);
+
+struct MemoEntries<H> {
+    /// Hash of the label values -> entries with that hash. The `Vec` makes a
+    /// hash collision harmless and lets a lookup borrow `&[&str]` without
+    /// allocating a key.
+    buckets: HashMap<u64, Vec<MemoEntry<H>>>,
+    len: usize,
+}
+
+impl<H> Default for HandleMemo<H> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(MemoEntries {
+                buckets: HashMap::new(),
+                len: 0,
+            }),
+        }
+    }
+}
+
+impl<H: Copy> HandleMemo<H> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn hash_values(values: &[&str]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for value in values {
+            value.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn get(&self, values: &[&str]) -> Option<H> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries
+            .buckets
+            .get(&Self::hash_values(values))?
+            .iter()
+            .find(|(stored, _)| stored.iter().map(String::as_str).eq(values.iter().copied()))
+            .map(|(_, handle)| *handle)
+    }
+
+    /// Remembers `handle`, unless the memo already holds `max_len` entries.
+    /// The bound keeps a worker's memo no larger than the cap behind it.
+    fn insert(&self, values: &[&str], handle: H, max_len: usize) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len >= max_len {
+            return;
+        }
+        let stored: Box<[String]> = values.iter().map(|v| v.to_string()).collect();
+        entries
+            .buckets
+            .entry(Self::hash_values(values))
+            .or_default()
+            .push((stored, handle));
+        entries.len += 1;
+    }
 }
 
 /// The stats registry: the shared, hot-path type every worker holds as
@@ -1318,8 +1489,18 @@ pub struct Registry {
     /// `ArcSwap`, because resolution needs to check-then-insert atomically
     /// with respect to *other resolutions* -- two concurrent `resolve` calls
     /// for the same new `(instrument, attrs)` must not both grow a slot.
-    /// This lock is never taken on the request path.
+    /// Recording never takes it; capped resolution of a dynamic series does
+    /// (see the module doc).
     control: Mutex<ControlState>,
+    /// The scope [`Registry::counters`]/[`Registry::histograms`] filter by.
+    /// Written only under `control`, so the counts there always describe the
+    /// scope stored here.
+    live: ArcSwap<LiveScope>,
+    /// How many times a capped resolution took `control`. A recorder that
+    /// serves a warm series from its [`HandleMemo`] leaves this unchanged,
+    /// which is how a test (or an operator) can see that the global lock was
+    /// not touched.
+    capped_lock_acquisitions: AtomicU64,
 }
 
 impl Registry {
@@ -1335,7 +1516,15 @@ impl Registry {
         Self {
             published: ArcSwap::from_pointee(Snapshot::empty(num_workers)),
             control: Mutex::new(ControlState::default()),
+            live: ArcSwap::from_pointee(LiveScope::default()),
+            capped_lock_acquisitions: AtomicU64::new(0),
         }
+    }
+
+    /// Times a capped resolution has taken the registry's control lock. See
+    /// [`HandleMemo`]: a warm memoized series does not move this.
+    pub fn capped_lock_acquisitions(&self) -> u64 {
+        self.capped_lock_acquisitions.load(Ordering::Relaxed)
     }
 
     /// How many worker shards this registry was built with.
@@ -1369,18 +1558,27 @@ impl Registry {
         let key = Self::resolve_key(instrument, attrs);
 
         // Rust note: this lock guards the dedup map AND the check-then-grow
-        // sequence below as one atomic unit with respect to other
-        // resolve/resolve_histogram calls; it is never taken by
-        // incr/value/observe, so it can never be held by, or block, a
-        // request. `unwrap_or_else(PoisonError::into_inner)` rather than
-        // `.unwrap()`: a panic while holding this lock (e.g. inside
-        // `validate_attrs`, above) must not poison every future resolve --
-        // the dedup map itself is still perfectly valid data.
+        // sequence in `insert_counter` as one atomic unit with respect to
+        // other resolutions. Recording (incr/value/observe) never takes it.
+        // `unwrap_or_else(PoisonError::into_inner)` rather than `.unwrap()`:
+        // a panic while holding this lock must not poison every future
+        // resolve -- the dedup map itself is still perfectly valid data.
         let mut control = self
             .control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.insert_counter(&mut control, instrument, key)
+    }
 
+    /// Dedup-or-grow for a counter, with `control` already held by the
+    /// caller. Taking the guard as a parameter is what lets the capped
+    /// resolvers check the cap and insert under ONE acquisition.
+    fn insert_counter(
+        &self,
+        control: &mut ControlState,
+        instrument: &'static Instrument,
+        key: ResolveKey,
+    ) -> Handle {
         if let Some(&handle) = control.lookup.get(&key) {
             return handle;
         }
@@ -1411,6 +1609,9 @@ impl Registry {
             }
         }
 
+        if self.live.load().is_live(&key.1) {
+            *control.live_counts.entry(instrument.name).or_default() += 1;
+        }
         self.published.store(Arc::new(Snapshot {
             resolved,
             resolved_attrs,
@@ -1463,7 +1664,17 @@ impl Registry {
             .control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.insert_histogram(&mut control, instrument, num_boundaries, key)
+    }
 
+    /// The histogram counterpart of [`Self::insert_counter`].
+    fn insert_histogram(
+        &self,
+        control: &mut ControlState,
+        instrument: &'static Instrument,
+        num_boundaries: usize,
+        key: ResolveKey,
+    ) -> HistogramHandle {
         if let Some(&handle) = control.histogram_lookup.get(&key) {
             return handle;
         }
@@ -1486,6 +1697,9 @@ impl Registry {
             worker_shards.push(Arc::new(HistogramShard::new(num_buckets)));
         }
 
+        if self.live.load().is_live(&key.1) {
+            *control.live_counts.entry(instrument.name).or_default() += 1;
+        }
         self.published.store(Arc::new(Snapshot {
             resolved: old.resolved.clone(),
             resolved_attrs: old.resolved_attrs.clone(),
@@ -1499,42 +1713,37 @@ impl Registry {
     }
 
     /// A single, deliberately narrow exception to "no public resolve" above
-    /// (module doc, "Resolution survives a config swap") — the tenant dimension. Every other
-    /// instrument's attribute values are this process's OWN config (cluster
-    /// names, listener names), known and bounded at boot, which is exactly
-    /// why the general `resolve`/`resolve_histogram` stay control-side-only:
-    /// a worker never needs to grow the registry for a value it didn't
-    /// already know at boot. `tenant` breaks that premise — it comes from a
-    /// caller's credential (`StreamInfo::auth.tenant`), is not known until a
-    /// request actually authenticates, and (via a JWT claim) is partly
-    /// caller-influenced, so an uncapped version of this method would be a
-    /// real cardinality-exhaustion vector, not just an engineering
-    /// inconvenience. Hence *capped*, not general: reachable from a worker's
-    /// plain `Arc<Registry>` (unlike `resolve`), but growth stops the moment
-    /// `instrument` already has `ceiling` or more resolved series — every
-    /// call past that point resolves `overflow_attrs` instead of `attrs`.
-    /// That is the hazard note's own framing: drop the DIMENSION
-    /// (fold into one shared series) rather than the MEASUREMENT (still
-    /// recorded) or the alternative of letting a caller-chosen string grow
-    /// the registry without bound.
+    /// (module doc, "Resolution survives a config swap"): dimensions whose
+    /// values are NOT this process's own config. The tenant on
+    /// `llm.client.token.usage` comes from a caller's credential (partly
+    /// caller-influenced via a JWT claim), and the provider on the tenant
+    /// credential counter is only known once the router picks a member, so
+    /// neither can be pre-resolved at boot. An uncapped version would be a
+    /// cardinality-exhaustion vector, hence *capped*: growth stops once
+    /// `instrument` has `ceiling` live series, and every call past that
+    /// resolves `overflow_attrs` instead of `attrs`. That is the hazard
+    /// note's own framing: drop the DIMENSION (fold into one shared series)
+    /// rather than the MEASUREMENT or letting a caller-chosen string grow the
+    /// registry without bound.
     ///
-    /// The cap check reads `resolved` off the currently-published
-    /// `Snapshot` — the SAME state `resolve` itself maintains for
-    /// rendering, not a second, parallel bookkeeping structure — so a
-    /// tenant this process has already resolved keeps its own series
-    /// (a fast dedup hit inside `resolve`, no growth) for as long as the
-    /// process runs, even after the ceiling trips for anyone new.
+    /// The cap check and the insert share one acquisition of the control
+    /// lock, against an O(1) per-instrument count, so concurrent callers can
+    /// never overshoot `ceiling`. "Live" excludes series hidden by the
+    /// [`LiveScope`] (see [`StatsControl::set_live_scope`]), so retiring a
+    /// name frees its slot. A series already resolved keeps its handle (a
+    /// dedup hit, no growth) even after the ceiling trips for anyone new.
+    ///
+    /// The first fold of each instrument logs one warning naming the
+    /// instrument and ceiling, never a label value.
+    ///
+    /// A request-path caller should use [`Self::resolve_capped_memo`], which
+    /// avoids this lock for a series it has seen before.
     ///
     /// Panics under the same conditions as `resolve` (attribute key
     /// mismatch against `instrument.attribute_keys`, or a `Histogram`
-    /// instrument) — `overflow_attrs` is checked too, since it reaches the
-    /// same call once the ceiling trips. Note this means `validate_attrs`
-    /// (see its own doc) is no longer *provably* off the request path the
-    /// way it was when only `StatsControl` could reach `resolve` — a
-    /// mismatch here would still only be a programming error in this
-    /// module's own call sites (`attrs`/`overflow_attrs` are built from
-    /// `'static` `Instrument`s in `proxy_http::stat_handles`, never from
-    /// caller input), not something a request can trigger.
+    /// instrument). `attrs`/`overflow_attrs` are built from `'static`
+    /// `Instrument`s at the call sites, never from caller input, so a
+    /// mismatch is a programming error a request cannot trigger.
     pub fn resolve_capped(
         &self,
         instrument: &'static Instrument,
@@ -1542,47 +1751,84 @@ impl Registry {
         ceiling: usize,
         overflow_attrs: &[(&str, &str)],
     ) -> Handle {
-        // Rust note: locking once just to peek `lookup` (rather than
-        // reusing `resolve`'s own internal lock for this) keeps this method
-        // simple and correct at the cost of a second lock/unlock on a
-        // genuinely new tenant -- fine here, this instrument is recorded at
-        // most once per completed stream, not per byte. The point of this
-        // peek is purely to avoid double-counting an ALREADY-resolved
-        // tenant against `ceiling` below (which would wrongly divert it to
-        // the overflow bucket once the process has resolved `ceiling` OTHER
-        // tenants, fragmenting its own history) -- `resolve` itself is
-        // idempotent regardless, this only affects which handle a call for
-        // an existing tenant is routed to.
-        let key = Self::resolve_key(instrument, attrs);
-        {
-            let control = self
-                .control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(&handle) = control.lookup.get(&key) {
-                return handle;
-            }
-        }
-
-        let already_resolved = self
-            .published
-            .load()
-            .resolved
-            .iter()
-            .filter(|i| i.name == instrument.name)
-            .count();
-        if already_resolved >= ceiling {
-            return self.resolve(instrument, overflow_attrs);
-        }
-        self.resolve(instrument, attrs)
+        self.resolve_capped_detailed(instrument, attrs, ceiling, overflow_attrs)
+            .0
     }
 
-    /// Histogram counterpart to [`Self::resolve_capped`]. This is the one
-    /// deliberate worker-side histogram-resolution escape hatch: the model
-    /// name comes from a request body and therefore cannot be pre-resolved at
-    /// boot, but it must not make a public proxy an unbounded-series source.
-    /// Existing series always retain their handles; only new attribute sets
-    /// past `ceiling` fold into the supplied shared overflow series.
+    /// [`Self::resolve_capped`], also reporting whether the result is the
+    /// overflow series (`true`) rather than the series `attrs` names.
+    pub fn resolve_capped_detailed(
+        &self,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+        ceiling: usize,
+        overflow_attrs: &[(&str, &str)],
+    ) -> (Handle, bool) {
+        assert_ne!(
+            instrument.kind,
+            InstrumentKind::Histogram,
+            "stats::Registry::resolve_capped: {} is a Histogram -- use resolve_histogram_capped()",
+            instrument.name
+        );
+        Self::validate_attrs(instrument, attrs);
+        let key = Self::resolve_key(instrument, attrs);
+
+        self.capped_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(&handle) = control.lookup.get(&key) {
+            return (handle, false);
+        }
+        if control
+            .live_counts
+            .get(instrument.name)
+            .copied()
+            .unwrap_or(0)
+            >= ceiling
+        {
+            Self::validate_attrs(instrument, overflow_attrs);
+            Self::warn_overflow_once(&mut control, instrument, ceiling);
+            let overflow_key = Self::resolve_key(instrument, overflow_attrs);
+            return (
+                self.insert_counter(&mut control, instrument, overflow_key),
+                true,
+            );
+        }
+        (self.insert_counter(&mut control, instrument, key), false)
+    }
+
+    /// [`Self::resolve_capped`] behind a worker-local [`HandleMemo`]: a series
+    /// the memo already holds returns without touching the control lock. Only
+    /// a genuine series is memoized (never the overflow fold), up to
+    /// `ceiling` entries. `memo` must be used for this one `instrument` only.
+    pub fn resolve_capped_memo(
+        &self,
+        memo: &HandleMemo<Handle>,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+        ceiling: usize,
+        overflow_attrs: &[(&str, &str)],
+    ) -> Handle {
+        let mut values = [""; MEMO_MAX_LABELS];
+        let values = Self::memo_values(attrs, &mut values);
+        if let Some(handle) = memo.get(values) {
+            return handle;
+        }
+        let (handle, folded) =
+            self.resolve_capped_detailed(instrument, attrs, ceiling, overflow_attrs);
+        if !folded {
+            memo.insert(values, handle, ceiling);
+        }
+        handle
+    }
+
+    /// Histogram counterpart to [`Self::resolve_capped`]: the worker-side
+    /// escape hatch for the model name, which comes from a request body and
+    /// cannot be pre-resolved at boot. Same single-acquisition cap, same
+    /// once-per-instrument warning, same meaning of "live".
     pub fn resolve_histogram_capped(
         &self,
         instrument: &'static Instrument,
@@ -1590,6 +1836,19 @@ impl Registry {
         ceiling: usize,
         overflow_attrs: &[(&str, &str)],
     ) -> HistogramHandle {
+        self.resolve_histogram_capped_detailed(instrument, attrs, ceiling, overflow_attrs)
+            .0
+    }
+
+    /// [`Self::resolve_histogram_capped`], also reporting whether the result
+    /// is the overflow series.
+    pub fn resolve_histogram_capped_detailed(
+        &self,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+        ceiling: usize,
+        overflow_attrs: &[(&str, &str)],
+    ) -> (HistogramHandle, bool) {
         assert_eq!(
             instrument.kind,
             InstrumentKind::Histogram,
@@ -1598,29 +1857,126 @@ impl Registry {
         );
         Self::validate_attrs(instrument, attrs);
         Self::validate_attrs(instrument, overflow_attrs);
-
+        let num_boundaries = instrument
+            .buckets
+            .unwrap_or_else(|| {
+                panic!(
+                    "stats::Registry::resolve_histogram_capped: {} is a Histogram instrument \
+                     with no bucket boundaries -- this is a bug in the instrument's definition",
+                    instrument.name
+                )
+            })
+            .len();
         let key = Self::resolve_key(instrument, attrs);
-        {
-            let control = self
-                .control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(&handle) = control.histogram_lookup.get(&key) {
-                return handle;
-            }
-        }
 
-        let already_resolved = self
-            .published
-            .load()
+        self.capped_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(&handle) = control.histogram_lookup.get(&key) {
+            return (handle, false);
+        }
+        if control
+            .live_counts
+            .get(instrument.name)
+            .copied()
+            .unwrap_or(0)
+            >= ceiling
+        {
+            Self::warn_overflow_once(&mut control, instrument, ceiling);
+            let overflow_key = Self::resolve_key(instrument, overflow_attrs);
+            return (
+                self.insert_histogram(&mut control, instrument, num_boundaries, overflow_key),
+                true,
+            );
+        }
+        (
+            self.insert_histogram(&mut control, instrument, num_boundaries, key),
+            false,
+        )
+    }
+
+    /// Histogram counterpart of [`Self::resolve_capped_memo`].
+    pub fn resolve_histogram_capped_memo(
+        &self,
+        memo: &HandleMemo<HistogramHandle>,
+        instrument: &'static Instrument,
+        attrs: &[(&str, &str)],
+        ceiling: usize,
+        overflow_attrs: &[(&str, &str)],
+    ) -> HistogramHandle {
+        let mut values = [""; MEMO_MAX_LABELS];
+        let values = Self::memo_values(attrs, &mut values);
+        if let Some(handle) = memo.get(values) {
+            return handle;
+        }
+        let (handle, folded) =
+            self.resolve_histogram_capped_detailed(instrument, attrs, ceiling, overflow_attrs);
+        if !folded {
+            memo.insert(values, handle, ceiling);
+        }
+        handle
+    }
+
+    /// The label values of `attrs`, in order, borrowed into `buf` so a memo
+    /// lookup allocates nothing.
+    fn memo_values<'a>(
+        attrs: &[(&'a str, &'a str)],
+        buf: &'a mut [&'a str; MEMO_MAX_LABELS],
+    ) -> &'a [&'a str] {
+        assert!(
+            attrs.len() <= MEMO_MAX_LABELS,
+            "stats::HandleMemo: more than {MEMO_MAX_LABELS} labels"
+        );
+        for (slot, (_, value)) in buf.iter_mut().zip(attrs) {
+            *slot = value;
+        }
+        &buf[..attrs.len()]
+    }
+
+    /// Logs the first overflow of `instrument`, once per process. Names the
+    /// instrument and ceiling only: label values can be client-controlled.
+    fn warn_overflow_once(
+        control: &mut ControlState,
+        instrument: &'static Instrument,
+        ceiling: usize,
+    ) {
+        if control.overflow_warned.insert(instrument.name) {
+            tracing::warn!(
+                instrument = instrument.name,
+                ceiling,
+                "stats: series cap reached; new label values now fold into one overflow series \
+                 (a removed cluster, tenant or model frees its slot only once the config no \
+                 longer names it)"
+            );
+        }
+    }
+
+    /// Control side only, via [`StatsControl::set_live_scope`]. Replaces the
+    /// [`LiveScope`] and recounts the live series per instrument, in one
+    /// acquisition, so a resolve can never see a count that disagrees with the
+    /// scope.
+    fn set_live_scope(&self, scope: LiveScope) {
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.published.load();
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        let counters = state.resolved.iter().zip(&state.resolved_attrs);
+        let histograms = state
             .resolved_histograms
             .iter()
-            .filter(|i| i.name == instrument.name)
-            .count();
-        if already_resolved >= ceiling {
-            return self.resolve_histogram(instrument, overflow_attrs);
+            .zip(&state.resolved_histogram_attrs);
+        for (instrument, attrs) in counters.chain(histograms) {
+            if scope.is_live(attrs) {
+                *counts.entry(instrument.name).or_default() += 1;
+            }
         }
-        self.resolve_histogram(instrument, attrs)
+        control.live_counts = counts;
+        self.live.store(Arc::new(scope));
     }
 
     /// Builds the sorted `(instrument.name, attrs)` dedup key shared by
@@ -1636,9 +1992,10 @@ impl Registry {
     }
 
     /// Checks `attrs`' keys against `instrument.attribute_keys` as sets
-    /// (order-insensitive, exact match). Called only from `resolve`/
-    /// `resolve_histogram`, which are control-side, so panicking here is
-    /// fine — it can never fire on the request path.
+    /// (order-insensitive, exact match). Called from every resolver, including
+    /// the capped ones a request reaches. Their attrs come from `'static`
+    /// instrument definitions at the call site, never from caller input, so
+    /// the panic marks a programming error, not something a request can cause.
     fn validate_attrs(instrument: &Instrument, attrs: &[(&str, &str)]) {
         let mut given: Vec<&str> = attrs.iter().map(|(k, _)| *k).collect();
         given.sort_unstable();
@@ -1755,17 +2112,26 @@ impl Registry {
         &self,
     ) -> impl Iterator<Item = (&'static Instrument, Vec<(String, String)>, u64)> {
         let state = self.published.load_full();
+        let live = self.live.load_full();
         let n = state.resolved.len();
-        (0..n).map(move |i| {
-            let block = i / COUNTER_BLOCK_LEN;
-            let slot = i % COUNTER_BLOCK_LEN;
-            let value = state
-                .counter_shards
-                .iter()
-                .map(|worker_blocks| worker_blocks[block][slot].load(Ordering::Relaxed))
-                .fold(0u64, u64::wrapping_add);
-            (state.resolved[i], state.resolved_attrs[i].clone(), value)
-        })
+        // Hidden series (see `LiveScope`) are skipped here and nowhere else:
+        // `value` on a handle still reads them, since a worker may hold one.
+        // Rust note: two closures each need the snapshot, and `move` gives the
+        // first one ownership, so the filter gets its own `Arc` clone (a
+        // refcount bump).
+        let for_filter = Arc::clone(&state);
+        (0..n)
+            .filter(move |&i| live.is_live(&for_filter.resolved_attrs[i]))
+            .map(move |i| {
+                let block = i / COUNTER_BLOCK_LEN;
+                let slot = i % COUNTER_BLOCK_LEN;
+                let value = state
+                    .counter_shards
+                    .iter()
+                    .map(|worker_blocks| worker_blocks[block][slot].load(Ordering::Relaxed))
+                    .fold(0u64, u64::wrapping_add);
+                (state.resolved[i], state.resolved_attrs[i].clone(), value)
+            })
     }
 
     /// Hot path. Records one observation of `value` (in the instrument's
@@ -1867,14 +2233,18 @@ impl Registry {
         &self,
     ) -> impl Iterator<Item = (HistogramHandle, &'static Instrument, Vec<(String, String)>)> {
         let state = self.published.load_full();
+        let live = self.live.load_full();
         let n = state.resolved_histograms.len();
-        (0..n).map(move |i| {
-            (
-                HistogramHandle(i),
-                state.resolved_histograms[i],
-                state.resolved_histogram_attrs[i].clone(),
-            )
-        })
+        let for_filter = Arc::clone(&state);
+        (0..n)
+            .filter(move |&i| live.is_live(&for_filter.resolved_histogram_attrs[i]))
+            .map(move |i| {
+                (
+                    HistogramHandle(i),
+                    state.resolved_histograms[i],
+                    state.resolved_histogram_attrs[i].clone(),
+                )
+            })
     }
 
     /// The `p`-th percentile (`p` in `[0, 100]`) of `handle`'s observations,
@@ -2006,6 +2376,16 @@ impl StatsControl {
         attrs: &[(&str, &str)],
     ) -> HistogramHandle {
         self.registry.resolve_histogram(instrument, attrs)
+    }
+
+    /// Tells the registry which cluster, listener, tenant and model names the
+    /// running config still names. Series outside the scope stop being
+    /// emitted and stop counting against their caps; they reappear with their
+    /// old value if the scope names them again. Call it on every config
+    /// apply, before resolving the new snapshot's series. Frees no memory:
+    /// see the module doc's "Series are bounded and hidden, never freed".
+    pub fn set_live_scope(&self, scope: LiveScope) {
+        self.registry.set_live_scope(scope);
     }
 }
 
@@ -3002,6 +3382,389 @@ mod tests {
             tenant_credential_series(&registry),
             instruments::TENANT_CREDENTIAL_SERIES_CEILING + 1,
             "growth stops at the ceiling plus the one overflow series"
+        );
+    }
+
+    // ---- retirement by hiding, atomic caps, the worker memo --------------
+
+    const TOKEN_OVERFLOW: &str = instruments::LLM_CLIENT_TOKEN_USAGE_TENANT_CARDINALITY_OVERFLOW;
+
+    /// Resolves `tenant`'s `input` series under `provider` through the
+    /// capped path, reporting whether it folded into the overflow series.
+    fn token_series(
+        registry: &Registry,
+        provider: &str,
+        tenant: &str,
+        ceiling: usize,
+    ) -> (Handle, bool) {
+        registry.resolve_capped_detailed(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", provider),
+                ("type", "input"),
+                ("tenant", tenant),
+            ],
+            ceiling,
+            &[
+                ("provider", provider),
+                ("type", "input"),
+                ("tenant", TOKEN_OVERFLOW),
+            ],
+        )
+    }
+
+    /// The attribute sets `counters()` emits for `name`, sorted.
+    fn emitted(registry: &Registry, name: &str) -> Vec<Vec<(String, String)>> {
+        let mut series: Vec<_> = registry
+            .counters()
+            .filter(|(instrument, _, _)| instrument.name == name)
+            .map(|(_, attrs, _)| attrs)
+            .collect();
+        series.sort();
+        series
+    }
+
+    fn names(set: &[&str]) -> Option<HashSet<String>> {
+        Some(set.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_series_whose_cluster_leaves_the_config_is_hidden_and_reappears_with_its_old_value() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let gone = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "gone")]);
+        let kept = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", "kept")]);
+        let latency =
+            control.resolve_histogram(&instruments::UPSTREAM_RQ_TIME, &[("cluster", "gone")]);
+        registry.incr(WorkerId(0), gone, 5);
+        registry.incr(WorkerId(0), kept, 1);
+        registry.observe(WorkerId(0), latency, 3.0);
+
+        control.set_live_scope(LiveScope {
+            clusters: names(&["kept"]),
+            ..LiveScope::default()
+        });
+        let live: Vec<_> = registry.counters().map(|(_, attrs, _)| attrs).collect();
+        assert_eq!(live, [[("cluster".to_string(), "kept".to_string())]]);
+        assert_eq!(
+            registry.histograms().count(),
+            0,
+            "the removed cluster's histogram is hidden too"
+        );
+
+        // A straggling request still records against the hidden handle.
+        registry.incr(WorkerId(0), gone, 2);
+
+        control.set_live_scope(LiveScope {
+            clusters: names(&["kept", "gone"]),
+            ..LiveScope::default()
+        });
+        let value_of = |cluster: &str| {
+            registry
+                .counters()
+                .find(|(_, attrs, _)| attrs[0].1 == cluster)
+                .map(|(_, _, value)| value)
+        };
+        assert_eq!(value_of("gone"), Some(7), "old value plus the straggler");
+        assert_eq!(registry.histograms().count(), 1);
+    }
+
+    #[test]
+    fn a_listener_absent_from_the_scope_is_hidden() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        control.resolve(&instruments::DOWNSTREAM_CX_TOTAL, &[("listener", "old")]);
+        control.resolve(&instruments::DOWNSTREAM_CX_TOTAL, &[("listener", "new")]);
+        control.set_live_scope(LiveScope {
+            listeners: names(&["new"]),
+            ..LiveScope::default()
+        });
+        let live = emitted(&registry, "downstream_cx_total");
+        assert_eq!(live, [[("listener".to_string(), "new".to_string())]]);
+    }
+
+    #[test]
+    fn retiring_a_provider_frees_the_cap_slots_of_its_tenant_series() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        // Ceiling 3: two tenants on `gone`, one on `kept`.
+        token_series(&registry, "gone", "t1", 3);
+        token_series(&registry, "gone", "t2", 3);
+        let (_, folded) = token_series(&registry, "kept", "t3", 3);
+        assert!(!folded);
+        let (overflow, folded) = token_series(&registry, "kept", "t4", 3);
+        assert!(folded, "the cap is full, so a new tenant folds");
+
+        control.set_live_scope(LiveScope {
+            clusters: names(&["kept"]),
+            ..LiveScope::default()
+        });
+        let live = emitted(&registry, "llm.client.token.usage");
+        assert_eq!(live.len(), 2, "gone's tenant series are hidden: {live:?}");
+
+        // The two slots `gone` held are free: t5 and t6 get their own series
+        // where they would have folded, and the cap holds again after that.
+        let (t5, folded5) = token_series(&registry, "kept", "t5", 3);
+        assert!(!folded5 && t5 != overflow);
+        let (_, folded6) = token_series(&registry, "kept", "t6", 3);
+        assert!(folded6, "the cap is full again");
+        let tenants: Vec<String> = emitted(&registry, "llm.client.token.usage")
+            .into_iter()
+            .map(|attrs| attrs.into_iter().find(|(k, _)| k == "tenant").unwrap().1)
+            .collect();
+        assert!(tenants.contains(&"t5".to_string()), "{tenants:?}");
+        assert!(!tenants.contains(&"t1".to_string()), "{tenants:?}");
+    }
+
+    #[test]
+    fn a_retired_tenant_is_hidden_and_frees_its_slot_but_reserved_labels_never_are() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        control.resolve(
+            &instruments::LLM_CLIENT_TOKEN_USAGE,
+            &[
+                ("provider", "p"),
+                ("type", "input"),
+                ("tenant", instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT),
+            ],
+        );
+        token_series(&registry, "p", "gone-co", 4);
+        token_series(&registry, "p", "acme", 4);
+        let (_, folded) = token_series(&registry, "p", "newco", 4);
+        assert!(!folded, "the fourth series still fits");
+        let (_, folded) = token_series(&registry, "p", "late", 4);
+        assert!(folded, "boot series count toward the cap too");
+
+        control.set_live_scope(LiveScope {
+            tenants: names(&["acme"]),
+            ..LiveScope::default()
+        });
+        let tenants: HashSet<String> = emitted(&registry, "llm.client.token.usage")
+            .into_iter()
+            .map(|attrs| attrs.into_iter().find(|(k, _)| k == "tenant").unwrap().1)
+            .collect();
+        assert_eq!(
+            tenants,
+            HashSet::from([
+                "acme".to_string(),
+                instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT.to_string(),
+                TOKEN_OVERFLOW.to_string(),
+            ]),
+            "gone-co is hidden; the unauthenticated and overflow labels stay"
+        );
+
+        // gone-co and newco no longer count, so `late` gets its own series.
+        let (_, folded) = token_series(&registry, "p", "late", 4);
+        assert!(!folded, "late now fits");
+    }
+
+    #[test]
+    fn a_retired_model_is_hidden_and_frees_its_histogram_slot() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let resolve = |model: &str| {
+            registry.resolve_histogram_capped_detailed(
+                &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.request.model", model),
+                    ("gen_ai.system", "openai"),
+                ],
+                3,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.request.model", TOKEN_OVERFLOW),
+                    ("gen_ai.system", "openai"),
+                ],
+            )
+        };
+        resolve("old-model");
+        resolve("live-model");
+        resolve("other-model");
+        assert!(resolve("fresh-model").1, "the cap is full");
+
+        control.set_live_scope(LiveScope {
+            models: names(&["live-model"]),
+            ..LiveScope::default()
+        });
+        let (_, folded) = resolve("fresh-model");
+        assert!(!folded, "old-model and other-model no longer count");
+        assert!(registry
+            .histograms()
+            .all(|(_, _, attrs)| attrs.iter().all(|(_, v)| v != "old-model")));
+    }
+
+    /// A `tracing` writer that appends to a shared buffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_overflow_warning_fires_once_per_instrument_and_never_names_a_label_value() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let control = StatsControl::new(1);
+            let registry = control.registry();
+            // Below the cap: silent.
+            token_series(&registry, "p", "secret-tenant-0", 2);
+            assert!(captured.0.lock().unwrap().is_empty());
+            for i in 1..6 {
+                token_series(&registry, "p", &format!("secret-tenant-{i}"), 2);
+            }
+            registry.resolve_histogram_capped(
+                &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.request.model", "secret-model-a"),
+                    ("gen_ai.system", "openai"),
+                ],
+                1,
+                &[
+                    ("gen_ai.operation.name", "chat"),
+                    ("gen_ai.request.model", TOKEN_OVERFLOW),
+                    ("gen_ai.system", "openai"),
+                ],
+            );
+            for model in ["secret-model-b", "secret-model-c"] {
+                registry.resolve_histogram_capped(
+                    &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
+                    &[
+                        ("gen_ai.operation.name", "chat"),
+                        ("gen_ai.request.model", model),
+                        ("gen_ai.system", "openai"),
+                    ],
+                    1,
+                    &[
+                        ("gen_ai.operation.name", "chat"),
+                        ("gen_ai.request.model", TOKEN_OVERFLOW),
+                        ("gen_ai.system", "openai"),
+                    ],
+                );
+            }
+            let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(text.matches("series cap reached").count(), 2, "{text}");
+            assert_eq!(text.matches("llm.client.token.usage").count(), 1, "{text}");
+            assert_eq!(
+                text.matches("gen_ai.server.time_to_first_token").count(),
+                1,
+                "{text}"
+            );
+            assert!(text.contains("ceiling=2"), "{text}");
+            assert!(!text.contains("secret"), "a label value leaked: {text}");
+        });
+    }
+
+    #[test]
+    fn concurrent_capped_resolves_never_exceed_the_ceiling() {
+        const CEILING: usize = 10;
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        thread::scope(|scope| {
+            for t in 0..8 {
+                let registry = &registry;
+                scope.spawn(move || {
+                    for i in 0..40 {
+                        token_series(registry, "p", &format!("tenant-{t}-{i}"), CEILING);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            emitted(&registry, "llm.client.token.usage").len(),
+            CEILING + 1,
+            "exactly the ceiling plus the one shared overflow series"
+        );
+    }
+
+    #[test]
+    fn a_warm_memoized_series_does_not_take_the_control_lock() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let memo = HandleMemo::<Handle>::new();
+        let resolve = |registry: &Registry| {
+            registry.resolve_capped_memo(
+                &memo,
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[("provider", "p"), ("type", "input"), ("tenant", "acme")],
+                10,
+                &[
+                    ("provider", "p"),
+                    ("type", "input"),
+                    ("tenant", TOKEN_OVERFLOW),
+                ],
+            )
+        };
+        let cold = resolve(&registry);
+        let acquisitions = registry.capped_lock_acquisitions();
+
+        // Hold the lock a lock-taking resolve would need. A warm resolve must
+        // finish anyway; the bounded wait only matters when it does not.
+        let guard = registry.control.lock().unwrap();
+        let warm_finished = thread::scope(|scope| {
+            let worker = scope.spawn(|| resolve(&registry));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let finished = worker.is_finished();
+            drop(guard);
+            assert_eq!(worker.join().unwrap(), cold);
+            finished
+        });
+        assert!(warm_finished, "a warm series blocked on the control lock");
+        assert_eq!(registry.capped_lock_acquisitions(), acquisitions);
+    }
+
+    #[test]
+    fn a_folded_name_is_not_memoized_so_a_freed_slot_is_used() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let memo = HandleMemo::<Handle>::new();
+        let resolve = |provider: &str, tenant: &str| {
+            registry.resolve_capped_memo(
+                &memo,
+                &instruments::LLM_CLIENT_TOKEN_USAGE,
+                &[
+                    ("provider", provider),
+                    ("type", "input"),
+                    ("tenant", tenant),
+                ],
+                2,
+                &[
+                    ("provider", provider),
+                    ("type", "input"),
+                    ("tenant", TOKEN_OVERFLOW),
+                ],
+            )
+        };
+        // Fill the cap without the memo, so its own size bound cannot be what
+        // keeps the folded name out.
+        token_series(&registry, "gone", "t1", 2);
+        token_series(&registry, "gone", "t2", 2);
+        let folded = resolve("kept", "t3");
+        assert_eq!(folded, resolve("kept", "t3"), "still folded while full");
+
+        control.set_live_scope(LiveScope {
+            clusters: names(&["kept"]),
+            ..LiveScope::default()
+        });
+        assert_ne!(
+            resolve("kept", "t3"),
+            folded,
+            "a stale memoized overflow handle would pin t3 to the fold"
         );
     }
 }
