@@ -317,25 +317,33 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   `BudgetStore`, not `ControlPlaneStore`, and only an in-process
   implementation exists — this is unaffected by everything above. See
   [Token rate limiting](../limits-and-budgets/token-rate-limiting/).
-- **The rate card is not shared.** `PUT /pricing` replaces the rate card in the
-  memory of the one replica that receives it. The handler calls only
-  `PricingRegistry::replace_json` (`handle_set_pricing` in
-  `crates/proxy-admin/src/server.rs`, and
-  `crates/proxy-filters/src/usage_filter.rs`). It writes nothing to the shared
-  store, and it does not reach other replicas. A restart loads the rate card
-  from the configuration again. A `SIGHUP` reload does not change it.
+- **The rate card is shared only through a store.** With an `auth` store, the
+  rate card is stored per chain and `PUT /pricing` writes it there. Every replica
+  that shares the store installs it on its next policy poll, which is 48 to 60
+  seconds at the default `poll_interval_seconds`, the same bound as a key
+  revocation. The configured `pricing` only seeds an empty store. A restart or a
+  `SIGHUP` reload never replaces a stored rate card, and the stored rate card
+  wins over a different `pricing` at start. Only a `persistent` or `shared`
+  store keeps the rate card across a restart; the default `in_memory` store does
+  not, and `PUT /pricing` says `"persisted": false` for it.
 
-  To change the rate card of a deployment, send the same `PUT /pricing` request
-  to every replica. Change the configuration too, so that a restart keeps the
-  change. In bootstrap mode, the configuration is the `pricing_json` field of
-  the `llmproxy.usage` filter. Replicas with different rate cards price the same
-  request differently. To find them, compare `rate_card_version` in
-  `GET /pricing` on each replica, or the `%LLM_RATE_CARD_VERSION%` values in the
-  access logs.
+  Without an `auth` section, the rate card stays in the memory of each process.
+  `PUT /pricing` then changes only the replica that receives it, a restart loads
+  the configured `pricing`, and a `SIGHUP` reload installs a changed `pricing`.
+  To change the rate card of a deployment without a store, change `pricing` in
+  every replica's configuration and reload, or send the same `PUT /pricing`
+  request to every replica.
+
+  Replicas with different rate cards price the same request differently. To find
+  them, compare `rate_card_version` in `GET /pricing` on each replica, or the
+  `%LLM_RATE_CARD_VERSION%` values in the access logs. The version covers the
+  prices and the cluster-to-provider map.
 
   `PUT /pricing` does not change the `pricing` list of `llmproxy.spend_limit`.
   The spend filter uses that list only for a request that the rate card does not
-  price. The fields and the limits of `PUT /pricing` are in
+  price. A request that neither prices, under a dollar budget, adds $0 to the
+  budget and logs one warning per chain and model. The fields and the limits of
+  `PUT /pricing` are in
   [`pricing`](../configuration/configuration-file/#pricing-pricing).
 
 ## Verifying a Redis-backed store

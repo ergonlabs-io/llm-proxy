@@ -77,7 +77,7 @@
       "$ref": "#/$defs/Observability"
     },
     "pricing": {
-      "description": "Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. Updating a file source requires config reload.",
+      "description": "Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime: it is stored (and reaches every replica sharing the store within one policy poll) when the store is `persistent` or `shared`, and is lost on restart otherwise. A card whose `effective_from` is in the future is refused.",
       "$ref": "#/$defs/Pricing"
     }
   },

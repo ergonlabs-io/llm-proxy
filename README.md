@@ -255,38 +255,52 @@ the known input/output rates. Whole-request tier overrides are imported with
 inclusive thresholds. Non-token charges remain visible but are excluded from
 token cost calculation.
 
-`PUT /pricing` is not the same as a restart. It replaces the whole rate card in
-the memory of the one replica that receives it. It does not write the rate card
-to the configuration or to the shared store, and it does not reach other
-replicas. A request that has started keeps the rate card that was active when it
-started. A restart loads the rate card from the configuration again. A `SIGHUP`
-reload does not change the rate card.
+Where the rate card lives depends on whether the filter chain has a
+control-plane store: an `auth` section in the dialect, or `llmproxy.auth` in
+bootstrap mode. `examples/llmproxy-openrouter.yaml` has none.
+
+- **With a store**, the store holds the rate card, per chain, and it wins. At
+  start the configured rate card seeds an empty store once. After that, neither a
+  restart nor a `SIGHUP` reload replaces a stored rate card; the proxy logs once
+  when the configuration differs from the stored card. `PUT /pricing` writes the
+  store and installs the card on the replica that received it at once. Every
+  other replica that shares the store installs it on its next policy poll, which
+  is 48 to 60 seconds at the default `poll_interval_seconds`. Only the
+  `persistent` and `shared` stores keep the card across a restart. The default
+  in-memory store loses it, and the response says `"persisted": false`.
+- **Without a store**, the configuration is the only durable source. A `SIGHUP`
+  reload installs the configured rate card when it changed, and a reload that did
+  not change it keeps a rate card installed with `PUT`. `PUT /pricing` changes
+  only the replica that receives it, and a restart loads the configured rate card
+  again. The response says `"persisted": false`.
+
+A request that has started keeps the rate card that was active when it started.
+A listener rebuilds its filter chain when a connection arrives after a reload, so
+a changed configured rate card applies from the first new connection.
 
 **Warning:** A model with no price adds $0 to every `llmproxy.spend_limit`
-dollar budget. The proxy does not refuse the request and logs no warning. A
-model has no price when the rate card has no entry for it and the `pricing`
-list of `llmproxy.spend_limit` has none either. `PUT /pricing` replaces the
-whole rate card, so a model that is missing from the new rate card has no price.
-The access log shows `-` for `%LLM_LIST_COST%` when the rate card has no price.
-`GET /keys/{id}/spend` counts these requests in `unpriced_requests`.
-
-To change the rate card on running replicas:
-
-1. Send the same `PUT /pricing` request to the admin port of every replica.
-2. Change the rate card in the configuration of every replica, so that a
-   restart keeps it. Edit the `pricing` section in the dialect, or
-   `pricing_json` of the `llmproxy.usage` filter in bootstrap mode.
+dollar budget. The proxy does not refuse the request. It logs one warning for
+each chain and model, with the reason, and stops logging that model. It names at
+most 256 models per chain, then logs one summary line. A model has no price when
+the rate card has no entry for it and the `pricing` list of `llmproxy.spend_limit`
+has none either. `PUT /pricing` replaces the whole rate card, so a model that is
+missing from the new rate card has no price. The access log shows `-` for
+`%LLM_LIST_COST%` when the rate card has no price. `GET /keys/{id}/spend` counts
+these requests in `unpriced_requests`.
 
 `PUT /pricing` needs the admin token (`LLMPROXY_ADMIN_TOKEN`) as a bearer token.
-It returns `503` when the filter chain has no `llmproxy.auth` filter. In the
-dialect, that means no `auth` section, and `examples/llmproxy-openrouter.yaml`
-has none. It returns `413` for a body larger than 65536 bytes, and the rate card
-in `examples/llmproxy-openrouter.yaml` is larger. To change a large rate card,
-do only step 2. Then restart every replica.
+It does not need an `auth` section. It accepts a body up to 4 MiB, which holds
+the rate card in `examples/llmproxy-openrouter.yaml` with its catalog (268 KB
+compact, 401 KB pretty-printed); every other admin write is limited to 64 KiB.
+It returns `400` for invalid JSON, an invalid rate card, or an `effective_from`
+in the future. A rate card applies from the moment it is installed, so a future
+date is refused instead of applied early. It returns `503` when the store
+refuses the write, and then no replica has changed.
 
 Each priced request records the rate card version (`%LLM_RATE_CARD_VERSION%` in
-the access log). Replicas with different price entries record different
-versions. `GET /pricing` also shows `rate_card_version`.
+the access log). The version covers the price entries and the map from cluster to
+provider type, so replicas that differ in either record different versions.
+`GET /pricing` also shows `rate_card_version`.
 
 Importing prices does not create dollar budgets.
 

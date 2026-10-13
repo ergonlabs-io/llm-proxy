@@ -40,7 +40,7 @@ applied before parsing.
 | `routes` | array of `Route` | yes | — | Ordered routing rules. The first rule whose `model` pattern matches wins; there is no specificity reordering. At least one route is required. |
 | `limits` | array of `Limit` | no | `[]` | Rate limits and quotas. See "What `limits` actually enforces" below — most combinations are recorded but not enforced. |
 | `observability` | `Observability` object | no | none (no access log) | Access logging. See "A schema/code note worth knowing" below for the current state of admin-endpoint metrics. |
-| `pricing` | `Pricing` object | no | none (no request has a price) | The rate card. It prices each completed request in integer nanodollars, using all four token buckets. The proxy reads it once, at startup. A restart loads a change. A `SIGHUP` reload does not. See "`pricing` (`Pricing`)" below. |
+| `pricing` | `Pricing` object | no | none (no request has a price) | The rate card. It prices each completed request in integer nanodollars, using all four token buckets. A `SIGHUP` reload installs a change, unless an `auth` store holds the rate card. See "`pricing` (`Pricing`)" below. |
 
 A request matching no `routes` entry and no `models` entry gets a 404 with a
 JSON error body listing known models.
@@ -239,7 +239,7 @@ no request has a price, `%LLM_LIST_COST%` is `-`, and `GET /pricing` returns
 | Field | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `price_list` | `PriceList` | one of `price_list`/`price_list_file` | — | The price list, written inline. |
-| `price_list_file` | string (path) | one of `price_list`/`price_list_file` | — | A file that holds one price list, in YAML or JSON, with the same fields as `price_list`. The proxy reads it once, at startup, and the load emits the warning that "When a change takes effect" below describes. |
+| `price_list_file` | string (path) | one of `price_list`/`price_list_file` | — | A file that holds one price list, in YAML or JSON, with the same fields as `price_list`. The proxy reads it at startup and on each reload, and the load emits a warning that says so. |
 | `catalog` | object | no | none | Public source information, such as where the prices came from. `GET /pricing` returns it. The proxy never uses it to price a request. |
 
 Set exactly one of `price_list` and `price_list_file`. Setting neither, or both,
@@ -250,8 +250,8 @@ path of the field, for example `pricing.price_list.entries[0].tier_mode`. A
 
 | `PriceList` field | Type | Required | Default | What it does |
 |---|---|---|---|---|
-| `version` | string | no | none | A label for the list. The recorded version is the label, a `+`, and 12 hex digits of a hash of the entries, for example `2026-10+3c2805867b2e`. With no label, the recorded version is the hash alone. Editing a price changes the hash, so the version changes even when you keep the label. |
-| `effective_from` | string, RFC 3339 timestamp | yes | — | A date for the list. The proxy checks the format and shows the value in `GET /pricing`. It does not compare the value with the time of a request. A list applies from the moment the proxy loads it. |
+| `version` | string | no | none | A label for the list. The recorded version is the label, a `+`, and 12 hex digits of a hash of the entries and of the map from cluster to provider type, for example `2026-10+3c2805867b2e`. With no label, the recorded version is the hash alone. Editing a price, or the provider that a cluster is priced as, changes the hash, so the version changes even when you keep the label. |
+| `effective_from` | string, RFC 3339 timestamp | yes | — | A date for the list. The proxy checks the format and shows the value in `GET /pricing`. It does not compare the value with the time of a request: a list applies from the moment the proxy installs it. A date in the future is an error, at load, in `PUT /pricing`, and for a rate card read from the store, because the list would otherwise apply early. |
 | `entries` | array of `PriceEntry`, at least 1 | yes | — | The prices. Each pair of `provider_type` and `model` may appear once. A duplicate pair is a load error. |
 
 | `PriceEntry` field | Type | Required | Default | What it does |
@@ -332,31 +332,53 @@ A request for any other model has no price: `%LLM_LIST_COST%` and
 
 ### When a change takes effect
 
-The proxy reads `pricing` once, when it starts. A restart loads a changed
-`pricing` section or a changed `price_list_file`. A `SIGHUP` reload does not
-change the rate card of a running proxy. The reload succeeds, and the proxy
-keeps the rate card that it loaded at start. Restart the proxy to apply a
-change.
+Where the rate card lives depends on whether the filter chain has a
+control-plane store: an `auth` section in the dialect, or `llmproxy.auth` in
+bootstrap mode. The rate card is stored per chain, under the chain's
+`stat_prefix`.
 
-Two texts suggest that a reload applies a change. The schema describes
-`pricing` as "Updating a file source requires config reload." The load warning
-on `pricing.price_list_file` reads "the price list is read once at startup;
-update it with a config reload". Neither is right today.
+Without a store, the configuration is the only durable source:
 
-`PUT /pricing` on the admin API replaces the rate card of the one proxy that
-receives it, without a restart. The new rate card replaces the whole old one, so
-a model that the new card does not list has no price. The change lives in memory
-only. A restart loses it, and it does not reach other replicas. To keep a
-change, edit `pricing` as well. See
-[Running in production](../operations/running-in-production/#what-stays-local-even-with-a-shared-store).
+- At start, the proxy loads `pricing`, including `price_list_file`.
+- A `SIGHUP` reload installs `pricing` when it changed. A listener rebuilds its
+  filter chain when the next connection arrives, so the new rate card applies
+  from that connection. A reload that did not change `pricing` leaves a rate
+  card that `PUT /pricing` installed. A reload that removes `pricing` clears the
+  rate card and logs a warning.
+- `PUT /pricing` replaces the rate card of the one proxy that receives it,
+  without a restart. A restart loads the configured rate card again. The
+  response says `"persisted": false`.
+
+With a store, the store holds the rate card and wins:
+
+- At start, `pricing` seeds a store that has no rate card for the chain. If the
+  store already has one, the stored rate card stays in force, and the proxy logs
+  once that `pricing` differs from it.
+- A `SIGHUP` reload never replaces a stored rate card. It logs once when the
+  changed `pricing` differs from it.
+- `PUT /pricing` writes the store and installs the rate card on the receiving
+  replica at once. Every other replica that shares the store installs it on its
+  next policy poll, which is 48 to 60 seconds at the default
+  `poll_interval_seconds`. The response says `"persisted": true` when the store
+  is `persistent` or `shared`. The default `in_memory` store keeps the rate card
+  only for the life of the process, and the response says `"persisted": false`.
+  If the store refuses the write, the response is `503` and no replica changes.
+- To replace a stored rate card, send it with `PUT /pricing`. Editing `pricing`
+  does not replace it.
+
+A request that has started keeps the rate card that was active when it started.
+The new rate card replaces the whole old one, so a model that the new card does
+not list has no price.
 
 `PUT /pricing` has these limits:
 
 - It needs the admin token (`LLMPROXY_ADMIN_TOKEN`) as a bearer token.
-- It returns `503` when the filter chain has no `llmproxy.auth` filter. In the
-  dialect, that means no `auth` section.
-- It returns `413` for a request body larger than 65536 bytes. The rate card in
-  `examples/llmproxy-openrouter.yaml` is larger than this.
+- It does not need an `auth` section.
+- It accepts a request body up to 4 MiB, and returns `413` above that. The rate
+  card in `examples/llmproxy-openrouter.yaml` is 268 KB with its catalog, so it
+  fits. The other admin writes keep a 64 KiB limit.
+- It returns `400` for invalid JSON, an invalid rate card, or an `effective_from`
+  in the future.
 
 `GET /pricing` needs no token. It returns the active rate card, its
 `rate_card_version`, and the `catalog` if one is set.

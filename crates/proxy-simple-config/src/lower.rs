@@ -385,7 +385,7 @@ fn lower_pricing(
         (Some(file), None) => {
             warnings.push(warning(
                 "pricing.price_list_file",
-                "the price list is read once at startup; update it with a config reload",
+                "the price list file is read at startup and on each config reload; with an `auth` store, the stored rate card wins over a changed file",
             ));
             let contents = std::fs::read_to_string(file).map_err(|e| ConfigError::Io {
                 path: file.clone(),
