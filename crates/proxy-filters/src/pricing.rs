@@ -172,6 +172,33 @@ impl PriceList {
             .find(|entry| entry.provider_type == provider_type && entry.model == model)
     }
 
+    /// The model to price a request at, and whether that is the served model.
+    ///
+    /// `base` is the model the proxy sent (selected, else requested). The
+    /// provider's reported `served` model replaces it only when it differs and
+    /// this card prices it for the dialled provider type with `usage`; a served
+    /// model with no card (a dated snapshot) keeps `base`, so the request is
+    /// never made unpriced by a model name the card lacks. The usage filter and
+    /// the spend filter both call this so a charge and the logged cost agree.
+    pub fn model_to_price<'a>(
+        &self,
+        cluster: &str,
+        base: &'a str,
+        served: Option<&'a str>,
+        usage: &TokenUsage,
+    ) -> (&'a str, bool) {
+        if let (Some(served), Some(provider)) = (served, self.provider_for(cluster)) {
+            if served != base
+                && self
+                    .list_cost_nanodollars(provider, served, usage)
+                    .is_some()
+            {
+                return (served, true);
+            }
+        }
+        (base, false)
+    }
+
     /// As [`Self::list_cost_nanodollars`], for the cluster a request actually
     /// dialled. `None` also covers a cluster the card's map does not name.
     pub fn list_cost_for_cluster(

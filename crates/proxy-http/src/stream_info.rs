@@ -91,6 +91,11 @@ pub struct LlmStats {
     pub usage: Option<LlmTokenUsage>,
     /// Filled once, alongside final usage, after the response stream ends.
     pub list_cost: Option<LlmListCost>,
+    /// The model the provider's response says it served (JSON `model`, or the
+    /// first SSE frame that names one), bounded by the usage filter. Audit
+    /// evidence, and the price key when the rate card lists it. `None` when the
+    /// response named none.
+    pub served_model: Option<String>,
     /// The response dialect selected from the route's usage-filter config.
     /// `None` means no usage filter ran, so GenAI latency metrics must not
     /// guess a system from a cluster name.
@@ -159,6 +164,9 @@ pub struct AttemptInfo {
     pub cluster: String,
     pub host: String,
     pub upstream_model: Option<String>,
+    /// The model the provider reported serving on this attempt, written by the
+    /// usage filter onto the selected attempt only.
+    pub served_model: Option<String>,
     pub started_at: SystemTime,
     pub started_instant: Instant,
     pub finished_at: Option<SystemTime>,
@@ -373,6 +381,7 @@ impl StreamInfo {
             cluster: proxy_observability::records::bounded_field(cluster),
             host: proxy_observability::records::bounded_field(host),
             upstream_model: upstream_model.map(|m| proxy_observability::records::bounded_field(&m)),
+            served_model: None,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
             finished_at: None,
@@ -412,6 +421,7 @@ impl StreamInfo {
             a.cluster = String::new();
             a.host = String::new();
             a.upstream_model = None;
+            a.served_model = None;
             a.attempt_id = String::new();
             a.retry_reason = None;
         }

@@ -494,6 +494,7 @@ impl LoggingBody {
             llm_system,
             llm_time_to_first_body_byte,
             requested_model,
+            llm_served_model,
             trace,
             tenant,
             response_code_details,
@@ -535,6 +536,7 @@ impl LoggingBody {
                 info.llm.system,
                 info.llm.time_to_first_body_byte,
                 info.requested_model.clone(),
+                info.llm.served_model.clone(),
                 info.trace,
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
@@ -688,6 +690,7 @@ impl LoggingBody {
                         cluster: Some(attempt.cluster.clone()),
                         provider: None,
                         upstream_model: attempt.upstream_model,
+                        served_model: attempt.served_model,
                         started_at: format_system_time(attempt.started_at),
                         finished_at: format_system_time(
                             attempt.finished_at.unwrap_or_else(SystemTime::now),
@@ -885,6 +888,7 @@ impl LoggingBody {
             llm_user_id: None,
             llm_requested_model: requested_model.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
+            llm_served_model: llm_served_model.as_deref(),
             llm_rate_card_version: usage_attribution.2.as_deref(),
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
@@ -1212,6 +1216,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn served_model_reaches_the_rendered_access_log_line() {
+        assert_eq!(
+            render_with_stream_info("%LLM_SERVED_MODEL%", |info| {
+                info.llm.served_model = Some("gpt-4o-mini-2024-07-18".into());
+            })
+            .await,
+            "gpt-4o-mini-2024-07-18"
+        );
+        assert_eq!(
+            render_with_stream_info("%LLM_SERVED_MODEL%", |_| {}).await,
+            "-"
+        );
+    }
+
+    #[tokio::test]
     async fn llm_stats_reach_the_rendered_access_log_line() {
         let llm = crate::stream_info::LlmStats {
             usage: Some(LlmTokenUsage {
@@ -1221,6 +1240,7 @@ mod tests {
                 output_tokens: 44,
             }),
             list_cost: None,
+            served_model: None,
             system: None,
             time_to_first_byte: Some(std::time::Duration::from_millis(250)),
             time_to_first_body_byte: None,
@@ -1270,6 +1290,7 @@ mod tests {
             let selected = info
                 .begin_attempt("fallback", "host", Some("upstream-model".into()))
                 .unwrap();
+            selected.borrow_mut().served_model = Some("upstream-model-2024-07-18".into());
             info.selected_attempt = Some(selected);
             info.upstream_cluster = Some("fallback".into());
             info.llm.usage = Some(LlmTokenUsage {
@@ -1293,6 +1314,12 @@ mod tests {
         assert!(record.attempts[0].cost.is_none());
         assert_eq!(record.attempts[1].usage, record.usage);
         assert_eq!(record.attempts[1].cost, record.cost);
+        // The served model is the selected attempt's evidence, not the failed one's.
+        assert_eq!(record.attempts[0].served_model, None);
+        assert_eq!(
+            record.attempts[1].served_model.as_deref(),
+            Some("upstream-model-2024-07-18")
+        );
         let cost = record.cost.unwrap();
         assert_eq!(cost.amount, 987_654);
         assert_eq!(cost.unit, "nanodollars");
@@ -1610,6 +1637,7 @@ mod tests {
         let llm = crate::stream_info::LlmStats {
             usage: None,
             list_cost: None,
+            served_model: None,
             system: None,
             time_to_first_byte: None,
             time_to_first_body_byte: None,
@@ -1647,6 +1675,7 @@ mod tests {
                 output_tokens: 10,
             }),
             list_cost: None,
+            served_model: None,
             system: None,
             time_to_first_byte: Some(std::time::Duration::from_millis(0)),
             time_to_first_body_byte: None,

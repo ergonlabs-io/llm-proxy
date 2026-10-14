@@ -47,7 +47,8 @@ use crate::auth_filter;
 use crate::control::{ControlPlane, StoredRateCard};
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{
-    extract_json_usage, extract_json_usage_from_tail, Dialect, SseUsageScanner, TokenUsage,
+    extract_json_served_model, extract_json_usage, extract_json_usage_from_tail, Dialect,
+    SseUsageScanner, TokenUsage,
 };
 
 /// Canonical type URL for the owned usage configuration.
@@ -170,6 +171,29 @@ impl PricingRegistry {
             .list
             .list_cost_for_cluster(cluster?, model?, usage)
             .map(|nano| nano.saturating_add(999) / 1000)
+    }
+
+    /// As [`Self::cost_micro_usd_for`], priced at the provider-reported model
+    /// when the card lists it (see `PriceList::model_to_price`). The spend
+    /// filter charges through this so its charge matches the usage filter's
+    /// logged cost.
+    pub(crate) fn cost_micro_usd_served(
+        pricing: Option<&PricingContext>,
+        cluster: Option<&str>,
+        sent_model: Option<&str>,
+        served_model: Option<&str>,
+        usage: &TokenUsage,
+    ) -> Option<u64> {
+        let model = match (pricing, cluster, sent_model) {
+            (Some(pricing), Some(cluster), Some(sent)) => Some(
+                pricing
+                    .list
+                    .model_to_price(cluster, sent, served_model, usage)
+                    .0,
+            ),
+            _ => sent_model,
+        };
+        Self::cost_micro_usd_for(pricing, cluster, model, usage)
     }
 
     /// Why a request the rate card could not price was left unpriced, in words
@@ -607,6 +631,10 @@ pub struct UsageStats {
     /// tail window. These requests were not metered.
     oversized_unrecoverable: AtomicU64,
     last_oversized_warning: Mutex<Option<Instant>>,
+    /// Requests priced at the provider-reported model instead of the sent one.
+    served_model_repriced: AtomicU64,
+    /// This chain's `llmproxy_usage_served_model_repriced_total` series.
+    repriced_handle: Option<Handle>,
     /// The process stats registry and this chain's series, when the listener
     /// seeded [`STATS_REGISTRY_KEY`]. `None` only where no registry exists
     /// (unit tests that build the filter directly).
@@ -633,14 +661,38 @@ impl UsageStats {
             );
             (registry, handle)
         });
+        let repriced_handle = exported.as_ref().map(|(registry, _)| {
+            registry.resolve_capped(
+                &instruments::USAGE_SERVED_MODEL_REPRICED,
+                &[("scope", scope)],
+                256,
+                &[("scope", "overflow")],
+            )
+        });
         UsageStats {
             exported,
+            repriced_handle,
             ..Default::default()
         }
     }
 
     pub fn oversized_unrecoverable(&self) -> u64 {
         self.oversized_unrecoverable.load(Ordering::Relaxed)
+    }
+
+    pub fn served_model_repriced(&self) -> u64 {
+        self.served_model_repriced.load(Ordering::Relaxed)
+    }
+
+    /// Count a request priced at the served model. Deliberately silent in the
+    /// log: a served model with no card is common and keeps the requested
+    /// price, and this path fires only when a card does exist, so the counter
+    /// is the whole signal.
+    fn note_served_model_repriced(&self) {
+        self.served_model_repriced.fetch_add(1, Ordering::Relaxed);
+        if let (Some((registry, _)), Some(handle)) = (&self.exported, self.repriced_handle) {
+            registry.incr(WorkerId(0), handle, 1);
+        }
     }
 
     fn note_oversized_unrecoverable(&self, cluster: Option<&str>) {
@@ -1333,6 +1385,17 @@ impl UsageFilterInstance {
         }
     }
 
+    /// The provider-reported model for the current body mode. The oversized
+    /// tail path yields `None`: `model` precedes the window.
+    fn compute_served_model(&self) -> Option<String> {
+        match &self.mode {
+            BodyMode::Sse(scanner) => scanner.served_model(),
+            BodyMode::Json(body) if body.overflowed => None,
+            BodyMode::Json(body) => extract_json_served_model(&body.buf),
+            BodyMode::Inert => None,
+        }
+    }
+
     /// Write the observed usage + timing into `StreamInfo::llm`, exactly
     /// once. Safe to call from more than one callback (`encode_data` at
     /// `end_stream`, `encode_trailers`) — the second call is a no-op.
@@ -1354,6 +1417,10 @@ impl UsageFilterInstance {
         // just must not be held across another `cb` call, or the `RefCell`
         // panics. It's dropped at the end of this function.
         let mut stream_info = cb.stream_info();
+        let served_model = self.compute_served_model();
+        if let Some(attempt) = &stream_info.selected_attempt {
+            attempt.borrow_mut().served_model = served_model.clone();
+        }
         // `None` must stay `None` here — never write `Some(0, 0)` for a
         // response that reported no usage at all (this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
@@ -1365,18 +1432,29 @@ impl UsageFilterInstance {
             let pricing = self.pricing.as_ref()?;
             let cluster = stream_info.upstream_cluster.as_deref()?;
             let provider_type = pricing.list.provider_for(cluster)?;
-            let model = stream_info
+            let sent_model = stream_info
                 .selected_model
                 .as_deref()
                 .or(stream_info.requested_model.as_deref())?;
-            pricing
+            // Price what the provider says it served when the card lists it;
+            // otherwise the sent model (dated snapshots have no card entry).
+            let (model, repriced) =
+                pricing
+                    .list
+                    .model_to_price(cluster, sent_model, served_model.as_deref(), &usage);
+            let cost = pricing
                 .list
                 .list_cost_nanodollars(provider_type, model, &usage)
                 .map(|nanodollars| LlmListCost {
                     nanodollars,
                     rate_card_version: pricing.list.version().as_str().to_string(),
-                })
+                });
+            if repriced && cost.is_some() {
+                self.stats.note_served_model_repriced();
+            }
+            cost
         });
+        stream_info.llm.served_model = served_model;
         stream_info.llm.system = Some(match self.dialect {
             Dialect::OpenAi | Dialect::OpenAiResponses => GenAiSystem::OpenAi,
             Dialect::Anthropic => GenAiSystem::Anthropic,
@@ -1648,24 +1726,33 @@ mod tests {
     }
 
     fn priced_filter() -> UsageFilterInstance {
+        priced_filter_with(&[("gpt-5", 10, 100)])
+    }
+
+    /// A card pricing each `(model, input, output)` nanodollars per token for
+    /// provider type `openai`.
+    fn priced_filter_with(models: &[(&str, u64, u64)]) -> UsageFilterInstance {
         let list = PriceList::new(
             Some("2026-09"),
             std::time::SystemTime::UNIX_EPOCH,
-            vec![PriceEntry {
-                cached_input_unpriced: false,
-                cache_write_unpriced: false,
-                provider_type: "openai".into(),
-                model: "gpt-5".into(),
-                tier_basis: TierBasis::InputTokens,
-                tier_mode: TierMode::WholeRequest,
-                tiers: vec![Tier {
-                    up_to: None,
-                    input_nanodollars_per_token: 10,
-                    cached_input_nanodollars_per_token: 1,
-                    cache_write_nanodollars_per_token: 20,
-                    output_nanodollars_per_token: 100,
-                }],
-            }],
+            models
+                .iter()
+                .map(|&(model, input, output)| PriceEntry {
+                    cached_input_unpriced: false,
+                    cache_write_unpriced: false,
+                    provider_type: "openai".into(),
+                    model: model.into(),
+                    tier_basis: TierBasis::InputTokens,
+                    tier_mode: TierMode::WholeRequest,
+                    tiers: vec![Tier {
+                        up_to: None,
+                        input_nanodollars_per_token: input,
+                        cached_input_nanodollars_per_token: 1,
+                        cache_write_nanodollars_per_token: 20,
+                        output_nanodollars_per_token: output,
+                    }],
+                })
+                .collect(),
             BTreeMap::from([("provider:openai".to_string(), "openai".to_string())]),
         );
         UsageFilterInstance {
@@ -2026,6 +2113,91 @@ mod tests {
         let cost = cb.llm().list_cost.expect("terminal usage is priced");
         assert_eq!(cost.nanodollars, 320);
         assert!(cost.rate_card_version.starts_with("2026-09+"));
+    }
+
+    /// Run one priced response (2 input, 3 output tokens) for a request that
+    /// asked for `gpt-5`, and return the final stats plus the repriced count.
+    /// `sse` selects the streaming scanner instead of the JSON body path.
+    fn run_served_model_case(body: &[u8], sse: bool) -> (proxy_http::LlmStats, u64) {
+        let mut filter = priced_filter_with(&[("gpt-5", 10, 100), ("gpt-5-mini", 1, 10)]);
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+            info.metadata_enabled = true;
+            let attempt = info.begin_attempt("provider:openai", "host", None).unwrap();
+            info.selected_attempt = Some(attempt);
+        }
+        let content_type = if sse {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        filter.encode_headers(&mut cb, &mut response_headers(content_type), false);
+        filter.encode_data(&mut cb, &mut Bytes::copy_from_slice(body), true);
+        let attempt_model = cb
+            .stream_info
+            .borrow()
+            .selected_attempt
+            .as_ref()
+            .and_then(|a| a.borrow().served_model.clone());
+        assert_eq!(
+            cb.llm().served_model,
+            attempt_model,
+            "stats and attempt agree"
+        );
+        (cb.llm(), filter.stats.served_model_repriced())
+    }
+
+    #[test]
+    fn served_model_with_a_card_entry_is_priced_at_that_entry_and_counted() {
+        for (body, sse) in [
+            (
+                &br#"{"model":"gpt-5-mini","usage":{"prompt_tokens":2,"completion_tokens":3}}"#[..],
+                false,
+            ),
+            (
+                &b"data: {\"model\":\"gpt-5-mini\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n"[..],
+                true,
+            ),
+        ] {
+            let (llm, repriced) = run_served_model_case(body, sse);
+            // gpt-5-mini: 2 * 1 + 3 * 10 = 32 (gpt-5 would be 320).
+            assert_eq!(llm.list_cost.expect("priced").nanodollars, 32, "sse={sse}");
+            assert_eq!(llm.served_model.as_deref(), Some("gpt-5-mini"));
+            assert_eq!(repriced, 1, "sse={sse}");
+        }
+    }
+
+    #[test]
+    fn served_model_without_a_card_entry_keeps_the_requested_price_and_is_not_counted() {
+        // A dated snapshot, and the requested model echoed back: both price at
+        // the requested model, neither counts, and the served name is kept.
+        for served in ["gpt-5-2025-08-07", "gpt-5"] {
+            let body = format!(
+                r#"{{"model":"{served}","usage":{{"prompt_tokens":2,"completion_tokens":3}}}}"#
+            );
+            let (llm, repriced) = run_served_model_case(body.as_bytes(), false);
+            assert_eq!(llm.list_cost.expect("priced").nanodollars, 320, "{served}");
+            assert_eq!(llm.served_model.as_deref(), Some(served));
+            assert_eq!(repriced, 0, "{served}");
+        }
+    }
+
+    #[test]
+    fn repriced_counter_is_exported_on_the_prometheus_surface() {
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let registry = control.registry();
+        let stats = UsageStats::new(Some(registry.clone()), "ingress");
+        stats.note_served_model_repriced();
+        let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("envoy_llmproxy_usage_served_model_repriced_total{"))
+            .unwrap_or_else(|| panic!("counter missing from export:\n{rendered}"));
+        assert!(line.contains(r#"scope="ingress""#), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 
     #[test]
