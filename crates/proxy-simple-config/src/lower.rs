@@ -174,7 +174,8 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "key_id=\"%LLM_KEY_ID%\" tenant=\"%LLM_TENANT%\" user_id=\"%LLM_USER_ID%\" ",
     "requested_model=\"%LLM_REQUESTED_MODEL%\" selected_provider=\"%UPSTREAM_CLUSTER%\" ",
     "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
-    "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\"\n",
+    "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\" ",
+    "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\"\n",
 );
 
 /// The header Anthropic requires on every Messages API request.
@@ -2276,6 +2277,7 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_rate_card_version": "%LLM_RATE_CARD_VERSION%",
                 "selected_provider": "%UPSTREAM_CLUSTER%",
                 "llm_list_cost_nanodollars": "%LLM_LIST_COST%",
+                "llm_credential_source": "%LLM_CREDENTIAL_SOURCE%",
             }
         }),
     };

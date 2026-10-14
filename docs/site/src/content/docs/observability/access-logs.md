@@ -62,10 +62,11 @@ key_id="%LLM_KEY_ID%" tenant="%LLM_TENANT%" user_id="%LLM_USER_ID%"
 requested_model="%LLM_REQUESTED_MODEL%" selected_provider="%UPSTREAM_CLUSTER%"
 selected_model="%LLM_SELECTED_MODEL%" rate_card_version="%LLM_RATE_CARD_VERSION%"
 llm_list_cost_nanodollars="%LLM_LIST_COST%"
+llm_credential_source="%LLM_CREDENTIAL_SOURCE%"
 ```
 
 The real format is one line that ends with a newline. The block above is
-wrapped for reading. The last four lines of the block carry the key, tenant,
+wrapped for reading. The last five lines of the block carry the key, tenant,
 user, model, provider, rate-card, and cost fields. The JSON format carries the
 same fields.
 
@@ -109,11 +110,12 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `llm_requested_model`, `llm_selected_model` | `%LLM_REQUESTED_MODEL%`, `%LLM_SELECTED_MODEL%` |
 | `llm_rate_card_version` | `%LLM_RATE_CARD_VERSION%` |
 | `llm_list_cost_nanodollars` | `%LLM_LIST_COST%` |
+| `llm_credential_source` | `%LLM_CREDENTIAL_SOURCE%` (`platform` or `tenant`) |
 
 The text format uses the same names without the `llm_` prefix for `key_id`,
 `tenant`, `user_id`, `requested_model`, `selected_model`, and
-`rate_card_version`. The names `selected_provider` and
-`llm_list_cost_nanodollars` are the same in both formats.
+`rate_card_version`. The names `selected_provider`,
+`llm_list_cost_nanodollars`, and `llm_credential_source` are the same in both formats.
 
 ### Envoy mode: `log_format`
 
