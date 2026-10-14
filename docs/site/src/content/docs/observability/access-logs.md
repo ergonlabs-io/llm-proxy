@@ -167,6 +167,8 @@ is a load error, never silently dropped or emitted as literal text.
 | `%LLM_RESOLVED_MODEL%` | The model a resolver chose when the requested model was `auto` (see [The auto model](../../providers-and-routing/auto-model/)). `-` when nothing was resolved. Takes no argument. `%LLM_REQUESTED_MODEL%` stays `auto`. |
 | `%LLM_SELECTED_MODEL%` | The model name sent to the provider that served the response, after any provider model mapping. If no mapping matches, it is the requested model. `-` when there is no requested model. |
 | `%LLM_RATE_CARD_VERSION%` | The version of the rate card used for `%LLM_LIST_COST%`. `-` when no list cost was computed. |
+| `%LLM_USAGE_COMPLETENESS%` | `complete`, or `partial` for a stream cut off before the provider's final usage (its tokens and cost are then estimates). `-` when no usage filter ran. |
+| `%LLM_COST_KIND%` | `list` for a rate-card price of provider-reported usage, `estimate` when the usage was estimated. `-` when there is no cost. |
 | `%LLM_UPSTREAM_ID%` | The provider's own id for the response (`chatcmpl-...`, `msg_...`, `resp_...`), for matching a request against the provider's dashboard. `-` when the response carried none or the id was over 256 bytes. |
 | `%LLM_UPSTREAM_USAGE%` | The provider's `usage` object exactly as it sent it (the last one, when a stream carries several). Evidence only: the proxy never reads a field of it, and `%LLM_LIST_COST%` comes from the rate card alone. In a `json_format` field whose whole value is this operator it is embedded as a JSON object (`null` when absent); elsewhere it is text, `-` when absent. Over 4096 bytes it is not stored and `llmproxy_usage_upstream_usage_oversized_total` counts the miss. Never a metric label. |
 

@@ -11,6 +11,16 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Fixed
+
+- A stream the client abandons, or the upstream cuts off, was never metered: no usage, no cost,
+  no spend or token-limit charge, and the record claimed `completeness: complete`. It is now
+  recorded `partial`, priced through the rate card from an estimate (4 bytes per token: input
+  from the request size, output from streamed text; provider figures that arrived are kept),
+  and charged by `spend_limit` and `token_limit`. Marked by `usage.provenance: estimate`,
+  `cost.kind: estimate`, `%LLM_USAGE_COMPLETENESS%` and `%LLM_COST_KIND%`; counted in
+  `llmproxy_usage_partial_total` and `llmproxy_usage_estimated_total`.
+
 ### Added
 
 - `%LLM_UPSTREAM_ID%` and `%LLM_UPSTREAM_USAGE%` access-log operators, and
