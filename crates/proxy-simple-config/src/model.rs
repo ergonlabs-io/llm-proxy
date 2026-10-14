@@ -636,8 +636,9 @@ pub struct Observability {
     #[serde(default)]
     pub access_logs: Option<AccessLogs>,
     /// Forces `stream_options.include_usage = true` onto streaming OpenAI-
-    /// dialect requests that didn't already opt in, so the usage filter has
-    /// a final SSE frame to read tokens off of. Defaults to `true`, both when
+    /// dialect requests, including ones where the client asked for no usage
+    /// (`include_usage: false`), so the usage filter always has a final SSE
+    /// frame to read tokens off of. Defaults to `true`, both when
     /// this key is absent AND when the whole `observability` block is absent
     /// -- see `default_force_usage_reporting`.
     #[serde(default = "default_force_usage_reporting")]

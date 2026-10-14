@@ -1067,8 +1067,33 @@ impl RouterHandler {
         // already-in-memory `Bytes` (a refcount bump, never a deep copy).
         // `%BYTES_RECEIVED%` is exact and known up front for the same
         // reason.
-        let body_bytes = self.captured_body.clone();
-        dcb.stream_info().bytes_received = body_bytes.len() as u64;
+        let original_body = self.captured_body.clone();
+        dcb.stream_info().bytes_received = original_body.len() as u64;
+        // The model and streaming-usage facts the earlier filters routed,
+        // authorized and metered on come from a bounded prefix scan; the
+        // provider decodes the whole body. Reconcile the two once, here, so
+        // every attempt forwards a body that says what the proxy believed.
+        let (routed_model, force_include_usage) = {
+            let info = dcb.stream_info();
+            (info.requested_model.clone(), info.force_include_usage)
+        };
+        let body_bytes = match reconcile_request_body(
+            &original_body,
+            routed_model.as_deref(),
+            force_include_usage,
+        ) {
+            Ok(None) => original_body,
+            Ok(Some(reconciled)) => {
+                if let Ok(length) = HeaderValue::from_str(&reconciled.len().to_string()) {
+                    head.headers.insert(http::header::CONTENT_LENGTH, length);
+                }
+                reconciled
+            }
+            Err(msg) => {
+                tracing::debug!(reason = msg, "request body disagrees with routing facts");
+                return local_reply(StatusCode::BAD_REQUEST, msg);
+            }
+        };
         let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
 
         let mut retry_state = fwd.retry_policy.as_ref().map(RetryState::new);
@@ -2465,6 +2490,120 @@ fn provider_model_pattern_matches(pattern: &str, model: &str) -> bool {
             .map_or(pattern == model, |prefix| model.starts_with(prefix))
 }
 
+/// Top-level facts the provider's JSON decoder would see in a request body.
+#[derive(Default)]
+struct BodyDecodeFacts {
+    model: Option<serde_json::Value>,
+    duplicate_model: bool,
+    stream: Option<bool>,
+    include_usage: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for BodyDecodeFacts {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Rust note: a `Visitor` is serde's callback interface; `visit_map`
+        // is called once with an iterator over the object's entries, so we
+        // choose per key whether to materialize the value or skip it.
+        struct FactsVisitor;
+        impl<'de> serde::de::Visitor<'de> for FactsVisitor {
+            type Value = BodyDecodeFacts;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut facts = BodyDecodeFacts::default();
+                // `Cow<str>` keys are unescaped exactly as the provider's
+                // decoder would unescape them.
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if facts.model.is_some() {
+                                facts.duplicate_model = true;
+                            }
+                            facts.model = Some(map.next_value::<serde_json::Value>()?);
+                        }
+                        "stream" => {
+                            facts.stream = map.next_value::<serde_json::Value>()?.as_bool();
+                        }
+                        "stream_options" => {
+                            // Last wins, matching the provider's decoder.
+                            let options = map.next_value::<serde_json::Value>()?;
+                            facts.include_usage = options.get("include_usage")
+                                == Some(&serde_json::Value::Bool(true));
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(facts)
+            }
+        }
+        deserializer.deserialize_map(FactsVisitor)
+    }
+}
+
+/// Make the whole buffered body agree with the facts the proxy routed and
+/// metered on (ADR-0004: decode is fully buffered).
+///
+/// `Ok(None)` forwards the body unchanged, `Ok(Some(_))` replaces it, and
+/// `Err(_)` is a static message for a local 400.
+fn reconcile_request_body(
+    body: &Bytes,
+    requested_model: Option<&str>,
+    force_include_usage: bool,
+) -> Result<Option<Bytes>, &'static str> {
+    if requested_model.is_none() && !force_include_usage {
+        return Ok(None);
+    }
+    let facts: BodyDecodeFacts = match serde_json::from_slice(body) {
+        Ok(facts) => facts,
+        // We routed on a model the body must therefore state; with no routed
+        // model there is nothing to disagree with.
+        Err(_) if requested_model.is_some() => return Err("request body is not a JSON object"),
+        Err(_) => return Ok(None),
+    };
+    if let Some(requested) = requested_model {
+        // Upstream decoders disagree on first-vs-last for duplicate keys, so
+        // a repeated `model` is refused rather than guessed at.
+        if facts.duplicate_model {
+            return Err("request body has duplicate model keys");
+        }
+        match facts.model.as_ref().and_then(serde_json::Value::as_str) {
+            Some(model) if model == requested => {}
+            _ => return Err("request model disagrees with routed model"),
+        }
+    }
+    if !(force_include_usage && facts.stream == Some(true) && !facts.include_usage) {
+        return Ok(None);
+    }
+    // Deliberate: when the operator forces usage reporting, a client opt-out
+    // does not switch metering off.
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    match object.get_mut("stream_options") {
+        Some(serde_json::Value::Object(options)) => {
+            options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+        }
+        _ => {
+            object.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
+    }
+    serde_json::to_vec(&value)
+        .map(|bytes| Some(Bytes::from(bytes)))
+        .map_err(|_| "request body could not be serialized")
+}
+
 /// Replace the top-level JSON `model` only after the final upstream cluster
 /// is known. The model selected for routing remains in `StreamInfo`; this
 /// changes only the body sent to the selected provider.
@@ -3601,6 +3740,85 @@ mod tests {
             head.uri,
             "/v1/projects/project-a/locations/us-central1/publishers/anthropic/models/claude-sonnet%4020250929:streamRawPredict?trace=1"
         );
+    }
+
+    fn reconcile(
+        body: &'static str,
+        model: Option<&str>,
+        force: bool,
+    ) -> Result<Option<Bytes>, &'static str> {
+        reconcile_request_body(&Bytes::from_static(body.as_bytes()), model, force)
+    }
+
+    #[test]
+    fn reconcile_refuses_escaped_and_plain_duplicate_models() {
+        assert!(reconcile(
+            r#"{"model":"cheap","mod\u0065l":"expensive"}"#,
+            Some("cheap"),
+            false
+        )
+        .is_err());
+        assert!(reconcile(r#"{"model":"cheap","model":"cheap"}"#, Some("cheap"), false).is_err());
+    }
+
+    #[test]
+    fn reconcile_refuses_a_body_model_that_differs_from_the_routed_model() {
+        assert!(reconcile(r#"{"model":"expensive"}"#, Some("cheap"), false).is_err());
+        assert!(reconcile(r#"{"messages":[]}"#, Some("cheap"), false).is_err());
+        assert!(reconcile("not json", Some("cheap"), false).is_err());
+    }
+
+    #[test]
+    fn reconcile_leaves_agreeing_and_unrouted_bodies_alone() {
+        assert_eq!(
+            reconcile(r#"{"model":"cheap","stream":true}"#, Some("cheap"), false),
+            Ok(None)
+        );
+        assert_eq!(reconcile("not json", None, false), Ok(None));
+        assert_eq!(reconcile("not json", None, true), Ok(None));
+    }
+
+    #[test]
+    fn reconcile_forces_usage_over_a_client_opt_out_and_keeps_other_options() {
+        let rewritten = reconcile(
+            r#"{"stream":true,"stream_options":{"include_usage":false,"x":1}}"#,
+            None,
+            true,
+        )
+        .unwrap()
+        .expect("opt-out must be overridden");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["stream_options"]["include_usage"], true);
+        assert_eq!(value["stream_options"]["x"], 1);
+    }
+
+    #[test]
+    fn reconcile_uses_the_last_stream_options_when_duplicated() {
+        let rewritten = reconcile(
+            r#"{"stream":true,"stream_options":{"include_usage":true},"stream_options":{"include_usage":false}}"#,
+            None,
+            true,
+        )
+        .unwrap()
+        .expect("last stream_options opts out");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["stream_options"]["include_usage"], true);
+        // The mirror case needs no rewrite.
+        assert_eq!(
+            reconcile(
+                r#"{"stream":true,"stream_options":{"include_usage":false},"stream_options":{"include_usage":true}}"#,
+                None,
+                true
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_touch_usage_unless_forced_or_streaming() {
+        let opt_out = r#"{"stream":true,"stream_options":{"include_usage":false}}"#;
+        assert_eq!(reconcile(opt_out, None, false), Ok(None));
+        assert_eq!(reconcile(r#"{"stream":false}"#, None, true), Ok(None));
     }
 
     #[test]

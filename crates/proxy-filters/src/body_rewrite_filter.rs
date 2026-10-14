@@ -324,6 +324,7 @@ impl FilterInstanceFactory for BodyRewriteInstanceFactory {
         Box::new(BodyRewriteFilterInstance {
             config: self.config,
             state: State::PassThrough,
+            takes_usage_option: false,
         })
     }
 }
@@ -355,6 +356,11 @@ enum State {
 struct BodyRewriteFilterInstance {
     config: BodyRewriteConfig,
     state: State,
+    /// Whether the request path takes `stream_options.include_usage`. Only
+    /// the (chat) completions APIs do: the Responses and Messages APIs
+    /// report usage on every stream unasked, and OpenAI's Responses API
+    /// rejects the field outright.
+    takes_usage_option: bool,
 }
 
 /// Whether `headers` names a JSON media type (ignoring `;` parameters,
@@ -405,6 +411,7 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // directly rather than through `modify_decoded_headers` -- that
         // callback is a no-op called from inside `decode_headers` itself
         // (see its doc); this parameter IS the live request head.
+        self.takes_usage_option = headers.uri.path().ends_with("/completions");
         if end_stream || !is_json_content_type(&headers.headers) {
             apply_model_header(&mut headers.headers, None);
             cb.clear_route_cache();
@@ -482,7 +489,13 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // longer depends on it (consumer B needs every dialect), so only
         // the splice decision reads it.
         let cfg = self.resolve_config(cb);
-        if cfg.enabled && cfg.dialect == Dialect::OpenAi {
+        if cfg.enabled && cfg.dialect == Dialect::OpenAi && self.takes_usage_option {
+            if facts.splice_at.is_some() {
+                // The router reconciles the whole buffered body against this,
+                // so a client opt-out or a key beyond the scan window cannot
+                // switch metering off.
+                cb.stream_info().force_include_usage = true;
+            }
             if let Some(inject) = include_usage_injection(&facts) {
                 let splice_at = facts
                     .splice_at
@@ -673,6 +686,7 @@ mod tests {
                 dialect,
             },
             state: State::PassThrough,
+            takes_usage_option: false,
         }
     }
 
@@ -967,6 +981,7 @@ mod tests {
                 dialect: Dialect::OpenAi,
             },
             state: State::PassThrough,
+            takes_usage_option: false,
         };
         let mut cb = TestCallbacks::new(headers.clone());
         let mut headers = headers;
@@ -1145,6 +1160,33 @@ mod tests {
             cb.stream_info.borrow().requested_model.as_deref(),
             Some("gpt-4o")
         );
+    }
+
+    /// The router overrides a client's usage opt-out only when this filter
+    /// asked it to, so the flag must follow the OpenAI forcing gate: set for
+    /// an OpenAI JSON body even when the client opted out, never for the
+    /// Anthropic dialect.
+    #[test]
+    fn forcing_gate_is_published_for_the_router() {
+        let body = br#"{"model":"m","stream":true,"stream_options":{"include_usage":false}}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        let (_out, cb) = run(Dialect::OpenAi, headers.clone(), &[body]);
+        assert!(cb.stream_info.borrow().force_include_usage);
+        let (_out, cb) = run(Dialect::Anthropic, headers, &[body]);
+        assert!(!cb.stream_info.borrow().force_include_usage);
+    }
+
+    /// The Responses API rejects `stream_options.include_usage` and reports
+    /// usage unasked, so a streaming request to it is neither spliced nor
+    /// forced.
+    #[test]
+    fn responses_path_gets_no_usage_option() {
+        let body = br#"{"model":"m","stream":true}"#;
+        let mut headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        headers.uri = Uri::from_static("/v1/responses");
+        let (out, cb) = run(Dialect::OpenAi, headers, &[body]);
+        assert_eq!(out, body.to_vec());
+        assert!(!cb.stream_info.borrow().force_include_usage);
     }
 
     /// A body with no extractable model must leave `StreamInfo::requested_model`

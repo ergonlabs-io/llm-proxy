@@ -259,6 +259,10 @@ pub struct StreamInfo {
     /// authorize a request against a tenant's model allow-list, and fails
     /// closed on `None` -- see that filter's module doc.
     pub requested_model: Option<String>,
+    /// Set by the body_rewrite filter when it is configured to force usage
+    /// reporting for this request's dialect; read by the router, which
+    /// enforces it against the whole buffered body.
+    pub force_include_usage: bool,
     /// Provider-owned model selected for the current upstream attempt.
     pub selected_model: Option<String>,
     pub attempts: Vec<Rc<RefCell<AttemptInfo>>>,
@@ -315,6 +319,7 @@ impl Default for StreamInfo {
             tenant_credentials: None,
             credential_source: None,
             requested_model: None,
+            force_include_usage: false,
             selected_model: None,
             attempts: Vec::new(),
             metadata_enabled: false,

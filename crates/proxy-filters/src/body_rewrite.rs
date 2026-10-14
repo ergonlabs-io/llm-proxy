@@ -365,7 +365,16 @@ impl BodyPrefixScanner {
                         return None;
                     }
                     if byte == b'"' {
-                        self.current_key = classify_key(&self.held[self.key_start..idx]);
+                        let raw_key = &self.held[self.key_start..idx];
+                        // A key spelled with a JSON escape (`"\u0073tream"`)
+                        // names the same member to the provider's decoder, so
+                        // decode before classifying.
+                        self.current_key = if raw_key.contains(&b'\\') {
+                            decode_json_string(raw_key)
+                                .map_or(KeyKind::Other, |k| classify_key(k.as_bytes()))
+                        } else {
+                            classify_key(raw_key)
+                        };
                         if self.current_key == KeyKind::StreamOptions {
                             // Presence is all that matters; the value is
                             // still parsed normally below so depth tracking
@@ -390,6 +399,11 @@ impl BodyPrefixScanner {
                 State::BeforeValue => {
                     if is_json_ws(byte) {
                         return None;
+                    }
+                    if self.current_key == KeyKind::Model && byte != b'"' {
+                        // A non-string `model` replaces an earlier string one
+                        // under last-key-wins, so no model is known.
+                        self.model_range = None;
                     }
                     match byte {
                         b'"' => {
@@ -555,6 +569,25 @@ mod tests {
     }
 
     // ---- basic extraction ---------------------------------------------
+
+    #[test]
+    fn escaped_stream_key_is_recognized_and_injected() {
+        let facts = scan(br#"{"model":"m","\u0073tream":true}"#, DEFAULT_PREFIX_CAP);
+        assert_eq!(facts.stream, Some(true));
+        assert!(include_usage_injection(&facts).is_some());
+    }
+
+    #[test]
+    fn escaped_model_key_is_recognized() {
+        let facts = scan(br#"{"mo\u0064el":"expensive"}"#, DEFAULT_PREFIX_CAP);
+        assert_eq!(facts.model.as_deref(), Some("expensive"));
+    }
+
+    #[test]
+    fn later_non_string_model_clears_earlier_model() {
+        let facts = scan(br#"{"model":"a","model":1}"#, DEFAULT_PREFIX_CAP);
+        assert_eq!(facts.model, None);
+    }
 
     #[test]
     fn typical_openai_body_extracts_model_and_stream() {

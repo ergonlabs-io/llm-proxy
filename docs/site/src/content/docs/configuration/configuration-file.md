@@ -297,7 +297,7 @@ reach it.
 |---|---|---|---|---|
 | `access_logs.output` | string: `stdout`, `stderr`, or a file path | no | `stdout` | Where per-request access-log lines are written. Not written at all unless `observability.access_logs` is present. |
 | `access_logs.format` | enum: `text`, `json` | no | `text` | `json` emits one structured object per line, recommended for log pipelines. |
-| `force_usage_reporting` | boolean | no | `true` | Forces `stream_options.include_usage` onto streaming OpenAI-dialect requests that did not already ask for it, so streamed responses still report token usage. Set `false` for strict passthrough if a hand-rolled client trips over the extra frame. |
+| `force_usage_reporting` | boolean | no | `true` | Forces `stream_options.include_usage` onto every streaming OpenAI-dialect request, including ones where the client asked for no usage, so streamed responses always report token usage. Set `false` for strict passthrough if a hand-rolled client trips over the extra frame. |
 | `metrics.otlp_endpoint` | string | yes, if `metrics` is set | — | The OTLP/gRPC collector endpoint for metrics. It may differ from the tracing endpoint. Empty or missing is a load error: `is required and must not be empty when `observability.metrics` is set`. |
 | `metrics.service_name` | string | no | `llm-proxy` | The OTLP resource attribute `service.name`. |
 | `metrics.export_interval` | `Duration` | no | `15s` | How often the proxy exports a full cumulative snapshot of its metrics. The range is `1s` to `1h`. |
