@@ -47,6 +47,32 @@ on every provider of a route a price. Then watch the warning and the
 `unpriced_requests` count in the spend reports, and treat a non-zero value as
 unbilled traffic.
 
+## Cut streams and estimated charges
+
+A response stream that ends early is still charged, once. The client can
+disconnect, the provider can reset the connection, or an idle or duration
+timeout can cut the stream. The proxy records the request as `partial` and
+charges the spend budget and the token window from an estimate:
+
+- Counts that the provider reported before the cut are used as sent.
+- A missing input count is estimated from the size of the forwarded request
+  body, at 4 bytes per token.
+- The output count is the larger of the provider's figure and the text that
+  the proxy forwarded, at 4 bytes per token.
+
+The access log shows `llm_usage_completeness="partial"` and
+`llm_cost_kind="estimate"`. The counter `llmproxy_usage_partial_total` counts
+these requests.
+
+The estimate is not the provider's bill. The provider can generate tokens
+after the cut that the proxy never sees, so the charge can be too low. Real
+tokens are not exactly 4 bytes each, so the estimate can also be high or low
+for the text that the proxy did see.
+
+A client that disconnects before the provider sends response headers is not
+charged and gets no access log line. The provider can still bill the input
+tokens of that request.
+
 ## Key lifecycle and API version
 
 Set a budget through the bearer-gated admin API:
