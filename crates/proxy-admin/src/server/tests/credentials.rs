@@ -44,6 +44,7 @@ fn provider_cluster(name: &str, verify_path: Option<&str>) -> ClusterConfig {
             credential: None,
             path_template: None,
             model_rewrites: Vec::new(),
+            request_field_policy: Default::default(),
             tenant_credential: Some(proxy_config::ir::TenantCredentialSlot {
                 provider: CRED_PROVIDER.to_string(),
                 header: "authorization".to_string(),

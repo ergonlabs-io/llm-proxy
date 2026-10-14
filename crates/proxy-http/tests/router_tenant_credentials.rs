@@ -188,6 +188,7 @@ fn member(
             credential: None,
             path_template: None,
             model_rewrites: Vec::new(),
+            request_field_policy: Default::default(),
             tenant_credential: Some(TenantCredentialSlot {
                 provider: provider.to_string(),
                 header: header.to_string(),

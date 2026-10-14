@@ -2189,10 +2189,34 @@ pub struct ProviderRuntimeConfig {
     /// fallback must send the selected member's upstream model, not the
     /// primary member's model.
     pub model_rewrites: Vec<ProviderModelRewrite>,
+    /// Top-level request-body fields this provider refuses or must not see.
+    /// Per cluster, never per route: an aggregate fallback dials a different
+    /// provider, so the policy has to follow the member actually dialled
+    /// (AGENTS.md invariant 6).
+    pub request_field_policy: RequestFieldPolicy,
     /// Present when this cluster accepts a tenant's own credential for
     /// `provider` (ADR-0007). It lives here, not on the route, because the
     /// credential must follow the member actually dialled (invariant 6).
     pub tenant_credential: Option<TenantCredentialSlot>,
+}
+
+/// Generic, provider-agnostic policy over top-level JSON request-body keys.
+/// The proxy holds no knowledge of which keys matter; operators name them.
+/// Both lists are disjoint and contain no empty names (checked at load).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFieldPolicy {
+    /// A request carrying any of these keys is refused locally with a 400 and
+    /// never dialled.
+    pub deny: Vec<String>,
+    /// These keys are removed before the request is forwarded.
+    pub strip: Vec<String>,
+}
+
+impl RequestFieldPolicy {
+    /// An empty policy is a no-op: the router must not parse the body.
+    pub fn is_empty(&self) -> bool {
+        self.deny.is_empty() && self.strip.is_empty()
+    }
 }
 
 /// Where a tenant credential goes on a request to this cluster. Header API-key

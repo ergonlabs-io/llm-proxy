@@ -364,6 +364,7 @@ mod tests {
             }),
             path_template: None,
             model_rewrites: Vec::new(),
+            request_field_policy: Default::default(),
             tenant_credential: None,
         };
         let mut request = RequestHeaders {
@@ -401,6 +402,7 @@ mod tests {
             }),
             path_template: None,
             model_rewrites: Vec::new(),
+            request_field_policy: Default::default(),
             tenant_credential: None,
         };
         let mut request = RequestHeaders {

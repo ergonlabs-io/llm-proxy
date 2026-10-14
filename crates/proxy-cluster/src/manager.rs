@@ -1834,6 +1834,7 @@ mod tests {
                 credential: None,
                 path_template: None,
                 model_rewrites: Vec::new(),
+                request_field_policy: Default::default(),
                 tenant_credential: Some(proxy_config::ir::TenantCredentialSlot {
                     provider: provider.to_string(),
                     header: "authorization".to_string(),
