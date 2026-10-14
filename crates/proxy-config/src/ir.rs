@@ -1625,6 +1625,9 @@ pub struct ForwardAction {
     /// (`None`) — the right setting for LLM streaming routes (S4).
     pub timeout: Option<Duration>,
     /// Idle timeout override; `None` inherits the HCM stream idle timeout.
+    /// `Some(ZERO)` is an explicit `0s`: no idle timeout on this route, and
+    /// the HCM value does not apply to its response body either (Envoy
+    /// semantics). Consumers must not arm a timer for it.
     pub idle_timeout: Option<Duration>,
     pub retry_policy: Option<RetryPolicyIR>,
     pub host_rewrite_literal: Option<String>,

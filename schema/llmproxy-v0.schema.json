@@ -701,7 +701,7 @@
         "idle_timeout": {
           "$ref": "#/$defs/Duration",
           "default": "90s",
-          "description": "Maximum time with NO bytes flowing (between response chunks / SSE events / WebSocket frames). There is deliberately no total-duration timeout by default — LLM generations and realtime sessions are long-lived; idle-based timeouts are the correct guard."
+          "description": "Maximum time with NO bytes flowing (between response chunks / SSE events / WebSocket frames). There is deliberately no total-duration timeout by default — LLM generations and realtime sessions are long-lived; idle-based timeouts are the correct guard. `0s` disables the idle timeout for this route."
         },
         "streaming": {
           "enum": ["strict"],

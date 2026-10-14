@@ -2273,7 +2273,7 @@ fn finalize_upstream_response<G: Unpin + 'static>(
     // A zero route `idle_timeout` means "no idle timeout on this route"
     // (Envoy treats 0 as disabled); a zero `IdleTimeoutBody` would instead
     // cut the stream at once.
-    if let Some(idle) = idle_timeout {
+    if let Some(idle) = idle_timeout.filter(|d| !d.is_zero()) {
         resp.body = local_boxed(IdleTimeoutBody::new(resp.body, idle));
     }
     // S5: wrap outermost (after the idle wrap) so the `max_requests` permit

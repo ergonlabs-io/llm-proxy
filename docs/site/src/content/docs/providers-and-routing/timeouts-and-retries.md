@@ -65,6 +65,7 @@ steadily-streaming response never trips it; only a genuine stall does. There
 is deliberately no *total* duration timeout by default
 (`listen.max_stream_duration` is opt-in) — LLM generations are long-lived, so
 an idle-based guard is the correct one for the response direction.
+`idle_timeout: 0s` turns the idle timeout off for that route, including the listener's `stream_idle_timeout` for the response body. Proof: `route_idle_timeout_zero_disables_the_idle_timeout_for_the_route` in `crates/proxy/tests/route_idle_timeout_e2e.rs`.
 
 ## What triggers a same-provider retry
 
