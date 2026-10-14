@@ -428,8 +428,25 @@ fn has_reader(field_name: &str, roots: &[PathBuf]) -> bool {
         let mut files = Vec::new();
         collect_rs_files(root, &mut files);
         for file in files {
+            let is_test_file = file.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n == "tests.rs" || n.ends_with("_tests.rs") || n == "test_support.rs"
+            });
+            if is_test_file {
+                continue;
+            }
             let Ok(contents) = fs::read_to_string(&file) else {
                 continue;
+            };
+            // Test code is not a reader: a field only the unit tests touch
+            // (the usage filter's tests write `upstream_usage_dialect` by hand)
+            // is exactly the lowered-but-unread shape this guard exists for.
+            // A top-level `#[cfg(test)] mod` sits at the end of its file in
+            // these crates, so cutting there drops all of it. A `#[cfg(test)]`
+            // on a single item further up (a test-only constructor) is not a
+            // module and is left alone.
+            let contents = match contents.find("\n#[cfg(test)]\nmod ") {
+                Some(cut) => &contents[..cut],
+                None => &contents[..],
             };
             let bytes = contents.as_bytes();
             let mut search_from = 0;

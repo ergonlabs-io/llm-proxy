@@ -1322,6 +1322,11 @@ impl RouterHandler {
                     let mut info = dcb.stream_info();
                     let routing_model = info.routing_model().map(str::to_owned);
                     info.upstream_cluster = Some(attempt_cluster.to_string());
+                    // Written on every attempt, `None` included, so a fallback
+                    // member without a dialect never inherits the failed
+                    // primary's (AGENTS.md invariant 6). The usage filter reads
+                    // it at response headers, after the last attempt.
+                    info.upstream_usage_dialect = attempt_entry.usage_dialect();
                     info.upstream_host = Some(host.address.to_string());
                     info.protocol = Some(
                         match proto {
