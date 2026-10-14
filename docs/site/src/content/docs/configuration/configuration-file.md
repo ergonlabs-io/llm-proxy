@@ -597,6 +597,7 @@ name exactly, evaluated after `routes` and before the 404 backstop.
 | `ModelDef` field | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `providers` | array of `ProviderModelRef` string or `ModelProvider` object | yes, ≥1 item | — | Providers able to serve this model, in priority order. |
+| `max_output_tokens` | integer, 1 to 4294967295 | no | no cap | Largest output-token limit a request for this model may ask for. See [Output token cap](#output-token-cap). |
 
 **The first provider is the primary. Later providers are fallbacks.** An
 entry with more than one provider lowers to an ordered aggregate cluster named
@@ -625,6 +626,43 @@ explicitly — the shorthand string form cannot carry it:
 | `provider` | string, key into `providers` | yes | — | Which provider serves this entry. |
 | `model` | string | no | the catalogue's own name | The upstream model ID at this provider, if different (e.g. Anthropic's dated model IDs). The proxy writes it into the `model` field of the request body for the provider that serves the attempt, and into the path for `vertex` and `bedrock`. After a fallback, the next provider gets its own `model`. The value is stored on the provider's cluster, so it never follows the route to another provider. Proof: `selected_provider_model_rewrite_changes_only_the_upstream_body` in `crates/proxy-http/src/router.rs`. |
 | `dialect` | enum: `openai`, `anthropic` | required for `vertex`/`bedrock`; derived otherwise | derived from the provider's `type` | The wire format this provider entry speaks. Required for `vertex`/`bedrock` because a single provider type there can serve more than one wire format (e.g. Vertex hosts Anthropic-shaped Claude and OpenAI-shaped Kimi under one provider). Omitting it where required is a load error, never a guess. |
+
+### Output token cap
+
+`models.<name>.max_output_tokens` refuses requests that ask for more output
+than you allow. The proxy never rewrites the body for it. A request is refused
+with `400` before any provider is dialled, and it is not retried on a fallback.
+The refusal is counted in `llmproxy_router_max_output_tokens_rejected_total`
+(no labels; `/stats/prometheus` only).
+
+The field that is checked follows the request path:
+
+| Path ends with | Field checked |
+|---|---|
+| `/responses` | `max_output_tokens` |
+| `/messages` | `max_tokens` |
+| anything else (chat completions, completions) | `max_completion_tokens` and `max_tokens`, each if present |
+
+A `400` is returned when a checked field:
+
+- is larger than the cap (the message names the field and the cap),
+- is not a non-negative integer (`-1`, `1.5`, `"100"`, `null`), or
+- appears more than once in the body, including under an escaped spelling such
+  as `"max\u005ftokens"`, because decoders disagree on which repeat wins.
+
+The cap applies to a limit the client sends; a request with no limit is
+forwarded unchanged and the provider's own limit applies. A body that is not a JSON object is also forwarded unchanged, unless the
+model check already refuses it.
+
+The cap comes from the model route, so it cannot be combined with the `auto`
+block. That combination is a load error at
+`models.<name>.max_output_tokens`, because `auto` resolves to a model after the
+cap is chosen. `0` is also a load error at the same path. In Envoy mode the same
+cap is the optional `max_output_tokens` field of `llmproxy.filters.v0.BodyRewrite`,
+valid in the filter config and in its `typed_per_filter_config` override. Proof:
+`cap_refuses_a_larger_limit_naming_the_field_and_the_cap` in
+`crates/proxy-http/src/router.rs` and the end-to-end tests in
+`crates/proxy/tests/max_output_tokens_e2e.rs`.
 
 ### `GET /v1/models`
 

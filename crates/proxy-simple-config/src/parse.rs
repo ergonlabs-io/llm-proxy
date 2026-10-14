@@ -345,6 +345,39 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         parse_host_port(admin, "admin")?;
     }
     validate_auto(config)?;
+    validate_output_caps(config)?;
+    Ok(())
+}
+
+/// `models.<name>.max_output_tokens` checks. A cap of 0 would make every
+/// request unservable, so it is refused rather than read as "no cap".
+///
+/// The cap also cannot be combined with `auto:`. It is read from the route the
+/// requested model selects, which for `auto` is not the route of the model the
+/// resolver then picks, so the cap of the resolved model would silently not
+/// apply. Refusing the combination keeps the cap from failing open.
+fn validate_output_caps(config: &SimpleConfig) -> Result<(), ConfigError> {
+    for (name, model) in &config.models {
+        let Some(cap) = model.max_output_tokens else {
+            continue;
+        };
+        let field_path = format!("models.{name}.max_output_tokens");
+        if cap == 0 {
+            return Err(ConfigError::InvalidValue {
+                field_path,
+                reason: "must be greater than 0".to_string(),
+            });
+        }
+        if config.auto.is_some() {
+            return Err(ConfigError::InvalidValue {
+                field_path,
+                reason: "is not supported together with the `auto` block: the cap is chosen \
+                         before `auto` resolves to a model, so the resolved model's cap would \
+                         not apply"
+                    .to_string(),
+            });
+        }
+    }
     Ok(())
 }
 

@@ -151,6 +151,10 @@ struct BodyRewriteConfig {
     /// surface).
     enabled: bool,
     dialect: Dialect,
+    /// `typed_config.max_output_tokens`: the output-token cap this config
+    /// asks the router to enforce. Independent of `enabled`, which only
+    /// governs the usage-option splice.
+    max_output_tokens: Option<u32>,
 }
 
 fn parse_dialect(raw: String, field_path: &str) -> Result<Dialect, ConfigError> {
@@ -204,7 +208,30 @@ fn parse_owned_config(config: &DynamicMessage) -> Result<BodyRewriteConfig, Conf
         })?;
     let dialect = parse_dialect(dialect, "typed_config.dialect")?;
 
-    Ok(BodyRewriteConfig { enabled, dialect })
+    // Rust note: `has_field_by_name` distinguishes "unset" from "set to the
+    // proto3 default (0)" for `optional` fields, which is what lets an explicit
+    // `0` be rejected instead of read as "no cap".
+    let max_output_tokens = if config.has_field_by_name("max_output_tokens") {
+        let value = config
+            .get_field_by_name("max_output_tokens")
+            .and_then(|v| v.as_u32())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                invalid(
+                    "typed_config.max_output_tokens",
+                    "must be a positive integer that fits in u32".into(),
+                )
+            })?;
+        Some(value)
+    } else {
+        None
+    };
+
+    Ok(BodyRewriteConfig {
+        enabled,
+        dialect,
+        max_output_tokens,
+    })
 }
 
 /// Read the borrowed `RuntimeFeatureFlag` compatibility config.
@@ -228,7 +255,11 @@ fn parse_legacy_config(config: &DynamicMessage) -> Result<BodyRewriteConfig, Con
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
     let dialect = parse_dialect(runtime_key, "typed_config.runtime_key")?;
-    Ok(BodyRewriteConfig { enabled, dialect })
+    Ok(BodyRewriteConfig {
+        enabled,
+        dialect,
+        max_output_tokens: None,
+    })
 }
 
 fn warn_legacy_config() {
@@ -396,6 +427,17 @@ impl BodyRewriteFilterInstance {
             })
             .unwrap_or(self.config)
     }
+
+    /// Publish the effective output-token cap for the router to enforce
+    /// (by refusal) against the whole buffered body. Every dialect and path, unlike the
+    /// usage splice: a cap is a spend control, not a protocol feature. Must
+    /// run after `clear_route_cache()` so `per_route_config` sees the route the
+    /// model header selects.
+    fn publish_max_output_tokens(&self, cb: &mut dyn DecoderCallbacks) {
+        if let Some(cap) = self.resolve_config(cb).max_output_tokens {
+            cb.stream_info().max_output_tokens = Some(cap);
+        }
+    }
 }
 
 impl HttpFilter for BodyRewriteFilterInstance {
@@ -458,6 +500,12 @@ impl HttpFilter for BodyRewriteFilterInstance {
             content_length,
         } = std::mem::replace(&mut self.state, State::PassThrough)
         else {
+            // Not scanning: a body not declared as JSON (the provider may still
+            // parse it as JSON, so the cap still applies; the router decides from
+            // the bytes). The manager refreshed its route snapshot from the head
+            // `decode_headers` just edited, so the route resolved here is the one
+            // the router will use.
+            self.publish_max_output_tokens(cb);
             return FilterDataStatus::Continue;
         };
 
@@ -550,6 +598,10 @@ impl HttpFilter for BodyRewriteFilterInstance {
             apply_model_header(&mut headers.headers, model.as_deref());
         });
         cb.clear_route_cache();
+        // Resolved only now: the per-route override must come from the route
+        // the model header just published selects, not the one matched before
+        // the body was read.
+        self.publish_max_output_tokens(cb);
 
         *data = pending.freeze();
         // `self.state` is already `PassThrough` from the `mem::replace`
@@ -686,6 +738,7 @@ mod tests {
             config: BodyRewriteConfig {
                 enabled: true,
                 dialect,
+                max_output_tokens: None,
             },
             state: State::PassThrough,
             takes_usage_option: false,
@@ -958,6 +1011,7 @@ mod tests {
         let override_cfg = Arc::new(BodyRewritePerRouteConfig(BodyRewriteConfig {
             enabled: true,
             dialect: Dialect::Anthropic,
+            max_output_tokens: None,
         }));
         let mut cb = TestCallbacks::new(headers.clone()).with_per_route_config(override_cfg);
         let mut req_headers = headers;
@@ -981,6 +1035,7 @@ mod tests {
             config: BodyRewriteConfig {
                 enabled: false,
                 dialect: Dialect::OpenAi,
+                max_output_tokens: None,
             },
             state: State::PassThrough,
             takes_usage_option: false,
@@ -1189,6 +1244,117 @@ mod tests {
         let (out, cb) = run(Dialect::OpenAi, headers, &[body]);
         assert_eq!(out, body.to_vec());
         assert!(!cb.stream_info.borrow().force_include_usage);
+    }
+
+    // --- output-token cap -----------------------------------------------------
+
+    fn filter_with_cap(dialect: Dialect, cap: Option<u32>) -> BodyRewriteFilterInstance {
+        let mut filter = filter_for(dialect);
+        filter.config.max_output_tokens = cap;
+        filter
+    }
+
+    /// Drive one JSON request through `filter` and return the callbacks double.
+    fn drive(
+        mut filter: BodyRewriteFilterInstance,
+        mut cb: TestCallbacks,
+        headers: RequestHeaders,
+        body: &[u8],
+    ) -> TestCallbacks {
+        let mut req_headers = headers;
+        filter.decode_headers(&mut cb, &mut req_headers, false);
+        let mut data = Bytes::copy_from_slice(body);
+        filter.decode_data(&mut cb, &mut data, true);
+        cb
+    }
+
+    #[test]
+    fn config_parses_max_output_tokens() {
+        let cfg = parse_owned_config(&body_rewrite(true, "openai")).unwrap();
+        assert_eq!(cfg.max_output_tokens, None);
+
+        let mut msg = body_rewrite(true, "openai");
+        msg.set_field_by_name("max_output_tokens", prost_reflect::Value::U32(4096));
+        let cfg = parse_owned_config(&msg).unwrap();
+        assert_eq!(cfg.max_output_tokens, Some(4096));
+    }
+
+    #[test]
+    fn explicit_zero_max_output_tokens_is_a_config_error_with_its_path() {
+        let mut msg = body_rewrite(true, "openai");
+        msg.set_field_by_name("max_output_tokens", prost_reflect::Value::U32(0));
+        let err = parse_owned_config(&msg).expect_err("zero cap must be rejected");
+        assert!(
+            err.to_string().contains("typed_config.max_output_tokens"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn listener_level_cap_is_published_for_both_dialects() {
+        let body = br#"{"model":"m","stream":false}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        for dialect in [Dialect::OpenAi, Dialect::Anthropic] {
+            let cb = drive(
+                filter_with_cap(dialect, Some(512)),
+                TestCallbacks::new(headers.clone()),
+                headers.clone(),
+                body,
+            );
+            assert_eq!(cb.stream_info.borrow().max_output_tokens, Some(512));
+        }
+    }
+
+    #[test]
+    fn no_cap_publishes_nothing() {
+        let body = br#"{"model":"m","stream":false}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        let cb = drive(
+            filter_with_cap(Dialect::OpenAi, None),
+            TestCallbacks::new(headers.clone()),
+            headers,
+            body,
+        );
+        assert_eq!(cb.stream_info.borrow().max_output_tokens, None);
+    }
+
+    /// The per-route override replaces the listener config wholesale, so a
+    /// route's cap wins over the listener's, and a route override without a
+    /// cap removes the listener's.
+    #[test]
+    fn per_route_cap_overrides_the_listener_cap() {
+        let body = br#"{"model":"m","stream":false}"#;
+        let headers = request_headers(Some("application/json"), Some(body.len() as u64));
+        for (route_cap, expected) in [(Some(64), Some(64)), (None, None)] {
+            let override_cfg = Arc::new(BodyRewritePerRouteConfig(BodyRewriteConfig {
+                enabled: true,
+                dialect: Dialect::OpenAi,
+                max_output_tokens: route_cap,
+            }));
+            let cb = drive(
+                filter_with_cap(Dialect::OpenAi, Some(512)),
+                TestCallbacks::new(headers.clone()).with_per_route_config(override_cfg),
+                headers.clone(),
+                body,
+            );
+            assert_eq!(cb.stream_info.borrow().max_output_tokens, expected);
+        }
+    }
+
+    /// A body declared as something other than JSON is still published a cap
+    /// (the provider may parse it as JSON anyway); the router decides from
+    /// the bytes.
+    #[test]
+    fn cap_is_published_for_a_non_json_content_type() {
+        let body = br#"{"model":"m"}"#;
+        let headers = request_headers(Some("text/plain"), Some(body.len() as u64));
+        let cb = drive(
+            filter_with_cap(Dialect::OpenAi, Some(7)),
+            TestCallbacks::new(headers.clone()),
+            headers,
+            body,
+        );
+        assert_eq!(cb.stream_info.borrow().max_output_tokens, Some(7));
     }
 
     /// A body with no extractable model must leave `StreamInfo::requested_model`
