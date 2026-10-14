@@ -830,3 +830,43 @@ fn translate_output_carries_the_persistent_store() {
     .expect("translate output must be strict-valid Envoy config");
     proxy_config::build_snapshot(&loaded).expect("and must build IR");
 }
+
+// --- auth.max_policy_staleness (review H4) -----------------------------------
+
+/// Absent adds no field (the filter's default bound applies); a value lowers
+/// to whole seconds that the real filter accepts; a sub-second value or one
+/// under the 96 s floor is refused at its dialect path.
+#[test]
+fn max_policy_staleness_lowers_to_seconds_and_refuses_values_under_the_floor() {
+    let with = |value: &str| {
+        format!(
+            "version: 0\n\
+             providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+             routes:\n  - {{ model: \"*\", provider: openai }}\n\
+             auth:\n  hmac_secret: \"test-operator-secret\"\n  max_policy_staleness: {value}\n"
+        )
+    };
+    let absent = parse(&config_with_store("{ in_memory: {} }")).unwrap();
+    assert!(auth_typed_config(&absent)
+        .get("max_policy_staleness_seconds")
+        .is_none());
+
+    let config = parse(&with("10m")).unwrap();
+    assert_eq!(
+        auth_typed_config(&config)["max_policy_staleness_seconds"],
+        600
+    );
+    real_filter_accepts(&config);
+
+    for value in ["95s", "100500ms"] {
+        match lower(&parse(&with(value)).unwrap()) {
+            Err(ConfigError::InvalidValue { field_path, .. }) => {
+                assert_eq!(field_path, "auth.max_policy_staleness", "{value}")
+            }
+            other => panic!(
+                "{value}: expected InvalidValue, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+}

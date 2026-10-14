@@ -2536,6 +2536,85 @@ fn decrypt_credentials(
         .collect()
 }
 
+/// When this replica last confirmed its published snapshot against the store,
+/// and how stale virtual-key authentication may let it get (review H4).
+///
+/// Shared by the [`ControlPlane`] (which marks it on every successful poll or
+/// rebuild) and every worker's `VirtualKeyAuthenticator` (which reads it per
+/// request). Two atomics, so the request path takes no lock: a read is one
+/// `Instant::now()` and two relaxed loads.
+///
+/// ADR-0005 makes authentication fail CLOSED. At boot an unreachable store
+/// already refuses to bind; at runtime the poller keeps serving the last-good
+/// snapshot so a store blip does not 401 every request, but only up to
+/// [`Self::max_staleness`]. Past it the snapshot may hold a key revoked since
+/// on another replica, so virtual-key authentication refuses every request
+/// until a poll succeeds again.
+#[derive(Debug)]
+pub struct PolicyFreshness {
+    epoch: Instant,
+    /// Milliseconds after `epoch` of the last successful reconciliation.
+    reconciled_at_ms: AtomicU64,
+    /// The bound, in milliseconds. `0` means no bound has been configured,
+    /// which only test-built control planes ever have: the auth filter sets
+    /// one for every chain it builds (see `auth_filter::parse_config`).
+    max_staleness_ms: AtomicU64,
+}
+
+impl PolicyFreshness {
+    fn new() -> Self {
+        PolicyFreshness {
+            epoch: Instant::now(),
+            reconciled_at_ms: AtomicU64::new(0),
+            max_staleness_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn mark_reconciled(&self) {
+        self.reconciled_at_ms
+            .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Time since the last successful reconciliation.
+    pub fn age(&self) -> Duration {
+        let reconciled = self.reconciled_at_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.now_ms().saturating_sub(reconciled))
+    }
+
+    /// Sets the staleness bound. Called by the auth filter each time it builds
+    /// the chain, so a reload that changes the bound takes effect.
+    pub fn set_max_staleness(&self, bound: Duration) {
+        let ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX);
+        self.max_staleness_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The configured bound, if any.
+    pub fn max_staleness(&self) -> Option<Duration> {
+        match self.max_staleness_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    /// Whether the snapshot is older than the bound, so authentication must
+    /// fail closed.
+    pub fn is_expired(&self) -> bool {
+        self.max_staleness().is_some_and(|bound| self.age() > bound)
+    }
+}
+
+/// The `llmproxy_policy_snapshot_age_seconds` series for one control plane.
+/// The registry only takes deltas, so the last published value is kept.
+struct AgeGauge {
+    registry: Arc<proxy_observability::stats::Registry>,
+    handle: proxy_observability::stats::Handle,
+    last: u64,
+}
+
 /// Owns the store, the operator's HMAC secret, the config bootstrap keys, and
 /// the published snapshot. See the module doc for the full seam and the
 /// boot/refresh fail-closed split.
@@ -2554,9 +2633,11 @@ pub struct ControlPlane {
     /// poll to rebuild rather than risk comparing against a stale or
     /// meaningless number. See [`Self::poll_once`].
     last_generation: Mutex<Option<u64>>,
-    /// When a poll (or a `rebuild()`) last SUCCEEDED. See
-    /// [`Self::snapshot_age`].
-    last_reconciled_at: Mutex<Instant>,
+    /// When a poll (or a `rebuild()`) last SUCCEEDED, and the staleness
+    /// bound. See [`Self::snapshot_age`] and [`PolicyFreshness`].
+    freshness: Arc<PolicyFreshness>,
+    /// Set by [`Self::export_snapshot_age`]; published by the poller.
+    age_gauge: Mutex<Option<AgeGauge>>,
     poller: Mutex<Option<PolicyPoller>>,
     /// Key-encryption keys for tenant provider credentials (ADR-0007
     /// decision 2). `None` means `typed_config.tenant_credentials` is not
@@ -2651,7 +2732,12 @@ impl ControlPlane {
             bootstrap_keys,
             published,
             last_generation: Mutex::new(generation),
-            last_reconciled_at: Mutex::new(Instant::now()),
+            freshness: {
+                let freshness = PolicyFreshness::new();
+                freshness.mark_reconciled();
+                Arc::new(freshness)
+            },
+            age_gauge: Mutex::new(None),
             poller: Mutex::new(None),
             credential_keys,
             credential_warnings,
@@ -2699,10 +2785,7 @@ impl ControlPlane {
                     .last_generation
                     .lock()
                     .expect("control plane mutex poisoned") = generation;
-                *self
-                    .last_reconciled_at
-                    .lock()
-                    .expect("control plane mutex poisoned") = Instant::now();
+                self.freshness.mark_reconciled();
                 self.notify_rate_card_watches();
             }
             Err(err) => {
@@ -2737,10 +2820,7 @@ impl ControlPlane {
             .lock()
             .expect("control plane mutex poisoned");
         if previous == Some(generation) {
-            *self
-                .last_reconciled_at
-                .lock()
-                .expect("control plane mutex poisoned") = Instant::now();
+            self.freshness.mark_reconciled();
             return Ok(false);
         }
         let loaded = self.store.load()?;
@@ -2750,10 +2830,7 @@ impl ControlPlane {
             .last_generation
             .lock()
             .expect("control plane mutex poisoned") = Some(generation);
-        *self
-            .last_reconciled_at
-            .lock()
-            .expect("control plane mutex poisoned") = Instant::now();
+        self.freshness.mark_reconciled();
         self.notify_rate_card_watches();
         Ok(true)
     }
@@ -2767,10 +2844,61 @@ impl ControlPlane {
     /// [`Self::start_policy_poller`]), is the replica-side half of that
     /// observability requirement.
     pub fn snapshot_age(&self) -> Duration {
-        self.last_reconciled_at
-            .lock()
-            .expect("control plane mutex poisoned")
-            .elapsed()
+        self.freshness.age()
+    }
+
+    /// The freshness clock and staleness bound this control plane marks,
+    /// for the authenticator that enforces the bound.
+    pub fn freshness(&self) -> Arc<PolicyFreshness> {
+        Arc::clone(&self.freshness)
+    }
+
+    /// Exports [`Self::snapshot_age`] as `llmproxy_policy_snapshot_age_seconds`
+    /// with `scope` (the chain's `stat_prefix`; bounded by the operator's
+    /// config, never request data). The poller publishes it every tick, so a
+    /// scrape lags the true age by at most one poll interval. The first call
+    /// wins; later calls (one per worker build) change nothing.
+    pub fn export_snapshot_age(
+        &self,
+        registry: Arc<proxy_observability::stats::Registry>,
+        scope: &str,
+    ) {
+        let mut gauge = self.age_gauge.lock().expect("control plane mutex poisoned");
+        if gauge.is_some() {
+            return;
+        }
+        let handle = registry.resolve_capped(
+            &proxy_observability::stats::instruments::POLICY_SNAPSHOT_AGE_SECONDS,
+            &[("scope", scope)],
+            256,
+            &[("scope", "overflow")],
+        );
+        *gauge = Some(AgeGauge {
+            registry,
+            handle,
+            last: 0,
+        });
+        drop(gauge);
+        self.publish_snapshot_age();
+    }
+
+    /// Sets the age gauge to the current [`Self::snapshot_age`], whole
+    /// seconds. A no-op until [`Self::export_snapshot_age`] has run.
+    pub fn publish_snapshot_age(&self) {
+        let mut gauge = self.age_gauge.lock().expect("control plane mutex poisoned");
+        let Some(gauge) = gauge.as_mut() else {
+            return;
+        };
+        let age = self.snapshot_age().as_secs();
+        // Rust note: the wrapping difference, applied back as an i64, is how
+        // the registry's delta-only `add` sets a gauge to an absolute value
+        // (the same trick `CaptureSpoolStats::publish` uses).
+        gauge.registry.add(
+            proxy_observability::stats::WorkerId(0),
+            gauge.handle,
+            age.wrapping_sub(gauge.last) as i64,
+        );
+        gauge.last = age;
     }
 
     /// Starts the background policy-poller thread, ticking roughly every
@@ -3581,6 +3709,9 @@ fn run_policy_poller(control: Weak<ControlPlane>, shutdown: Arc<PollShutdown>, i
     // is at least ten intervals old, whichever comes first.
     let mut last_warn: Option<Instant> = None;
     let mut warned_since_success = false;
+    // Whether this thread already announced that authentication fails
+    // closed, so the transition is logged once per outage, not per tick.
+    let mut announced_expiry = false;
 
     let mut guard = shutdown
         .stop
@@ -3611,12 +3742,37 @@ fn run_policy_poller(control: Weak<ControlPlane>, shutdown: Arc<PollShutdown>, i
                 return;
             };
             let bound = interval + interval / 4;
-            match cp.poll_once() {
+            let polled = cp.poll_once();
+            cp.publish_snapshot_age();
+            match polled {
                 Ok(_rebuilt) => {
+                    if announced_expiry {
+                        tracing::warn!(
+                            "control-plane policy poll succeeded again; virtual-key \
+                             authentication is serving requests again"
+                        );
+                    }
                     warned_since_success = false;
+                    announced_expiry = false;
                 }
                 Err(err) => {
                     let snapshot_age = cp.snapshot_age();
+                    let expired = cp.freshness.is_expired();
+                    if expired && !announced_expiry {
+                        tracing::error!(
+                            error = %err,
+                            snapshot_age_seconds = snapshot_age.as_secs_f64(),
+                            max_staleness_seconds = cp
+                                .freshness
+                                .max_staleness()
+                                .map(|bound| bound.as_secs_f64())
+                                .unwrap_or_default(),
+                            "control-plane policy snapshot is older than \
+                             max_policy_staleness_seconds; virtual-key authentication now \
+                             FAILS CLOSED (503 auth_policy_stale) until a poll succeeds"
+                        );
+                        announced_expiry = true;
+                    }
                     let should_warn = !warned_since_success
                         || last_warn.is_none_or(|at| at.elapsed() >= interval * 10);
                     if should_warn {
@@ -5930,6 +6086,93 @@ mod tests {
             "a failed poll must not reset last_reconciled_at -- the snapshot is getting \
              staler, not fresher, while the store is down"
         );
+    }
+
+    // --- the hard staleness bound (review H4; ADR-0005: auth fails closed) --
+    //
+    // Before the bound, a store outage keeps the last-good snapshot serving;
+    // past it, virtual-key authentication refuses every key, and the age
+    // gauge on /stats/prometheus shows how stale the snapshot is. A poll that
+    // succeeds again restores service and resets the gauge.
+    //
+    // The bound is moved rather than the clock: "age > bound" is the whole
+    // condition, and waiting out a real bound would make the test slow. The
+    // one sleep is for the gauge, which counts whole seconds.
+    #[test]
+    fn past_the_staleness_bound_auth_fails_closed_and_the_age_gauge_shows_it() {
+        let secret_bytes = b"operator-secret";
+        let fail_flag = Arc::new(AtomicBool::new(false));
+        let inner = InMemoryControlPlaneStore::default();
+        inner
+            .put_key(&StoredKey {
+                key_id: KeyId::new("k1"),
+                digest: digest_bytes(secret_bytes, "llmp_good-key"),
+                tenant: TenantId::new("tenant-a"),
+                revoked: false,
+            })
+            .unwrap();
+        let cp = ControlPlane::new(
+            Box::new(ToggleStore {
+                inner,
+                fail: Arc::clone(&fail_flag),
+                load_calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            HmacSecret::new(secret_bytes),
+            KeySet::new(),
+        )
+        .unwrap();
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        cp.export_snapshot_age(Arc::clone(&registry), "ingress");
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle())
+                .with_freshness(cp.freshness());
+        let headers = headers_with_authorization("Bearer llmp_good-key");
+        let gauge = || {
+            proxy_observability::stats::prometheus_render::render(&registry)
+                .lines()
+                .find(|line| {
+                    line.starts_with(
+                        "envoy_llmproxy_policy_snapshot_age_seconds{scope=\"ingress\"}",
+                    )
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .expect("the age gauge is exported")
+        };
+
+        fail_flag.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(cp.poll_once().is_err());
+        cp.publish_snapshot_age();
+
+        cp.freshness().set_max_staleness(Duration::from_secs(3600));
+        assert!(
+            matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "before the bound, the last-good snapshot keeps serving"
+        );
+
+        cp.freshness().set_max_staleness(Duration::from_millis(1));
+        assert!(
+            matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Rejected(AuthError::PolicyStale)
+            ),
+            "past the bound, a valid key is refused: the snapshot may hold a revoked key"
+        );
+        assert!(gauge() >= 1, "the gauge shows the stale snapshot's age");
+
+        fail_flag.store(false, Ordering::SeqCst);
+        cp.poll_once().unwrap();
+        cp.publish_snapshot_age();
+        cp.freshness().set_max_staleness(Duration::from_secs(3600));
+        assert!(matches!(
+            authenticator.authenticate(&headers),
+            AuthOutcome::Authenticated(_)
+        ));
+        assert_eq!(gauge(), 0, "a successful poll resets the age");
     }
 
     // --- an unmoved generation must skip `load()` entirely -- the whole

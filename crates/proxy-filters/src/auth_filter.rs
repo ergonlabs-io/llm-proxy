@@ -436,6 +436,37 @@ fn parse_poll_interval(config: &DynamicMessage) -> Duration {
     }
 }
 
+/// Reads `typed_config.max_policy_staleness_seconds` (review H4): how old the
+/// policy snapshot may get before virtual-key authentication fails closed.
+/// `0` means 5 x `poll_interval`. An explicit value under 2 x `poll_interval`
+/// is rejected, because a healthy replica's snapshot already ages up to
+/// 1.25 x the interval between polls and would refuse traffic between them.
+/// There is no "no bound" value: unset never means open.
+fn parse_max_policy_staleness(
+    config: &DynamicMessage,
+    poll_interval: Duration,
+) -> Result<Duration, ConfigError> {
+    let secs = config
+        .get_field_by_name("max_policy_staleness_seconds")
+        .and_then(|v| v.as_u32())
+        .unwrap_or(0);
+    if secs == 0 {
+        return Ok(poll_interval * 5);
+    }
+    let bound = Duration::from_secs(u64::from(secs));
+    if bound < poll_interval * 2 {
+        return Err(invalid(
+            "typed_config.max_policy_staleness_seconds",
+            format!(
+                "must be at least 2 x poll_interval_seconds ({}s), or a healthy replica \
+                 would refuse requests between two polls",
+                (poll_interval * 2).as_secs()
+            ),
+        ));
+    }
+    Ok(bound)
+}
+
 /// [`parse_config`]'s return value -- a named struct rather than a growing
 /// tuple, purely to keep clippy's `type_complexity` quiet now that there are
 /// several fields; see each field's doc (mirroring [`parse_config`]'s own) for
@@ -455,6 +486,8 @@ struct AuthConfig {
     /// How often the policy poller re-checks the store's generation
     /// stamp -- see [`parse_poll_interval`].
     poll_interval: Duration,
+    /// See [`parse_max_policy_staleness`].
+    max_policy_staleness: Duration,
     /// One entry per `typed_config.jwt_providers[i]`,
     /// in config order. Each becomes one `JwtAuthenticator` appended to the
     /// chain after the virtual-key authenticator.
@@ -747,6 +780,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
     let store_spec = parse_store(config)?;
     let poll_interval = parse_poll_interval(config);
+    let max_policy_staleness = parse_max_policy_staleness(config, poll_interval)?;
 
     let mut key_set = KeySet::new();
     // Rust note: `HashMap<String, usize>` / `HashMap<Vec<u8>, usize>` remember
@@ -871,6 +905,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         bootstrap_keys: key_set,
         store_spec,
         poll_interval,
+        max_policy_staleness,
         jwt_providers: parse_jwt_providers(config)?,
         credential_ring,
     })
@@ -901,6 +936,7 @@ impl HttpFilterFactory for AuthFilterFactory {
             bootstrap_keys,
             store_spec,
             poll_interval,
+            max_policy_staleness,
             jwt_providers,
             credential_ring,
         } = parse_config(config)?;
@@ -1104,10 +1140,24 @@ impl HttpFilterFactory for AuthFilterFactory {
         }) {
             registry.attach_control_plane(&control_plane, "typed_config")?;
         }
-        let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
-            HmacSecret::new(&secret_bytes),
-            control_plane.handle(),
-        ));
+        // Every worker's build sets the bound, so a reload that changes it
+        // takes effect; they all write the same value.
+        control_plane
+            .freshness()
+            .set_max_staleness(max_policy_staleness);
+        // Looked up outside `get_or_try_init`'s closure: that closure runs
+        // under the singleton map's lock, which `get` also takes.
+        if let Some(registry) = ctx
+            .shared
+            .get("", crate::usage_filter::STATS_REGISTRY_KEY)
+            .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok())
+        {
+            control_plane.export_snapshot_age(registry, &ctx.stat_prefix);
+        }
+        let authenticator: Box<dyn Authenticator> = Box::new(
+            VirtualKeyAuthenticator::new(HmacSecret::new(&secret_bytes), control_plane.handle())
+                .with_freshness(control_plane.freshness()),
+        );
         // One chain per (filter config, listener), shared by every per-stream
         // instance below via `Arc::clone` -- see `token_limit_filter`'s
         // `TokenLimitFilterFactory::create` for the same one-store-per-listener
@@ -1252,6 +1302,18 @@ impl HttpFilter for AuthFilterInstance {
             }
             AuthOutcome::Rejected(AuthError::JwtJwksStale) => {
                 self.deny(cb, "auth_jwt_jwks_stale");
+                FilterHeadersStatus::Continue
+            }
+            // Fail closed on a stale policy snapshot (review H4). 503, not
+            // 401: the store is the problem, not necessarily the credential,
+            // and a client should retry rather than discard its key.
+            AuthOutcome::Rejected(AuthError::PolicyStale) => {
+                cb.send_local_reply(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service unavailable",
+                    None,
+                    "auth_policy_stale",
+                );
                 FilterHeadersStatus::Continue
             }
             AuthOutcome::NoCredential => {
@@ -2339,6 +2401,96 @@ mod tests {
                 matches!(other, AuthOutcome::Authenticated(_))
             ),
         }
+    }
+
+    // --- the policy staleness bound (review H4) ------------------------------
+
+    /// Unset means 5 x the poll interval; an explicit value under 2 x the poll
+    /// interval is refused with its dotted path; one at the floor is taken.
+    #[test]
+    fn max_policy_staleness_defaults_to_five_polls_and_refuses_less_than_two() {
+        let mut config = authentication(inline_secret("secret"), vec![]);
+        assert_eq!(
+            parse_config(&config).unwrap().max_policy_staleness,
+            Duration::from_secs(240)
+        );
+        config.set_field_by_name(
+            "max_policy_staleness_seconds",
+            prost_reflect::Value::U32(95),
+        );
+        match parse_config(&config) {
+            Err(ConfigError::InvalidValue { field_path, .. }) => {
+                assert_eq!(field_path, "typed_config.max_policy_staleness_seconds")
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+        config.set_field_by_name(
+            "max_policy_staleness_seconds",
+            prost_reflect::Value::U32(96),
+        );
+        assert_eq!(
+            parse_config(&config).unwrap().max_policy_staleness,
+            Duration::from_secs(96)
+        );
+    }
+
+    /// Through the real factory: the bound reaches the control plane, the age
+    /// gauge is exported under the chain's `stat_prefix`, and once the
+    /// snapshot is older than the bound a valid key gets 503
+    /// `auth_policy_stale` instead of being admitted (fail closed).
+    #[test]
+    fn a_snapshot_past_the_bound_makes_the_filter_answer_503() {
+        let config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        let ctx = FactoryContext {
+            stat_prefix: "ingress".to_string(),
+            ..FactoryContext::default()
+        };
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        ctx.shared
+            .get_or_try_init("", "", crate::usage_filter::STATS_REGISTRY_KEY, || {
+                Ok(Arc::clone(&registry) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+        let factory = match AuthFilterFactory.create(&config, &ctx) {
+            Ok(factory) => factory,
+            Err(e) => panic!("valid config must build: {e:?}"),
+        };
+        let control_plane = ctx
+            .get(TYPE_URL)
+            .unwrap()
+            .downcast::<ControlPlane>()
+            .unwrap();
+        assert_eq!(
+            control_plane.freshness().max_staleness(),
+            Some(Duration::from_secs(240))
+        );
+        assert!(
+            proxy_observability::stats::prometheus_render::render(&registry)
+                .contains("envoy_llmproxy_policy_snapshot_age_seconds{scope=\"ingress\"}"),
+            "the age gauge is exported for the chain"
+        );
+        let minted = control_plane
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .unwrap();
+        let bearer = format!("Bearer {}", minted.plaintext);
+
+        let mut filter = factory.create_filter();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        filter.decode_headers(&mut cb, &mut request_headers(Some(&bearer)), true);
+        assert!(cb.local_reply.is_none(), "a fresh snapshot admits the key");
+
+        // Stand in for an outage longer than the bound.
+        control_plane
+            .freshness()
+            .set_max_staleness(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        filter.decode_headers(&mut cb, &mut request_headers(Some(&bearer)), true);
+        let reply = cb
+            .local_reply
+            .expect("a stale snapshot must refuse the key");
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.details, "auth_policy_stale");
     }
 
     // 19: the shared-singleton property.

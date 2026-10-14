@@ -218,7 +218,12 @@
           "$ref": "#/$defs/AuthTenantCredentials",
           "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials. Requires a durable `store`, `persistent` or `shared`; with `store` absent or `in_memory` this block is a load error."
         },
-        "enforce": { "$ref": "#/$defs/AuthEnforce" }
+        "enforce": { "$ref": "#/$defs/AuthEnforce" },
+        "max_policy_staleness": {
+          "$ref": "#/$defs/Duration",
+          "default": "4m",
+          "description": "How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`."
+        }
       },
       "oneOf": [
         { "required": ["hmac_secret"], "not": { "required": ["hmac_secret_file"] } },

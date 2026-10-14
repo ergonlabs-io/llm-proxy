@@ -375,6 +375,12 @@ pub enum AuthError {
     /// serving indefinitely old keys would trust a rotation that already
     /// happened.
     JwtJwksStale,
+    /// The control-plane snapshot the virtual keys are checked against has
+    /// not been confirmed against the store for longer than
+    /// `max_policy_staleness_seconds` (review H4). Fail closed: it may still
+    /// hold a key another replica revoked. The filter answers 503, not 401,
+    /// because the credential itself may be fine.
+    PolicyStale,
 }
 
 /// The result of asking one [`Authenticator`] to resolve a request.
@@ -711,11 +717,27 @@ pub struct VirtualKeyAuthenticator {
     // path beyond that one atomic load -- no store I/O happens here. See
     // `crate::control`'s module doc for the full publish/read seam.
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
+    /// The staleness clock of the control plane that publishes `snapshot`.
+    /// `None` only for an authenticator over keys no control plane
+    /// republishes ([`Self::from_static_keys`], and unit tests).
+    freshness: Option<Arc<crate::control::PolicyFreshness>>,
 }
 
 impl VirtualKeyAuthenticator {
     pub fn new(secret: HmacSecret, snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>) -> Self {
-        VirtualKeyAuthenticator { secret, snapshot }
+        VirtualKeyAuthenticator {
+            secret,
+            snapshot,
+            freshness: None,
+        }
+    }
+
+    /// Enforces the control plane's staleness bound: once its snapshot is
+    /// older than the bound, every virtual key is refused with
+    /// [`AuthError::PolicyStale`]. The auth filter always wires this.
+    pub fn with_freshness(mut self, freshness: Arc<crate::control::PolicyFreshness>) -> Self {
+        self.freshness = Some(freshness);
+        self
     }
 
     /// Build an authenticator over a fixed [`KeySet`] (no policies) whose
@@ -735,7 +757,11 @@ impl VirtualKeyAuthenticator {
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
         })));
-        VirtualKeyAuthenticator { secret, snapshot }
+        VirtualKeyAuthenticator {
+            secret,
+            snapshot,
+            freshness: None,
+        }
     }
 }
 
@@ -772,6 +798,18 @@ impl Authenticator for VirtualKeyAuthenticator {
             // see the module doc and `AuthOutcome::NoCredential`'s doc for
             // why this must not become `Rejected`.
             return AuthOutcome::NoCredential;
+        }
+
+        // Past the staleness bound the snapshot may still hold a key that was
+        // revoked elsewhere, so no virtual key is trusted (fail closed). Two
+        // relaxed atomic loads; nothing is logged here, the policy poller
+        // announces the transition once.
+        if self
+            .freshness
+            .as_ref()
+            .is_some_and(|freshness| freshness.is_expired())
+        {
+            return AuthOutcome::Rejected(AuthError::PolicyStale);
         }
 
         // Rust note: `ArcSwap::load` returns a guard that derefs to the

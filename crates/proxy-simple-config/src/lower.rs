@@ -2039,6 +2039,21 @@ fn lower_auth(
         ));
     }
 
+    if let Some(SimpleDuration(bound)) = auth.max_policy_staleness {
+        // The dialect does not expose the poll interval, so the floor is
+        // fixed: 2 x the 48 s default, the same rule
+        // `auth_filter::parse_max_policy_staleness` applies to the lowered
+        // value. Checked here so the error names the dialect path.
+        if bound.subsec_nanos() != 0 || bound < std::time::Duration::from_secs(96) {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth.max_policy_staleness".to_string(),
+                reason: "must be whole seconds and at least 96s (2 x the 48s policy poll), \
+                         or a healthy replica would refuse requests between two polls"
+                    .to_string(),
+            });
+        }
+    }
+
     if !auth.enforce.model_policy && auth.enforce.tenants_without_policy.is_some() {
         return Err(ConfigError::InvalidValue {
             field_path: "auth.enforce.tenants_without_policy".to_string(),
@@ -2056,6 +2071,9 @@ fn lower_auth(
     // Only an explicit `store:` adds a member. Absent means no store field at
     // all, which is what keeps configs written before this field lowering
     // byte-identical.
+    if let Some(SimpleDuration(bound)) = auth.max_policy_staleness {
+        typed_config["max_policy_staleness_seconds"] = json!(bound.as_secs());
+    }
     let store_member = lower_auth_store(auth.store.as_ref())?;
     let store_is_durable = matches!(&store_member, Some(("persistent" | "shared", _)));
     if let Some((member, value)) = store_member {

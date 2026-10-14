@@ -503,6 +503,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "poll_interval_seconds",
             "jwt_providers",
             "tenant_credentials",
+            "max_policy_staleness_seconds",
         ],
         "llmproxy.filters.v0.TenantCredentials" => {
             &["encryption_key_file", "encryption_key_id", "previous_keys"]

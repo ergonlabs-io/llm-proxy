@@ -844,6 +844,19 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Seconds since this replica last confirmed its control-plane policy
+    /// snapshot (keys, revocations, tenant policies) against the store, as of
+    /// the policy poller's last tick. Grows while the store is unreachable;
+    /// past the auth filter's `max_policy_staleness_seconds`, virtual-key
+    /// authentication fails closed. `scope` is the operator-chosen HCM
+    /// `stat_prefix`. Prometheus surface only (no Envoy equivalent).
+    pub const POLICY_SNAPSHOT_AGE_SECONDS: Instrument = Instrument {
+        name: "llmproxy_policy_snapshot_age_seconds",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "s",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

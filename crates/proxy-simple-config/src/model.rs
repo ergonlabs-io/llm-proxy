@@ -405,6 +405,11 @@ pub struct Auth {
     /// Which tenant controls the proxy enforces. Absent means both on.
     #[serde(default)]
     pub enforce: AuthEnforce,
+    /// How old the policy snapshot may get while the store cannot be read
+    /// before virtual-key authentication fails closed (503). Absent means
+    /// 4m (5 x the 48 s policy poll). Whole seconds, at least 96s.
+    #[serde(default)]
+    pub max_policy_staleness: Option<SimpleDuration>,
 }
 
 /// `auth.enforce`: opt-out switches for the controls that read the admin

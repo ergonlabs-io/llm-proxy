@@ -109,6 +109,18 @@ message Authentication {
   // decrypt stored ones: a tenant that already holds stored credentials then
   // fails closed (503) instead of falling back to a platform key.
   TenantCredentials tenant_credentials = 8;
+
+  // How old, in seconds, this replica's policy snapshot (keys, revocations,
+  // tenant policies) may get while the store cannot be read before
+  // virtual-key authentication fails closed: every `Bearer llmp_...` request
+  // is then refused with 503 (`auth_policy_stale`) until a poll succeeds
+  // again. Before the bound, the last-good snapshot keeps serving, so a store
+  // blip does not refuse traffic. `0` (unset) means 5 x
+  // `poll_interval_seconds`, 240 seconds at the default. An explicit value
+  // below 2 x `poll_interval_seconds` is a load error: a healthy replica's
+  // snapshot already ages up to 1.25 x the interval between polls. The age is
+  // exported as `llmproxy_policy_snapshot_age_seconds`.
+  uint32 max_policy_staleness_seconds = 9;
 }
 
 // Where the proxy finds the keys that seal tenant provider credentials at rest.
