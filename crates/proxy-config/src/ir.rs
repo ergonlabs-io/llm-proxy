@@ -579,6 +579,18 @@ pub struct HttpConnectionManagerConfig {
     /// the whole request (headers and body) is received. `None` (unset or
     /// `0s`) disables it, which is Envoy's default.
     pub request_timeout: Option<std::time::Duration>,
+    /// HCM `stream_idle_timeout`: how long a stream may go without activity
+    /// before it is cut. `None` disables it. Envoy's default is 5 minutes, so
+    /// lowering turns an unset field into `Some(300s)` and only an explicit
+    /// `0s` into `None`. A route `idle_timeout` overrides this for response
+    /// body gaps; before response headers only this value applies
+    /// (`internal-docs/envoy-divergences.md`).
+    pub stream_idle_timeout: Option<std::time::Duration>,
+    /// HCM `common_http_protocol_options.max_stream_duration`: the longest a
+    /// stream may live, from the first request byte to the last response
+    /// byte, however active it is. `None` (unset or `0s`) disables it, which
+    /// is Envoy's default.
+    pub max_stream_duration: Option<std::time::Duration>,
 }
 
 impl ListenerConfig {

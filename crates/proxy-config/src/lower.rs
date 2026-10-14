@@ -690,6 +690,9 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             // Downstream admission deadlines; see `convert_hcm`.
             "request_headers_timeout",
             "request_timeout",
+            // Stream-lifetime bounds; see `convert_hcm`.
+            "stream_idle_timeout",
+            "common_http_protocol_options",
             // Listed so a config setting it gets
             // `convert_hcm`'s specific "not implemented, see the dialect"
             // message instead of the generic surface-check one -- see
@@ -703,6 +706,10 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // RDS has the same ADS-only ConfigSource rule as EDS/SDS. The typed
         // converter performs its per-specifier refusal so all members pass
         // through this surface layer first.
+        // Only the stream lifetime is mapped. The connection-level fields on
+        // this message (`idle_timeout`, `max_connection_duration`, ...) stay
+        // rejected by the surface walk until something reads them.
+        "envoy.config.core.v3.HttpProtocolOptions" => &["max_stream_duration"],
         "envoy.extensions.filters.network.http_connection_manager.v3.Rds" => {
             &["config_source", "route_config_name"]
         }
@@ -2157,6 +2164,18 @@ fn convert_hcm(
         request_timeout: convert_optional_timeout(
             hcm.request_timeout.as_ref(),
             &format!("{path}.request_timeout"),
+        )?,
+        // Envoy's own default is 5 minutes, and only an explicit `0s`
+        // disables it.
+        stream_idle_timeout: match hcm.stream_idle_timeout.as_ref() {
+            None => Some(StdDuration::from_secs(300)),
+            some => convert_optional_timeout(some, &format!("{path}.stream_idle_timeout"))?,
+        },
+        max_stream_duration: convert_optional_timeout(
+            hcm.common_http_protocol_options
+                .as_ref()
+                .and_then(|o| o.max_stream_duration.as_ref()),
+            &format!("{path}.common_http_protocol_options.max_stream_duration"),
         )?,
     })
 }

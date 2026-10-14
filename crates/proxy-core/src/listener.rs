@@ -2267,6 +2267,8 @@ mod tests {
             upgrade_configs: vec![],
             request_headers_timeout: None,
             request_timeout: None,
+            stream_idle_timeout: None,
+            max_stream_duration: None,
         })
     }
 
@@ -2349,6 +2351,8 @@ mod tests {
             upgrade_configs: vec![],
             request_headers_timeout: None,
             request_timeout: None,
+            stream_idle_timeout: None,
+            max_stream_duration: None,
         })
     }
 
@@ -3337,6 +3341,8 @@ mod tests {
             upgrade_configs: vec![],
             request_headers_timeout: None,
             request_timeout: None,
+            stream_idle_timeout: None,
+            max_stream_duration: None,
         })
     }
 
@@ -4509,6 +4515,8 @@ mod tests {
             upgrade_configs: vec![],
             request_headers_timeout: None,
             request_timeout: None,
+            stream_idle_timeout: None,
+            max_stream_duration: None,
         })
     }
 

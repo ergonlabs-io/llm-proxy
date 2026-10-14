@@ -116,6 +116,8 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         upgrade_configs: vec![],
         request_headers_timeout: None,
         request_timeout: None,
+        stream_idle_timeout: None,
+        max_stream_duration: None,
     };
 
     let listener = ListenerConfig {
@@ -311,6 +313,8 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         upgrade_configs: vec![],
         request_headers_timeout: None,
         request_timeout: None,
+        stream_idle_timeout: None,
+        max_stream_duration: None,
     };
     let listener = ListenerConfig {
         name: "listener_0".to_string(),
