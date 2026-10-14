@@ -339,6 +339,15 @@ impl ConfigPublisher {
             }
         }
     }
+
+    /// Like [`ConfigPublisher::join`], but waits on a blocking-pool thread so
+    /// an async caller (the shutdown path on the control runtime) never parks
+    /// one of its own threads while workers finish.
+    pub async fn join_async(self) {
+        if let Err(err) = tokio::task::spawn_blocking(move || self.join()).await {
+            tracing::error!(?err, "worker join task failed");
+        }
+    }
 }
 
 /// Test helper for exercising `!Send` types outside a full `WorkerPool`
@@ -368,6 +377,45 @@ mod tests {
 
     fn handles() -> Arc<SnapshotHandles> {
         Arc::new(SnapshotHandles::new())
+    }
+
+    #[test]
+    fn join_async_does_not_block_the_calling_runtime() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let publisher = WorkerPool::spawn(
+            WorkerPoolConfig {
+                concurrency: 1,
+                pin_cores: false,
+            },
+            snapshot(0),
+            handles(),
+            move |_ctx: WorkerContext| {
+                let rx = release_rx.lock().unwrap().take();
+                async move {
+                    // The worker thread stays busy until the test releases
+                    // it, so `join` has something to wait for.
+                    if let Some(rx) = rx {
+                        let _ = rx.recv();
+                    }
+                }
+            },
+        );
+        publisher.shutdown();
+
+        // A current-thread runtime has one thread: a blocking join inside it
+        // would wait for a release that only this same thread can send, and
+        // the test would hang (nextest's terminate-after fails it).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let joined = tokio::spawn(publisher.join_async());
+            tokio::task::yield_now().await;
+            release_tx.send(()).unwrap();
+            joined.await.expect("join task panicked");
+        });
     }
 
     #[test]

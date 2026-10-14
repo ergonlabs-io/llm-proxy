@@ -64,7 +64,7 @@ use chrono::SecondsFormat;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::host_set::HostSet;
 use crate::{HealthFlags, Host};
@@ -377,16 +377,17 @@ pub struct OutlierDetector {
     states: Mutex<HashMap<SocketAddr, HostState>>,
     rng: Mutex<StdRng>,
     sink: Arc<dyn OutlierEventSink>,
-    /// Test-only seam: handles for every detached un-eject timer spawned by
-    /// [`OutlierDetector::schedule_uneject`]. `tokio::time::advance` moves
-    /// the virtual clock but does not by itself run tasks parked on an
-    /// already-expired timer back to completion -- only actually polling
-    /// them (awaiting the `JoinHandle`) does. Production code never reads
-    /// this; it exists purely so tests can deterministically wait for a
-    /// scheduled un-ejection to finish after advancing time, instead of
-    /// guessing how many `yield_now`s are enough.
-    #[cfg(test)]
-    uneject_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Every pending un-eject timer. Owned here, not detached, so a removed
+    /// cluster's timers stop with it: [`OutlierDetector::shutdown`] and
+    /// dropping the detector both abort them (`JoinSet` aborts on drop). The
+    /// tests also join it to wait deterministically for a scheduled
+    /// un-ejection after advancing the virtual clock.
+    unejects: Mutex<JoinSet<()>>,
+    /// The runtime that built the detector (the control runtime, where the
+    /// cluster manager runs). Timers are spawned there even when the
+    /// ejection is triggered from a worker thread, keeping the "control
+    /// computes, workers read" split.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl OutlierDetector {
@@ -419,20 +420,28 @@ impl OutlierDetector {
             states: Mutex::new(HashMap::new()),
             rng: Mutex::new(StdRng::seed_from_u64(seed)),
             sink,
-            #[cfg(test)]
-            uneject_handles: Mutex::new(Vec::new()),
+            unejects: Mutex::new(JoinSet::new()),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
     /// Test-only: wait for every un-eject timer spawned so far to run to
     /// completion. Only meaningful *after* advancing the virtual clock past
-    /// a scheduled ejection's deadline -- see the field doc on
-    /// [`OutlierDetector::uneject_handles`].
+    /// a scheduled ejection's deadline.
     #[cfg(test)]
     async fn await_pending_unejects(&self) {
-        let handles: Vec<JoinHandle<()>> = self.uneject_handles.lock().unwrap().drain(..).collect();
-        for handle in handles {
-            handle.await.expect("un-eject task must not panic");
+        let mut set = std::mem::take(&mut *self.unejects.lock().unwrap());
+        while let Some(joined) = set.join_next().await {
+            joined.expect("un-eject task must not panic");
+        }
+    }
+
+    /// Abort every pending un-eject timer. Called when the
+    /// owning cluster is removed or replaced; a timer that outlived its
+    /// cluster would only mutate an orphaned host set and emit a stale event.
+    pub fn shutdown(&self) {
+        if let Ok(mut set) = self.unejects.lock() {
+            set.abort_all();
         }
     }
 
@@ -694,7 +703,7 @@ impl OutlierDetector {
         base.saturating_mul(ejection_count.max(1)).min(cap)
     }
 
-    /// Detached un-eject timer. Deliberately does not need `Arc<Self>` --
+    /// Un-eject timer, owned by the detector. Deliberately does not need `Arc<Self>` --
     /// only clones of `host_set`/`sink`/`cluster_name` cross into the
     /// spawned task, so `report_result`/`eject` can stay plain `&self`
     /// methods (matching the router-facing API shape the router expects) even
@@ -703,7 +712,7 @@ impl OutlierDetector {
         let host_set = Arc::clone(&self.host_set);
         let sink = Arc::clone(&self.sink);
         let cluster_name = self.cluster_name.clone();
-        let handle = tokio::spawn(async move {
+        let timer = async move {
             tokio::time::sleep(duration).await;
             if Self::set_outlier_flag(&host_set, addr, false) {
                 Self::emit_uneject_event_static(
@@ -713,11 +722,19 @@ impl OutlierDetector {
                     UnejectReason::EjectionExpired,
                 );
             }
-        });
-        #[cfg(test)]
-        self.uneject_handles.lock().unwrap().push(handle);
-        #[cfg(not(test))]
-        drop(handle);
+        };
+        let mut set = self.unejects.lock().unwrap();
+        // Reap finished timers so a long-lived cluster does not accumulate
+        // completed entries.
+        while set.try_join_next().is_some() {}
+        match &self.runtime {
+            Some(handle) => {
+                set.spawn_on(timer, handle);
+            }
+            None => {
+                set.spawn(timer);
+            }
+        }
     }
 
     /// Toggle one host's `failed_outlier_check` bit, preserving
@@ -1089,6 +1106,41 @@ mod tests {
             !is_ejected(&host_set, a),
             "3rd ejection must be capped at max_ejection_time (250s), not the uncapped 300s"
         );
+    }
+
+    /// A removed cluster's un-eject timers must stop: after `shutdown` (and
+    /// after the detector is dropped) the pending timer never fires, so no
+    /// stale un-eject event is emitted and the orphaned host set is untouched.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_and_drop_stop_pending_uneject_timers() {
+        let a = addr(1);
+        for drop_instead in [false, true] {
+            let (engine, host_set, sink) =
+                detector(vec![host(1), host(2)], config_without_ejection_cap());
+            for _ in 0..5 {
+                engine.report_result(a, RequestResult::Http5xx);
+            }
+            assert!(is_ejected(&host_set, a));
+            if drop_instead {
+                drop(engine);
+            } else {
+                engine.shutdown();
+            }
+            // Sleeping (not `advance`) lets the paused clock auto-advance
+            // after every runnable task has run, so a live timer fires.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            assert!(
+                is_ejected(&host_set, a),
+                "timer must not fire after the cluster is gone (drop={drop_instead})"
+            );
+            let events = sink.events.lock().unwrap();
+            assert!(
+                events
+                    .iter()
+                    .all(|e| matches!(e.action, EjectAction::Eject)),
+                "no un-eject event may be emitted (drop={drop_instead})"
+            );
+        }
     }
 
     // --------------------------------- gateway failure, 0% enforcement --

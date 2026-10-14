@@ -1382,7 +1382,7 @@ async fn run_serve(
     if let Err(message) = wait_for_initial_binds(&mut bind_rx, concurrency).await {
         eprintln!("{message}");
         publisher.shutdown();
-        publisher.join();
+        publisher.join_async().await;
         if let Some(delivery) = metadata_delivery {
             let summary = delivery.shutdown(Duration::from_secs(5)).await;
             tracing::warn!(
@@ -1526,7 +1526,7 @@ async fn run_serve(
     // Stopping the workers drops every connection still open: this is the
     // deadline cut (or the fast exit). Workers that already drained exit at once.
     publisher.shutdown();
-    publisher.join();
+    publisher.join_async().await;
 
     // Access-log lines are written by background threads, so a process that
     // exits right after the workers would lose whatever is still queued.

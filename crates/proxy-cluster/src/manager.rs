@@ -219,6 +219,10 @@ impl Drop for ManagedCluster {
                 handle.abort();
             }
         }
+        // Pending un-eject timers belong to the cluster too.
+        if let Some(detector) = &self.outlier_detector {
+            detector.shutdown();
+        }
         // And the DNS refresh timer. Its `Weak` would stop upgrading anyway,
         // so it would never resolve for a dead cluster again, but it would
         // sit asleep until its next tick to find that out: a refresh interval
