@@ -82,6 +82,39 @@ pub enum UsageCompleteness {
     Partial,
 }
 
+/// JSON kept exactly as a provider sent it, embedded in a record as a JSON
+/// value (not a quoted string).
+///
+/// Rust note: `RawValue` is serde_json's "unparsed JSON" type. It serializes
+/// as the original text, so number formatting and key order survive. It only
+/// deserializes from a JSON text (`from_slice`/`from_str`), not from a
+/// `serde_json::Value`, which is how every record consumer reads records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RawJson(Box<serde_json::value::RawValue>);
+
+impl RawJson {
+    /// Wrap `text`, which must be valid JSON; `None` otherwise.
+    pub fn from_text(text: &str) -> Option<Self> {
+        serde_json::value::RawValue::from_string(text.to_owned())
+            .ok()
+            .map(Self)
+    }
+
+    /// The JSON text.
+    pub fn get(&self) -> &str {
+        self.0.get()
+    }
+}
+
+impl PartialEq for RawJson {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl Eq for RawJson {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -89,7 +122,16 @@ pub struct Usage {
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
     pub completeness: UsageCompleteness,
+    /// `provider` when every count is the provider's own figure, `estimate`
+    /// when the proxy estimated any of them (see the two flags below).
     pub provenance: String,
+    /// The input count was estimated from the request size. Added under
+    /// schema version 1: absent in older records, read as `false`.
+    #[serde(default)]
+    pub input_estimated: bool,
+    /// The output count was estimated from the streamed text. Same default.
+    #[serde(default)]
+    pub output_estimated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +140,8 @@ pub struct Cost {
     pub unit: String,
     pub currency: String,
     pub rate_card_version: String,
+    /// `list` for a rate-card price of provider-reported usage; `estimate`
+    /// when the usage it prices was estimated (a stream that ended early).
     pub kind: String,
 }
 
@@ -119,6 +163,15 @@ pub struct AttemptRecord {
     /// `null` when the response named none; absent in records from older builds.
     #[serde(default)]
     pub served_model: Option<String>,
+    /// The provider's id for this attempt's response; selected attempt only.
+    /// Added under schema version 1: absent in older records, `null` when the
+    /// response named none.
+    #[serde(default)]
+    pub upstream_response_id: Option<String>,
+    /// The provider's `usage` object exactly as sent, embedded as JSON;
+    /// selected attempt only. Evidence, never read for cost.
+    #[serde(default)]
+    pub upstream_usage: Option<RawJson>,
     pub started_at: String,
     pub finished_at: String,
     pub duration_ms: u64,
@@ -160,6 +213,16 @@ pub struct RequestRecord {
     pub selected_cluster: Option<String>,
     pub selected_provider: Option<String>,
     pub selected_model: Option<String>,
+    /// The provider's id for the response that answered this request (the
+    /// selected attempt's). Added under schema version 1: absent in older
+    /// records, `null` when the response named none.
+    #[serde(default)]
+    pub upstream_response_id: Option<String>,
+    /// The provider's `usage` object exactly as sent, embedded as a JSON
+    /// value. Audit evidence: `cost` comes from the rate card, never from
+    /// this. `null` when absent or over the size bound.
+    #[serde(default)]
+    pub upstream_usage: Option<RawJson>,
     pub status: Option<u16>,
     pub termination: Termination,
     pub error_category: Option<String>,
@@ -212,6 +275,7 @@ impl RequestRecord {
             &self.selected_cluster,
             &self.selected_provider,
             &self.selected_model,
+            &self.upstream_response_id,
             &self.error_category,
         ]
         .into_iter()
@@ -219,6 +283,7 @@ impl RequestRecord {
         {
             add(value);
         }
+        let mut raw_usage_bytes = self.upstream_usage.as_ref().map_or(0, |u| u.get().len());
         for flag in &self.response_flags {
             add(flag);
         }
@@ -253,6 +318,7 @@ impl RequestRecord {
                 &attempt.provider,
                 &attempt.upstream_model,
                 &attempt.served_model,
+                &attempt.upstream_response_id,
                 &attempt.retry_reason,
             ]
             .into_iter()
@@ -260,6 +326,7 @@ impl RequestRecord {
             {
                 add(value);
             }
+            raw_usage_bytes += attempt.upstream_usage.as_ref().map_or(0, |u| u.get().len());
             if let Some(usage) = &attempt.usage {
                 add(&usage.provenance);
             }
@@ -274,7 +341,7 @@ impl RequestRecord {
                 }
             }
         }
-        total
+        total.saturating_add(raw_usage_bytes)
     }
     pub fn validate(&self, max_attempts: u16) -> Result<(), &'static str> {
         if self.schema_version != SCHEMA_VERSION {
@@ -547,6 +614,8 @@ pub(crate) mod tests {
             selected_cluster: None,
             selected_provider: None,
             selected_model: None,
+            upstream_response_id: None,
+            upstream_usage: None,
             status: Some(200),
             termination: Termination::Complete,
             error_category: None,
@@ -563,6 +632,51 @@ pub(crate) mod tests {
             attempts_truncated: false,
             credential_source: None,
         }
+    }
+
+    /// Provider usage text survives a record's JSON round trip byte for byte
+    /// and is embedded as a JSON object, not a quoted string. The number
+    /// `0.000012340` would not survive a pass through `serde_json::Value`.
+    #[test]
+    fn upstream_usage_is_embedded_raw_and_round_trips() {
+        let raw = r#"{"cost":0.000012340,"prompt_tokens":7,"nested":{"b":1,"a":2}}"#;
+        let mut r = record();
+        r.upstream_response_id = Some("chatcmpl-abc".into());
+        r.upstream_usage = RawJson::from_text(raw);
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.contains(&format!(r#""upstream_usage":{raw}"#)),
+            "{text}"
+        );
+        let back: RequestRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.upstream_usage.unwrap().get(), raw);
+        // The same record as a `Value` has the usage as an object.
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["upstream_usage"]["prompt_tokens"], 7);
+        assert_eq!(value["upstream_response_id"], "chatcmpl-abc");
+    }
+
+    /// Records from before these fields exist still parse, with both unset.
+    #[test]
+    fn record_without_upstream_fields_still_parses() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("upstream_response_id");
+        object.remove("upstream_usage");
+        let back: RequestRecord =
+            serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(back.upstream_response_id, None);
+        assert_eq!(back.upstream_usage, None);
+    }
+
+    #[test]
+    fn retained_bytes_counts_the_raw_usage_text() {
+        let mut r = record();
+        let base = r.retained_bytes();
+        r.upstream_usage = RawJson::from_text(&format!(r#"{{"k":"{}"}}"#, "x".repeat(1000)));
+        assert!(r.retained_bytes() >= base + 1000);
     }
 
     #[test]

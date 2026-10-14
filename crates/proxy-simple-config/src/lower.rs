@@ -197,7 +197,9 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
     "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\" ",
     "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\" ",
-    "llm_served_model=\"%LLM_SERVED_MODEL%\"\n",
+    "llm_served_model=\"%LLM_SERVED_MODEL%\" ",
+    "llm_usage_completeness=\"%LLM_USAGE_COMPLETENESS%\" llm_cost_kind=\"%LLM_COST_KIND%\" ",
+    "llm_upstream_id=\"%LLM_UPSTREAM_ID%\"\n",
 );
 
 /// The header Anthropic requires on every Messages API request.
@@ -1477,12 +1479,20 @@ fn enforces_spend(config: &SimpleConfig) -> bool {
 /// the dialect. Shared by the
 /// listener-level entry and every per-route override so the two can never
 /// drift in shape.
-fn body_rewrite_typed_config(enabled: bool, dialect: &str) -> Value {
-    json!({
+fn body_rewrite_typed_config(
+    enabled: bool,
+    dialect: &str,
+    max_output_tokens: Option<u32>,
+) -> Value {
+    let mut config = json!({
         "@type": BODY_REWRITE_FILTER_TYPE_URL,
         "enabled": enabled,
         "dialect": dialect,
-    })
+    });
+    if let Some(cap) = max_output_tokens {
+        config["max_output_tokens"] = json!(cap);
+    }
+    config
 }
 
 /// `auto:` -> `llmproxy.filters.v0.ModelResolver` in-process rules.
@@ -1702,7 +1712,7 @@ fn lower_route(
     // stays correct across a failover too.
     if force_usage_reporting(config) {
         typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
-            body_rewrite_typed_config(true, primary_dialect);
+            body_rewrite_typed_config(true, primary_dialect, None);
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
@@ -1956,9 +1966,13 @@ fn lower_model(
             "dialect": dialect,
         }
     });
-    if force_usage_reporting(config) {
+    // The per-route override replaces the listener-level config outright, so
+    // it must carry the usage switch as well as the cap. A cap alone on a
+    // config with usage reporting turned off keeps the splice off.
+    let max_output_tokens = model.max_output_tokens;
+    if force_usage_reporting(config) || max_output_tokens.is_some() {
         typed_per_filter_config[BODY_REWRITE_FILTER_NAME] =
-            body_rewrite_typed_config(true, dialect);
+            body_rewrite_typed_config(force_usage_reporting(config), dialect, max_output_tokens);
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
@@ -2555,6 +2569,12 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_list_cost_nanodollars": "%LLM_LIST_COST%",
                 "llm_credential_source": "%LLM_CREDENTIAL_SOURCE%",
                 "llm_served_model": "%LLM_SERVED_MODEL%",
+                "llm_usage_completeness": "%LLM_USAGE_COMPLETENESS%",
+                "llm_cost_kind": "%LLM_COST_KIND%",
+                "llm_upstream_id": "%LLM_UPSTREAM_ID%",
+                // Embedded as a JSON value, not a string; it has no text-format
+                // twin because raw JSON would break that line's quoting.
+                "llm_upstream_usage": "%LLM_UPSTREAM_USAGE%",
             }
         }),
     };
@@ -2746,7 +2766,7 @@ fn lower_listener(
         // this filter present, just with the splice off.
         http_filters.push(json!({
             "name": BODY_REWRITE_FILTER_NAME,
-            "typed_config": body_rewrite_typed_config(force_usage_reporting(config), default_dialect),
+            "typed_config": body_rewrite_typed_config(force_usage_reporting(config), default_dialect, None),
         }));
     }
     if let Some(auto) = &config.auto {

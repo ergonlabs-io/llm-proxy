@@ -639,6 +639,12 @@ pub struct ModelDef {
     /// `lower_model`). Every entry is validated; a bad one fails the load
     /// (AGENTS.md invariant 1).
     pub providers: Vec<ModelProviderRef>,
+    /// Upper bound on the output tokens a request for this model may ask for.
+    /// A request asking for more is refused with 400; the body is never
+    /// rewritten. Positive. Unset means no cap. Lowers to the `llmproxy.body_rewrite`
+    /// per-route override on this model's route.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// One entry in a [`ModelDef`]'s `providers` list: either the shorthand

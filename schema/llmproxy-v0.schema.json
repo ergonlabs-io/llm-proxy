@@ -642,6 +642,13 @@
               { "$ref": "#/$defs/ModelProvider" }
             ]
           }
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Upper bound on the output tokens a request for this model may ask for. A request whose limit is larger is refused with a 400 naming the field and the cap; it is never lowered or rewritten. A limit that is not a non-negative integer, or a limit key repeated in the body, is also refused with a 400. A request that names no limit is forwarded unchanged. The field checked follows the request path: `/responses` uses `max_output_tokens`, `/messages` uses `max_tokens`, and any other path (chat completions, completions) checks both `max_completion_tokens` and `max_tokens`. A body that is not JSON is forwarded unchanged. The cap follows the model the request names, so it cannot be combined with the `auto` block (a load error). Absent means no cap.",
+          "examples": [4096]
         }
       }
     },

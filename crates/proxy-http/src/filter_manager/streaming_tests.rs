@@ -109,6 +109,10 @@ impl HttpFilter for ProbeFilter {
         FilterTrailersStatus::Continue
     }
 
+    fn on_stream_complete(&mut self, _cb: &mut dyn EncoderCallbacks) {
+        self.record("on_stream_complete");
+    }
+
     fn on_destroy(&mut self) {
         self.record("on_destroy");
     }
@@ -674,6 +678,50 @@ fn on_destroy_runs_in_reverse_creation_order_when_the_stream_ends() {
              log: {entries:?}"
         );
     });
+}
+
+/// `on_stream_complete` fires once per filter, in reverse creation order, and
+/// every filter's completion precedes every `on_destroy`: a filter's teardown
+/// must not be able to hide a stream's state from a later filter's completion.
+/// Covers both a clean end and a body dropped without being polled.
+#[test]
+fn on_stream_complete_runs_once_per_filter_in_reverse_order_before_any_on_destroy() {
+    for abandon in [false, true] {
+        block_on(async {
+            let log = log_of();
+            let filters: Vec<Box<dyn HttpFilter>> = vec![
+                Box::new(ProbeFilter::new("a", log.clone())),
+                Box::new(ProbeFilter::new("b", log.clone())),
+                Box::new(ProbeFilter::new("c", log.clone())),
+            ];
+            let body = multi_frame_body(&[b"x", b"y"], None);
+            let resp = run_streaming(filters, body, DEFAULT_BUFFER_LIMIT).await;
+            if abandon {
+                drop(resp.body);
+            } else {
+                let _ = resp.body.collect().await.expect("body");
+            }
+
+            let entries = log.borrow().clone();
+            let lifecycle: Vec<&str> = entries
+                .iter()
+                .map(String::as_str)
+                .filter(|e| e.ends_with(":on_stream_complete") || e.ends_with(":on_destroy"))
+                .collect();
+            assert_eq!(
+                lifecycle,
+                vec![
+                    "c:on_stream_complete",
+                    "b:on_stream_complete",
+                    "a:on_stream_complete",
+                    "c:on_destroy",
+                    "b:on_destroy",
+                    "a:on_destroy",
+                ],
+                "abandon={abandon}; log: {entries:?}"
+            );
+        });
+    }
 }
 
 // --- per-position state machine regression tests (defects 1 & 2) ----------

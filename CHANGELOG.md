@@ -24,6 +24,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - `--mode translate` prints secrets as `[REDACTED]`; `--reveal-secrets` prints them.
 - `%REQ(X)%` renders `[REDACTED]` for credential headers (`authorization`,
   `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, `cookie`).
+- A request whose output-token limit is above `models.<name>.max_output_tokens` (Envoy
+  mode: `BodyRewrite.max_output_tokens`, filter level or per route) is refused with `400`
+  naming the field and the cap; so is a non-integer or repeated limit. The checked field
+  follows the path: `max_output_tokens` for `/responses`, `max_tokens` for `/messages`,
+  `max_tokens` and `max_completion_tokens` otherwise. A request with no limit is forwarded
+  unchanged. Counted in `llmproxy_router_max_output_tokens_rejected_total`.
+- The `spend_limit` warning for an unset node id names `--service-node`.
 
 ### Added
 
@@ -37,6 +44,25 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - `envoy_llmproxy_usage_rate_card_active{scope,version}` on `/stats/prometheus` reports
   the rate card each chain prices with (1 for the active version, 0 for a retired one).
   Compare it across replicas to see a card that has not propagated.
+- `%LLM_UPSTREAM_ID%` and `%LLM_UPSTREAM_USAGE%` access-log operators, and
+  `upstream_response_id` / `upstream_usage` on request and attempt records (schema version
+  1, additive): the provider's response id and its `usage` object exactly as sent. Evidence
+  only; cost still comes from the rate card. Misses over the size bounds are counted in
+  `llmproxy_usage_upstream_usage_oversized_total` and `llmproxy_usage_upstream_id_oversized_total`.
+- `HttpFilter::on_stream_complete`: a callbacks-carrying hook that runs once per filter, before
+  the access log reads `StreamInfo`, for clean ends, local replies and abandoned streams.
+- The config dialect's default access-log formats carry `llm_usage_completeness`,
+  `llm_cost_kind` and `llm_upstream_id`; the JSON format also embeds `llm_upstream_usage`.
+
+### Fixed
+
+- A stream the client abandons, or the upstream cuts off, was never metered: no usage, no cost,
+  no spend or token-limit charge, and the record claimed `completeness: complete`. It is now
+  recorded `partial`, priced through the rate card from an estimate (4 bytes per token: input
+  from the request size, output from streamed text; provider figures that arrived are kept),
+  and charged by `spend_limit` and `token_limit`. Marked by `usage.provenance: estimate`,
+  `cost.kind: estimate`, `%LLM_USAGE_COMPLETENESS%` and `%LLM_COST_KIND%`; counted in
+  `llmproxy_usage_partial_total` and `llmproxy_usage_estimated_total`.
 
 ## [0.3.4] - 2026-10-13
 

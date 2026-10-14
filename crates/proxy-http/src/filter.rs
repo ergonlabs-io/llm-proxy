@@ -414,6 +414,19 @@ pub trait HttpFilter {
         Filter1xxStatus::Continue
     }
 
+    /// Called exactly once per filter when the response stream is over, before
+    /// the access log reads `StreamInfo` and before [`Self::on_destroy`]
+    /// (Envoy's `onStreamComplete`). It runs for a clean end, a local reply,
+    /// and a stream abandoned part-way (client disconnect), in reverse
+    /// creation order. Unlike `on_destroy` it has callbacks, so a filter that
+    /// writes its observations to `StreamInfo` at stream end can still do so
+    /// for a stream that never delivered its terminal frame.
+    ///
+    /// Only [`EncoderCallbacks::stream_info`] is meaningful here; the buffer
+    /// and continuation methods have nothing left to act on, and a response
+    /// that failed before any encode phase ran may not have per-route config.
+    fn on_stream_complete(&mut self, _cb: &mut dyn EncoderCallbacks) {}
+
     /// Called once when the stream ends or resets; release resources here.
     fn on_destroy(&mut self) {}
 

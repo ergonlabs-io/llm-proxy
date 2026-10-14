@@ -82,8 +82,21 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use proxy_observability::access_log::LlmTokens;
 use proxy_observability::stats::{
-    instruments, record_tenant_credential_request, Handle, HandleMemo, HistogramHandle, Registry,
-    StatsControl, WorkerId,
+    instruments, record_tenant_credential_request, Handle, HandleMemo, HistogramHandle, Instrument,
+    InstrumentKind, Registry, StatsControl, WorkerId,
+};
+
+/// Requests refused with 400 because of the configured `max_output_tokens`
+/// cap: a limit above it, a repeated limit key, or one that is not a
+/// non-negative integer. Defined beside the router that records it. No labels:
+/// model, tenant and route are unbounded or config-sized and belong in usage
+/// records. Prometheus surface only.
+pub const MAX_OUTPUT_TOKENS_REJECTED: Instrument = Instrument {
+    name: "llmproxy_router_max_output_tokens_rejected_total",
+    kind: InstrumentKind::Counter,
+    unit: "{request}",
+    attribute_keys: &[],
+    buckets: None,
 };
 
 /// How many distinct unknown names each per-worker dedup set remembers, and
@@ -301,6 +314,7 @@ pub struct RouterStats {
     handles: Arc<StatHandles>,
     worker: WorkerId,
     warned_unknown_clusters: UnknownNames,
+    rejected_memo: HandleMemo<Handle>,
 }
 
 impl RouterStats {
@@ -310,7 +324,22 @@ impl RouterStats {
             handles,
             worker,
             warned_unknown_clusters: UnknownNames::default(),
+            rejected_memo: HandleMemo::new(),
         }
+    }
+
+    /// Counts one request refused by the output-token cap. The series carries
+    /// no labels, so it is resolved once per worker through the memo and later
+    /// calls skip the registry's lock.
+    pub fn record_output_cap_rejected(&self) {
+        let handle = self.registry.resolve_capped_memo(
+            &self.rejected_memo,
+            &MAX_OUTPUT_TOKENS_REJECTED,
+            &[],
+            1,
+            &[],
+        );
+        self.registry.incr(self.worker, handle, 1);
     }
 
     /// The shared [`Registry`] this recorder writes into -- a plain `Arc`

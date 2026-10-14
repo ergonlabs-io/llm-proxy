@@ -42,7 +42,7 @@ use http::HeaderMap;
 use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
-use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
+use proxy_observability::access_log::{render, FormatOp, FormatString, LlmTokens, LogContext};
 use proxy_observability::records::{
     RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
 };
@@ -142,8 +142,13 @@ impl AccessLoggerRuntime {
 /// this IR doesn't carry -- `AccessLogFormat::Json` is
 /// `Vec<(String, FormatString)>`, always string-typed -- so every value
 /// renders as a JSON string here, never a bare number/bool/object. That's a
-/// known, disclosed gap (AGENTS.md invariant 1), not a silent one: nothing in the
-/// IR asks for a typed value today, so there's nothing to drop.
+/// known, disclosed gap (AGENTS.md invariant 1), not a silent one: nothing in
+/// the IR asks for a typed value today, so there's nothing to drop.
+///
+/// The one exception is a field whose entire format is `%LLM_UPSTREAM_USAGE%`:
+/// the operator exists to carry the provider's JSON object as sent, so it is
+/// embedded as a JSON value (`null` when absent), not as an escaped string.
+/// Combined with any other text the field is an ordinary string.
 fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> String {
     let mut out = String::from("{");
     for (i, (key, fmt)) in fields.iter().enumerate() {
@@ -152,9 +157,15 @@ fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> Strin
         }
         out.push('"');
         json_escape_into(key, &mut out);
-        out.push_str("\":\"");
-        json_escape_into(&render(fmt, ctx), &mut out);
-        out.push('"');
+        out.push_str("\":");
+        if matches!(fmt.0.as_slice(), [FormatOp::LlmUpstreamUsage]) {
+            // Validated JSON: see where `llm_upstream` is built in `finish`.
+            out.push_str(ctx.llm_upstream_usage.unwrap_or("null"));
+        } else {
+            out.push('"');
+            json_escape_into(&render(fmt, ctx), &mut out);
+            out.push('"');
+        }
     }
     out.push_str("}\n");
     out
@@ -461,6 +472,29 @@ impl LoggingBody {
             return;
         };
         let stream_duration = ctx.start_instant.elapsed();
+        // Settle the selected attempt's termination from the stream's flags
+        // before the inner body drops: the upstream body's own drop handlers
+        // would otherwise record a less specific reason first.
+        {
+            let info = ctx.stream_info.borrow();
+            if let Some(attempt) = &info.selected_attempt {
+                attempt.borrow_mut().finish(metadata_termination(
+                    info.response_flags(),
+                    ctx.response_code,
+                    info.is_local_reply,
+                ));
+            }
+        }
+        // Tear the filter chain down now, not when this body is dropped. Its
+        // `StreamingEncoder` runs every filter's `on_stream_complete` as it
+        // drops, and a filter may write `StreamInfo` there (the usage filter
+        // records a partial count for a stream cut short). The log reads
+        // `StreamInfo` below, so it has to come after.
+        //
+        // Rust note: `mem::replace` swaps a fresh empty body into the field
+        // and hands back the old one, which then drops at the end of the
+        // statement. A struct field cannot simply be moved out of `&mut self`.
+        drop(std::mem::replace(&mut self.inner, empty_body()));
         #[cfg(unix)]
         ctx.stream_info.borrow_mut().check_capture_gate();
         #[cfg(unix)]
@@ -497,6 +531,8 @@ impl LoggingBody {
             llm_time_to_first_body_byte,
             requested_model,
             llm_served_model,
+            llm_upstream,
+            llm_completeness,
             trace,
             tenant,
             response_code_details,
@@ -539,6 +575,20 @@ impl LoggingBody {
                 info.llm.time_to_first_body_byte,
                 info.requested_model.clone(),
                 info.llm.served_model.clone(),
+                (
+                    info.llm.upstream_response_id.clone(),
+                    // Validated here, once, so a filter that wrote malformed
+                    // text can neither corrupt a JSON log line nor a record.
+                    info.llm
+                        .upstream_usage
+                        .as_deref()
+                        .and_then(proxy_observability::records::RawJson::from_text),
+                ),
+                (
+                    info.llm.completeness,
+                    info.llm.input_estimated,
+                    info.llm.output_estimated,
+                ),
                 info.trace,
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
@@ -638,6 +688,8 @@ impl LoggingBody {
                     .1
                     .as_deref()
                     .map(proxy_observability::records::bounded_field),
+                upstream_response_id: llm_upstream.0.clone(),
+                upstream_usage: llm_upstream.1.clone(),
                 status: Some(ctx.response_code),
                 termination,
                 error_category: response_code_details
@@ -657,8 +709,19 @@ impl LoggingBody {
                     cache_read_tokens: t.cached,
                     cache_write_tokens: t.cache_creation,
                     output_tokens: t.output,
-                    completeness: proxy_observability::records::UsageCompleteness::Complete,
-                    provenance: "provider".to_owned(),
+                    // No usage filter completeness means the usage came from
+                    // somewhere that only writes finished responses.
+                    completeness: llm_completeness
+                        .0
+                        .unwrap_or(proxy_observability::records::UsageCompleteness::Complete),
+                    provenance: if llm_completeness.1 || llm_completeness.2 {
+                        "estimate"
+                    } else {
+                        "provider"
+                    }
+                    .to_owned(),
+                    input_estimated: llm_completeness.1,
+                    output_estimated: llm_completeness.2,
                 }),
                 // A numeric amount without its immutable rate-card version
                 // is not an auditable cost. Keep the whole cost null rather
@@ -671,7 +734,12 @@ impl LoggingBody {
                             unit: "nanodollars".to_owned(),
                             currency: "USD".to_owned(),
                             rate_card_version: rate_card_version.to_owned(),
-                            kind: "list".to_owned(),
+                            kind: if llm_completeness.1 || llm_completeness.2 {
+                                "estimate"
+                            } else {
+                                "list"
+                            }
+                            .to_owned(),
                         },
                     ),
                 attempt_count: attempts.len().min(u16::MAX as usize) as u16,
@@ -698,6 +766,11 @@ impl LoggingBody {
                         provider: None,
                         upstream_model: attempt.upstream_model,
                         served_model: attempt.served_model,
+                        upstream_response_id: attempt.upstream_response_id,
+                        upstream_usage: attempt
+                            .upstream_usage
+                            .as_deref()
+                            .and_then(proxy_observability::records::RawJson::from_text),
                         started_at: format_system_time(attempt.started_at),
                         finished_at: format_system_time(
                             attempt.finished_at.unwrap_or_else(SystemTime::now),
@@ -897,6 +970,19 @@ impl LoggingBody {
             llm_resolved_model: usage_attribution.2.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
             llm_served_model: llm_served_model.as_deref(),
+            llm_upstream_id: llm_upstream.0.as_deref(),
+            llm_upstream_usage: llm_upstream.1.as_ref().map(|usage| usage.get()),
+            llm_usage_completeness: llm_completeness.0.map(|c| match c {
+                proxy_observability::records::UsageCompleteness::Complete => "complete",
+                proxy_observability::records::UsageCompleteness::Partial => "partial",
+            }),
+            llm_cost_kind: llm_list_cost_nanodollars.map(|_| {
+                if llm_completeness.1 || llm_completeness.2 {
+                    "estimate"
+                } else {
+                    "list"
+                }
+            }),
             llm_rate_card_version: usage_attribution.3.as_deref(),
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
@@ -941,6 +1027,16 @@ fn metadata_termination(
 
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A body that is already at its end, left in place of a torn-down inner body.
+fn empty_body() -> StreamBody {
+    use http_body_util::BodyExt as _;
+    // `Empty`'s error type is `Infallible`, which has no values, so the
+    // conversion closure is unreachable.
+    crate::handler::local_boxed(
+        http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
+    )
 }
 
 impl Body for LoggingBody {
@@ -1240,6 +1336,120 @@ mod tests {
         );
     }
 
+    const USAGE: &str = r#"{"prompt_tokens":7,"cost":0.000012340}"#;
+
+    #[tokio::test]
+    async fn upstream_id_and_usage_reach_the_text_access_log_line() {
+        let with = |info: &mut StreamInfo| {
+            info.llm.upstream_response_id = Some("chatcmpl-abc".into());
+            info.llm.upstream_usage = Some(USAGE.into());
+        };
+        assert_eq!(
+            render_with_stream_info("%LLM_UPSTREAM_ID% %LLM_UPSTREAM_USAGE%", with).await,
+            format!("chatcmpl-abc {USAGE}")
+        );
+        assert_eq!(
+            render_with_stream_info("%LLM_UPSTREAM_ID% %LLM_UPSTREAM_USAGE%", |_| {}).await,
+            "- -"
+        );
+    }
+
+    #[tokio::test]
+    async fn completeness_and_cost_kind_reach_the_rendered_line() {
+        use proxy_observability::records::UsageCompleteness;
+        let fmt = "%LLM_USAGE_COMPLETENESS% %LLM_COST_KIND%";
+        assert_eq!(render_with_stream_info(fmt, |_| {}).await, "- -");
+        let cost = || crate::stream_info::LlmListCost {
+            nanodollars: 5,
+            rate_card_version: "v1".into(),
+        };
+        let line = render_with_stream_info(fmt, |info| {
+            info.llm.completeness = Some(UsageCompleteness::Complete);
+            info.llm.list_cost = Some(cost());
+        })
+        .await;
+        assert_eq!(line, "complete list");
+        let line = render_with_stream_info(fmt, |info| {
+            info.llm.completeness = Some(UsageCompleteness::Partial);
+            info.llm.output_estimated = true;
+            info.llm.list_cost = Some(cost());
+        })
+        .await;
+        assert_eq!(line, "partial estimate");
+    }
+
+    #[tokio::test]
+    async fn malformed_upstream_usage_is_dropped_rather_than_logged() {
+        let line = render_with_stream_info("%LLM_UPSTREAM_USAGE%", |info| {
+            info.llm.upstream_usage = Some("{not json".into());
+        })
+        .await;
+        assert_eq!(line, "-");
+    }
+
+    /// A json_format field made only of `%LLM_UPSTREAM_USAGE%` embeds the
+    /// provider's object as JSON; mixed with text it stays a string.
+    #[test]
+    fn json_format_embeds_upstream_usage_as_a_json_value() {
+        use proxy_observability::access_log::LogContext;
+        let fields = vec![
+            (
+                "usage".to_owned(),
+                parse_format("%LLM_UPSTREAM_USAGE%").unwrap(),
+            ),
+            (
+                "text".to_owned(),
+                parse_format("u=%LLM_UPSTREAM_USAGE%").unwrap(),
+            ),
+        ];
+        let empty = HeaderMap::new();
+        let mut ctx = LogContext {
+            start_time: SystemTime::UNIX_EPOCH,
+            request_headers: &empty,
+            response_headers: &empty,
+            response_trailers: &empty,
+            protocol: None,
+            response_code: Some(200),
+            response_flags: &[],
+            duration: None,
+            bytes_received: 0,
+            bytes_sent: 0,
+            upstream_host: None,
+            upstream_cluster: None,
+            downstream_remote_address: None,
+            response_code_details: None,
+            llm_tokens: None,
+            llm_ttft: None,
+            llm_max_stall: None,
+            llm_response_chunks: 0,
+            llm_list_cost_nanodollars: None,
+            llm_key_id: None,
+            llm_tenant: None,
+            llm_credential_source: None,
+            llm_user_id: None,
+            llm_requested_model: None,
+            llm_resolved_model: None,
+            llm_selected_model: None,
+            llm_served_model: None,
+            llm_upstream_id: None,
+            llm_upstream_usage: Some(USAGE),
+            llm_usage_completeness: None,
+            llm_cost_kind: None,
+            llm_rate_card_version: None,
+            request_method: None,
+            request_path: None,
+            request_authority: None,
+            request_scheme: None,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&fields, &ctx)).unwrap();
+        assert_eq!(parsed["usage"]["prompt_tokens"], 7);
+        assert_eq!(parsed["text"], format!("u={USAGE}"));
+        ctx.llm_upstream_usage = None;
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&fields, &ctx)).unwrap();
+        assert!(parsed["usage"].is_null());
+        assert_eq!(parsed["text"], "u=-");
+    }
+
     #[tokio::test]
     async fn llm_stats_reach_the_rendered_access_log_line() {
         let llm = crate::stream_info::LlmStats {
@@ -1256,6 +1466,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 1,
+            ..Default::default()
         };
         assert_eq!(render_one(llm).await, "11 22 33 44 110 250");
     }
@@ -1653,6 +1864,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: Some(std::time::Duration::from_millis(150)),
             response_chunks: 7,
+            ..Default::default()
         };
         assert_eq!(
             render_one_fmt("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%", llm).await,
@@ -1691,6 +1903,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 1,
+            ..Default::default()
         };
         let line = render_one_fmt("%LLM_TPOT%", llm).await;
         assert_ne!(line, "-", "usage + ttft + duration are all present");
