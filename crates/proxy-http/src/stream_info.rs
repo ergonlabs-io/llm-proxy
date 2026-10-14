@@ -104,6 +104,18 @@ pub struct LlmStats {
     /// stream carrying several), as JSON text. Evidence only: nothing reads a
     /// field of it, and cost comes from the rate card alone.
     pub upstream_usage: Option<String>,
+    /// Whether `usage` and `list_cost` describe a finished response.
+    /// `Some(Partial)` is a stream cut off before the provider's final usage:
+    /// the usage filter wrote an estimate (see `input_estimated` /
+    /// `output_estimated`) so the request is still metered and charged.
+    /// `None` means no usage filter ran.
+    pub completeness: Option<proxy_observability::records::UsageCompleteness>,
+    /// The input token count in `usage` is an estimate from the request body
+    /// size, not a provider figure.
+    pub input_estimated: bool,
+    /// The output token count in `usage` is an estimate from the generated
+    /// text that was streamed, not a provider figure.
+    pub output_estimated: bool,
     /// The response dialect selected from the route's usage-filter config.
     /// `None` means no usage filter ran, so GenAI latency metrics must not
     /// guess a system from a cluster name.

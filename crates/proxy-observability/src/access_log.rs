@@ -161,6 +161,14 @@ pub enum FormatOp {
     /// embeds it as a JSON value (`null` when absent); anywhere else it is
     /// text, `-` when absent. Evidence only: it is never read for cost.
     LlmUpstreamUsage,
+    /// `%LLM_USAGE_COMPLETENESS%` -- `complete` for a finished response,
+    /// `partial` for a stream cut off before the provider's final usage (its
+    /// tokens and cost are then estimates). `-` when no usage filter ran.
+    LlmUsageCompleteness,
+    /// `%LLM_COST_KIND%` -- `list` for a rate-card price of provider-reported
+    /// usage, `estimate` when the usage it prices was estimated. `-` when
+    /// there is no cost.
+    LlmCostKind,
     LlmRateCardVersion,
 }
 
@@ -467,6 +475,14 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmUpstreamUsage
         }
+        "LLM_USAGE_COMPLETENESS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmUsageCompleteness
+        }
+        "LLM_COST_KIND" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmCostKind
+        }
         "LLM_RATE_CARD_VERSION" => {
             bare(name, args, truncate, input)?;
             FormatOp::LlmRateCardVersion
@@ -569,6 +585,10 @@ pub struct LogContext<'a> {
     pub llm_upstream_id: Option<&'a str>,
     /// The provider's `usage` object as JSON text, exactly as sent.
     pub llm_upstream_usage: Option<&'a str>,
+    /// `complete` / `partial`; `None` when no usage filter ran.
+    pub llm_usage_completeness: Option<&'a str>,
+    /// `list` / `estimate`; `None` when there is no cost.
+    pub llm_cost_kind: Option<&'a str>,
     pub llm_rate_card_version: Option<&'a str>,
 
     /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
@@ -742,6 +762,8 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::LlmServedModel => out.push_str(ctx.llm_served_model.unwrap_or("-")),
         FormatOp::LlmUpstreamId => out.push_str(ctx.llm_upstream_id.unwrap_or("-")),
         FormatOp::LlmUpstreamUsage => out.push_str(ctx.llm_upstream_usage.unwrap_or("-")),
+        FormatOp::LlmUsageCompleteness => out.push_str(ctx.llm_usage_completeness.unwrap_or("-")),
+        FormatOp::LlmCostKind => out.push_str(ctx.llm_cost_kind.unwrap_or("-")),
         FormatOp::LlmRateCardVersion => out.push_str(ctx.llm_rate_card_version.unwrap_or("-")),
         FormatOp::LlmListCost => match ctx.llm_list_cost_nanodollars {
             Some(cost) => {
@@ -1049,6 +1071,8 @@ mod tests {
             llm_served_model: None,
             llm_upstream_id: None,
             llm_upstream_usage: None,
+            llm_usage_completeness: None,
+            llm_cost_kind: None,
             llm_rate_card_version: None,
 
             request_method: Some("POST"),
@@ -1128,6 +1152,18 @@ mod tests {
         assert_eq!(render(&fs, &c), r#"chatcmpl-abc {"prompt_tokens":7}"#);
         assert!(parse_format("%LLM_UPSTREAM_ID(x)%").is_err());
         assert!(parse_format("%LLM_UPSTREAM_USAGE:5%").is_err());
+    }
+
+    #[test]
+    fn renders_completeness_and_cost_kind_and_dash_when_absent() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%LLM_USAGE_COMPLETENESS% %LLM_COST_KIND%");
+        assert_eq!(render(&fs, &c), "- -");
+        c.llm_usage_completeness = Some("partial");
+        c.llm_cost_kind = Some("estimate");
+        assert_eq!(render(&fs, &c), "partial estimate");
+        assert!(parse_format("%LLM_COST_KIND(x)%").is_err());
     }
 
     #[test]

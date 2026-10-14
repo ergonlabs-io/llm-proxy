@@ -530,6 +530,7 @@ impl LoggingBody {
             requested_model,
             llm_served_model,
             llm_upstream,
+            llm_completeness,
             trace,
             tenant,
             response_code_details,
@@ -580,6 +581,11 @@ impl LoggingBody {
                         .upstream_usage
                         .as_deref()
                         .and_then(proxy_observability::records::RawJson::from_text),
+                ),
+                (
+                    info.llm.completeness,
+                    info.llm.input_estimated,
+                    info.llm.output_estimated,
                 ),
                 info.trace,
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
@@ -701,8 +707,19 @@ impl LoggingBody {
                     cache_read_tokens: t.cached,
                     cache_write_tokens: t.cache_creation,
                     output_tokens: t.output,
-                    completeness: proxy_observability::records::UsageCompleteness::Complete,
-                    provenance: "provider".to_owned(),
+                    // No usage filter completeness means the usage came from
+                    // somewhere that only writes finished responses.
+                    completeness: llm_completeness
+                        .0
+                        .unwrap_or(proxy_observability::records::UsageCompleteness::Complete),
+                    provenance: if llm_completeness.1 || llm_completeness.2 {
+                        "estimate"
+                    } else {
+                        "provider"
+                    }
+                    .to_owned(),
+                    input_estimated: llm_completeness.1,
+                    output_estimated: llm_completeness.2,
                 }),
                 // A numeric amount without its immutable rate-card version
                 // is not an auditable cost. Keep the whole cost null rather
@@ -715,7 +732,12 @@ impl LoggingBody {
                             unit: "nanodollars".to_owned(),
                             currency: "USD".to_owned(),
                             rate_card_version: rate_card_version.to_owned(),
-                            kind: "list".to_owned(),
+                            kind: if llm_completeness.1 || llm_completeness.2 {
+                                "estimate"
+                            } else {
+                                "list"
+                            }
+                            .to_owned(),
                         },
                     ),
                 attempt_count: attempts.len().min(u16::MAX as usize) as u16,
@@ -948,6 +970,17 @@ impl LoggingBody {
             llm_served_model: llm_served_model.as_deref(),
             llm_upstream_id: llm_upstream.0.as_deref(),
             llm_upstream_usage: llm_upstream.1.as_ref().map(|usage| usage.get()),
+            llm_usage_completeness: llm_completeness.0.map(|c| match c {
+                proxy_observability::records::UsageCompleteness::Complete => "complete",
+                proxy_observability::records::UsageCompleteness::Partial => "partial",
+            }),
+            llm_cost_kind: llm_list_cost_nanodollars.map(|_| {
+                if llm_completeness.1 || llm_completeness.2 {
+                    "estimate"
+                } else {
+                    "list"
+                }
+            }),
             llm_rate_card_version: usage_attribution.3.as_deref(),
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
@@ -1318,6 +1351,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completeness_and_cost_kind_reach_the_rendered_line() {
+        use proxy_observability::records::UsageCompleteness;
+        let fmt = "%LLM_USAGE_COMPLETENESS% %LLM_COST_KIND%";
+        assert_eq!(render_with_stream_info(fmt, |_| {}).await, "- -");
+        let cost = || crate::stream_info::LlmListCost {
+            nanodollars: 5,
+            rate_card_version: "v1".into(),
+        };
+        let line = render_with_stream_info(fmt, |info| {
+            info.llm.completeness = Some(UsageCompleteness::Complete);
+            info.llm.list_cost = Some(cost());
+        })
+        .await;
+        assert_eq!(line, "complete list");
+        let line = render_with_stream_info(fmt, |info| {
+            info.llm.completeness = Some(UsageCompleteness::Partial);
+            info.llm.output_estimated = true;
+            info.llm.list_cost = Some(cost());
+        })
+        .await;
+        assert_eq!(line, "partial estimate");
+    }
+
+    #[tokio::test]
     async fn malformed_upstream_usage_is_dropped_rather_than_logged() {
         let line = render_with_stream_info("%LLM_UPSTREAM_USAGE%", |info| {
             info.llm.upstream_usage = Some("{not json".into());
@@ -1372,6 +1429,8 @@ mod tests {
             llm_served_model: None,
             llm_upstream_id: None,
             llm_upstream_usage: Some(USAGE),
+            llm_usage_completeness: None,
+            llm_cost_kind: None,
             llm_rate_card_version: None,
             request_method: None,
             request_path: None,

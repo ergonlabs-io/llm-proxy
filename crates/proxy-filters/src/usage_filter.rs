@@ -40,6 +40,7 @@ use proxy_http::filter::{
 };
 use proxy_http::stream_info::GenAiSystem;
 use proxy_http::{LlmListCost, LlmTokenUsage};
+use proxy_observability::records::UsageCompleteness;
 use proxy_observability::stats::{instruments, Handle, Instrument, Registry, WorkerId};
 use serde::{Deserialize, Serialize};
 
@@ -621,6 +622,21 @@ pub const JSON_TAIL_WINDOW_BYTES: usize = 64 << 10;
 /// suppressed, or the log becomes the incident (AGENTS.md "Fail-open controls").
 const OVERSIZED_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Bytes per token assumed when estimating the usage of a stream that ended
+/// before the provider reported any: a coarse, tokenizer-free figure applied
+/// to the request size (input) and the streamed text (output), rounded up.
+/// It over-charges short English text slightly and under-charges dense text
+/// such as code or CJK; the aim is that aborting does not make a request free,
+/// not an exact count.
+const BYTES_PER_TOKEN_ESTIMATE: u64 = 4;
+
+/// Which token counts of a usage record are estimates.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Estimated {
+    input: bool,
+    output: bool,
+}
+
 /// Counters shared by every stream of one usage filter instance factory.
 ///
 /// Failing to meter is a fail-open for spend and token limits, which read the
@@ -644,6 +660,11 @@ pub struct UsageStats {
     upstream_usage_oversized: ExportedCounter,
     /// Responses whose provider response id was over its bound.
     upstream_id_oversized: ExportedCounter,
+    /// Streams that ended before the provider's final usage and were recorded
+    /// as partial. Each one is metered from an estimate.
+    partial: ExportedCounter,
+    /// Partial records whose token counts include an estimate.
+    estimated: ExportedCounter,
 }
 
 /// One Prometheus-exported counter that also keeps an in-process total, so
@@ -722,6 +743,16 @@ impl UsageStats {
                 &instruments::USAGE_UPSTREAM_ID_OVERSIZED,
                 scope,
             ),
+            partial: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_PARTIAL,
+                scope,
+            ),
+            estimated: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_ESTIMATED,
+                scope,
+            ),
             exported,
             repriced_handle,
             ..Default::default()
@@ -734,6 +765,14 @@ impl UsageStats {
 
     pub fn upstream_usage_oversized(&self) -> u64 {
         self.upstream_usage_oversized.get()
+    }
+
+    pub fn partial(&self) -> u64 {
+        self.partial.get()
+    }
+
+    pub fn estimated(&self) -> u64 {
+        self.estimated.get()
     }
 
     pub fn upstream_id_oversized(&self) -> u64 {
@@ -1268,6 +1307,7 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
             time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 0,
+            response_ok: false,
             finalized: false,
         })
     }
@@ -1294,10 +1334,13 @@ struct JsonBody {
     buf: BytesMut,
     /// The body passed [`MAX_JSON_BODY_BYTES`]; `buf` is now a tail window.
     overflowed: bool,
+    /// Total body bytes seen, including any dropped from the head.
+    seen: u64,
 }
 
 impl JsonBody {
     fn push(&mut self, data: &[u8]) {
+        self.seen = self.seen.saturating_add(data.len() as u64);
         if !self.overflowed && self.buf.len() + data.len() <= MAX_JSON_BODY_BYTES {
             self.buf.extend_from_slice(data);
             return;
@@ -1346,6 +1389,9 @@ struct UsageFilterInstance {
     time_to_first_body_byte: Option<Duration>,
     max_inter_chunk: Option<Duration>,
     response_chunks: u64,
+    /// The response status was 2xx. Only such a response that is cut off is
+    /// recorded as a partial, metered stream; an error body is not usage.
+    response_ok: bool,
     /// Guards against writing `StreamInfo` twice — `encode_data` with
     /// `end_stream=true` and a later `encode_trailers` (or vice versa) must
     /// not both finalize.
@@ -1481,6 +1527,49 @@ impl UsageFilterInstance {
             let cluster = cb.stream_info().upstream_cluster.clone();
             self.stats.note_oversized_unrecoverable(cluster.as_deref());
         }
+        self.write_stats(cb, usage, UsageCompleteness::Complete, Estimated::default());
+    }
+
+    /// Estimate what a stream that ended before the provider's final usage
+    /// consumed, from what was actually seen (see [`BYTES_PER_TOKEN_ESTIMATE`]).
+    /// Provider figures that did arrive are kept as they are.
+    fn estimate_partial_usage(&self, request_bytes: u64) -> (Option<TokenUsage>, Estimated) {
+        let seen = self.compute_usage();
+        let streamed_bytes = match &self.mode {
+            BodyMode::Sse(scanner) => scanner.streamed_text_bytes(),
+            // A cut-off JSON body cannot be parsed, so its size stands in for
+            // the generated text.
+            BodyMode::Json(body) => body.seen,
+            BodyMode::Inert => 0,
+        };
+        let mut usage = seen.unwrap_or_default();
+        let mut estimated = Estimated::default();
+        let input_seen = usage.input_tokens + usage.cached_tokens + usage.cache_creation_tokens > 0;
+        if !input_seen {
+            usage.input_tokens = request_bytes.div_ceil(BYTES_PER_TOKEN_ESTIMATE);
+            estimated.input = usage.input_tokens > 0;
+        }
+        // A provider's early output figure (Anthropic's `message_start` reports
+        // 1) understates a stream that kept going, so the larger of the two
+        // stands.
+        let output_estimate = streamed_bytes.div_ceil(BYTES_PER_TOKEN_ESTIMATE);
+        if output_estimate > usage.output_tokens {
+            usage.output_tokens = output_estimate;
+            estimated.output = true;
+        }
+        let nothing = usage == TokenUsage::default();
+        (if nothing { None } else { Some(usage) }, estimated)
+    }
+
+    /// Write usage, cost, timing and the provider's own evidence into
+    /// `StreamInfo::llm`.
+    fn write_stats(
+        &mut self,
+        cb: &mut dyn EncoderCallbacks,
+        usage: Option<TokenUsage>,
+        completeness: UsageCompleteness,
+        estimated: Estimated,
+    ) {
         // Rust note: `stream_info()` hands back a `RefMut` guard, not a plain
         // `&mut` — the stream's single `StreamInfo` is shared (`Rc<RefCell<_>>`)
         // between the filter chain and the router. `RefMut` derefs to
@@ -1527,6 +1616,9 @@ impl UsageFilterInstance {
             cost
         });
         stream_info.llm.served_model = served_model;
+        stream_info.llm.completeness = Some(completeness);
+        stream_info.llm.input_estimated = estimated.input;
+        stream_info.llm.output_estimated = estimated.output;
         // Evidence only. Nothing below reads a field of the provider's usage
         // object; the rate card is the only source of cost.
         if upstream.id_oversized {
@@ -1572,6 +1664,7 @@ impl HttpFilter for UsageFilterInstance {
         end_stream: bool,
     ) -> FilterHeadersStatus {
         self.headers_at = Some(Instant::now());
+        self.response_ok = headers.status.is_success();
         let route_dialect = cb.per_route_config().and_then(|cfg| {
             cfg.as_any()
                 .downcast_ref::<UsagePerRouteConfig>()
@@ -1651,17 +1744,38 @@ impl HttpFilter for UsageFilterInstance {
         FilterTrailersStatus::Continue
     }
 
-    // `on_destroy` deliberately has no override here. Its contract (see
-    // `filter.rs`) is `fn on_destroy(&mut self)` — no callbacks parameter —
-    // so a reset-mid-stream path has no `StreamInfo` to write into even
-    // though `self` still holds the timing/chunk counters observed so far.
-    // There's no mechanism in the current `HttpFilter` trait to plumb a
-    // reset notification through to something that *can* write `StreamInfo`
-    // (the filter manager would need to call `finalize`-like logic itself,
-    // or `on_destroy` would need a callbacks parameter) — that's a trait
-    // change, which is out of scope here. Today, a reset mid-response simply
-    // never gets a `StreamInfo::llm` write; the "finalize on end_stream /
-    // trailers" path above is the only one that fires.
+    /// A response that started but never reached its terminal frame (the
+    /// client disconnected, or the upstream died) is recorded here as a
+    /// partial: whatever the provider had reported, plus estimates for what it
+    /// had not (see [`BYTES_PER_TOKEN_ESTIMATE`]), priced like a complete one
+    /// so an aborted request still costs what it used. `finalized` makes this
+    /// a no-op after a clean end, so nothing is written twice.
+    ///
+    /// This control fails toward charging, not toward free: the estimate is
+    /// loud (`llmproxy_usage_partial_total`, `llmproxy_usage_estimated_total`,
+    /// `completeness: partial`, `cost.kind: estimate`).
+    fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
+        if self.finalized || self.headers_at.is_none() || !self.response_ok {
+            return;
+        }
+        if matches!(self.mode, BodyMode::Inert) {
+            return;
+        }
+        let (dialled, request_bytes) = {
+            let info = cb.stream_info();
+            (info.upstream_cluster.is_some(), info.bytes_received)
+        };
+        if !dialled {
+            return;
+        }
+        self.finalized = true;
+        let (usage, estimated) = self.estimate_partial_usage(request_bytes);
+        self.stats.partial.incr();
+        if estimated.input || estimated.output {
+            self.stats.estimated.incr();
+        }
+        self.write_stats(cb, usage, UsageCompleteness::Partial, estimated);
+    }
 }
 
 #[cfg(test)]
@@ -1808,6 +1922,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 0,
+            response_ok: false,
             finalized: false,
         }
     }
@@ -2409,6 +2524,165 @@ mod tests {
         for name in [
             "envoy_llmproxy_usage_upstream_usage_oversized_total{",
             "envoy_llmproxy_usage_upstream_id_oversized_total{",
+        ] {
+            let line = rendered
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} missing from export:\n{rendered}"));
+            assert!(
+                line.contains(r#"scope="ingress""#) && line.ends_with(" 1"),
+                "{line}"
+            );
+        }
+    }
+
+    // ---- partial (cut-off) streams ------------------------------------
+
+    /// Feed `frames` of an SSE response to `filter` without ending it, then
+    /// complete the stream the way the filter manager does for an abandoned
+    /// one. `request_bytes` stands in for the downstream request body size.
+    fn abort_after(
+        filter: &mut UsageFilterInstance,
+        request_bytes: u64,
+        frames: &[&str],
+    ) -> proxy_http::LlmStats {
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+            info.bytes_received = request_bytes;
+        }
+        filter.encode_headers(&mut cb, &mut response_headers("text/event-stream"), false);
+        for frame in frames {
+            filter.encode_data(
+                &mut cb,
+                &mut Bytes::copy_from_slice(frame.as_bytes()),
+                false,
+            );
+        }
+        filter.on_stream_complete(&mut cb);
+        cb.llm()
+    }
+
+    const CHAT_ID: &str =
+        "data: {\"id\":\"chatcmpl-9\",\"choices\":[{\"delta\":{\"content\":\"abcdefgh\"}}]}\n\n";
+    const CHAT_MORE: &str =
+        "data: {\"id\":\"chatcmpl-9\",\"choices\":[{\"delta\":{\"content\":\"ijkl\"}}]}\n\n";
+
+    #[test]
+    fn a_cut_off_stream_is_partial_estimated_priced_and_counted() {
+        let mut filter = priced_filter();
+        let stats = Arc::clone(&filter.stats);
+        let llm = abort_after(&mut filter, 40, &[CHAT_ID, CHAT_MORE]);
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
+        // 40 request bytes -> 10 input tokens; 12 streamed bytes -> 3 output.
+        let usage = llm.usage.expect("estimated usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10, 3));
+        assert!(llm.input_estimated && llm.output_estimated);
+        // Same card path as a complete record: 10 * 10 + 3 * 100.
+        assert_eq!(llm.list_cost.expect("priced").nanodollars, 400);
+        assert_eq!(llm.upstream_response_id.as_deref(), Some("chatcmpl-9"));
+        assert_eq!((stats.partial(), stats.estimated()), (1, 1));
+    }
+
+    #[test]
+    fn exact_input_from_anthropic_message_start_beats_the_body_estimate() {
+        let mut filter = filter_for(Dialect::Anthropic);
+        let stats = Arc::clone(&filter.stats);
+        let start = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n";
+        let delta = format!(
+            "data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n",
+            "x".repeat(40)
+        );
+        let llm = abort_after(&mut filter, 4000, &[start, &delta]);
+        let usage = llm.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 25, "exact, not 4000 / 4");
+        assert_eq!(usage.output_tokens, 10, "the larger of 1 and 40 / 4");
+        assert!(!llm.input_estimated && llm.output_estimated);
+        assert_eq!(llm.upstream_response_id.as_deref(), Some("msg_1"));
+        assert_eq!(stats.partial(), 1);
+    }
+
+    #[test]
+    fn a_partial_with_every_figure_from_the_provider_is_not_marked_estimated() {
+        let mut filter = filter_for(Dialect::OpenAi);
+        let stats = Arc::clone(&filter.stats);
+        let usage_frame = "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":50}}\n\n";
+        let llm = abort_after(&mut filter, 4000, &[CHAT_ID, usage_frame]);
+        let usage = llm.usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (5, 50));
+        assert!(!llm.input_estimated && !llm.output_estimated);
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
+        assert_eq!((stats.partial(), stats.estimated()), (1, 0));
+    }
+
+    #[test]
+    fn a_stream_that_ended_cleanly_is_complete_and_not_rewritten_on_completion() {
+        let mut filter = priced_filter();
+        let stats = Arc::clone(&filter.stats);
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+            info.bytes_received = 4000;
+        }
+        filter.encode_headers(&mut cb, &mut response_headers("text/event-stream"), false);
+        let last = "data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n";
+        filter.encode_data(
+            &mut cb,
+            &mut Bytes::copy_from_slice(CHAT_ID.as_bytes()),
+            false,
+        );
+        filter.encode_data(&mut cb, &mut Bytes::copy_from_slice(last.as_bytes()), true);
+        let before = cb.llm();
+        filter.on_stream_complete(&mut cb);
+        assert_eq!(cb.llm(), before);
+        assert_eq!(before.completeness, Some(UsageCompleteness::Complete));
+        assert_eq!(before.list_cost.unwrap().nanodollars, 320);
+        assert!(!before.input_estimated && !before.output_estimated);
+        assert_eq!((stats.partial(), stats.estimated()), (0, 0));
+    }
+
+    #[test]
+    fn error_bodies_and_unrecognised_content_are_never_recorded_as_partial() {
+        // A non-2xx response that is cut off carries no usage to estimate.
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        cb.stream_info.borrow_mut().upstream_cluster = Some("provider:openai".into());
+        let mut headers = response_headers("text/event-stream");
+        headers.status = StatusCode::BAD_GATEWAY;
+        filter.encode_headers(&mut cb, &mut headers, false);
+        filter.on_stream_complete(&mut cb);
+        assert_eq!(cb.llm().completeness, None);
+        // So is a body the filter does not read.
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        cb.stream_info.borrow_mut().upstream_cluster = Some("provider:openai".into());
+        filter.encode_headers(&mut cb, &mut response_headers("text/plain"), false);
+        filter.on_stream_complete(&mut cb);
+        assert_eq!(cb.llm().completeness, None);
+        // And a response that never came from an upstream (a local reply).
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
+        filter.on_stream_complete(&mut cb);
+        assert_eq!(cb.llm().completeness, None);
+        assert_eq!(filter.stats.partial(), 0);
+    }
+
+    #[test]
+    fn partial_counters_are_exported_on_the_prometheus_surface() {
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let registry = control.registry();
+        let stats = UsageStats::new(Some(registry.clone()), "ingress");
+        stats.partial.incr();
+        stats.estimated.incr();
+        let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+        for name in [
+            "envoy_llmproxy_usage_partial_total{",
+            "envoy_llmproxy_usage_estimated_total{",
         ] {
             let line = rendered
                 .lines()

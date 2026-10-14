@@ -1144,6 +1144,27 @@ impl HttpFilter for SpendLimitFilterInstance {
         self.record_if_present(cb);
         FilterTrailersStatus::Continue
     }
+
+    /// A stream cut off before its terminal frame never reaches the
+    /// end-of-stream callbacks above. The usage filter, which completes before
+    /// this filter (completion runs in reverse chain order), has by now written
+    /// a partial estimate; charge it, so a client that keeps aborting still
+    /// consumes its budget. A clean end already set `recorded`, so this cannot
+    /// charge twice, and a stream with no partial usage (a denial, a local
+    /// reply) is left alone, not reported as missing usage.
+    fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
+        if self.recorded {
+            return;
+        }
+        let partial_usage = {
+            let info = cb.stream_info();
+            info.llm.completeness == Some(proxy_observability::records::UsageCompleteness::Partial)
+                && info.llm.usage.is_some()
+        };
+        if partial_usage {
+            self.record_if_present(cb);
+        }
+    }
 }
 
 /// This replica's spend-writer identity: `service_node` if the operator
@@ -1803,6 +1824,90 @@ mod tests {
         fn clone(&self) -> Self {
             unreachable!("only `local_reply` is ever cloned out of a TestCallbacks")
         }
+    }
+
+    // --- cut-off streams ----------------------------------------------------
+
+    /// One request for tenant-a on `first` (1 micro-dollar per input token)
+    /// with `tokens` of usage, ended `abort`ed or cleanly, then completed the
+    /// way the filter manager completes every stream. `completeness` is what
+    /// the usage filter would have written.
+    fn run_stream(
+        harness: &FilterHarness,
+        tokens: u64,
+        completeness: Option<proxy_observability::records::UsageCompleteness>,
+        abort: bool,
+    ) -> Option<StatusCode> {
+        let mut filter = harness.new_instance();
+        let mut cb = TestCallbacks::new();
+        cb.set_tenant("tenant-a");
+        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        if let Some((status, _)) = cb.local_reply.clone() {
+            return Some(status);
+        }
+        cb.set_upstream("cluster-a", "first");
+        if tokens > 0 {
+            cb.set_usage(usage(tokens));
+        }
+        cb.stream_info.borrow_mut().llm.completeness = completeness;
+        filter.encode_headers(&mut cb, &mut response_headers(), false);
+        if !abort {
+            filter.encode_data(&mut cb, &mut Bytes::new(), true);
+        }
+        filter.on_stream_complete(&mut cb);
+        None
+    }
+
+    fn one_micro_per_token_harness(limit_micros: u64) -> FilterHarness {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            TenantBudget {
+                max_micros: MicroUsd::from_micros(limit_micros),
+                period: Period::Daily,
+                credential_source: CredentialSource::Platform,
+            },
+        )]);
+        let mut table = PriceTable::new();
+        table.insert(
+            "cluster-a",
+            "first",
+            ModelPrices {
+                input_per_million: MicroUsd::from_micros(1_000_000),
+                ..Default::default()
+            },
+        );
+        filter_with(&cp, table, Period::Monthly)
+    }
+
+    fn spent(harness: &FilterHarness) -> u64 {
+        harness
+            .accumulator
+            .current_total_key(&test_key_id("tenant-a"), &Period::Daily.key_for_now())
+    }
+
+    #[test]
+    fn an_aborted_stream_is_charged_its_partial_estimate_exactly_once() {
+        use proxy_observability::records::UsageCompleteness::Partial;
+        let harness = one_micro_per_token_harness(1_000);
+        assert_eq!(run_stream(&harness, 7, Some(Partial), true), None);
+        assert_eq!(spent(&harness), 7);
+    }
+
+    #[test]
+    fn a_clean_stream_is_charged_once_and_completion_does_not_charge_again() {
+        use proxy_observability::records::UsageCompleteness::Complete;
+        let harness = one_micro_per_token_harness(1_000);
+        assert_eq!(run_stream(&harness, 7, Some(Complete), false), None);
+        assert_eq!(spent(&harness), 7);
+    }
+
+    /// With no partial usage written (a denial, a local reply, an unreadable
+    /// body) completion records nothing and does not call the usage missing.
+    #[test]
+    fn completion_without_partial_usage_records_nothing() {
+        let harness = one_micro_per_token_harness(1_000);
+        assert_eq!(run_stream(&harness, 0, None, true), None);
+        assert_eq!(spent(&harness), 0);
     }
 
     // --- over-admission while stale ---------------------------------

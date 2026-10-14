@@ -1177,6 +1177,8 @@ mod tests {
             llm_served_model: None,
             llm_upstream_id: None,
             llm_upstream_usage: None,
+            llm_usage_completeness: None,
+            llm_cost_kind: None,
             llm_rate_card_version: None,
 
             request_method: None,

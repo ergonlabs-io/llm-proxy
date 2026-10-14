@@ -122,7 +122,16 @@ pub struct Usage {
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
     pub completeness: UsageCompleteness,
+    /// `provider` when every count is the provider's own figure, `estimate`
+    /// when the proxy estimated any of them (see the two flags below).
     pub provenance: String,
+    /// The input count was estimated from the request size. Added under
+    /// schema version 1: absent in older records, read as `false`.
+    #[serde(default)]
+    pub input_estimated: bool,
+    /// The output count was estimated from the streamed text. Same default.
+    #[serde(default)]
+    pub output_estimated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +140,8 @@ pub struct Cost {
     pub unit: String,
     pub currency: String,
     pub rate_card_version: String,
+    /// `list` for a rate-card price of provider-reported usage; `estimate`
+    /// when the usage it prices was estimated (a stream that ended early).
     pub kind: String,
 }
 

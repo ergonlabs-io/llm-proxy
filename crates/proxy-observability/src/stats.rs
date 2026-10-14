@@ -864,6 +864,27 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Streams that ended before the provider's final usage (client abort,
+    /// upstream death) and were recorded with `completeness: partial`, metered
+    /// from an estimate. Any increase means clients or upstreams are cutting
+    /// streams short. `scope` is the operator-chosen HCM `stat_prefix`.
+    /// Prometheus surface only.
+    pub const USAGE_PARTIAL: Instrument = Instrument {
+        name: "llmproxy_usage_partial_total",
+        kind: InstrumentKind::Counter,
+        unit: "{response}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
+    /// Partial records in which any token count (and so the cost) is the
+    /// proxy's estimate rather than a provider figure. `scope` as above.
+    pub const USAGE_ESTIMATED: Instrument = Instrument {
+        name: "llmproxy_usage_estimated_total",
+        kind: InstrumentKind::Counter,
+        unit: "{response}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

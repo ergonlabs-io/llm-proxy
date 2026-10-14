@@ -747,6 +747,10 @@ pub struct SseUsageScanner {
     /// An id has been decided (kept or found oversized); later frames never
     /// replace it.
     id_decided: bool,
+    /// Bytes of generated text seen in content deltas, for estimating the
+    /// output of a stream that ends before the provider reports usage. A
+    /// counter only; the text itself is never kept.
+    text_bytes: u64,
 }
 
 impl SseUsageScanner {
@@ -758,6 +762,7 @@ impl SseUsageScanner {
             served_model: None,
             upstream: UpstreamEvidence::default(),
             id_decided: false,
+            text_bytes: 0,
         }
     }
 
@@ -789,6 +794,7 @@ impl SseUsageScanner {
                 &mut self.served_model,
                 &mut self.upstream,
                 &mut self.id_decided,
+                &mut self.text_bytes,
                 self.dialect,
                 &line[..line.len() - 1],
             );
@@ -815,6 +821,7 @@ impl SseUsageScanner {
                 &mut None,
                 &mut UpstreamEvidence::default(),
                 &mut true,
+                &mut 0,
                 self.dialect,
                 &self.partial,
             );
@@ -836,6 +843,7 @@ impl SseUsageScanner {
             &mut result,
             &mut UpstreamEvidence::default(),
             &mut true,
+            &mut 0,
             self.dialect,
             &self.partial,
         );
@@ -855,10 +863,16 @@ impl SseUsageScanner {
             &mut None,
             &mut evidence,
             &mut self.id_decided.clone(),
+            &mut 0,
             self.dialect,
             &self.partial,
         );
         evidence
+    }
+
+    /// Bytes of generated text seen so far in content deltas.
+    pub fn streamed_text_bytes(&self) -> u64 {
+        self.text_bytes
     }
 
     /// The dialect this scanner was built for.
@@ -902,6 +916,50 @@ fn frame_served_model(dialect: Dialect, value: &serde_json::Value) -> Option<&st
         Dialect::OpenAiResponses => value.get("response").and_then(|r| r.get("model")),
     }?
     .as_str()
+}
+
+/// Bytes of generated text one parsed SSE frame carries, per wire format:
+/// chat-completions `choices[*].delta.{content,reasoning,reasoning_content}`
+/// (and the legacy `choices[*].text`), Anthropic `content_block_delta`
+/// `delta.{text,thinking,partial_json}`, Responses `response.output_text.delta`
+/// `delta`. Only the length is taken.
+fn frame_text_bytes(dialect: Dialect, value: &serde_json::Value) -> u64 {
+    let len = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map_or(0, str::len) as u64;
+    match dialect {
+        Dialect::OpenAi => value
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .map_or(0, |choices| {
+                choices
+                    .iter()
+                    .map(|choice| {
+                        let delta = choice.get("delta");
+                        ["content", "reasoning", "reasoning_content"]
+                            .iter()
+                            .map(|key| len(delta.and_then(|d| d.get(*key))))
+                            .sum::<u64>()
+                            + len(choice.get("text"))
+                    })
+                    .sum()
+            }),
+        Dialect::Anthropic => {
+            if value.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+                return 0;
+            }
+            let delta = value.get("delta");
+            ["text", "thinking", "partial_json"]
+                .iter()
+                .map(|key| len(delta.and_then(|d| d.get(*key))))
+                .sum()
+        }
+        Dialect::OpenAiResponses => {
+            if value.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta") {
+                len(value.get("delta"))
+            } else {
+                0
+            }
+        }
+    }
 }
 
 /// Whether a parsed frame carries a string id where `dialect` puts one.
@@ -951,6 +1009,7 @@ fn merge_line(
     served_model: &mut Option<String>,
     upstream: &mut UpstreamEvidence,
     id_decided: &mut bool,
+    text_bytes: &mut u64,
     dialect: Dialect,
     line: &[u8],
 ) {
@@ -972,6 +1031,7 @@ fn merge_line(
     if let Some(usage) = frame_usage_object(dialect, &value) {
         merge_usage(target, dialect, usage);
     }
+    *text_bytes = text_bytes.saturating_add(frame_text_bytes(dialect, &value));
     // Second pass for the raw text. The typed parse above cannot give back the
     // bytes as sent, so only frames that can carry an id we still want, or a
     // `usage` object, pay for it.
@@ -1551,6 +1611,45 @@ mod tests {
         let e = sse_upstream(Dialect::OpenAi, &small);
         assert!(!e.usage_oversized);
         assert_eq!(e.usage_json.as_deref(), Some(r#"{"prompt_tokens":2}"#));
+    }
+
+    #[test]
+    fn streamed_text_bytes_count_content_deltas_per_wire_format() {
+        let cases: [(Dialect, &str, u64); 5] = [
+            (
+                Dialect::OpenAi,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"abcd\",\"reasoning\":\"xy\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"z\"}},{\"text\":\"qq\"}]}\n\n",
+                9,
+            ),
+            (
+                Dialect::OpenAi,
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}],\"usage\":null}\n\n",
+                0,
+            ),
+            (
+                Dialect::Anthropic,
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"thinking\":\"hm\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"partial_json\":\"{}\"}}\n\n",
+                9,
+            ),
+            (
+                Dialect::Anthropic,
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n",
+                0,
+            ),
+            (
+                Dialect::OpenAiResponses,
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"héllo\"}\n\ndata: {\"type\":\"response.created\",\"delta\":\"ignored\"}\n\n",
+                6,
+            ),
+        ];
+        for (dialect, stream, expected) in cases {
+            let mut s = SseUsageScanner::new(dialect);
+            // One byte at a time: chunking must not change the count.
+            for b in stream.as_bytes() {
+                s.push(std::slice::from_ref(b));
+            }
+            assert_eq!(s.streamed_text_bytes(), expected, "{dialect:?} {stream}");
+        }
     }
 
     // ---- SseUsageScanner: OpenAI ------------------------------------------
