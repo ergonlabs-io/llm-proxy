@@ -144,6 +144,8 @@ routes:
   - {{ model: "*", provider: openai }}
 auth:
   hmac_secret: "{HMAC_SECRET}"
+  # The tenant holds no model policy; this test is about metering, not access.
+  enforce: {{ tenants_without_policy: allow }}
 pricing:
   price_list:
     version: partial-e2e
