@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-14
+
 ### Changed
 
 - **Breaking:** with `llmproxy.model_authz` in the chain (dialect: `auth` with
@@ -63,6 +65,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   and charged by `spend_limit` and `token_limit`. Marked by `usage.provenance: estimate`,
   `cost.kind: estimate`, `%LLM_USAGE_COMPLETENESS%` and `%LLM_COST_KIND%`; counted in
   `llmproxy_usage_partial_total` and `llmproxy_usage_estimated_total`.
+
+Also in this tag: the ADS channel honours the xDS cluster's TLS `transport_socket`; a retry
+that runs out of members returns the last upstream response; a route `idle_timeout` of `0s`
+disables the timeout; outlier un-eject timers and worker joins move off the runtime. See the
+git log for details.
 
 ## [0.3.4] - 2026-10-13
 
