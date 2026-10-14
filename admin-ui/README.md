@@ -21,7 +21,9 @@ VITE_ADMIN_URL=http://localhost:8080 npm run dev
 ```
 
 The header-bar `Admin URL` value takes precedence when set; empty means same-origin.
-Token, admin URL, and chain prefix persist to `localStorage`.
+The admin URL and chain prefix persist to `localStorage`. The token is kept in
+`sessionStorage` only, so it is cleared when the tab closes and is never written
+to `localStorage`.
 
 ## Build
 

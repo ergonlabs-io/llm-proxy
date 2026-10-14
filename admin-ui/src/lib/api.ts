@@ -8,27 +8,56 @@ export interface AdminConn {
 }
 
 const LS_KEY = 'llm-proxy-admin-conn-v1'
+// The admin token lives in sessionStorage: it is gone when the tab closes and
+// is never written to disk-backed localStorage, which any script on this
+// origin can read for as long as the browser profile lives. The admin URL and
+// chain prefix are not secrets and stay in localStorage.
+const SS_TOKEN_KEY = 'llm-proxy-admin-token-v1'
+
+function readToken(): string {
+  try {
+    return sessionStorage.getItem(SS_TOKEN_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
 
 export function loadConn(): AdminConn {
   const envDefault = (import.meta.env.VITE_ADMIN_URL as string | undefined) ?? ''
+  const token = readToken()
   try {
     const raw = localStorage.getItem(LS_KEY)
     if (raw) {
       const p = JSON.parse(raw) as Partial<AdminConn>
+      if (p.token !== undefined) {
+        // Written by an older UI: drop the token from localStorage.
+        localStorage.setItem(
+          LS_KEY,
+          JSON.stringify({ adminUrl: p.adminUrl, chainPrefix: p.chainPrefix }),
+        )
+      }
       return {
-        token: p.token ?? '',
+        token,
         adminUrl: p.adminUrl ?? envDefault,
         chainPrefix: p.chainPrefix ?? '',
       }
     }
   } catch {
-    // ignore corrupt storage
+    // ignore corrupt or unavailable storage
   }
-  return { token: '', adminUrl: envDefault, chainPrefix: '' }
+  return { token, adminUrl: envDefault, chainPrefix: '' }
 }
 
 export function saveConn(c: AdminConn): void {
-  localStorage.setItem(LS_KEY, JSON.stringify(c))
+  try {
+    sessionStorage.setItem(SS_TOKEN_KEY, c.token)
+    localStorage.setItem(
+      LS_KEY,
+      JSON.stringify({ adminUrl: c.adminUrl, chainPrefix: c.chainPrefix }),
+    )
+  } catch {
+    // storage unavailable: the connection lasts for this page only
+  }
 }
 
 export interface ApiResult {

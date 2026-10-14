@@ -33,7 +33,7 @@
 //! [`handle`] for the rest of the semantics.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,9 @@ use proxy_observability::capture_transport::{
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+mod auth_limit;
+use auth_limit::{AuthFailureLimiter, Verdict};
 
 use crate::dump::{
     clusters_from_snapshot_and_live, models_from_snapshot, ClusterDump, ConfigDump, LiveCluster,
@@ -448,6 +451,8 @@ pub(crate) async fn serve_with_stats_ttl(
 ) -> Result<AdminServer, AdminError> {
     // One cache per server, shared by every connection (and so every caller).
     let stats_cache = Arc::new(CaptureStatsCache::new(stats_ttl));
+    // One limiter per server, shared by every connection, like the cache.
+    let auth_limiter = Arc::new(AuthFailureLimiter::default());
     let admin_token = normalize_admin_token(runtime.admin_token.clone());
     let listener = TcpListener::bind(addr)
         .await
@@ -458,7 +463,7 @@ pub(crate) async fn serve_with_stats_ttl(
 
     let accept_task = tokio::spawn(async move {
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(err) => {
                     tracing::warn!(error = %err, "admin server: accept failed, continuing");
@@ -470,12 +475,20 @@ pub(crate) async fn serve_with_stats_ttl(
             let admin_token = admin_token.clone();
             runtime.admin_token = admin_token;
             let stats_cache = Arc::clone(&stats_cache);
+            let auth_limiter = Arc::clone(&auth_limiter);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let runtime = runtime.clone();
                     let stats_cache = Arc::clone(&stats_cache);
+                    let auth_limiter = Arc::clone(&auth_limiter);
+                    let gate = GatePeer {
+                        ip: peer.ip(),
+                        limiter: auth_limiter,
+                    };
                     async move {
-                        Ok::<_, std::convert::Infallible>(handle(req, &runtime, &stats_cache).await)
+                        Ok::<_, std::convert::Infallible>(
+                            handle(req, &runtime, &stats_cache, &gate).await,
+                        )
                     }
                 });
                 if let Err(err) = hyper::server::conn::http1::Builder::new()
@@ -498,6 +511,7 @@ async fn handle(
     req: Request<Incoming>,
     runtime: &AdminRuntime,
     stats_cache: &CaptureStatsCache,
+    peer: &GatePeer,
 ) -> Response<Full<Bytes>> {
     let config = &runtime.config;
     let registry = runtime.registry.as_deref();
@@ -649,7 +663,7 @@ async fn handle(
     // for how a GET fits a type named for writes. ----
     // The gated records read has its own handler, but passes the same gate.
     if req.uri().path() == "/capture/spool/records" {
-        return handle_capture_records(&req, runtime).await;
+        return handle_capture_records(&req, runtime, peer).await;
     }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -674,7 +688,7 @@ async fn handle(
     }
 
     // Gates 1 and 2: see `admin_gate`.
-    if let Some(refusal) = admin_gate(&path, admin_token, req.headers()) {
+    if let Some(refusal) = admin_gate(&path, admin_token, req.headers(), peer) {
         return refusal;
     }
 
@@ -1401,10 +1415,12 @@ fn admin_gate(
     path: &str,
     admin_token: Option<&str>,
     headers: &HeaderMap,
+    peer: &GatePeer,
 ) -> Option<Response<Full<Bytes>>> {
     let Some(token) = admin_token else {
         tracing::warn!(
             endpoint = %path,
+            peer = %peer.ip,
             "admin request refused: LLMPROXY_ADMIN_TOKEN is not set, so admin write endpoints are disabled"
         );
         return Some(text(
@@ -1412,15 +1428,58 @@ fn admin_gate(
             "admin write endpoints are disabled because LLMPROXY_ADMIN_TOKEN is not set",
         ));
     };
+    // Gate 2a: a peer past its failed-token budget is refused before its
+    // token is even compared (review M9; see `auth_limit`'s module doc).
+    let now = Instant::now();
+    if let Verdict::Limited { retry_after, first } = peer.limiter.check(peer.ip, now) {
+        if first {
+            tracing::warn!(
+                endpoint = %path,
+                peer = %peer.ip,
+                max_failures = auth_limit::MAX_FAILURES,
+                window_seconds = auth_limit::WINDOW.as_secs(),
+                retry_after_seconds = retry_after.as_secs(),
+                "admin requests from this peer are refused (429) after repeated invalid \
+                 bearer tokens"
+            );
+        }
+        let mut response = text(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many invalid admin bearer tokens from this address; retry later",
+        );
+        // Whole seconds, rounded up, so a client that honours it is not
+        // refused again for the remaining fraction.
+        let seconds = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+        response.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from(seconds),
+        );
+        return Some(response);
+    }
     let authorized = match extract_bearer(headers) {
         Some(candidate) => secrets_match(candidate.as_bytes(), token.as_bytes()),
         None => false,
     };
     if !authorized {
-        tracing::warn!(endpoint = %path, "admin request refused: missing or invalid bearer token");
+        peer.limiter.record_failure(peer.ip, now);
+        // The peer and the endpoint only: never the presented value, which
+        // may be a near-miss of the real token.
+        tracing::warn!(
+            endpoint = %path,
+            peer = %peer.ip,
+            "admin request refused: missing or invalid bearer token"
+        );
         return Some(unauthorized("missing or invalid bearer token"));
     }
+    peer.limiter.record_success(peer.ip);
     None
+}
+
+/// The connection a request arrived on, as the admin gate needs it: the peer
+/// address it logs and limits by, and the server's shared limiter.
+struct GatePeer {
+    ip: IpAddr,
+    limiter: Arc<AuthFailureLimiter>,
 }
 
 const CAPTURE_NOT_CONFIGURED: &str = "no capture agent is configured for this proxy; \
@@ -1462,6 +1521,7 @@ async fn handle_capture_stats(
 async fn handle_capture_records(
     req: &Request<Incoming>,
     runtime: &AdminRuntime,
+    peer: &GatePeer,
 ) -> Response<Full<Bytes>> {
     if req.method() != Method::GET {
         return text(
@@ -1473,6 +1533,7 @@ async fn handle_capture_records(
         req.uri().path(),
         runtime.admin_token.as_deref(),
         req.headers(),
+        peer,
     ) {
         return refusal;
     }

@@ -3215,6 +3215,7 @@ async fn key_rotation_conflicts_and_api_version_are_explicit() {
     );
 }
 
+mod admin_rate_limit;
 mod budget_scope;
 mod capture_spool;
 mod credentials;
