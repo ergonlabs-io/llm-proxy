@@ -37,7 +37,21 @@ async fn handle(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infall
         .expect("static response is always valid"))
 }
 
+/// How long [`handle_held`] holds every response. It is far longer than the
+/// open-loop dispatch interval, so counting response time as dispatch time
+/// moves the reported elapsed time by much more than any rounding margin.
+const RESPONSE_HOLD: Duration = Duration::from_millis(250);
+
+async fn handle_held(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    tokio::time::sleep(RESPONSE_HOLD).await;
+    handle(req).await
+}
+
 async fn spawn_server() -> std::net::SocketAddr {
+    spawn_server_with(false).await
+}
+
+async fn spawn_server_with(hold_responses: bool) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -50,8 +64,15 @@ async fn spawn_server() -> std::net::SocketAddr {
             };
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
+                let service = service_fn(move |req| async move {
+                    if hold_responses {
+                        handle_held(req).await
+                    } else {
+                        handle(req).await
+                    }
+                });
                 let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service_fn(handle))
+                    .serve_connection(io, service)
                     .await;
             });
         }
@@ -88,9 +109,16 @@ async fn closed_loop_end_to_end_smoke() {
     assert!(summary.total_from_scheduled_us.is_some());
 }
 
+// The run cannot return before its last request, dispatched at
+// `last_send`, has been held for `RESPONSE_HOLD`. So with correct pacing the
+// reported dispatch window, `last_send - run_start + interval`, is at most
+// `run_wall - RESPONSE_HOLD + interval`. Counting the response drain makes it
+// roughly `run_wall` instead. Machine load only lengthens `run_wall` and the
+// hold, never shortens them, so the bound holds on a loaded box; it asserts
+// no wall-clock window (AGENTS.md "Build And Test").
 #[tokio::test]
 async fn open_loop_paces_without_counting_response_drain_as_dispatch_time() {
-    let addr = spawn_server().await;
+    let addr = spawn_server_with(true).await;
     let targets = driver::parse_targets(&[format!("http://{addr}")]).expect("parse target");
     let cfg = Arc::new(RunConfig {
         targets,
@@ -100,19 +128,30 @@ async fn open_loop_paces_without_counting_response_drain_as_dispatch_time() {
         max_tokens: 16,
         api_key: None,
         stream: true,
-        timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(30),
         transport: Default::default(),
     });
+    let rate = 100.0;
+    let interval = Duration::from_secs_f64(1.0 / rate);
 
+    let wall_start = std::time::Instant::now();
     let (summary, stats) =
-        driver::run_open_loop(cfg, 100.0, Duration::from_millis(500), Duration::ZERO).await;
+        driver::run_open_loop(cfg, rate, Duration::from_millis(500), Duration::ZERO).await;
+    let run_wall = wall_start.elapsed();
 
     assert_eq!(stats.requested_count, 50);
     assert_eq!(summary.streams_started, stats.requested_count);
     assert_eq!(summary.error_rate, 0.0, "expected no errors: {summary:?}");
-    assert!(!stats.driver_saturated, "driver saturated: {stats:?}");
+    assert!(stats.achieved_rate > 0.0, "no dispatch recorded: {stats:?}");
+
+    let reported_window =
+        Duration::from_secs_f64(summary.streams_started as f64 / stats.achieved_rate);
+    // 1ms absorbs float rounding in the rate -> window round trip only.
+    let bound = (run_wall + interval + Duration::from_millis(1)).saturating_sub(RESPONSE_HOLD);
     assert!(
-        stats.achieved_rate >= 90.0,
-        "response drain was counted as dispatch time: {stats:?}"
+        reported_window <= bound,
+        "response drain was counted as dispatch time: reported window \
+         {reported_window:?} exceeds {bound:?} (run took {run_wall:?}, \
+         each response held {RESPONSE_HOLD:?}): {stats:?}"
     );
 }
