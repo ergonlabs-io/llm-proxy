@@ -3318,6 +3318,11 @@ impl DecoderCallbacks for DecoderCallbacksAdapter<'_, '_> {
             return false;
         };
         f(head);
+        // Refresh the route snapshot so a later `route()` / `per_route_config()`
+        // in this same callback sees the edit (S2.8). Without this, a filter that
+        // publishes a routing header and then reads its own per-route config
+        // resolves, and caches, the route of the headers it just replaced.
+        sync_route_head(self.ctx, head);
         true
     }
 
