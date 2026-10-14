@@ -17,4 +17,15 @@ message BodyRewrite {
   // Required. Provider response dialect used to decide whether OpenAI-only
   // stream usage fields may be injected.
   optional string dialect = 2;
+
+  // Optional. Upper bound on the output tokens a request may ask for; must be
+  // a positive integer. The router refuses (400) a request whose limit exceeds
+  // it, whose limit is not a non-negative integer, or that repeats the limit
+  // key. The field checked is chosen by request path (`/responses`:
+  // `max_output_tokens`; `/messages`: `max_tokens`; any other path:
+  // `max_completion_tokens` and `max_tokens`). A request that names no limit is
+  // forwarded unchanged; the body is never rewritten for the cap. Also valid in
+  // the per-route override, where it applies to requests that route matches.
+  // Unset means no cap.
+  optional uint32 max_output_tokens = 3;
 }

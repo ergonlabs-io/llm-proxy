@@ -552,7 +552,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // schema before building the listener factory.
         "llmproxy.filters.v0.Usage" => &["dialect", "pricing_json"],
         // Owned body-rewrite configuration.
-        "llmproxy.filters.v0.BodyRewrite" => &["enabled", "dialect"],
+        "llmproxy.filters.v0.BodyRewrite" => &["enabled", "dialect", "max_output_tokens"],
         // Model resolution. Listed so a future resolver branch is a strict-mode
         // error until a reader is deliberately added.
         "llmproxy.filters.v0.ModelResolver" => &["rules"],

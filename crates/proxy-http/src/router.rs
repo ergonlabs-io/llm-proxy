@@ -1073,14 +1073,20 @@ impl RouterHandler {
         // authorized and metered on come from a bounded prefix scan; the
         // provider decodes the whole body. Reconcile the two once, here, so
         // every attempt forwards a body that says what the proxy believed.
-        let (routed_model, force_include_usage) = {
+        let (routed_model, force_include_usage, max_output_tokens) = {
             let info = dcb.stream_info();
-            (info.requested_model.clone(), info.force_include_usage)
+            (
+                info.requested_model.clone(),
+                info.force_include_usage,
+                info.max_output_tokens,
+            )
         };
         let body_bytes = match reconcile_request_body(
             &original_body,
             routed_model.as_deref(),
             force_include_usage,
+            max_output_tokens,
+            head.uri.path(),
         ) {
             Ok(None) => original_body,
             Ok(Some(reconciled)) => {
@@ -1089,9 +1095,15 @@ impl RouterHandler {
                 }
                 reconciled
             }
-            Err(msg) => {
-                tracing::debug!(reason = msg, "request body disagrees with routing facts");
-                return local_reply(StatusCode::BAD_REQUEST, msg);
+            Err(refusal) => {
+                if refusal.output_cap {
+                    self.stats.record_output_cap_rejected();
+                }
+                tracing::debug!(
+                    reason = %refusal.message,
+                    "request body disagrees with routing facts"
+                );
+                return local_reply(StatusCode::BAD_REQUEST, &refusal.message);
             }
         };
         let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
@@ -2513,7 +2525,14 @@ struct BodyDecodeFacts {
     duplicate_model: bool,
     stream: Option<bool>,
     include_usage: bool,
+    /// Every occurrence, in document order, of the output-token limit keys
+    /// (see [`OUTPUT_TOKEN_KEYS`]). Kept as a list, not a map, so a repeated
+    /// key is visible as a repeat.
+    token_limits: Vec<(&'static str, serde_json::Value)>,
 }
+
+/// The top-level keys any supported wire format uses to bound output tokens.
+const OUTPUT_TOKEN_KEYS: [&str; 3] = ["max_output_tokens", "max_completion_tokens", "max_tokens"];
 
 impl<'de> serde::Deserialize<'de> for BodyDecodeFacts {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -2550,8 +2569,13 @@ impl<'de> serde::Deserialize<'de> for BodyDecodeFacts {
                             facts.include_usage = options.get("include_usage")
                                 == Some(&serde_json::Value::Bool(true));
                         }
-                        _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
+                        other => {
+                            if let Some(name) = OUTPUT_TOKEN_KEYS.iter().find(|k| **k == other) {
+                                let value = map.next_value::<serde_json::Value>()?;
+                                facts.token_limits.push((name, value));
+                            } else {
+                                map.next_value::<serde::de::IgnoredAny>()?;
+                            }
                         }
                     }
                 }
@@ -2562,36 +2586,123 @@ impl<'de> serde::Deserialize<'de> for BodyDecodeFacts {
     }
 }
 
+/// Why [`reconcile_request_body`] refused a body (a local 400).
+#[derive(Debug, PartialEq)]
+struct Refusal {
+    message: String,
+    /// The refusal came from the output-token cap, for its counter.
+    output_cap: bool,
+}
+
+impl Refusal {
+    fn body(message: &'static str) -> Self {
+        Refusal {
+            message: message.to_string(),
+            output_cap: false,
+        }
+    }
+
+    fn cap(message: String) -> Self {
+        Refusal {
+            message,
+            output_cap: true,
+        }
+    }
+}
+
+/// The body fields that bound output tokens for a request path.
+///
+/// `/responses` (OpenAI Responses) and `/messages` (Anthropic) each have
+/// exactly one such field. Every other path is treated as chat completions or
+/// completions, which accept `max_completion_tokens`, `max_tokens`, or both.
+fn output_token_fields(path: &str) -> &'static [&'static str] {
+    if path.ends_with("/responses") {
+        &["max_output_tokens"]
+    } else if path.ends_with("/messages") {
+        &["max_tokens"]
+    } else {
+        &["max_completion_tokens", "max_tokens"]
+    }
+}
+
+/// Enforce the output-token cap against the body the provider will decode.
+/// The body is only inspected, never rewritten: the client's output limit is
+/// theirs to set, and the proxy refuses what exceeds the cap.
+///
+/// Refused: a limit above the cap, a limit that is not a non-negative integer,
+/// and a repeated limit key (decoders disagree on which repeat wins, so any
+/// repeat could hide a large value from the proxy).
+///
+/// A request that names no limit passes unchanged. This is the one place that
+/// decides the absent case.
+fn check_output_cap(path: &str, cap: u32, facts: &BodyDecodeFacts) -> Result<(), Refusal> {
+    for field in output_token_fields(path) {
+        let mut seen = facts.token_limits.iter().filter(|(name, _)| name == field);
+        let Some((_, value)) = seen.next() else {
+            // Absent: forwarded as the client sent it.
+            continue;
+        };
+        if seen.next().is_some() {
+            return Err(Refusal::cap(format!(
+                "request body has duplicate `{field}` keys"
+            )));
+        }
+        match value.as_u64() {
+            Some(requested) if requested > u64::from(cap) => {
+                return Err(Refusal::cap(format!(
+                    "`{field}` {requested} exceeds the maximum of {cap} output tokens for this model"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                return Err(Refusal::cap(format!(
+                    "`{field}` must be a non-negative integer"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Make the whole buffered body agree with the facts the proxy routed and
-/// metered on (ADR-0004: decode is fully buffered).
+/// metered on (ADR-0004: decode is fully buffered), and enforce the output-token
+/// cap against what the provider will decode.
 ///
 /// `Ok(None)` forwards the body unchanged, `Ok(Some(_))` replaces it, and
-/// `Err(_)` is a static message for a local 400.
+/// `Err(_)` is a local 400. A non-JSON body is passed through unchanged unless
+/// a routed model makes it an error, cap or no cap.
 fn reconcile_request_body(
     body: &Bytes,
     requested_model: Option<&str>,
     force_include_usage: bool,
-) -> Result<Option<Bytes>, &'static str> {
-    if requested_model.is_none() && !force_include_usage {
+    max_output_tokens: Option<u32>,
+    path: &str,
+) -> Result<Option<Bytes>, Refusal> {
+    if requested_model.is_none() && !force_include_usage && max_output_tokens.is_none() {
         return Ok(None);
     }
     let facts: BodyDecodeFacts = match serde_json::from_slice(body) {
         Ok(facts) => facts,
         // We routed on a model the body must therefore state; with no routed
         // model there is nothing to disagree with.
-        Err(_) if requested_model.is_some() => return Err("request body is not a JSON object"),
+        Err(_) if requested_model.is_some() => {
+            return Err(Refusal::body("request body is not a JSON object"))
+        }
         Err(_) => return Ok(None),
     };
     if let Some(requested) = requested_model {
         // Upstream decoders disagree on first-vs-last for duplicate keys, so
         // a repeated `model` is refused rather than guessed at.
         if facts.duplicate_model {
-            return Err("request body has duplicate model keys");
+            return Err(Refusal::body("request body has duplicate model keys"));
         }
         match facts.model.as_ref().and_then(serde_json::Value::as_str) {
             Some(model) if model == requested => {}
-            _ => return Err("request model disagrees with routed model"),
+            _ => return Err(Refusal::body("request model disagrees with routed model")),
         }
+    }
+    if let Some(cap) = max_output_tokens {
+        check_output_cap(path, cap, &facts)?;
     }
     if !(force_include_usage && facts.stream == Some(true) && !facts.include_usage) {
         return Ok(None);
@@ -2617,7 +2728,7 @@ fn reconcile_request_body(
     }
     serde_json::to_vec(&value)
         .map(|bytes| Some(Bytes::from(bytes)))
-        .map_err(|_| "request body could not be serialized")
+        .map_err(|_| Refusal::body("request body could not be serialized"))
 }
 
 /// Why the selected cluster's body preparation refused the request.
@@ -3866,8 +3977,153 @@ mod tests {
         body: &'static str,
         model: Option<&str>,
         force: bool,
-    ) -> Result<Option<Bytes>, &'static str> {
-        reconcile_request_body(&Bytes::from_static(body.as_bytes()), model, force)
+    ) -> Result<Option<Bytes>, String> {
+        reconcile_request_body(
+            &Bytes::from_static(body.as_bytes()),
+            model,
+            force,
+            None,
+            "/v1/chat/completions",
+        )
+        .map_err(|r| r.message)
+    }
+
+    /// Run the reconcile step with an output-token cap on `path`.
+    fn reconcile_capped(
+        body: &'static str,
+        path: &str,
+        model: Option<&str>,
+        cap: u32,
+    ) -> Result<Option<Bytes>, Refusal> {
+        reconcile_request_body(
+            &Bytes::from_static(body.as_bytes()),
+            model,
+            false,
+            Some(cap),
+            path,
+        )
+    }
+
+    const CHAT: &str = "/v1/chat/completions";
+
+    fn refused_message(body: &'static str, path: &str) -> String {
+        let refusal = reconcile_capped(body, path, None, 100).expect_err(body);
+        assert!(refusal.output_cap, "{body}: must count as a cap refusal");
+        refusal.message
+    }
+
+    #[test]
+    fn cap_refuses_a_larger_limit_naming_the_field_and_the_cap() {
+        let msg = refused_message(r#"{"max_tokens":9000}"#, CHAT);
+        assert!(msg.contains("max_tokens") && msg.contains("100"), "{msg}");
+        let msg = refused_message(r#"{"max_completion_tokens":101}"#, CHAT);
+        assert!(msg.contains("max_completion_tokens"), "{msg}");
+        // Either chat field over the cap is enough.
+        refused_message(r#"{"max_tokens":5,"max_completion_tokens":500}"#, CHAT);
+    }
+
+    #[test]
+    fn cap_uses_the_field_the_path_names() {
+        let msg = refused_message(r#"{"max_output_tokens":900}"#, "/v1/responses");
+        assert!(msg.contains("max_output_tokens"), "{msg}");
+        let msg = refused_message(r#"{"max_tokens":900}"#, "/v1/messages");
+        assert!(msg.contains("max_tokens"), "{msg}");
+        // Another path's field is not this path's limit.
+        assert_eq!(
+            reconcile_capped(r#"{"max_tokens":9000}"#, "/v1/responses", None, 100).unwrap(),
+            None
+        );
+        assert_eq!(
+            reconcile_capped(r#"{"max_output_tokens":9000}"#, "/v1/messages", None, 100).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cap_never_changes_the_body() {
+        for (path, body) in [
+            (CHAT, r#"{"model":"m"}"#),
+            (CHAT, r#"{ "max_tokens" : 100 }"#),
+            (CHAT, r#"{"max_tokens":0}"#),
+            ("/v1/responses", r#"{"input":"hi"}"#),
+            ("/v1/messages", r#"{"max_tokens":7}"#),
+        ] {
+            assert_eq!(
+                reconcile_capped(body, path, None, 100).unwrap(),
+                None,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_refuses_duplicate_limit_keys_plain_or_escaped() {
+        for body in [
+            r#"{"max_tokens":1,"max_tokens":999999}"#,
+            r#"{"max_tokens":999999,"max_tokens":1}"#,
+            r#"{"max_tokens":1,"max_\u0074okens":999999}"#,
+        ] {
+            let msg = refused_message(body, CHAT);
+            assert!(msg.contains("duplicate"), "{body}: {msg}");
+        }
+        refused_message(
+            r#"{"max_output_tokens":1,"max_output_tokens":2}"#,
+            "/v1/responses",
+        );
+    }
+
+    #[test]
+    fn cap_recognizes_an_escaped_key_as_the_limit() {
+        // `\u006dax_tokens` decodes to `max_tokens`, as the provider sees it.
+        let msg = refused_message(r#"{"\u006dax_tokens":9000}"#, CHAT);
+        assert!(msg.contains("exceeds"), "{msg}");
+    }
+
+    #[test]
+    fn cap_refuses_a_limit_that_is_not_a_non_negative_integer() {
+        for bad in ["-1", "1.5", "1e3", "\"100\"", "null", "true", "[]"] {
+            let body: &'static str =
+                Box::leak(format!(r#"{{"max_tokens":{bad}}}"#).into_boxed_str());
+            let msg = refused_message(body, CHAT);
+            assert!(msg.contains("non-negative integer"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn cap_still_checks_the_routed_model() {
+        let refusal = reconcile_capped(r#"{"model":"other"}"#, CHAT, Some("cheap"), 100)
+            .expect_err("model mismatch");
+        assert!(!refusal.output_cap, "a model refusal is not a cap refusal");
+        assert!(reconcile_capped(
+            r#"{"model":"cheap","model":"cheap"}"#,
+            CHAT,
+            Some("cheap"),
+            100
+        )
+        .is_err());
+        assert_eq!(
+            reconcile_capped(r#"{"model":"cheap"}"#, CHAT, Some("cheap"), 100).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cap_with_a_non_json_body_follows_the_model_check() {
+        assert_eq!(reconcile_capped("not json", CHAT, None, 100).unwrap(), None);
+        assert!(reconcile_capped("not json", CHAT, Some("cheap"), 100).is_err());
+    }
+
+    #[test]
+    fn cap_check_and_forced_usage_coexist() {
+        let body = Bytes::from_static(br#"{"stream":true,"max_tokens":50}"#);
+        let rewritten = reconcile_request_body(&body, None, true, Some(100), CHAT)
+            .unwrap()
+            .expect("usage is still forced");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(value["max_tokens"], 50);
+        assert_eq!(value["stream_options"]["include_usage"], true);
+        let over = Bytes::from_static(br#"{"stream":true,"max_tokens":500}"#);
+        assert!(reconcile_request_body(&over, None, true, Some(100), CHAT).is_err());
     }
 
     #[test]
