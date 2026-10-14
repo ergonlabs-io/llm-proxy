@@ -135,6 +135,24 @@ pub(crate) const BEARER_PREFIX: &str = "Bearer ";
 /// "whose kind is this" cannot silently drift apart.
 pub(crate) const KEY_PREFIX: &str = "llmp_";
 
+/// Rejects a tenant or key id that is empty or longer than
+/// [`proxy_observability::records::MAX_PRINCIPAL_ID_BYTES`]. A free function
+/// rather than a check inside [`TenantId::new`]/[`KeyId::new`] because those
+/// constructors are infallible and shared across crates; every site that
+/// accepts a NEW id from outside (mint, config load) calls this first.
+/// `field` names the offending input in the message.
+pub fn check_principal_id(field: &str, id: &str) -> Result<(), String> {
+    let max = proxy_observability::records::MAX_PRINCIPAL_ID_BYTES;
+    if id.len() > max {
+        return Err(format!(
+            "{field} is {} bytes; the maximum is {max} (longer ids cannot be recorded without \
+             truncation, which could merge two distinct ids)",
+            id.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Identifies the tenant (account/team) a request was authenticated as.
 ///
 /// Rust note: a one-field tuple struct ("newtype") rather than a bare

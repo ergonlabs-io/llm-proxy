@@ -254,6 +254,9 @@ pub enum StoreError {
     NotFound,
     /// Stable key ownership or terminal revocation forbids this update.
     Conflict(String),
+    /// The caller supplied a value the store must never hold (for example an
+    /// over-long principal id). Maps to a client error, not a store outage.
+    InvalidInput(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -264,6 +267,7 @@ impl std::fmt::Display for StoreError {
             }
             StoreError::NotFound => write!(f, "control-plane store: not found"),
             StoreError::Conflict(reason) => write!(f, "control-plane store conflict: {reason}"),
+            StoreError::InvalidInput(reason) => write!(f, "invalid input: {reason}"),
         }
     }
 }
@@ -2862,6 +2866,9 @@ impl ControlPlane {
     /// section and every other write method below: a reader must never
     /// observe a republish that predates the write it is meant to reflect.
     pub fn mint_key(&self, tenant: &TenantId, key_id: &KeyId) -> Result<MintedKey, StoreError> {
+        crate::auth::check_principal_id("tenant", tenant.as_str())
+            .and_then(|()| crate::auth::check_principal_id("key_id", key_id.as_str()))
+            .map_err(StoreError::InvalidInput)?;
         let snapshot = self.published.load();
         if let Some(owner) = snapshot.key_tenants.get(key_id) {
             if owner != tenant {
@@ -4307,6 +4314,33 @@ mod tests {
     // --- ControlPlane write methods ---------
 
     // --- mint_key produces a key that authenticates
+
+    #[test]
+    fn mint_key_enforces_the_principal_id_length_bound() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"operator-secret"),
+            KeySet::new(),
+        )
+        .expect("empty store must not fail boot");
+        let max = proxy_observability::records::MAX_PRINCIPAL_ID_BYTES;
+        cp.mint_key(
+            &TenantId::new("t".repeat(max)),
+            &KeyId::new("k".repeat(max)),
+        )
+        .expect("ids at the bound are accepted");
+        for (tenant, key) in [
+            ("t".repeat(max + 1), "ok".to_string()),
+            ("ok".into(), "k".repeat(max + 1)),
+        ] {
+            match cp.mint_key(&TenantId::new(tenant), &KeyId::new(key)) {
+                Err(StoreError::InvalidInput(reason)) => {
+                    assert!(reason.contains("maximum"), "{reason}")
+                }
+                other => panic!("over-long id must be refused, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn mint_key_produces_a_key_that_authenticates() {

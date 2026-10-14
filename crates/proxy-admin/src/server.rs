@@ -1667,6 +1667,7 @@ fn store_error_response(endpoint: &str, err: StoreError) -> Response<Full<Bytes>
     match err {
         StoreError::NotFound => text(StatusCode::NOT_FOUND, "not found"),
         StoreError::Conflict(reason) => text(StatusCode::CONFLICT, &reason),
+        StoreError::InvalidInput(reason) => bad_request(&reason),
         other => {
             tracing::warn!(endpoint, error = %other, "admin write failed: control-plane store error");
             text(StatusCode::INTERNAL_SERVER_ERROR, &other.to_string())
@@ -1853,6 +1854,13 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
     }
     if key_id.trim().is_empty() {
         return bad_request("key_id must not be empty");
+    }
+    // Checked here for a 400 that names the field, and again inside
+    // `ControlPlane::mint_key` so no other caller can bypass it.
+    if let Err(reason) = proxy_filters::auth::check_principal_id("tenant", &tenant)
+        .and_then(|()| proxy_filters::auth::check_principal_id("key_id", &key_id))
+    {
+        return bad_request(&reason);
     }
 
     match control_plane.mint_key(&TenantId::new(tenant), &KeyId::new(key_id)) {

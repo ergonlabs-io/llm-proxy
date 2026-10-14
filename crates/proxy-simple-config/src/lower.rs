@@ -80,6 +80,9 @@ const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http
 /// in a route's `typed_per_filter_config`.
 const AUTH_FILTER_NAME: &str = "llmproxy.auth";
 
+/// Longest accepted `auth.keys[].id` / `.tenant`.
+const MAX_PRINCIPAL_ID_BYTES: usize = 128;
+
 /// Must equal `proxy_filters::auth_filter::TYPE_URL`. Duplicated for the same
 /// dependency-tree reason as [`USAGE_FILTER_TYPE_URL`]; `tests/auth.rs`'s
 /// `auth_filter_type_url_matches_the_filter` pins the two together.
@@ -1838,6 +1841,21 @@ fn lower_auth(
                 field_path: format!("{path}.tenant"),
                 reason: "must not be empty".to_string(),
             });
+        }
+        // Must equal `proxy_observability::records::MAX_PRINCIPAL_ID_BYTES`
+        // (pinned by a test); duplicated because this crate does not depend on
+        // the data plane. Over-long ids would be truncated or rejected in
+        // request records, so fail at load with the dotted path.
+        for (field, value) in [("id", &key.id), ("tenant", &key.tenant)] {
+            if value.len() > MAX_PRINCIPAL_ID_BYTES {
+                return Err(ConfigError::InvalidValue {
+                    field_path: format!("{path}.{field}"),
+                    reason: format!(
+                        "is {} bytes; the maximum is {MAX_PRINCIPAL_ID_BYTES}",
+                        value.len()
+                    ),
+                });
+            }
         }
         validate_digest(&key.digest, &format!("{path}.digest"))?;
 

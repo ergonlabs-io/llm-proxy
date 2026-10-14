@@ -43,7 +43,9 @@ use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
 use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
-use proxy_observability::records::{RequestRecord, RequestRecordSink, SCHEMA_VERSION};
+use proxy_observability::records::{
+    RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
+};
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
 use proxy_observability::ResponseFlag;
@@ -719,23 +721,30 @@ impl LoggingBody {
                     }
                 }
             }
-            if record.validate(u16::MAX).is_ok() {
-                #[cfg(unix)]
-                if let Some(Ok(permit)) = terminal {
-                    // Trusted ownership identifiers are rejected, never truncated into collisions.
-                    if tenant.as_ref().is_none_or(|t| t.len() <= 128)
-                        && usage_attribution.0.as_ref().is_none_or(|k| k.len() <= 128)
-                    {
-                        let _ = permit.submit(record);
-                    } else if let Some(lease) = &lease {
-                        lease.identity_limit();
-                    }
-                } else {
-                    let _ = sink.submit(record);
+            // No validity pre-check here: a malformed record must reach the
+            // sink (or capture permit) so it is counted as `invalid` in
+            // `llmproxy_metadata_admission` rather than vanishing. Dropping the
+            // permit on that path releases its reservation.
+            #[cfg(unix)]
+            if let Some(Ok(permit)) = terminal {
+                // Trusted ownership identifiers are rejected, never truncated into collisions.
+                if tenant
+                    .as_ref()
+                    .is_none_or(|t| t.len() <= MAX_PRINCIPAL_ID_BYTES)
+                    && usage_attribution
+                        .0
+                        .as_ref()
+                        .is_none_or(|k| k.len() <= MAX_PRINCIPAL_ID_BYTES)
+                {
+                    let _ = permit.submit(record);
+                } else if let Some(lease) = &lease {
+                    lease.identity_limit();
                 }
-                #[cfg(not(unix))]
+            } else {
                 let _ = sink.submit(record);
             }
+            #[cfg(not(unix))]
+            let _ = sink.submit(record);
         }
 
         #[cfg(unix)]
@@ -1290,6 +1299,36 @@ mod tests {
         assert_eq!(cost.kind, "list");
         assert_eq!(cost.rate_card_version, version);
         assert!(records.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_terminal_record_is_counted_invalid_not_silently_dropped() {
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+        let counters = sink.counters();
+        ctx.request_record_sink = Some(Arc::new(sink));
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.metadata_enabled = true;
+            info.begin_attempt("primary", "host", None).unwrap();
+            // Fewer physical attempts than recorded ones is impossible in
+            // production; `validate` rejects it regardless of sink limits.
+            info.physical_attempt_count = 0;
+        }
+        LoggingBody::new(
+            local_boxed(
+                Full::new(Bytes::new()).map_err(|never: std::convert::Infallible| match never {}),
+            ),
+            ctx,
+        )
+        .collect()
+        .await
+        .unwrap();
+        assert!(records.try_recv().is_err());
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.invalid, 1);
+        assert_eq!(snapshot.capacity_exceeded + snapshot.oversize, 0);
     }
 
     #[tokio::test]

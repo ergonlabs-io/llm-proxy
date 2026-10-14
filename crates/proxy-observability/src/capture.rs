@@ -219,12 +219,13 @@ impl CaptureTerminalPermit {
         record.instance_id = self.shared.instance_id.clone();
         let result = if !self.live() {
             SubmitResult::Disabled
-        } else if record.retained_bytes() > self.bytes
-            || record
-                .validate(self.policy.config.metadata.max_attempts)
-                .is_err()
+        } else if record.retained_bytes() > self.bytes {
+            SubmitResult::Oversize
+        } else if record
+            .validate(self.policy.config.metadata.max_attempts)
+            .is_err()
         {
-            SubmitResult::CapacityExceeded
+            SubmitResult::Invalid
         } else {
             match shared.tx.try_reserve() {
                 Ok(slot) => {

@@ -764,3 +764,33 @@ async fn successful_probe_handshake_does_not_reopen_parallel_delivery_before_dur
     agent.abort();
     let _ = agent.await;
 }
+
+#[tokio::test]
+async fn lease_submit_counts_oversize_and_invalid_apart_from_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let c = config(&temp);
+    let limit = c.metadata.max_record_retained_bytes;
+    let (s, d, stats) = supervisor();
+    s.configure(Some(c), 1).unwrap();
+    let lease = s.try_admit().unwrap().unwrap();
+
+    let mut big = crate::records::tests::record();
+    big.route = String::with_capacity(limit + 1);
+    assert_eq!(
+        lease.reserve_terminal().unwrap().submit(big),
+        SubmitResult::Oversize
+    );
+    let mut bad = crate::records::tests::record();
+    bad.event_id.clear();
+    assert_eq!(
+        lease.reserve_terminal().unwrap().submit(bad),
+        SubmitResult::Invalid
+    );
+
+    let scrape = prometheus_render::render(&stats.registry());
+    assert!(scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"oversize\"} 1"));
+    assert!(scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"invalid\"} 1"));
+    assert!(scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"capacity_exceeded\"} 0"));
+    drop(lease);
+    assert!(!d.shutdown(Duration::from_secs(1)).await);
+}

@@ -14,6 +14,13 @@ pub const SCHEMA_VERSION: u16 = 1;
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 pub const MAX_ATTEMPTS: u16 = 64;
 
+/// Longest tenant or key id a record may carry. Ids are trusted ownership
+/// identifiers: the capture path rejects longer ones and the non-capture path
+/// would truncate them at `bounded_field`'s 512 bytes, merging two long ids
+/// that share a prefix. Minting and config load enforce this bound so neither
+/// outcome is reachable.
+pub const MAX_PRINCIPAL_ID_BYTES: usize = 128;
+
 /// Copy bounded metadata into independent storage. Caller-controlled paths
 /// and models cannot pin an arbitrarily large String allocation in a queue.
 pub fn bounded_field(value: &str) -> String {
@@ -288,7 +295,14 @@ impl RequestRecord {
 pub enum SubmitResult {
     Accepted,
     Disabled,
+    /// The bounded queue (or capture budget) is full. Nothing is wrong with
+    /// the record itself.
     CapacityExceeded,
+    /// The record alone exceeds the per-record retained-byte limit. Retrying
+    /// can never succeed, so a biller must not read this as overload.
+    Oversize,
+    /// The record failed `RequestRecord::validate`: a producer bug, not load.
+    Invalid,
     Closed,
 }
 
@@ -384,6 +398,8 @@ impl<C: MetadataCollector> MetadataAgent<C> {
 pub struct DropCounters {
     accepted: AtomicU64,
     capacity_exceeded: AtomicU64,
+    oversize: AtomicU64,
+    invalid: AtomicU64,
     closed: AtomicU64,
 }
 
@@ -391,6 +407,8 @@ pub struct DropCounters {
 pub struct DropCounterSnapshot {
     pub accepted: u64,
     pub capacity_exceeded: u64,
+    pub oversize: u64,
+    pub invalid: u64,
     pub closed: u64,
 }
 
@@ -399,6 +417,8 @@ impl DropCounters {
         DropCounterSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
             capacity_exceeded: self.capacity_exceeded.load(Ordering::Relaxed),
+            oversize: self.oversize.load(Ordering::Relaxed),
+            invalid: self.invalid.load(Ordering::Relaxed),
             closed: self.closed.load(Ordering::Relaxed),
         }
     }
@@ -407,6 +427,8 @@ impl DropCounters {
         let counter = match result {
             SubmitResult::Accepted => &self.accepted,
             SubmitResult::CapacityExceeded => &self.capacity_exceeded,
+            SubmitResult::Oversize => &self.oversize,
+            SubmitResult::Invalid => &self.invalid,
             SubmitResult::Closed => &self.closed,
             SubmitResult::Disabled => return,
         };
@@ -459,10 +481,10 @@ impl BoundedRecordSink {
 
 impl RequestRecordSink for BoundedRecordSink {
     fn submit(&self, record: RequestRecord) -> SubmitResult {
-        let result = if record.retained_bytes() > MAX_RECORD_BYTES
-            || record.validate(self.max_attempts).is_err()
-        {
-            SubmitResult::CapacityExceeded
+        let result = if record.retained_bytes() > MAX_RECORD_BYTES {
+            SubmitResult::Oversize
+        } else if record.validate(self.max_attempts).is_err() {
+            SubmitResult::Invalid
         } else {
             match self.tx.try_reserve() {
                 Ok(permit) => {
@@ -553,7 +575,7 @@ pub(crate) mod tests {
         let (sink, _) = BoundedRecordSink::new(1);
         let mut r = record();
         r.response_flags = Vec::with_capacity(MAX_RECORD_BYTES);
-        assert_eq!(sink.submit(r), SubmitResult::CapacityExceeded);
+        assert_eq!(sink.submit(r), SubmitResult::Oversize);
     }
 
     #[test]
@@ -568,9 +590,32 @@ pub(crate) mod tests {
         let mut record = record();
         record.route = String::with_capacity(MAX_RECORD_BYTES + 1);
         record.route.push('/');
-        assert_eq!(sink.submit(record), SubmitResult::CapacityExceeded);
+        assert_eq!(sink.submit(record), SubmitResult::Oversize);
         assert!(rx.try_recv().is_err());
-        assert_eq!(sink.counters().snapshot().capacity_exceeded, 1);
+        // Only the oversize reason moves; a biller must not read this as a full queue.
+        assert_eq!(
+            sink.counters().snapshot(),
+            DropCounterSnapshot {
+                oversize: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_record_counts_as_invalid_not_capacity() {
+        let (sink, mut rx) = BoundedRecordSink::new(1);
+        let mut bad = record();
+        bad.event_id.clear();
+        assert_eq!(sink.submit(bad), SubmitResult::Invalid);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            sink.counters().snapshot(),
+            DropCounterSnapshot {
+                invalid: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -620,6 +665,7 @@ pub(crate) mod tests {
                 accepted: 1,
                 capacity_exceeded: 1,
                 closed: 1,
+                ..Default::default()
             }
         );
     }

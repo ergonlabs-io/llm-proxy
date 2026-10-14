@@ -1466,6 +1466,39 @@ async fn scoped_write_with_unknown_stat_prefix_is_404() {
     );
 }
 
+/// An id one byte over the bound is a 400 naming the field; exactly at the
+/// bound mints. Request records cannot carry longer ids without truncation.
+#[tokio::test]
+async fn post_keys_enforces_the_128_byte_principal_id_bound() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    let mint = |tenant: String, key_id: String| async move {
+        request(
+            addr,
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            &format!(r#"{{"tenant":"{tenant}","key_id":"{key_id}"}}"#),
+        )
+        .await
+    };
+
+    let (status, _, body) = mint("t".repeat(129), "key-a".into()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("tenant") && body.contains("128"), "{body}");
+    let (status, _, body) = mint("tenant-a".into(), "k".repeat(129)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("key_id") && body.contains("128"), "{body}");
+    let (status, _, body) = mint("t".repeat(128), "k".repeat(128)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 /// The mint flow, correctly authorized: 201, a non-empty plaintext `key`
 /// returned exactly once, and the key actually authenticates through the
 /// `ControlPlane`'s published snapshot afterward.

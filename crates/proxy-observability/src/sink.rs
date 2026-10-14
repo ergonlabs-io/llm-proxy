@@ -103,7 +103,11 @@ impl RateLimiter {
             .is_ok()
     }
 
+    /// Counts the failure unconditionally (the counter is the record of loss),
+    /// then warns at most once per window.
     fn warn(&self, context: &str, err: &io::Error) {
+        WRITE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        record_write_failure_stat();
         if self.should_warn() {
             tracing::warn!(
                 error = %err,
@@ -324,6 +328,14 @@ static DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// with them the sinks, before the main thread gets to flush).
 static LIVE_QUEUES: Mutex<Vec<Weak<QueueShared>>> = Mutex::new(Vec::new());
 
+/// Write or flush errors from every destination in the process since start.
+static WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total access-log write/flush failures, across all destinations.
+pub fn write_failures_total() -> u64 {
+    WRITE_FAILURES_TOTAL.load(Ordering::Relaxed)
+}
+
 /// Total lines dropped because a queue was full, across all destinations.
 pub fn dropped_lines_total() -> u64 {
     DROPPED_TOTAL.load(Ordering::Relaxed)
@@ -333,6 +345,12 @@ pub fn dropped_lines_total() -> u64 {
 /// [`register_dropped_lines_counter`].
 static DROP_STAT: std::sync::RwLock<Option<(Arc<crate::stats::Registry>, crate::stats::Handle)>> =
     std::sync::RwLock::new(None);
+
+/// Where write failures are counted as a stat, set by
+/// [`register_dropped_lines_counter`] alongside [`DROP_STAT`].
+static WRITE_FAILURE_STAT: std::sync::RwLock<
+    Option<(Arc<crate::stats::Registry>, crate::stats::Handle)>,
+> = std::sync::RwLock::new(None);
 
 /// Count every future dropped line in `llmproxy_access_log_dropped_lines`.
 /// Call once at boot, after the stats control exists. Registering again
@@ -347,6 +365,22 @@ pub fn register_dropped_lines_counter(control: &crate::stats::StatsControl) {
     // Rust note: a poisoned lock only means another thread panicked while
     // holding it; the data (an `Option` we overwrite whole) is still valid.
     *DROP_STAT.write().unwrap_or_else(|e| e.into_inner()) = Some((control.registry(), handle));
+    // Same boot hook also exposes `llmproxy_access_log_write_failures`, so an
+    // idle process renders an explicit zero for both loss signals.
+    let failures = control.resolve(&crate::stats::instruments::ACCESS_LOG_WRITE_FAILURES, &[]);
+    *WRITE_FAILURE_STAT
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some((control.registry(), failures));
+}
+
+fn record_write_failure_stat() {
+    if let Some((registry, handle)) = WRITE_FAILURE_STAT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        registry.incr(crate::stats::WorkerId(0), *handle, 1);
+    }
 }
 
 fn record_drop_stat() {
@@ -761,6 +795,34 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&renamed).unwrap();
+    }
+
+    #[test]
+    fn file_write_and_flush_failures_are_counted_and_rendered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.log");
+        std::fs::write(&path, "").unwrap();
+        let control = crate::stats::StatsControl::new(1);
+        register_dropped_lines_counter(&control);
+        let handle = control.resolve(&crate::stats::instruments::ACCESS_LOG_WRITE_FAILURES, &[]);
+        // A read-only handle fails every write on every platform (EBADF), unlike
+        // /dev/full which macOS lacks. Built in-module: no production seam.
+        let sink = FileSink {
+            path: path.clone(),
+            writer: Mutex::new(BufWriter::new(File::open(&path).unwrap())),
+            limiter: RateLimiter::new(),
+        };
+        let before = write_failures_total();
+        sink.write_line("buffered, so the error surfaces on flush\n");
+        sink.flush();
+        // `>=`: process-wide counters, other tests may also fail writes.
+        assert!(write_failures_total() - before >= 1);
+        assert!(control.registry().value(handle) >= 1);
+        let rendered = crate::stats::prometheus_render::render(&control.registry());
+        assert!(
+            rendered.contains("llmproxy_access_log_write_failures"),
+            "{rendered}"
+        );
     }
 
     /// Inner sink that parks in `write_line` until the test sends on `gate`,
