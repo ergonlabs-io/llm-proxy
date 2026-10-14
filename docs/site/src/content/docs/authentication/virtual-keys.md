@@ -30,7 +30,7 @@ separate value attached to the cluster — see
 After a request is authenticated, llm-proxy removes its `Authorization`
 header. A provider never receives the virtual key.
 
-## Authentication fails closed; authorization defaults open
+## Authentication and authorization fail closed
 
 These are two different questions, and the code answers them differently on
 purpose:
@@ -38,17 +38,23 @@ purpose:
 - **Authentication** — "who is this?" — fails closed. With `auth:` present,
   a request carrying no recognized credential is refused with a 401, never
   admitted anonymously.
-- **Authorization** — "what may they do?" — defaults open. A tenant with no
-  configured policy may use every model and every provider. Restriction is
-  opt-in.
+- **Authorization** — "what may they do?" — fails closed for models. A tenant
+  with no stored model policy is refused with a `403` and the response-code
+  detail `model_not_permitted`. A tenant that has only a budget is also
+  refused. The proxy logs the first refusal for each tenant once at warn.
 
-This second point matters for what to expect today. `TenantPolicy` carries a
-per-tenant model allow-list and spend ceiling, not empty placeholder fields
+To let a tenant use models, set its policy with `PUT /tenants/{id}/policy`.
+The body `{"access":"all"}` grants every model. To grant every model to all
+tenants without a policy, set `auth.enforce.tenants_without_policy: allow`
+(default `deny`). The proxy then logs a warning at load. Setting it together
+with `model_policy: false` is a load error at
+`auth.enforce.tenants_without_policy`. In Envoy mode the field is
+`llmproxy.filters.v0.ModelAuthz.tenants_without_policy`: `DENY` (0, default)
+or `ALLOW` (1).
+
+`TenantPolicy` carries a per-tenant model allow-list and spend ceiling
 (`crates/proxy-filters/src/auth.rs:226-251`, the `model_access` and `budget`
-fields). Both default open: an unconfigured tenant may use every model and
-has no spend ceiling (`crates/proxy-filters/src/model_authz.rs:106-108`,
-`ModelAccess::default`; `crates/proxy-filters/src/auth.rs:233-249`, the
-`budget` field's doc on why `None` means unlimited). Two more `llmproxy.*` filters
+fields). A tenant with no spend ceiling is unlimited. Two more `llmproxy.*` filters
 enforce these policies, `llmproxy.model_authz` and `llmproxy.spend_limit`
 (`crates/proxy-filters/src/model_authz_filter.rs`,
 `crates/proxy-filters/src/spend_limit_filter.rs`). An operator sets a
@@ -371,6 +377,24 @@ the access log does not yet render these details (see above).
   [External authorization](../../authentication/external-authorization/).
   That filter checks headers and does not set the tenant.
 
+## Policy staleness
+
+Each replica polls the store for key, revocation, and policy changes every 48
+seconds (jittered up to 60 seconds). If the store cannot be read, the replica
+keeps serving its last copy until the copy is older than
+`auth.max_policy_staleness` (default `4m`, whole seconds, at least `96s`).
+Past that bound, every `Bearer llmp_...` request gets `503` with the
+response-code detail `auth_policy_stale` until a poll succeeds. Authentication
+fails closed. The poller logs at error once when this starts and at warn once
+when it recovers.
+
+In Envoy mode, set `llmproxy.filters.v0.Authentication.max_policy_staleness_seconds`
+(uint32). `0` or unset means 5 x `poll_interval_seconds`, which is 240 seconds
+at the 48-second default. An explicit value below 2 x `poll_interval_seconds`
+is a load error. The gauge `envoy_llmproxy_policy_snapshot_age_seconds` on
+`/stats/prometheus` shows the age. See
+[Metrics and stats](../../observability/metrics-and-stats/).
+
 ## Managing keys and tenants at runtime
 
 Minting a key, revoking one, creating or deleting a tenant, and setting a
@@ -393,6 +417,14 @@ the store first and republishes immediately, so the change is visible to
 every worker's very next request rather than waiting on a periodic refresh
 (`crates/proxy-filters/src/control.rs:1713-1775`, `ControlPlane::mint_key`,
 `revoke_key`, `set_policy`, `set_budget`, each documented "then republishes").
+`DELETE /tenants/{id}` revokes every key that authenticates as the tenant and
+answers `204`. Keys minted through `POST /keys` are revoked and their rows
+stay, as with `DELETE /keys/{id}`. A key from `auth.keys` for that tenant is
+revoked by a revoked row in the store under the same key id. That row wins over
+the config entry on every replica that shares the store, and across restarts.
+Revoked key ids are permanent. The next request with any of those keys gets
+`401`.
+
 For example, `PUT /tenants/acme/policy` with
 `{"access":{"only":["gpt-*"]},"deny":["gpt-5*"]}` permits the
 `gpt-*` models except those matching `gpt-5*`. Omit `deny` or send `[]` for

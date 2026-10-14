@@ -11,6 +11,30 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** with `llmproxy.model_authz` in the chain (dialect: `auth` with
+  `enforce.model_policy` on, the default), a tenant with no stored model policy is
+  refused with `403 model_not_permitted` instead of being allowed every model. Grant
+  models with `PUT /tenants/{id}/policy` (`{"access":"all"}` grants all), or set
+  `auth.enforce.tenants_without_policy: allow` (Envoy mode:
+  `ModelAuthz.tenants_without_policy: ALLOW`), which logs a load-time warning.
+- `DELETE /tenants/{id}` revokes every key of the tenant, including `auth.keys`
+  entries (a revoked store row under the same key id).
+- `--mode translate` prints secrets as `[REDACTED]`; `--reveal-secrets` prints them.
+- `%REQ(X)%` renders `[REDACTED]` for credential headers (`authorization`,
+  `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, `cookie`).
+
+### Added
+
+- `auth.max_policy_staleness` (Envoy mode `max_policy_staleness_seconds`, default
+  4 minutes): past it, with the store unreachable, virtual-key requests get
+  `503 auth_policy_stale`. The age is exported as
+  `llmproxy_policy_snapshot_age_seconds`.
+- The admin API answers `429` with `Retry-After` after 10 bad bearer tokens from one
+  peer in 60 seconds, and logs the peer address on every refusal. The admin UI keeps
+  its token in `sessionStorage`.
+
 ## [0.3.4] - 2026-10-13
 
 Fixes from a production metering review of an OpenRouter deployment run in config mode,

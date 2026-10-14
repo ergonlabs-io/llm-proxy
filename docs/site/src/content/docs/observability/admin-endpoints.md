@@ -46,6 +46,15 @@ A gated route passes two checks in this order
 
 The proxy compares the token with a constant-time check (`secrets_match`).
 
+**Caution.** After 10 missing or wrong bearer tokens from one peer IP within 60
+seconds, the proxy refuses that peer's gated requests with `429` and a
+`Retry-After` header (in seconds). This lasts until the 60-second window ends,
+even if the peer then sends the right token. The limit covers all write
+endpoints and the gated reads, such as `GET /keys`, spend reads, and capture
+records. A correct token before the limit clears the count for that peer. The
+proxy logs each refusal at warn with the peer IP and the endpoint. It never logs
+the presented token.
+
 | Route class | Routes | Gated |
 |---|---|---|
 | Probes and dumps | `GET /ready`, `/config_dump`, `/clusters`, `/server_info`, `/models` | No |
@@ -152,7 +161,7 @@ model and examples.
 | `/keys/{id}/budget` | PUT | `204` | Sets or clears a key budget. |
 | `/keys/{id}/spend` | GET | `200` | Reads the spend of a key. |
 | `/tenants` | POST | `201` | Creates a tenant. Body: `tenant`. |
-| `/tenants/{id}` | DELETE | `204` | Deletes a tenant. |
+| `/tenants/{id}` | DELETE | `204` | Deletes a tenant and revokes every key that authenticates as it. Minted keys are revoked and their rows stay. Config-file `auth.keys` entries for the tenant are revoked by a revoked store row with the same key id. That row wins on every replica that shares the store, and across restarts. Revoked key ids are permanent. The next request with any of those keys gets `401`. |
 | `/tenants/{id}/policy` | PUT | `204` | Sets the model-access policy. Body: `access` (`all` or `{"only": [...]}`) and optional `deny`. |
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |

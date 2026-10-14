@@ -224,6 +224,7 @@ present at all.
 | `store` | `AuthStore` | no | `in_memory` | Where keys minted through the admin API and tenant policy live. Exactly one of `in_memory: {}`, `persistent: {path}`, or `shared: {url \| url_file, namespace}`. Fixed at startup: changing it takes a restart. |
 | `tenant_credentials` | `AuthTenantCredentials` | required when any `providers` entry sets `tenant_credentials: true`; otherwise no | absent | The key ring that seals tenant provider credentials at rest. Absent means the proxy cannot seal or open them. Requires a durable store, `store.persistent` or `store.shared`: with `store` absent or `in_memory`, this block is a load error at `auth.tenant_credentials`. See the table below. |
 
+| `max_policy_staleness` | duration | no | `4m` | How old the replica's copy of keys, revocations, and policies may get when the store cannot be read. Whole seconds, at least `96s`. Past it, every `Bearer llmp_...` request gets `503` with response-code detail `auth_policy_stale` until a poll succeeds. Any other value is a load error at `auth.max_policy_staleness`. See "Policy staleness" below. |
 | `enforce` | `AuthEnforce` | no | both `true` | Which tenant controls the proxy enforces. See "`auth.enforce`" below. |
 
 `store.persistent.path` is an embedded `redb` file, created if missing; an empty
@@ -242,7 +243,8 @@ a load error that names the full path, for example `auth.enforce.model_polcy`.
 
 | Field | Type | Required | Default | What it does |
 |---|---|---|---|---|
-| `model_policy` | boolean | no | `true` | Enforce tenant model allow-lists. A tenant with no policy stays open. `false` omits `llmproxy.model_authz`. |
+| `model_policy` | boolean | no | `true` | Enforce tenant model allow-lists. A tenant with no stored policy is refused (`403`, response-code detail `model_not_permitted`) unless `tenants_without_policy` is `allow`. `false` omits `llmproxy.model_authz`. |
+| `tenants_without_policy` | `deny` or `allow` | no | `deny` | What `llmproxy.model_authz` does for a tenant with no stored policy. `deny` refuses the request. `allow` grants every model and logs a load-time warning. Setting it with `model_policy: false` is a load error at `auth.enforce.tenants_without_policy`. |
 | `spend` | boolean | no | `true` | Enforce tenant and key spend budgets. Cost comes from `pricing`. `false` omits `llmproxy.spend_limit`. |
 
 Setting either to `false` logs a load-time warning that names what is not
@@ -301,9 +303,27 @@ routes:
     provider: openai
 ```
 
-Authentication fails closed; authorization does not. An authenticated tenant
-with no configured policy may use every model and provider. Once you set a
-policy for the tenant through the admin API, `auth` enforces it.
+Authentication fails closed, and so does authorization. An authenticated
+tenant with no stored policy is refused with `403` and the response-code detail
+`model_not_permitted`. A tenant that has only a budget is also refused. The
+proxy logs the first refusal for each tenant once at warn, with the tenant and
+the fix. Set a policy with `PUT /tenants/{id}/policy`. The body
+`{"access":"all"}` grants every model. To grant every model to tenants without
+a policy, set `auth.enforce.tenants_without_policy: allow`.
+
+### Policy staleness
+
+Each replica polls the store for key, revocation, and policy changes every 48
+seconds (jittered up to 60 seconds). If the store cannot be read, the replica
+keeps its last copy until the copy is older than `auth.max_policy_staleness`.
+Past that bound, every `Bearer llmp_...` request gets `503` with the
+response-code detail `auth_policy_stale`. The poller logs at error once when
+this starts and at warn once when it recovers. The gauge
+`envoy_llmproxy_policy_snapshot_age_seconds{scope="<stat_prefix>"}` on
+`/stats/prometheus` shows the age. In Envoy mode the field is
+`llmproxy.filters.v0.Authentication.max_policy_staleness_seconds`. A value of
+`0` or unset means 5 x `poll_interval_seconds` (240 seconds at the default).
+An explicit value below 2 x `poll_interval_seconds` is a load error.
 
 ## `limits[]` (`Limit`)
 

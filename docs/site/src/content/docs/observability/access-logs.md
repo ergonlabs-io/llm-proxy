@@ -142,7 +142,7 @@ is a load error, never silently dropped or emitted as literal text.
 | Operator | Renders |
 |---|---|
 | `%START_TIME%` / `%START_TIME(fmt)%` | Request start time. `fmt` is a strftime pattern; default is ISO-8601 with millisecond precision. |
-| `%REQ(X)%` / `%REQ(X?Y)%` / `%REQ(X):Z%` | Request header `X`, falling back to `Y` if absent, truncated to `Z` characters. `:METHOD`, `:PATH`, `:AUTHORITY`, `:SCHEME` are pseudo-headers. |
+| `%REQ(X)%` / `%REQ(X?Y)%` / `%REQ(X):Z%` | Request header `X`, falling back to `Y` if absent, truncated to `Z` characters. `:METHOD`, `:PATH`, `:AUTHORITY`, `:SCHEME` are pseudo-headers. For the credential headers `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, and `cookie` (any case, also as a `?` fallback name), the operator renders `[REDACTED]` when the header is present and `-` when it is absent. The value never reaches the log. Envoy renders these headers verbatim; this is a deliberate difference. |
 | `%RESP(X)%` / `%RESP(X?Y)%` | Response header `X`, same fallback/truncation rules. |
 | `%TRAILER(X)%` / `%TRAILER(X?Y)%` | Response trailer `X`. |
 | `%PROTOCOL%` | The HTTP protocol version. |

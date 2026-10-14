@@ -95,6 +95,7 @@ reachable).
 | Metric | Type | Labels | Counts |
 |---|---|---|---|
 | `llmproxy_access_log_dropped_lines` | counter | none | Access-log lines that the proxy dropped because a destination queue was full. See [Access logs](../access-logs/#where-a-line-goes). |
+| `envoy_llmproxy_policy_snapshot_age_seconds` | gauge | `scope` (the HCM `stat_prefix`) | Age of the replica's copy of keys, revocations, and policies, in whole seconds. Updated each poll tick, so it lags by up to one poll interval. Only on `/stats/prometheus`. See [Policy staleness](../../authentication/virtual-keys/#policy-staleness). |
 | `llmproxy_otel_export_failures` | counter | `signal` (`traces` or `metrics`) | OTLP export attempts that failed: a connect error, a collector rejection, or an expired deadline. |
 | `llmproxy_otel_spans_dropped` | counter | none | Spans that the proxy discarded before export: the span queue was full, or the export of the batch failed. |
 
