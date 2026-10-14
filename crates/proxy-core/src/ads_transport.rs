@@ -6,7 +6,7 @@
 //! provider credentials in cluster headers, so a plaintext channel to a
 //! remote control plane would expose them (architecture.md section 11, H7).
 //! Loading refuses that case unless the operator opts in; see
-//! `envoy-divergences.md` row 32.
+//! `envoy-divergences.md` row 33.
 
 use std::future::Future;
 use std::io;

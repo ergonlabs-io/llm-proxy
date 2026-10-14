@@ -123,7 +123,7 @@ Plaintext is permitted only when all endpoints of the ADS cluster are
 loopback addresses (`127.0.0.0/8`, `::1`, or `localhost`). For other
 addresses, the load fails with this path:
 `static_resources.clusters[N].transport_socket`. Envoy does not do this
-check (`internal-docs/envoy-divergences.md` row 32).
+check (`internal-docs/envoy-divergences.md` row 33).
 
 To permit plaintext to a remote control plane, set this key:
 
