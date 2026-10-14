@@ -90,6 +90,11 @@ struct Args {
     #[arg(long = "hmac-secret-file", value_name = "PATH")]
     hmac_secret_file: Option<PathBuf>,
 
+    /// `--mode translate`: print provider keys, the auth HMAC secret and the
+    /// store URL as configured. Without it they print as `[REDACTED]`.
+    #[arg(long = "reveal-secrets")]
+    reveal_secrets: bool,
+
     /// Warn on unknown fields in the bootstrap configuration instead of
     /// failing (default: strict). Has no effect on `--config` files, which
     /// are always strict.
@@ -410,10 +415,21 @@ fn load(args: &Args) -> Result<(String, LoadedBootstrap), (String, String)> {
         .map_err(|e| (display.clone(), e.to_string()))?;
 
     if args.mode == Mode::Translate {
-        let (yaml, warnings) = proxy_simple_config::to_envoy_yaml(&config)
-            .map_err(|e| (display.clone(), e.to_string()))?;
+        // Secrets are redacted unless asked for (review M9).
+        let translated = if args.reveal_secrets {
+            proxy_simple_config::to_envoy_yaml_with_secrets(&config)
+        } else {
+            proxy_simple_config::to_envoy_yaml(&config)
+        };
+        let (yaml, warnings) = translated.map_err(|e| (display.clone(), e.to_string()))?;
         for warning in &warnings {
             eprintln!("warning: `{}`: {}", warning.field_path, warning.message);
+        }
+        if !args.reveal_secrets && proxy_simple_config::has_inline_secrets(&config) {
+            eprintln!(
+                "note: secrets print as {}; pass --reveal-secrets to print them",
+                proxy_simple_config::REDACTED
+            );
         }
         print!("{yaml}");
     }
@@ -3703,6 +3719,7 @@ mod tests {
             tenant: None,
             key_id: "REPLACE_ME".to_string(),
             hmac_secret_file: None,
+            reveal_secrets: false,
             permissive,
             concurrency: 1,
             request_records_file: None,

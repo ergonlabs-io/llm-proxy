@@ -23,7 +23,10 @@ pub mod lower;
 pub mod model;
 pub mod parse;
 
-pub use lower::{lower, lower_to_loaded, to_envoy_yaml, Lowered, MODEL_HEADER};
+pub use lower::{
+    has_inline_secrets, lower, lower_to_loaded, to_envoy_yaml, to_envoy_yaml_with_secrets, Lowered,
+    MODEL_HEADER, REDACTED,
+};
 pub use model::SimpleConfig;
 pub use parse::{
     load_simple_config_file, looks_like_envoy_bootstrap, looks_like_simple_config,

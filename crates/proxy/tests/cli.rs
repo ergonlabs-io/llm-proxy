@@ -34,6 +34,72 @@ fn validate_exits_zero_for_a_good_config() {
     assert!(status.success(), "expected exit 0, got {status:?}");
 }
 
+/// Review M9: `--mode translate` prints the lowered bootstrap, which holds
+/// every interpolated secret. By default none reaches stdout; the operator
+/// is told how to get them, and `--reveal-secrets` prints them.
+#[test]
+fn translate_redacts_interpolated_secrets_unless_asked_to_reveal_them() {
+    let provider_key = "sk-translate-test-provider-key-0001";
+    let header_key = "sk-translate-test-header-key-0002";
+    let hmac_secret = "translate-test-hmac-secret-0003";
+    let redis_url = "redis://:translate-test-redis-password@127.0.0.1:6379/0";
+    let path = std::env::temp_dir().join(format!(
+        "llm-proxy-translate-secrets-{}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            "version: 0\n\
+             providers:\n  openai: {{ api_key: ${{TRANSLATE_TEST_OPENAI_KEY}} }}\n  \
+             other:\n    type: openai-compatible\n    base_url: http://127.0.0.1:9\n    \
+             extra_headers: {{ x-api-key: {header_key} }}\n\
+             routes:\n  - {{ model: \"gpt-*\", provider: openai }}\n  - {{ model: \"*\", provider: other }}\n\
+             auth:\n  hmac_secret: {hmac_secret}\n  store: {{ shared: {{ url: \"{redis_url}\" }} }}\n"
+        ),
+    )
+    .unwrap();
+    let translate = |reveal: bool| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["--config", path.to_str().unwrap(), "--mode", "translate"])
+            .env("TRANSLATE_TEST_OPENAI_KEY", provider_key);
+        if reveal {
+            command.arg("--reveal-secrets");
+        }
+        let output = command.output().expect("failed to run llm-proxy");
+        assert!(output.status.success(), "{output:?}");
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let secrets = [provider_key, header_key, hmac_secret, redis_url];
+
+    let (stdout, stderr) = translate(false);
+    for secret in secrets {
+        assert!(
+            !stdout.contains(secret),
+            "{secret} reached stdout:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains(secret),
+            "{secret} reached stderr:\n{stderr}"
+        );
+    }
+    assert!(stdout.contains("[REDACTED]"), "{stdout}");
+    assert!(stderr.contains("--reveal-secrets"), "{stderr}");
+
+    let (stdout, _) = translate(true);
+    let _ = std::fs::remove_file(&path);
+    for secret in secrets {
+        assert!(
+            stdout.contains(secret),
+            "--reveal-secrets must print {secret}"
+        );
+    }
+}
+
 #[test]
 fn validate_exits_nonzero_for_a_bad_config() {
     let dir = std::env::temp_dir();

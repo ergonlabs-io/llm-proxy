@@ -236,12 +236,120 @@ pub fn lower_to_loaded(config: &SimpleConfig) -> Result<LoadedBootstrap, ConfigE
     Ok(loaded)
 }
 
-/// Render the lowered bootstrap as YAML (`llm-proxy --mode translate`).
+/// Render the lowered bootstrap as YAML (`llm-proxy --mode translate`), with
+/// every inline secret replaced by [`REDACTED`] (review M9). `${VAR}`
+/// interpolation has already put provider keys, the HMAC secret and the store
+/// URL into `config`, and the lowering copies them into header values and
+/// `inline_string`s, so printing the raw bootstrap would put them on stdout,
+/// in a terminal scrollback or a CI log. The redacted output is still a valid
+/// bootstrap; it just does not authenticate anywhere.
+/// [`to_envoy_yaml_with_secrets`] is the `--reveal-secrets` form.
 pub fn to_envoy_yaml(config: &SimpleConfig) -> Result<(String, Vec<ConfigWarning>), ConfigError> {
-    let lowered = lower(config)?;
+    let mut lowered = lower(config)?;
+    redact_secrets(&mut lowered.bootstrap, &secret_values(config));
+    render_yaml(lowered)
+}
+
+/// [`to_envoy_yaml`] without redaction: the bootstrap exactly as `serve`
+/// would load it, secrets included. Only for an operator who asked for them
+/// (`--reveal-secrets`).
+pub fn to_envoy_yaml_with_secrets(
+    config: &SimpleConfig,
+) -> Result<(String, Vec<ConfigWarning>), ConfigError> {
+    render_yaml(lower(config)?)
+}
+
+fn render_yaml(lowered: Lowered) -> Result<(String, Vec<ConfigWarning>), ConfigError> {
     let yaml = serde_yaml::to_string(&lowered.bootstrap)
         .map_err(|e| ConfigError::Parse(format!("internal: cannot render YAML: {e}")))?;
     Ok((yaml, lowered.warnings))
+}
+
+/// What [`to_envoy_yaml`] prints in place of a secret.
+pub const REDACTED: &str = "[REDACTED]";
+
+/// Whether `config` holds any secret inline, i.e. whether [`to_envoy_yaml`]
+/// has anything to redact. A secret read from a `*_file` field is not inline:
+/// the lowering emits the file's path, never its contents.
+pub fn has_inline_secrets(config: &SimpleConfig) -> bool {
+    !secret_values(config).is_empty()
+}
+
+/// Request headers whose value is a credential when an operator sets them in
+/// `providers.<name>.extra_headers`.
+const CREDENTIAL_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+/// Every inline secret in `config`, after `${VAR}` interpolation: provider
+/// keys and tokens, credential-named `extra_headers`, the auth HMAC secret,
+/// and the shared store URL (which may carry a password). Empty values are
+/// left out; there is nothing to hide in them and an empty pattern would match
+/// everywhere.
+fn secret_values(config: &SimpleConfig) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for provider in config.providers.values() {
+        secrets.extend(
+            [
+                &provider.api_key,
+                &provider.access_token,
+                &provider.access_key_id,
+                &provider.secret_access_key,
+                &provider.session_token,
+            ]
+            .into_iter()
+            .flatten()
+            .cloned(),
+        );
+        secrets.extend(
+            provider
+                .extra_headers
+                .iter()
+                .filter(|(name, _)| {
+                    CREDENTIAL_HEADER_NAMES
+                        .iter()
+                        .any(|credential| credential.eq_ignore_ascii_case(name))
+                })
+                .map(|(_, value)| value.clone()),
+        );
+    }
+    if let Some(auth) = &config.auth {
+        secrets.extend(auth.hmac_secret.iter().cloned());
+        if let Some(shared) = auth.store.as_ref().and_then(|store| store.shared.as_ref()) {
+            secrets.extend(shared.url.iter().cloned());
+        }
+    }
+    secrets.retain(|secret| !secret.is_empty());
+    // Longest first, so a secret that contains another is replaced whole.
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    secrets
+}
+
+/// Replaces every occurrence of each secret in every string of `value`.
+/// Substring, not whole-value, matching: a provider key is lowered into
+/// `Bearer <key>` header values, not stored alone.
+fn redact_secrets(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => {
+            for secret in secrets {
+                if text.contains(secret.as_str()) {
+                    *text = text.replace(secret.as_str(), REDACTED);
+                }
+            }
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_secrets(item, secrets)),
+        Value::Object(members) => members
+            .values_mut()
+            .for_each(|member| redact_secrets(member, secrets)),
+        _ => {}
+    }
 }
 
 pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
