@@ -117,7 +117,11 @@
 //! this filter's `decode_headers` ever runs, so every request reaching here
 //! carries a tenant. Without one, there is no assigned identity in the system
 //! at all and the hashed header is the only key available — the same
-//! best-effort behavior as before, and no worse.
+//! best-effort behavior as before, and no worse. Because the caller picks
+//! that header, the store caps how many credential buckets exist at once
+//! ([`crate::token_limit::MAX_CREDENTIAL_WINDOWS`]); past the cap, new
+//! credentials share one overflow budget per route, and expired windows are
+//! evicted (review M8).
 //!
 //! **Which means the ordering requirement is a security property, not a
 //! preference.** Decoder callbacks run in **config order** (S2.1), so

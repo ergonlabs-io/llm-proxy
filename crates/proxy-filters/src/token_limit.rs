@@ -147,6 +147,10 @@ pub enum LimitSubject {
     /// [`CredentialDigest`] -- a digest is the only thing this variant can
     /// hold; there is no way to construct it from a raw, unhashed value.
     Credential(CredentialDigest),
+    /// The one bucket per route that unauthenticated credentials share once
+    /// [`MAX_CREDENTIAL_WINDOWS`] distinct ones already hold a window. See
+    /// [`InProcessBudgetStore`]'s "Bounded" section.
+    CredentialOverflow,
 }
 
 impl LimitKey {
@@ -203,6 +207,7 @@ impl std::fmt::Display for LimitKey {
         match &self.subject {
             LimitSubject::Tenant(tenant) => write!(f, "tenant={tenant}"),
             LimitSubject::Credential(digest) => write!(f, "cred={digest}"),
+            LimitSubject::CredentialOverflow => f.write_str("cred=overflow"),
         }
     }
 }
@@ -475,15 +480,75 @@ struct Window {
 /// request lifecycle those calls happen).
 pub struct InProcessBudgetStore {
     rule: LimitRule,
-    windows: Mutex<HashMap<LimitKey, Window>>,
+    windows: Mutex<Windows>,
+}
+
+/// Every key's window, plus when the next sweep for expired ones is due.
+///
+/// # Expired windows are evicted
+///
+/// A window whose time has run out reads exactly like no window at all (see
+/// [`InProcessBudgetStore::used_in_current_window`]), so dropping it changes
+/// no answer. Without dropping, the map kept one entry for every key that
+/// ever recorded usage, for the life of the process (review M8). `record`
+/// sweeps at most once per window length, so a sweep's O(n) cost is paid
+/// once per window, not per request, and an expired entry is gone within
+/// two window lengths of its last record.
+///
+/// # Bounded: credential-keyed windows are capped
+///
+/// Expiry alone does not bound the map against a caller: without an auth
+/// filter the key is a digest of the `authorization` header, which the caller
+/// chooses, so every invented header that records usage adds a window that
+/// lives a full window length (review M8). At most
+/// [`MAX_CREDENTIAL_WINDOWS`] credential windows exist at once; a credential
+/// with no window of its own arriving after that draws on one shared
+/// [`LimitSubject::CredentialOverflow`] bucket per route, for `check` and
+/// `record` alike, so it is still limited, just not on its own. The first
+/// fold logs one warning per store, naming no credential (AGENTS.md
+/// "Fail-open controls"). Tenant windows are not capped: the proxy assigns
+/// tenants, so a caller cannot invent them.
+#[derive(Default)]
+struct Windows {
+    by_key: HashMap<LimitKey, Window>,
+    /// `None` until the first `record`.
+    next_sweep: Option<Instant>,
+    /// How many keys in `by_key` are [`LimitSubject::Credential`].
+    credential_windows: usize,
+    /// Set by the first fold into an overflow bucket.
+    overflow_warned: bool,
+}
+
+/// The most [`LimitSubject::Credential`] windows one store holds at once. A
+/// window is a few hundred bytes, so this bounds the credential side of the
+/// map to a few megabytes.
+pub const MAX_CREDENTIAL_WINDOWS: usize = 10_000;
+
+impl Windows {
+    /// The key `key`'s usage is counted under: `key` itself, or the route's
+    /// overflow bucket for a credential with no window once the cap is full.
+    fn bounded(&self, key: &LimitKey) -> Option<LimitKey> {
+        let new_credential =
+            matches!(key.subject, LimitSubject::Credential(_)) && !self.by_key.contains_key(key);
+        (new_credential && self.credential_windows >= MAX_CREDENTIAL_WINDOWS).then(|| LimitKey {
+            route: key.route.clone(),
+            subject: LimitSubject::CredentialOverflow,
+        })
+    }
 }
 
 impl InProcessBudgetStore {
     pub fn new(rule: LimitRule) -> Self {
         Self {
             rule,
-            windows: Mutex::new(HashMap::new()),
+            windows: Mutex::new(Windows::default()),
         }
+    }
+
+    /// How many windows are held, expired or not.
+    #[cfg(test)]
+    pub(crate) fn tracked_windows(&self) -> usize {
+        self.windows.lock().unwrap().by_key.len()
     }
 
     /// The bucket of `usage` this store's rule cares about, per
@@ -507,7 +572,8 @@ impl InProcessBudgetStore {
         // unlock), so this can't actually fire; `sink.rs`'s `FileSink` makes
         // the same choice for the same reason.
         let windows = self.windows.lock().unwrap();
-        match windows.get(key) {
+        let overflow = windows.bounded(key);
+        match windows.by_key.get(overflow.as_ref().unwrap_or(key)) {
             Some(w) => {
                 let elapsed = now.saturating_duration_since(w.started_at);
                 if elapsed >= self.rule.window {
@@ -558,8 +624,33 @@ impl BudgetStore for InProcessBudgetStore {
             weighted as u64
         };
 
-        let mut windows = self.windows.lock().unwrap();
-        let window = windows.entry(key.clone()).or_insert(Window {
+        let mut guard = self.windows.lock().unwrap();
+        let windows = &mut *guard;
+        if windows.next_sweep.is_none_or(|due| now >= due) {
+            let length = self.rule.window;
+            let mut credentials_dropped = 0;
+            windows.by_key.retain(|key, w| {
+                let live = now.saturating_duration_since(w.started_at) < length;
+                if !live && matches!(key.subject, LimitSubject::Credential(_)) {
+                    credentials_dropped += 1;
+                }
+                live
+            });
+            windows.credential_windows -= credentials_dropped;
+            windows.next_sweep = now.checked_add(length);
+        }
+        let overflow = windows.bounded(key);
+        let first_fold =
+            overflow.is_some() && !std::mem::replace(&mut windows.overflow_warned, true);
+        let key = match overflow {
+            Some(overflow) => overflow,
+            None => key.clone(),
+        };
+        if matches!(key.subject, LimitSubject::Credential(_)) && !windows.by_key.contains_key(&key)
+        {
+            windows.credential_windows += 1;
+        }
+        let window = windows.by_key.entry(key).or_insert(Window {
             started_at: now,
             used: 0,
         });
@@ -571,6 +662,15 @@ impl BudgetStore for InProcessBudgetStore {
             window.used = weighted_tokens;
         } else {
             window.used = window.used.saturating_add(weighted_tokens);
+        }
+        drop(guard);
+        if first_fold {
+            tracing::warn!(
+                max_credential_windows = MAX_CREDENTIAL_WINDOWS,
+                "llmproxy.token_limit: the per-credential budget cap is full; further \
+                 unauthenticated credentials share one overflow budget per route until \
+                 windows expire. Configure llmproxy.auth to budget per tenant instead"
+            );
         }
     }
 
@@ -589,6 +689,7 @@ impl BudgetStore for InProcessBudgetStore {
         let windows = self.windows.lock().unwrap();
         let limit = self.rule.max_tokens;
         let mut usages: Vec<TenantUsage> = windows
+            .by_key
             .iter()
             .filter(|(key, _)| key.is_for_tenant(tenant))
             .map(|(key, window)| {
@@ -1064,5 +1165,94 @@ mod tests {
         );
 
         assert_eq!(store.usage_for_tenant("acme", now).unwrap(), vec![]);
+    }
+
+    /// Expired windows leave the map (review M8): a window read as fresh is
+    /// dropped by the next sweep, which runs at most once per window length.
+    /// This is also what happens to a deleted tenant's window: the store is
+    /// never told about the delete, and does not need to be, since the
+    /// window frees itself within two window lengths.
+    ///
+    /// Mutation: skip the `retain` in `record`; the map keeps all 1000.
+    #[test]
+    fn expired_windows_are_evicted_by_the_next_sweep() {
+        let window = Duration::from_secs(60);
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 100, window));
+        let start = Instant::now();
+        for i in 0..1000 {
+            let key = LimitKey::for_tenant("r", &format!("tenant-{i}"));
+            store.record(&key, &usage(5, 0), 1.0, start);
+        }
+        assert_eq!(store.tracked_windows(), 1000);
+
+        // Inside the window: nothing expires, and no sweep is due.
+        let live = LimitKey::for_tenant("r", "live");
+        store.record(&live, &usage(1, 0), 1.0, start + window / 2);
+        assert_eq!(store.tracked_windows(), 1001);
+
+        // One window later the 1000 have expired; the live one has not.
+        store.record(&live, &usage(1, 0), 1.0, start + window);
+        assert_eq!(store.tracked_windows(), 1);
+        assert_eq!(
+            store.check(&LimitKey::for_tenant("r", "tenant-0"), start + window),
+            Ok(LimitDecision::Allow {
+                limit: 100,
+                remaining: 100,
+                reset_after: window,
+            }),
+            "an evicted window reads the same as an expired one"
+        );
+    }
+
+    /// Review M8: without an auth filter the key is a digest of a header the
+    /// caller picks, so invented headers must not grow the map without
+    /// bound. Past the cap, new credentials share one overflow budget per
+    /// route, which still limits them (a check sees the overflow's usage),
+    /// and the first fold warns once without naming a credential. When the
+    /// windows expire the cap frees again.
+    ///
+    /// Mutation: have `Windows::bounded` always return `None`; the map then
+    /// holds every credential.
+    #[test]
+    fn distinct_credentials_past_the_cap_share_one_overflow_budget() {
+        let window = Duration::from_secs(60);
+        let store = InProcessBudgetStore::new(rule(LimitOn::Total, 10, window));
+        let start = Instant::now();
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        for i in 0..MAX_CREDENTIAL_WINDOWS + 100 {
+            let key = LimitKey::for_credential("r", &format!("Bearer bogus-{i}"));
+            store.record(&key, &usage(1, 0), 1.0, start);
+        }
+        drop(guard);
+
+        assert_eq!(
+            store.tracked_windows(),
+            MAX_CREDENTIAL_WINDOWS + 1,
+            "the cap, plus the route's one overflow bucket"
+        );
+        // The 100 past the cap spent 100 tokens of the shared overflow
+        // budget, so a further new credential is denied on its first check.
+        let late = LimitKey::for_credential("r", "Bearer one-more");
+        assert!(matches!(
+            store.check(&late, start),
+            Ok(LimitDecision::Deny { .. })
+        ));
+        // A credential that got its own window keeps it.
+        assert!(matches!(
+            store.check(&LimitKey::for_credential("r", "Bearer bogus-0"), start),
+            Ok(LimitDecision::Allow { remaining: 9, .. })
+        ));
+
+        let warnings = capture.rendered_at_or_above(tracing::Level::WARN);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!warnings[0].contains("bogus"), "{}", warnings[0]);
+
+        // Once they expire, a new credential gets a window of its own again.
+        store.record(&late, &usage(1, 0), 1.0, start + window);
+        assert_eq!(store.tracked_windows(), 1);
+        assert!(matches!(
+            store.check(&late, start + window),
+            Ok(LimitDecision::Allow { remaining: 9, .. })
+        ));
     }
 }
