@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
+# `TokioIo` adapts the ADS TLS stream to the hyper I/O traits tonic's
+# connector requires (`ads_transport`).
+hyper-util = { workspace = true }
 # Threads the shared ClusterManager through the listener manager into
 # the HTTP router terminal.
 proxy-cluster = { workspace = true }
@@ -31,6 +34,8 @@ thiserror = { workspace = true }
 tls-parser = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+# The ADS gRPC channel (`ads_transport`).
+tonic = { workspace = true }
 tracing = { workspace = true }
 x509-parser = { workspace = true }
 

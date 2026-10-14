@@ -217,6 +217,25 @@ pub struct AdsConfig {
     /// different sources, including one ADS source and one filesystem file.
     pub lds_source: Option<DiscoverySource>,
     pub cds_source: Option<DiscoverySource>,
+    /// Whether the operator allowed a plaintext ADS channel to a control
+    /// plane that is not on loopback, from bootstrap
+    /// `node.metadata["io.llmproxy.ads"].allow_plaintext`. The channel
+    /// carries provider credentials in cluster headers, so loading refuses
+    /// that case unless this is set, and the runtime warns when it is used
+    /// (`envoy-divergences.md` row 32).
+    pub allow_plaintext: bool,
+}
+
+/// Whether an endpoint host is on this machine: a loopback IP literal or
+/// `localhost`. Any other name is treated as remote, because DNS decides
+/// where it resolves.
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

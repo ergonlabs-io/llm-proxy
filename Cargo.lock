@@ -355,7 +355,9 @@ dependencies = [
  "futures",
  "prost-types",
  "proxy-api",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tonic",
 ]
 
@@ -1772,6 +1774,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "prost-reflect",
  "proxy-api",
  "proxy-cluster",
@@ -1790,6 +1793,7 @@ dependencies = [
  "tls-parser",
  "tokio",
  "tokio-rustls",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "x509-parser",

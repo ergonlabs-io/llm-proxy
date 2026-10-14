@@ -342,6 +342,7 @@ fn with_ads_requirements(
         node: NodeIdentity::default(),
         lds_source: Some(proxy_config::ir::DiscoverySource::Ads),
         cds_source: Some(proxy_config::ir::DiscoverySource::Ads),
+        allow_plaintext: false,
     });
     base
 }

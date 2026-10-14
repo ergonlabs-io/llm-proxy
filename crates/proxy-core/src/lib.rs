@@ -3,6 +3,7 @@
 //! and the L4 network filter framework.
 
 pub mod admission;
+pub mod ads_transport;
 pub mod drain;
 pub mod filter_chain;
 pub mod header_mutation_filter;

@@ -27,7 +27,6 @@ proxy-api = { workspace = true }
 proxy-xds = { workspace = true }
 ring = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -72,10 +71,10 @@ prost-types = { workspace = true }
 # (generated in `proxy-api`) served over a real ephemeral `tonic` endpoint --
 # the only way to prove spans actually cross the wire in the shape a real
 # collector expects, rather than asserting against `FinishedSpan` (which
-# `otlp::map_span` already unit-tests without any network at all). `proxy-api`
-# and `tonic` themselves are declared above in `[dependencies]` now -- regular
-# dependencies are visible to tests too, so
-# nothing further is needed here.
+# `otlp::map_span` already unit-tests without any network at all). The ADS
+# channel itself is built in `proxy_core::ads_transport`, so `tonic` is a test
+# dependency here.
+tonic = { workspace = true }
 
 [lints]
 workspace = true

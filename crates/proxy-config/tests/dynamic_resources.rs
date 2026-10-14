@@ -481,3 +481,134 @@ fn an_empty_ads_cluster_name_is_refused() {
         "the error must carry the full dotted path, got: {rendered}"
     );
 }
+
+// --------------------------------------------- ADS transport security (H7) --
+
+/// A bootstrap whose ADS cluster is the SECOND cluster, so the dotted path
+/// must carry the right index, dialling `address`, with optional extra
+/// cluster YAML (a `transport_socket`) and optional `node.metadata` YAML.
+fn ads_transport_bootstrap(address: &str, cluster_extra: &str, metadata: &str) -> String {
+    format!(
+        r#"node:
+  id: proxy-1
+{metadata}dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config: {{ ads: {{}}, resource_api_version: V3 }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 10.9.9.9, port_value: 80 }}
+    - name: xds_cluster
+      type: STRICT_DNS
+{cluster_extra}      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: "{address}", port_value: 18000 }}
+"#
+    )
+}
+
+const ADS_TLS: &str = r#"      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: cp.example.com
+"#;
+
+const ALLOW_PLAINTEXT: &str = "  metadata:\n    io.llmproxy.ads: { allow_plaintext: true }\n";
+
+/// The ADS channel carries provider credentials, so plaintext is accepted
+/// only on loopback, with TLS configured, or with the explicit opt-in;
+/// anything else fails load at the ADS cluster's `transport_socket` path
+/// (envoy-divergences.md row 32).
+#[test]
+fn a_plaintext_ads_channel_is_refused_unless_loopback_tls_or_allowed() {
+    const REFUSED: Result<bool, &str> = Err("static_resources.clusters[1].transport_socket");
+    // (address, cluster extra, metadata, expected allow_plaintext or error path)
+    let cases: [(&str, &str, &str, Result<bool, &str>); 8] = [
+        ("10.0.0.5", "", "", REFUSED),
+        ("cp.example.com", "", "", REFUSED),
+        (
+            "10.0.0.5",
+            "",
+            "  metadata:\n    io.llmproxy.ads: { allow_plaintext: false }\n",
+            REFUSED,
+        ),
+        ("127.0.0.1", "", "", Ok(false)),
+        ("::1", "", "", Ok(false)),
+        ("localhost", "", "", Ok(false)),
+        ("cp.example.com", ADS_TLS, "", Ok(false)),
+        ("10.0.0.5", "", ALLOW_PLAINTEXT, Ok(true)),
+    ];
+    for (address, extra, metadata, expected) in cases {
+        let yaml = ads_transport_bootstrap(address, extra, metadata);
+        let result = snapshot_from(&yaml);
+        match expected {
+            Ok(allow) => {
+                let snap =
+                    result.unwrap_or_else(|e| panic!("{address} {extra:?} {metadata:?}: {e}"));
+                assert_eq!(snap.ads.expect("ads").allow_plaintext, allow, "{address}");
+            }
+            Err(path) => {
+                let err = result.expect_err(&format!("plaintext to {address} must be refused"));
+                assert_eq!(err_path(&err), path, "{address}");
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("allow_plaintext") && rendered.contains(address),
+                    "the error must name the target and the opt-in, got: {rendered}"
+                );
+            }
+        }
+    }
+}
+
+/// `node.metadata["io.llmproxy.ads"]` is opaque to the reflective surface
+/// walk, so its strictness is enforced by hand: an unknown key, a wrong type,
+/// or the key on a bootstrap with no ADS channel each fail with their path
+/// (AGENTS.md invariant 1).
+#[test]
+fn the_ads_metadata_key_is_strict() {
+    let cases = [
+        (
+            ads_transport_bootstrap(
+                "10.0.0.5",
+                "",
+                "  metadata:\n    io.llmproxy.ads: { allow_plaintxt: true }\n",
+            ),
+            "node.metadata[\"io.llmproxy.ads\"].allow_plaintxt",
+        ),
+        (
+            ads_transport_bootstrap(
+                "10.0.0.5",
+                "",
+                "  metadata:\n    io.llmproxy.ads: { allow_plaintext: \"yes\" }\n",
+            ),
+            "node.metadata[\"io.llmproxy.ads\"].allow_plaintext",
+        ),
+        (
+            format!(
+                "node:\n  id: p\n{ALLOW_PLAINTEXT}static_resources:\n  listeners: []{XDS_CLUSTER}"
+            ),
+            "node.metadata[\"io.llmproxy.ads\"]",
+        ),
+    ];
+    for (yaml, path) in cases {
+        let err = snapshot_from(&yaml).expect_err(path);
+        assert_eq!(err_path(&err), path);
+    }
+}

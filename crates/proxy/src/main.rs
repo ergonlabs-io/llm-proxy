@@ -22,6 +22,7 @@ use proxy_config::ir::{AdsProtocol, DiscoverySource, NodeIdentity, SnapshotVersi
 use proxy_config::{
     build_snapshot, load_bootstrap_file, ConfigSnapshot, LoadedBootstrap, StrictMode,
 };
+use proxy_core::ads_transport::AdsTransport;
 use proxy_core::drain::{drain_worker, ConnectionRegistry};
 use proxy_core::lifecycle::LifecycleState;
 use proxy_core::listener::{initial_bind, run_listener_manager};
@@ -35,7 +36,6 @@ use proxy_xds::{
     ResourceApplier, ResponseHandler, Subscription, SubscriptionState,
 };
 use tokio::sync::{mpsc, oneshot, Notify};
-use tonic::transport::Channel;
 
 mod init;
 mod keygen;
@@ -2291,8 +2291,11 @@ fn effective_node(
 ///   `ClusterConfig.eds` -- so this gate also starts an ADS client for a
 ///   bootstrap that enables neither `lds` nor `cds` but declares a `Cluster`
 ///   whose membership comes over EDS.
-/// - an ADS-backed source has no usable cluster endpoint: a config error,
-///   logged at `error!` with the cluster name. Filesystem-only sources do not
+/// - an ADS-backed source has no usable cluster endpoint, or its channel
+///   cannot be built (`proxy_core::ads_transport::ads_channel`: a bad
+///   `transport_socket`, or plaintext to a remote control plane without the
+///   opt-in): a config error, logged at `error!` with the
+///   cluster name. Filesystem-only sources do not
 ///   need an ADS cluster and are handled by the local watcher above.
 ///
 /// The `Channel` is built with `connect_lazy`, not an eager `connect().await`:
@@ -2498,41 +2501,56 @@ fn start_ads(
         return None;
     }
 
-    // Rust note: `?` above already returned on `ads.is_none()`; from here on
-    // `ads.cluster` is a name config lowering has already checked exists in
-    // `static_resources`, so a missing entry here would be that guarantee
-    // breaking, not an operator mistake -- treated the same as "no
-    // endpoints" below rather than a panic, per AGENTS.md invariant 1's spirit
-    // (loud, not silent -- but never fatal to the process here, see
-    // architecture.md §12.2 rule 5).
-    let endpoint = match snapshot
-        .clusters
-        .get(ads_cluster)
-        .and_then(|c| c.endpoints.first())
-    {
-        Some(endpoint) => endpoint,
-        None => {
+    // `ads.cluster` names a cluster lowering has already checked exists in
+    // `static_resources`; a missing one is treated like "no endpoints":
+    // loud, never fatal to the process (architecture.md section 12.2 rule 5).
+    let Some(cluster) = snapshot.clusters.get(ads_cluster) else {
+        tracing::error!(
+            cluster = %ads_cluster,
+            "ADS cluster does not exist; not starting an ADS client"
+        );
+        return None;
+    };
+    let ads_channel = match proxy_core::ads_transport::ads_channel(cluster, ads) {
+        Ok(ads_channel) => ads_channel,
+        Err(error) => {
             tracing::error!(
                 cluster = %ads_cluster,
-                "ADS cluster has no endpoints (or does not exist); not starting an ADS client"
+                %error,
+                "cannot build the ADS channel; not starting an ADS client"
             );
             return None;
         }
     };
-    let uri = format!("http://{}:{}", endpoint.host, endpoint.port);
-
-    let channel = match Channel::from_shared(uri.clone()) {
-        Ok(endpoint) => endpoint.connect_lazy(),
-        Err(err) => {
-            tracing::error!(
-                cluster = %ads_cluster,
-                uri,
-                error = %err,
-                "ADS cluster address is not a valid URI; not starting an ADS client"
-            );
-            return None;
+    let target = &ads_channel.target;
+    match ads_channel.transport {
+        AdsTransport::Tls {
+            server_verified: true,
+        } => tracing::info!(cluster = %ads_cluster, %target, "ADS channel uses TLS"),
+        // Envoy parity: no validation_context means any server certificate
+        // is accepted. Encrypted but unauthenticated, so say so.
+        AdsTransport::Tls {
+            server_verified: false,
+        } => tracing::warn!(
+            cluster = %ads_cluster,
+            %target,
+            "ADS channel uses TLS without a validation_context: the control plane's \
+             certificate is NOT verified"
+        ),
+        AdsTransport::PlaintextLoopback => {
+            tracing::info!(cluster = %ads_cluster, %target, "ADS channel is plaintext on loopback")
         }
-    };
+        // The fail-open path of AGENTS.md "Fail-open controls": the operator
+        // chose a plaintext remote control plane, so log it loudly.
+        AdsTransport::PlaintextAllowed => tracing::warn!(
+            cluster = %ads_cluster,
+            %target,
+            "ADS channel is PLAINTEXT to a non-loopback control plane \
+             (io.llmproxy.ads.allow_plaintext): provider credentials it delivers are \
+             readable on the network"
+        ),
+    }
+    let channel = ads_channel.channel;
     let mut grpc_client = AggregatedDiscoveryServiceClient::new(channel);
 
     // Bounded at 1: `ResourceApplier` (via `AdsClient::run_once`) applies one

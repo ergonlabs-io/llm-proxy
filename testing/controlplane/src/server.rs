@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -287,6 +288,9 @@ pub struct Harness {
     pub log: RequestLog,
     shutdown: Option<oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<()>,
+    /// The TLS accept loop, for [`Harness::spawn_tls`]; aborted on shutdown.
+    acceptor: Option<tokio::task::JoinHandle<()>>,
+    tls_handshake_failures: Arc<AtomicUsize>,
 }
 
 impl Harness {
@@ -295,12 +299,80 @@ impl Harness {
     pub async fn spawn(script: Vec<Step>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
+        Ok(Self::serve(
+            script,
+            addr,
+            TcpIncoming(listener),
+            None,
+            Arc::default(),
+        ))
+    }
 
+    /// Like [`Harness::spawn`], but terminates TLS with `tls` on every
+    /// connection before gRPC sees it, so a client must originate TLS the
+    /// server accepts. `tls` should offer ALPN `h2`. A failed handshake is
+    /// counted in [`Harness::tls_handshake_failures`] and the connection
+    /// dropped, which is what lets a test tell "the client dialled and was
+    /// refused" from "the client never dialled".
+    pub async fn spawn_tls(
+        script: Vec<Step>,
+        tls: Arc<rustls::ServerConfig>,
+    ) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let failures = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel::<std::io::Result<TlsConn>>(16);
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+        let counter = Arc::clone(&failures);
+        // Handshakes run in their own tasks so one stalled client cannot
+        // hold up the next accept.
+        let accept_loop = tokio::spawn(async move {
+            while let Ok((tcp, _peer)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    match acceptor.accept(tcp).await {
+                        Ok(tls) => {
+                            let _ = tx.send(Ok(TlsConn(tls))).await;
+                        }
+                        Err(err) => {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            eprintln!("controlplane: TLS handshake failed: {err}");
+                        }
+                    }
+                });
+            }
+        });
+        Ok(Self::serve(
+            script,
+            addr,
+            ReceiverStream(rx),
+            Some(accept_loop),
+            failures,
+        ))
+    }
+
+    fn serve<S, IO>(
+        script: Vec<Step>,
+        addr: SocketAddr,
+        incoming: S,
+        acceptor: Option<tokio::task::JoinHandle<()>>,
+        tls_handshake_failures: Arc<AtomicUsize>,
+    ) -> Self
+    where
+        S: Stream<Item = std::io::Result<IO>> + Send + 'static,
+        IO: tokio::io::AsyncRead
+            + tokio::io::AsyncWrite
+            + tonic::transport::server::Connected
+            + Unpin
+            + Send
+            + 'static,
+    {
         let ads = ScriptedAds::new(script);
         let log = ads.log();
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let incoming = TcpIncoming(listener);
 
         let join = tokio::spawn(async move {
             let serve = tonic::transport::Server::builder()
@@ -318,20 +390,73 @@ impl Harness {
             }
         });
 
-        Ok(Self {
+        Self {
             addr,
             log,
             shutdown: Some(shutdown_tx),
             join,
-        })
+            acceptor,
+            tls_handshake_failures,
+        }
+    }
+
+    /// TLS handshakes this harness refused so far; always 0 for
+    /// [`Harness::spawn`].
+    pub fn tls_handshake_failures(&self) -> usize {
+        self.tls_handshake_failures.load(Ordering::SeqCst)
     }
 
     /// Signals the server to stop accepting/serving and waits for it to
     /// finish.
     pub async fn shutdown(mut self) {
+        if let Some(acceptor) = self.acceptor.take() {
+            acceptor.abort();
+        }
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
         let _ = self.join.await;
+    }
+}
+
+/// A server-side TLS connection tonic can serve.
+///
+/// Rust note: tonic's own `Connected` impl for TLS streams sits behind its
+/// `tls` feature, which this workspace does not enable, so a newtype supplies
+/// one. `Pin::new` is enough to delegate the I/O traits because the inner
+/// stream is `Unpin`.
+struct TlsConn(tokio_rustls::server::TlsStream<TcpStream>);
+
+impl tonic::transport::server::Connected for TlsConn {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+impl tokio::io::AsyncRead for TlsConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for TlsConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }

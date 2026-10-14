@@ -104,7 +104,21 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
 
     // Lowered before `static_resources` so the ADS
     // cluster-existence check below can run against the finished cluster map.
-    let ads_pending = convert_dynamic_resources(b, "dynamic_resources")?;
+    let mut ads_pending = convert_dynamic_resources(b, "dynamic_resources")?;
+    let allow_plaintext = convert_ads_metadata(b.node.as_ref(), "node")?;
+    match ads_pending.as_mut() {
+        Some(ads) if ads.cluster.is_some() => {
+            ads.allow_plaintext = allow_plaintext.unwrap_or(false);
+        }
+        _ if allow_plaintext.is_some() => {
+            return Err(invalid(
+                format!("node.metadata[\"{ADS_METADATA_KEY}\"]"),
+                "only applies to an ADS gRPC channel, but no \
+                 dynamic_resources.ads_config.grpc_services is configured",
+            ));
+        }
+        _ => {}
+    }
 
     let Some(sr) = &b.static_resources else {
         // An ADS config naming a cluster is only legal with static resources
@@ -180,9 +194,107 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             }
         }
     }
+    if let Some(ads) = &ads_pending {
+        if let Some(cluster) = &ads.cluster {
+            check_ads_transport(sr, &snapshot, cluster, ads.allow_plaintext)?;
+        }
+    }
     validate_ext_authz_clusters(&mut snapshot)?;
     snapshot.ads = ads_pending;
     Ok(snapshot)
+}
+
+/// Namespace key for ADS transport options in `Bootstrap.node.metadata`.
+/// Envoy has no field for "allow a plaintext control plane", so the opt-in
+/// rides the same `node.metadata` carrier as `io.llmproxy.tracing`, which
+/// Envoy itself ignores.
+const ADS_METADATA_KEY: &str = "io.llmproxy.ads";
+
+/// Lower `node.metadata["io.llmproxy.ads"]`: `{ allow_plaintext: bool }`.
+/// `None` when the key is absent, so the caller can reject the key on a
+/// bootstrap without ADS instead of ignoring it (AGENTS.md invariant 1).
+fn convert_ads_metadata(
+    node: Option<&core_v3::Node>,
+    path: &str,
+) -> Result<Option<bool>, ConfigError> {
+    let Some(value) = node
+        .and_then(|n| n.metadata.as_ref())
+        .and_then(|m| m.fields.get(ADS_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let ads_path = format!("{path}.metadata[\"{ADS_METADATA_KEY}\"]");
+    let Some(prost_types::value::Kind::StructValue(ads)) = &value.kind else {
+        return Err(invalid(&ads_path, "must be an object"));
+    };
+    // Rust note: `Struct::fields` is a `HashMap`; sort so the reported key
+    // is deterministic.
+    let mut unknown: Vec<&String> = ads
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "allow_plaintext")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{ads_path}.{key}"),
+            format!("`{ADS_METADATA_KEY}` only supports `allow_plaintext`"),
+        ));
+    }
+    match ads
+        .fields
+        .get("allow_plaintext")
+        .and_then(|v| v.kind.as_ref())
+    {
+        None => Ok(Some(false)),
+        Some(prost_types::value::Kind::BoolValue(allow)) => Ok(Some(*allow)),
+        Some(_) => Err(invalid(
+            format!("{ads_path}.allow_plaintext"),
+            "must be a boolean",
+        )),
+    }
+}
+
+/// The ADS channel delivers provider credentials (cluster headers), so it
+/// must be encrypted unless every endpoint is on loopback or the operator
+/// opted in with `io.llmproxy.ads.allow_plaintext`. Envoy dials a plaintext
+/// control plane anywhere; this is `envoy-divergences.md` row 32.
+fn check_ads_transport(
+    sr: &proxy_api::envoy::config::bootstrap::v3::bootstrap::StaticResources,
+    snapshot: &ConfigSnapshot,
+    cluster: &str,
+    allow_plaintext: bool,
+) -> Result<(), ConfigError> {
+    let Some(ir) = snapshot.clusters.get(cluster) else {
+        return Ok(());
+    };
+    if ir.transport_socket.is_some() || allow_plaintext {
+        return Ok(());
+    }
+    let remote = ir
+        .endpoints
+        .iter()
+        .find(|e| !crate::ir::is_loopback_host(&e.host));
+    if !ir.endpoints.is_empty() && remote.is_none() {
+        return Ok(());
+    }
+    let index = sr
+        .clusters
+        .iter()
+        .position(|c| c.name == cluster)
+        .unwrap_or_default();
+    let target = remote.map_or_else(
+        || "a cluster with no static endpoints".to_string(),
+        |e| format!("`{}:{}`", e.host, e.port),
+    );
+    Err(invalid(
+        format!("static_resources.clusters[{index}].transport_socket"),
+        format!(
+            "ADS cluster `{cluster}` dials {target} in plaintext, and the ADS channel carries \
+             provider credentials; configure an UpstreamTlsContext transport_socket, use a \
+             loopback address, or set node.metadata[\"{ADS_METADATA_KEY}\"].allow_plaintext: true"
+        ),
+    ))
 }
 
 // --------------------------------------------------- single xDS resource lowering --
@@ -3204,6 +3316,7 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
             node: NodeIdentity::default(),
             lds_source,
             cds_source,
+            allow_plaintext: false,
         }));
     };
     let api_path = format!("{path}.ads_config");
@@ -3233,6 +3346,7 @@ fn convert_dynamic_resources(b: &Bootstrap, path: &str) -> Result<Option<AdsConf
             node: NodeIdentity::default(),
             lds_source: lds_source.map(|source| source.transport),
             cds_source: cds_source.map(|source| source.transport),
+            allow_plaintext: false,
         }));
     }
 
@@ -3534,6 +3648,7 @@ fn convert_api_config_source(
         },
         lds_source: selection.lds_source,
         cds_source: selection.cds_source,
+        allow_plaintext: false,
     }))
 }
 

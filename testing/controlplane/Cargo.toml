@@ -18,7 +18,10 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 proxy-api = { workspace = true }
 prost-types = { workspace = true }
+# `Harness::spawn_tls`: a TLS-terminating control plane.
+rustls = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tonic = { workspace = true }
 
 [lints]
