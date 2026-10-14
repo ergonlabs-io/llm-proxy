@@ -79,9 +79,33 @@
     "pricing": {
       "description": "Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime: it is stored (and reaches every replica sharing the store within one policy poll) when the store is `persistent` or `shared`, and is lost on restart otherwise. A card whose `effective_from` is in the future is refused.",
       "$ref": "#/$defs/Pricing"
+    },
+    "auto": {
+      "description": "Resolution of the reserved model name `auto`. A request whose `model` is `auto` is routed as the model this block selects: the tenant's entry in `tenants`, otherwise `default`. With no matching entry and no `default`, the request is refused with 400. Any other model name is routed unchanged. The provider's response is passed through unchanged, so its `model` field names the model the provider served, not `auto`. Access logs and usage records show both `auto` and the resolved model. While this block is set, `auto` is reserved: a `models` key or `routes[].model` of exactly `auto` is a load error. Absent means `auto` is an ordinary model name.",
+      "$ref": "#/$defs/AutoModel",
+      "examples": [{ "default": "gpt-4o-mini", "tenants": { "acme": "claude-sonnet" } }]
     }
   },
   "$defs": {
+    "AutoModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "default": {
+          "description": "The model for a tenant with no entry in `tenants`, and for a request with no authenticated tenant. Must be a concrete model name (no `*`, not `auto`) that a `routes` rule or `models` entry serves. Absent means such a request is refused with 400.",
+          "type": "string",
+          "minLength": 1,
+          "examples": ["gpt-4o-mini"]
+        },
+        "tenants": {
+          "description": "Tenant -> model. A tenant is the `tenant` an `auth.keys` entry (or a minted key) authenticates as. Requires an `auth` block. Each model must be a concrete model name that a `routes` rule or `models` entry serves.",
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "examples": [{ "acme": "claude-sonnet", "globex": "gpt-4o" }]
+        }
+      }
+    },
     "HostPort": {
       "type": "string",
       "description": "A bind address in `host:port` form. IPv6 hosts use brackets: `[::1]:8080`.",

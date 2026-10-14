@@ -344,7 +344,107 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
     if let Some(admin) = &config.admin {
         parse_host_port(admin, "admin")?;
     }
+    validate_auto(config)?;
     Ok(())
+}
+
+/// The reserved model name `auto:` resolves.
+const AUTO_MODEL: &str = "auto";
+
+/// `auto:` checks. Every target must be a concrete model a route or `models`
+/// entry serves, so a resolved request never falls through to a 404. While
+/// `auto:` is set, `auto` itself is reserved: a route or model named exactly
+/// `auto` could never be reached.
+fn validate_auto(config: &SimpleConfig) -> Result<(), ConfigError> {
+    let Some(auto) = &config.auto else {
+        return Ok(());
+    };
+    let invalid =
+        |field_path: String, reason: String| ConfigError::InvalidValue { field_path, reason };
+
+    if auto.default.is_none() && auto.tenants.is_empty() {
+        return Err(invalid(
+            "auto".to_string(),
+            "set `default`, `tenants`, or both; an empty block would refuse every `auto` request"
+                .to_string(),
+        ));
+    }
+    if !auto.tenants.is_empty() && config.auth.is_none() {
+        return Err(invalid(
+            "auto.tenants".to_string(),
+            "requires an `auth` block: without authentication no request has a tenant, so \
+             these rules would never apply"
+                .to_string(),
+        ));
+    }
+    if config.models.contains_key(AUTO_MODEL) {
+        return Err(invalid(
+            format!("models.{AUTO_MODEL}"),
+            "`auto` is reserved while the `auto` block is set".to_string(),
+        ));
+    }
+    if let Some(i) = config.routes.iter().position(|r| r.model == AUTO_MODEL) {
+        return Err(invalid(
+            format!("routes[{i}].model"),
+            "`auto` is reserved while the `auto` block is set".to_string(),
+        ));
+    }
+
+    if auto.tenants.contains_key("") {
+        return Err(invalid(
+            "auto.tenants".to_string(),
+            "a tenant must not be empty".to_string(),
+        ));
+    }
+
+    let targets = auto
+        .default
+        .iter()
+        .map(|model| ("auto.default".to_string(), model))
+        .chain(
+            auto.tenants
+                .iter()
+                .map(|(tenant, model)| (format!("auto.tenants.{tenant}"), model)),
+        );
+    for (path, model) in targets {
+        if model.is_empty() || model == AUTO_MODEL || model.contains('*') {
+            return Err(invalid(
+                path,
+                "must be a concrete model name, not empty, `auto`, or a pattern".to_string(),
+            ));
+        }
+        let served = config.models.keys().any(|key| glob_matches(key, model))
+            || config.routes.iter().any(|r| glob_matches(&r.model, model));
+        if !served {
+            return Err(invalid(
+                path,
+                format!("no route or `models` entry serves `{model}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Matches `name` against a `routes[].model` or `models` key glob: `*`
+/// matches any run of characters, the same grammar `lower::model_glob_matcher`
+/// emits as a header matcher.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, middle)) = parts.split_last() else {
+        return rest.is_empty();
+    };
+    for part in middle {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
 }
 
 fn validate_provider_specific_fields(

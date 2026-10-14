@@ -144,6 +144,9 @@ pub enum FormatOp {
     LlmCredentialSource,
     LlmUserId,
     LlmRequestedModel,
+    /// `%LLM_RESOLVED_MODEL%` -- the model a resolver chose when the
+    /// requested model was `auto`. `-` when nothing was resolved.
+    LlmResolvedModel,
     LlmSelectedModel,
     /// `%LLM_SERVED_MODEL%` -- the model the provider's response says it
     /// served, which can differ from the selected model (dated snapshots,
@@ -435,6 +438,10 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmRequestedModel
         }
+        "LLM_RESOLVED_MODEL" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmResolvedModel
+        }
         "LLM_SELECTED_MODEL" => {
             bare(name, args, truncate, input)?;
             FormatOp::LlmSelectedModel
@@ -537,6 +544,7 @@ pub struct LogContext<'a> {
     pub llm_credential_source: Option<&'a str>,
     pub llm_user_id: Option<&'a str>,
     pub llm_requested_model: Option<&'a str>,
+    pub llm_resolved_model: Option<&'a str>,
     pub llm_selected_model: Option<&'a str>,
     /// The model the provider reported serving; `None` when the response named none.
     pub llm_served_model: Option<&'a str>,
@@ -708,6 +716,7 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         }
         FormatOp::LlmUserId => out.push_str(ctx.llm_user_id.unwrap_or("-")),
         FormatOp::LlmRequestedModel => out.push_str(ctx.llm_requested_model.unwrap_or("-")),
+        FormatOp::LlmResolvedModel => out.push_str(ctx.llm_resolved_model.unwrap_or("-")),
         FormatOp::LlmSelectedModel => out.push_str(ctx.llm_selected_model.unwrap_or("-")),
         FormatOp::LlmServedModel => out.push_str(ctx.llm_served_model.unwrap_or("-")),
         FormatOp::LlmRateCardVersion => out.push_str(ctx.llm_rate_card_version.unwrap_or("-")),
@@ -1012,6 +1021,7 @@ mod tests {
             llm_credential_source: None,
             llm_user_id: None,
             llm_requested_model: None,
+            llm_resolved_model: None,
             llm_selected_model: None,
             llm_served_model: None,
             llm_rate_card_version: None,
@@ -1039,6 +1049,21 @@ mod tests {
             "stable-key tenant-a - alias provider-model card-v2"
         );
         assert!(parse_format("%LLM_KEY_ID(secret)%").is_err());
+    }
+
+    #[test]
+    fn renders_the_resolved_model_and_dash_when_nothing_was_resolved() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%LLM_REQUESTED_MODEL% %LLM_RESOLVED_MODEL% %LLM_SELECTED_MODEL%");
+        c.llm_requested_model = Some("gpt-4o");
+        c.llm_selected_model = Some("gpt-4o");
+        assert_eq!(render(&fs, &c), "gpt-4o - gpt-4o");
+        c.llm_requested_model = Some("auto");
+        c.llm_resolved_model = Some("fast");
+        c.llm_selected_model = Some("provider-fast-v2");
+        assert_eq!(render(&fs, &c), "auto fast provider-fast-v2");
+        assert!(parse_format("%LLM_RESOLVED_MODEL(x)%").is_err());
     }
 
     #[test]

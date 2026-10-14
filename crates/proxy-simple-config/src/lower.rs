@@ -121,6 +121,15 @@ const BODY_REWRITE_FILTER_NAME: &str = "llmproxy.body_rewrite";
 /// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
 /// `dialect.rs`'s `body_rewrite_filter_type_url_matches_the_filter` pins it.
 const BODY_REWRITE_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
+
+/// The model resolver's name in `http_filters`, emitted only when `auto:` is
+/// set. Placed after `llmproxy.body_rewrite`, whose extracted model it reads.
+const MODEL_RESOLVER_FILTER_NAME: &str = "llmproxy.model_resolver";
+
+/// Must equal `proxy_filters::model_resolver_filter::TYPE_URL`. Duplicated for
+/// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
+/// `tests/auto_model.rs` pins it.
+const MODEL_RESOLVER_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelResolver";
 /// The token-limit filter's name in `http_filters`, emitted only when a
 /// `limits` entry actually lowers (see [`lower_limits`]). No per-route
 /// override exists for this filter (its module doc: "no per-route config in
@@ -180,7 +189,8 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "llm_tpot_ms=\"%LLM_TPOT%\" llm_max_stall_ms=\"%LLM_MAX_STALL%\" ",
     "llm_response_chunks=\"%LLM_RESPONSE_CHUNKS%\" ",
     "key_id=\"%LLM_KEY_ID%\" tenant=\"%LLM_TENANT%\" user_id=\"%LLM_USER_ID%\" ",
-    "requested_model=\"%LLM_REQUESTED_MODEL%\" selected_provider=\"%UPSTREAM_CLUSTER%\" ",
+    "requested_model=\"%LLM_REQUESTED_MODEL%\" resolved_model=\"%LLM_RESOLVED_MODEL%\" ",
+    "selected_provider=\"%UPSTREAM_CLUSTER%\" ",
     "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
     "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\" ",
     "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\" ",
@@ -1348,6 +1358,21 @@ fn body_rewrite_typed_config(enabled: bool, dialect: &str) -> Value {
     })
 }
 
+/// `auto:` -> `llmproxy.filters.v0.ModelResolver` in-process rules.
+fn model_resolver_typed_config(auto: &crate::model::AutoModel) -> Value {
+    let mut rules = json!({
+        "tenants": auto
+            .tenants
+            .iter()
+            .map(|(tenant, model)| json!({ "tenant": tenant, "model": model }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(default) = &auto.default {
+        rules["default_model"] = json!(default);
+    }
+    json!({ "@type": MODEL_RESOLVER_FILTER_TYPE_URL, "rules": rules })
+}
+
 // -------------------------------------------------------------------- routes --
 
 /// Model glob -> Envoy header matcher on [`MODEL_HEADER`]. `*` alone means
@@ -2369,6 +2394,7 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_tenant": "%LLM_TENANT%",
                 "llm_user_id": "%LLM_USER_ID%",
                 "llm_requested_model": "%LLM_REQUESTED_MODEL%",
+                "llm_resolved_model": "%LLM_RESOLVED_MODEL%",
                 "llm_selected_model": "%LLM_SELECTED_MODEL%",
                 "llm_rate_card_version": "%LLM_RATE_CARD_VERSION%",
                 "selected_provider": "%UPSTREAM_CLUSTER%",
@@ -2568,9 +2594,19 @@ fn lower_listener(
             "typed_config": body_rewrite_typed_config(force_usage_reporting(config), default_dialect),
         }));
     }
+    if let Some(auto) = &config.auto {
+        // After `llmproxy.auth` and `llmproxy.body_rewrite` (it reads the
+        // tenant and the extracted model); `check_lane_h_filter_order`
+        // rejects any other order.
+        http_filters.push(json!({
+            "name": MODEL_RESOLVER_FILTER_NAME,
+            "typed_config": model_resolver_typed_config(auto),
+        }));
+    }
     if enforces_model_policy(config) {
-        // After auth (reads `StreamInfo::auth.tenant`) and body_rewrite (reads
-        // the requested model it publishes); decode runs in config order.
+        // After auth (reads `StreamInfo::auth.tenant`), body_rewrite (publishes
+        // the requested model) and the resolver when present (publishes the
+        // routing model it authorizes); decode runs in config order.
         // `policies` stays empty: live policy comes from the admin store, and
         // a tenant with no stored policy stays open.
         http_filters.push(json!({

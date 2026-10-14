@@ -553,6 +553,11 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "llmproxy.filters.v0.Usage" => &["dialect", "pricing_json"],
         // Owned body-rewrite configuration.
         "llmproxy.filters.v0.BodyRewrite" => &["enabled", "dialect"],
+        // Model resolution. Listed so a future resolver branch is a strict-mode
+        // error until a reader is deliberately added.
+        "llmproxy.filters.v0.ModelResolver" => &["rules"],
+        "llmproxy.filters.v0.StaticModelRules" => &["default_model", "tenants"],
+        "llmproxy.filters.v0.TenantModelRule" => &["tenant", "model"],
         // One-release compatibility for the old borrowed body-rewrite type.
         "envoy.config.core.v3.RuntimeFeatureFlag" => &["default_value", "runtime_key"],
         // The Redis-backed shared store. `url` is an
@@ -2222,6 +2227,7 @@ pub const BODY_REWRITE_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v
 pub const LEGACY_BODY_REWRITE_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
+pub const MODEL_RESOLVER_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelResolver";
 pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
 
 /// Rejects llmproxy filter chains whose order silently disables a filter.
@@ -2294,6 +2300,18 @@ pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0
 ///   configured ceiling can never be reached no matter how much a tenant
 ///   actually spends.
 ///
+/// # `llmproxy.model_resolver` sits between extraction and authorization
+///
+/// The resolver reads the tenant `llmproxy.auth` writes and the model
+/// `llmproxy.body_rewrite` publishes, and `llmproxy.model_authz` must check
+/// the model it resolved. All three are decode-side, so `llmproxy.auth` and
+/// `llmproxy.body_rewrite` come BEFORE the resolver, and the resolver comes
+/// BEFORE `llmproxy.model_authz`. Reversed, the resolver would see no tenant
+/// and give every tenant the default, or see no model and never resolve, or
+/// the authz filter would refuse `auto` as an ungranted model name. The
+/// resolver without `llmproxy.body_rewrite` anywhere in the chain is also an
+/// error: it would never see a model, and `auto` would reach the provider.
+///
 /// Both rules are stated at their own call sites too
 /// (`token_limit_filter`'s, `model_authz_filter`'s, and
 /// `spend_limit_filter`'s module docs); this function is the enforcement.
@@ -2362,6 +2380,33 @@ fn check_lane_h_filter_order(
         (
             AUTH_FILTER_TYPE,
             "llmproxy.auth",
+            MODEL_RESOLVER_FILTER_TYPE,
+            "llmproxy.model_resolver",
+            "the model resolver picks a model from the tenant the auth filter resolves, \
+             and decode callbacks run in config order; with this order reversed every \
+             tenant would silently get the default model",
+        ),
+        (
+            BODY_REWRITE_FILTER_TYPE,
+            "llmproxy.body_rewrite",
+            MODEL_RESOLVER_FILTER_TYPE,
+            "llmproxy.model_resolver",
+            "the model resolver reads the requested model body_rewrite publishes onto \
+             StreamInfo::requested_model, and decode callbacks run in config order; with \
+             this order reversed `auto` would never be resolved and would reach the provider",
+        ),
+        (
+            MODEL_RESOLVER_FILTER_TYPE,
+            "llmproxy.model_resolver",
+            MODEL_AUTHZ_FILTER_TYPE,
+            "llmproxy.model_authz",
+            "the model-authz filter must check the model the resolver chose, and decode \
+             callbacks run in config order; with this order reversed the authz filter \
+             would check the literal name `auto` instead",
+        ),
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
             SPEND_LIMIT_FILTER_TYPE,
             "llmproxy.spend_limit",
             "the spend limiter buckets on the tenant the auth filter resolves, and decode \
@@ -2380,6 +2425,17 @@ fn check_lane_h_filter_order(
              priced as free and a configured ceiling could never be reached",
         ),
     ];
+
+    if let Some(resolver) = indices_of(&[MODEL_RESOLVER_FILTER_TYPE]).first() {
+        if indices_of(&[BODY_REWRITE_FILTER_TYPE, LEGACY_BODY_REWRITE_FILTER_TYPE]).is_empty() {
+            return Err(invalid(
+                format!("{path}.http_filters[{resolver}]"),
+                "`llmproxy.model_resolver` requires `llmproxy.body_rewrite` earlier in the \
+                 same chain: the resolver reads the model body_rewrite extracts, and without \
+                 it `auto` would never be resolved and would reach the provider",
+            ));
+        }
+    }
 
     for (first_type, first_name, second_type, second_name, reason) in rules {
         // A rule only applies when BOTH filters are present -- either one

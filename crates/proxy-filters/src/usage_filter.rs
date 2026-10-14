@@ -1435,7 +1435,7 @@ impl UsageFilterInstance {
             let sent_model = stream_info
                 .selected_model
                 .as_deref()
-                .or(stream_info.requested_model.as_deref())?;
+                .or(stream_info.routing_model())?;
             // Price what the provider says it served when the card lists it;
             // otherwise the sent model (dated snapshots have no card entry).
             let (model, repriced) =

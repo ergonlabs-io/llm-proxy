@@ -59,7 +59,8 @@ llm_tokens="%LLM_INPUT_TOKENS%/%LLM_CACHED_TOKENS%/%LLM_CACHE_CREATION_TOKENS%/%
 llm_ttft_ms="%LLM_TTFT%" llm_tpot_ms="%LLM_TPOT%" llm_max_stall_ms="%LLM_MAX_STALL%"
 llm_response_chunks="%LLM_RESPONSE_CHUNKS%"
 key_id="%LLM_KEY_ID%" tenant="%LLM_TENANT%" user_id="%LLM_USER_ID%"
-requested_model="%LLM_REQUESTED_MODEL%" selected_provider="%UPSTREAM_CLUSTER%"
+requested_model="%LLM_REQUESTED_MODEL%" resolved_model="%LLM_RESOLVED_MODEL%"
+selected_provider="%UPSTREAM_CLUSTER%"
 selected_model="%LLM_SELECTED_MODEL%" rate_card_version="%LLM_RATE_CARD_VERSION%"
 llm_list_cost_nanodollars="%LLM_LIST_COST%"
 llm_credential_source="%LLM_CREDENTIAL_SOURCE%" llm_served_model="%LLM_SERVED_MODEL%"
@@ -107,14 +108,14 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `llm_input_tokens`, `llm_cached_tokens`, `llm_cache_creation_tokens`, `llm_output_tokens`, `llm_total_tokens` | The matching `%LLM_*_TOKENS%` operators |
 | `llm_ttft_ms`, `llm_tpot_ms`, `llm_max_stall_ms`, `llm_response_chunks` | `%LLM_TTFT%`, `%LLM_TPOT%`, `%LLM_MAX_STALL%`, `%LLM_RESPONSE_CHUNKS%` |
 | `llm_key_id`, `llm_tenant`, `llm_user_id` | `%LLM_KEY_ID%`, `%LLM_TENANT%`, `%LLM_USER_ID%` |
-| `llm_requested_model`, `llm_selected_model` | `%LLM_REQUESTED_MODEL%`, `%LLM_SELECTED_MODEL%` |
+| `llm_requested_model`, `llm_resolved_model`, `llm_selected_model` | `%LLM_REQUESTED_MODEL%`, `%LLM_RESOLVED_MODEL%`, `%LLM_SELECTED_MODEL%` |
 | `llm_rate_card_version` | `%LLM_RATE_CARD_VERSION%` |
 | `llm_list_cost_nanodollars` | `%LLM_LIST_COST%` |
 | `llm_credential_source` | `%LLM_CREDENTIAL_SOURCE%` (`platform` or `tenant`) |
 | `llm_served_model` | `%LLM_SERVED_MODEL%`: the `model` the provider's response says it served, which can be a dated snapshot of the selected model or a different model. The cost is computed at this model when the rate card lists it for the provider; otherwise at the selected model. `-` when the response named none. |
 
 The text format uses the same names without the `llm_` prefix for `key_id`,
-`tenant`, `user_id`, `requested_model`, `selected_model`, and
+`tenant`, `user_id`, `requested_model`, `resolved_model`, `selected_model`, and
 `rate_card_version`. The names `selected_provider`,
 `llm_list_cost_nanodollars`, `llm_credential_source`, and `llm_served_model` are the same in both formats.
 
@@ -163,6 +164,7 @@ is a load error, never silently dropped or emitted as literal text.
 | `%LLM_KEY_ID%` | The `key_id` of the credential the auth filter resolved. This is the key's configured identifier, not the key itself. `-` when the request is not authenticated. |
 | `%LLM_USER_ID%` | Always `-` in this release. The proxy does not yet publish an authenticated user, so there is no value to render. |
 | `%LLM_REQUESTED_MODEL%` | The `model` value the body-rewrite filter read from the request body, before any provider model mapping. `-` when no filter set it. |
+| `%LLM_RESOLVED_MODEL%` | The model a resolver chose when the requested model was `auto` (see [The auto model](../../providers-and-routing/auto-model/)). `-` when nothing was resolved. Takes no argument. `%LLM_REQUESTED_MODEL%` stays `auto`. |
 | `%LLM_SELECTED_MODEL%` | The model name sent to the provider that served the response, after any provider model mapping. If no mapping matches, it is the requested model. `-` when there is no requested model. |
 | `%LLM_RATE_CARD_VERSION%` | The version of the rate card used for `%LLM_LIST_COST%`. `-` when no list cost was computed. |
 

@@ -810,7 +810,7 @@ impl SpendLimitFilterInstance {
             (
                 info.llm.usage,
                 info.upstream_cluster.clone(),
-                info.requested_model.clone(),
+                info.routing_model().map(str::to_owned),
                 info.selected_model.clone(),
                 info.llm.served_model.clone(),
                 info.credential_source,

@@ -1,0 +1,46 @@
+// Model resolution for the llm-proxy data plane.
+//
+// Vendored for its own sake, same reasoning as `model_authz.proto`: a
+// per-tenant rule list is a repeated structured record that no compiled Envoy
+// message shapes.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures the model resolver filter (`llmproxy.model_resolver`).
+//
+// When a request's body names the reserved model `auto`, the filter replaces
+// it with a configured model alias before authorization and routing. A request
+// that names any other model passes through untouched. The resolved alias is
+// still authorized by `llmproxy.model_authz`: a resolver never widens a
+// tenant's grants.
+message ModelResolver {
+  // Required (exactly one branch must be set). A oneof so an external
+  // resolver can be added as another branch.
+  oneof resolver {
+    // In-process rules, evaluated with no I/O.
+    StaticModelRules rules = 1;
+  }
+}
+
+// Resolves `auto` from the authenticated tenant.
+message StaticModelRules {
+  // The alias for a tenant with no entry in `tenants`, and for a request with
+  // no authenticated tenant. Empty means no default: such a request is
+  // refused with 400 rather than routed to a guessed model.
+  string default_model = 1;
+
+  // Per-tenant aliases. Each `tenant` must be unique.
+  repeated TenantModelRule tenants = 2;
+}
+
+// One tenant's `auto` alias.
+message TenantModelRule {
+  // Required. Matches `StreamInfo::auth.tenant` as written by `llmproxy.auth`.
+  string tenant = 1;
+
+  // Required. A model alias the route table matches, e.g. `fast`. Must not be
+  // `auto` and must not contain `*`.
+  string model = 2;
+}

@@ -68,6 +68,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "llmproxy/filters/v0/body_rewrite.proto",
         // Per-tenant model allow-lists.
         "llmproxy/filters/v0/model_authz.proto",
+        // Per-tenant resolution of the reserved `auto` model.
+        "llmproxy/filters/v0/model_resolver.proto",
         // The spend-budget filter's (cluster, model)
         // price table.
         "llmproxy/filters/v0/spend.proto",

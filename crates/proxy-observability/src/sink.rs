@@ -1172,6 +1172,7 @@ mod tests {
             llm_credential_source: None,
             llm_user_id: None,
             llm_requested_model: None,
+            llm_resolved_model: None,
             llm_selected_model: None,
             llm_served_model: None,
             llm_rate_card_version: None,

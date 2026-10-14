@@ -271,6 +271,13 @@ pub struct StreamInfo {
     /// reporting for this request's dialect; read by the router, which
     /// enforces it against the whole buffered body.
     pub force_include_usage: bool,
+    /// The model alias a resolver chose for a request whose `requested_model`
+    /// is a resolver trigger such as `auto`, published by
+    /// `proxy_filters::model_resolver_filter`. `None` when no resolver ran or
+    /// the request named a concrete model. Routing, authorization, and
+    /// pricing use [`StreamInfo::routing_model`]; `requested_model` keeps what
+    /// the client sent, so usage records show both.
+    pub resolved_model: Option<String>,
     /// Provider-owned model selected for the current upstream attempt.
     pub selected_model: Option<String>,
     pub attempts: Vec<Rc<RefCell<AttemptInfo>>>,
@@ -328,6 +335,7 @@ impl Default for StreamInfo {
             credential_source: None,
             requested_model: None,
             force_include_usage: false,
+            resolved_model: None,
             selected_model: None,
             attempts: Vec::new(),
             metadata_enabled: false,
@@ -345,6 +353,14 @@ impl Default for StreamInfo {
 }
 
 impl StreamInfo {
+    /// The model this request is routed, authorized, and priced as: the
+    /// resolver's choice when one ran, otherwise the client's own model.
+    pub fn routing_model(&self) -> Option<&str> {
+        self.resolved_model
+            .as_deref()
+            .or(self.requested_model.as_deref())
+    }
+
     pub fn begin_attempt(
         &mut self,
         cluster: &str,

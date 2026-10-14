@@ -95,6 +95,59 @@ pub struct SimpleConfig {
     /// replacing it requires a config reload.
     #[serde(default)]
     pub pricing: Option<Pricing>,
+    /// Resolution of the reserved model name `auto`. Absent means `auto` is
+    /// an ordinary model name.
+    #[serde(default)]
+    pub auto: Option<AutoModel>,
+}
+
+/// `auto`: which model a request for `auto` gets. Lowers to the
+/// `llmproxy.model_resolver` filter's in-process rules.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoModel {
+    /// The model for a tenant with no entry in `tenants`, and for a request
+    /// with no authenticated tenant. Absent means such a request is refused.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Tenant -> model. `deserialize_with` rejects a duplicate tenant rather
+    /// than keeping the last one.
+    #[serde(default, deserialize_with = "deserialize_auto_tenants")]
+    pub tenants: BTreeMap<String, String>,
+}
+
+/// Deserializes `auto.tenants`, erroring on a literal duplicate tenant, for
+/// the same reason as [`deserialize_model_catalog`].
+fn deserialize_auto_tenants<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AutoTenantsVisitor;
+
+    impl<'de> Visitor<'de> for AutoTenantsVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of tenant -> model")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if out.insert(key.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate `auto.tenants` entry `{key}`"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(AutoTenantsVisitor)
 }
 
 /// Deserializes `models:` into a `BTreeMap`, erroring on a literal duplicate

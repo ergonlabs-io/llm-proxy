@@ -22,8 +22,9 @@ use proxy_config::lower::{
     AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
     LEGACY_BODY_REWRITE_FILTER_TYPE as LEGACY_BODY_REWRITE,
     LEGACY_TOKEN_LIMIT_FILTER_TYPE as LEGACY_TOKEN_LIMIT, LEGACY_USAGE_FILTER_TYPE as LEGACY_USAGE,
-    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT,
-    TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
+    MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, MODEL_RESOLVER_FILTER_TYPE as MODEL_RESOLVER,
+    SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT,
+    USAGE_FILTER_TYPE as USAGE,
 };
 
 /// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
@@ -96,6 +97,13 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          stop firing"
     );
     assert_eq!(
+        MODEL_RESOLVER,
+        proxy_filters::model_resolver_filter::TYPE_URL,
+        "the model_resolver filter's type URL changed; update `MODEL_RESOLVER_FILTER_TYPE` \
+         in proxy-config/src/lower.rs or every model_resolver ordering rule silently \
+         stops firing"
+    );
+    assert_eq!(
         SPEND_LIMIT,
         proxy_filters::spend_limit_filter::TYPE_URL,
         "the spend_limit filter's type URL changed; update `SPEND_LIMIT_FILTER_TYPE` in \
@@ -118,6 +126,7 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         BODY_REWRITE => "\n                      enabled: true\n                      dialect: openai",
         LEGACY_BODY_REWRITE => "\n                      default_value: true\n                      runtime_key: openai",
         MODEL_AUTHZ => "\n                      policies: []",
+        MODEL_RESOLVER => "\n                      rules: { default_model: fast }",
         SPEND_LIMIT => "\n                      pricing: []",
         other => panic!("unexpected type url {other}"),
     };
@@ -526,4 +535,102 @@ fn a_chain_satisfying_one_rule_is_still_rejected_for_violating_the_other() {
         reason.contains("llmproxy.auth"),
         "the auth rule must still fire: {reason}"
     );
+}
+
+// --- model_resolver: after auth and body_rewrite, before model_authz -------
+
+#[test]
+fn model_resolver_between_extraction_and_authz_is_accepted() {
+    chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+        ("llmproxy.model_resolver", MODEL_RESOLVER),
+        ("llmproxy.model_authz", MODEL_AUTHZ),
+    ])
+    .expect("auth, body_rewrite, model_resolver, model_authz is the correct order");
+}
+
+#[test]
+fn model_resolver_before_auth_is_rejected_because_every_tenant_would_get_the_default() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+        ("llmproxy.model_resolver", MODEL_RESOLVER),
+        ("llmproxy.auth", AUTH),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[2]"
+    );
+    assert!(
+        reason.contains("llmproxy.auth") && reason.contains("llmproxy.model_resolver"),
+        "the reason must name both filters: {reason}"
+    );
+    assert!(
+        reason.contains("default model"),
+        "the reason must say what actually goes wrong: {reason}"
+    );
+}
+
+#[test]
+fn model_resolver_before_body_rewrite_is_rejected_because_auto_would_reach_the_provider() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.model_resolver", MODEL_RESOLVER),
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("llmproxy.body_rewrite") && reason.contains("BEFORE"),
+        "the reason must name the filter and the required direction: {reason}"
+    );
+}
+
+#[test]
+fn model_authz_before_model_resolver_is_rejected_because_it_would_check_auto() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.body_rewrite", BODY_REWRITE),
+        ("llmproxy.model_authz", MODEL_AUTHZ),
+        ("llmproxy.model_resolver", MODEL_RESOLVER),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[2]"
+    );
+    assert!(
+        reason.contains("`auto`"),
+        "the reason must say what actually goes wrong: {reason}"
+    );
+}
+
+/// Without body_rewrite the resolver never sees a model, so no ordering rule
+/// fires; the chain must still be refused.
+#[test]
+fn model_resolver_without_body_rewrite_is_rejected() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.model_resolver", MODEL_RESOLVER),
+    ]));
+
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("requires `llmproxy.body_rewrite`"),
+        "unexpected reason: {reason}"
+    );
+}
+
+#[test]
+fn model_resolver_with_legacy_body_rewrite_is_accepted() {
+    chain(&[
+        ("llmproxy.body_rewrite", LEGACY_BODY_REWRITE),
+        ("llmproxy.model_resolver", MODEL_RESOLVER),
+    ])
+    .expect("the one-release legacy body_rewrite type satisfies the resolver");
 }

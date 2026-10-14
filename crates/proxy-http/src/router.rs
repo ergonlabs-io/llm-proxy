@@ -749,14 +749,14 @@ impl RouterHandler {
         };
         apply_request_transforms(fwd, matcher, request_headers_to_add, &mut attempt_head);
         apply_cluster_request_path_rewrite(attempt_entry.request_path_rewrite(), &mut attempt_head);
-        let requested_model = dcb.stream_info().requested_model.clone();
+        let routing_model = dcb.stream_info().routing_model().map(str::to_owned);
         dcb.stream_info().selected_model =
-            selected_provider_model(attempt_entry.provider_runtime(), requested_model.as_deref());
+            selected_provider_model(attempt_entry.provider_runtime(), routing_model.as_deref());
         apply_cluster_provider_path_template(
             attempt_entry
                 .provider_runtime()
                 .and_then(|runtime| runtime.path_template.as_ref()),
-            requested_model.as_deref(),
+            routing_model.as_deref(),
             &mut attempt_head,
         );
         let mut provider_credentials = ProviderCredentials::new(
@@ -1320,7 +1320,7 @@ impl RouterHandler {
                 // `FinishedSpan`'s own doc for why).
                 let (attempt_trace, attempt_started_system, attempt_info) = {
                     let mut info = dcb.stream_info();
-                    let requested_model = info.requested_model.clone();
+                    let routing_model = info.routing_model().map(str::to_owned);
                     info.upstream_cluster = Some(attempt_cluster.to_string());
                     info.upstream_host = Some(host.address.to_string());
                     info.protocol = Some(
@@ -1335,7 +1335,7 @@ impl RouterHandler {
                     // still belongs to this physical attempt's selected member.
                     info.selected_model = selected_provider_model(
                         attempt_entry.provider_runtime(),
-                        requested_model.as_deref(),
+                        routing_model.as_deref(),
                     );
                     let selected_model = info.selected_model.clone();
                     let attempt_info = info.begin_attempt(
@@ -1519,16 +1519,18 @@ impl RouterHandler {
                     attempt_entry.request_path_rewrite(),
                     &mut attempt_head,
                 );
-                let requested_model = dcb.stream_info().requested_model.clone();
-                dcb.stream_info().selected_model = selected_provider_model(
-                    attempt_entry.provider_runtime(),
-                    requested_model.as_deref(),
-                );
+                let (requested_model, resolved_model) = {
+                    let info = dcb.stream_info();
+                    (info.requested_model.clone(), info.resolved_model.clone())
+                };
+                let routing_model = resolved_model.as_deref().or(requested_model.as_deref());
+                dcb.stream_info().selected_model =
+                    selected_provider_model(attempt_entry.provider_runtime(), routing_model);
                 apply_cluster_provider_path_template(
                     attempt_entry
                         .provider_runtime()
                         .and_then(|runtime| runtime.path_template.as_ref()),
-                    requested_model.as_deref(),
+                    routing_model,
                     &mut attempt_head,
                 );
                 // Deny runs per attempt, after the member is chosen, because
@@ -1540,6 +1542,7 @@ impl RouterHandler {
                 let attempt_body_bytes = match prepare_attempt_body(
                     attempt_entry.provider_runtime(),
                     requested_model.as_deref(),
+                    resolved_model.as_deref(),
                     &body_bytes,
                 ) {
                     Ok(body) => body,
@@ -1982,7 +1985,7 @@ impl RouterHandler {
                                 info.upstream_usage_dialect = entry.usage_dialect();
                                 info.selected_model = selected_provider_model(
                                     entry.provider_runtime(),
-                                    info.requested_model.as_deref(),
+                                    info.routing_model(),
                                 );
                             }
                             info.selected_attempt = winning_attempt_info.clone();
@@ -2684,22 +2687,32 @@ fn scan_policy_keys(
 /// A policy-free cluster forwards the body untouched. With a policy, one key
 /// scan decides; the body is parsed into a `Value` and reserialized only when
 /// a key must be stripped or the model rewrite applies, and then once for both.
+///
+/// The body still names what the client sent (`requested_model`). The
+/// cluster's mapping is looked up by the routing model, which is the
+/// resolver's choice when one ran. A resolved model is written to the body
+/// even without a mapping: otherwise the provider would receive the trigger
+/// name (`auto`) rather than a model it serves.
 fn prepare_attempt_body(
     runtime: Option<&proxy_config::ir::ProviderRuntimeConfig>,
     requested_model: Option<&str>,
+    resolved_model: Option<&str>,
     body: &Bytes,
 ) -> Result<Bytes, BodyRefusal> {
     let policy = runtime
         .map(|runtime| &runtime.request_field_policy)
         .filter(|policy| !policy.is_empty());
     let upstream_model = requested_model.and_then(|requested| {
-        runtime.and_then(|runtime| {
-            runtime
-                .model_rewrites
-                .iter()
-                .find(|mapping| provider_model_pattern_matches(&mapping.pattern, requested))
-                .map(|mapping| mapping.upstream_model.as_str())
-        })
+        let routing_model = resolved_model.unwrap_or(requested);
+        runtime
+            .and_then(|runtime| {
+                runtime
+                    .model_rewrites
+                    .iter()
+                    .find(|mapping| provider_model_pattern_matches(&mapping.pattern, routing_model))
+                    .map(|mapping| mapping.upstream_model.as_str())
+            })
+            .or(resolved_model)
     });
 
     let mut must_strip = false;
@@ -3941,7 +3954,7 @@ mod tests {
             br#"{"model":"fast-alias","messages":[{"role":"user","content":"hi"}]}"#,
         );
 
-        let rewritten = prepare_attempt_body(Some(&runtime), Some("fast-alias"), &body)
+        let rewritten = prepare_attempt_body(Some(&runtime), Some("fast-alias"), None, &body)
             .unwrap_or_else(|_| panic!("selected provider model rewrite must succeed"));
 
         assert_eq!(
@@ -3968,6 +3981,7 @@ mod tests {
         let Err(BodyRefusal::Invalid(err)) = prepare_attempt_body(
             Some(&runtime),
             Some("fast-alias"),
+            None,
             &Bytes::from_static(br#"{"model":"client-spoofed"}"#),
         ) else {
             panic!("a rewrite cannot turn an unverified body into an upstream request");
@@ -4001,7 +4015,12 @@ mod tests {
         model: Option<&str>,
         body: &'static str,
     ) -> Result<Bytes, BodyRefusal> {
-        prepare_attempt_body(Some(runtime), model, &Bytes::from_static(body.as_bytes()))
+        prepare_attempt_body(
+            Some(runtime),
+            model,
+            None,
+            &Bytes::from_static(body.as_bytes()),
+        )
     }
 
     #[test]
@@ -4103,6 +4122,58 @@ mod tests {
             prepare(&runtime, Some("m"), r#"{"model":"m","route":"x"}"#),
             Err(BodyRefusal::FieldNotPermitted(_))
         ));
+    }
+
+    #[test]
+    fn resolved_model_reaches_an_unmapped_provider_instead_of_the_trigger() {
+        let body = Bytes::from_static(br#"{"model":"auto","stream":true}"#);
+
+        let rewritten = prepare_attempt_body(None, Some("auto"), Some("fast"), &body)
+            .unwrap_or_else(|_| panic!("a resolved model must be written to the body"));
+
+        let value = serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap();
+        assert_eq!(value["model"], "fast");
+        assert_eq!(value["stream"], true);
+    }
+
+    #[test]
+    fn resolved_model_is_mapped_through_the_cluster_rewrites() {
+        let runtime = runtime_with(
+            vec![
+                proxy_config::ir::ProviderModelRewrite {
+                    pattern: "auto".to_string(),
+                    upstream_model: "provider-wrong".to_string(),
+                },
+                proxy_config::ir::ProviderModelRewrite {
+                    pattern: "fast".to_string(),
+                    upstream_model: "provider-fast-v2".to_string(),
+                },
+            ],
+            Default::default(),
+        );
+        let body = Bytes::from_static(br#"{"model":"auto"}"#);
+
+        let rewritten = prepare_attempt_body(Some(&runtime), Some("auto"), Some("fast"), &body)
+            .unwrap_or_else(|_| panic!("a resolved model must be mapped by the selected cluster"));
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap()["model"],
+            "provider-fast-v2"
+        );
+    }
+
+    #[test]
+    fn resolved_rewrite_still_requires_the_body_to_match_the_requested_model() {
+        let Err(BodyRefusal::Invalid(err)) = prepare_attempt_body(
+            None,
+            Some("auto"),
+            Some("fast"),
+            &Bytes::from_static(br#"{"model":"client-spoofed"}"#),
+        ) else {
+            panic!("the body must still name what the resolver saw");
+        };
+
+        assert!(err.contains("disagrees"), "unexpected error: {err}");
     }
 
     #[tokio::test(flavor = "current_thread")]
