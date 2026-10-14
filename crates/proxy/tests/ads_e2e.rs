@@ -717,6 +717,146 @@ async fn a_cds_delivered_cluster_is_routable_by_real_traffic() {
     harness.shutdown().await;
 }
 
+/// A cluster that lowers cleanly but whose upstream TLS cannot be built (its
+/// `trusted_ca` holds no certificate), so only `ClusterManager` rejects it.
+fn cluster_with_unbuildable_tls(name: &str, port: u32) -> cluster_v3::Cluster {
+    let tls = tls_v3::UpstreamTlsContext {
+        common_tls_context: Some(tls_v3::CommonTlsContext {
+            validation_context_type: Some(
+                tls_v3::common_tls_context::ValidationContextType::ValidationContext(
+                    tls_v3::CertificateValidationContext {
+                        trusted_ca: Some(core_v3::DataSource {
+                            specifier: Some(core_v3::data_source::Specifier::InlineString(
+                                "not a certificate".to_string(),
+                            )),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    cluster_v3::Cluster {
+        transport_socket: Some(core_v3::TransportSocket {
+            name: "envoy.transport_sockets.tls".to_string(),
+            config_type: Some(core_v3::transport_socket::ConfigType::TypedConfig(any_of(
+                &tls,
+                "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+            ))),
+        }),
+        ..minimal_cluster(name, port)
+    }
+}
+
+/// Review H1 / S8: a CDS response with one cluster the cluster manager cannot
+/// build is NACKed with that cluster's dotted path, and the whole response is
+/// discarded. The same response also repoints `dynamic_backend` at a dead
+/// port; serving 200 from the original upstream afterwards is the negative
+/// half (a partial apply would 503), and no ACK of the bad nonce may ever be
+/// sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cds_cluster_that_fails_to_build_is_nacked_and_last_good_keeps_serving() {
+    let upstream_addr = spawn_mock_upstream();
+    let dead = dead_addr();
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![any_of(
+                &minimal_cluster(TEST_B_DYNAMIC_CLUSTER, upstream_addr.port() as u32),
+                CLUSTER_TYPE,
+            )],
+        },
+        Step::WaitForAck {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            response_nonce: "n1".to_string(),
+        },
+        Step::Push {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "v2".to_string(),
+            nonce: "n2".to_string(),
+            resources: vec![
+                any_of(
+                    &minimal_cluster(TEST_B_DYNAMIC_CLUSTER, dead.port() as u32),
+                    CLUSTER_TYPE,
+                ),
+                any_of(
+                    &cluster_with_unbuildable_tls("broken_tls", upstream_addr.port() as u32),
+                    CLUSTER_TYPE,
+                ),
+            ],
+        },
+        Step::WaitForNack {
+            type_url: CDS_TYPE_URL.to_string(),
+            response_nonce: "n2".to_string(),
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let listener_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-nack-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &config_path,
+        bootstrap_static_listener_dynamic_cluster(listener_port, harness.addr),
+    )
+    .expect("write config");
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    let nack = loop {
+        let log = harness.log.snapshot();
+        if let Some(nack) = log
+            .iter()
+            .find(|r| r.kind() == RequestKind::Nack && r.response_nonce == "n2")
+        {
+            break nack.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a NACK of n2; ADS requests so far: {log:?}; stderr: {:?}",
+            drain_available_lines(&stderr_rx)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let detail = nack.error_detail.expect("a NACK carries error_detail");
+    assert!(
+        detail.contains("cds.clusters[broken_tls].transport_socket"),
+        "NACK must name the cluster by dotted path, got: {detail}"
+    );
+    assert_eq!(
+        nack.version_info, "v1",
+        "a SotW NACK echoes the last accepted version"
+    );
+    assert!(
+        !harness
+            .log
+            .snapshot()
+            .iter()
+            .any(|r| r.kind() == RequestKind::Ack && r.response_nonce == "n2"),
+        "the rejected response must never be ACKed"
+    );
+
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let response = get(listener_addr, "/", "test.local");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "the last-good `{TEST_B_DYNAMIC_CLUSTER}` must keep serving; got:\n{response}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
 // ------------------------------------------------------------------ test C --
 
 /// One static listener/cluster (a real, reachable mock upstream) plus

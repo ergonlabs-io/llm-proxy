@@ -578,6 +578,34 @@ pub struct ClusterManager {
     transport_builder: TransportSocketBuilder,
 }
 
+/// A cluster set built by [`ClusterManager::stage`] and not yet installed.
+/// Dropping it discards the built clusters (their `Drop` aborts any task they
+/// started).
+pub struct StagedClusters {
+    next: HashMap<ClusterName, Arc<ManagedCluster>>,
+    freshly_built: Vec<ClusterName>,
+    rejected: Vec<(ClusterName, ClusterBuildError)>,
+}
+
+impl StagedClusters {
+    /// Clusters whose config could not be built, with the reason.
+    pub fn rejected(&self) -> &[(ClusterName, ClusterBuildError)] {
+        &self.rejected
+    }
+
+    /// Discards the staged clusters, keeping only the rejections.
+    pub fn into_rejected(self) -> Vec<(ClusterName, ClusterBuildError)> {
+        self.rejected
+    }
+}
+
+/// Clusters [`ClusterManager::install`] kept only for workers still on the
+/// previous snapshot; [`ClusterManager::retire`] removes them.
+#[must_use = "dropped clusters stay in the registry until this is passed to `retire`"]
+pub struct PendingRemoval {
+    names: Vec<ClusterName>,
+}
+
 /// Immutable view of the cluster registry captured for one listener/HCM
 /// configuration generation. Existing downstream connections retain their
 /// generation's view while a newly published configuration serves new
@@ -691,17 +719,34 @@ impl ClusterManager {
     /// entirely and its name+error is returned here so the caller can
     /// surface it (e.g. as a config error) instead of it disappearing
     /// silently.
+    ///
+    /// This builds, installs, and retires dropped clusters in one step, for
+    /// callers with no workers to publish to in between (boot, tests). A live
+    /// apply uses [`Self::stage`], [`Self::install`], and [`Self::retire`] so
+    /// that removal is two-phase.
     pub async fn update_from_snapshot(
         &self,
         clusters: &HashMap<ClusterName, Arc<ClusterConfig>>,
     ) -> Vec<(ClusterName, ClusterBuildError)> {
+        let (pending, rejected) = self.install(self.stage(clusters)).await;
+        self.retire(pending);
+        rejected
+    }
+
+    /// Builds every cluster in `clusters` whose config differs from the live
+    /// one, without installing anything; unchanged clusters are carried
+    /// forward (see [`Self::update_from_snapshot`]). A caller that must apply
+    /// all-or-nothing (an xDS response, S8) checks
+    /// [`StagedClusters::rejected`] and drops the result to discard it: the
+    /// live registry is untouched until [`Self::install`].
+    pub fn stage(&self, clusters: &HashMap<ClusterName, Arc<ClusterConfig>>) -> StagedClusters {
         let previous = self.clusters.load_full();
         let mut next: HashMap<ClusterName, Arc<ManagedCluster>> =
             HashMap::with_capacity(clusters.len());
         let mut rejected = Vec::new();
         // Freshly-built clusters only -- these are the only ones that need
-        // `resolve_cluster` below. A carried-forward cluster's `host_set` is
-        // already live and must not be touched (see this method's own doc).
+        // `resolve_cluster` in `install`. A carried-forward cluster's
+        // `host_set` is already live and must not be touched.
         let mut freshly_built: Vec<ClusterName> = Vec::new();
         for (name, config) in clusters {
             let carried = match previous.get(name) {
@@ -730,7 +775,34 @@ impl ClusterManager {
                 }
             }
         }
+        StagedClusters {
+            next,
+            freshly_built,
+            rejected,
+        }
+    }
 
+    /// Resolves the staged clusters and installs them, keeping every live
+    /// cluster the new set dropped. Returns those dropped names as a
+    /// [`PendingRemoval`] for [`Self::retire`], plus the clusters `stage`
+    /// rejected (left out of the set).
+    ///
+    /// Removal waits because a worker builds a connection's router against
+    /// the registry as it is when that worker first serves a snapshot
+    /// version. A worker still on the previous snapshot, whose routes name a
+    /// dropped cluster, would otherwise build against a registry that lacks
+    /// it and answer 503 "unknown cluster" for the life of that connection.
+    /// New and changed clusters must be present before workers see the new
+    /// snapshot; dropped ones must stay until they have it.
+    pub async fn install(
+        &self,
+        staged: StagedClusters,
+    ) -> (PendingRemoval, Vec<(ClusterName, ClusterBuildError)>) {
+        let StagedClusters {
+            mut next,
+            freshly_built,
+            rejected,
+        } = staged;
         // Resolve each freshly-built cluster's own discovery into ITS OWN
         // `host_set` -- nothing here is reachable through `self.clusters` yet
         // (the `store` below hasn't happened), so nothing else can observe
@@ -760,8 +832,34 @@ impl ClusterManager {
             }
             self.start_dns_refresh(managed, resolved.is_ok());
         }
+        let previous = self.clusters.load_full();
+        let mut dropped = Vec::new();
+        for (name, managed) in previous.iter() {
+            // A live cluster whose new definition was rejected is retired the
+            // same way: it is not part of the new set, but workers on the
+            // previous snapshot still route to it.
+            if !next.contains_key(name) {
+                next.insert(name.clone(), Arc::clone(managed));
+                dropped.push(name.clone());
+            }
+        }
         self.clusters.store(Arc::new(next));
-        rejected
+        (PendingRemoval { names: dropped }, rejected)
+    }
+
+    /// Removes the clusters an earlier [`Self::install`] kept for workers on
+    /// the previous snapshot. Call only after the new snapshot is published.
+    /// Connections built before this keep their own registry view, so a
+    /// retired cluster lives on until they close.
+    pub fn retire(&self, pending: PendingRemoval) {
+        if pending.names.is_empty() {
+            return;
+        }
+        let mut next = HashMap::clone(&self.clusters.load_full());
+        for name in &pending.names {
+            next.remove(name);
+        }
+        self.clusters.store(Arc::new(next));
     }
 
     /// Start the timer that re-resolves `managed`'s hostnames, if it has any:
@@ -1511,6 +1609,38 @@ mod tests {
         snapshot.clear();
         manager.update_from_snapshot(&snapshot).await;
         assert!(manager.cluster("svc").is_none());
+    }
+
+    /// Two-phase removal (make-before-break, review M5). Between `install`
+    /// and `retire` a worker still serving the previous snapshot builds its
+    /// router from `routing_snapshot`; the cluster the new set dropped must
+    /// still be there, or that connection answers 503 "unknown cluster" for
+    /// its whole life. The new cluster must already be there too.
+    #[tokio::test]
+    async fn a_dropped_cluster_stays_routable_until_it_is_retired() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "old".to_string(),
+            cluster_config("old", DiscoveryType::Static, vec![endpoint("10.0.0.1", 80)]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+
+        let mut next = HashMap::new();
+        next.insert(
+            "new".to_string(),
+            cluster_config("new", DiscoveryType::Static, vec![endpoint("10.0.0.2", 80)]),
+        );
+        let (pending, rejected) = manager.install(manager.stage(&next)).await;
+        assert!(rejected.is_empty());
+        let between = manager.routing_snapshot();
+        assert!(between.cluster("old").is_some(), "dropped before retire");
+        assert!(between.cluster("new").is_some(), "added after install");
+
+        manager.retire(pending);
+        assert!(manager.cluster("old").is_none());
+        assert!(manager.cluster("new").is_some());
     }
 
     #[tokio::test]

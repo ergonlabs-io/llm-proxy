@@ -1334,20 +1334,18 @@ async fn run_serve(
                 }
             }
             ads_msg = recv_ads_apply(&mut ads_apply_rx) => {
-                if let Some((mut ads_snapshot, reply)) = ads_msg {
-                    ads_snapshot.version = SnapshotVersion(current_version.0 + 1);
-                    let (version, rejected) = apply_snapshot(
+                if let Some((ads_snapshot, reply)) = ads_msg {
+                    if let Some(version) = apply_ads_snapshot(
                         ads_snapshot,
+                        reply,
+                        current_version,
                         &publisher,
                         &cluster_manager_for_reload,
                         &stats_control,
                         &stat_handle_tables_for_reload,
-                    ).await;
-                    current_version = version;
-                    for (name, err) in rejected {
-                        tracing::error!(cluster = %name, error = %err, "ADS: cluster rejected during startup");
+                    ).await {
+                        current_version = version;
                     }
-                    let _ = reply.send(Ok(()));
                 } else {
                     ads_apply_rx = None;
                 }
@@ -1423,38 +1421,20 @@ async fn run_serve(
                 ));
             }
             ads_msg = recv_ads_apply(&mut ads_apply_rx) => match ads_msg {
-                Some((mut ads_snapshot, reply)) => {
-                    // Rust note: authoritative version stamping happens HERE,
-                    // not inside `ResourceApplier` -- see the comment on
-                    // `apply_snapshot`'s own doc and on `current_version`
-                    // above. Two producers stamp a version: `reload` (SIGHUP)
-                    // does the same overwrite right before its own
-                    // `apply_snapshot` call; `ResourceApplier::assemble_snapshot`'s
-                    // internal version is advisory only and is discarded here.
-                    ads_snapshot.version = SnapshotVersion(current_version.0 + 1);
-                    let (version, rejected) = apply_snapshot(
+                Some((ads_snapshot, reply)) => {
+                    if let Some(version) = apply_ads_snapshot(
                         ads_snapshot,
+                        reply,
+                        current_version,
                         &publisher,
                         &cluster_manager_for_reload,
                         &stats_control,
                         &stat_handle_tables_for_reload,
                     )
-                    .await;
-                    current_version = version;
-                    for (name, err) in &rejected {
-                        tracing::error!(
-                            cluster = %name,
-                            error = %err,
-                            "ADS: cluster rejected while applying a discovery response; it is \
-                             not part of the live cluster set (a request routed to it will fail \
-                             until the control plane sends a working definition)"
-                        );
+                    .await
+                    {
+                        current_version = version;
                     }
-                    // A dropped receiver (the ADS task's `Publish` future was
-                    // cancelled, e.g. mid-shutdown) must not panic this loop
-                    // -- `send` returning `Err` just means nobody is waiting
-                    // for the reply any more.
-                    let _ = reply.send(Ok(()));
                 }
                 None => {
                     // Reachable ONLY when the ADS task dropped its sender,
@@ -1737,27 +1717,32 @@ struct StatHandleTables {
 /// is the cheapest way to turn "a comment says do these in order" into "the
 /// compiler says so", and it exists because two separate attempts to catch
 /// the wrong order with a test both failed -- see [`apply_snapshot`]'s doc.
+///
+/// It carries the clusters the new snapshot dropped, which stay installed
+/// until [`retire_clusters`] runs (review M5: removal is two-phase).
 #[must_use = "publishing without installing clusters first is the bug this type exists to prevent"]
-struct ClustersInstalled;
+struct ClustersInstalled(proxy_cluster::manager::PendingRemoval);
 
-/// Step 4: teach the shared cluster manager about this snapshot's clusters,
-/// returning the receipt [`publish_to_workers`] needs plus any clusters it
-/// rejected.
+/// Proof that workers have been handed the snapshot, so the clusters it
+/// dropped can leave the registry. Same receipt technique as
+/// [`ClustersInstalled`], for the other end of the window.
+#[must_use = "dropped clusters stay installed until this is passed to `retire_clusters`"]
+struct SnapshotPublished(proxy_cluster::manager::PendingRemoval);
+
+type RejectedClusters = Vec<(
+    proxy_config::ir::ClusterName,
+    proxy_cluster::manager::ClusterBuildError,
+)>;
+
+/// Step 4: teach the shared cluster manager about this snapshot's built
+/// clusters, returning the receipt [`publish_to_workers`] needs plus any
+/// clusters it rejected. Clusters the snapshot dropped stay installed.
 async fn install_clusters(
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
-    clusters: &std::collections::HashMap<
-        proxy_config::ir::ClusterName,
-        Arc<proxy_config::ir::ClusterConfig>,
-    >,
-) -> (
-    ClustersInstalled,
-    Vec<(
-        proxy_config::ir::ClusterName,
-        proxy_cluster::manager::ClusterBuildError,
-    )>,
-) {
-    let rejected = cluster_manager.update_from_snapshot(clusters).await;
-    (ClustersInstalled, rejected)
+    staged: proxy_cluster::manager::StagedClusters,
+) -> (ClustersInstalled, RejectedClusters) {
+    let (pending, rejected) = cluster_manager.install(staged).await;
+    (ClustersInstalled(pending), rejected)
 }
 
 /// Step 5: make the snapshot visible to workers. Takes the
@@ -1765,11 +1750,50 @@ async fn install_clusters(
 fn publish_to_workers(
     publisher: &proxy_core::runtime::ConfigPublisher,
     snapshot: ConfigSnapshot,
-    _installed: ClustersInstalled,
-) -> SnapshotVersion {
+    installed: ClustersInstalled,
+) -> (SnapshotVersion, SnapshotPublished) {
     let version = snapshot.version;
     publisher.publish(Arc::new(snapshot));
-    version
+    (version, SnapshotPublished(installed.0))
+}
+
+/// Step 6: drop the clusters the published snapshot no longer names. A
+/// worker that has not yet woken for the new snapshot builds new connections
+/// from the latest one, because `publish` stores before it pings.
+fn retire_clusters(
+    cluster_manager: &proxy_cluster::manager::ClusterManager,
+    published: SnapshotPublished,
+) {
+    cluster_manager.retire(published.0);
+}
+
+/// What a snapshot producer wants done when the cluster manager cannot build
+/// one of its clusters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnClusterRejection {
+    /// SIGHUP: leave the cluster out and apply the rest, so a reload never
+    /// takes the process down.
+    LeaveOut,
+    /// xDS: refuse the whole snapshot so the response is NACKed and
+    /// last-good state keeps serving (S8 all-or-nothing).
+    RefuseSnapshot,
+}
+
+/// The NACK `error_detail` for clusters the cluster manager could not build,
+/// as dotted paths in the same `cds.clusters[<name>]` form lowering errors use.
+fn cluster_rejection_detail(rejected: &RejectedClusters) -> String {
+    let mut parts: Vec<String> = rejected
+        .iter()
+        .map(|(name, err)| {
+            let field = match err {
+                proxy_cluster::manager::ClusterBuildError::Lb(_) => "lb_policy",
+                proxy_cluster::manager::ClusterBuildError::TransportSocket(_) => "transport_socket",
+            };
+            format!("cds.clusters[{name}].{field}: {err}")
+        })
+        .collect();
+    parts.sort();
+    parts.join("; ")
 }
 
 /// The names `snapshot` still configures, as the stats registry's live scope.
@@ -1794,8 +1818,16 @@ fn live_scope_for(snapshot: &ConfigSnapshot) -> proxy_observability::stats::Live
 /// publish on its own.
 ///
 /// Order of operations, and why -- unchanged from what used to be inline in
-/// `reload`, just no longer duplicated for a second caller:
-/// 0. [`proxy_observability::stats::StatsControl::set_live_scope`] with the
+/// `reload`, just no longer duplicated for a second caller.
+///
+/// Before any step, [`proxy_cluster::manager::ClusterManager::stage`] builds
+/// the snapshot's new and changed clusters without installing them. A
+/// cluster it rejects (unimplemented `lb_policy`, a bad `transport_socket`,
+/// ...) is handled per `on_rejection`: [`OnClusterRejection::RefuseSnapshot`]
+/// returns `Err` with nothing touched (the ADS caller NACKs, review H1);
+/// [`OnClusterRejection::LeaveOut`] applies the rest (`reload` logs).
+///
+/// 0.[`proxy_observability::stats::StatsControl::set_live_scope`] with the
 ///    snapshot's cluster and listener names, so series of removed ones stop
 ///    being emitted and stop counting against their caps, and series absent
 ///    from this snapshot and the previous one are drained for reuse. The
@@ -1815,24 +1847,21 @@ fn live_scope_for(snapshot: &ConfigSnapshot) -> proxy_observability::stats::Live
 ///    over the cluster keys, so a cluster this snapshot introduces has its
 ///    four `llm.client.token.usage` handles resolved before it can dial its
 ///    first request.
-/// 4. [`proxy_cluster::manager::ClusterManager::update_from_snapshot`] --
-///    exactly the call `run_serve` makes at boot -- so the shared cluster
-///    manager every worker's router reads through picks up added, removed, or
-///    changed clusters. A rejected cluster (unimplemented `lb_policy`, a bad
-///    `transport_socket`, ...) is left out of the live cluster set; the
-///    name+error pairs are *returned* rather than logged here, since the two
-///    callers want different things done with them (`reload` logs a
-///    SIGHUP-specific message below; the ADS caller will want to NACK the
-///    discovery response, not just log).
-/// 5. [`proxy_core::runtime::ConfigPublisher::publish`], LAST: this is what
+/// 4. [`proxy_cluster::manager::ClusterManager::install`] so the shared
+///    cluster manager every worker's router reads through picks up added and
+///    changed clusters. Clusters the snapshot dropped stay installed.
+/// 5. [`proxy_core::runtime::ConfigPublisher::publish`]: this is what
 ///    makes the snapshot visible to workers (via each worker's `config_ping`
 ///    -> `reconcile`, already covered by `proxy-core`'s own tests), so it must
 ///    not run until step 4 has already taught the cluster manager about every
 ///    cluster the new snapshot's routes can reach -- otherwise a worker could
 ///    start routing to a cluster the manager doesn't know about yet.
+/// 6. [`proxy_cluster::manager::ClusterManager::retire`], LAST: removes the
+///    dropped clusters only once workers have the snapshot whose routes no
+///    longer reach them (make-before-break, review M5).
 ///
-/// **The ordering of steps 4 and 5 is enforced by the TYPE SYSTEM, not by a
-/// test, and that is a deliberate choice made after two measured failures.**
+/// **The ordering of steps 4, 5 and 6 is enforced by the TYPE SYSTEM, not by
+/// a test, and that is a deliberate choice made after two measured failures.**
 ///
 /// First (2026-09-06) a plain mutation showed no unit test caught a
 /// reordering. Then an end-to-end test was written for exactly this -- boot
@@ -1847,22 +1876,26 @@ fn live_scope_for(snapshot: &ConfigSnapshot) -> proxy_observability::stats::Live
 ///
 /// So the order is a compile-time property instead: [`install_clusters`]
 /// returns a [`ClustersInstalled`] receipt that [`publish_to_workers`]
-/// requires by value. Swapping the two statements below does not typecheck --
-/// the receipt would be used before it exists. That is a stronger guarantee
-/// than the test that could not be written, and it costs one zero-sized type.
+/// requires by value, and [`publish_to_workers`] returns the
+/// [`SnapshotPublished`] receipt [`retire_clusters`] requires. Reordering the
+/// statements below does not typecheck -- a receipt would be used before it
+/// exists. That is a stronger guarantee than the test that could not be
+/// written.
 async fn apply_snapshot(
     snapshot: ConfigSnapshot,
+    on_rejection: OnClusterRejection,
     publisher: &proxy_core::runtime::ConfigPublisher,
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
     stats_control: &proxy_observability::stats::StatsControl,
     tables: &StatHandleTables,
-) -> (
-    SnapshotVersion,
-    Vec<(
-        proxy_config::ir::ClusterName,
-        proxy_cluster::manager::ClusterBuildError,
-    )>,
-) {
+) -> Result<(SnapshotVersion, RejectedClusters), RejectedClusters> {
+    let staged = cluster_manager.stage(&snapshot.clusters);
+    if on_rejection == OnClusterRejection::RefuseSnapshot && !staged.rejected().is_empty() {
+        // Dropping `staged` discards every cluster it built; nothing below
+        // has run, so stats scope, registry and workers are all unchanged.
+        return Err(staged.into_rejected());
+    }
+
     // Hide the series of clusters and listeners this snapshot no longer
     // names, and let one that returns after a single absent snapshot
     // reappear with its old value, BEFORE the resolves below so their cap
@@ -1883,12 +1916,60 @@ async fn apply_snapshot(
         .token_usage
         .resolve_missing(stats_control, snapshot.clusters.keys().map(String::as_str));
 
-    let (installed, rejected) = install_clusters(cluster_manager, &snapshot.clusters).await;
+    let (installed, rejected) = install_clusters(cluster_manager, staged).await;
     // `installed` is consumed here, and it cannot exist before the line above
     // -- that is what makes the order a compile error rather than a comment.
-    let version = publish_to_workers(publisher, snapshot, installed);
+    let (version, published) = publish_to_workers(publisher, snapshot, installed);
+    retire_clusters(cluster_manager, published);
 
-    (version, rejected)
+    Ok((version, rejected))
+}
+
+/// Applies one snapshot the dynamic-resource applier assembled and answers its
+/// reply: `Ok` lets the response be ACKed, `Err` NACKs it with the clusters'
+/// dotted paths (S8). Returns the new version, or `None` when the snapshot
+/// was refused and last-good keeps serving.
+async fn apply_ads_snapshot(
+    mut snapshot: ConfigSnapshot,
+    reply: oneshot::Sender<Result<(), String>>,
+    current_version: SnapshotVersion,
+    publisher: &proxy_core::runtime::ConfigPublisher,
+    cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
+    stats_control: &proxy_observability::stats::StatsControl,
+    tables: &StatHandleTables,
+) -> Option<SnapshotVersion> {
+    // Rust note: authoritative version stamping happens HERE, not inside
+    // `ResourceApplier`. Two producers stamp a version: `reload` (SIGHUP) does
+    // the same overwrite before its own `apply_snapshot` call;
+    // `ResourceApplier::assemble_snapshot`'s internal version is advisory
+    // only and is discarded here.
+    snapshot.version = SnapshotVersion(current_version.0 + 1);
+    let applied = apply_snapshot(
+        snapshot,
+        OnClusterRejection::RefuseSnapshot,
+        publisher,
+        cluster_manager,
+        stats_control,
+        tables,
+    )
+    .await;
+    let (outcome, version) = match applied {
+        Ok((version, _)) => (Ok(()), Some(version)),
+        Err(rejected) => {
+            let detail = cluster_rejection_detail(&rejected);
+            tracing::error!(
+                %detail,
+                "xDS: a cluster in the discovery response could not be built; rejecting the \
+                 response and keeping the last-good configuration"
+            );
+            (Err(detail), None)
+        }
+    };
+    // A dropped receiver (the ADS task's `Publish` future was cancelled, e.g.
+    // mid-shutdown) must not panic this loop -- `send` returning `Err` just
+    // means nobody is waiting for the reply any more.
+    let _ = reply.send(outcome);
+    version
 }
 
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
@@ -1946,8 +2027,27 @@ async fn reload(
     let listeners = snapshot.listeners.len();
     let clusters = snapshot.clusters.len();
 
-    let (version, rejected) =
-        apply_snapshot(snapshot, publisher, cluster_manager, stats_control, tables).await;
+    let applied = apply_snapshot(
+        snapshot,
+        OnClusterRejection::LeaveOut,
+        publisher,
+        cluster_manager,
+        stats_control,
+        tables,
+    )
+    .await;
+    // `LeaveOut` never refuses the snapshot; the arm exists so a future change
+    // to that rule fails loudly instead of being ignored.
+    let (version, rejected) = match applied {
+        Ok(applied) => applied,
+        Err(rejected) => {
+            tracing::error!(
+                detail = %cluster_rejection_detail(&rejected),
+                "SIGHUP: config reload refused; continuing to serve the previous snapshot"
+            );
+            return None;
+        }
+    };
 
     for (name, err) in &rejected {
         tracing::error!(
