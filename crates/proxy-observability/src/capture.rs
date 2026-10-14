@@ -155,12 +155,10 @@ impl CaptureLease {
             return Err(SubmitResult::Disabled);
         }
         let shared = &self.shared;
-        let _lock = shared.pool.lock.try_lock().map_err(|_| {
-            shared
-                .stats
-                .record_submission(SubmitResult::CapacityExceeded);
-            SubmitResult::CapacityExceeded
-        })?;
+        // Blocking lock: it guards in-memory accounting only (no I/O under it), so a
+        // wait is bounded by a few atomic ops. Contention must never be reported as
+        // CapacityExceeded; that outcome means the pool is genuinely full.
+        let _lock = shared.pool.lock.lock().unwrap();
         let current = shared
             .current
             .load_full()
@@ -491,12 +489,8 @@ impl CaptureSupervisor {
         if generation & 1 != 0 {
             return Err(SubmitResult::Disabled);
         }
-        let _lock = self
-            .shared
-            .pool
-            .lock
-            .try_lock()
-            .map_err(|_| SubmitResult::CapacityExceeded)?;
+        // See `reserve_terminal`: short blocking lock, contention is not exhaustion.
+        let _lock = self.shared.pool.lock.lock().unwrap();
         let policy = self
             .shared
             .current
@@ -962,25 +956,69 @@ mod reservation_tests {
     use crate::stats::{prometheus_render, StatsControl};
 
     #[tokio::test]
-    async fn contended_terminal_reservation_records_an_explicit_capacity_decline() {
+    async fn concurrent_admission_below_capacity_is_never_counted_as_exhaustion() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 200;
         let temp = tempfile::tempdir().unwrap();
-        let config = crate::capture_tests::config(&temp);
+        let mut config = crate::capture_tests::config(&temp);
+        config.budgets.max_active_requests = THREADS;
+        config.budgets.max_queue_events = THREADS;
+        let stats = StatsControl::new(1);
+        let (supervisor, delivery) =
+            CaptureSupervisor::start(MetadataDeliveryStats::resolve(&stats)).unwrap();
+        supervisor.configure(Some(config), 1).unwrap();
+        let barrier = std::sync::Barrier::new(THREADS);
+        let declined = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        let lease = match supervisor.try_admit() {
+                            Ok(Some(lease)) => Some(lease),
+                            _ => {
+                                declined.fetch_add(1, Ordering::Relaxed);
+                                None
+                            }
+                        };
+                        let permit = lease.as_ref().map(|l| l.reserve_terminal());
+                        if matches!(permit, Some(Err(_))) {
+                            declined.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Hold both until every thread has finished this round so
+                        // all THREADS are outstanding at once, exactly at capacity.
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert_eq!(declined.load(Ordering::Relaxed), 0);
+        let rendered = prometheus_render::render(&stats.registry());
+        assert!(
+            rendered.contains("outcome=\"capacity_exceeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(!delivery.shutdown(Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn genuinely_full_terminal_queue_still_reports_capacity_exceeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::capture_tests::config(&temp);
+        config.budgets.max_queue_events = 1;
         let stats = StatsControl::new(1);
         let (supervisor, delivery) =
             CaptureSupervisor::start(MetadataDeliveryStats::resolve(&stats)).unwrap();
         supervisor.configure(Some(config), 1).unwrap();
         let lease = supervisor.try_admit().unwrap().unwrap();
-        {
-            let _lock = supervisor.shared.pool.lock.lock().unwrap();
-            assert!(matches!(
-                lease.reserve_terminal(),
-                Err(SubmitResult::CapacityExceeded)
-            ));
-        }
-        assert_eq!(supervisor.status().outstanding_events, 0);
-        assert_eq!(supervisor.status().retained_event_bytes, 0);
+        let first = lease.reserve_terminal().unwrap();
+        assert!(matches!(
+            lease.reserve_terminal(),
+            Err(SubmitResult::CapacityExceeded)
+        ));
         assert!(prometheus_render::render(&stats.registry())
             .contains("envoy_llmproxy_metadata_admission{outcome=\"capacity_exceeded\"} 1"));
+        drop(first);
         drop(lease);
         assert!(!delivery.shutdown(Duration::from_secs(1)).await);
     }
