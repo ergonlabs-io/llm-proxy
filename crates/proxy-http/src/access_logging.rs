@@ -880,6 +880,7 @@ impl LoggingBody {
                 .map(CredentialSource::as_str),
             llm_user_id: None,
             llm_requested_model: requested_model.as_deref(),
+            llm_resolved_model: usage_attribution.2.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
             llm_rate_card_version: usage_attribution.3.as_deref(),
             request_method: Some(&ctx.request.method),
