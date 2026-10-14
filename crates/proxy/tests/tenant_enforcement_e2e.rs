@@ -102,6 +102,42 @@ fn a_zero_budget_refuses_the_next_request() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Offboarding (review H4): `DELETE /tenants/{id}` revokes the tenant's keys,
+/// so the next request with a key minted for it is 401, not admitted.
+#[test]
+fn deleting_a_tenant_makes_its_keys_stop_authenticating() {
+    let dir = scratch_dir("delete");
+    let proxy = Proxy::start(&dir, &config_text(""));
+    let key = mint_key(&proxy);
+    allow_all_models(&proxy);
+    let before = chat(&proxy, &key);
+    assert!(
+        before.starts_with("HTTP/1.1 200"),
+        "before the delete:\n{before}"
+    );
+
+    let deleted = http_request(
+        "DELETE",
+        proxy.admin,
+        &format!("/tenants/{TENANT}"),
+        Some(&format!("Bearer {ADMIN_TOKEN}")),
+        "application/json",
+        "",
+    );
+    assert!(
+        deleted.starts_with("HTTP/1.1 204"),
+        "DELETE tenant:\n{deleted}"
+    );
+
+    let after = chat(&proxy, &key);
+    assert!(
+        after.starts_with("HTTP/1.1 401"),
+        "a deleted tenant's key must not authenticate:\n{after}"
+    );
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Negative control: with the filters opted out, the writes are refused rather
 /// than stored and ignored.
 #[test]
@@ -263,6 +299,16 @@ fn mint_key(proxy: &Proxy) -> String {
         .as_str()
         .expect("POST /keys returns the plaintext key")
         .to_string()
+}
+
+/// `PUT /tenants/{TENANT}/policy` granting every model.
+fn allow_all_models(proxy: &Proxy) {
+    let put = http_put(
+        proxy.admin,
+        &format!("/tenants/{TENANT}/policy"),
+        r#"{"access":"all"}"#,
+    );
+    assert!(put.starts_with("HTTP/1.1 204"), "PUT policy:\n{put}");
 }
 
 fn chat(proxy: &Proxy, key: &str) -> String {

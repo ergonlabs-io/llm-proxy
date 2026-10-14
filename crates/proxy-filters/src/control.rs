@@ -2990,11 +2990,74 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Deletes `tenant`, then republishes.
-    pub fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+    /// Deletes `tenant` and revokes every key that authenticates as it, then
+    /// republishes. Returns how many keys this call revoked.
+    ///
+    /// Deleting a tenant offboards it, so none of its keys may keep
+    /// authenticating (review H4). The stores' own `delete_tenant` leaves the
+    /// key rows alone, so the cascade lives here, once, for every store:
+    ///
+    /// - an active store key is revoked, which keeps its row as the audit
+    ///   trail, exactly as `DELETE /keys/{id}` does;
+    /// - an active config (bootstrap) key gets a revoked store row under the
+    ///   same `key_id` and digest. The store wins a `key_id` collision in
+    ///   [`Self::merge`], so the config key stops authenticating here and on
+    ///   every replica that shares the store, and stays revoked across a
+    ///   restart. Revoked IDs are permanent tombstones, as for any key.
+    ///
+    /// Keys are revoked BEFORE the tenant row goes, so a failure part way
+    /// leaves the tenant present with some keys revoked: the safe direction,
+    /// and a retry finishes the job. A second sweep runs after the row is
+    /// deleted to catch a key minted concurrently with the first one. A key
+    /// minted after this returns belongs to a new tenant of the same name,
+    /// because tenants are implicit (a key or a policy creates one).
+    pub fn delete_tenant(&self, tenant: &TenantId) -> Result<usize, StoreError> {
+        let mut revoked = self.revoke_tenant_keys(tenant)?;
         self.store.delete_tenant(tenant)?;
+        revoked += self.revoke_tenant_keys(tenant)?;
         self.rebuild();
-        Ok(())
+        Ok(revoked)
+    }
+
+    /// The cascade step of [`Self::delete_tenant`]: revokes every active key
+    /// of `tenant`, store and bootstrap alike. Reads the store, not the
+    /// published snapshot, so a key another replica minted since our last
+    /// poll is included.
+    fn revoke_tenant_keys(&self, tenant: &TenantId) -> Result<usize, StoreError> {
+        let loaded = self.store.load()?;
+        let mut revoked = 0;
+        for key in loaded
+            .keys
+            .iter()
+            .filter(|key| &key.tenant == tenant && !key.revoked)
+        {
+            match self.store.revoke_key(&key.key_id) {
+                Ok(()) => revoked += 1,
+                // Gone between the load and the revoke: nothing to revoke.
+                Err(StoreError::NotFound) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let stored: HashSet<&KeyId> = loaded.keys.iter().map(|key| &key.key_id).collect();
+        for (digest, record) in self.bootstrap_keys.iter() {
+            if &record.tenant != tenant || record.revoked || stored.contains(&record.key_id) {
+                continue;
+            }
+            // Bootstrap digests are HMAC-SHA256 outputs, so always 32 bytes;
+            // a length mismatch would be a parse bug, and skipping the row
+            // would leave the key live, so it is an error rather than a skip.
+            let digest: [u8; 32] = digest.try_into().map_err(|_| {
+                StoreError::InvalidInput("bootstrap key digest is not 32 bytes".into())
+            })?;
+            self.store.put_key(&StoredKey {
+                key_id: record.key_id.clone(),
+                digest,
+                tenant: tenant.clone(),
+                revoked: true,
+            })?;
+            revoked += 1;
+        }
+        Ok(revoked)
     }
 
     /// Sets `tenant`'s model-access policy, then republishes.
@@ -4570,6 +4633,76 @@ mod tests {
         // row -- confirm the republish reflects that too.
         let snapshot = cp.handle().load();
         assert!(!snapshot.policies.contains_key("tenant-a"));
+    }
+
+    // --- delete_tenant cascades to the tenant's keys (review H4) ----------
+    //
+    // Offboarding by deleting the tenant must stop every key that
+    // authenticates as it: the minted store key AND the config bootstrap key,
+    // on this replica and on a second replica that shares the store and boots
+    // with the same config. Another tenant's keys are untouched.
+    #[test]
+    fn deleting_a_tenant_revokes_its_store_and_config_keys_on_every_replica() {
+        let secret_bytes = b"operator-secret";
+        let bootstrap = || {
+            let mut keys = KeySet::new();
+            keys.insert(
+                &HmacSecret::new(secret_bytes),
+                "llmp_config-key-a",
+                KeyRecord {
+                    key_id: KeyId::new("config-a"),
+                    tenant: TenantId::new("tenant-a"),
+                    revoked: false,
+                },
+            );
+            keys
+        };
+        let shared = Arc::new(InMemoryControlPlaneStore::default());
+        let cp = ControlPlane::new(
+            Box::new(SharedStore(Arc::clone(&shared))),
+            HmacSecret::new(secret_bytes),
+            bootstrap(),
+        )
+        .unwrap();
+        let minted_a = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("minted-a"))
+            .unwrap();
+        let minted_b = cp
+            .mint_key(&TenantId::new("tenant-b"), &KeyId::new("minted-b"))
+            .unwrap();
+        let replica = ControlPlane::new(
+            Box::new(SharedStore(Arc::clone(&shared))),
+            HmacSecret::new(secret_bytes),
+            bootstrap(),
+        )
+        .unwrap();
+
+        let revoked = cp.delete_tenant(&TenantId::new("tenant-a")).unwrap();
+        assert_eq!(revoked, 2, "the minted key and the config key");
+        replica.poll_once().unwrap();
+
+        for (name, plane) in [("deleting replica", &cp), ("other replica", &replica)] {
+            let authenticator =
+                VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), plane.handle());
+            for key in [minted_a.plaintext.as_str(), "llmp_config-key-a"] {
+                let headers = headers_with_authorization(&format!("Bearer {key}"));
+                assert!(
+                    matches!(
+                        authenticator.authenticate(&headers),
+                        AuthOutcome::Rejected(AuthError::RevokedKey)
+                    ),
+                    "{name}: a key of the deleted tenant must be revoked"
+                );
+            }
+            let other = headers_with_authorization(&format!("Bearer {}", minted_b.plaintext));
+            assert!(
+                matches!(
+                    authenticator.authenticate(&other),
+                    AuthOutcome::Authenticated(_)
+                ),
+                "{name}: another tenant's key must keep authenticating"
+            );
+        }
     }
 
     // --- seed_bootstrap_policies ---------------------

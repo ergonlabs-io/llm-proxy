@@ -1950,11 +1950,12 @@ fn handle_delete_tenant(control_plane: &ControlPlane, tenant: &str) -> Response<
         return bad_request("tenant must not be empty");
     }
     match control_plane.delete_tenant(&TenantId::new(tenant)) {
-        Ok(()) => {
+        Ok(revoked_keys) => {
             tracing::info!(
                 endpoint = "/tenants/{id}",
                 tenant,
-                "admin: deleted a tenant"
+                revoked_keys,
+                "admin: deleted a tenant and revoked its keys"
             );
             no_content()
         }
