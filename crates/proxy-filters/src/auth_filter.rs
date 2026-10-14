@@ -947,6 +947,14 @@ impl HttpFilterFactory for AuthFilterFactory {
             jwt_validations.push(validation);
         }
 
+        // The stats registry a shared store exports its policy-load cost to.
+        // Looked up before `get_or_try_init`: its closure runs under the
+        // singleton map's lock, which `get` also takes.
+        let stats_registry = ctx
+            .shared
+            .get("", crate::usage_filter::STATS_REGISTRY_KEY)
+            .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok());
+
         // The `ControlPlane` is now the ONE
         // per-serve instance shared across every worker BUILDING THIS SAME
         // CHAIN, resolved through `ctx.get_or_try_init` (`FactoryContext`'s
@@ -1033,7 +1041,13 @@ impl HttpFilterFactory for AuthFilterFactory {
                         let store = match namespace {
                             Some(ns) => RedisControlPlaneStore::open_with_namespace(&url, ns),
                             None => RedisControlPlaneStore::open(&url),
-                        };
+                        }
+                        .map(|store| match &stats_registry {
+                            Some(registry) => {
+                                store.with_load_stats(Arc::clone(registry), &ctx.stat_prefix)
+                            }
+                            None => store,
+                        });
                         Box::new(store.map_err(|e| {
                             invalid(
                                 "typed_config.store.shared.url",

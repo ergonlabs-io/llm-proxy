@@ -859,6 +859,56 @@ fn a_failed_call_resets_only_its_own_lane_and_that_lane_reconnects() {
 // The load log line
 // ---------------------------------------------------------------------------
 
+/// The load's cost is exported, not only logged: two loads read back from
+/// the Prometheus scrape as two duration samples, and a size and row count
+/// equal to ONE load's (they are gauges of the last load, so a second load of
+/// the same state must not add to them).
+#[test]
+fn a_load_exports_its_duration_and_size_as_stats() {
+    let fake = FakeRedis::start();
+    let control = proxy_observability::stats::StatsControl::new(1);
+    let store = fake.store().with_load_stats(control.registry(), "chain-a");
+
+    store.load().expect("first load");
+    store.load().expect("second load");
+
+    let scrape = proxy_observability::stats::prometheus_render::render(&control.registry());
+    let sample = |prefix: &str| -> String {
+        scrape
+            .lines()
+            .find(|line| line.starts_with(prefix) && line.contains(r#"scope="chain-a""#))
+            .unwrap_or_else(|| panic!("no {prefix} sample in:\n{scrape}"))
+            .rsplit(' ')
+            .next()
+            .expect("a sample line ends with its value")
+            .to_string()
+    };
+    let rows = &fake.shared.rows;
+    let row_count = rows.tenants.len()
+        + [
+            &rows.keys,
+            &rows.policies,
+            &rows.budgets,
+            &rows.credentials,
+            &rows.rate_cards,
+        ]
+        .iter()
+        .map(|hash| hash.len())
+        .sum::<usize>();
+    assert_eq!(
+        sample("envoy_llmproxy_control_plane_load_payload_bytes"),
+        rows.payload_bytes().to_string()
+    );
+    assert_eq!(
+        sample("envoy_llmproxy_control_plane_load_rows"),
+        row_count.to_string()
+    );
+    assert_eq!(
+        sample("envoy_llmproxy_control_plane_load_duration_count"),
+        "2"
+    );
+}
+
 #[test]
 fn a_load_logs_its_duration_and_size_and_never_row_content() {
     let fake = FakeRedis::start();

@@ -67,8 +67,13 @@
 //! ciphertext only; this store never decrypts (ADR-0007 decision 2).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use proxy_observability::stats::{
+    Handle, HistogramHandle, Instrument, InstrumentKind, Registry, WorkerId,
+    ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS,
+};
 
 use redis::{Client, Connection, Script};
 
@@ -90,7 +95,108 @@ const DEFAULT_NAMESPACE: &str = "llmproxy";
 /// How long a connect, a read, or a write may block, on either [`Lane`]. A
 /// store that cannot answer within this fails the one call and reconnects on
 /// the next, rather than holding its lane indefinitely.
+///
+/// # One second is enough for a full policy read
+///
+/// The timeout bounds each socket read, not the call: `redis` sets it as the
+/// socket's receive timeout, so a large `load` whose reply keeps arriving
+/// never trips it, however long the transfer takes. What it bounds is
+/// silence, and Redis is silent before a reply only while it builds it in
+/// memory. A policy state large enough to keep Redis silent for a second
+/// would be far past the fleet sizes this store is meant for (an estimate,
+/// not measured); `llmproxy_control_plane_load_duration` and
+/// `llmproxy_control_plane_load_payload_bytes` show an operator one coming.
+/// A longer timeout would also lengthen how long a dead Redis holds the
+/// control lane, which is the revocation path. A load that does time out
+/// keeps the last-good policy and retries on the next poll.
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Each successful [`RedisControlPlaneStore::load`]'s duration, in
+/// milliseconds: the same figure as the load log line's `duration_ms`.
+static LOAD_DURATION: Instrument = Instrument {
+    name: "llmproxy_control_plane_load_duration",
+    kind: InstrumentKind::Histogram,
+    unit: "ms",
+    attribute_keys: &["scope"],
+    buckets: Some(&ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS),
+};
+
+/// The last successful load's size: the log line's `payload_bytes`.
+static LOAD_PAYLOAD_BYTES: Instrument = Instrument {
+    name: "llmproxy_control_plane_load_payload_bytes",
+    kind: InstrumentKind::UpDownCounter,
+    unit: "By",
+    attribute_keys: &["scope"],
+    buckets: None,
+};
+
+/// The last successful load's row count, every kind of row together.
+static LOAD_ROWS: Instrument = Instrument {
+    name: "llmproxy_control_plane_load_rows",
+    kind: InstrumentKind::UpDownCounter,
+    unit: "{row}",
+    attribute_keys: &["scope"],
+    buckets: None,
+};
+
+/// More `scope` values than any deployment has chains with a shared store.
+const LOAD_STATS_SCOPES: usize = 256;
+
+/// Where [`RedisControlPlaneStore::load`] exports its cost. The two gauges
+/// are `UpDownCounter`s, which only move by deltas, so the last values set
+/// are kept here to turn "set to N" into "add N minus last".
+struct LoadStats {
+    registry: Arc<Registry>,
+    duration: HistogramHandle,
+    payload_bytes: Handle,
+    rows: Handle,
+    /// `(payload_bytes, rows)` as last exported. Only a successful load
+    /// writes it, and loads on one store are serialized by the control
+    /// lane's mutex, so the read-then-store pairs never interleave.
+    last: Mutex<(u64, u64)>,
+}
+
+impl LoadStats {
+    fn new(registry: Arc<Registry>, scope: &str) -> Self {
+        let attrs = [("scope", scope)];
+        let overflow = [("scope", "overflow")];
+        LoadStats {
+            duration: registry.resolve_histogram_capped(
+                &LOAD_DURATION,
+                &attrs,
+                LOAD_STATS_SCOPES,
+                &overflow,
+            ),
+            payload_bytes: registry.resolve_capped(
+                &LOAD_PAYLOAD_BYTES,
+                &attrs,
+                LOAD_STATS_SCOPES,
+                &overflow,
+            ),
+            rows: registry.resolve_capped(&LOAD_ROWS, &attrs, LOAD_STATS_SCOPES, &overflow),
+            registry,
+            last: Mutex::new((0, 0)),
+        }
+    }
+
+    fn record(&self, duration: Duration, payload_bytes: usize, rows: usize) {
+        let (payload_bytes, rows) = (payload_bytes as u64, rows as u64);
+        self.registry
+            .observe(WorkerId(0), self.duration, duration.as_secs_f64() * 1000.0);
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        // Rust note: `wrapping_sub` then a cast to `i64` gives the signed
+        // difference for any two values below 2^63, which byte and row
+        // counts are.
+        self.registry.add(
+            WorkerId(0),
+            self.payload_bytes,
+            payload_bytes.wrapping_sub(last.0) as i64,
+        );
+        self.registry
+            .add(WorkerId(0), self.rows, rows.wrapping_sub(last.1) as i64);
+        *last = (payload_bytes, rows);
+    }
+}
 
 /// Which of the store's two connections a call runs on. Every trait method
 /// names one, so a slow call can only ever queue behind calls of its own kind.
@@ -408,9 +514,22 @@ pub struct RedisControlPlaneStore {
     delete_tenant_credential_script: Script,
     delete_tenant_script: Script,
     put_rate_card_if_absent_script: Script,
+    /// Where `load` exports its duration and size; `None` until
+    /// [`Self::with_load_stats`].
+    load_stats: Option<LoadStats>,
 }
 
 impl RedisControlPlaneStore {
+    /// Exports each successful [`ControlPlaneStore::load`]'s duration and
+    /// size to `registry` under `scope` (the chain's `stat_prefix`), beside
+    /// the log line that already reports them: a log line shows one load,
+    /// the series show the trend, which is what tells an operator the policy
+    /// state is outgrowing a full read per change.
+    pub fn with_load_stats(mut self, registry: Arc<Registry>, scope: &str) -> Self {
+        self.load_stats = Some(LoadStats::new(registry, scope));
+        self
+    }
+
     /// Connects to `url` (e.g. `redis://127.0.0.1:6379`) under the default
     /// namespace [`DEFAULT_NAMESPACE`]. Opening performs no I/O of its own --
     /// `redis::Client::open` only parses the URL -- so a Redis outage at
@@ -442,6 +561,7 @@ impl RedisControlPlaneStore {
             delete_tenant_credential_script: Script::new(DELETE_TENANT_CREDENTIAL_LUA),
             delete_tenant_script: Script::new(DELETE_TENANT_LUA),
             put_rate_card_if_absent_script: Script::new(PUT_RATE_CARD_IF_ABSENT_LUA),
+            load_stats: None,
         })
     }
 
@@ -660,7 +780,9 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     /// combined length of the field names, set members and values read,
     /// without the protocol framing. The line carries counts and lengths
     /// ONLY: the rows hold key digests and sealed tenant credentials, which
-    /// must never reach a log (AGENTS.md "Fail-open controls").
+    /// must never reach a log (AGENTS.md "Fail-open controls"). The same
+    /// duration, byte count and total row count are exported as stats when
+    /// the store was built [`Self::with_load_stats`].
     fn load(&self) -> Result<StoredControlPlane, StoreError> {
         let started = Instant::now();
         let tenants_key = self.tenants_key();
@@ -761,8 +883,16 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             .filter_map(|(chain, bytes)| decode_rate_card_row(&chain, &bytes))
             .collect();
 
+        let duration = started.elapsed();
+        if let Some(stats) = &self.load_stats {
+            stats.record(
+                duration,
+                payload_bytes,
+                n_tenants + n_keys + n_policies + n_budgets + n_credentials + n_rate_cards,
+            );
+        }
         tracing::info!(
-            duration_ms = started.elapsed().as_millis() as u64,
+            duration_ms = duration.as_millis() as u64,
             fetch_ms = fetched.as_millis() as u64,
             tenants = n_tenants,
             keys = n_keys,
