@@ -141,6 +141,10 @@ pub struct RequestRecord {
     pub method: String,
     pub route: String,
     pub requested_model: Option<String>,
+    /// The model alias a resolver chose when `requested_model` was a
+    /// resolver trigger such as `auto`; `None` otherwise.
+    #[serde(default)]
+    pub resolved_model: Option<String>,
     pub selected_cluster: Option<String>,
     pub selected_provider: Option<String>,
     pub selected_model: Option<String>,
@@ -192,6 +196,7 @@ impl RequestRecord {
             &self.routing_revision,
             &self.capture_policy_version,
             &self.requested_model,
+            &self.resolved_model,
             &self.selected_cluster,
             &self.selected_provider,
             &self.selected_model,
@@ -510,6 +515,7 @@ pub(crate) mod tests {
             method: "POST".into(),
             route: "/v1/chat/completions".into(),
             requested_model: None,
+            resolved_model: None,
             selected_cluster: None,
             selected_provider: None,
             selected_model: None,

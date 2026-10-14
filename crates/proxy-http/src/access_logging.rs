@@ -545,6 +545,7 @@ impl LoggingBody {
                 (
                     info.auth.key_id.clone(),
                     info.selected_model.clone(),
+                    info.resolved_model.clone(),
                     info.llm
                         .list_cost
                         .as_ref()
@@ -617,6 +618,10 @@ impl LoggingBody {
                 requested_model: requested_model
                     .as_deref()
                     .map(proxy_observability::records::bounded_field),
+                resolved_model: usage_attribution
+                    .2
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
                 selected_cluster: upstream_cluster
                     .as_deref()
                     .map(proxy_observability::records::bounded_field),
@@ -653,7 +658,7 @@ impl LoggingBody {
                 // is not an auditable cost. Keep the whole cost null rather
                 // than inventing an "unknown" version.
                 cost: llm_list_cost_nanodollars
-                    .zip(usage_attribution.2.as_deref())
+                    .zip(usage_attribution.3.as_deref())
                     .map(
                         |(amount, rate_card_version)| proxy_observability::records::Cost {
                             amount,
@@ -876,7 +881,7 @@ impl LoggingBody {
             llm_user_id: None,
             llm_requested_model: requested_model.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
-            llm_rate_card_version: usage_attribution.2.as_deref(),
+            llm_rate_card_version: usage_attribution.3.as_deref(),
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),

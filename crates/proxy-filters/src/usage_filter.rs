@@ -1190,7 +1190,7 @@ impl UsageFilterInstance {
             let model = stream_info
                 .selected_model
                 .as_deref()
-                .or(stream_info.requested_model.as_deref())?;
+                .or(stream_info.routing_model())?;
             pricing
                 .list
                 .list_cost_nanodollars(provider_type, model, &usage)

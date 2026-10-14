@@ -453,7 +453,12 @@ impl ModelAuthzFilterInstance {
         // clone out and let the guard drop before any other call on `cb`.
         let (tenant, model) = {
             let info = cb.stream_info();
-            (info.auth.tenant.clone(), info.requested_model.clone())
+            // The resolver's choice when one ran: a trigger such as `auto`
+            // is never itself granted, only the model it resolved to.
+            (
+                info.auth.tenant.clone(),
+                info.routing_model().map(str::to_owned),
+            )
         };
 
         // Case 1 is re-checked rather than assumed: `decode_headers` already
@@ -1293,6 +1298,39 @@ mod tests {
         let reply = cb
             .local_reply
             .expect("claude-3 is outside the gpt-4* allow-list and must be refused");
+        assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+    }
+
+    /// A resolver trigger is authorized as the model it resolved to, never as
+    /// the trigger: a tenant limited to `gpt-4*` may use `auto` only while it
+    /// resolves inside that grant.
+    #[test]
+    fn a_resolved_model_is_authorized_instead_of_the_trigger() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]),
+        )]);
+
+        let mut filter = filter_with(policies.clone());
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_requested_model("auto");
+        cb.stream_info.borrow_mut().resolved_model = Some("gpt-4o".to_string());
+        decode_request(&mut filter, &mut cb);
+        assert!(
+            cb.local_reply.is_none(),
+            "auto resolved to gpt-4o is inside the grant"
+        );
+
+        let mut filter = filter_with(policies);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_requested_model("auto");
+        cb.stream_info.borrow_mut().resolved_model = Some("claude-3".to_string());
+        decode_request(&mut filter, &mut cb);
+        let reply = cb
+            .local_reply
+            .expect("auto resolved to claude-3 is outside the grant and must be refused");
         assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
     }
 
