@@ -194,7 +194,9 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
     "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\" ",
     "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\" ",
-    "llm_served_model=\"%LLM_SERVED_MODEL%\"\n",
+    "llm_served_model=\"%LLM_SERVED_MODEL%\" ",
+    "llm_usage_completeness=\"%LLM_USAGE_COMPLETENESS%\" llm_cost_kind=\"%LLM_COST_KIND%\" ",
+    "llm_upstream_id=\"%LLM_UPSTREAM_ID%\"\n",
 );
 
 /// The header Anthropic requires on every Messages API request.
@@ -2413,6 +2415,12 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_list_cost_nanodollars": "%LLM_LIST_COST%",
                 "llm_credential_source": "%LLM_CREDENTIAL_SOURCE%",
                 "llm_served_model": "%LLM_SERVED_MODEL%",
+                "llm_usage_completeness": "%LLM_USAGE_COMPLETENESS%",
+                "llm_cost_kind": "%LLM_COST_KIND%",
+                "llm_upstream_id": "%LLM_UPSTREAM_ID%",
+                // Embedded as a JSON value, not a string; it has no text-format
+                // twin because raw JSON would break that line's quoting.
+                "llm_upstream_usage": "%LLM_UPSTREAM_USAGE%",
             }
         }),
     };

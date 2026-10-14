@@ -64,10 +64,12 @@ selected_provider="%UPSTREAM_CLUSTER%"
 selected_model="%LLM_SELECTED_MODEL%" rate_card_version="%LLM_RATE_CARD_VERSION%"
 llm_list_cost_nanodollars="%LLM_LIST_COST%"
 llm_credential_source="%LLM_CREDENTIAL_SOURCE%" llm_served_model="%LLM_SERVED_MODEL%"
+llm_usage_completeness="%LLM_USAGE_COMPLETENESS%" llm_cost_kind="%LLM_COST_KIND%"
+llm_upstream_id="%LLM_UPSTREAM_ID%"
 ```
 
 The real format is one line that ends with a newline. The block above is
-wrapped for reading. The last five lines of the block carry the key, tenant,
+wrapped for reading. The last seven lines of the block carry the key, tenant,
 user, model, provider, rate-card, and cost fields. The JSON format carries the
 same fields.
 
@@ -76,13 +78,17 @@ flags" below. A dash in `llm_tokens="-/-/-/-/-"` is not a zero. A dash means
 the provider reported no usage for this exchange. That is a different fact
 from "zero tokens were used". Do not confuse the two on a billing dashboard.
 
-Both fixed formats include `%LLM_CREDENTIAL_SOURCE%` and `%LLM_SERVED_MODEL%`.
+Both fixed formats include `%LLM_CREDENTIAL_SOURCE%`, `%LLM_SERVED_MODEL%`,
+`%LLM_USAGE_COMPLETENESS%`, `%LLM_COST_KIND%`, and `%LLM_UPSTREAM_ID%`. Only the
+JSON format includes `%LLM_UPSTREAM_USAGE%`, because raw JSON breaks the
+quoting of the text line.
 See [Tenant provider credentials](../../authentication/tenant-provider-credentials/#access-log).
 
 ## JSON format
 
 One JSON object per line. Every value renders as a JSON string, including
-numbers. The field values all go through the same format-string engine as the
+numbers. The one exception is `llm_upstream_usage`, which is a JSON object
+(or `null`). The field values all go through the same format-string engine as the
 text format. `AccessLogFormat::Json` carries no typed (numeric or boolean)
 value today (`crates/proxy-http/src/access_logging.rs`, `render_json`). The
 real line in [Getting started](../../getting-started/quickstart/#step-5-read-the-access-log)
@@ -112,12 +118,17 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `llm_rate_card_version` | `%LLM_RATE_CARD_VERSION%` |
 | `llm_list_cost_nanodollars` | `%LLM_LIST_COST%` |
 | `llm_credential_source` | `%LLM_CREDENTIAL_SOURCE%` (`platform` or `tenant`) |
+| `llm_usage_completeness`, `llm_cost_kind` | `%LLM_USAGE_COMPLETENESS%`, `%LLM_COST_KIND%` |
+| `llm_upstream_id` | `%LLM_UPSTREAM_ID%` |
+| `llm_upstream_usage` | `%LLM_UPSTREAM_USAGE%`, embedded as a JSON object |
 | `llm_served_model` | `%LLM_SERVED_MODEL%`: the `model` the provider's response says it served, which can be a dated snapshot of the selected model or a different model. The cost is computed at this model when the rate card lists it for the provider; otherwise at the selected model. `-` when the response named none. |
 
 The text format uses the same names without the `llm_` prefix for `key_id`,
 `tenant`, `user_id`, `requested_model`, `resolved_model`, `selected_model`, and
 `rate_card_version`. The names `selected_provider`,
-`llm_list_cost_nanodollars`, `llm_credential_source`, and `llm_served_model` are the same in both formats.
+`llm_list_cost_nanodollars`, `llm_credential_source`, `llm_served_model`,
+`llm_usage_completeness`, `llm_cost_kind`, and `llm_upstream_id` are the same
+in both formats.
 
 ### Envoy mode: `log_format`
 

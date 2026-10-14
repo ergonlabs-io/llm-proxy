@@ -4089,6 +4089,50 @@ observability:
     );
 }
 
+/// Both default formats carry the evidence an operator needs to reconcile a
+/// request against the provider's bill: completeness, cost kind and the
+/// provider's response id, plus the raw usage object in JSON only.
+#[test]
+fn default_access_log_formats_carry_upstream_evidence() {
+    for format in ["json", "text"] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "*", provider: openai }}
+observability:
+  access_logs: {{ output: stdout, format: {format} }}
+"#,
+        ))
+        .expect("must parse");
+        let lowered = proxy_simple_config::lower(&config).expect("must lower");
+        let log_format =
+            &hcm_typed_config(&lowered.bootstrap)["access_log"][0]["typed_config"]["log_format"];
+        if format == "json" {
+            let json = &log_format["json_format"];
+            assert_eq!(json["llm_usage_completeness"], "%LLM_USAGE_COMPLETENESS%");
+            assert_eq!(json["llm_cost_kind"], "%LLM_COST_KIND%");
+            assert_eq!(json["llm_upstream_id"], "%LLM_UPSTREAM_ID%");
+            assert_eq!(json["llm_upstream_usage"], "%LLM_UPSTREAM_USAGE%");
+        } else {
+            let text = log_format["text_format"].as_str().expect("text_format");
+            assert!(
+                text.contains("llm_usage_completeness=\"%LLM_USAGE_COMPLETENESS%\" ")
+                    && text.contains("llm_cost_kind=\"%LLM_COST_KIND%\" "),
+                "text format must carry completeness and cost kind, got {text}"
+            );
+            assert!(
+                text.ends_with("llm_upstream_id=\"%LLM_UPSTREAM_ID%\"\n"),
+                "text format must end with the upstream id, got {text}"
+            );
+            // Raw JSON would break the text line's quoting.
+            assert!(!text.contains("%LLM_UPSTREAM_USAGE%"), "got {text}");
+        }
+    }
+}
+
 /// Both default formats carry the served model, so a dialect user can see
 /// when the provider billed a different model than the one selected.
 #[test]
@@ -4117,8 +4161,8 @@ observability:
         } else {
             let text = log_format["text_format"].as_str().expect("text_format");
             assert!(
-                text.ends_with("llm_served_model=\"%LLM_SERVED_MODEL%\"\n"),
-                "text format must end with the served model, got {text}"
+                text.contains("llm_served_model=\"%LLM_SERVED_MODEL%\" "),
+                "text format must carry the served model, got {text}"
             );
         }
     }
