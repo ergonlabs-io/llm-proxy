@@ -291,6 +291,29 @@ fn empty_id_or_tenant_is_rejected_naming_that_keys_path() {
     }
 }
 
+#[test]
+fn over_long_id_or_tenant_is_rejected_naming_that_keys_path() {
+    let secret = "test-operator-secret";
+    let digest = digest_hex(secret.as_bytes(), "llmp_x");
+    let at_bound = "a".repeat(128);
+    lower(&parse(&config_with_one_key(secret, &at_bound, &at_bound, &digest)).unwrap())
+        .expect("ids at the bound lower");
+    // The dialect duplicates the bound; this pins it to the data plane's.
+    assert_eq!(proxy_observability::records::MAX_PRINCIPAL_ID_BYTES, 128);
+
+    let long = "a".repeat(129);
+    for (id, tenant, path) in [
+        (long.as_str(), "acme", "auth.keys[0].id"),
+        ("k1", long.as_str(), "auth.keys[0].tenant"),
+    ] {
+        let cfg = parse(&config_with_one_key(secret, id, tenant, &digest)).expect("must parse");
+        match lower(&cfg).expect_err("over-long id must be rejected") {
+            ConfigError::InvalidValue { field_path, .. } => assert_eq!(field_path, path),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+}
+
 // --- 6: duplicate id / duplicate digest -> error naming index 1 --
 
 #[test]

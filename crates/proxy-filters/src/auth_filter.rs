@@ -783,6 +783,13 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
             ));
         }
 
+        if let Err(reason) = crate::auth::check_principal_id("key_id", &key_id) {
+            return Err(invalid(
+                format!("typed_config.virtual_keys[{i}].key_id"),
+                reason,
+            ));
+        }
+
         let tenant = msg
             .get_field_by_name("tenant")
             .and_then(|v| v.as_str().map(str::to_string))
@@ -791,6 +798,13 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
             return Err(invalid(
                 format!("typed_config.virtual_keys[{i}].tenant"),
                 "must not be empty",
+            ));
+        }
+
+        if let Err(reason) = crate::auth::check_principal_id("tenant", &tenant) {
+            return Err(invalid(
+                format!("typed_config.virtual_keys[{i}].tenant"),
+                reason,
             ));
         }
 
@@ -1716,6 +1730,39 @@ mod tests {
                 assert_eq!(field_path, "typed_config.virtual_keys[1].digest_hex");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn over_long_key_id_or_tenant_is_rejected_naming_its_path() {
+        let digest = digest_hex(b"secret", "llmp_x");
+        let at_bound = "a".repeat(128);
+        parse_config(&authentication(
+            inline_secret("secret"),
+            vec![virtual_key(&at_bound, &at_bound, &digest, false)],
+        ))
+        .expect("ids at the bound load");
+        for (key, tenant, path) in [
+            (
+                "k".repeat(129),
+                "t".to_string(),
+                "typed_config.virtual_keys[0].key_id",
+            ),
+            (
+                "k".to_string(),
+                "t".repeat(129),
+                "typed_config.virtual_keys[0].tenant",
+            ),
+        ] {
+            let err = parse_config(&authentication(
+                inline_secret("secret"),
+                vec![virtual_key(&key, &tenant, &digest, false)],
+            ))
+            .expect_err("over-long id must be rejected");
+            match err {
+                ConfigError::InvalidValue { field_path, .. } => assert_eq!(field_path, path),
+                other => panic!("expected InvalidValue, got {other:?}"),
+            }
         }
     }
 

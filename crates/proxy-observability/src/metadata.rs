@@ -164,6 +164,7 @@ impl MetadataDelivery {
                     while receiver.blocking_recv().is_some() {
                         if let Some(stats) = &stats {
                             stats.record_dequeued();
+                            stats.record_drained_after_close();
                         }
                     }
                 }
@@ -252,6 +253,54 @@ mod tests {
         let summary = delivery.shutdown(Duration::from_secs(2)).await;
         assert_eq!(summary.failed, 1);
         assert_eq!(sink.submit(record()), SubmitResult::Closed);
+    }
+
+    #[tokio::test]
+    async fn records_drained_after_the_lane_closes_are_counted_as_dropped() {
+        // The first write blocks until three more records are queued, then
+        // fails; the writer closes the lane and drains those three unwritten.
+        struct FailAfterRelease {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for FailAfterRelease {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                Err(io::Error::other("full"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (sink, delivery) = MetadataDelivery::start_writer(
+            FailAfterRelease {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            3,
+            "instance".into(),
+            Some(MetadataDeliveryStats::resolve(&control)),
+        )
+        .unwrap();
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        entered_rx.recv().unwrap();
+        for _ in 0..3 {
+            assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        }
+        release_tx.send(()).unwrap();
+        let summary = delivery.shutdown(Duration::from_secs(2)).await;
+        assert!(!summary.timed_out);
+        assert_eq!(summary.failed, 1);
+        let rendered = prometheus_render::render(&registry);
+        assert!(
+            rendered.contains("envoy_llmproxy_metadata_dropped{reason=\"drained_after_close\"} 3"),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

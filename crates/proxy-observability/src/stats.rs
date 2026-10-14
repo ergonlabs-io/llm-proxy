@@ -776,6 +776,34 @@ pub mod instruments {
     pub const METADATA_ADMISSION_ACCEPTED: &str = "accepted";
     pub const METADATA_ADMISSION_CAPACITY_EXCEEDED: &str = "capacity_exceeded";
     pub const METADATA_ADMISSION_CLOSED: &str = "closed";
+    /// The record alone exceeded the per-record byte limit (not queue pressure).
+    pub const METADATA_ADMISSION_OVERSIZE: &str = "oversize";
+    /// The record failed schema validation (a producer bug, not load).
+    pub const METADATA_ADMISSION_INVALID: &str = "invalid";
+
+    /// Records that were admitted (counted `accepted`) and later discarded by
+    /// the collector without being written. Without this a biller sees
+    /// `accepted` exceed `written + write_failures` with no explanation.
+    pub const METADATA_DROPPED: Instrument = Instrument {
+        name: "llmproxy_metadata_dropped",
+        kind: InstrumentKind::Counter,
+        unit: "{record}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Queued behind a failed write after the file lane closed.
+    pub const METADATA_DROPPED_DRAINED_AFTER_CLOSE: &str = "drained_after_close";
+
+    /// Access-log lines a destination failed to write or flush (disk full,
+    /// closed pipe). Distinct from `ACCESS_LOG_DROPPED_LINES`, which counts
+    /// queue overflow. **No Envoy equivalent**; Prometheus and OTLP only.
+    pub const ACCESS_LOG_WRITE_FAILURES: Instrument = Instrument {
+        name: "llmproxy_access_log_write_failures",
+        kind: InstrumentKind::Counter,
+        unit: "{failure}",
+        attribute_keys: &[],
+        buckets: None,
+    };
 
     /// Tenant-mode credential decisions at the router's credential step
     /// (ADR-0007). Only tenant-mode requests reach this counter; a
@@ -1103,13 +1131,16 @@ pub struct MetadataDeliveryStats {
     registry: Arc<Registry>,
     accepted: Handle,
     capacity_exceeded: Handle,
+    oversize: Handle,
+    invalid: Handle,
     closed: Handle,
+    drained_after_close: Handle,
     queue_depth: Handle,
     queue_capacity: Handle,
     written: Handle,
     durable: Handle,
     write_failures: Handle,
-    state_admission: [Handle; 4],
+    state_admission: [Handle; 6],
     active: Handle,
     state_bytes: Handle,
     event_bytes: Handle,
@@ -1131,17 +1162,36 @@ impl MetadataDeliveryStats {
                 &instruments::METADATA_ADMISSION,
                 &[("outcome", instruments::METADATA_ADMISSION_CAPACITY_EXCEEDED)],
             ),
+            oversize: control.resolve(
+                &instruments::METADATA_ADMISSION,
+                &[("outcome", instruments::METADATA_ADMISSION_OVERSIZE)],
+            ),
+            invalid: control.resolve(
+                &instruments::METADATA_ADMISSION,
+                &[("outcome", instruments::METADATA_ADMISSION_INVALID)],
+            ),
             closed: control.resolve(
                 &instruments::METADATA_ADMISSION,
                 &[("outcome", instruments::METADATA_ADMISSION_CLOSED)],
+            ),
+            drained_after_close: control.resolve(
+                &instruments::METADATA_DROPPED,
+                &[("reason", instruments::METADATA_DROPPED_DRAINED_AFTER_CLOSE)],
             ),
             queue_depth: control.resolve(&instruments::METADATA_QUEUE_DEPTH, &[]),
             queue_capacity: control.resolve(&instruments::METADATA_QUEUE_CAPACITY, &[]),
             written: control.resolve(&instruments::METADATA_WRITTEN, &[]),
             durable: control.resolve(&instruments::METADATA_DURABLE, &[]),
             write_failures: control.resolve(&instruments::METADATA_WRITE_FAILURES, &[]),
-            state_admission: ["accepted", "disabled", "capacity_exceeded", "closed"]
-                .map(|v| control.resolve(&instruments::CAPTURE_STATE_ADMISSION, &[("outcome", v)])),
+            state_admission: [
+                "accepted",
+                "disabled",
+                "capacity_exceeded",
+                "closed",
+                "oversize",
+                "invalid",
+            ]
+            .map(|v| control.resolve(&instruments::CAPTURE_STATE_ADMISSION, &[("outcome", v)])),
             active: control.resolve(&instruments::CAPTURE_ACTIVE, &[]),
             state_bytes: control.resolve(&instruments::CAPTURE_STATE_BYTES, &[]),
             event_bytes: control.resolve(&instruments::CAPTURE_EVENT_BYTES, &[]),
@@ -1178,6 +1228,8 @@ impl MetadataDeliveryStats {
             Disabled => 1,
             CapacityExceeded => 2,
             Closed => 3,
+            Oversize => 4,
+            Invalid => 5,
         };
         self.registry
             .incr(WorkerId(0), self.state_admission[index], 1);
@@ -1214,11 +1266,23 @@ impl MetadataDeliveryStats {
             crate::records::SubmitResult::CapacityExceeded => {
                 self.registry.incr(WorkerId(0), self.capacity_exceeded, 1);
             }
+            crate::records::SubmitResult::Oversize => {
+                self.registry.incr(WorkerId(0), self.oversize, 1);
+            }
+            crate::records::SubmitResult::Invalid => {
+                self.registry.incr(WorkerId(0), self.invalid, 1);
+            }
             crate::records::SubmitResult::Closed => {
                 self.registry.incr(WorkerId(0), self.closed, 1);
             }
             crate::records::SubmitResult::Disabled => {}
         }
+    }
+
+    /// Lifecycle point: an already-accepted record discarded unwritten after
+    /// the file lane closed on a write failure.
+    pub fn record_drained_after_close(&self) {
+        self.registry.incr(WorkerId(0), self.drained_after_close, 1);
     }
 
     /// After obtaining a channel permit, before publishing the record. This
