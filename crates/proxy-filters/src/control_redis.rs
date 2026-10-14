@@ -41,6 +41,11 @@
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
 //! ```
 //!
+//! The `spend` and `seq` keys of a period expire together, a fixed retention
+//! after the period ends (`SPEND_RETENTION_AFTER_PERIOD`); every other key is
+//! permanent. The flusher and the bind-time prefetch reach them in pipelines,
+//! not one round trip per row.
+//!
 //! `{ns}` is a constructor parameter ([`RedisControlPlaneStore::open_with_namespace`],
 //! defaulting to [`DEFAULT_NAMESPACE`] via [`RedisControlPlaneStore::open`]) so
 //! two deployments can share one Redis. The braces around
@@ -72,8 +77,8 @@ use crate::control::decode_tenant_credential_row;
 use crate::control::{
     decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
     EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget, EncodedTenantCredentialRow,
-    FlushToken, StoreError, StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential,
-    SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION,
+    FlushToken, SpendDelta, StoreError, StoredControlPlane, StoredKey, StoredRateCard,
+    StoredTenantCredential, SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
@@ -100,10 +105,9 @@ enum Lane {
     /// write. A revoked key reaches this replica through a call on this lane,
     /// so nothing slow may be allowed to queue ahead of it.
     Control,
-    /// Tier 3: spend reconciliation. `add_spend` (one script call per bucket,
-    /// in sequence), the `last_flush_seq` that seeds it, the `load_spend`
-    /// reads that fill buckets at bind time, and the operator's
-    /// `overwrite_spend`.
+    /// Tier 3: spend reconciliation. The flusher's pipelined `add_spend`,
+    /// `last_flush_seq` and `load_spend` batches, the `load_spend` batch that
+    /// fills buckets at bind time, and the operator's `overwrite_spend`.
     Spend,
 }
 
@@ -125,10 +129,15 @@ enum Lane {
 ///
 /// `KEYS[1]` = the spend total key, `KEYS[2]` = the per-writer sequence
 /// hash, `ARGV[1]` = `token.node_id`, `ARGV[2]` = `token.seq`, `ARGV[3]` =
-/// `delta_micros`. Dedup state lives in `KEYS[2]`, a HASH keyed by
-/// `ARGV[1]` (the node id) -- see [`FlushToken`]'s doc for why keying it on
-/// `seq` alone loses one replica's spend the instant two replicas emit the
-/// same sequence number.
+/// `delta_micros`, `ARGV[4]` = when both keys expire, as Unix seconds, or `0`
+/// for never (see [`spend_expires_at`]). Dedup state lives in `KEYS[2]`, a
+/// HASH keyed by `ARGV[1]` (the node id) -- see [`FlushToken`]'s doc for why
+/// keying it on `seq` alone loses one replica's spend the instant two
+/// replicas emit the same sequence number.
+///
+/// The expiry is set on every accepted write, on both keys together, so the
+/// dedup row never outlives the total it protects or the reverse. A replay
+/// writes nothing and leaves the expiry alone.
 const ADD_SPEND_LUA: &str = r#"
 local last = tonumber(redis.call('HGET', KEYS[2], ARGV[1]) or '0')
 local seq = tonumber(ARGV[2])
@@ -136,8 +145,46 @@ if seq <= last then
   return tonumber(redis.call('GET', KEYS[1]) or '0')
 end
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
-return redis.call('INCRBY', KEYS[1], ARGV[3])
+local total = redis.call('INCRBY', KEYS[1], ARGV[3])
+local expires_at = tonumber(ARGV[4])
+if expires_at > 0 then
+  redis.call('EXPIREAT', KEYS[1], expires_at)
+  redis.call('EXPIREAT', KEYS[2], expires_at)
+end
+return total
 "#;
+
+/// How long a spend row stays in Redis after its period ends: 32 days.
+///
+/// Nothing enforces against an ended period, so the row is kept only to be
+/// read: the admin spend report answers an ended period from the store once
+/// its bucket has left memory. 32 days keeps last month's total readable for
+/// all of the following month. Without an expiry every row ever written
+/// stays forever: keys x periods, plus one dedup field per replica boot when
+/// `service_node` is unset (review H5).
+const SPEND_RETENTION_AFTER_PERIOD: chrono::Duration = chrono::Duration::days(32);
+
+/// When the spend and seq keys of `period` expire, as Unix seconds: the
+/// period end plus [`SPEND_RETENTION_AFTER_PERIOD`]. `0` (never) for a key
+/// that is not one `Period::key_for` renders, since there is no end to count
+/// from; nothing in production writes such a key.
+///
+/// Also `0` when that instant has already passed: `EXPIREAT` with a past time
+/// deletes the key on the spot, so a write to a long-ended period (an
+/// operator correcting old spend) would vanish as it landed.
+fn spend_expires_at(period: &PeriodKey) -> i64 {
+    period
+        .ends_at()
+        .and_then(|end| end.checked_add_signed(SPEND_RETENTION_AFTER_PERIOD))
+        .filter(|at| *at > chrono::Utc::now())
+        .map_or(0, |at| at.timestamp())
+}
+
+/// The most rows one pipeline carries. A batch larger than this goes as
+/// several pipelines in sequence on the same connection, so neither side
+/// buffers an unbounded request or reply, and one failed pipeline costs at
+/// most this many rows a retry.
+const SPEND_PIPELINE_ROWS: usize = 1000;
 
 /// [`ControlPlaneStore::revoke_key`]'s Lua script.
 ///
@@ -328,7 +375,7 @@ fn unescape_component(escaped: &str) -> Option<String> {
 /// # Why two: policy calls and spend calls must not queue behind each other
 ///
 /// The policy poller (`policy_generation`, `load`, and the admin writes) and
-/// the spend flusher (`add_spend`, once per bucket, in sequence) share this
+/// the spend flusher (pipelined `add_spend` and `load_spend` batches) share this
 /// one store, and their calls differ by orders of magnitude in how long they
 /// hold a connection. On a single connection each had to wait its turn behind
 /// the other: a revocation pickup behind a long flush, a reconciliation
@@ -530,6 +577,47 @@ impl RedisControlPlaneStore {
             self.namespace,
             Self::hash_tag(stat_prefix, tenant, period)
         )
+    }
+
+    /// Runs one spend command per row on [`Lane::Spend`], as one pipeline per
+    /// [`SPEND_PIPELINE_ROWS`] rows, and answers one result per row in order.
+    /// Every command must reply with an integer or nil (read as `0`). A
+    /// pipeline that fails gives each of its rows the error and drops the
+    /// connection like any other failed call, so the next pipeline reconnects.
+    ///
+    /// Not `MULTI`/`EXEC`: the rows are independent, and each `add_spend`
+    /// script is already atomic on its own. A plain pipeline only saves the
+    /// round trips.
+    fn pipelined<R>(
+        &self,
+        rows: &[R],
+        mut queue: impl FnMut(&mut redis::Pipeline, &R),
+    ) -> Vec<Result<u64, StoreError>> {
+        let mut results = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(SPEND_PIPELINE_ROWS) {
+            let mut pipe = redis::pipe();
+            pipe.cmd("SCRIPT").arg("LOAD").arg(ADD_SPEND_LUA).ignore();
+            for row in chunk {
+                queue(&mut pipe, row);
+            }
+            let replies =
+                self.with_connection(Lane::Spend, |conn| pipe.query::<Vec<Option<u64>>>(conn));
+            match replies {
+                Ok(replies) if replies.len() == chunk.len() => {
+                    results.extend(replies.into_iter().map(|v| Ok(v.unwrap_or(0))));
+                }
+                Ok(replies) => {
+                    let err = StoreError::Unavailable(format!(
+                        "spend pipeline answered {} replies for {} commands",
+                        replies.len(),
+                        chunk.len()
+                    ));
+                    results.extend(chunk.iter().map(|_| Err(err.clone())));
+                }
+                Err(err) => results.extend(chunk.iter().map(|_| Err(err.clone()))),
+            }
+        }
+        results
     }
 }
 
@@ -956,7 +1044,56 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .arg(token.node_id)
                 .arg(token.seq)
                 .arg(delta_micros)
+                .arg(spend_expires_at(period))
                 .invoke::<u64>(conn)
+        })
+    }
+
+    /// One pipeline of `EVALSHA` per [`SPEND_PIPELINE_ROWS`] rows, led by a
+    /// `SCRIPT LOAD` so the hash is known to Redis before the first call (a
+    /// pipeline cannot fall back to loading the script mid-way the way a
+    /// single [`redis::Script::invoke`] does). The load is idempotent and
+    /// costs one short command per pipeline.
+    fn add_spend_batch(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[SpendDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.pipelined(rows, |pipe, row| {
+            pipe.cmd("EVALSHA")
+                .arg(self.add_spend_script.get_hash())
+                .arg(2)
+                .arg(self.spend_key(stat_prefix, row.tenant.as_str(), row.period.as_str()))
+                .arg(self.seq_key(stat_prefix, row.tenant.as_str(), row.period.as_str()))
+                .arg(node_id)
+                .arg(row.seq)
+                .arg(row.delta_micros)
+                .arg(spend_expires_at(row.period));
+        })
+    }
+
+    fn last_flush_seq_batch(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[(TenantId, PeriodKey)],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.pipelined(rows, |pipe, (tenant, period)| {
+            pipe.cmd("HGET")
+                .arg(self.seq_key(stat_prefix, tenant.as_str(), period.as_str()))
+                .arg(node_id);
+        })
+    }
+
+    fn load_spend_batch(
+        &self,
+        stat_prefix: &str,
+        rows: &[(TenantId, PeriodKey)],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.pipelined(rows, |pipe, (tenant, period)| {
+            pipe.cmd("GET")
+                .arg(self.spend_key(stat_prefix, tenant.as_str(), period.as_str()));
         })
     }
 
@@ -971,11 +1108,16 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         total_micros: u64,
     ) -> Result<(), StoreError> {
         let spend_key = self.spend_key(stat_prefix, tenant.as_str(), period.as_str());
+        let expires_at = spend_expires_at(period);
         self.with_connection(Lane::Spend, |conn| {
-            redis::cmd("SET")
-                .arg(&spend_key)
-                .arg(total_micros)
-                .query::<()>(conn)
+            // `SET` drops any expiry the key had, so the correction restates
+            // it in the same transaction rather than leaving the row immortal.
+            let mut pipe = redis::pipe();
+            pipe.atomic().cmd("SET").arg(&spend_key).arg(total_micros);
+            if expires_at > 0 {
+                pipe.cmd("EXPIREAT").arg(&spend_key).arg(expires_at);
+            }
+            pipe.query::<()>(conn)
         })
     }
 
@@ -1121,6 +1263,50 @@ mod tests {
             .as_nanos();
         RedisControlPlaneStore::open_with_namespace(&url, format!("llmproxy-test-{label}-{nanos}"))
             .expect("Client::open only parses the URL and must not fail here")
+    }
+
+    /// The batched spend calls against a real Redis: the pipelined script
+    /// applies, dedups a replay, and leaves both keys expiring at the
+    /// period's end plus the retention; the batched reads see the same rows.
+    /// The fake cannot show this, since it runs no Lua.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_batched_spend_applies_dedups_and_expires_with_the_period() {
+        let store = test_store("batch");
+        let (a, b) = (TenantId::new("tenant-a"), TenantId::new("tenant-b"));
+        let period = crate::spend::Period::Daily.key_for_now();
+        let row = |tenant, delta, seq| SpendDelta {
+            tenant,
+            period: &period,
+            delta_micros: delta,
+            seq,
+        };
+
+        let first = store.add_spend_batch("chain", "node-a", &[row(&a, 10, 1), row(&b, 20, 1)]);
+        assert_eq!(first, vec![Ok(10), Ok(20)]);
+        let replay = store.add_spend_batch("chain", "node-a", &[row(&a, 10, 1), row(&b, 5, 2)]);
+        assert_eq!(replay, vec![Ok(10), Ok(25)], "seq 1 again is a replay");
+
+        let rows = [(a.clone(), period.clone()), (b.clone(), period.clone())];
+        assert_eq!(store.load_spend_batch("chain", &rows), vec![Ok(10), Ok(25)]);
+        assert_eq!(
+            store.last_flush_seq_batch("chain", "node-a", &rows),
+            vec![Ok(1), Ok(2)]
+        );
+
+        let want = spend_expires_at(&period);
+        assert!(want > 0);
+        for key in [
+            store.spend_key("chain", "tenant-a", period.as_str()),
+            store.seq_key("chain", "tenant-a", period.as_str()),
+        ] {
+            let at: i64 = store
+                .with_connection(Lane::Spend, |conn| {
+                    redis::cmd("EXPIRETIME").arg(&key).query(conn)
+                })
+                .unwrap();
+            assert_eq!(at, want, "{key}");
+        }
     }
 
     #[test]

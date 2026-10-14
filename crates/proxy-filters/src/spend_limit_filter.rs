@@ -484,20 +484,14 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                     .collect();
                 let snapshot = control_plane.handle().load_full();
                 let tenants: Vec<_> = snapshot.key_tenants.values().cloned().collect();
-                accumulator
+                // A failed prefetch fails open, loudly: see
+                // `SpendAccumulator::prepare_request_workers`.
+                if let Err(err) = accumulator
                     .prepare_tenant_request_workers(&tenants)
-                    .map_err(|err| {
-                        invalid(
-                            "typed_config",
-                            format!("tenant spend startup prefetch failed: {err}"),
-                        )
-                    })?;
-                accumulator.prepare_request_workers(&keys).map_err(|err| {
-                    invalid(
-                        "typed_config",
-                        format!("spend startup prefetch failed: {err}"),
-                    )
-                })?;
+                    .and(accumulator.prepare_request_workers(&keys))
+                {
+                    warn_prefetch_failed(&ctx.stat_prefix, &err);
+                }
                 let accumulator = Arc::new(accumulator);
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
@@ -1144,6 +1138,21 @@ impl HttpFilter for SpendLimitFilterInstance {
         self.record_if_present(cb);
         FilterTrailersStatus::Continue
     }
+}
+
+/// The one warning for a startup spend prefetch that could not read every
+/// row. The filter still builds (AGENTS.md "Fail-open controls": metering
+/// must not take the listener down with a store blip), and this line is what
+/// makes the open window visible. It is logged once per accumulator, and
+/// renders the store's error and the chain, never a key or tenant.
+fn warn_prefetch_failed(stat_prefix: &str, err: &crate::control::StoreError) {
+    tracing::warn!(
+        stat_prefix = %stat_prefix,
+        error = %err,
+        "llmproxy.spend_limit: startup spend prefetch failed; serving anyway. Spend rows \
+         that could not be read start from zero on this replica and are corrected from \
+         the store on the first successful flush. Until then budgets may be over-admitted"
+    );
 }
 
 /// This replica's spend-writer identity: `service_node` if the operator
@@ -2565,6 +2574,56 @@ mod tests {
             "spend must be flushed into the ControlPlane's OWN store -- a private \
              store here would reset every tenant's accrued spend on restart while \
              budgets persisted, making a ceiling escapable by bouncing the proxy"
+        );
+    }
+
+    /// A store that cannot answer the startup spend prefetch must not take
+    /// the listener down (review H5: a Redis blip during a rollout left the
+    /// replica with no listener). The filter builds, and says once, loudly,
+    /// that budgets are open until the first flush; the line names no key.
+    /// What happens to the rows afterwards is
+    /// `spend::tests::a_failed_startup_prefetch_still_serves_and_the_next_flush_corrects_the_base`.
+    #[test]
+    fn a_failed_startup_prefetch_builds_the_filter_and_warns_once() {
+        use crate::spend::tests::ProbeStore;
+        let probe = Arc::try_unwrap(ProbeStore::new())
+            .ok()
+            .expect("nothing else holds the new store");
+        probe
+            .fail_load_spend
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cp = ControlPlane::new(
+            Box::new(probe),
+            HmacSecret::new(b"test-secret-value-long-enough"),
+            KeySet::default(),
+        )
+        .expect("the policy load does not read spend");
+        let tenant = TenantId::new("tenant-a");
+        cp.create_tenant(&tenant).unwrap();
+        cp.mint_key(&tenant, &KeyId::new("key-secret-looking-id"))
+            .unwrap();
+        let ctx = FactoryContext::default();
+        ctx.shared
+            .get_or_try_init(&ctx.scope, &ctx.stat_prefix, auth_filter::TYPE_URL, || {
+                Ok(Arc::new(cp) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        let built = SpendLimitFilterFactory.create(&spend_limit_config(vec![]), &ctx);
+        drop(guard);
+
+        assert!(built.is_ok(), "a prefetch failure is not a config error");
+        let warnings: Vec<String> = capture
+            .rendered_at_or_above(tracing::Level::WARN)
+            .into_iter()
+            .filter(|line| line.contains("startup spend prefetch failed"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            !warnings[0].contains("key-secret-looking-id") && !warnings[0].contains("tenant-a"),
+            "{}",
+            warnings[0]
         );
     }
 

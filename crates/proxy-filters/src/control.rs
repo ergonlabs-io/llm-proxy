@@ -6371,9 +6371,9 @@ mod tests {
         );
     }
 
-    /// A zero delta is a legal, EXPECTED call -- it is how a replica serving
-    /// no traffic learns what the others spent. It must still consume its
-    /// sequence and still return the true total.
+    /// A zero delta is a legal call (the trait allows it; the accumulator
+    /// reads instead). It must still consume its sequence and still return
+    /// the true total.
     #[test]
     fn a_zero_delta_flush_reads_the_true_total_and_still_advances_the_sequence() {
         let store = InMemoryControlPlaneStore::default();

@@ -360,6 +360,12 @@ fn answer(
         "GET" => bulk_number(STORED_SPEND),
         "HGET" => bulk_number(LAST_SEQ),
         "SET" | "CLIENT" => b"+OK\r\n".to_vec(),
+        // `SCRIPT LOAD` answers the script's hash; the store ignores it.
+        "SCRIPT" => {
+            let mut out = Vec::new();
+            bulk(&mut out, b"0000000000000000000000000000000000000000");
+            out
+        }
         other => format!("-ERR the fake does not expect {other}\r\n").into_bytes(),
     })
 }
@@ -725,6 +731,39 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
             "load_spend",
             Box::new(|| store.load_spend("chain", &tenant, &period).is_ok()),
         ),
+        (
+            "add_spend_batch",
+            Box::new(|| {
+                let row = SpendDelta {
+                    tenant: &tenant,
+                    period: &period,
+                    delta_micros: 5,
+                    seq: 2,
+                };
+                store
+                    .add_spend_batch("chain", "node-a", &[row])
+                    .iter()
+                    .all(Result::is_ok)
+            }),
+        ),
+        (
+            "last_flush_seq_batch",
+            Box::new(|| {
+                store
+                    .last_flush_seq_batch("chain", "node-a", &[(tenant.clone(), period.clone())])
+                    .iter()
+                    .all(Result::is_ok)
+            }),
+        ),
+        (
+            "load_spend_batch",
+            Box::new(|| {
+                store
+                    .load_spend_batch("chain", &[(tenant.clone(), period.clone())])
+                    .iter()
+                    .all(Result::is_ok)
+            }),
+        ),
     ];
 
     // The first call of each tier opens that tier's connection; every other
@@ -957,5 +996,152 @@ fn seeding_a_rate_card_is_one_script_that_names_the_card_and_the_generation() {
     assert_eq!(
         store.put_rate_card_if_absent(&sample_rate_card("chain-a")),
         Ok(false)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spend: pipelines and expiry
+// ---------------------------------------------------------------------------
+
+impl FakeRedis {
+    /// How many times the server has read `command` so far.
+    fn count(&self, command: &str) -> usize {
+        self.shared
+            .lock()
+            .log
+            .iter()
+            .filter(|(_, name)| name == command)
+            .count()
+    }
+}
+
+/// An accumulator over the real store, pointed at the fake.
+fn accumulator_over(fake: &FakeRedis) -> crate::spend::SpendAccumulator {
+    crate::spend::SpendAccumulator::new(
+        "chain".into(),
+        Arc::new(fake.store()),
+        Period::Daily,
+        "node-a".into(),
+    )
+}
+
+/// Review H5's boot: 20k keys used to cost one blocking read per row before
+/// the listener could bind (80k round trips). The rows now go out as
+/// pipelines of a thousand, each led by one `SCRIPT LOAD`, so counting
+/// those counts round trips.
+///
+/// Mutation: set `SPEND_PIPELINE_ROWS` to 1; the round trips equal the
+/// rows again.
+#[test]
+fn a_boot_prefetch_of_20k_keys_reads_in_pipelines_of_a_thousand_rows() {
+    let fake = FakeRedis::start();
+    let accumulator = Arc::new(accumulator_over(&fake));
+    let keys: Vec<KeyId> = (0..20_000)
+        .map(|i| KeyId::new(format!("key-{i}")))
+        .collect();
+
+    let prefetched = {
+        let (accumulator, keys) = (Arc::clone(&accumulator), keys.clone());
+        within("prefetch", move || {
+            accumulator.prepare_request_workers(&keys)
+        })
+    };
+    assert_eq!(prefetched, Ok(()));
+
+    // Today and tomorrow, daily and monthly: 3 distinct rows per key, or 4
+    // on the last day of a month.
+    let reads = fake.count("GET");
+    assert!(
+        reads == 60_000 || reads == 80_000,
+        "one read per distinct row: {reads}"
+    );
+    assert_eq!(
+        fake.count("SCRIPT"),
+        reads / 1000,
+        "one pipeline per 1000 rows"
+    );
+    // The rows landed in memory with the store's total, so serving reads none.
+    let today = Period::Daily.key_for_now();
+    assert_eq!(
+        accumulator.current_total_key(&keys[19_999], &today),
+        STORED_SPEND
+    );
+    assert_eq!(
+        fake.count("GET"),
+        reads,
+        "a prefetched row is never re-read"
+    );
+}
+
+/// One flush tick: the sequence seeds go out as one pipeline and the
+/// deliveries as another, and every delivery carries its period's expiry.
+#[test]
+fn a_flush_pipelines_its_deliveries_and_each_carries_its_periods_expiry() {
+    let fake = FakeRedis::start();
+    let accumulator = accumulator_over(&fake);
+    accumulator
+        .prepare_request_workers(&[])
+        .expect("nothing to read");
+    let now = chrono::Utc::now();
+    for tenant in ["tenant-a", "tenant-b", "tenant-c"] {
+        accumulator.record(
+            &TenantId::new(tenant),
+            now,
+            Period::Daily,
+            crate::spend::Charge::Priced(MicroUsd::from_micros(7)),
+            None,
+            None,
+        );
+    }
+    let mark = fake.wire_len();
+
+    accumulator
+        .flush_now()
+        .expect("the fake accepts every delivery");
+
+    let sent: Vec<Vec<String>> = fake.wire_since(mark).into_iter().map(|(_, a)| a).collect();
+    let names: Vec<&str> = sent.iter().map(|args| args[0].as_str()).collect();
+    assert_eq!(
+        names,
+        ["SCRIPT", "HGET", "HGET", "HGET", "SCRIPT", "EVALSHA", "EVALSHA", "EVALSHA"],
+        "two pipelines: the seeds, then the deliveries"
+    );
+    // The day after `now`, at midnight UTC, plus the 32-day retention.
+    let expires_at = (now.date_naive() + chrono::Duration::days(1 + 32))
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight exists")
+        .and_utc()
+        .timestamp()
+        .to_string();
+    for args in &sent[5..] {
+        // EVALSHA sha 2 spend_key seq_key node seq delta expires_at
+        assert_eq!(args[6], (LAST_SEQ + 1).to_string(), "seeded from the store");
+        assert_eq!(args[7], "7");
+        assert_eq!(args[8], expires_at, "{args:?}");
+    }
+}
+
+/// `SET` drops a key's expiry, so the operator's correction restates it in
+/// the same transaction; without that the corrected row would never expire.
+#[test]
+fn an_operator_overwrite_keeps_the_rows_expiry() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    let period = Period::Monthly.key_for_now();
+    store.policy_generation().expect("policy_generation");
+    let mark = fake.wire_len();
+
+    store
+        .overwrite_spend("chain", &TenantId::new("tenant-a"), &period, 0)
+        .expect("the fake accepts the write");
+
+    let sent: Vec<Vec<String>> = fake.wire_since(mark).into_iter().map(|(_, a)| a).collect();
+    let names: Vec<&str> = sent.iter().map(|args| args[0].as_str()).collect();
+    assert_eq!(names, ["MULTI", "SET", "EXPIREAT", "EXEC"]);
+    assert_eq!(sent[2][1], sent[1][1], "the expiry is on the row just set");
+    assert_eq!(
+        sent[2][2],
+        spend_expires_at(&period).to_string(),
+        "and it is the period's"
     );
 }

@@ -156,7 +156,11 @@ after an ambiguous response remain separate and are delivered on the next
 sequence. A successful checkpoint survives SIGKILL, including during a Redis
 outage. Request workers update memory; they never query the journal or Redis.
 Startup prefetch and the flusher load shared totals. Store and disk I/O do not
-hold the request bucket lock.
+hold the request bucket lock. If the startup prefetch cannot read Redis, the
+listener still starts and logs one warning. Until the first successful flush,
+the rows it could not read count only this replica's spend, so a budget can be
+over-admitted for that time. Redis spend keys expire 32 days after their
+period ends.
 
 This is asynchronous durability. Charges since the last successful journal
 checkpoint remain volatile. A healthy checkpoint loop limits the time window

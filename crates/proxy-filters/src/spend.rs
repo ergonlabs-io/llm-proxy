@@ -107,7 +107,7 @@ mod recovery;
 // use it); this crate had no prior need for wall-clock rendering.
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
-use crate::control::{ControlPlaneStore, FlushToken, StoreError};
+use crate::control::{ControlPlaneStore, SpendDelta, StoreError};
 use crate::usage::TokenUsage;
 use proxy_http::tenant_credentials::CredentialSource;
 
@@ -584,7 +584,7 @@ impl PeriodKey {
     /// for a string that is not one of the two shapes [`Period::key_for`]
     /// renders. Parsed rather than carried so a key read back from a journal
     /// or the store needs no side channel; callers cache the result.
-    fn ends_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) fn ends_at(&self) -> Option<DateTime<Utc>> {
         let (period, start) = match self.0.len() {
             10 => (
                 Period::Daily,
@@ -888,6 +888,21 @@ impl BucketMap {
         self.active.get(key).or_else(|| self.settled.get(key))
     }
 
+    /// Whether `key` is in `active`, moving it back from `settled` first if
+    /// it is there. Never creates a bucket.
+    fn activate(&mut self, key: &BucketKey) -> bool {
+        if self.active.contains_key(key) {
+            return true;
+        }
+        match self.settled.take(key) {
+            Some(bucket) => {
+                self.active.insert(key.clone(), bucket);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Moves a bucket the flusher has just settled out of `active`.
     fn settle(&mut self, key: &BucketKey) {
         if let Some((key, bucket)) = self.active.remove_entry(key) {
@@ -1012,7 +1027,7 @@ struct Inner {
     stat_prefix: String,
     store: Arc<dyn ControlPlaneStore>,
     /// This replica's identity, from `service_node`. Half of every
-    /// [`FlushToken`] this accumulator builds -- see that type's doc for
+    /// [`FlushToken`](crate::control::FlushToken) this accumulator builds -- see that type's doc for
     /// what two replicas sharing one node id cost.
     node_id: String,
     /// The period used ONLY for a tenant with no configured [`TenantBudget`]
@@ -1058,7 +1073,7 @@ struct Inner {
 }
 
 impl Inner {
-    /// Returns the bucket for `(tenant, period_key)`, inserting a freshly
+    /// Locks the buckets with `key`'s bucket in `active`, inserting a freshly
     /// LOADED one on first touch if this process has not seen that period
     /// before. Both [`SpendAccumulator::record`] (which then mutates it)
     /// and [`SpendAccumulator::current_total`] (which only reads it) go
@@ -1066,6 +1081,17 @@ impl Inner {
     /// a fresh period still resumes from the store rather than reporting
     /// zero for spend that already happened -- the "restart resume"
     /// property.
+    ///
+    /// # The store is never read under the buckets mutex
+    ///
+    /// Every completed request takes this mutex to record its charge, so a
+    /// store read under it (up to the store's I/O timeout) would stall every
+    /// worker behind one first touch. A miss therefore releases the mutex,
+    /// reads, relocks, and inserts only if nobody else did meanwhile; a
+    /// bucket that appeared in between wins, and the read is dropped. Request
+    /// workers do not read at all once [`SpendAccumulator::prepare_request_workers`]
+    /// has run: their first touch starts at zero and the next flush adopts
+    /// the store's total (see [`Inner::flush_now`]).
     ///
     /// A load failure here must NOT lose the request it is servicing: this
     /// logs loudly and starts the bucket at zero rather than propagating an
@@ -1082,49 +1108,50 @@ impl Inner {
     /// flush, which is what keeps that late charge from being dropped as a
     /// replay of an earlier one. Readers that must not disturb a settled
     /// bucket look it up with [`BucketMap::get`] first.
-    fn get_or_load_bucket<'a>(
-        &self,
-        buckets: &'a mut BucketMap,
-        tenant: &TenantId,
-        period_key: &PeriodKey,
-    ) -> &'a mut Bucket {
-        use std::collections::hash_map::Entry;
-        // Rust note: `active` and `settled` are borrowed through separate
-        // fields, which the borrow checker accepts at the same time; going
-        // through a `&mut self` method on `BucketMap` would not be.
-        match buckets.active.entry((tenant.clone(), period_key.clone())) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let bucket = buckets
-                    .settled
-                    .take(entry.key())
-                    .unwrap_or_else(|| self.load_new_bucket(tenant, period_key));
-                entry.insert(bucket)
-            }
+    fn lock_with_bucket(&self, key: &BucketKey) -> std::sync::MutexGuard<'_, BucketMap> {
+        let mut buckets = self.lock_buckets();
+        if buckets.activate(key) {
+            return buckets;
         }
-    }
-
-    fn load_new_bucket(&self, tenant: &TenantId, period_key: &PeriodKey) -> Bucket {
-        let total_micros = if self.memory_only_requests.load(Ordering::Relaxed) {
+        let base = if self.memory_only_requests.load(Ordering::Relaxed) {
             0
         } else {
-            match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
-                Ok(total) => total,
-                Err(err) => {
-                    tracing::warn!(
-                        stat_prefix = %self.stat_prefix,
-                        tenant = tenant.as_str(),
-                        period = period_key.as_str(),
-                        error = %err,
-                        "spend accumulator: failed to load the stored total for a new \
-                         period; resuming from zero in this process rather than \
-                         refusing the request"
-                    );
-                    0
-                }
+            drop(buckets);
+            let base = self.load_base(key);
+            buckets = self.lock_buckets();
+            if buckets.activate(key) {
+                return buckets;
             }
+            base
         };
-        Bucket::new(total_micros, period_key)
+        buckets
+            .active
+            .insert(key.clone(), Bucket::new(base, &key.1));
+        buckets
+    }
+
+    fn lock_buckets(&self) -> std::sync::MutexGuard<'_, BucketMap> {
+        self.buckets
+            .lock()
+            .expect("spend accumulator mutex poisoned")
+    }
+
+    fn load_base(&self, (tenant, period_key): &BucketKey) -> u64 {
+        match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
+            Ok(total) => total,
+            Err(err) => {
+                tracing::warn!(
+                    stat_prefix = %self.stat_prefix,
+                    tenant = tenant.as_str(),
+                    period = period_key.as_str(),
+                    error = %err,
+                    "spend accumulator: failed to load the stored total for a new \
+                     period; resuming from zero in this process rather than \
+                     refusing the request"
+                );
+                0
+            }
+        }
     }
 
     /// How long since the last flush in which EVERY bucket was written --
@@ -1210,10 +1237,15 @@ impl Inner {
     /// against its own spend alone, which is the old non-additive behaviour wearing
     /// a new signature.
     ///
-    /// A bucket in a LIVE period with NOTHING to add is flushed anyway, with
-    /// a delta of zero. That is deliberate and is not a wasted call: a
-    /// replica serving no traffic still has to learn what the others spent,
-    /// or it admits requests against a ceiling it thinks is empty. There is
+    /// A bucket in a LIVE period with NOTHING to add still costs one READ
+    /// ([`ControlPlaneStore::load_spend_batch`]) and adopts the total it
+    /// returns. That is deliberate and is not a wasted call: a replica
+    /// serving no traffic still has to learn what the others spent, or it
+    /// admits requests against a ceiling it thinks is empty. It is a read and
+    /// not a zero-delta `add_spend` because a write would take a flush
+    /// sequence and rewrite the dedup row for nothing. The same read is what
+    /// gives a bucket created memory-only after boot (a key minted later, or
+    /// a row the prefetch could not load) its real base within one tick. There is
     /// likewise no single-replica short circuit -- the embedded store
     /// implements the same contract, and skipping the path in embedded mode
     /// would leave the multi-replica path exercised only in production
@@ -1246,13 +1278,18 @@ impl Inner {
     /// 1. One pass under the buckets mutex lists every bucket and freezes the
     ///    ones whose sequence is already seeded. Nothing is copied but the
     ///    keys.
+    ///    A bucket with nothing pending is only listed for a read.
     /// 2. Buckets that have never flushed in this process seed their sequence
-    ///    from the store, one read each, with the mutex released.
+    ///    from the store in one batch, with the mutex released.
     /// 3. With a journal, ONE copy of the map is made and ONE durable commit
     ///    freezes every `(seq, delta)` pair before any remote write. Without
     ///    a journal there is no copy at all.
-    /// 4. Each frozen attempt is delivered, taking the mutex only for the
-    ///    instant it applies that bucket's result.
+    /// 4. The frozen attempts go to the store as one
+    ///    [`ControlPlaneStore::add_spend_batch`] and the reads as one
+    ///    [`ControlPlaneStore::load_spend_batch`], with the mutex released;
+    ///    then one acquisition applies every result. A store with a network
+    ///    hop pipelines each batch, so a tick costs a few round trips however
+    ///    many buckets are live.
     ///
     /// The commit sits after the freeze and before the first delivery, which
     /// is the only position that is load-bearing: if a delivery landed and
@@ -1304,8 +1341,9 @@ impl Inner {
         // with no second hash lookup. The keys are cloned because the guard
         // must be dropped before any I/O, and a borrow into the map cannot
         // outlive it.
-        let mut attempts: Vec<((TenantId, PeriodKey), FlushAttempt)> = Vec::new();
-        let mut unseeded: Vec<(TenantId, PeriodKey)> = Vec::new();
+        let mut attempts: Vec<(BucketKey, FlushAttempt)> = Vec::new();
+        let mut unseeded: Vec<BucketKey> = Vec::new();
+        let mut reads: Vec<BucketKey> = Vec::new();
         {
             let mut buckets = self
                 .buckets
@@ -1314,6 +1352,11 @@ impl Inner {
             // Everything in `active` owes the store a call; settled buckets
             // are not here, so this pass does not grow with them.
             for (key, bucket) in buckets.active.iter_mut() {
+                if bucket.attempt.is_none() && bucket.pending_delta_micros == 0 {
+                    // Nothing to deliver: only learn the total.
+                    reads.push(key.clone());
+                    continue;
+                }
                 match bucket.next_seq {
                     Some(u64::MAX) => {
                         first_err.get_or_insert_with(sequence_exhausted);
@@ -1325,33 +1368,30 @@ impl Inner {
         }
 
         // Step 2.
-        for key in unseeded {
-            let seq =
-                match self
-                    .store
-                    .last_flush_seq(&self.stat_prefix, &key.0, &key.1, &self.node_id)
-                {
-                    Ok(last) => match last.checked_add(1) {
-                        Some(seq) => seq,
-                        None => {
-                            first_err.get_or_insert_with(sequence_exhausted);
-                            continue;
-                        }
-                    },
+        if !unseeded.is_empty() {
+            let seeds =
+                self.store
+                    .last_flush_seq_batch(&self.stat_prefix, &self.node_id, &unseeded);
+            let mut buckets = self
+                .buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned");
+            for (key, seed) in unseeded.into_iter().zip(seeds) {
+                let seq = match seed.map(|last| last.checked_add(1)) {
+                    Ok(Some(seq)) => seq,
+                    Ok(None) => {
+                        first_err.get_or_insert_with(sequence_exhausted);
+                        continue;
+                    }
                     Err(err) => {
                         first_err.get_or_insert(err);
                         continue;
                     }
                 };
-            let mut buckets = self
-                .buckets
-                .lock()
-                .expect("spend accumulator mutex poisoned");
-            let bucket = buckets.active.get_mut(&key).expect("known bucket");
-            bucket.next_seq = Some(seq);
-            let attempt = bucket.freeze(seq);
-            drop(buckets);
-            attempts.push((key, attempt));
+                let bucket = buckets.active.get_mut(&key).expect("known bucket");
+                bucket.next_seq = Some(seq);
+                attempts.push((key, bucket.freeze(seq)));
+            }
         }
 
         // Step 3. A bucket whose seeding failed has no attempt but is still
@@ -1368,49 +1408,81 @@ impl Inner {
             None => None,
         };
 
-        // Step 4.
-        let (mut confirmed_micros, mut cleared_rows) = (0u64, 0u64);
-        for (key, attempt) in attempts {
-            match self.store.add_spend(
-                &self.stat_prefix,
-                &key.0,
-                &key.1,
-                attempt.delta,
-                FlushToken {
-                    node_id: &self.node_id,
+        // Step 4. The deliveries, then the reads, each one batch.
+        let delivered = if attempts.is_empty() {
+            Vec::new()
+        } else {
+            let deltas: Vec<SpendDelta<'_>> = attempts
+                .iter()
+                .map(|(key, attempt)| SpendDelta {
+                    tenant: &key.0,
+                    period: &key.1,
+                    delta_micros: attempt.delta,
                     seq: attempt.seq,
-                },
-            ) {
-                Ok(total) => {
-                    if let Some(rows) = &snapshot {
-                        // What the journal holds for this row is its pending at
-                        // the copy, which is at least the attempt's delta.
-                        let journaled = rows.get(&key).map_or(0, |row| row.pending_delta_micros);
-                        confirmed_micros =
-                            confirmed_micros.saturating_add(attempt.delta.min(journaled));
-                        if attempt.delta > 0 && journaled <= attempt.delta {
-                            cleared_rows += 1;
-                        }
+                })
+                .collect();
+            self.store
+                .add_spend_batch(&self.stat_prefix, &self.node_id, &deltas)
+        };
+        let totals = if reads.is_empty() {
+            Vec::new()
+        } else {
+            self.store.load_spend_batch(&self.stat_prefix, &reads)
+        };
+
+        let (mut confirmed_micros, mut cleared_rows) = (0u64, 0u64);
+        {
+            let mut buckets = self
+                .buckets
+                .lock()
+                .expect("spend accumulator mutex poisoned");
+            for ((key, attempt), result) in attempts.into_iter().zip(delivered) {
+                let total = match result {
+                    Ok(total) => total,
+                    Err(err) => {
+                        first_err.get_or_insert(err);
+                        continue;
                     }
-                    let mut buckets = self
-                        .buckets
-                        .lock()
-                        .expect("spend accumulator mutex poisoned");
-                    let bucket = buckets.active.get_mut(&key).expect("known bucket");
-                    bucket.base_micros = total;
-                    bucket.pending_delta_micros =
-                        bucket.pending_delta_micros.saturating_sub(attempt.delta);
-                    bucket.next_seq = attempt.seq.checked_add(1);
-                    bucket.attempt = None;
-                    // `now` is the tick's start, so this can only under-claim:
-                    // a bucket reconciled after the boundary inside a long
-                    // tick is simply reconciled once more next tick.
-                    if bucket.is_settled(now) {
-                        buckets.settle(&key);
+                };
+                if let Some(rows) = &snapshot {
+                    // What the journal holds for this row is its pending at
+                    // the copy, which is at least the attempt's delta.
+                    let journaled = rows.get(&key).map_or(0, |row| row.pending_delta_micros);
+                    confirmed_micros =
+                        confirmed_micros.saturating_add(attempt.delta.min(journaled));
+                    if attempt.delta > 0 && journaled <= attempt.delta {
+                        cleared_rows += 1;
                     }
                 }
-                Err(err) => {
-                    first_err.get_or_insert(err);
+                let bucket = buckets.active.get_mut(&key).expect("known bucket");
+                bucket.base_micros = total;
+                bucket.pending_delta_micros =
+                    bucket.pending_delta_micros.saturating_sub(attempt.delta);
+                bucket.next_seq = attempt.seq.checked_add(1);
+                bucket.attempt = None;
+                // `now` is the tick's start, so this can only under-claim:
+                // a bucket reconciled after the boundary inside a long tick
+                // is simply reconciled once more next tick.
+                if bucket.is_settled(now) {
+                    buckets.settle(&key);
+                }
+            }
+            for (key, result) in reads.into_iter().zip(totals) {
+                let total = match result {
+                    Ok(total) => total,
+                    Err(err) => {
+                        first_err.get_or_insert(err);
+                        continue;
+                    }
+                };
+                // The store's total leaves out what this replica recorded
+                // since the listing; that stays in `pending_delta_micros` for
+                // the next delivery, so adopting the total counts nothing
+                // twice.
+                let bucket = buckets.active.get_mut(&key).expect("known bucket");
+                bucket.base_micros = total;
+                if bucket.is_settled(now) {
+                    buckets.settle(&key);
                 }
             }
         }
@@ -1551,7 +1623,7 @@ impl SpendAccumulator {
     /// `default_period` is used ONLY for a tenant [`Self::record`] is never
     /// given an explicit period for -- see [`Inner::default_period`]'s doc.
     /// `node_id` MUST be unique per replica -- it is half of every
-    /// [`FlushToken`] this accumulator writes, and two replicas sharing one
+    /// [`FlushToken`](crate::control::FlushToken) this accumulator writes, and two replicas sharing one
     /// id share one dedup sequence space, so each silently drops the other's
     /// flushes. It is a required argument rather than an `Option` with a
     /// default for exactly that reason: a wrong value here loses money
@@ -1631,13 +1703,30 @@ impl SpendAccumulator {
         Ok(self)
     }
 
-    /// Startup prefetch: production request workers never read a store on first touch.
-    /// New keys/windows begin with local state and reconcile on the next flusher tick.
+    /// Startup prefetch: loads today's and tomorrow's daily and monthly rows
+    /// for every key, then puts request workers in memory-only mode, where a
+    /// first touch never reads the store.
+    ///
+    /// All rows go to the store as ONE [`ControlPlaneStore::load_spend_batch`],
+    /// so a store with a network hop answers 20k keys (80k rows) in a few
+    /// pipelined round trips rather than 80k sequential ones (review H5).
+    ///
+    /// # A failed prefetch fails OPEN
+    ///
+    /// Request workers are memory-only afterwards whether or not the reads
+    /// succeeded. A row that could not be read is left out, so its first
+    /// touch starts at zero and the next flush adopts the store's total (the
+    /// flusher reads every live row it owes nothing; see [`Inner::flush_now`]).
+    /// Until then this replica enforces that row against its own accrual
+    /// only, the same exposure as a replica past its reconciliation bound.
+    /// The error is returned so the caller can say so loudly; it is not a
+    /// reason to refuse the config, because a store blip during a rollout
+    /// would otherwise leave the replica with no listener at all.
     pub fn prepare_request_workers(&self, keys: &[KeyId]) -> Result<(), StoreError> {
         self.prepare_request_subjects(keys.iter().map(key_spend_subject))
     }
 
-    /// Load tenant aggregates at startup, before request workers become memory-only.
+    /// [`Self::prepare_request_workers`] for tenant aggregates.
     pub fn prepare_tenant_request_workers(&self, tenants: &[TenantId]) -> Result<(), StoreError> {
         self.prepare_request_subjects(tenants.iter().cloned())
     }
@@ -1647,22 +1736,45 @@ impl SpendAccumulator {
         subjects: impl IntoIterator<Item = TenantId>,
     ) -> Result<(), StoreError> {
         let now = Utc::now();
-        let mut buckets = self
-            .inner
-            .buckets
-            .lock()
-            .expect("spend accumulator mutex poisoned");
-        for subject in subjects {
-            for period in [Period::Daily, Period::Monthly] {
-                for date in [now, now + chrono::Duration::days(1)] {
-                    let row = (subject.clone(), period.key_for(date));
-                    if buckets.get(&row).is_none() {
-                        let total =
-                            self.inner
-                                .store
-                                .load_spend(&self.inner.stat_prefix, &row.0, &row.1)?;
-                        let bucket = Bucket::new(total, &row.1);
-                        buckets.active.insert(row, bucket);
+        let periods: Vec<PeriodKey> = [Period::Daily, Period::Monthly]
+            .into_iter()
+            .flat_map(|period| {
+                [
+                    period.key_for(now),
+                    period.key_for(now + chrono::Duration::days(1)),
+                ]
+            })
+            .collect();
+        let rows: Vec<BucketKey> = {
+            let buckets = self.inner.lock_buckets();
+            let mut seen = std::collections::HashSet::new();
+            subjects
+                .into_iter()
+                .flat_map(|subject| periods.iter().map(move |p| (subject.clone(), p.clone())))
+                .filter(|row| buckets.get(row).is_none() && seen.insert(row.clone()))
+                .collect()
+        };
+        // The store is read with the buckets mutex released.
+        let totals = if rows.is_empty() {
+            Vec::new()
+        } else {
+            self.inner
+                .store
+                .load_spend_batch(&self.inner.stat_prefix, &rows)
+        };
+        let mut first_err = None;
+        {
+            let mut buckets = self.inner.lock_buckets();
+            for (row, total) in rows.into_iter().zip(totals) {
+                match total {
+                    Ok(total) => {
+                        if buckets.get(&row).is_none() {
+                            let bucket = Bucket::new(total, &row.1);
+                            buckets.active.insert(row, bucket);
+                        }
+                    }
+                    Err(err) => {
+                        first_err.get_or_insert(err);
                     }
                 }
             }
@@ -1670,9 +1782,11 @@ impl SpendAccumulator {
         self.inner
             .memory_only_requests
             .store(true, Ordering::Relaxed);
-        Ok(())
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
-
     /// Records one request's charge against `tenant`'s bucket for the
     /// period `now` falls in, under `period` -- see this section's "`record`
     /// takes its `Period` explicitly" note for why the caller supplies this
@@ -1705,15 +1819,9 @@ impl SpendAccumulator {
         // this section's "`record` takes its `Period` explicitly" note; using
         // the accumulator's default here regardless of what was passed is
         // exactly the bug this fixup closes.
-        let period_key = period.key_for(now);
-        let mut buckets = self
-            .inner
-            .buckets
-            .lock()
-            .expect("spend accumulator mutex poisoned");
-        let bucket = self
-            .inner
-            .get_or_load_bucket(&mut buckets, tenant, &period_key);
+        let key = (tenant.clone(), period.key_for(now));
+        let mut buckets = self.inner.lock_with_bucket(&key);
+        let bucket = buckets.active.get_mut(&key).expect("just ensured");
 
         match charge {
             Charge::Priced(amount) => {
@@ -1813,11 +1921,7 @@ impl SpendAccumulator {
     /// the flusher or its state, so the flusher's liveness cannot affect
     /// what it returns.
     pub fn current_total(&self, tenant: &TenantId, period: &PeriodKey) -> u64 {
-        let mut buckets = self
-            .inner
-            .buckets
-            .lock()
-            .expect("spend accumulator mutex poisoned");
+        let buckets = self.inner.lock_buckets();
         // A bucket already in memory answers from where it is, settled or
         // not, so a read never moves one back into the set the flusher
         // visits. Only a miss creates, as a first touch always has. A miss
@@ -1832,7 +1936,9 @@ impl SpendAccumulator {
                 .base_micros
                 .saturating_add(bucket.pending_delta_micros);
         }
-        let bucket = self.inner.get_or_load_bucket(&mut buckets, tenant, period);
+        drop(buckets);
+        let buckets = self.inner.lock_with_bucket(&key);
+        let bucket = &buckets.active[&key];
         // Everything the store has confirmed, plus what this replica has
         // recorded since. Enforcement reads THIS, not the store -- see this
         // section's "Enforcement reads live memory" note -- so a replica
@@ -1939,7 +2045,7 @@ impl SpendAccumulator {
     /// several separate calls.
     ///
     /// A `(tenant, period)` this process has never touched reports ZEROS,
-    /// not an error -- it goes through the same [`Inner::get_or_load_bucket`]
+    /// not an error -- it goes through the same [`Inner::lock_with_bucket`]
     /// [`Self::current_total`] does, which resumes from the store (itself
     /// `0` for a row nothing has ever written, per
     /// [`ControlPlaneStore::load_spend`]'s doc) rather than treating "never
@@ -1983,23 +2089,16 @@ impl SpendAccumulator {
             unpriced_pairs: bucket.unpriced_pairs.iter().cloned().collect(),
             unpriced_pairs_truncated: bucket.unpriced_pairs_truncated,
         };
+        let key = (tenant.clone(), period.clone());
         let from_memory = {
-            let mut buckets = self
-                .inner
-                .buckets
-                .lock()
-                .expect("spend accumulator mutex poisoned");
-            let key = (tenant.clone(), period.clone());
+            let buckets = self.inner.lock_buckets();
             if let Some(bucket) = buckets.get(&key) {
                 Some(view(bucket))
             } else if period.ends_at().is_some_and(|end| end <= now) {
                 None
             } else {
-                Some(view(self.inner.get_or_load_bucket(
-                    &mut buckets,
-                    tenant,
-                    period,
-                )))
+                drop(buckets);
+                Some(view(&self.inner.lock_with_bucket(&key).active[&key]))
             }
         };
         // The store is read with the buckets mutex released.
@@ -2203,7 +2302,7 @@ impl Drop for SpendAccumulator {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn usage(input: u64, cached: u64, cache_creation: u64, output: u64) -> TokenUsage {
@@ -2520,7 +2619,7 @@ mod tests {
     // Periods, the accumulator, and the flusher.
     // ------------------------------------------------------------------
 
-    use crate::control::InMemoryControlPlaneStore;
+    use crate::control::{FlushToken, InMemoryControlPlaneStore};
 
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         use chrono::TimeZone;
@@ -4065,8 +4164,9 @@ mod tests {
     /// a closure on either side of an `add_spend` so a test can interleave
     /// something with a delivery that is genuinely in flight.
     ///
-    /// `pub(super)` so `recovery.rs`'s journal tests drive the same double.
-    pub(super) struct ProbeStore {
+    /// `pub(crate)` so `recovery.rs`'s journal tests and `spend_limit_filter`'s
+    /// prefetch test drive the same double.
+    pub(crate) struct ProbeStore {
         pub(super) inner: InMemoryControlPlaneStore,
         pub(super) add_spend_calls: std::sync::atomic::AtomicUsize,
         pub(super) last_flush_seq_calls: std::sync::atomic::AtomicUsize,
@@ -4082,10 +4182,16 @@ mod tests {
         pub(super) before_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
         /// Runs after an `add_spend` has applied, before it returns.
         pub(super) after_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// `load_spend` fails without reading anything.
+        pub(crate) fail_load_spend: std::sync::atomic::AtomicBool,
+        /// Runs at the start of every `load_spend`.
+        pub(crate) before_load_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Runs after a `load_spend` has read, before it returns.
+        pub(super) after_load_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl ProbeStore {
-        pub(super) fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             Arc::new(ProbeStore {
                 inner: InMemoryControlPlaneStore::default(),
                 add_spend_calls: Default::default(),
@@ -4096,11 +4202,19 @@ mod tests {
                 fail_last_flush_seq: Default::default(),
                 before_add_spend: Mutex::new(None),
                 after_add_spend: Mutex::new(None),
+                fail_load_spend: Default::default(),
+                before_load_spend: Mutex::new(None),
+                after_load_spend: Mutex::new(None),
             })
         }
 
         pub(super) fn add_spend_calls(&self) -> usize {
             self.add_spend_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn load_spend_calls(&self) -> usize {
+            self.load_spend_calls
                 .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
@@ -4202,9 +4316,21 @@ mod tests {
             tenant: &TenantId,
             period: &PeriodKey,
         ) -> Result<u64, StoreError> {
-            self.load_spend_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.load_spend(stat_prefix, tenant, period)
+            use std::sync::atomic::Ordering::SeqCst;
+            self.load_spend_calls.fetch_add(1, SeqCst);
+            if let Some(hook) = self.before_load_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.fail_load_spend.load(SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: load_spend refused".to_string(),
+                ));
+            }
+            let total = self.inner.load_spend(stat_prefix, tenant, period)?;
+            if let Some(hook) = self.after_load_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            Ok(total)
         }
     }
 
@@ -4232,6 +4358,7 @@ mod tests {
         for tenant in ["tenant-a", "tenant-b", "tenant-c"] {
             record_micros(&accumulator, &TenantId::new(tenant), now, 1_000);
         }
+        let first_touch_reads = store.load_spend_calls();
 
         accumulator.inner.flush_at(now).unwrap();
         accumulator.inner.flush_at(now).unwrap();
@@ -4245,10 +4372,121 @@ mod tests {
             "no journal is configured, so no flush may copy the map"
         );
         assert_eq!(
-            store.add_spend_calls(),
-            6,
-            "and the tick still delivered: 3 buckets x 2 ticks, zero deltas included"
+            (
+                store.add_spend_calls(),
+                store.load_spend_calls() - first_touch_reads
+            ),
+            (3, 3),
+            "the first tick delivered the 3 buckets; the second owed nothing, so it \
+             only read their totals"
         );
+    }
+
+    /// A first touch that reads the store must not hold the mutex every
+    /// completed request records under: one slow read would stall every
+    /// worker. The store double parks inside `load_spend` while another
+    /// tenant's charge is recorded; that record must finish while the read
+    /// is still in flight.
+    ///
+    /// Mutation: in `lock_with_bucket`, read the base before dropping the
+    /// guard; the record then waits on the parked read and the test times out.
+    #[test]
+    fn a_first_touch_store_read_does_not_block_other_records() {
+        use std::sync::mpsc;
+        let store = ProbeStore::new();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        *store.before_load_spend.lock().unwrap() = Some(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+        }));
+        let accumulator = Arc::new(accumulator_over(&store));
+        let now = dt(2026, 9, 3, 12, 0, 0);
+
+        let reader = {
+            let accumulator = Arc::clone(&accumulator);
+            std::thread::spawn(move || {
+                accumulator.current_total(&TenantId::new("tenant-a"), &Period::Daily.key_for(now))
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first touch reads the store");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let accumulator = Arc::clone(&accumulator);
+            std::thread::spawn(move || {
+                // A bucket that already exists, so this record reads nothing.
+                accumulator.inner.lock_buckets().active.insert(
+                    (TenantId::new("tenant-b"), Period::Daily.key_for(now)),
+                    Bucket::new(0, &Period::Daily.key_for(now)),
+                );
+                record_micros(&accumulator, &TenantId::new("tenant-b"), now, 5);
+                let _ = done_tx.send(());
+            });
+        }
+        let recorded = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        // The final flush on drop reads too; it must not park.
+        drop(release_tx);
+        assert!(
+            recorded.is_ok(),
+            "a record waited on another tenant's store read"
+        );
+        assert_eq!(reader.join().unwrap(), 0);
+    }
+
+    /// A startup prefetch the store cannot answer fails open: the error is
+    /// returned for the caller to log, request workers are memory-only
+    /// anyway (a charge reads nothing from the store), and the first flush
+    /// after the store recovers corrects the base from the store's total.
+    #[test]
+    fn a_failed_startup_prefetch_still_serves_and_the_next_flush_corrects_the_base() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let store = ProbeStore::new();
+        let key = KeyId::new("key-a");
+        let subject = key_spend_subject(&key);
+        let today = Period::Daily.key_for_now();
+        store
+            .inner
+            .overwrite_spend("test-chain", &subject, &today, 900)
+            .unwrap();
+        let accumulator = accumulator_over(&store);
+
+        store.fail_load_spend.store(true, SeqCst);
+        assert!(
+            accumulator
+                .prepare_request_workers(std::slice::from_ref(&key))
+                .is_err(),
+            "the failure is reported, not swallowed"
+        );
+        let reads = store.load_spend_calls();
+        accumulator.record_key_now(
+            &key,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(5)),
+            None,
+            None,
+        );
+        assert_eq!(
+            store.load_spend_calls(),
+            reads,
+            "serving reads nothing from the store"
+        );
+        assert_eq!(
+            accumulator.current_total_key(&key, &today),
+            5,
+            "until a flush, this replica knows only its own accrual"
+        );
+
+        store.fail_load_spend.store(false, SeqCst);
+        accumulator.flush_now().unwrap();
+        assert_eq!(accumulator.current_total_key(&key, &today), 905);
     }
 
     // --- settling and eviction ---------------------------------------------
@@ -4417,9 +4655,10 @@ mod tests {
         assert_eq!(counts(&accumulator), (0, 0), "and was evicted again");
     }
 
-    /// Live periods keep the zero-delta call (an idle replica must still learn
-    /// what the others spent); an ended period gets exactly one final
-    /// reconciliation and then costs the store nothing.
+    /// A live bucket with nothing to deliver costs a read and no write (an
+    /// idle replica must still learn what the others spent, and a zero-delta
+    /// write would only burn a sequence); an ended period gets exactly one
+    /// final reconciliation and then costs the store nothing.
     ///
     /// Mutation: drop `self.is_ended(now)` from `Bucket::is_settled`, so a
     /// live idle bucket settles and stops syncing.
@@ -4429,28 +4668,35 @@ mod tests {
         let accumulator = accumulator_over(&store);
         let tenant = TenantId::new("tenant-a");
         record_micros(&accumulator, &tenant, dt(2026, 9, 3, 12, 0, 0), 5);
+        let first_touch_reads = store.load_spend_calls();
+        let calls = || {
+            (
+                store.add_spend_calls(),
+                store.load_spend_calls() - first_touch_reads,
+            )
+        };
 
         accumulator
             .inner
             .flush_at(dt(2026, 9, 3, 12, 30, 0))
             .unwrap();
-        assert_eq!(store.add_spend_calls(), 1);
+        assert_eq!(calls(), (1, 0), "the 5 is delivered");
         accumulator
             .inner
             .flush_at(dt(2026, 9, 3, 12, 35, 0))
             .unwrap();
-        assert_eq!(store.add_spend_calls(), 2, "live and idle: still syncs");
+        assert_eq!(calls(), (1, 1), "live and idle: still syncs, by reading");
         accumulator
             .inner
             .flush_at(dt(2026, 9, 4, 0, 10, 0))
             .unwrap();
-        assert_eq!(store.add_spend_calls(), 3, "one final reconciliation");
+        assert_eq!(calls(), (1, 2), "one final reconciliation");
         accumulator
             .inner
             .flush_at(dt(2026, 9, 4, 0, 15, 0))
             .unwrap();
         accumulator.inner.flush_at(dt(2026, 9, 4, 6, 0, 0)).unwrap();
-        assert_eq!(store.add_spend_calls(), 3, "settled, then gone: no calls");
+        assert_eq!(calls(), (1, 2), "settled, then gone: no calls");
         assert_eq!(counts(&accumulator), (0, 0));
     }
 
@@ -4506,9 +4752,9 @@ mod tests {
         );
     }
 
-    /// A charge that arrives while the bucket is mid-delivery must not be
-    /// evicted with it. The store double records one from inside `add_spend`,
-    /// after the delta applied and before the flusher takes the mutex to
+    /// A charge that arrives while the bucket is mid-reconciliation must not
+    /// be evicted with it. The store double records one from inside the final
+    /// `load_spend`, after the read and before the flusher takes the mutex to
     /// settle the bucket: the real interleaving, not a staged state.
     ///
     /// Mutation: remove `self.pending_delta_micros == 0` from
@@ -4531,7 +4777,7 @@ mod tests {
             let weak = Arc::downgrade(&accumulator);
             let tenant = tenant.clone();
             let fired = std::sync::atomic::AtomicBool::new(false);
-            *store.after_add_spend.lock().unwrap() = Some(Box::new(move || {
+            *store.after_load_spend.lock().unwrap() = Some(Box::new(move || {
                 if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     record_micros(&weak.upgrade().unwrap(), &tenant, day, 3);
                 }
@@ -4540,7 +4786,7 @@ mod tests {
 
         // The final reconciliation of the ended period is where it lands.
         accumulator.inner.flush_at(dt(2026, 9, 4, 6, 0, 0)).unwrap();
-        *store.after_add_spend.lock().unwrap() = None;
+        *store.after_load_spend.lock().unwrap() = None;
         assert_eq!(counts(&accumulator), (1, 0), "it still owes the 3");
         assert_eq!(
             store.inner.load_spend("test-chain", &tenant, &key).unwrap(),
@@ -4562,7 +4808,7 @@ mod tests {
     /// the bucket would answer 0. The unpriced detail does not survive
     /// eviction; that is the documented change.
     ///
-    /// Mutation: have `report_at` always call `get_or_load_bucket`.
+    /// Mutation: have `report_at` always call `lock_with_bucket`.
     #[test]
     fn a_report_for_an_ended_period_answers_from_memory_then_from_the_store() {
         let store = ProbeStore::new();
