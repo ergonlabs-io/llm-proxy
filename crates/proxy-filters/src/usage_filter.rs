@@ -2402,6 +2402,9 @@ mod tests {
         assert!(line.ends_with(" 1"), "{line}");
     }
 
+    /// The selected attempt's `(upstream_response_id, upstream_usage)`.
+    type AttemptEvidence = (Option<String>, Option<String>);
+
     /// Run one response through the filter with a selected attempt present,
     /// returning the final stats, the attempt, and the filter's counters.
     fn run_upstream_case(
@@ -2410,7 +2413,7 @@ mod tests {
         body: &[u8],
     ) -> (
         proxy_http::LlmStats,
-        Option<(Option<String>, Option<String>)>,
+        Option<AttemptEvidence>,
         Arc<UsageStats>,
     ) {
         let mut filter = filter_for(dialect);
