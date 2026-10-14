@@ -146,6 +146,13 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::model_authz_filter::ModelAuthzFilterFactory,
         ));
+        // Resolution of the reserved `auto` model. Must be configured AFTER
+        // `llmproxy.auth` and `llmproxy.body_rewrite` and BEFORE
+        // `llmproxy.model_authz`; `check_lane_h_filter_order` enforces all
+        // three. Registering it resolves nothing until a listener configures it.
+        registry.register(Arc::new(
+            proxy_filters::model_resolver_filter::ModelResolverFilterFactory,
+        ));
         // Per-tenant spend-budget
         // enforcement. Decode-check + encode-record, exactly like
         // `llmproxy.token_limit` above -- must be configured AFTER

@@ -130,7 +130,7 @@ pub const MODEL_HEADER_NAME: &str = "x-llmproxy-model";
 /// that doesn't survive `HeaderValue::from_str` (e.g. it contains a raw
 /// newline) is treated the same as "no model": removed, never a failed
 /// request — the module's "never fails a request" rule applies here too.
-fn apply_model_header(headers: &mut HeaderMap, model: Option<&str>) {
+pub(crate) fn apply_model_header(headers: &mut HeaderMap, model: Option<&str>) {
     let name = http::header::HeaderName::from_static(MODEL_HEADER_NAME);
     match model.and_then(|m| HeaderValue::from_str(m).ok()) {
         Some(value) => {

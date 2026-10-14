@@ -97,6 +97,13 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          stop firing"
     );
     assert_eq!(
+        MODEL_RESOLVER,
+        proxy_filters::model_resolver_filter::TYPE_URL,
+        "the model_resolver filter's type URL changed; update `MODEL_RESOLVER_FILTER_TYPE` \
+         in proxy-config/src/lower.rs or every model_resolver ordering rule silently \
+         stops firing"
+    );
+    assert_eq!(
         SPEND_LIMIT,
         proxy_filters::spend_limit_filter::TYPE_URL,
         "the spend_limit filter's type URL changed; update `SPEND_LIMIT_FILTER_TYPE` in \
