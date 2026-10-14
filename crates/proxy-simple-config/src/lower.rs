@@ -30,9 +30,12 @@
 //!   invariant 7); a mismatch is a hard error. An aggregate carries no
 //!   endpoints, TLS, protocol options, or metadata.
 //! - LLM-safe defaults: the total route `timeout` is `0s` (disabled --
-//!   generations are long) and `idle_timeout` (default 90s, per-rule override)
-//!   is the only time guard; this is a deliberate dialect-only divergence from
-//!   Envoy's 15s route default. Retries fire only on
+//!   generations are long). `idle_timeout` (default 90s, per-rule override)
+//!   bounds gaps between response chunks, and the listener's
+//!   `stream_idle_timeout` (default 10m) bounds the wait for the provider's
+//!   response headers, so a provider that accepts and never answers is cut. A
+//!   listener `max_stream_duration` is opt-in. This is a deliberate
+//!   dialect-only divergence from Envoy's 15s route default. Retries fire only on
 //!   connect-failure/refused-stream/reset or status 429/500/502/503, which
 //!   Envoy's router never applies once response bytes have streamed (S3).
 //!   `num_retries` is the rule's `retries.attempts` (default 1), raised to
@@ -2556,6 +2559,7 @@ fn lower_listener(
         ),
     };
     let (headers_timeout, request_timeout) = request_timeouts(config);
+    let (stream_idle_timeout, max_stream_duration) = stream_timeouts(config);
 
     // The listener-level dialect is a fallback that is, in practice,
     // unreachable: every route lowered above carries its own
@@ -2676,6 +2680,13 @@ fn lower_listener(
     // operator disables one (Envoy reads `0s` as disabled).
     hcm["typed_config"]["request_headers_timeout"] = json!(headers_timeout.to_string());
     hcm["typed_config"]["request_timeout"] = json!(request_timeout.to_string());
+    // `stream_idle_timeout` is always emitted for the same reason: unset would
+    // fall back to Envoy's own 5 minute default, not to the dialect's.
+    hcm["typed_config"]["stream_idle_timeout"] = json!(stream_idle_timeout.to_string());
+    if let Some(max) = max_stream_duration {
+        hcm["typed_config"]["common_http_protocol_options"] =
+            json!({ "max_stream_duration": max.to_string() });
+    }
     if let Some(access_log) = access_log {
         hcm["typed_config"]["access_log"] = json!([access_log]);
     }
@@ -2726,6 +2737,18 @@ fn request_timeouts(config: &SimpleConfig) -> (SimpleDuration, SimpleDuration) {
             )),
         spec.and_then(|s| s.request_timeout)
             .unwrap_or(SimpleDuration(crate::model::DEFAULT_REQUEST_TIMEOUT)),
+    )
+}
+
+/// (stream_idle_timeout, max_stream_duration). The second is `None` unless the
+/// operator sets it; `0s` also means no limit.
+fn stream_timeouts(config: &SimpleConfig) -> (SimpleDuration, Option<SimpleDuration>) {
+    let spec = listener_spec(config);
+    (
+        spec.and_then(|s| s.stream_idle_timeout)
+            .unwrap_or(SimpleDuration(crate::model::DEFAULT_STREAM_IDLE_TIMEOUT)),
+        spec.and_then(|s| s.max_stream_duration)
+            .filter(|d| !d.0.is_zero()),
     )
 }
 

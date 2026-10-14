@@ -51,7 +51,7 @@ use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
 use proxy_observability::ResponseFlag;
 
 use crate::handler::{BodyError, StreamBody};
-use crate::router::idle::IdleTimeoutError;
+use crate::router::idle::{IdleTimeoutError, MaxStreamDurationError};
 use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
 use crate::stream_info::StreamInfo;
 use crate::tenant_credentials::CredentialSource;
@@ -414,6 +414,8 @@ impl LoggingBody {
             BodyError::Upstream(source) => {
                 if source.downcast_ref::<IdleTimeoutError>().is_some() {
                     ResponseFlag::StreamIdleTimeout
+                } else if source.downcast_ref::<MaxStreamDurationError>().is_some() {
+                    ResponseFlag::UpstreamMaxStreamDurationReached
                 } else {
                     ResponseFlag::UpstreamConnectionTermination
                 }
@@ -922,7 +924,9 @@ fn metadata_termination(
     } else if flags.iter().any(|f| {
         matches!(
             f,
-            ResponseFlag::StreamIdleTimeout | ResponseFlag::UpstreamRequestTimeout
+            ResponseFlag::StreamIdleTimeout
+                | ResponseFlag::UpstreamRequestTimeout
+                | ResponseFlag::UpstreamMaxStreamDurationReached
         )
     }) {
         Termination::Timeout

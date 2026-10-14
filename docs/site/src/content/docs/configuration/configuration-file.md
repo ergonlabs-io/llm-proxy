@@ -662,8 +662,10 @@ whether the `auth` filter gates this route. Proof:
 | `max_connections` | integer, at least 1 | no | `50000` | The most client connections held open at once, across the whole proxy. The proxy closes a connection over the limit as soon as it accepts it. |
 | `request_headers_timeout` | `Duration` | no | `10s` | Time allowed from a request's first byte to its complete headers. `0s` disables it. Enforced for HTTP/1 only. |
 | `request_timeout` | `Duration` | no | `60s` | Time allowed to receive the whole request, headers and body. Does not bound the response. `0s` disables it. |
+| `stream_idle_timeout` | `Duration` | no | `10m` | How long a request may go with no activity: the wait for the provider's response headers (`408`, flag `SI`) and, on a route with no `idle_timeout`, gaps between response chunks. `0s` disables it. |
+| `max_stream_duration` | `Duration` | no | none | The longest a request may live, however active the stream is. Before response headers the proxy answers `504` (flag `UMSDR`); after, the stream ends without a clean finish. `0s` also means no limit. |
 
-The three limits above default to Envoy's edge-proxy guidance and apply even
+The first three limits above default to Envoy's edge-proxy guidance and apply even
 when `listen` is the shorthand `host:port` form. Envoy-mode config keeps
 Envoy's defaults, which are disabled.
 

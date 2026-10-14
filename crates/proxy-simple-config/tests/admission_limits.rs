@@ -124,3 +124,43 @@ fn malformed_duration_is_rejected() {
         );
     }
 }
+
+/// (stream idle timeout, max stream duration) from the IR.
+fn stream_limits(s: &ConfigSnapshot) -> (Option<Duration>, Option<Duration>) {
+    let listener = &s.listeners["llmproxy_listener"];
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM");
+    };
+    (hcm.stream_idle_timeout, hcm.max_stream_duration)
+}
+
+/// The dialect cuts a silent provider after 10 minutes where Envoy mode keeps
+/// Envoy's 5 minute default, and imposes no overall stream limit.
+#[test]
+fn stream_limits_default_to_a_ten_minute_idle_and_no_total() {
+    let text = config_with_listen(r#""127.0.0.1:8080""#);
+    let expected = (secs(600), None);
+    assert_eq!(stream_limits(&snapshot(&text).unwrap()), expected);
+    assert_eq!(stream_limits(&snapshot_via_translate(&text)), expected);
+}
+
+#[test]
+fn stream_limits_overrides_are_honored() {
+    let text = config_with_listen(
+        r#"{ address: "127.0.0.1:8080", stream_idle_timeout: 90s, max_stream_duration: 30m }"#,
+    );
+    let expected = (secs(90), secs(1800));
+    assert_eq!(stream_limits(&snapshot(&text).unwrap()), expected);
+    assert_eq!(stream_limits(&snapshot_via_translate(&text)), expected);
+}
+
+#[test]
+fn zero_disables_the_stream_limits() {
+    let text = config_with_listen(
+        r#"{ address: "127.0.0.1:8080", stream_idle_timeout: 0s, max_stream_duration: 0s }"#,
+    );
+    let expected = (None, None);
+    assert_eq!(stream_limits(&snapshot(&text).unwrap()), expected);
+    assert_eq!(stream_limits(&snapshot_via_translate(&text)), expected);
+}

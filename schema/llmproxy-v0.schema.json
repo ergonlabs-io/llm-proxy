@@ -169,6 +169,15 @@
           "$ref": "#/$defs/Duration",
           "default": "60s"
         },
+        "stream_idle_timeout": {
+          "description": "How long a request may go with no activity before it is cut. It bounds the wait for the provider's response headers (so a provider that accepts a request and never answers cannot hold the client and a concurrency permit forever) and, on a rule with no `idle_timeout` of its own, the gap between response chunks. Default: 10m, long enough for a non-streaming generation that sends nothing until it finishes. `0s` disables the timeout. Lowers to the HTTP connection manager's `stream_idle_timeout`.",
+          "$ref": "#/$defs/Duration",
+          "default": "10m"
+        },
+        "max_stream_duration": {
+          "description": "The longest a request may live, from receipt to the last response byte, however active the stream is. A cut stream that has already started answering ends without a clean finish. Default: no limit. `0s` also means no limit. Lowers to the HTTP connection manager's `common_http_protocol_options.max_stream_duration`.",
+          "$ref": "#/$defs/Duration"
+        },
         "tls": {
           "description": "Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.",
           "type": "object",

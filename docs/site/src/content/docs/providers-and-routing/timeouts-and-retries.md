@@ -1,9 +1,8 @@
 ---
 title: Timeouts and retries
-summary: The two timeouts a route actually has, exactly which failures
-  trigger a retry, and a real gap worth knowing before you rely on this
-  configuration format alone to bound a slow provider.
-last_updated: 2026-10-13
+summary: The timeouts a route and a listener have, exactly which failures
+  trigger a retry, and what bounds a slow or silent provider.
+last_updated: 2026-10-14
 related:
   - ../providers-and-routing/providers-and-clusters/
   - ../providers-and-routing/failover-and-aggregates/
@@ -15,33 +14,37 @@ related:
 # Timeouts and retries
 
 A route has two independent timeouts, and they bound different things. This
-page covers both, exactly what triggers a same-provider retry, and one gap
-in what this configuration format can bound at all.
+page covers both, the listener's stream limits, and exactly what triggers a
+same-provider retry.
 
-## Caution: nothing bounds the wait for a provider's first response byte
+## The wait for a provider's first response byte: `listen.stream_idle_timeout`
 
-Read this before the rest of the page. `routes[]` has no `timeout` field in
-this schema version — there is only `idle_timeout`, and `idle_timeout` bounds
-gaps in the response **body**, only after headers have already arrived (see
-below). The router's own total-timeout mechanism, `ForwardAction::timeout`,
-does bound "time to response headers", but lowering always emits `timeout:
-"0s"` — this engine's spelling for "disabled" — for every route this configuration
-format produces, deliberately, because LLM generations are long-lived
-(`crates/proxy-simple-config/src/lower.rs`'s `lower_route`/`lower_model`;
-`ForwardAction::timeout`'s doc comment in `crates/proxy-config/src/ir.rs`).
+`routes[]` has no `timeout` field in this schema version, and lowering always
+emits `timeout: "0s"` (disabled) for every route, because LLM generations are
+long-lived. `idle_timeout` only starts once response headers have arrived.
+The bound on the wait for headers is the listener's `stream_idle_timeout`
+(default `10m`, `0s` disables it).
 
-The practical consequence: if a provider accepts a TCP connection and then
-never sends a response at all, nothing in this configuration format ends
-that request. `connect_timeout` has already succeeded (the connection is
-open), and `idle_timeout` has not started (no response has arrived to have
-gaps in). The request hangs until the client itself gives up. This is
-verifiable directly: the router's own test for "connected, then silent
-forever" (`s4_route_timeout_fires_as_a_504` in
-`crates/proxy-http/src/router.rs`) only passes because that test's route sets
-a `timeout` — a field this configuration format's schema does not expose.
-`per_try_timeout` (a per-attempt bound a bootstrap configuration's retry
-policies can set) is likewise not in this schema's `retries` object, which
-carries only `attempts`.
+If a provider accepts a TCP connection and then never answers, the proxy
+answers the client `408` (`stream_idle_timeout`, response flag `SI`) after
+`stream_idle_timeout`. It then releases the provider connection and the
+cluster's concurrency permit. The default is long on purpose: a non-streaming
+generation sends nothing until it finishes. Lower it if you only serve
+streaming traffic.
+
+This cuts the request. It does not fail over to the next provider, because
+`routes[].retries` has no `per_try_timeout`. A hung provider therefore ends
+the request instead of moving to a fallback.
+
+`listen.max_stream_duration` (default: no limit) bounds the whole life of a
+request, however active the stream is. Before response headers the proxy
+answers `504` (`UMSDR`). After headers the stream ends without a clean finish.
+
+Proof: `a_provider_that_never_answers_is_cut_and_its_permit_released`,
+`a_stream_that_keeps_producing_outlives_the_idle_timeout`,
+`a_stream_that_goes_quiet_mid_body_is_cut` and
+`max_stream_duration_cuts_a_stream_that_is_still_producing` in
+`crates/proxy-http/tests/stream_timeouts.rs`.
 
 ## `connect_timeout`: bounds establishing the connection
 
@@ -59,10 +62,9 @@ headers have arrived, a gap longer than `idle_timeout` between response body
 frames — chunks, SSE events, or WebSocket frames — ends the stream, logged as
 the `SI` response flag. The timer resets on every frame, so a long but
 steadily-streaming response never trips it; only a genuine stall does. There
-is deliberately no *total* duration timeout by default (see the caution
-above) — LLM generations are long-lived, so an idle-based guard is the
-correct one for the response direction, and this is the one this
-configuration format actually gives you.
+is deliberately no *total* duration timeout by default
+(`listen.max_stream_duration` is opt-in) — LLM generations are long-lived, so
+an idle-based guard is the correct one for the response direction.
 
 ## What triggers a same-provider retry
 
@@ -136,6 +138,8 @@ detail.
 | TLS handshake | `transport_socket_connect_timeout` (Envoy mode only) | `10s` | The proxy closes the connection. |
 | Request headers | `listen.request_headers_timeout` | `10s` | HTTP/1: the proxy closes the connection, with no `408`. HTTP/2: not enforced. |
 | Whole request | `listen.request_timeout` | `60s` | The proxy answers `408` (`request_overall_timeout`) and closes the HTTP/1 connection. |
+| No activity | `listen.stream_idle_timeout` | `10m` | Before response headers: `408` (`stream_idle_timeout`, flag `SI`). On a route with no `idle_timeout`, also cuts a response body that goes quiet. |
+| Total life | `listen.max_stream_duration` | none | Before response headers: `504` (flag `UMSDR`). After: the stream ends without a clean finish. |
 
 Set a request timeout to `0s` to disable it. The defaults above are the
 `llmproxy` dialect defaults
@@ -145,8 +149,8 @@ handshake default of `10s` applies in both front-ends.
 
 The request timeout stops when the proxy has the whole request body. It does
 not bound the response, so it does not cut a long generation. It also does
-not replace the caution at the top of this page: no timeout bounds the wait
-for the first provider response byte.
+not bound the wait for the provider either: `listen.stream_idle_timeout` does
+that (see above).
 
 ## Retries and fallbacks share one budget
 

@@ -45,9 +45,13 @@
 //!   rewrite. `crate::headers` already implements the functions; this
 //!   router doesn't call them yet.
 //! - Request-direction body idle (bounding gaps in the *downstream* request
-//!   body) and HCM-level `stream_idle_timeout` inheritance -- the IR has no
-//!   HCM `stream_idle_timeout` field yet, so a `None` route `idle_timeout`
-//!   means "no idle timeout" for now, not "inherit the listener's".
+//!   body). HCM `request_timeout` bounds request-body collection instead.
+//!
+//! HCM `stream_idle_timeout` and `max_stream_duration` are enforced one level
+//! up, in `crate::filter_manager`, around this router: it bounds the wait for
+//! response headers and wraps the body this router returns. A route
+//! `idle_timeout` set here wins over the HCM idle for body gaps (divergences
+//! row 29).
 //! - The retry & hedging engine (S3).
 //!
 //! Response flags are recorded onto a per-request

@@ -189,23 +189,6 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   field can only ever be `false` in the IR, and retry.rs's \
                   outcome classifier never consults it.",
     },
-    // The IR for these two lands in its own commit (AGENTS.md invariant 8);
-    // the stream handler reads them in the commit that follows, which deletes
-    // both entries.
-    AllowlistEntry {
-        struct_name: "HttpConnectionManagerConfig",
-        field_name: "stream_idle_timeout",
-        kind: EntryKind::KnownInert,
-        reason: "Lowered from HCM `stream_idle_timeout`; the stream handler reads it \
-                  in the next commit (WP-76).",
-    },
-    AllowlistEntry {
-        struct_name: "HttpConnectionManagerConfig",
-        field_name: "max_stream_duration",
-        kind: EntryKind::KnownInert,
-        reason: "Lowered from HCM `common_http_protocol_options.max_stream_duration`; \
-                  the stream handler reads it in the next commit (WP-76).",
-    },
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "admin",

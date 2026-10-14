@@ -228,6 +228,16 @@ pub struct ListenerSpec {
     /// Unset means 60s; `0s` disables the timeout.
     #[serde(default)]
     pub request_timeout: Option<SimpleDuration>,
+    /// How long a request may go with no activity before it is cut: the wait
+    /// for the provider's response headers, and (on a rule with no
+    /// `idle_timeout` of its own) the gap between response chunks. Unset
+    /// means 10m; `0s` disables the timeout.
+    #[serde(default)]
+    pub stream_idle_timeout: Option<SimpleDuration>,
+    /// The longest a request may live from receipt to the last response byte,
+    /// however active it is. Unset means no limit.
+    #[serde(default)]
+    pub max_stream_duration: Option<SimpleDuration>,
 }
 
 /// Safe edge-proxy defaults for the admission limits, from Envoy's edge
@@ -235,6 +245,10 @@ pub struct ListenerSpec {
 pub const DEFAULT_MAX_CONNECTIONS: u64 = 50_000;
 pub const DEFAULT_REQUEST_HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Long enough for a non-streaming generation that sends nothing until it
+/// finishes, short enough that a provider which accepts and never answers
+/// cannot hold a client and a `max_requests` permit forever.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

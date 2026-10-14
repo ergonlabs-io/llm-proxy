@@ -112,3 +112,76 @@ impl Body for IdleTimeoutBody {
         self.inner.size_hint()
     }
 }
+
+/// The error surfaced through `BodyError::Upstream` when HCM
+/// `max_stream_duration` ends a stream whose headers were already sent.
+///
+/// `pub(crate)` for the same reason as [`IdleTimeoutError`]: `LoggingBody`
+/// downcasts it to record `UMSDR` instead of `UC`.
+#[derive(Debug)]
+pub(crate) struct MaxStreamDurationError;
+
+impl fmt::Display for MaxStreamDurationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "stream exceeded max_stream_duration")
+    }
+}
+
+impl Error for MaxStreamDurationError {}
+
+/// A [`Body`] combinator that fails the stream once `deadline` passes,
+/// however recently a frame arrived. Unlike [`IdleTimeoutBody`] the timer is
+/// never reset, so it also cuts a stream that is still producing data.
+///
+/// The deadline is checked before the inner body is polled: a body that is
+/// always ready would otherwise never yield to the timer.
+pub(crate) struct MaxDurationBody {
+    inner: StreamBody,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    fired: bool,
+}
+
+impl MaxDurationBody {
+    pub(crate) fn new(inner: StreamBody, deadline: std::time::Instant) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline,
+            ))),
+            fired: false,
+        }
+    }
+}
+
+impl Body for MaxDurationBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.fired {
+            return Poll::Ready(None);
+        }
+        if this.inner.is_end_stream() {
+            return Pin::new(&mut this.inner).poll_frame(cx);
+        }
+        if this.sleep.as_mut().poll(cx).is_ready() {
+            this.fired = true;
+            return Poll::Ready(Some(Err(BodyError::Upstream(Box::new(
+                MaxStreamDurationError,
+            )))));
+        }
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.fired || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}

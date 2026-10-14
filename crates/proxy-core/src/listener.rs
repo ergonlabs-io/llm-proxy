@@ -1653,7 +1653,8 @@ fn build_hcm_handler(
     // before any filter runs, as well as filter buffering. A larger body gets a
     // 413 (`decode_buffer_overflow`).
     .with_buffer_limit(buffer_limit_bytes as usize)
-    .with_request_timeout(hcm.request_timeout);
+    .with_request_timeout(hcm.request_timeout)
+    .with_stream_timeouts(hcm.stream_idle_timeout, hcm.max_stream_duration);
     handler = handler.with_gen_ai_latency_stats(runtime.latency_stats.clone());
     if let Some(sink) = runtime.metadata {
         handler = handler.with_request_record_sink(sink.clone());

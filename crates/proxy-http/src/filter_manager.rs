@@ -122,7 +122,7 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Body, Frame};
 use tokio::sync::Notify;
 
-use proxy_config::ir::{AccessLogIR, PerFilterConfig, RouteEntry, RouteTable};
+use proxy_config::ir::{AccessLogIR, PerFilterConfig, RouteActionIR, RouteEntry, RouteTable};
 use proxy_config::ConfigError;
 
 use crate::access_logging::{
@@ -139,9 +139,12 @@ use crate::handler::{
     StreamHandler,
 };
 use crate::route::{match_route, RouteMatch, RouteRequest};
+use crate::router::idle::{IdleTimeoutBody, MaxDurationBody};
 use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
 use crate::stream_info::StreamInfo;
+use proxy_observability::records::Termination;
 use proxy_observability::trace::{SpanSink, TraceContext};
+use proxy_observability::ResponseFlag;
 
 /// Default per-direction buffer limit (Envoy's
 /// `per_connection_buffer_limit_bytes` default is 1 MiB). Overflow of a filter
@@ -433,6 +436,15 @@ pub struct FilterChainHandler {
     /// measured from when this handler receives the request head. `None`
     /// (Envoy's default) disables it.
     request_timeout: Option<std::time::Duration>,
+    /// HCM `stream_idle_timeout`: longest a stream may go without activity.
+    /// Before response headers it bounds the wait for the upstream; after, it
+    /// bounds gaps between body frames on routes with no `idle_timeout` of
+    /// their own. `None` disables it.
+    stream_idle_timeout: Option<std::time::Duration>,
+    /// HCM `common_http_protocol_options.max_stream_duration`: total life of
+    /// a stream, from when this handler receives the request head. `None`
+    /// disables it.
+    max_stream_duration: Option<std::time::Duration>,
     /// S9/HCM: generate `x-request-id` when the request lacks one (Envoy
     /// default true).
     generate_request_id: bool,
@@ -522,6 +534,8 @@ impl FilterChainHandler {
             route_table,
             buffer_limit: DEFAULT_BUFFER_LIMIT,
             request_timeout: None,
+            stream_idle_timeout: None,
+            max_stream_duration: None,
             generate_request_id,
             use_remote_address,
             xff_num_trusted_hops,
@@ -647,6 +661,20 @@ impl FilterChainHandler {
     /// disables it.
     pub fn with_request_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Sets the HCM stream-lifetime bounds: `idle` (`stream_idle_timeout`) and
+    /// `max_duration` (`max_stream_duration`). Unlike `request_timeout` these
+    /// cover the response: `max_duration` cuts even a stream that is still
+    /// producing data, `idle` cuts one that went quiet. `None` disables each.
+    pub fn with_stream_timeouts(
+        mut self,
+        idle: Option<std::time::Duration>,
+        max_duration: Option<std::time::Duration>,
+    ) -> Self {
+        self.stream_idle_timeout = idle;
+        self.max_stream_duration = max_duration;
         self
     }
 
@@ -852,7 +880,11 @@ impl StreamHandler for FilterChainHandler {
                 filters,
                 ctx: ChainCtx::new(stream_info.clone())
                     .with_route_table(self.route_table.clone())
-                    .with_per_route(self.per_route.clone()),
+                    .with_per_route(self.per_route.clone())
+                    .with_stream_limits(StreamLimits {
+                        idle: self.stream_idle_timeout,
+                        deadline: self.max_stream_duration.map(|d| start_instant + d),
+                    }),
                 terminal,
                 buffer_limit: self.buffer_limit,
                 request_deadline: self.request_timeout.map(|t| start_instant + t),
@@ -1096,6 +1128,9 @@ struct ChainCtx {
     /// `per_route_config()` then always returns `None`, the same shape
     /// `route_table: None` gives `route()`.
     per_route: Option<Arc<PerRouteTable>>,
+    /// HCM stream-lifetime bounds, enforced around the terminal in
+    /// [`FilterManager::run`].
+    stream_limits: StreamLimits,
     /// S2.5: a pending `send_local_reply()`, recorded here by
     /// [`DecoderCallbacksAdapter::send_local_reply`] and consumed by `run()`.
     /// First one wins — see that method's doc.
@@ -1172,6 +1207,7 @@ impl ChainCtx {
             route_headers: HeaderMap::new(),
             route: None,
             per_route: None,
+            stream_limits: StreamLimits::default(),
             local_reply: None,
             response_headers_forwarded: false,
             reset_after_headers: false,
@@ -1198,6 +1234,50 @@ impl ChainCtx {
     fn with_per_route(mut self, per_route: Arc<PerRouteTable>) -> Self {
         self.per_route = Some(per_route);
         self
+    }
+
+    fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
+        self.stream_limits = limits;
+        self
+    }
+}
+
+/// HCM `stream_idle_timeout` and `max_stream_duration` for one stream.
+#[derive(Clone, Copy, Default)]
+struct StreamLimits {
+    /// Longest quiet period, `None` for no bound.
+    idle: Option<std::time::Duration>,
+    /// Absolute time the stream must be over by, `None` for no bound.
+    deadline: Option<Instant>,
+}
+
+/// Which stream limit cut a stream.
+enum StreamCut {
+    Idle,
+    MaxDuration,
+}
+
+impl StreamLimits {
+    /// Runs `fut` (the terminal's wait for response headers) under both
+    /// limits. Nothing flows in either direction while it runs: the request
+    /// body is already collected, so the whole wait counts as idle time.
+    async fn bound<F: Future>(self, fut: F) -> Result<F::Output, StreamCut> {
+        let idled = async {
+            match self.idle {
+                Some(idle) => tokio::time::timeout(idle, fut)
+                    .await
+                    .map_err(|_| StreamCut::Idle),
+                None => Ok(fut.await),
+            }
+        };
+        match self.deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), idled)
+                    .await
+                    .unwrap_or(Err(StreamCut::MaxDuration))
+            }
+            None => idled.await,
+        }
     }
 }
 
@@ -1561,9 +1641,45 @@ impl FilterManager {
         }
 
         // --- terminal handler (router) produces the response ---
-        let resp = {
+        //
+        // The HCM stream limits bound the wait for response headers here, and
+        // the body below once they arrive. Dropping the terminal's future on
+        // expiry releases its upstream connection, breaker permit and retry
+        // guard, so a provider that accepts and never answers cannot hold
+        // them.
+        let stream_limits = ctx.stream_limits;
+        let responded = {
             let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
-            terminal.respond(&mut cb).await
+            stream_limits.bound(terminal.respond(&mut cb)).await
+        };
+        let resp = match responded {
+            Ok(resp) => resp,
+            Err(cut) => {
+                let (status, text, details, flag) = match cut {
+                    StreamCut::Idle => (
+                        http::StatusCode::REQUEST_TIMEOUT,
+                        "stream timeout",
+                        "stream_idle_timeout",
+                        ResponseFlag::StreamIdleTimeout,
+                    ),
+                    StreamCut::MaxDuration => (
+                        http::StatusCode::GATEWAY_TIMEOUT,
+                        "stream max duration reached",
+                        "max_stream_duration_reached",
+                        ResponseFlag::UpstreamMaxStreamDurationReached,
+                    ),
+                };
+                {
+                    let mut info = ctx.stream_info.borrow_mut();
+                    info.set_response_flag(flag);
+                    // The dropped terminal could not close its own attempt.
+                    for attempt in &info.attempts {
+                        attempt.borrow_mut().finish(Termination::Timeout);
+                    }
+                }
+                let reply = LocalReply::new(status, text, details);
+                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            }
         };
         // S10: `upgrade` is carried straight through
         // to this function's own return below, past the encode header phase
@@ -1578,6 +1694,25 @@ impl FilterManager {
             mut body,
             upgrade,
         } = resp;
+
+        // Headers are in, so the limits now govern the body. A route
+        // `idle_timeout` already wraps its own body in the router and wins
+        // over the HCM value; `max_stream_duration` always applies. A
+        // tunnelled upgrade has its own idle handling and an empty body here.
+        if upgrade.is_none() {
+            let route_sets_idle = ctx.route.as_ref().is_some_and(|route| {
+                matches!(
+                    &route.action,
+                    RouteActionIR::Forward(fwd) if fwd.idle_timeout.is_some()
+                )
+            });
+            if let Some(idle) = stream_limits.idle.filter(|_| !route_sets_idle) {
+                body = local_boxed(IdleTimeoutBody::new(body, idle));
+            }
+            if let Some(deadline) = stream_limits.deadline {
+                body = local_boxed(MaxDurationBody::new(body, deadline));
+            }
+        }
 
         // --- encode header phase (async: a header hold may need to consume
         // upstream frames to resolve it, S2.2) ---
