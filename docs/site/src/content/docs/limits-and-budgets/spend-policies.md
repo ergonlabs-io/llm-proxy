@@ -10,6 +10,15 @@ counts the spend of every key of one tenant. Each ceiling uses its own UTC
 budget period and counts spend across every model and selected provider. There
 is no per-user budget. A key budget never grants model access.
 
+In the `llmproxy` dialect, an `auth:` block adds `llmproxy.spend_limit` to the
+chain for you, with the `START_KEYS_FRESH` cutover already set (the dialect never
+had legacy tenant budgets), and it prices requests from the `pricing` rate card.
+Set `auth.enforce.spend: false` to leave the filter out. The proxy then warns at
+load, and `PUT /tenants/{id}/budget` returns `409` with
+`{"error":"not_enforced", ...}` instead of storing a budget nothing enforces.
+With `auth:` and no `pricing`, every request costs $0, so the proxy warns that
+budgets cannot fire.
+
 Missing budget means unlimited; an explicit zero denies the first request.
 Charges use integer micro-dollars and the rate card for the provider actually
 dialled, including after fallback. A request that neither the rate card nor the
@@ -79,8 +88,8 @@ you set at runtime with `PUT /tenants/{id}/budget` counts too, so that request
 returns `409` while the serving spend filter lacks the policy. The error names
 `typed_config.legacy_tenant_budget_cutover` and changes nothing, so the problem
 shows when you write the budget and not at the next deploy. Clearing a tenant
-budget (`{"budget": null}`) is always allowed, a chain with no spend filter is
-not checked, and a tenant budget already in the store behaves as before: the
+budget (`{"budget": null}`) is always allowed, setting one on a chain with no spend
+filter returns `409` `not_enforced`, and a tenant budget already in the store behaves as before: the
 next start fails until you set the policy. Key budgets need no cutover.
 
 This selects a deliberate fresh-key cutover while retaining legacy history.

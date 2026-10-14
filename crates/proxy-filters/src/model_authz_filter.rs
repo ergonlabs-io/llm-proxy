@@ -130,6 +130,14 @@ use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 
+/// Marker the factory registers in [`proxy_http::filter::SharedFactoryState`]
+/// under [`TYPE_URL`] so the admin API can tell whether a chain enforces tenant
+/// model policies. The policies themselves live in the `ControlPlane`; this
+/// carries no data, only the fact that the filter is present. Without it
+/// `PUT /tenants/{id}/policy` would be accepted on a chain that never reads it.
+#[derive(Debug)]
+pub struct ModelAuthzEnforced;
+
 /// The single `%RESPONSE_CODE_DETAILS%` value for every denial this filter
 /// issues -- see the module doc's "Fail closed" section for why all four
 /// reasons collapse into one generic string rather than distinguishing them.
@@ -377,6 +385,12 @@ impl HttpFilterFactory for ModelAuthzFilterFactory {
                     ),
                 )
             })?;
+
+        // Register the presence marker. `create` runs once per worker; the
+        // first call wins and the rest read it back, so this is idempotent.
+        ctx.get_or_try_init(TYPE_URL, || {
+            Ok(Arc::new(ModelAuthzEnforced) as Arc<dyn std::any::Any + Send + Sync>)
+        })?;
 
         Ok(Box::new(ModelAuthzInstanceFactory {
             snapshot: control_plane.handle(),

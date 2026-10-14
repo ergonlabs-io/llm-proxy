@@ -184,12 +184,22 @@
         "tenant_credentials": {
           "$ref": "#/$defs/AuthTenantCredentials",
           "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials. Requires a durable `store`, `persistent` or `shared`; with `store` absent or `in_memory` this block is a load error."
-        }
+        },
+        "enforce": { "$ref": "#/$defs/AuthEnforce" }
       },
       "oneOf": [
         { "required": ["hmac_secret"], "not": { "required": ["hmac_secret_file"] } },
         { "required": ["hmac_secret_file"], "not": { "required": ["hmac_secret"] } }
       ]
+    },
+    "AuthEnforce": {
+      "type": "object",
+      "description": "Which tenant controls the proxy enforces when `auth` is set. Both default to `true`. Setting one to `false` removes that filter from the chain and logs a load-time warning; the matching admin writes (`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`) are then refused with 409.",
+      "additionalProperties": false,
+      "properties": {
+        "model_policy": { "type": "boolean", "default": true, "description": "Enforce per-tenant model allow-lists set through the admin API (`llmproxy.model_authz`). A tenant with no policy stays open." },
+        "spend": { "type": "boolean", "default": true, "description": "Enforce per-tenant and per-key spend budgets (`llmproxy.spend_limit`). Cost comes from the `pricing` rate card." }
+      }
     },
     "AuthStore": {
       "type": "object",

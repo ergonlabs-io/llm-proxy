@@ -519,7 +519,30 @@ fn factory_state_with_control_plane() -> (
         TEST_CHAIN_STAT_PREFIX,
         TEST_HMAC_SECRET,
     );
+    register_model_authz_marker(&factory_state, TEST_CHAIN_SCOPE, TEST_CHAIN_STAT_PREFIX);
     (factory_state, handle)
+}
+
+/// Registers the presence marker `ModelAuthzFilterFactory::create` registers,
+/// so policy writes are accepted on this chain.
+fn register_model_authz_marker(
+    factory_state: &Arc<SharedFactoryState>,
+    scope: &str,
+    stat_prefix: &str,
+) {
+    factory_state
+        .get_or_try_init(
+            scope,
+            stat_prefix,
+            proxy_filters::model_authz_filter::TYPE_URL,
+            || {
+                Ok(
+                    Arc::new(proxy_filters::model_authz_filter::ModelAuthzEnforced)
+                        as Arc<dyn std::any::Any + Send + Sync>,
+                )
+            },
+        )
+        .expect("inserting the model_authz marker must not fail");
 }
 
 /// Registers a real [`SpendAccumulator`] into `factory_state` under
@@ -1793,7 +1816,7 @@ async fn put_policy_deny_overrides_allow_and_is_visible_in_snapshot() {
 /// both directions of the endpoint's one request shape.
 #[tokio::test]
 async fn put_budget_sets_reads_back_and_clears() {
-    let (factory_state, handle) = factory_state_with_control_plane();
+    let (factory_state, handle, _spend) = factory_state_with_control_plane_and_spend(Period::Daily);
     let (_server, addr) = start_full(
         snapshot_with_secret(),
         None,
@@ -1966,7 +1989,7 @@ async fn key_spend_read_reports_only_the_requested_key_ledger() {
 /// real HTTP endpoints rather than `ControlPlane` directly.
 #[tokio::test]
 async fn put_budget_and_put_policy_do_not_clobber_each_other() {
-    let (factory_state, handle) = factory_state_with_control_plane();
+    let (factory_state, handle, _spend) = factory_state_with_control_plane_and_spend(Period::Daily);
     let (_server, addr) = start_full(
         snapshot_with_secret(),
         None,
@@ -2054,6 +2077,12 @@ async fn scoped_put_budget_lands_in_the_named_chains_control_plane_and_not_the_o
         "chain-b",
         TEST_HMAC_SECRET,
     );
+    for (scope, name) in [
+        ("listener 'a' filter_chains[0]", "chain-a"),
+        ("listener 'b' filter_chains[0]", "chain-b"),
+    ] {
+        register_spend_accumulator(&factory_state, scope, name, Period::Daily);
+    }
 
     let (_server, addr) = start_full(
         snapshot_with_secret(),

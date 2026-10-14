@@ -790,7 +790,7 @@ async fn handle(
             handle_delete_tenant(&control_plane, id)
         }
         WriteRoute::TenantPolicy(id) | WriteRoute::ScopedTenantPolicy(_, id) => {
-            handle_set_policy(&control_plane, id, &body)
+            handle_set_policy(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
         WriteRoute::TenantBudget(id) | WriteRoute::ScopedTenantBudget(_, id) => {
             handle_set_budget(factory_state, stat_prefix_opt, &control_plane, id, &body)
@@ -1621,6 +1621,25 @@ fn bad_request(message: &str) -> Response<Full<Bytes>> {
     text(StatusCode::BAD_REQUEST, message)
 }
 
+/// 409 for a write the proxy would store but never enforce.
+fn not_enforced(detail: &str) -> Response<Full<Bytes>> {
+    json(
+        StatusCode::CONFLICT,
+        &serde_json::json!({ "error": "not_enforced", "detail": detail }),
+    )
+}
+
+/// Whether the addressed chain (scoped) or any chain (unscoped) runs
+/// `llmproxy.model_authz`, which registers a marker in `factory_state`.
+fn model_authz_enforced(factory_state: &SharedFactoryState, stat_prefix: Option<&str>) -> bool {
+    let type_url = proxy_filters::model_authz_filter::TYPE_URL;
+    match stat_prefix {
+        Some(name) => factory_state.get_by_name(name, type_url).is_some(),
+        // `Err` means several chains registered it, so it is enforced somewhere.
+        None => !matches!(factory_state.get_across_scopes(type_url), Ok(None)),
+    }
+}
+
 fn no_content() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -2342,6 +2361,8 @@ fn handle_delete_tenant_credential(
 }
 
 fn handle_set_policy(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
     control_plane: &ControlPlane,
     tenant: &str,
     body: &[u8],
@@ -2374,6 +2395,13 @@ fn handle_set_policy(
         }
     }
     let access = allow.with_deny(request.deny.into_iter().map(ModelPattern::new).collect());
+    // A policy no filter reads is a silent hole: the write succeeds and the
+    // operator believes the tenant is restricted. Refuse it, naming why.
+    if !model_authz_enforced(factory_state, stat_prefix) {
+        return not_enforced(
+            "no listener chain runs llmproxy.model_authz; tenant policies would not be enforced",
+        );
+    }
     match control_plane.set_policy(&TenantId::new(tenant), &access) {
         Ok(()) => {
             tracing::info!(
@@ -2447,18 +2475,26 @@ fn handle_set_budget(
     // rolling restart would crash-loop every replica, so refuse it at write
     // time, where the operator is looking. Clearing a budget is always fine,
     // and rows already in the store behave as they did.
+    //
+    // A budget no spend filter reads is the same silent hole as an unread
+    // policy, so setting one is refused when the chain has no
+    // `llmproxy.spend_limit`. Clearing stays allowed so an operator can tidy up
+    // after turning enforcement off.
     if budget.is_some() {
-        if let Some(shared) = resolve_spend_shared(factory_state, stat_prefix) {
-            if !shared.legacy_tenant_budget_cutover() {
-                return text(
-                    StatusCode::CONFLICT,
-                    "this chain's llmproxy.spend_limit does not set \
-                     `typed_config.legacy_tenant_budget_cutover`, and without it the next start \
-                     refuses to load a stored tenant budget. Set it to START_KEYS_FRESH on the \
-                     spend filter first (key budgets, PUT /keys/{id}/budget, need no cutover). \
-                     Nothing was changed.",
-                );
-            }
+        let Some(shared) = resolve_spend_shared(factory_state, stat_prefix) else {
+            return not_enforced(
+                "no listener chain runs llmproxy.spend_limit; tenant budgets would not be enforced",
+            );
+        };
+        if !shared.legacy_tenant_budget_cutover() {
+            return text(
+                StatusCode::CONFLICT,
+                "this chain's llmproxy.spend_limit does not set \
+                 `typed_config.legacy_tenant_budget_cutover`, and without it the next start \
+                 refuses to load a stored tenant budget. Set it to START_KEYS_FRESH on the \
+                 spend filter first (key budgets, PUT /keys/{id}/budget, need no cutover). \
+                 Nothing was changed.",
+            );
         }
     }
 

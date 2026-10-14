@@ -318,6 +318,38 @@ pub struct Auth {
     /// (ADR-0007 decision 2). Absent means the proxy cannot seal or open them.
     #[serde(default)]
     pub tenant_credentials: Option<TenantCredentials>,
+    /// Which tenant controls the proxy enforces. Absent means both on.
+    #[serde(default)]
+    pub enforce: AuthEnforce,
+}
+
+/// `auth.enforce`: opt-out switches for the controls that read the admin
+/// store. Both default to `true`, so `auth:` alone enforces tenant model
+/// allow-lists and spend budgets. Setting one to `false` omits that filter
+/// and lowering warns what is left unenforced.
+///
+/// Rust note: `Default` is written by hand because `#[derive(Default)]` would
+/// give `false` for a `bool`, and the safe default here is `true`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthEnforce {
+    #[serde(default = "default_true")]
+    pub model_policy: bool,
+    #[serde(default = "default_true")]
+    pub spend: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AuthEnforce {
+    fn default() -> Self {
+        Self {
+            model_policy: true,
+            spend: true,
+        }
+    }
 }
 
 /// `auth.tenant_credentials`: the key-encryption keys for tenant provider

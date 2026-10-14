@@ -144,7 +144,7 @@ async fn tenant_budget_without_credential_source_is_platform_and_clear_reports_n
 /// and the previously stored budget survives untouched.
 #[tokio::test]
 async fn tenant_budget_with_an_unknown_credential_source_is_400_and_stores_nothing() {
-    let (factory_state, handle) = factory_state_with_control_plane();
+    let (factory_state, handle, _spend) = factory_state_with_control_plane_and_spend(Period::Daily);
     let (_server, addr) = start_full(
         snapshot_with_secret(),
         None,

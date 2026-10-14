@@ -51,13 +51,20 @@ has no spend ceiling (`crates/proxy-filters/src/model_authz.rs:106-108`,
 `budget` field's doc on why `None` means unlimited). Two more `llmproxy.*` filters
 enforce these policies, `llmproxy.model_authz` and `llmproxy.spend_limit`
 (`crates/proxy-filters/src/model_authz_filter.rs`,
-`crates/proxy-filters/src/spend_limit_filter.rs`), and an operator sets a
+`crates/proxy-filters/src/spend_limit_filter.rs`). An operator sets a
 tenant's allow-list or budget through the admin write API — see "Managing
-keys and tenants at runtime" below. None of this reaches the `auth:` block
-itself: `schema/llmproxy-v0.schema.json`'s `Auth` type has no allow-list or
-budget field, so the `llmproxy` dialect cannot pre-configure either from the
-config file. An `auth:` block alone still answers only "who", never "what
-may they do".
+keys and tenants at runtime" below.
+
+In the `llmproxy` dialect, an `auth:` block turns both filters on. You do not
+list them: the config file has no allow-list or budget field, because policies
+and budgets live in the control-plane store and change at runtime. To turn one
+off, set `auth.enforce.model_policy: false` or `auth.enforce.spend: false`
+(both default to `true`). The proxy then logs a warning at load that names what
+is not enforced, and the admin API answers `PUT /tenants/{id}/policy` or
+`PUT /tenants/{id}/budget` with `409` and `{"error":"not_enforced", ...}`
+rather than storing a rule nothing reads. Spend budgets need a `pricing` rate
+card; without one every request costs $0 and a budget never fires, and the
+proxy warns at load.
 
 ## What a virtual key looks like, and how it verifies
 
@@ -438,11 +445,10 @@ running process; a config reload is not.
 
 ## What is not built yet
 
-- **Model allow-lists or budgets from the `llmproxy` dialect's config file.**
-  `schema/llmproxy-v0.schema.json`'s `Auth` type has no such field. Setting
-  either requires the admin write API or a hand-written Envoy-mode
-  `llmproxy.model_authz`/`llmproxy.spend_limit` `typed_config` — see
-  "Managing keys and tenants at runtime" above.
+- **Model allow-lists or budgets written in the `llmproxy` dialect's config
+  file.** `schema/llmproxy-v0.schema.json`'s `Auth` type has no such field.
+  The `auth:` block enforces them, but you set them through the admin write
+  API — see "Managing keys and tenants at runtime" above.
 - **JWT in the `llmproxy` dialect.** `jwt_providers` exists only in the
   `llmproxy.auth` filter of an Envoy-mode bootstrap.
 - **Algorithms other than RS256 for JWT.** The filter rejects them.

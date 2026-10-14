@@ -151,7 +151,7 @@ provider on failover. That has been a real key-disclosure bug here twice.
 - **Authorizes models.** A tenant can be restricted to named models and exclude
   specific models from that grant. The effective access is allow minus deny,
   enforced before routing. It fails closed on an unauthenticated request and
-  defaults to all models for an authenticated tenant with no policy.
+  defaults to all models for an authenticated tenant with no policy. The dialect's `auth:` block turns this on; `auth.enforce.model_policy: false` turns it off, and the admin API then refuses policy writes with `409`.
 
 - **Mints and revokes keys at runtime.** A bearer-gated admin write API creates
   tenants, mints and revokes virtual keys, and sets per-tenant policies and

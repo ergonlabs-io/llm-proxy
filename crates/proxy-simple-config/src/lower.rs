@@ -80,6 +80,14 @@ const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http
 /// in a route's `typed_per_filter_config`.
 const AUTH_FILTER_NAME: &str = "llmproxy.auth";
 
+/// Must equal `proxy_filters::model_authz_filter::TYPE_URL`; pinned by
+/// `tests/auth.rs`. Same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`].
+const MODEL_AUTHZ_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
+
+/// Must equal `proxy_filters::spend_limit_filter::TYPE_URL`; pinned by
+/// `tests/auth.rs`.
+const SPEND_LIMIT_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
+
 /// Longest accepted `auth.keys[].id` / `.tenant`.
 const MAX_PRINCIPAL_ID_BYTES: usize = 128;
 
@@ -303,6 +311,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     // happens to set -- no warning needed here anymore.
 
     let auth_filter = lower_auth(config, &mut warnings)?;
+    warn_unenforced_tenant_controls(config, &mut warnings);
     let token_limit_filter = lower_limits(config, &mut warnings)?;
     let pricing = lower_pricing(config, &mut warnings)?;
 
@@ -371,6 +380,37 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         bootstrap,
         warnings,
     })
+}
+
+/// Load-time warnings for the tenant controls `auth.enforce` switches off, or
+/// that are on but cannot do their job. The admin API still stores policies and
+/// budgets, so an operator who opts out must be told, loudly, what is open.
+fn warn_unenforced_tenant_controls(config: &SimpleConfig, warnings: &mut Vec<ConfigWarning>) {
+    let Some(auth) = &config.auth else {
+        return;
+    };
+    if !auth.enforce.model_policy {
+        warnings.push(warning(
+            "auth.enforce.model_policy",
+            "tenant model allow-lists are NOT enforced: llmproxy.model_authz is omitted, so \
+             every authenticated tenant can call every routed model, and the admin API \
+             refuses PUT /tenants/{id}/policy",
+        ));
+    }
+    if !auth.enforce.spend {
+        warnings.push(warning(
+            "auth.enforce.spend",
+            "spend budgets are NOT enforced: llmproxy.spend_limit is omitted, so tenant and \
+             key budgets never refuse a request, and the admin API refuses \
+             PUT /tenants/{id}/budget",
+        ));
+    } else if config.pricing.is_none() {
+        warnings.push(warning(
+            "pricing",
+            "spend budgets are enforced but no `pricing` rate card is set, so every request \
+             costs zero and a budget never fires; set `pricing` to meter spend",
+        ));
+    }
 }
 
 // -------------------------------------------------------------- pricing --
@@ -1234,7 +1274,28 @@ fn force_usage_reporting(config: &SimpleConfig) -> bool {
 /// turned off still needs the filter present (with `enabled: false`,
 /// so consumer A stays off), just for consumer B.
 fn needs_body_rewrite_filter(config: &SimpleConfig) -> bool {
-    force_usage_reporting(config) || !config.routes.is_empty() || !config.models.is_empty()
+    force_usage_reporting(config)
+        || !config.routes.is_empty()
+        || !config.models.is_empty()
+        // `llmproxy.model_authz` reads the requested model that this filter
+        // publishes; without it every request would look model-less and be
+        // refused, even in a config that otherwise needs no body peek.
+        || enforces_model_policy(config)
+}
+
+/// `auth` is set and `auth.enforce.model_policy` is on: the chain carries
+/// `llmproxy.model_authz`.
+fn enforces_model_policy(config: &SimpleConfig) -> bool {
+    config
+        .auth
+        .as_ref()
+        .is_some_and(|auth| auth.enforce.model_policy)
+}
+
+/// `auth` is set and `auth.enforce.spend` is on: the chain carries
+/// `llmproxy.spend_limit`.
+fn enforces_spend(config: &SimpleConfig) -> bool {
+    config.auth.as_ref().is_some_and(|auth| auth.enforce.spend)
 }
 
 /// Owned `llmproxy.filters.v0.BodyRewrite` `typed_config` for the body-rewrite
@@ -2471,6 +2532,16 @@ fn lower_listener(
             "typed_config": body_rewrite_typed_config(force_usage_reporting(config), default_dialect),
         }));
     }
+    if enforces_model_policy(config) {
+        // After auth (reads `StreamInfo::auth.tenant`) and body_rewrite (reads
+        // the requested model it publishes); decode runs in config order.
+        // `policies` stays empty: live policy comes from the admin store, and
+        // a tenant with no stored policy stays open.
+        http_filters.push(json!({
+            "name": "llmproxy.model_authz",
+            "typed_config": { "@type": MODEL_AUTHZ_FILTER_TYPE_URL },
+        }));
+    }
     if let Some(token_limit_filter) = token_limit_filter {
         // Before `llmproxy.usage` in config order -- S2.1 encoder callbacks
         // run in REVERSE config order, and this filter's encode-side job
@@ -2478,6 +2549,21 @@ fn lower_listener(
         // encode callback to have already run. See
         // `token_limit_filter`'s module doc, "Filter position" section.
         http_filters.push(token_limit_filter);
+    }
+    if enforces_spend(config) {
+        // After auth (tenant) and before usage, whose encode callback runs
+        // first and reports the cost this filter records. Prices come from the
+        // usage filter's rate card, so no `pricing` list is repeated here.
+        // START_KEYS_FRESH is unconditional: the dialect never had legacy
+        // tenant budgets, so there is no history to cut over from, and without
+        // it a stored tenant budget would block the next start.
+        http_filters.push(json!({
+            "name": "llmproxy.spend_limit",
+            "typed_config": {
+                "@type": SPEND_LIMIT_FILTER_TYPE_URL,
+                "legacy_tenant_budget_cutover": "START_KEYS_FRESH",
+            },
+        }));
     }
     let mut usage_config = json!({
         "@type": USAGE_FILTER_TYPE_URL,

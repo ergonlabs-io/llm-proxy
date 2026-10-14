@@ -188,11 +188,32 @@ present at all.
 | `store` | `AuthStore` | no | `in_memory` | Where keys minted through the admin API and tenant policy live. Exactly one of `in_memory: {}`, `persistent: {path}`, or `shared: {url \| url_file, namespace}`. Fixed at startup: changing it takes a restart. |
 | `tenant_credentials` | `AuthTenantCredentials` | required when any `providers` entry sets `tenant_credentials: true`; otherwise no | absent | The key ring that seals tenant provider credentials at rest. Absent means the proxy cannot seal or open them. Requires a durable store, `store.persistent` or `store.shared`: with `store` absent or `in_memory`, this block is a load error at `auth.tenant_credentials`. See the table below. |
 
+| `enforce` | `AuthEnforce` | no | both `true` | Which tenant controls the proxy enforces. See "`auth.enforce`" below. |
+
 `store.persistent.path` is an embedded `redb` file, created if missing; an empty
 path is an error. `store.shared` is Redis: exactly one of `url` (inline, use
 `${ENV_VAR}` for any password) or `url_file` (read at load time, trailing
 newlines trimmed); `namespace` prefixes every Redis key. Config-file `keys` are
 re-seeded on every start and are not written to the store.
+
+### `auth.enforce` (`AuthEnforce`)
+
+With `auth` present, the proxy adds `llmproxy.model_authz` and
+`llmproxy.spend_limit` to the filter chain. Tenant allow-lists and budgets are
+not in the config file; you set them through the admin API
+(`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`). Unknown keys here are
+a load error that names the full path, for example `auth.enforce.model_polcy`.
+
+| Field | Type | Required | Default | What it does |
+|---|---|---|---|---|
+| `model_policy` | boolean | no | `true` | Enforce tenant model allow-lists. A tenant with no policy stays open. `false` omits `llmproxy.model_authz`. |
+| `spend` | boolean | no | `true` | Enforce tenant and key spend budgets. Cost comes from `pricing`. `false` omits `llmproxy.spend_limit`. |
+
+Setting either to `false` logs a load-time warning that names what is not
+enforced. The matching admin write then returns `409` with
+`{"error":"not_enforced","detail":"..."}` instead of storing a rule nothing
+reads. With `spend` on and no `pricing`, every request costs $0 and a budget
+never fires; the proxy warns about that too.
 
 | `AuthKey` field | Type | Required | Default | What it does |
 |---|---|---|---|---|
@@ -245,7 +266,8 @@ routes:
 ```
 
 Authentication fails closed; authorization does not. An authenticated tenant
-with no configured policy may use every model and provider.
+with no configured policy may use every model and provider. Once you set a
+policy for the tenant through the admin API, `auth` enforces it.
 
 ## `limits[]` (`Limit`)
 
