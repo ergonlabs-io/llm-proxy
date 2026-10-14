@@ -11,6 +11,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-14
+
+### Fixed
+
+- Request capture no longer counts two workers admitting at the same moment as
+  `capacity_exceeded`. Admission takes a short lock over in-memory accounting, so the
+  counter only moves when the capture pool is genuinely full.
+- The `listen.stream_idle_timeout` schema description no longer claims it bounds the gap
+  between response chunks; every rule's own `idle_timeout` governs that gap.
+
+Also in this tag: real-binary tests pinning cut-stream charging on upstream reset, idle
+timeout and `max_stream_duration`, and milestone records for the Dynamic configuration
+and Hardening gates, both shipped in tag v0.3.5.
+
 ## [0.3.5] - 2026-10-14
 
 ### Changed
