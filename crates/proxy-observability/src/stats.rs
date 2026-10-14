@@ -4208,6 +4208,43 @@ mod tests {
         assert_eq!(registry.value(back), 1);
     }
 
+    /// The churn drill at the registry boundary: every snapshot renames the
+    /// one cluster and the one listener (as the rename-churn drill does), and
+    /// the exported series count must follow the live set, not the number of
+    /// names ever seen. Counts series (including the previous name still in
+    /// its one-snapshot grace period being hidden), never bytes.
+    #[test]
+    fn series_count_follows_the_live_set_across_renaming_snapshots() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        for cycle in 0..20 {
+            let cluster = format!("cluster-{cycle}");
+            let listener = format!("listener-{cycle}");
+            control.set_live_scope(LiveScope {
+                clusters: names(&[cluster.as_str()]),
+                listeners: names(&[listener.as_str()]),
+                ..LiveScope::default()
+            });
+            let up = control.resolve(&instruments::UPSTREAM_RQ, &[("cluster", cluster.as_str())]);
+            control.resolve(
+                &instruments::DOWNSTREAM_CX_TOTAL,
+                &[("listener", listener.as_str())],
+            );
+            registry.incr(WorkerId(0), up, 1);
+
+            assert_eq!(
+                emitted(&registry, "upstream_rq"),
+                [[("cluster".to_string(), cluster.clone())]],
+                "cycle {cycle}: only the live cluster is exported"
+            );
+            assert_eq!(
+                emitted(&registry, "downstream_cx_total"),
+                [[("listener".to_string(), listener.clone())]],
+                "cycle {cycle}: only the live listener is exported"
+            );
+        }
+    }
+
     #[test]
     fn churning_tenant_names_reuses_slots_instead_of_growing() {
         const ROUNDS: usize = 500;

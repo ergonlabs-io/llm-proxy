@@ -364,6 +364,15 @@ impl Harness {
     }
 }
 
+/// A failed assertion must not leave the proxy running: an orphan keeps the
+/// test binary's output pipe open and hangs `cargo test`.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Requirement (test list item 1): SIGHUP with a valid, CHANGED config takes
 /// effect -- proved by a listener the original config never had becoming
 /// connectable after the reload, not merely by a log line saying so.
@@ -668,6 +677,73 @@ fn sighup_reload_is_reflected_in_config_dump_and_clusters() {
         clusters_after.contains("backend_v2") && !clusters_after.contains("backend_v1"),
         "/clusters must reflect the SIGHUP reload, got:\n{clusters_after}"
     );
+
+    harness.finish();
+}
+
+/// Churn drill over the real binary: every reload renames the cluster, and
+/// `/stats` must follow the live config -- the previous names' series are gone
+/// and the line count stays flat instead of growing by one cluster's series
+/// per reload. Counts series lines, not bytes.
+#[test]
+fn stats_series_follow_the_live_cluster_across_renaming_reloads() {
+    let port = free_port();
+    let admin_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-reload-stats-churn-{}-{}.yaml",
+        std::process::id(),
+        port
+    ));
+    std::fs::write(
+        &config_path,
+        config_with_admin(admin_port, port, "churn_v0"),
+    )
+    .expect("write initial config");
+
+    let mut harness = Harness::spawn(config_path, port);
+    let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    assert!(
+        wait_for_connectable(("127.0.0.1", admin_port), STARTUP_TIMEOUT),
+        "admin server did not become connectable; stderr so far: {:?}",
+        harness.log
+    );
+
+    let series_lines = |body: &str| body.lines().filter(|l| l.contains("churn_v")).count();
+    let first = get(admin_addr, "/stats");
+    let baseline = series_lines(&first);
+    assert!(
+        baseline > 0 && first.contains("churn_v0"),
+        "the boot cluster must have series (else this test proves nothing):\n{first}"
+    );
+
+    for cycle in 1..=5 {
+        let name = format!("churn_v{cycle}");
+        harness.rewrite_config(&config_with_admin(admin_port, port, &name));
+        harness.sighup();
+        let needle = format!("version={}", cycle + 1);
+        assert!(
+            harness.wait_for_log(&needle, RELOAD_TIMEOUT),
+            "cycle {cycle}: expected a successful reload; stderr so far: {:?}",
+            harness.log
+        );
+        let body = get(admin_addr, "/stats");
+        assert!(
+            body.contains(&name),
+            "cycle {cycle}: live cluster missing:\n{body}"
+        );
+        for old in 0..cycle {
+            assert!(
+                !body.contains(&format!("churn_v{old}."))
+                    && !body.contains(&format!("churn_v{old} ")),
+                "cycle {cycle}: series of removed cluster churn_v{old} still exported:\n{body}"
+            );
+        }
+        assert_eq!(
+            series_lines(&body),
+            baseline,
+            "cycle {cycle}: series count must follow the live set:\n{body}"
+        );
+    }
 
     harness.finish();
 }
