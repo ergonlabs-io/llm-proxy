@@ -40,19 +40,23 @@
 //! retries plus safe hedges acquire the same fixed `max_retries` or dynamic
 //! `retry_budget` guard before dispatch.
 //!
-//! Deferred (known feature gaps, not silent drops -- AGENTS.md invariant 1):
-//! - S9 request-header transforms: XFF, `x-request-id`, `:authority`
-//!   rewrite. `crate::headers` already implements the functions; this
-//!   router doesn't call them yet.
-//! - Request-direction body idle (bounding gaps in the *downstream* request
-//!   body). HCM `request_timeout` bounds request-body collection instead.
+//! Deferred (known feature gap, not a silent drop -- AGENTS.md invariant 1):
+//! request-direction body idle (bounding gaps in the *downstream* request
+//! body). HCM `request_timeout` bounds request-body collection instead.
+//!
+//! The S9 request-header transforms are not done here. XFF and
+//! `x-request-id` are applied on decode by `crate::filter_manager` (through
+//! `crate::headers`), and the `:authority` rewrite is the route's
+//! `host_rewrite_literal`, applied by this router.
 //!
 //! HCM `stream_idle_timeout` and `max_stream_duration` are enforced one level
 //! up, in `crate::filter_manager`, around this router: it bounds the wait for
 //! response headers and wraps the body this router returns. A route
 //! `idle_timeout` set here wins over the HCM idle for body gaps (divergences
 //! row 29).
-//! - The retry & hedging engine (S3).
+//!
+//! The retry and hedging engine (S3) lives in `crate::retry` and is driven
+//! from the attempt loop in this file.
 //!
 //! Response flags are recorded onto a per-request
 //! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below --
