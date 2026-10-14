@@ -1193,8 +1193,8 @@ fn resolve_node_id(configured: &str, stat_prefix: &str) -> String {
         node_id = %unique,
         "llmproxy.spend_limit: no service_node is configured, so this replica has no stable \
          identity to write spend under; using a synthesised one. Spend is still counted \
-         correctly, but set service_node in the bootstrap to keep a restarted replica's \
-         identity stable"
+         correctly, but pass --service-node (or set the bootstrap node.id) to a name \
+         unique to this replica and stable across its restarts"
     );
     unique
 }

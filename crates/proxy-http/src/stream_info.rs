@@ -271,6 +271,10 @@ pub struct StreamInfo {
     /// reporting for this request's dialect; read by the router, which
     /// enforces it against the whole buffered body.
     pub force_include_usage: bool,
+    /// Set by the body_rewrite filter when the route caps output tokens; read
+    /// by the router, which clamps or injects the request's output-token
+    /// limit in the whole buffered body. `None` means no cap.
+    pub max_output_tokens: Option<u32>,
     /// The model alias a resolver chose for a request whose `requested_model`
     /// is a resolver trigger such as `auto`, published by
     /// `proxy_filters::model_resolver_filter`. `None` when no resolver ran or
@@ -335,6 +339,7 @@ impl Default for StreamInfo {
             credential_source: None,
             requested_model: None,
             force_include_usage: false,
+            max_output_tokens: None,
             resolved_model: None,
             selected_model: None,
             attempts: Vec::new(),
