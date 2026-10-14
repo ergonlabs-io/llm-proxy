@@ -1085,18 +1085,15 @@ fn accumulator_over(fake: &FakeRedis) -> crate::spend::SpendAccumulator {
 #[test]
 fn a_boot_prefetch_of_20k_keys_reads_in_pipelines_of_a_thousand_rows() {
     let fake = FakeRedis::start();
-    let accumulator = Arc::new(accumulator_over(&fake));
+    let accumulator = accumulator_over(&fake);
     let keys: Vec<KeyId> = (0..20_000)
         .map(|i| KeyId::new(format!("key-{i}")))
         .collect();
 
-    let prefetched = {
-        let (accumulator, keys) = (Arc::clone(&accumulator), keys.clone());
-        within("prefetch", move || {
-            accumulator.prepare_request_workers(&keys)
-        })
-    };
-    assert_eq!(prefetched, Ok(()));
+    // No deadline of its own: nothing here waits on another thread, and a
+    // loaded machine must not fail it on time alone. A hang is nextest's
+    // terminate-after.
+    assert_eq!(accumulator.prepare_request_workers(&keys), Ok(()));
 
     // Today and tomorrow, daily and monthly: 3 distinct rows per key, or 4
     // on the last day of a month.
