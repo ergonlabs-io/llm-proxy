@@ -170,7 +170,7 @@
           "default": "60s"
         },
         "stream_idle_timeout": {
-          "description": "How long a request may go with no activity before it is cut. It bounds the wait for the provider's response headers (so a provider that accepts a request and never answers cannot hold the client and a concurrency permit forever) and, on a rule with no `idle_timeout` of its own, the gap between response chunks. Default: 10m, long enough for a non-streaming generation that sends nothing until it finishes. `0s` disables the timeout. Lowers to the HTTP connection manager's `stream_idle_timeout`.",
+          "description": "How long a request may go with no activity before it is cut. It bounds the wait for the provider's response headers (so a provider that accepts a request and never answers cannot hold the client and a concurrency permit forever). It does not bound the gap between response chunks: every rule carries its own `idle_timeout` (default 90s), which governs that gap once headers arrive. Default: 10m, long enough for a non-streaming generation that sends nothing until it finishes. `0s` disables the timeout. Lowers to the HTTP connection manager's `stream_idle_timeout`.",
           "$ref": "#/$defs/Duration",
           "default": "10m"
         },
