@@ -198,8 +198,8 @@ provider on failover. That has been a real key-disclosure bug here twice.
   backoff, and last-good config retained on failure. Conformance is checked
   against go-control-plane (`make xds-conformance`), not only against our own
   harness — a harness we wrote both sides of cannot catch us agreeing with
-  ourselves and both being wrong. See [Roadmap](#roadmap) for where the v0.3.2
-  gate stands.
+  ourselves and both being wrong. The v0.3.2 gate shipped in tag v0.3.5; see
+  [Roadmap](#roadmap).
 
 ## Build
 
@@ -457,9 +457,9 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.2.0** | Production-ready serving — capacity report, admin endpoints, swap-under-load | Shipped 2026-08-29 |
 | **v0.3.0** | ADS/xDS delivery | Shipped 2026-09-29; tagged with the dynamic-configuration gate still open |
 | **v0.3.1** | Follow-up fixes, OpenRouter defaults, local metadata capture | Shipped 2026-10-09 |
-| **v0.3.2** | Dynamic configuration — the open ADS/xDS gate, plus live-defect fixes | Current; gate open |
+| **v0.3.2** | Dynamic configuration — ADS/xDS gate, plus live-defect fixes | Shipped 2026-10-14 in tag v0.3.5 |
 | **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 |
-| **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Gate open; tags v0.3.4 and v0.3.5 (latest release) carry metering, enforcement and hardening fixes |
+| **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Shipped 2026-10-14 in tag v0.3.5 (latest release) |
 | **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
 | **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
 
