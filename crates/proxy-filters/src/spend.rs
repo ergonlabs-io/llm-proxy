@@ -1716,7 +1716,7 @@ impl SpendAccumulator {
     /// Request workers are memory-only afterwards whether or not the reads
     /// succeeded. A row that could not be read is left out, so its first
     /// touch starts at zero and the next flush adopts the store's total (the
-    /// flusher reads every live row it owes nothing; see [`Inner::flush_now`]).
+    /// flusher reads every live row it owes nothing; see [`Self::flush_now`]).
     /// Until then this replica enforces that row against its own accrual
     /// only, the same exposure as a replica past its reconciliation bound.
     /// The error is returned so the caller can say so loudly; it is not a
