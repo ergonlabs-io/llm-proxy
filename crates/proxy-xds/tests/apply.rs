@@ -385,7 +385,7 @@ fn recording_publisher() -> (Publish, Arc<Mutex<Vec<Arc<ConfigSnapshot>>>>) {
     // body, same idiom as `client::FnHandler` uses for `Validator`.
     let publish: Publish = Box::new(move |snapshot| {
         recorded.lock().unwrap().push(snapshot);
-        Box::pin(std::future::ready(()))
+        Box::pin(std::future::ready(Ok(())))
     });
     (publish, published)
 }
@@ -618,6 +618,53 @@ async fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_p
     assert!(published.lock().unwrap().is_empty());
     assert!(!applier.current().listeners.contains_key("good"));
     assert_eq!(applier.current().version.0, 0);
+}
+
+/// A CDS response that lowers cleanly but whose publish is refused (the
+/// cluster manager could not build one of its clusters) is NACKed with the
+/// refusal as `error_detail`, and every effect of it is discarded (S8). The
+/// negative half is the next, unrelated LDS response: if the refused cluster
+/// set survived in the applier, that LDS publish would carry it and be
+/// refused too, NACKing a valid listener for a CDS fault.
+#[tokio::test]
+async fn a_refused_publish_is_rejected_and_does_not_leak_into_the_next_response() {
+    let published: Arc<Mutex<Vec<Arc<ConfigSnapshot>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&published);
+    let publish: Publish = Box::new(move |snapshot: Arc<ConfigSnapshot>| {
+        let outcome = if snapshot.clusters.contains_key("b") {
+            Err("cds.clusters[b].transport_socket: refused".to_string())
+        } else {
+            recorded.lock().unwrap().push(snapshot);
+            Ok(())
+        };
+        Box::pin(std::future::ready(outcome))
+    });
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let v1 = cds_response("v1", &[minimal_cluster("a", 8080)]);
+    assert_eq!(applier.on_response(&v1).await, Verdict::Accept);
+
+    let v2 = cds_response(
+        "v2",
+        &[minimal_cluster("a", 9090), minimal_cluster("b", 8081)],
+    );
+    assert_eq!(
+        applier.on_response(&v2).await,
+        Verdict::Reject("cds.clusters[b].transport_socket: refused".to_string())
+    );
+    assert_eq!(
+        applier.current().version.0,
+        1,
+        "a refused publish must not move current"
+    );
+
+    let lds = lds_response("v1", &[minimal_listener("l", "a", 10000)]);
+    assert_eq!(applier.on_response(&lds).await, Verdict::Accept);
+    let published = published.lock().unwrap();
+    let last = published.last().expect("the LDS response publishes");
+    assert!(last.listeners.contains_key("l"));
+    assert!(!last.clusters.contains_key("b"));
+    assert_eq!(last.clusters["a"].endpoints[0].port, 8080);
 }
 
 #[tokio::test]

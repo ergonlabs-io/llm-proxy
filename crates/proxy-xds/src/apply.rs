@@ -242,8 +242,17 @@ fn delta_apply_error(type_name: &str, error: DeltaApplyError) -> String {
 /// injected callback, not a dependency on `proxy-core`'s `ConfigPublisher`
 /// directly, so this crate never pulls in the worker runtime; wiring the real
 /// one in is `crates/proxy/src/main.rs`'s job, not this module's.
-pub type Publish =
-    Box<dyn FnMut(Arc<ConfigSnapshot>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+///
+/// It returns `Result` because installing a snapshot can fail after lowering
+/// succeeded: a cluster whose transport socket or load balancer cannot be
+/// built is only discovered by the cluster manager. S8 requires that response
+/// to be NACKed with last-good state kept, so an `Err` here (its message is
+/// the NACK's `error_detail`) rejects the response and restores the applier's
+/// resource sets to what they were before it arrived.
+pub type Publish = Box<
+    dyn FnMut(Arc<ConfigSnapshot>) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send,
+>;
 
 /// Where a newly assembled EDS resource's endpoints go once they lower
 /// cleanly -- the counterpart to [`Publish`] for endpoints, mirroring
@@ -338,7 +347,7 @@ pub type InitializationSink =
 /// silently ignores a field is a footgun anywhere else in this codebase --
 /// safe here only because of the invariant above, which is why it is written
 /// down rather than left for whoever next touches `ir` to rediscover.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Entry<T> {
     raw: Vec<u8>,
     ir: Arc<T>,
@@ -363,6 +372,18 @@ fn same_published_resources(left: &ConfigSnapshot, right: &ConfigSnapshot) -> bo
     same_map(&left.listeners, &right.listeners)
         && same_map(&left.clusters, &right.clusters)
         && same_map(&left.routes, &right.routes)
+}
+
+// Rust note: written by hand because `#[derive(Clone)]` would demand
+// `T: Clone`, and the IR types are deliberately not `Clone`. Cloning an
+// entry only bumps the `Arc`.
+impl<T> Clone for Entry<T> {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw.clone(),
+            ir: Arc::clone(&self.ir),
+        }
+    }
 }
 
 impl<T> PartialEq for Entry<T> {
@@ -416,6 +437,22 @@ fn sds_path(any: &prost_types::Any, index: usize) -> String {
         Ok(s) if !s.name.is_empty() => format!("sds.secrets[{}]", s.name),
         _ => format!("sds.secrets[{index}]"),
     }
+}
+
+/// The response types whose apply ends in a [`Publish`] call, and so can be
+/// refused after their resource sets already changed.
+fn publishes_snapshot(type_url: &str) -> bool {
+    matches!(type_url, CDS_TYPE_URL | LDS_TYPE_URL | RDS_TYPE_URL)
+}
+
+/// Pre-response state [`ResourceApplier::restore`] puts back when a publish
+/// is refused.
+struct PublishCheckpoint {
+    clusters: SotwSet<Entry<ClusterConfig>>,
+    listeners: SotwSet<Entry<ListenerConfig>>,
+    routes: SotwSet<Entry<RouteTable>>,
+    active_dynamic_listeners: std::collections::HashMap<String, Arc<ListenerConfig>>,
+    delta_versions: BTreeSet<(String, String, String)>,
 }
 
 /// Turns accepted `DiscoveryResponse`s into published [`ConfigSnapshot`]s.
@@ -636,6 +673,7 @@ impl ResourceApplier {
     /// [`AdsClient::run_once`](crate::client::AdsClient::run_once) can finish
     /// applying a response before it sends that response's ACK.
     pub async fn on_response(&mut self, resp: &DiscoveryResponse) -> Verdict {
+        let checkpoint = publishes_snapshot(&resp.type_url).then(|| self.checkpoint());
         let verdict = match resp.type_url.as_str() {
             CDS_TYPE_URL => self.on_cds_response(resp).await,
             LDS_TYPE_URL => self.on_lds_response(resp).await,
@@ -644,6 +682,9 @@ impl ResourceApplier {
             RDS_TYPE_URL => self.on_rds_response(resp).await,
             other => Verdict::Reject(format!("unknown ADS type_url `{other}`")),
         };
+        if let (Verdict::Reject(_), Some(checkpoint)) = (&verdict, checkpoint) {
+            self.restore(checkpoint);
+        }
         if verdict == Verdict::Accept {
             self.emit_initialization_event(&resp.type_url).await;
         }
@@ -692,6 +733,7 @@ impl ResourceApplier {
             }
         }
 
+        let checkpoint = publishes_snapshot(&normalized.type_url).then(|| self.checkpoint());
         let verdict = match normalized.type_url.as_str() {
             CDS_TYPE_URL => self.on_delta_cds_response(&normalized).await,
             LDS_TYPE_URL => self.on_delta_lds_response(&normalized).await,
@@ -700,6 +742,9 @@ impl ResourceApplier {
             SDS_TYPE_URL => self.on_delta_sds_response(&normalized).await,
             other => Verdict::Reject(format!("unknown delta ADS type_url `{other}`")),
         };
+        if let (Verdict::Reject(_), Some(checkpoint)) = (&verdict, checkpoint) {
+            self.restore(checkpoint);
+        }
         if verdict == Verdict::Accept {
             self.emit_initialization_event(&response.type_url).await;
         }
@@ -1582,10 +1627,37 @@ impl ResourceApplier {
         self.refresh_active_dynamic_listeners();
         let snapshot = self.assemble_snapshot();
         if !same_published_resources(&self.current, &snapshot) {
-            (self.publish)(Arc::clone(&snapshot)).await;
+            // The caller restores its checkpoint on this rejection, so the
+            // sets this response changed do not outlive the refusal.
+            if let Err(error) = (self.publish)(Arc::clone(&snapshot)).await {
+                return Verdict::Reject(error);
+            }
             self.current = snapshot;
         }
         Verdict::Accept
+    }
+
+    /// Everything a CDS, LDS or RDS response mutates before [`Publish`] can
+    /// refuse it. Cloned per response because S8 makes a refused response
+    /// discard all of its effects: without the restore, a retransmission of
+    /// the same bytes would compare `unchanged` and be ACKed without ever
+    /// having been installed.
+    fn checkpoint(&self) -> PublishCheckpoint {
+        PublishCheckpoint {
+            clusters: self.clusters.clone(),
+            listeners: self.listeners.clone(),
+            routes: self.routes.clone(),
+            active_dynamic_listeners: self.active_dynamic_listeners.clone(),
+            delta_versions: self.delta_versions.clone(),
+        }
+    }
+
+    fn restore(&mut self, checkpoint: PublishCheckpoint) {
+        self.clusters = checkpoint.clusters;
+        self.listeners = checkpoint.listeners;
+        self.routes = checkpoint.routes;
+        self.active_dynamic_listeners = checkpoint.active_dynamic_listeners;
+        self.delta_versions = checkpoint.delta_versions;
     }
 
     /// Return all routes known to the staged resource sets. RDS resources are
@@ -1794,7 +1866,7 @@ mod tests {
         let recorded = Arc::clone(&published);
         let publish: Publish = Box::new(move |snapshot| {
             recorded.lock().unwrap().push(snapshot);
-            Box::pin(std::future::ready(()))
+            Box::pin(std::future::ready(Ok(())))
         });
         (publish, published)
     }

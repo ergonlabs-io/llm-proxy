@@ -1347,7 +1347,7 @@ async fn run_serve(
                     for (name, err) in rejected {
                         tracing::error!(cluster = %name, error = %err, "ADS: cluster rejected during startup");
                     }
-                    let _ = reply.send(());
+                    let _ = reply.send(Ok(()));
                 } else {
                     ads_apply_rx = None;
                 }
@@ -1454,7 +1454,7 @@ async fn run_serve(
                     // cancelled, e.g. mid-shutdown) must not panic this loop
                     // -- `send` returning `Err` just means nobody is waiting
                     // for the reply any more.
-                    let _ = reply.send(());
+                    let _ = reply.send(Ok(()));
                 }
                 None => {
                     // Reachable ONLY when the ADS task dropped its sender,
@@ -1995,7 +1995,23 @@ const SDS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.transport_socke
 /// loop for one accepted `DiscoveryResponse`: an owned snapshot to apply, and
 /// the oneshot half the loop replies on once it actually has (see
 /// `start_ads`'s doc for why the callback awaits the reply before resolving).
-type AdsApplyMsg = (ConfigSnapshot, oneshot::Sender<()>);
+///
+/// The reply is the apply outcome: `Err` carries the NACK `error_detail` for
+/// a snapshot the control loop refused to install (S8 keeps last-good).
+type AdsApplyMsg = (ConfigSnapshot, oneshot::Sender<Result<(), String>>);
+
+/// The NACK detail for a response the control loop never answered. A loop
+/// that went away (shutdown) did not apply the snapshot, so the response must
+/// not be ACKed.
+const CONTROL_LOOP_GONE: &str = "the proxy's control loop stopped before applying this response";
+
+/// What a dynamic-resource publish resolves to once the control loop has
+/// answered.
+async fn await_apply_reply(reply_rx: oneshot::Receiver<Result<(), String>>) -> Result<(), String> {
+    reply_rx
+        .await
+        .unwrap_or_else(|_| Err(CONTROL_LOOP_GONE.to_string()))
+}
 
 /// Tracks Envoy's initial dependency chain. A deadline releases workers from
 /// startup gating, but never changes any cluster's initialization state.
@@ -2183,9 +2199,10 @@ fn start_filesystem_ads(
                 snapshot.version,
             );
             let (reply_tx, reply_rx) = oneshot::channel();
-            if apply_tx.send((owned, reply_tx)).await.is_ok() {
-                let _ = reply_rx.await;
+            if apply_tx.send((owned, reply_tx)).await.is_err() {
+                return Err(CONTROL_LOOP_GONE.to_string());
             }
+            await_apply_reply(reply_rx).await
         })
     });
     let initialization_sink: InitializationSink = Box::new(move |event| {
@@ -2407,9 +2424,9 @@ fn start_ads(
             if apply_tx.send((owned, reply_tx)).await.is_err() {
                 // The control loop only ever drops its receiver by falling
                 // out of `run_serve`'s select loop at shutdown -- if this
-                // fires, the process is already on its way down and there is
-                // nothing left to apply.
-                return;
+                // fires, the process is already on its way down and nothing
+                // was applied, so the response is not ACKed.
+                return Err(CONTROL_LOOP_GONE.to_string());
             }
             // Apply-then-ACK (S8): this future does not resolve until the
             // control loop has actually applied the snapshot --
@@ -2435,7 +2452,7 @@ fn start_ads(
             // compiler can require. Left open deliberately, and the harm is
             // bounded: a control plane believes config is live fractionally
             // early, which is an S8 conformance point, not a serving defect.
-            let _ = reply_rx.await;
+            await_apply_reply(reply_rx).await
         })
     });
 
