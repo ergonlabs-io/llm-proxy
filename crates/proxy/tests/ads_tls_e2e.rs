@@ -353,12 +353,20 @@ async fn an_untrusted_control_plane_certificate_never_streams_and_logs_why() {
     let mut proxy = Proxy::spawn(&config);
     let line = proxy.wait_for_line(&["ADS TLS handshake with the control plane failed"]);
     assert!(
-        line.contains("WARN") && line.contains("xds_cluster"),
-        "the failure must be a warning naming the cluster: {line}"
+        line.contains("WARN")
+            && line.contains("xds_cluster")
+            && line.contains("invalid peer certificate"),
+        "the failure must be a warning naming the cluster and the TLS cause: {line}"
     );
+    // The proxy logs its side of the failure before the harness reads the
+    // proxy's alert, so the count is polled, bounded.
+    let deadline = Instant::now() + WAIT;
+    while harness.tls_handshake_failures() == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         harness.tls_handshake_failures() >= 1,
-        "the harness must have seen the proxy's handshake fail"
+        "the harness must have seen the proxy's handshake fail; proxy line: {line}"
     );
     assert!(
         harness.log.snapshot().is_empty(),
