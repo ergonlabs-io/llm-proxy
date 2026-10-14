@@ -1531,15 +1531,28 @@ impl RouterHandler {
                     requested_model.as_deref(),
                     &mut attempt_head,
                 );
-                let attempt_body_bytes = match rewrite_cluster_provider_model(
-                    attempt_entry
-                        .provider_runtime()
-                        .map(|runtime| runtime.model_rewrites.as_slice()),
+                // Deny runs per attempt, after the member is chosen, because
+                // a fallback can be a provider with a stricter policy. A deny
+                // is a final answer, not a retryable failure: the request
+                // itself is what the operator refuses for that provider, and
+                // failing over from a 400 would quietly send the same body to
+                // another provider that never saw the refusal.
+                let attempt_body_bytes = match prepare_attempt_body(
+                    attempt_entry.provider_runtime(),
                     requested_model.as_deref(),
                     &body_bytes,
                 ) {
                     Ok(body) => body,
-                    Err(err) => {
+                    Err(BodyRefusal::FieldNotPermitted(field)) => {
+                        tracing::warn!(cluster = %attempt_cluster, field = %field, "request field not permitted by cluster policy");
+                        dcb.stream_info().response_code_details =
+                            Some("request_field_not_permitted".to_string());
+                        return local_reply(
+                            StatusCode::BAD_REQUEST,
+                            &format!("request field not permitted: {field}"),
+                        );
+                    }
+                    Err(BodyRefusal::Invalid(err)) => {
                         tracing::warn!(cluster = %attempt_cluster, error = %err, "provider model rewrite failed");
                         return local_reply(
                             StatusCode::BAD_REQUEST,
@@ -2604,43 +2617,137 @@ fn reconcile_request_body(
         .map_err(|_| "request body could not be serialized")
 }
 
-/// Replace the top-level JSON `model` only after the final upstream cluster
-/// is known. The model selected for routing remains in `StreamInfo`; this
-/// changes only the body sent to the selected provider.
-fn rewrite_cluster_provider_model(
-    mappings: Option<&[proxy_config::ir::ProviderModelRewrite]>,
+/// Why the selected cluster's body preparation refused the request.
+enum BodyRefusal {
+    /// A `request_field_policy.deny` key is present.
+    FieldNotPermitted(String),
+    /// The body could not be rewritten (not JSON, not an object, model
+    /// disagreement).
+    Invalid(String),
+}
+
+/// Top-level keys present in a body that the cluster policy names. Only keys
+/// the policy cares about are recorded; every value is skipped unparsed.
+struct PolicyKeyScan {
+    denied: Option<String>,
+    strip_present: bool,
+}
+
+fn scan_policy_keys(
+    policy: &proxy_config::ir::RequestFieldPolicy,
+    body: &[u8],
+) -> Result<PolicyKeyScan, String> {
+    // Rust note: a `DeserializeSeed`-free way to walk a map is a hand-written
+    // `Visitor`; `IgnoredAny` makes serde validate and discard each value
+    // without building a `Value` tree.
+    struct Scan<'a>(&'a proxy_config::ir::RequestFieldPolicy);
+    impl<'de, 'a> serde::de::Visitor<'de> for Scan<'a> {
+        type Value = PolicyKeyScan;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut scan = PolicyKeyScan {
+                denied: None,
+                strip_present: false,
+            };
+            // `Cow<str>` keys are unescaped, so `"mod\u0065ls"` matches `models`
+            // exactly as the provider's decoder would see it.
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if scan.denied.is_none() && self.0.deny.iter().any(|d| d == key.as_ref()) {
+                    scan.denied = Some(key.into_owned());
+                } else if self.0.strip.iter().any(|d| d == key.as_ref()) {
+                    scan.strip_present = true;
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(scan)
+        }
+    }
+    use serde::Deserializer as _;
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let scan = de
+        .deserialize_map(Scan(policy))
+        .map_err(|err| format!("request body is not a JSON object: {err}"))?;
+    de.end()
+        .map_err(|err| format!("request body is not valid JSON: {err}"))?;
+    Ok(scan)
+}
+
+/// Build the body for the selected cluster: enforce its request-field policy
+/// and apply its model rewrite. The model selected for routing remains in
+/// `StreamInfo`; this changes only the bytes sent to the selected provider.
+///
+/// A policy-free cluster forwards the body untouched. With a policy, one key
+/// scan decides; the body is parsed into a `Value` and reserialized only when
+/// a key must be stripped or the model rewrite applies, and then once for both.
+fn prepare_attempt_body(
+    runtime: Option<&proxy_config::ir::ProviderRuntimeConfig>,
     requested_model: Option<&str>,
     body: &Bytes,
-) -> Result<Bytes, String> {
-    let Some(requested_model) = requested_model else {
+) -> Result<Bytes, BodyRefusal> {
+    let policy = runtime
+        .map(|runtime| &runtime.request_field_policy)
+        .filter(|policy| !policy.is_empty());
+    let upstream_model = requested_model.and_then(|requested| {
+        runtime.and_then(|runtime| {
+            runtime
+                .model_rewrites
+                .iter()
+                .find(|mapping| provider_model_pattern_matches(&mapping.pattern, requested))
+                .map(|mapping| mapping.upstream_model.as_str())
+        })
+    });
+
+    let mut must_strip = false;
+    if let Some(policy) = policy {
+        let scan = scan_policy_keys(policy, body).map_err(BodyRefusal::Invalid)?;
+        if let Some(field) = scan.denied {
+            return Err(BodyRefusal::FieldNotPermitted(field));
+        }
+        must_strip = scan.strip_present;
+    }
+    if !must_strip && upstream_model.is_none() {
         return Ok(body.clone());
-    };
-    let Some(upstream_model) = mappings.and_then(|mappings| {
-        mappings
-            .iter()
-            .find(|mapping| provider_model_pattern_matches(&mapping.pattern, requested_model))
-            .map(|mapping| mapping.upstream_model.as_str())
-    }) else {
-        return Ok(body.clone());
-    };
+    }
 
     let mut value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|err| format!("request body is not valid JSON: {err}"))?;
+        .map_err(|err| BodyRefusal::Invalid(format!("request body is not valid JSON: {err}")))?;
     let object = value
         .as_object_mut()
-        .ok_or_else(|| "request body must be a JSON object".to_string())?;
-    match object.get("model").and_then(serde_json::Value::as_str) {
-        Some(model) if model == requested_model => {}
-        Some(_) => return Err("request model disagrees with routed model".to_string()),
-        None => return Err("request body has no model field".to_string()),
+        .ok_or_else(|| BodyRefusal::Invalid("request body must be a JSON object".to_string()))?;
+    if must_strip {
+        if let Some(policy) = policy {
+            for field in &policy.strip {
+                object.remove(field);
+            }
+        }
     }
-    object.insert(
-        "model".to_string(),
-        serde_json::Value::String(upstream_model.to_string()),
-    );
+    if let (Some(requested_model), Some(upstream_model)) = (requested_model, upstream_model) {
+        match object.get("model").and_then(serde_json::Value::as_str) {
+            Some(model) if model == requested_model => {}
+            Some(_) => {
+                return Err(BodyRefusal::Invalid(
+                    "request model disagrees with routed model".to_string(),
+                ))
+            }
+            None => {
+                return Err(BodyRefusal::Invalid(
+                    "request body has no model field".to_string(),
+                ))
+            }
+        }
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(upstream_model.to_string()),
+        );
+    }
     serde_json::to_vec(&value)
         .map(Bytes::from)
-        .map_err(|err| format!("request body could not be serialized: {err}"))
+        .map_err(|err| BodyRefusal::Invalid(format!("request body could not be serialized: {err}")))
 }
 
 fn path_segment(value: &str) -> String {
@@ -3823,16 +3930,19 @@ mod tests {
 
     #[test]
     fn selected_provider_model_rewrite_changes_only_the_upstream_body() {
-        let mappings = [proxy_config::ir::ProviderModelRewrite {
-            pattern: "fast-*".to_string(),
-            upstream_model: "provider-fast-v2".to_string(),
-        }];
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "fast-*".to_string(),
+                upstream_model: "provider-fast-v2".to_string(),
+            }],
+            Default::default(),
+        );
         let body = Bytes::from_static(
             br#"{"model":"fast-alias","messages":[{"role":"user","content":"hi"}]}"#,
         );
 
-        let rewritten = rewrite_cluster_provider_model(Some(&mappings), Some("fast-alias"), &body)
-            .expect("selected provider model rewrite must succeed");
+        let rewritten = prepare_attempt_body(Some(&runtime), Some("fast-alias"), &body)
+            .unwrap_or_else(|_| panic!("selected provider model rewrite must succeed"));
 
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap()["model"],
@@ -3847,19 +3957,152 @@ mod tests {
 
     #[test]
     fn provider_model_rewrite_requires_the_body_to_match_the_routed_model() {
-        let mappings = [proxy_config::ir::ProviderModelRewrite {
-            pattern: "fast-*".to_string(),
-            upstream_model: "provider-fast-v2".to_string(),
-        }];
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "fast-*".to_string(),
+                upstream_model: "provider-fast-v2".to_string(),
+            }],
+            Default::default(),
+        );
 
-        let err = rewrite_cluster_provider_model(
-            Some(&mappings),
+        let Err(BodyRefusal::Invalid(err)) = prepare_attempt_body(
+            Some(&runtime),
             Some("fast-alias"),
             &Bytes::from_static(br#"{"model":"client-spoofed"}"#),
-        )
-        .expect_err("a rewrite cannot turn an unverified body into an upstream request");
+        ) else {
+            panic!("a rewrite cannot turn an unverified body into an upstream request");
+        };
 
         assert!(err.contains("disagrees"), "unexpected error: {err}");
+    }
+
+    fn runtime_with(
+        model_rewrites: Vec<proxy_config::ir::ProviderModelRewrite>,
+        request_field_policy: proxy_config::ir::RequestFieldPolicy,
+    ) -> proxy_config::ir::ProviderRuntimeConfig {
+        proxy_config::ir::ProviderRuntimeConfig {
+            credential: None,
+            path_template: None,
+            model_rewrites,
+            request_field_policy,
+            tenant_credential: None,
+        }
+    }
+
+    fn policy(deny: &[&str], strip: &[&str]) -> proxy_config::ir::RequestFieldPolicy {
+        proxy_config::ir::RequestFieldPolicy {
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            strip: strip.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn prepare(
+        runtime: &proxy_config::ir::ProviderRuntimeConfig,
+        model: Option<&str>,
+        body: &'static str,
+    ) -> Result<Bytes, BodyRefusal> {
+        prepare_attempt_body(Some(runtime), model, &Bytes::from_static(body.as_bytes()))
+    }
+
+    #[test]
+    fn deny_refuses_a_listed_top_level_key_and_names_it() {
+        let runtime = runtime_with(Vec::new(), policy(&["models"], &[]));
+        let Err(BodyRefusal::FieldNotPermitted(field)) =
+            prepare(&runtime, None, r#"{"model":"a","models":["a","b"]}"#)
+        else {
+            panic!("expected a denial");
+        };
+        assert_eq!(field, "models");
+    }
+
+    #[test]
+    fn deny_compares_keys_after_json_unescaping() {
+        let runtime = runtime_with(Vec::new(), policy(&["models"], &[]));
+        assert!(matches!(
+            prepare(&runtime, None, r#"{"mod\u0065ls":["b"]}"#),
+            Err(BodyRefusal::FieldNotPermitted(_))
+        ));
+    }
+
+    #[test]
+    fn deny_looks_at_top_level_keys_only() {
+        let runtime = runtime_with(Vec::new(), policy(&["models"], &[]));
+        let body = r#"{"model":"a","metadata":{"models":["b"]}}"#;
+        let out = prepare(&runtime, None, body).unwrap_or_else(|_| panic!("nested key allowed"));
+        assert_eq!(&out[..], body.as_bytes());
+    }
+
+    #[test]
+    fn policy_with_a_non_object_body_is_refused() {
+        let runtime = runtime_with(Vec::new(), policy(&["models"], &[]));
+        for body in ["[1]", "not json", r#"{"a":1} trailing"#] {
+            assert!(
+                matches!(prepare(&runtime, None, body), Err(BodyRefusal::Invalid(_))),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_policy_does_not_parse_or_touch_the_body() {
+        let runtime = runtime_with(Vec::new(), Default::default());
+        let out = prepare(&runtime, None, "not json at all").unwrap_or_else(|_| panic!("no-op"));
+        assert_eq!(&out[..], b"not json at all");
+    }
+
+    #[test]
+    fn strip_removes_only_the_named_key() {
+        let runtime = runtime_with(Vec::new(), policy(&[], &["plugins"]));
+        let out = prepare(
+            &runtime,
+            None,
+            r#"{"model":"a","plugins":[{"id":"web"}],"messages":[1]}"#,
+        )
+        .unwrap_or_else(|_| panic!("strip must succeed"));
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value, serde_json::json!({"model":"a","messages":[1]}));
+    }
+
+    #[test]
+    fn strip_with_the_key_absent_forwards_the_exact_bytes() {
+        let runtime = runtime_with(Vec::new(), policy(&[], &["plugins"]));
+        let body = "{ \"model\" :  \"a\" }";
+        let out = prepare(&runtime, None, body).unwrap_or_else(|_| panic!("ok"));
+        assert_eq!(&out[..], body.as_bytes());
+    }
+
+    #[test]
+    fn strip_and_model_rewrite_apply_in_one_pass() {
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "fast-*".to_string(),
+                upstream_model: "up".to_string(),
+            }],
+            policy(&[], &["plugins"]),
+        );
+        let out = prepare(
+            &runtime,
+            Some("fast-x"),
+            r#"{"model":"fast-x","plugins":[1]}"#,
+        )
+        .unwrap_or_else(|_| panic!("ok"));
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value, serde_json::json!({"model":"up"}));
+    }
+
+    #[test]
+    fn deny_wins_over_a_model_rewrite() {
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "*".to_string(),
+                upstream_model: "up".to_string(),
+            }],
+            policy(&["route"], &[]),
+        );
+        assert!(matches!(
+            prepare(&runtime, Some("m"), r#"{"model":"m","route":"x"}"#),
+            Err(BodyRefusal::FieldNotPermitted(_))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
