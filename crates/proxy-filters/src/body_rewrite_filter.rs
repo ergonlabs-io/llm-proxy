@@ -356,10 +356,11 @@ enum State {
 struct BodyRewriteFilterInstance {
     config: BodyRewriteConfig,
     state: State,
-    /// Whether the request path takes `stream_options.include_usage`. Only
-    /// the (chat) completions APIs do: the Responses and Messages APIs
-    /// report usage on every stream unasked, and OpenAI's Responses API
-    /// rejects the field outright.
+    /// Whether the request path takes `stream_options.include_usage`. The
+    /// Responses and Messages APIs report usage on every stream unasked, and
+    /// OpenAI's Responses API rejects the field outright, so those two are
+    /// excluded. Every other path keeps the option, so an unrecognized path
+    /// errs toward metering.
     takes_usage_option: bool,
 }
 
@@ -411,7 +412,8 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // directly rather than through `modify_decoded_headers` -- that
         // callback is a no-op called from inside `decode_headers` itself
         // (see its doc); this parameter IS the live request head.
-        self.takes_usage_option = headers.uri.path().ends_with("/completions");
+        let path = headers.uri.path();
+        self.takes_usage_option = !(path.ends_with("/responses") || path.ends_with("/messages"));
         if end_stream || !is_json_content_type(&headers.headers) {
             apply_model_header(&mut headers.headers, None);
             cb.clear_route_cache();
