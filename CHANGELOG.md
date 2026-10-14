@@ -11,8 +11,47 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-13
+
+Fixes from a production metering review of an OpenRouter deployment run in config mode,
+plus auto model resolution and the capture spool view. The "Hardening" milestone gate is
+not closed by this tag.
+
+### Changed
+
+- With `auth` configured, the config dialect now runs `llmproxy.model_authz` and
+  `llmproxy.spend_limit`, so tenant model policies and budgets written through the admin
+  API are enforced. A tenant with no policy or budget stays open.
+  `auth.enforce: {model_policy, spend}` turns either off, with a load-time warning.
+- `PUT /tenants/{id}/policy` and `PUT /tenants/{id}/budget` answer `409 not_enforced` when
+  no listener chain runs the enforcing filter, instead of storing a value nothing reads.
+- A request whose body has two `model` keys (including a JSON-escaped one), or whose body
+  `model` differs from the routed model, is refused with `400` on every route, not only
+  on routes that rewrite the provider model.
+- With `force_usage_reporting`, a streaming request always gets usage reporting, including
+  when the client sends `include_usage: false`, spells `stream` with a JSON escape, or
+  places it beyond the scan window. The Responses and Messages APIs are left alone; they
+  report usage unasked.
+- Pricing uses the model the provider says it served when the rate card has an entry for
+  it; the spend charge uses the same cost. Counted in
+  `llmproxy_usage_served_model_repriced_total`.
+- Tenant and key ids longer than 128 bytes are refused at mint and at config load.
+- `--drain-strategy` warns only when the flag is given.
+
 ### Added
 
+- `providers.<name>.request_fields: {deny, strip}` (Envoy mode: `request_field_policy`
+  under the cluster's `io.llmproxy.provider_auth` metadata): a generic top-level
+  request-body field policy, applied per attempt to the provider actually dialled.
+  `deny` answers `400 request_field_not_permitted`. The OpenRouter importer and example
+  deny `models`, `route`, `plugins` and `transforms`.
+- `auto` model resolution (`llmproxy.model_resolver`, the dialect's `auto` block) and the
+  `%LLM_RESOLVED_MODEL%` access-log operator.
+- `%LLM_SERVED_MODEL%` access-log operator and `served_model` on attempt records. The
+  dialect's default formats carry `llm_served_model` and `llm_credential_source`.
+- Metering counters: `envoy_llmproxy_usage_oversized_body_unmetered_total`, record
+  admission outcomes `oversize` and `invalid`, `llmproxy_metadata_dropped{reason="drained_after_close"}`
+  and `llmproxy_access_log_write_failures`.
 - `GET /capture/spool/stats` and `GET /capture/spool/records?after=&limit=` show the
   capture agent's spool. Records are end-user metadata, so they need the admin token
   (`LLMPROXY_ADMIN_TOKEN`), like the spend read. Stats need no token; the proxy caches
@@ -34,6 +73,21 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   unreachable or recovers, and once when stats are off because the grant lacks
   `"inspect": true` or the agent needs an upgrade.
 - The admin UI has a Capture tab with the spool stats and a paged table of stored records.
+
+### Fixed
+
+- `POST /v1/responses` and `POST /v1/messages` on an OpenAI-compatible provider now
+  record usage and cost (the usage parser is chosen from the request path).
+- OpenAI-format `prompt_tokens_details.cache_write_tokens` is billed at the cache-write
+  rate instead of the input rate.
+- JSON responses over 1 MiB are metered from a bounded tail of the body; when the usage
+  object is not in it, the miss is counted and logged instead of passing silently.
+- Oversized and invalid request records are no longer counted as a full queue, and a
+  record that failed validation in access logging is no longer dropped uncounted.
+
+Also in this tag: downstream admission limits, DNS cluster re-resolution, pool draining
+for removed endpoints, per-host in-flight counts for `LEAST_REQUEST`, stats slot reclamation,
+rate-card persistence, and off-thread access-log writes. See the git log for details.
 
 ## [0.3.3] - 2026-10-11
 

@@ -14,7 +14,7 @@ and cluster policy on top of it, not a parallel system.
 
 [![CI](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Version: v0.3.3](https://img.shields.io/badge/version-v0.3.3-blue.svg)
+![Version: v0.3.4](https://img.shields.io/badge/version-v0.3.4-blue.svg)
 ![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
@@ -28,7 +28,7 @@ cargo run -p proxy -- --config examples/llmproxy.yaml --mode translate  # print 
 
 > [!NOTE]
 > **The data plane serves real traffic; workspace qualification passed 2,335 tests.**
-> `v0.3.3` is the current release; dynamic configuration remains partially complete.
+> `v0.3.4` is the current release; dynamic configuration remains partially complete.
 > Interfaces still change between releases and there are no backports to earlier
 > tags. Read [What is not built yet](#what-is-not-built-yet) before you depend
 > on it — that section is deliberately specific — and
@@ -340,7 +340,7 @@ Re-run the same command to upgrade. It keeps the existing configuration,
 secrets, and admin token. Pass options after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.3.3 --port 8080 --admin-port 8081
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.3.4 --port 8080 --admin-port 8081
 ```
 
 | Option | Effect |
@@ -458,8 +458,8 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.3.0** | ADS/xDS delivery | Shipped 2026-09-29; tagged with the dynamic-configuration gate still open |
 | **v0.3.1** | Follow-up fixes, OpenRouter defaults, local metadata capture | Shipped 2026-10-09 |
 | **v0.3.2** | Dynamic configuration — the open ADS/xDS gate, plus live-defect fixes | Current; gate open |
-| **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 (latest release) |
-| **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Planned |
+| **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 |
+| **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Gate open; tag v0.3.4 (latest release) carries metering and enforcement fixes |
 | **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
 | **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
 
