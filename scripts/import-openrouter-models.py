@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Import OpenRouter's model catalog into an explicit local llm-proxy config."""
+"""Import OpenRouter's model catalog into an explicit local llm-proxy config.
+
+The generated `openrouter` provider carries `request_fields.deny` for the
+body fields below. OpenRouter accepts them to pick other models, enable paid
+plugins, or rewrite prompts, and they bypass the proxy's model authorization,
+which only sees the `model` the client names. Edit the generated file if you
+want to allow any of them.
+"""
 import argparse
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -8,6 +15,18 @@ import json
 import os
 from pathlib import Path
 import urllib.request
+
+
+# Top-level body fields denied on the generated provider. Operator config for
+# this importer's output only; the proxy itself has no provider presets.
+DENIED_REQUEST_FIELDS = ['models', 'route', 'plugins', 'transforms']
+
+
+def provider_block():
+    return {
+        'api_key': '${OPENROUTER_API_KEY}',
+        'request_fields': {'deny': list(DENIED_REQUEST_FIELDS)},
+    }
 
 
 def billing_entry(entry):
@@ -96,7 +115,7 @@ def main():
         raise ValueError('no exact input/output token rate cards available')
     config = {
         'version': 0, 'listen': '127.0.0.1:8080', 'admin': '127.0.0.1:9901',
-        'providers': {'openrouter': {'api_key': '${OPENROUTER_API_KEY}'}},
+        'providers': {'openrouter': provider_block()},
         'routes': [],
         'models': {model: {'providers': [{'provider': 'openrouter', 'model': model}]} for model in ids},
         'pricing': {'catalog': snapshot, 'price_list': {

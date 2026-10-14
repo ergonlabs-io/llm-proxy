@@ -426,6 +426,25 @@
           "type": "string",
           "pattern": "^/",
           "description": "Upstream path of the zero-cost GET that checks a tenant key when it is saved, e.g. `/api/v1/key`. Requires `tenant_credentials: true`. Defaults when unset and `base_url` is unset: `/api/v1/key` for `openrouter`, `/v1/models` for `openai` and `anthropic`; no default for other types, and none when `base_url` is set. Sent as is, without the cluster path rewrite."
+        },
+        "request_fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Generic top-level request-body field policy for this provider, enforced per attempt against whichever provider is actually dialled (so it holds on failover). A name must not appear in both lists.",
+          "properties": {
+            "deny": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Top-level body keys that make the request fail with 400 `request_field_not_permitted`."
+            },
+            "strip": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Top-level body keys removed before the request is sent to this provider."
+            }
+          }
         }
       },
       "not": {

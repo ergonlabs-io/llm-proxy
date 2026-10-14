@@ -238,6 +238,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+The example denies the `models`, `route`, `plugins`, and `transforms` body fields on the OpenRouter provider: OpenRouter honors them to run other models or paid plugins, and they bypass the proxy's model authorization. Remove entries from `request_fields.deny` to allow them.
+
 The example listens only on loopback and has no downstream authentication. The
 OpenRouter key comes from the environment and replaces downstream authorization
 on the provider cluster. Live requests use your OpenRouter account and may incur

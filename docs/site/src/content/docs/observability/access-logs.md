@@ -62,7 +62,7 @@ key_id="%LLM_KEY_ID%" tenant="%LLM_TENANT%" user_id="%LLM_USER_ID%"
 requested_model="%LLM_REQUESTED_MODEL%" selected_provider="%UPSTREAM_CLUSTER%"
 selected_model="%LLM_SELECTED_MODEL%" rate_card_version="%LLM_RATE_CARD_VERSION%"
 llm_list_cost_nanodollars="%LLM_LIST_COST%"
-llm_credential_source="%LLM_CREDENTIAL_SOURCE%"
+llm_credential_source="%LLM_CREDENTIAL_SOURCE%" llm_served_model="%LLM_SERVED_MODEL%"
 ```
 
 The real format is one line that ends with a newline. The block above is
@@ -75,8 +75,8 @@ flags" below. A dash in `llm_tokens="-/-/-/-/-"` is not a zero. A dash means
 the provider reported no usage for this exchange. That is a different fact
 from "zero tokens were used". Do not confuse the two on a billing dashboard.
 
-Neither fixed format includes `%LLM_CREDENTIAL_SOURCE%`. To log it, use Envoy
-mode. See [Tenant provider credentials](../../authentication/tenant-provider-credentials/#access-log).
+Both fixed formats include `%LLM_CREDENTIAL_SOURCE%` and `%LLM_SERVED_MODEL%`.
+See [Tenant provider credentials](../../authentication/tenant-provider-credentials/#access-log).
 
 ## JSON format
 
@@ -108,15 +108,15 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `llm_ttft_ms`, `llm_tpot_ms`, `llm_max_stall_ms`, `llm_response_chunks` | `%LLM_TTFT%`, `%LLM_TPOT%`, `%LLM_MAX_STALL%`, `%LLM_RESPONSE_CHUNKS%` |
 | `llm_key_id`, `llm_tenant`, `llm_user_id` | `%LLM_KEY_ID%`, `%LLM_TENANT%`, `%LLM_USER_ID%` |
 | `llm_requested_model`, `llm_selected_model` | `%LLM_REQUESTED_MODEL%`, `%LLM_SELECTED_MODEL%` |
-| `llm_rate_card_version` | `%LLM_SERVED_MODEL%` | The `model` the provider's response says it served, which can be a dated snapshot of the selected model or a different model. The cost is computed at this model when the rate card lists it for the provider; otherwise at the selected model. `-` when the response named none. |
-| `%LLM_RATE_CARD_VERSION%` |
+| `llm_rate_card_version` | `%LLM_RATE_CARD_VERSION%` |
 | `llm_list_cost_nanodollars` | `%LLM_LIST_COST%` |
 | `llm_credential_source` | `%LLM_CREDENTIAL_SOURCE%` (`platform` or `tenant`) |
+| `llm_served_model` | `%LLM_SERVED_MODEL%`: the `model` the provider's response says it served, which can be a dated snapshot of the selected model or a different model. The cost is computed at this model when the rate card lists it for the provider; otherwise at the selected model. `-` when the response named none. |
 
 The text format uses the same names without the `llm_` prefix for `key_id`,
 `tenant`, `user_id`, `requested_model`, `selected_model`, and
 `rate_card_version`. The names `selected_provider`,
-`llm_list_cost_nanodollars`, and `llm_credential_source` are the same in both formats.
+`llm_list_cost_nanodollars`, `llm_credential_source`, and `llm_served_model` are the same in both formats.
 
 ### Envoy mode: `log_format`
 

@@ -183,7 +183,8 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "requested_model=\"%LLM_REQUESTED_MODEL%\" selected_provider=\"%UPSTREAM_CLUSTER%\" ",
     "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
     "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\" ",
-    "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\"\n",
+    "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\" ",
+    "llm_served_model=\"%LLM_SERVED_MODEL%\"\n",
 );
 
 /// The header Anthropic requires on every Messages API request.
@@ -804,6 +805,12 @@ fn lower_provider(
         provider_auth["tenant_credential"] =
             tenant_credential_slot(config, name, provider, provider_type)?;
     }
+    // Every cluster lowered from this provider gets the policy, aggregate
+    // members included (AGENTS.md invariant 6): the policy follows the
+    // provider actually dialled, not the route.
+    if let Some(fields) = &provider.request_fields {
+        provider_auth["request_field_policy"] = request_field_policy(name, fields)?;
+    }
     let mut path_template = None;
     match provider_type {
         ProviderType::Vertex => {
@@ -1028,6 +1035,34 @@ fn api_key_header(provider_type: ProviderType) -> (&'static str, &'static str) {
         ProviderType::AzureOpenai => ("api-key", ""),
         _ => ("authorization", "Bearer "),
     }
+}
+
+/// `providers.<name>.request_fields` as the `request_field_policy` metadata
+/// object. Empty names and a name in both lists are refused here, at the
+/// dialect path, rather than later at the metadata path.
+fn request_field_policy(
+    name: &str,
+    fields: &crate::model::RequestFields,
+) -> Result<serde_json::Value, ConfigError> {
+    for (list, names) in [("deny", &fields.deny), ("strip", &fields.strip)] {
+        for (i, field) in names.iter().enumerate() {
+            if field.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field_path: format!("providers.{name}.request_fields.{list}[{i}]"),
+                    reason: "field name must not be empty".to_string(),
+                });
+            }
+        }
+    }
+    for (i, field) in fields.strip.iter().enumerate() {
+        if fields.deny.contains(field) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("providers.{name}.request_fields.strip[{i}]"),
+                reason: format!("`{field}` is also in `deny`; choose one"),
+            });
+        }
+    }
+    Ok(json!({ "deny": fields.deny, "strip": fields.strip }))
 }
 
 /// The `tenant_credential` slot under `io.llmproxy.provider_auth` for a
@@ -2339,6 +2374,7 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "selected_provider": "%UPSTREAM_CLUSTER%",
                 "llm_list_cost_nanodollars": "%LLM_LIST_COST%",
                 "llm_credential_source": "%LLM_CREDENTIAL_SOURCE%",
+                "llm_served_model": "%LLM_SERVED_MODEL%",
             }
         }),
     };

@@ -275,6 +275,23 @@ pub struct Provider {
     /// sent as is, without the cluster path rewrite.
     #[serde(default)]
     pub tenant_credential_verify_path: Option<String>,
+    /// Top-level request-body fields this provider refuses (`deny`) or drops
+    /// (`strip`). Enforced per attempt against whichever provider is dialled,
+    /// so it holds across fallback.
+    #[serde(default)]
+    pub request_fields: Option<RequestFields>,
+}
+
+/// `providers.<name>.request_fields`: a generic top-level body-field policy.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestFields {
+    /// Requests carrying any of these top-level keys get `400`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// These top-level keys are removed before the request is sent upstream.
+    #[serde(default)]
+    pub strip: Vec<String>,
 }
 
 /// `providers.<name>.protocol`: which HTTP version the proxy dials this

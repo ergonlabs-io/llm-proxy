@@ -59,6 +59,7 @@ JSON error body listing known models.
 | `protocol` | enum: `http1`, `http2` | no | `http1` | Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse — each worker keeps up to 4 multiplexed connections to each address of this provider (it dials another connection when each open one carries 100 streams) instead of connecting fresh on every request. Most hosted providers support it; many local/self-hosted plaintext servers do not. |
 | `tenant_credentials` | boolean | no | `false` | Lets a tenant that stored its own key for this provider send that key instead of the operator key. Requires `auth.tenant_credentials`. Only header API-key types qualify: `openai`, `anthropic`, `openai-compatible`, `openrouter`, and `azure-openai`. `vertex` and `bedrock` are rejected at this field. The key goes in `x-api-key` for `anthropic`, in `api-key` for `azure-openai`, and in `Authorization: Bearer` for the rest. See [Tenant provider credentials](../../authentication/tenant-provider-credentials/). |
 | `tenant_credential_verify_path` | string (path, starts with `/`) | no | `/api/v1/key` for `openrouter`; `/v1/models` for `openai` and `anthropic`; none for other types, and none when `base_url` is set | The path of the `GET` that checks a tenant key when `PUT` saves it. Sent as is. Requires `tenant_credentials: true`. Set it to use another path. Must be at most 2048 bytes, printable ASCII, no `#`. See [Save-time check](../../authentication/tenant-provider-credentials/#save-time-check). |
+| `request_fields` | object: `deny` and `strip`, each a list of non-empty strings | no | none | A generic policy on top-level request-body fields, for this provider. See "Request field policy" below. |
 
 A `Provider` config rejects setting both `api_key` and `api_key_file`.
 
@@ -114,6 +115,40 @@ The tests are `vertex_and_bedrock_runtime_settings_survive_ir_lowering`,
 `crates/proxy-simple-config/tests/dialect.rs`, plus
 `bedrock_signature_uses_final_body_and_required_headers` and
 `vertex_credential_replaces_any_client_authorization` in `credential_provider.rs`.
+
+### Request field policy
+
+`providers.<name>.request_fields` names top-level JSON body keys the proxy
+checks on every request before it goes to this provider:
+
+- `deny`: a request that carries any listed key gets `400` with error code
+  `request_field_not_permitted`, and nothing is sent upstream.
+- `strip`: the listed keys are removed and the rest of the body is sent.
+
+The policy is generic. The proxy has no built-in list for any provider. It
+exists because some providers accept body fields that change what the gateway
+runs or bills, for example a field that lists other models to try or a field
+that turns on paid plugins. Those fields can also bypass model authorization,
+because the proxy authorizes the `model` the client names, not models named
+elsewhere in the body. Deny what you do not want clients to reach. Use `strip`
+when the field is harmless to drop and you would rather not fail the request.
+
+The check runs per attempt against the provider that is actually dialled, so
+it holds on failover: if the primary provider has no policy and the fallback
+has one, a request that reaches the fallback is checked against the fallback's
+policy. Every cluster lowered from the provider gets the policy, including
+aggregate members. A name must not be empty and must not appear in both lists.
+Errors name the dialect path, for example `providers.openrouter.request_fields.deny[0]`.
+
+Example for an OpenRouter provider. This is operator config, not a default:
+
+```yaml
+providers:
+  openrouter:
+    api_key: ${OPENROUTER_API_KEY}
+    request_fields:
+      deny: [models, route, plugins, transforms]
+```
 
 ### OpenRouter
 

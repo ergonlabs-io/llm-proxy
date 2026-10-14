@@ -4088,3 +4088,38 @@ observability:
         "node.metadata[\"io.llmproxy.tracing\"].export_deadline"
     );
 }
+
+/// Both default formats carry the served model, so a dialect user can see
+/// when the provider billed a different model than the one selected.
+#[test]
+fn default_access_log_formats_carry_the_served_model() {
+    for format in ["json", "text"] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "*", provider: openai }}
+observability:
+  access_logs: {{ output: stdout, format: {format} }}
+"#,
+        ))
+        .expect("must parse");
+        let lowered = proxy_simple_config::lower(&config).expect("must lower");
+        let log_format =
+            &hcm_typed_config(&lowered.bootstrap)["access_log"][0]["typed_config"]["log_format"];
+        if format == "json" {
+            assert_eq!(
+                log_format["json_format"]["llm_served_model"],
+                "%LLM_SERVED_MODEL%"
+            );
+        } else {
+            let text = log_format["text_format"].as_str().expect("text_format");
+            assert!(
+                text.ends_with("llm_served_model=\"%LLM_SERVED_MODEL%\"\n"),
+                "text format must end with the served model, got {text}"
+            );
+        }
+    }
+}

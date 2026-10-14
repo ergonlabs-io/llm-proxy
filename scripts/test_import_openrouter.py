@@ -3,7 +3,8 @@ from pathlib import Path
 import runpy
 import unittest
 
-convert = runpy.run_path(str(Path(__file__).with_name('import-openrouter-models.py')))['billing_entry']
+module = runpy.run_path(str(Path(__file__).with_name('import-openrouter-models.py')))
+convert = module['billing_entry']
 
 
 class PricingConversion(unittest.TestCase):
@@ -48,6 +49,18 @@ class PricingConversion(unittest.TestCase):
             entry, reason = self.card(overrides=[{'min_prompt_tokens': value} for value in thresholds])
             self.assertIsNone(entry)
             self.assertIsNotNone(reason)
+
+
+class ProviderBlock(unittest.TestCase):
+    def test_generated_provider_denies_gateway_steering_fields(self):
+        block = module['provider_block']()
+        self.assertEqual(block['request_fields'], {'deny': ['models', 'route', 'plugins', 'transforms']})
+        self.assertEqual(block['api_key'], '${OPENROUTER_API_KEY}')
+
+    def test_checked_in_example_matches_the_generated_provider(self):
+        import json
+        example = Path(__file__).parent.parent / 'examples' / 'llmproxy-openrouter.yaml'
+        self.assertEqual(json.loads(example.read_text())['providers']['openrouter'], module['provider_block']())
 
 
 if __name__ == '__main__':

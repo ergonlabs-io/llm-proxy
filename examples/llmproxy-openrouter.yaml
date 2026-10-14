@@ -4,7 +4,15 @@
   "admin": "127.0.0.1:9901",
   "providers": {
     "openrouter": {
-      "api_key": "${OPENROUTER_API_KEY}"
+      "api_key": "${OPENROUTER_API_KEY}",
+      "request_fields": {
+        "deny": [
+          "models",
+          "route",
+          "plugins",
+          "transforms"
+        ]
+      }
     }
   },
   "models": {
