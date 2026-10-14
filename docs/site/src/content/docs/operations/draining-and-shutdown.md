@@ -91,6 +91,6 @@ warming, until `initial_fetch_timeout`.
 | Flag | Default | What it does |
 |---|---|---|
 | `--drain-time-s` | `600` | Seconds to wait for connections to finish before cutting them. |
-| `--drain-strategy` | `gradual` | Accepted for Envoy command lines. It has no effect: both values drain as described above, and the proxy logs a warning at startup. |
+| `--drain-strategy` | none | Accepted for Envoy command lines. It has no effect: both values drain as described above, and the proxy logs a warning at startup when the flag is given. |
 
 See [CLI reference](../../reference/cli/) for the full flag list.

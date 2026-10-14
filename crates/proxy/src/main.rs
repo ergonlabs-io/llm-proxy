@@ -142,9 +142,10 @@ struct Args {
     drain_time_s: u64,
 
     /// Accepted for Envoy CLI compatibility. Both values behave as Envoy's
-    /// `immediate`: see the startup warning and the docs.
-    #[arg(long = "drain-strategy", value_enum, default_value_t = DrainStrategyArg::Gradual)]
-    drain_strategy: DrainStrategyArg,
+    /// `immediate`: the startup warning fires only when this flag is given;
+    /// see the docs.
+    #[arg(long = "drain-strategy", value_enum)]
+    drain_strategy: Option<DrainStrategyArg>,
 
     /// Hot-restart base id. Accepted for CLI compatibility only: we have no
     /// hot-restart implementation, so this is parsed and ignored.
@@ -495,6 +496,27 @@ impl ConfigSource {
     }
 }
 
+/// The flag is accepted so Envoy command lines keep working, but it has no
+/// effect: every drain is `immediate` (internal-docs/envoy-divergences.md,
+/// "Drain strategy"). Loud on purpose, so an operator who chose `gradual`
+/// learns that idle and finished connections close at drain start. Warns only
+/// when the flag was given, so a default start is silent. Returns whether it
+/// warned, for the unit test.
+fn warn_drain_strategy_ignored(strategy: Option<DrainStrategyArg>) -> bool {
+    let Some(strategy) = strategy else {
+        return false;
+    };
+    tracing::warn!(
+        drain_strategy = ?strategy,
+        "--drain-strategy has no effect: `gradual` and `immediate` both behave as immediate. \
+         At drain start the proxy stops accepting, closes idle keep-alive connections, and lets \
+         in-flight requests finish before closing their connection (Connection: close on \
+         HTTP/1, GOAWAY on HTTP/2); connections still open at --drain-time-s are cut \
+         (see internal-docs/envoy-divergences.md, \"Drain strategy\")"
+    );
+    true
+}
+
 /// Serve mode: build the control runtime, spawn the worker pool, wait for
 /// SIGTERM/SIGINT/SIGHUP, then run the graceful shutdown sequence.
 fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
@@ -513,20 +535,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     }
 
     let drain_time = Duration::from_secs(args.drain_time_s);
-    let strategy = args.drain_strategy;
-
-    // The flag is accepted so Envoy command lines keep working, but it has no
-    // effect: every drain is `immediate` (internal-docs/envoy-divergences.md,
-    // "Drain strategy"). Loud on purpose, so an operator who chose `gradual`
-    // learns that idle and finished connections close at drain start.
-    tracing::warn!(
-        drain_strategy = ?strategy,
-        "--drain-strategy has no effect: `gradual` and `immediate` both behave as immediate. \
-         At drain start the proxy stops accepting, closes idle keep-alive connections, and lets \
-         in-flight requests finish before closing their connection (Connection: close on \
-         HTTP/1, GOAWAY on HTTP/2); connections still open at --drain-time-s are cut \
-         (see internal-docs/envoy-divergences.md, \"Drain strategy\")"
-    );
+    warn_drain_strategy_ignored(args.drain_strategy);
 
     // Rust note: the control runtime is a separate, ordinary multi-thread
     // tokio runtime (2 worker threads) -- distinct from the
@@ -3570,12 +3579,25 @@ mod tests {
             request_record_max_attempts: None,
             capture_spool_poll_interval_ms: 10_000,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
-            drain_strategy: DrainStrategyArg::Gradual,
+            drain_strategy: None,
             base_id: None,
             log_level: LogLevel::Info,
             service_node: None,
             service_cluster: None,
         }
+    }
+
+    #[test]
+    fn drain_strategy_is_none_without_the_flag_and_some_with_it() {
+        let none = Args::try_parse_from(["llm-proxy", "-c", "x.yaml"]).expect("parses");
+        assert_eq!(none.drain_strategy, None);
+        assert!(!warn_drain_strategy_ignored(none.drain_strategy));
+
+        let some =
+            Args::try_parse_from(["llm-proxy", "-c", "x.yaml", "--drain-strategy", "gradual"])
+                .expect("parses");
+        assert_eq!(some.drain_strategy, Some(DrainStrategyArg::Gradual));
+        assert!(warn_drain_strategy_ignored(some.drain_strategy));
     }
 
     #[test]

@@ -752,6 +752,42 @@ observability:
     );
 }
 
+/// The dialect has no custom format, so its two default formats are the only
+/// way a dialect user can tell a tenant-credential (BYOK) request from a
+/// platform-credential one in the access log.
+#[test]
+fn default_access_log_formats_carry_the_credential_source() {
+    for format in ["json", "text"] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "*", provider: openai }}
+observability:
+  access_logs: {{ output: stdout, format: {format} }}
+"#,
+        ))
+        .expect("must parse");
+        let lowered = proxy_simple_config::lower(&config).expect("must lower");
+        let log_format =
+            &hcm_typed_config(&lowered.bootstrap)["access_log"][0]["typed_config"]["log_format"];
+        if format == "json" {
+            assert_eq!(
+                log_format["json_format"]["llm_credential_source"],
+                "%LLM_CREDENTIAL_SOURCE%"
+            );
+        } else {
+            let text = log_format["text_format"].as_str().expect("text_format");
+            assert!(
+                text.contains("llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\""),
+                "text format must carry the credential source, got {text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn access_logs_file_text_lands_on_the_hcm() {
     let config = parse(

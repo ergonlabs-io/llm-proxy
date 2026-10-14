@@ -509,7 +509,7 @@ Stated plainly, because a feature list without this is not much use:
   at load rather than failing silently.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
-- **`--drain-strategy` has no effect.** It is accepted and warns at startup; both values drain like Envoy's `immediate`.
+- **`--drain-strategy` has no effect.** It is accepted and warns at startup when given; both values drain like Envoy's `immediate`.
 - **No embeddings and no `/v1/models` handling.** A request to any other path
   proxies through, but gets no token metering.
 - **No Kubernetes controller or CRDs.**
