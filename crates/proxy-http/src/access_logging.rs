@@ -42,7 +42,7 @@ use http::HeaderMap;
 use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
-use proxy_observability::access_log::{render, FormatString, LlmTokens, LogContext};
+use proxy_observability::access_log::{render, FormatOp, FormatString, LlmTokens, LogContext};
 use proxy_observability::records::{
     RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
 };
@@ -142,8 +142,13 @@ impl AccessLoggerRuntime {
 /// this IR doesn't carry -- `AccessLogFormat::Json` is
 /// `Vec<(String, FormatString)>`, always string-typed -- so every value
 /// renders as a JSON string here, never a bare number/bool/object. That's a
-/// known, disclosed gap (AGENTS.md invariant 1), not a silent one: nothing in the
-/// IR asks for a typed value today, so there's nothing to drop.
+/// known, disclosed gap (AGENTS.md invariant 1), not a silent one: nothing in
+/// the IR asks for a typed value today, so there's nothing to drop.
+///
+/// The one exception is a field whose entire format is `%LLM_UPSTREAM_USAGE%`:
+/// the operator exists to carry the provider's JSON object as sent, so it is
+/// embedded as a JSON value (`null` when absent), not as an escaped string.
+/// Combined with any other text the field is an ordinary string.
 fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> String {
     let mut out = String::from("{");
     for (i, (key, fmt)) in fields.iter().enumerate() {
@@ -152,9 +157,15 @@ fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> Strin
         }
         out.push('"');
         json_escape_into(key, &mut out);
-        out.push_str("\":\"");
-        json_escape_into(&render(fmt, ctx), &mut out);
-        out.push('"');
+        out.push_str("\":");
+        if matches!(fmt.0.as_slice(), [FormatOp::LlmUpstreamUsage]) {
+            // Validated JSON: see where `llm_upstream` is built in `finish`.
+            out.push_str(ctx.llm_upstream_usage.unwrap_or("null"));
+        } else {
+            out.push('"');
+            json_escape_into(&render(fmt, ctx), &mut out);
+            out.push('"');
+        }
     }
     out.push_str("}\n");
     out
@@ -518,6 +529,7 @@ impl LoggingBody {
             llm_time_to_first_body_byte,
             requested_model,
             llm_served_model,
+            llm_upstream,
             trace,
             tenant,
             response_code_details,
@@ -560,6 +572,15 @@ impl LoggingBody {
                 info.llm.time_to_first_body_byte,
                 info.requested_model.clone(),
                 info.llm.served_model.clone(),
+                (
+                    info.llm.upstream_response_id.clone(),
+                    // Validated here, once, so a filter that wrote malformed
+                    // text can neither corrupt a JSON log line nor a record.
+                    info.llm
+                        .upstream_usage
+                        .as_deref()
+                        .and_then(proxy_observability::records::RawJson::from_text),
+                ),
                 info.trace,
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
@@ -659,6 +680,8 @@ impl LoggingBody {
                     .1
                     .as_deref()
                     .map(proxy_observability::records::bounded_field),
+                upstream_response_id: llm_upstream.0.clone(),
+                upstream_usage: llm_upstream.1.clone(),
                 status: Some(ctx.response_code),
                 termination,
                 error_category: response_code_details
@@ -719,6 +742,11 @@ impl LoggingBody {
                         provider: None,
                         upstream_model: attempt.upstream_model,
                         served_model: attempt.served_model,
+                        upstream_response_id: attempt.upstream_response_id,
+                        upstream_usage: attempt
+                            .upstream_usage
+                            .as_deref()
+                            .and_then(proxy_observability::records::RawJson::from_text),
                         started_at: format_system_time(attempt.started_at),
                         finished_at: format_system_time(
                             attempt.finished_at.unwrap_or_else(SystemTime::now),
@@ -918,6 +946,8 @@ impl LoggingBody {
             llm_resolved_model: usage_attribution.2.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
             llm_served_model: llm_served_model.as_deref(),
+            llm_upstream_id: llm_upstream.0.as_deref(),
+            llm_upstream_usage: llm_upstream.1.as_ref().map(|usage| usage.get()),
             llm_rate_card_version: usage_attribution.3.as_deref(),
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
@@ -1269,6 +1299,94 @@ mod tests {
         );
     }
 
+    const USAGE: &str = r#"{"prompt_tokens":7,"cost":0.000012340}"#;
+
+    #[tokio::test]
+    async fn upstream_id_and_usage_reach_the_text_access_log_line() {
+        let with = |info: &mut StreamInfo| {
+            info.llm.upstream_response_id = Some("chatcmpl-abc".into());
+            info.llm.upstream_usage = Some(USAGE.into());
+        };
+        assert_eq!(
+            render_with_stream_info("%LLM_UPSTREAM_ID% %LLM_UPSTREAM_USAGE%", with).await,
+            format!("chatcmpl-abc {USAGE}")
+        );
+        assert_eq!(
+            render_with_stream_info("%LLM_UPSTREAM_ID% %LLM_UPSTREAM_USAGE%", |_| {}).await,
+            "- -"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_upstream_usage_is_dropped_rather_than_logged() {
+        let line = render_with_stream_info("%LLM_UPSTREAM_USAGE%", |info| {
+            info.llm.upstream_usage = Some("{not json".into());
+        })
+        .await;
+        assert_eq!(line, "-");
+    }
+
+    /// A json_format field made only of `%LLM_UPSTREAM_USAGE%` embeds the
+    /// provider's object as JSON; mixed with text it stays a string.
+    #[test]
+    fn json_format_embeds_upstream_usage_as_a_json_value() {
+        use proxy_observability::access_log::LogContext;
+        let fields = vec![
+            (
+                "usage".to_owned(),
+                parse_format("%LLM_UPSTREAM_USAGE%").unwrap(),
+            ),
+            (
+                "text".to_owned(),
+                parse_format("u=%LLM_UPSTREAM_USAGE%").unwrap(),
+            ),
+        ];
+        let empty = HeaderMap::new();
+        let mut ctx = LogContext {
+            start_time: SystemTime::UNIX_EPOCH,
+            request_headers: &empty,
+            response_headers: &empty,
+            response_trailers: &empty,
+            protocol: None,
+            response_code: Some(200),
+            response_flags: &[],
+            duration: None,
+            bytes_received: 0,
+            bytes_sent: 0,
+            upstream_host: None,
+            upstream_cluster: None,
+            downstream_remote_address: None,
+            response_code_details: None,
+            llm_tokens: None,
+            llm_ttft: None,
+            llm_max_stall: None,
+            llm_response_chunks: 0,
+            llm_list_cost_nanodollars: None,
+            llm_key_id: None,
+            llm_tenant: None,
+            llm_credential_source: None,
+            llm_user_id: None,
+            llm_requested_model: None,
+            llm_resolved_model: None,
+            llm_selected_model: None,
+            llm_served_model: None,
+            llm_upstream_id: None,
+            llm_upstream_usage: Some(USAGE),
+            llm_rate_card_version: None,
+            request_method: None,
+            request_path: None,
+            request_authority: None,
+            request_scheme: None,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&fields, &ctx)).unwrap();
+        assert_eq!(parsed["usage"]["prompt_tokens"], 7);
+        assert_eq!(parsed["text"], format!("u={USAGE}"));
+        ctx.llm_upstream_usage = None;
+        let parsed: serde_json::Value = serde_json::from_str(&render_json(&fields, &ctx)).unwrap();
+        assert!(parsed["usage"].is_null());
+        assert_eq!(parsed["text"], "u=-");
+    }
+
     #[tokio::test]
     async fn llm_stats_reach_the_rendered_access_log_line() {
         let llm = crate::stream_info::LlmStats {
@@ -1285,6 +1403,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 1,
+            ..Default::default()
         };
         assert_eq!(render_one(llm).await, "11 22 33 44 110 250");
     }
@@ -1682,6 +1801,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: Some(std::time::Duration::from_millis(150)),
             response_chunks: 7,
+            ..Default::default()
         };
         assert_eq!(
             render_one_fmt("%LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%", llm).await,
@@ -1720,6 +1840,7 @@ mod tests {
             time_to_first_body_byte: None,
             max_inter_chunk: None,
             response_chunks: 1,
+            ..Default::default()
         };
         let line = render_one_fmt("%LLM_TPOT%", llm).await;
         assert_ne!(line, "-", "usage + ttft + duration are all present");

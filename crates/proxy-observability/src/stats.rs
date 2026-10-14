@@ -844,6 +844,26 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Responses whose `usage` object exceeded the verbatim-capture bound, so
+    /// the record carries no `upstream_usage`. Token counts and cost are
+    /// unaffected: they come from the parsed fields and the rate card.
+    /// `scope` is the operator-chosen HCM `stat_prefix`. Prometheus surface only.
+    pub const USAGE_UPSTREAM_USAGE_OVERSIZED: Instrument = Instrument {
+        name: "llmproxy_usage_upstream_usage_oversized_total",
+        kind: InstrumentKind::Counter,
+        unit: "{response}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
+    /// Responses whose provider response id exceeded its bound, so the record
+    /// carries no `upstream_response_id`. `scope` as above. Prometheus only.
+    pub const USAGE_UPSTREAM_ID_OVERSIZED: Instrument = Instrument {
+        name: "llmproxy_usage_upstream_id_oversized_total",
+        kind: InstrumentKind::Counter,
+        unit: "{response}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

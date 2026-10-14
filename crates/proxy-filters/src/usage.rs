@@ -177,6 +177,14 @@ pub fn extract_json_usage(dialect: Dialect, body: &[u8]) -> Option<TokenUsage> {
 /// that requires a non-standard response and the object must still parse as
 /// this dialect's token counts, otherwise the answer is `None`, never a guess.
 pub fn extract_json_usage_from_tail(dialect: Dialect, tail: &[u8]) -> Option<TokenUsage> {
+    let span = tail_usage_span(tail)?;
+    let usage: serde_json::Value = serde_json::from_slice(span).ok()?;
+    usage_from_object(dialect, &usage)
+}
+
+/// The byte span of the top-level `usage` object inside a body tail, found by
+/// the structural rules documented on [`extract_json_usage_from_tail`].
+fn tail_usage_span(tail: &[u8]) -> Option<&[u8]> {
     const KEY: &[u8] = b"\"usage\"";
     // Bound the work an adversarial body full of `"usage"` keys can cause.
     const MAX_CANDIDATES: usize = 8;
@@ -212,8 +220,7 @@ pub fn extract_json_usage_from_tail(dialect: Dialect, tail: &[u8]) -> Option<Tok
         if !closes_exactly_one_object(&tail[object_end..]) {
             continue;
         }
-        let usage: serde_json::Value = serde_json::from_slice(&tail[i..object_end]).ok()?;
-        return usage_from_object(dialect, &usage);
+        return Some(&tail[i..object_end]);
     }
     None
 }
@@ -244,6 +251,181 @@ fn bounded_served_model(model: &str) -> Option<String> {
 pub fn extract_json_served_model(body: &[u8]) -> Option<String> {
     let json_body: serde_json::Value = serde_json::from_slice(body).ok()?;
     bounded_served_model(json_body.get("model")?.as_str()?)
+}
+
+// --- the provider's own identifiers and usage object ------------------------
+//
+// Audit evidence only. Nothing here is read for billing: the rate card is the
+// only source of cost, and the provider's `usage` object is kept as the exact
+// text it sent so a disagreement can be investigated later.
+
+/// Longest upstream response id kept. Real ids are well under this; a longer
+/// one is dropped, not truncated (a truncated id would name a different
+/// response).
+pub const MAX_UPSTREAM_ID_BYTES: usize = 256;
+
+/// Largest provider `usage` object kept verbatim. Over this nothing is stored
+/// and the miss is counted, so a hostile or odd provider cannot make every
+/// record carry an arbitrarily large blob.
+pub const MAX_UPSTREAM_USAGE_BYTES: usize = 4096;
+
+/// What the provider said about itself in one response: its response id and
+/// the `usage` object exactly as sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamEvidence {
+    /// The upstream response id (`chatcmpl-...`, `msg_...`, `resp_...`).
+    pub response_id: Option<String>,
+    /// The `usage` JSON text as sent (the last one, for a stream that carries
+    /// several). Only insignificant whitespace is ever altered; see
+    /// [`single_line_json`].
+    pub usage_json: Option<String>,
+    /// An id was present but longer than [`MAX_UPSTREAM_ID_BYTES`].
+    pub id_oversized: bool,
+    /// The latest `usage` object was longer than [`MAX_UPSTREAM_USAGE_BYTES`].
+    pub usage_oversized: bool,
+}
+
+impl UpstreamEvidence {
+    /// Record an id from its raw JSON text. Returns whether the member was a
+    /// string and so settles the id (a number or `null` leaves it open for a
+    /// later frame).
+    fn set_id(&mut self, raw: &str) -> bool {
+        // Escapes only shorten a string, so a span this long cannot hold an
+        // in-bounds id; skip decoding it.
+        if raw.len() > 4 * MAX_UPSTREAM_ID_BYTES {
+            self.id_oversized = true;
+            return true;
+        }
+        let Ok(id) = serde_json::from_str::<String>(raw) else {
+            return false;
+        };
+        if id.len() > MAX_UPSTREAM_ID_BYTES {
+            self.id_oversized = true;
+        } else if !id.is_empty() && !id.chars().any(char::is_control) {
+            self.response_id = Some(id);
+        }
+        true
+    }
+
+    fn set_usage(&mut self, raw: &str) {
+        let raw = raw.trim();
+        // Only an object is a usage record; `null` (OpenAI sends it on every
+        // content chunk when usage is requested) must not replace a real one.
+        if !raw.starts_with('{') {
+            return;
+        }
+        if raw.len() > MAX_UPSTREAM_USAGE_BYTES {
+            self.usage_json = None;
+            self.usage_oversized = true;
+        } else {
+            self.usage_json = Some(single_line_json(raw));
+            self.usage_oversized = false;
+        }
+    }
+}
+
+/// Remove line breaks from JSON text. Inside a JSON string a line break must
+/// be escaped, so a raw one can only be insignificant whitespace between
+/// tokens; dropping it keeps the value identical while letting it sit on one
+/// access-log line.
+fn single_line_json(raw: &str) -> String {
+    if raw.contains(['\n', '\r']) {
+        raw.chars().filter(|c| !matches!(c, '\n' | '\r')).collect()
+    } else {
+        raw.to_owned()
+    }
+}
+
+/// Members of a JSON object kept as raw text, so no value is re-encoded.
+///
+/// Rust note: `&RawValue` borrows the exact input span; with `#[serde(borrow)]`
+/// the derive hands it out without copying. Members not named here are skipped.
+#[derive(serde::Deserialize)]
+struct RawMembers<'a> {
+    #[serde(borrow)]
+    id: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    usage: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    message: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    response: Option<&'a serde_json::value::RawValue>,
+}
+
+fn raw_members(json: &str) -> Option<RawMembers<'_>> {
+    serde_json::from_str(json).ok()
+}
+
+/// Id and `usage` of a complete (non-streaming) JSON response body.
+pub fn extract_json_upstream(body: &[u8]) -> UpstreamEvidence {
+    let mut evidence = UpstreamEvidence::default();
+    let Ok(text) = std::str::from_utf8(body) else {
+        return evidence;
+    };
+    let Some(members) = raw_members(text) else {
+        return evidence;
+    };
+    if let Some(id) = members.id {
+        evidence.set_id(id.get());
+    }
+    if let Some(usage) = members.usage {
+        evidence.set_usage(usage.get());
+    }
+    evidence
+}
+
+/// `usage` of an oversized body, from the tail window. The id sits at the
+/// start of the document, which the window has already dropped.
+pub fn extract_json_upstream_from_tail(tail: &[u8]) -> UpstreamEvidence {
+    let mut evidence = UpstreamEvidence::default();
+    let valid = tail_usage_span(tail)
+        .and_then(|span| std::str::from_utf8(span).ok())
+        .filter(|span| serde_json::from_str::<&serde_json::value::RawValue>(span).is_ok());
+    if let Some(span) = valid {
+        evidence.set_usage(span);
+    }
+    evidence
+}
+
+/// Where the frame's id and usage live, per dialect, mirroring
+/// [`frame_usage_object`] and [`frame_served_model`]. Returns the raw `id` and
+/// raw `usage` texts of one SSE data payload.
+fn frame_upstream(dialect: Dialect, payload: &str) -> (Option<String>, Option<String>) {
+    let Some(top) = raw_members(payload) else {
+        return (None, None);
+    };
+    // Rust note: a named `fn` can say the result borrows from the argument;
+    // closure signatures cannot express that relationship.
+    fn nested(holder: Option<&serde_json::value::RawValue>) -> Option<RawMembers<'_>> {
+        holder.and_then(|h| raw_members(h.get()))
+    }
+    let owned = |raw: Option<&serde_json::value::RawValue>| raw.map(|r| r.get().to_owned());
+    match dialect {
+        Dialect::OpenAi => (owned(top.id), owned(top.usage)),
+        Dialect::Anthropic => {
+            let message = nested(top.message);
+            let id = message
+                .as_ref()
+                .and_then(|m| m.id)
+                .map(|i| i.get().to_owned());
+            let usage = message
+                .as_ref()
+                .and_then(|m| m.usage)
+                .or(top.usage)
+                .map(|u| u.get().to_owned());
+            (id, usage)
+        }
+        Dialect::OpenAiResponses => {
+            let response = nested(top.response);
+            (
+                owned(response.as_ref().and_then(|r| r.id)),
+                response
+                    .as_ref()
+                    .and_then(|r| r.usage)
+                    .map(|u| u.get().to_owned()),
+            )
+        }
+    }
 }
 
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
@@ -559,6 +741,12 @@ pub struct SseUsageScanner {
     usage: Option<TokenUsage>,
     /// The first model name any frame reported; later frames never replace it.
     served_model: Option<String>,
+    /// The provider's response id (first frame that names one) and last
+    /// `usage` object, kept as sent.
+    upstream: UpstreamEvidence,
+    /// An id has been decided (kept or found oversized); later frames never
+    /// replace it.
+    id_decided: bool,
 }
 
 impl SseUsageScanner {
@@ -568,6 +756,8 @@ impl SseUsageScanner {
             partial: Vec::new(),
             usage: None,
             served_model: None,
+            upstream: UpstreamEvidence::default(),
+            id_decided: false,
         }
     }
 
@@ -597,6 +787,8 @@ impl SseUsageScanner {
             merge_line(
                 &mut self.usage,
                 &mut self.served_model,
+                &mut self.upstream,
+                &mut self.id_decided,
                 self.dialect,
                 &line[..line.len() - 1],
             );
@@ -618,7 +810,14 @@ impl SseUsageScanner {
     pub fn usage(&self) -> Option<TokenUsage> {
         let mut result = self.usage;
         if !self.partial.is_empty() {
-            merge_line(&mut result, &mut None, self.dialect, &self.partial);
+            merge_line(
+                &mut result,
+                &mut None,
+                &mut UpstreamEvidence::default(),
+                &mut true,
+                self.dialect,
+                &self.partial,
+            );
         }
         result
     }
@@ -632,8 +831,34 @@ impl SseUsageScanner {
             return self.served_model.clone();
         }
         let mut result = None;
-        merge_line(&mut None, &mut result, self.dialect, &self.partial);
+        merge_line(
+            &mut None,
+            &mut result,
+            &mut UpstreamEvidence::default(),
+            &mut true,
+            self.dialect,
+            &self.partial,
+        );
         result
+    }
+
+    /// The provider's response id and last `usage` object seen so far. Like
+    /// [`Self::usage`], folds in an unterminated final line without mutating
+    /// state.
+    pub fn upstream(&self) -> UpstreamEvidence {
+        if self.partial.is_empty() {
+            return self.upstream.clone();
+        }
+        let mut evidence = self.upstream.clone();
+        merge_line(
+            &mut None,
+            &mut None,
+            &mut evidence,
+            &mut self.id_decided.clone(),
+            self.dialect,
+            &self.partial,
+        );
+        evidence
     }
 
     /// The dialect this scanner was built for.
@@ -679,6 +904,16 @@ fn frame_served_model(dialect: Dialect, value: &serde_json::Value) -> Option<&st
     .as_str()
 }
 
+/// Whether a parsed frame carries a string id where `dialect` puts one.
+fn frame_has_id(dialect: Dialect, value: &serde_json::Value) -> bool {
+    match dialect {
+        Dialect::OpenAi => value.get("id"),
+        Dialect::Anthropic => value.get("message").and_then(|m| m.get("id")),
+        Dialect::OpenAiResponses => value.get("response").and_then(|r| r.get("id")),
+    }
+    .is_some_and(serde_json::Value::is_string)
+}
+
 /// Merge the token counts a single frame carries into `target`.
 ///
 /// A field is updated only when the frame actually carries it, so an Anthropic
@@ -714,6 +949,8 @@ fn merge_usage(target: &mut Option<TokenUsage>, dialect: Dialect, usage: &serde_
 fn merge_line(
     target: &mut Option<TokenUsage>,
     served_model: &mut Option<String>,
+    upstream: &mut UpstreamEvidence,
+    id_decided: &mut bool,
     dialect: Dialect,
     line: &[u8],
 ) {
@@ -734,6 +971,26 @@ fn merge_line(
     };
     if let Some(usage) = frame_usage_object(dialect, &value) {
         merge_usage(target, dialect, usage);
+    }
+    // Second pass for the raw text. The typed parse above cannot give back the
+    // bytes as sent, so only frames that can carry an id we still want, or a
+    // `usage` object, pay for it.
+    let wants_id = !*id_decided && frame_has_id(dialect, &value);
+    let has_usage = frame_usage_object(dialect, &value).is_some_and(serde_json::Value::is_object);
+    if wants_id || has_usage {
+        if let Ok(text) = std::str::from_utf8(payload) {
+            let (id, usage) = frame_upstream(dialect, text);
+            if wants_id {
+                if let Some(id) = id {
+                    *id_decided = upstream.set_id(&id);
+                }
+            }
+            if has_usage {
+                if let Some(usage) = usage {
+                    upstream.set_usage(&usage);
+                }
+            }
+        }
     }
     if served_model.is_none() {
         *served_model = frame_served_model(dialect, &value).and_then(bounded_served_model);
@@ -1164,6 +1421,136 @@ mod tests {
             anthropic, responses,
             "the two dialects must not agree on this body"
         );
+    }
+
+    // ---- upstream id and raw usage ----------------------------------------
+
+    fn sse_upstream(dialect: Dialect, stream: &str) -> UpstreamEvidence {
+        let mut s = SseUsageScanner::new(dialect);
+        s.push(stream.as_bytes());
+        s.upstream()
+    }
+
+    #[test]
+    fn json_body_id_and_usage_are_kept_verbatim_for_every_dialect() {
+        let usage = r#"{"prompt_tokens": 7,"cost":0.000012340,  "x":{"b":1,"a":2}}"#;
+        let body = format!(r#"{{"id":"chatcmpl-1","usage":{usage}}}"#);
+        let e = extract_json_upstream(body.as_bytes());
+        assert_eq!(e.response_id.as_deref(), Some("chatcmpl-1"));
+        assert_eq!(e.usage_json.as_deref(), Some(usage));
+        // Anthropic and Responses JSON bodies carry both at the top level too.
+        let e = extract_json_upstream(br#"{"id":"msg_1","usage":{"input_tokens":3}}"#);
+        assert_eq!(e.response_id.as_deref(), Some("msg_1"));
+        assert_eq!(e.usage_json.as_deref(), Some(r#"{"input_tokens":3}"#));
+    }
+
+    #[test]
+    fn json_body_without_id_or_with_null_usage_records_nothing() {
+        let e = extract_json_upstream(br#"{"id":5,"usage":null}"#);
+        assert_eq!(e, UpstreamEvidence::default());
+        assert_eq!(
+            extract_json_upstream(b"not json"),
+            UpstreamEvidence::default()
+        );
+    }
+
+    #[test]
+    fn pretty_printed_usage_is_collapsed_to_one_line_without_changing_its_value() {
+        let body = "{\"usage\": {\n  \"a\": 1,\r\n  \"b\": \"x y\"\n}}";
+        let e = extract_json_upstream(body.as_bytes());
+        let text = e.usage_json.unwrap();
+        assert!(!text.contains(['\n', '\r']), "{text:?}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["b"], "x y");
+    }
+
+    #[test]
+    fn oversized_id_and_usage_are_dropped_and_flagged() {
+        let id = "i".repeat(MAX_UPSTREAM_ID_BYTES + 1);
+        let pad = "p".repeat(MAX_UPSTREAM_USAGE_BYTES);
+        let body = format!(r#"{{"id":"{id}","usage":{{"k":"{pad}"}}}}"#);
+        let e = extract_json_upstream(body.as_bytes());
+        assert_eq!(e.response_id, None);
+        assert_eq!(e.usage_json, None);
+        assert!(e.id_oversized && e.usage_oversized);
+        // At the bound exactly, both are kept.
+        let id = "i".repeat(MAX_UPSTREAM_ID_BYTES);
+        let body = format!(r#"{{"id":"{id}","usage":{{"k":1}}}}"#);
+        let e = extract_json_upstream(body.as_bytes());
+        assert_eq!(e.response_id.as_deref(), Some(id.as_str()));
+        assert!(!e.id_oversized);
+    }
+
+    #[test]
+    fn tail_window_yields_raw_usage_but_no_id() {
+        let tail = br#"...,"id":"x","usage":{"prompt_tokens":1,"completion_tokens":2}}"#;
+        let e = extract_json_upstream_from_tail(tail);
+        assert_eq!(
+            e.usage_json.as_deref(),
+            Some(r#"{"prompt_tokens":1,"completion_tokens":2}"#)
+        );
+        assert_eq!(e.response_id, None);
+    }
+
+    #[test]
+    fn openai_sse_first_id_wins_and_last_object_usage_is_kept() {
+        let stream = "data: {\"id\":\"chatcmpl-1\",\"usage\":null}\n\n\
+                      data: {\"id\":\"chatcmpl-2\",\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n\
+                      data: {\"id\":\"chatcmpl-3\",\"usage\":null}\n\n";
+        let e = sse_upstream(Dialect::OpenAi, stream);
+        assert_eq!(e.response_id.as_deref(), Some("chatcmpl-1"));
+        assert_eq!(
+            e.usage_json.as_deref(),
+            Some(r#"{"prompt_tokens":1,"completion_tokens":2}"#),
+            "a later `usage: null` must not erase a real object"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_id_is_message_start_and_usage_is_the_last_object() {
+        let stream = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\n";
+        let e = sse_upstream(Dialect::Anthropic, stream);
+        assert_eq!(e.response_id.as_deref(), Some("msg_1"));
+        assert_eq!(e.usage_json.as_deref(), Some(r#"{"output_tokens":15}"#));
+    }
+
+    #[test]
+    fn responses_sse_reads_response_id_and_response_usage() {
+        let stream = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+            data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n";
+        let e = sse_upstream(Dialect::OpenAiResponses, stream);
+        assert_eq!(e.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(
+            e.usage_json.as_deref(),
+            Some(r#"{"input_tokens":4,"output_tokens":2}"#)
+        );
+    }
+
+    #[test]
+    fn sse_upstream_is_independent_of_chunking_and_sees_an_unterminated_last_line() {
+        let stream = "data: {\"id\":\"c1\",\"usage\":{\"prompt_tokens\":1}}";
+        let mut s = SseUsageScanner::new(Dialect::OpenAi);
+        for b in stream.as_bytes() {
+            s.push(std::slice::from_ref(b));
+        }
+        let e = s.upstream();
+        assert_eq!(e.response_id.as_deref(), Some("c1"));
+        assert_eq!(e.usage_json.as_deref(), Some(r#"{"prompt_tokens":1}"#));
+    }
+
+    #[test]
+    fn sse_oversized_usage_is_dropped_flagged_and_a_later_small_one_recovers() {
+        let pad = "p".repeat(MAX_UPSTREAM_USAGE_BYTES);
+        let big = format!("data: {{\"usage\":{{\"prompt_tokens\":1,\"k\":\"{pad}\"}}}}\n\n");
+        let e = sse_upstream(Dialect::OpenAi, &big);
+        assert!(e.usage_oversized && e.usage_json.is_none());
+        let small = format!("{big}data: {{\"usage\":{{\"prompt_tokens\":2}}}}\n\n");
+        let e = sse_upstream(Dialect::OpenAi, &small);
+        assert!(!e.usage_oversized);
+        assert_eq!(e.usage_json.as_deref(), Some(r#"{"prompt_tokens":2}"#));
     }
 
     // ---- SseUsageScanner: OpenAI ------------------------------------------

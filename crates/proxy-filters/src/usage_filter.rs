@@ -40,15 +40,16 @@ use proxy_http::filter::{
 };
 use proxy_http::stream_info::GenAiSystem;
 use proxy_http::{LlmListCost, LlmTokenUsage};
-use proxy_observability::stats::{instruments, Handle, Registry, WorkerId};
+use proxy_observability::stats::{instruments, Handle, Instrument, Registry, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use crate::auth_filter;
 use crate::control::{ControlPlane, StoredRateCard};
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{
-    extract_json_served_model, extract_json_usage, extract_json_usage_from_tail, Dialect,
-    SseUsageScanner, TokenUsage,
+    extract_json_served_model, extract_json_upstream, extract_json_upstream_from_tail,
+    extract_json_usage, extract_json_usage_from_tail, Dialect, SseUsageScanner, TokenUsage,
+    UpstreamEvidence,
 };
 
 /// Canonical type URL for the owned usage configuration.
@@ -639,6 +640,47 @@ pub struct UsageStats {
     /// seeded [`STATS_REGISTRY_KEY`]. `None` only where no registry exists
     /// (unit tests that build the filter directly).
     exported: Option<(Arc<Registry>, Handle)>,
+    /// Responses whose raw `usage` object was over the verbatim-capture bound.
+    upstream_usage_oversized: ExportedCounter,
+    /// Responses whose provider response id was over its bound.
+    upstream_id_oversized: ExportedCounter,
+}
+
+/// One Prometheus-exported counter that also keeps an in-process total, so
+/// unit tests can read it without rendering the export. `series` is `None`
+/// only where no registry exists (filters built directly in tests).
+#[derive(Default)]
+struct ExportedCounter {
+    total: AtomicU64,
+    series: Option<(Arc<Registry>, Handle)>,
+}
+
+impl ExportedCounter {
+    fn new(registry: Option<&Arc<Registry>>, instrument: &'static Instrument, scope: &str) -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            series: registry.map(|registry| {
+                let handle = registry.resolve_capped(
+                    instrument,
+                    &[("scope", scope)],
+                    256,
+                    &[("scope", "overflow")],
+                );
+                (Arc::clone(registry), handle)
+            }),
+        }
+    }
+
+    fn incr(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        if let Some((registry, handle)) = &self.series {
+            registry.incr(WorkerId(0), *handle, 1);
+        }
+    }
+
+    fn get(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
 }
 
 /// `SharedFactoryState` key under which the listener seeds the process
@@ -670,6 +712,16 @@ impl UsageStats {
             )
         });
         UsageStats {
+            upstream_usage_oversized: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_UPSTREAM_USAGE_OVERSIZED,
+                scope,
+            ),
+            upstream_id_oversized: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_UPSTREAM_ID_OVERSIZED,
+                scope,
+            ),
             exported,
             repriced_handle,
             ..Default::default()
@@ -678,6 +730,14 @@ impl UsageStats {
 
     pub fn oversized_unrecoverable(&self) -> u64 {
         self.oversized_unrecoverable.load(Ordering::Relaxed)
+    }
+
+    pub fn upstream_usage_oversized(&self) -> u64 {
+        self.upstream_usage_oversized.get()
+    }
+
+    pub fn upstream_id_oversized(&self) -> u64 {
+        self.upstream_id_oversized.get()
     }
 
     pub fn served_model_repriced(&self) -> u64 {
@@ -1396,6 +1456,17 @@ impl UsageFilterInstance {
         }
     }
 
+    /// The provider's response id and `usage` object as sent, for the current
+    /// body mode.
+    fn compute_upstream(&self) -> UpstreamEvidence {
+        match &self.mode {
+            BodyMode::Sse(scanner) => scanner.upstream(),
+            BodyMode::Json(body) if body.overflowed => extract_json_upstream_from_tail(&body.buf),
+            BodyMode::Json(body) => extract_json_upstream(&body.buf),
+            BodyMode::Inert => UpstreamEvidence::default(),
+        }
+    }
+
     /// Write the observed usage + timing into `StreamInfo::llm`, exactly
     /// once. Safe to call from more than one callback (`encode_data` at
     /// `end_stream`, `encode_trailers`) — the second call is a no-op.
@@ -1418,6 +1489,7 @@ impl UsageFilterInstance {
         // panics. It's dropped at the end of this function.
         let mut stream_info = cb.stream_info();
         let served_model = self.compute_served_model();
+        let upstream = self.compute_upstream();
         if let Some(attempt) = &stream_info.selected_attempt {
             attempt.borrow_mut().served_model = served_model.clone();
         }
@@ -1455,6 +1527,21 @@ impl UsageFilterInstance {
             cost
         });
         stream_info.llm.served_model = served_model;
+        // Evidence only. Nothing below reads a field of the provider's usage
+        // object; the rate card is the only source of cost.
+        if upstream.id_oversized {
+            self.stats.upstream_id_oversized.incr();
+        }
+        if upstream.usage_oversized {
+            self.stats.upstream_usage_oversized.incr();
+        }
+        if let Some(attempt) = &stream_info.selected_attempt {
+            let mut attempt = attempt.borrow_mut();
+            attempt.upstream_response_id = upstream.response_id.clone();
+            attempt.upstream_usage = upstream.usage_json.clone();
+        }
+        stream_info.llm.upstream_response_id = upstream.response_id;
+        stream_info.llm.upstream_usage = upstream.usage_json;
         stream_info.llm.system = Some(match self.dialect {
             Dialect::OpenAi | Dialect::OpenAiResponses => GenAiSystem::OpenAi,
             Dialect::Anthropic => GenAiSystem::Anthropic,
@@ -2198,6 +2285,140 @@ mod tests {
             .unwrap_or_else(|| panic!("counter missing from export:\n{rendered}"));
         assert!(line.contains(r#"scope="ingress""#), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// Run one response through the filter with a selected attempt present,
+    /// returning the final stats, the attempt, and the filter's counters.
+    fn run_upstream_case(
+        dialect: Dialect,
+        content_type: &str,
+        body: &[u8],
+    ) -> (
+        proxy_http::LlmStats,
+        Option<(Option<String>, Option<String>)>,
+        Arc<UsageStats>,
+    ) {
+        let mut filter = filter_for(dialect);
+        let stats = Arc::clone(&filter.stats);
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.metadata_enabled = true;
+            let attempt = info.begin_attempt("provider:openai", "host", None).unwrap();
+            info.selected_attempt = Some(attempt);
+        }
+        filter.encode_headers(&mut cb, &mut response_headers(content_type), false);
+        filter.encode_data(&mut cb, &mut Bytes::copy_from_slice(body), true);
+        let attempt = cb.stream_info.borrow().selected_attempt.as_ref().map(|a| {
+            let a = a.borrow();
+            (a.upstream_response_id.clone(), a.upstream_usage.clone())
+        });
+        (cb.llm(), attempt, stats)
+    }
+
+    #[test]
+    fn upstream_id_and_raw_usage_reach_stats_and_the_selected_attempt_for_every_dialect() {
+        let cases: [(Dialect, &str, &[u8], &str, &str); 4] = [
+            (
+                Dialect::OpenAi,
+                "application/json",
+                br#"{"id":"chatcmpl-1","usage":{"prompt_tokens":2,"completion_tokens":3,"cost":0.5}}"#,
+                "chatcmpl-1",
+                r#"{"prompt_tokens":2,"completion_tokens":3,"cost":0.5}"#,
+            ),
+            (
+                Dialect::OpenAi,
+                "text/event-stream",
+                b"data: {\"id\":\"chatcmpl-2\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n",
+                "chatcmpl-2",
+                r#"{"prompt_tokens":2,"completion_tokens":3}"#,
+            ),
+            (
+                Dialect::Anthropic,
+                "text/event-stream",
+                b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
+                "msg_1",
+                r#"{"output_tokens":4}"#,
+            ),
+            (
+                Dialect::OpenAiResponses,
+                "text/event-stream",
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n",
+                "resp_1",
+                r#"{"input_tokens":4,"output_tokens":2}"#,
+            ),
+        ];
+        for (dialect, content_type, body, id, usage) in cases {
+            let (llm, attempt, _) = run_upstream_case(dialect, content_type, body);
+            assert_eq!(llm.upstream_response_id.as_deref(), Some(id), "{id}");
+            assert_eq!(llm.upstream_usage.as_deref(), Some(usage), "{id}");
+            assert_eq!(
+                attempt,
+                Some((Some(id.to_owned()), Some(usage.to_owned()))),
+                "{id}"
+            );
+        }
+    }
+
+    /// The provider's own `cost` is evidence, never billing: rate-card cost is
+    /// what the stats carry, whatever the provider said.
+    #[test]
+    fn provider_reported_cost_never_becomes_the_recorded_cost() {
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+        }
+        filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
+        let body = br#"{"usage":{"prompt_tokens":2,"completion_tokens":3,"cost":999.0}}"#;
+        filter.encode_data(&mut cb, &mut Bytes::from_static(body), true);
+        let llm = cb.llm();
+        assert_eq!(llm.list_cost.expect("priced").nanodollars, 320);
+        assert!(llm.upstream_usage.unwrap().contains("999.0"));
+    }
+
+    #[test]
+    fn oversized_upstream_fields_are_not_stored_and_are_counted() {
+        let pad = "p".repeat(crate::usage::MAX_UPSTREAM_USAGE_BYTES);
+        let id = "i".repeat(crate::usage::MAX_UPSTREAM_ID_BYTES + 1);
+        let body = format!(
+            r#"{{"id":"{id}","usage":{{"prompt_tokens":2,"completion_tokens":3,"k":"{pad}"}}}}"#
+        );
+        let (llm, attempt, stats) =
+            run_upstream_case(Dialect::OpenAi, "application/json", body.as_bytes());
+        assert_eq!(llm.upstream_response_id, None);
+        assert_eq!(llm.upstream_usage, None);
+        assert_eq!(attempt, Some((None, None)));
+        assert_eq!(stats.upstream_id_oversized(), 1);
+        assert_eq!(stats.upstream_usage_oversized(), 1);
+        // Token counts are unaffected by dropping the raw text.
+        assert_eq!(llm.usage.unwrap().input_tokens, 2);
+    }
+
+    #[test]
+    fn oversized_counters_are_exported_on_the_prometheus_surface() {
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let registry = control.registry();
+        let stats = UsageStats::new(Some(registry.clone()), "ingress");
+        stats.upstream_usage_oversized.incr();
+        stats.upstream_id_oversized.incr();
+        let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+        for name in [
+            "envoy_llmproxy_usage_upstream_usage_oversized_total{",
+            "envoy_llmproxy_usage_upstream_id_oversized_total{",
+        ] {
+            let line = rendered
+                .lines()
+                .find(|l| l.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} missing from export:\n{rendered}"));
+            assert!(
+                line.contains(r#"scope="ingress""#) && line.ends_with(" 1"),
+                "{line}"
+            );
+        }
     }
 
     #[test]

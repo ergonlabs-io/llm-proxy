@@ -11,6 +11,16 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- `%LLM_UPSTREAM_ID%` and `%LLM_UPSTREAM_USAGE%` access-log operators, and
+  `upstream_response_id` / `upstream_usage` on request and attempt records (schema version
+  1, additive): the provider's response id and its `usage` object exactly as sent. Evidence
+  only; cost still comes from the rate card. Misses over the size bounds are counted in
+  `llmproxy_usage_upstream_usage_oversized_total` and `llmproxy_usage_upstream_id_oversized_total`.
+- `HttpFilter::on_stream_complete`: a callbacks-carrying hook that runs once per filter, before
+  the access log reads `StreamInfo`, for clean ends, local replies and abandoned streams.
+
 ## [0.3.4] - 2026-10-13
 
 Fixes from a production metering review of an OpenRouter deployment run in config mode,
