@@ -163,6 +163,134 @@ pub fn extract_json_usage(dialect: Dialect, body: &[u8]) -> Option<TokenUsage> {
     usage_from_object(dialect, usage)
 }
 
+/// Extract usage from the last bytes of a response body too large to hold
+/// whole. Providers emit `usage` as the final top-level member, so it normally
+/// survives in a bounded tail.
+///
+/// The truncated document cannot be fully parsed, so "top-level" is checked
+/// structurally. Candidates are `"usage"` keys followed by `:` and `{`, tried
+/// last to first. A candidate is accepted only if, after its balanced object,
+/// the rest of the tail closes exactly one object, at the last non-whitespace
+/// byte. A `usage` nested in `choices[..]` or `message` closes more than one
+/// level (or a `]`) and is rejected. The residual risk is a nested `usage`
+/// that is the final member of a document whose top-level `usage` is absent;
+/// that requires a non-standard response and the object must still parse as
+/// this dialect's token counts, otherwise the answer is `None`, never a guess.
+pub fn extract_json_usage_from_tail(dialect: Dialect, tail: &[u8]) -> Option<TokenUsage> {
+    const KEY: &[u8] = b"\"usage\"";
+    // Bound the work an adversarial body full of `"usage"` keys can cause.
+    const MAX_CANDIDATES: usize = 8;
+    let mut end = tail.len();
+    let mut tried = 0;
+    while let Some(pos) = tail[..end].windows(KEY.len()).rposition(|w| w == KEY) {
+        end = pos;
+        // An escaped quote means the key text sits inside a string value.
+        let backslashes = tail[..pos]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+        if backslashes % 2 == 1 {
+            continue;
+        }
+        tried += 1;
+        if tried > MAX_CANDIDATES {
+            return None;
+        }
+        let mut i = pos + KEY.len();
+        i = skip_ws(tail, i);
+        if tail.get(i) != Some(&b':') {
+            continue;
+        }
+        i = skip_ws(tail, i + 1);
+        if tail.get(i) != Some(&b'{') {
+            continue;
+        }
+        let Some(object_end) = balanced_object_end(tail, i) else {
+            continue;
+        };
+        if !closes_exactly_one_object(&tail[object_end..]) {
+            continue;
+        }
+        let usage: serde_json::Value = serde_json::from_slice(&tail[i..object_end]).ok()?;
+        return usage_from_object(dialect, &usage);
+    }
+    None
+}
+
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// Index one past the `}` matching the `{` at `start`, honoring strings.
+fn balanced_object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when `rest` (what follows a candidate `usage` object) never closes a
+/// container before its final non-whitespace byte, and that byte is the `}`
+/// closing the one object that held the key.
+fn closes_exactly_one_object(rest: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut closed = false;
+    for &b in rest {
+        if closed {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            return false;
+        }
+        if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth += 1,
+            b'}' if depth == 0 => closed = true,
+            b']' if depth == 0 => return false,
+            b'}' | b']' => depth -= 1,
+            _ => {}
+        }
+    }
+    closed
+}
+
 // --- shared usage-object reading -------------------------------------------
 //
 // Both the whole-body path and the SSE path pull the same two token counts out
@@ -262,18 +390,25 @@ fn read_tokens(dialect: Dialect, usage: &serde_json::Value) -> RawTokens {
             // `cached_tokens` is nested under `prompt_tokens_details` and is a
             // *subset* of `prompt_tokens`; subtract it out so `input` is the
             // non-cached remainder (saturating, in case a provider ever reports
-            // cached > prompt). OpenAI bills no cache-write bucket.
-            let cached = token_count(
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens")),
-            );
-            let input =
-                u64_at("prompt_tokens").map(|prompt| prompt.saturating_sub(cached.unwrap_or(0)));
+            // cached > prompt). OpenAI itself bills no cache-write bucket, but
+            // OpenAI-compatible gateways fronting Anthropic or Gemini (for
+            // example OpenRouter) report cache writes as
+            // `prompt_tokens_details.cache_write_tokens`, also a subset of
+            // `prompt_tokens`. Read it when present so the write is billed at
+            // the cache-write rate instead of folded into full-price input.
+            // The SSE path reaches this same arm through `merge_usage`.
+            let details = usage.get("prompt_tokens_details");
+            let cached = token_count(details.and_then(|d| d.get("cached_tokens")));
+            let cache_write = token_count(details.and_then(|d| d.get("cache_write_tokens")));
+            let input = u64_at("prompt_tokens").map(|prompt| {
+                prompt
+                    .saturating_sub(cached.unwrap_or(0))
+                    .saturating_sub(cache_write.unwrap_or(0))
+            });
             RawTokens {
                 input,
                 cached,
-                cache_creation: None,
+                cache_creation: cache_write,
                 output: u64_at("completion_tokens"),
             }
         }
@@ -543,6 +678,66 @@ mod tests {
     //! pass. Add a failing test here first when extending a dialect.
 
     use super::*;
+
+    // ---- OpenAI-compatible gateways: cache writes ---------------------------
+
+    #[test]
+    fn openai_cache_write_tokens_are_split_out_of_input_json_and_sse() {
+        let usage = r#"{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":10,"cache_write_tokens":30}}"#;
+        let expected = TokenUsage {
+            input_tokens: 60,
+            cached_tokens: 10,
+            cache_creation_tokens: 30,
+            output_tokens: 5,
+        };
+        let body = format!(r#"{{"usage":{usage}}}"#);
+        assert_eq!(
+            extract_json_usage(Dialect::OpenAi, body.as_bytes()),
+            Some(expected)
+        );
+        let mut scanner = SseUsageScanner::new(Dialect::OpenAi);
+        scanner.push(format!("data: {body}\n\n").as_bytes());
+        assert_eq!(scanner.usage(), Some(expected));
+    }
+
+    #[test]
+    fn openai_without_cache_write_tokens_is_unchanged() {
+        let body = br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":10}}}"#;
+        let usage = extract_json_usage(Dialect::OpenAi, body).expect("usage");
+        assert_eq!(usage.input_tokens, 90);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    // ---- tail extraction for bodies past the accumulation cap ---------------
+
+    #[test]
+    fn tail_extraction_accepts_only_the_top_level_usage_object() {
+        let ok = br#"ssage":"x"}}],"usage":{"prompt_tokens":7,"completion_tokens":9},"id":"a"}"#;
+        let got = extract_json_usage_from_tail(Dialect::OpenAi, ok).expect("top-level usage");
+        assert_eq!((got.input_tokens, got.output_tokens), (7, 9));
+
+        // A usage object nested inside another container closes more than one
+        // level afterwards, so it is not mistaken for the top-level one.
+        let nested = br#"..."choices":[{"usage":{"prompt_tokens":7,"completion_tokens":9}}]}"#;
+        assert_eq!(extract_json_usage_from_tail(Dialect::OpenAi, nested), None);
+        let nested_obj = br#"{"message":{"usage":{"prompt_tokens":7,"completion_tokens":9}}}"#;
+        assert_eq!(
+            extract_json_usage_from_tail(Dialect::OpenAi, nested_obj),
+            None
+        );
+        // Escaped key text inside a string value is not a key.
+        let in_string = br#"{"t":"\"usage\":{\"prompt_tokens\":1}"}"#;
+        assert_eq!(
+            extract_json_usage_from_tail(Dialect::OpenAi, in_string),
+            None
+        );
+        // Another dialect's object is not read as zero tokens.
+        let wrong = br#"{"usage":{"input_tokens":1,"output_tokens":2}}"#;
+        assert_eq!(extract_json_usage_from_tail(Dialect::OpenAi, wrong), None);
+        // Truncated usage object (opening brace beyond the window) is None.
+        let cut = br#""prompt_tokens":1,"completion_tokens":2},"id":"a"}"#;
+        assert_eq!(extract_json_usage_from_tail(Dialect::OpenAi, cut), None);
+    }
 
     // ---- token_count: a present-but-unparseable count must never read as 0 --
     //

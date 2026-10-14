@@ -819,6 +819,19 @@ pub mod instruments {
         attribute_keys: &["provider", "outcome"],
         buckets: None,
     };
+    /// Oversized JSON responses (past the usage filter's body cap) whose
+    /// `usage` could not be recovered, so the request went unmetered: no
+    /// usage, no cost, nothing counted by spend or token limits. `scope` is
+    /// the operator-chosen HCM `stat_prefix`, bounded by config. Exported on
+    /// `/stats/prometheus` only: `/stats` is Envoy's compatibility surface
+    /// and carries no equivalent stat.
+    pub const USAGE_OVERSIZED_BODY_UNMETERED: Instrument = Instrument {
+        name: "llmproxy_usage_oversized_body_unmetered_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

@@ -1462,6 +1462,20 @@ fn build_hcm_handler(
         // rename of `scope`.
         stat_prefix: hcm.stat_prefix.clone(),
     };
+    // Filters built from a `DynamicMessage` have no other way to reach the
+    // stats registry, so seed it where `FactoryContext` consumers can find it.
+    runtime
+        .factory_state
+        .get_or_try_init(
+            "",
+            "",
+            proxy_filters::usage_filter::STATS_REGISTRY_KEY,
+            || Ok(runtime.router_stats.registry() as Arc<dyn std::any::Any + Send + Sync>),
+        )
+        .map_err(|e| HttpFilterChainBuildError {
+            context: context.to_string(),
+            reason: format!("stats registry: {e}"),
+        })?;
     let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
     for f in &hcm.http_filters {
         if f.is_router {
