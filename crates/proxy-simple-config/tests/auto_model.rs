@@ -59,12 +59,14 @@ fn filter_names(bootstrap: &serde_json::Value) -> Vec<String> {
 const SECRET: &str = "test-operator-secret";
 
 /// `auth:` block with one key per tenant; the plaintext key is
-/// `llmp_<tenant>-key`.
+/// `llmp_<tenant>-key`. Neither tenant has a stored model policy, so the
+/// block opts them in with `tenants_without_policy: allow`; these tests are
+/// about resolution, not model grants.
 fn auth_block() -> String {
     let acme = digest_hex(SECRET.as_bytes(), "llmp_acme-key");
     let globex = digest_hex(SECRET.as_bytes(), "llmp_globex-key");
     format!(
-        "auth:\n  hmac_secret: \"{SECRET}\"\n  keys:\n    \
+        "auth:\n  hmac_secret: \"{SECRET}\"\n  enforce: {{ tenants_without_policy: allow }}\n  keys:\n    \
          - {{ id: \"k1\", tenant: \"acme\", digest: \"{acme}\" }}\n    \
          - {{ id: \"k2\", tenant: \"globex\", digest: \"{globex}\" }}\n"
     )

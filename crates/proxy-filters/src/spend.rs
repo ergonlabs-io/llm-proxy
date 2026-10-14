@@ -627,8 +627,7 @@ impl PeriodKey {
 ///
 /// # `None` (on `TenantPolicy::budget`) means unlimited -- the deliberate default
 ///
-/// Mirrors [`crate::model_authz::ModelAccess::default`]'s reasoning exactly,
-/// restated for money: a budget is an opt-in ceiling, not a default-deny. If
+/// A budget is an opt-in ceiling, not a default-deny. If
 /// an absent budget meant "spend nothing", turning the
 /// enforcement filter on would deny every tenant's very first request the
 /// moment an operator adds it to a chain -- that is an outage, not a safety
@@ -640,7 +639,7 @@ impl PeriodKey {
 /// `ModelAccess` has no missing-vs-configured distinction to make *inside*
 /// the enum -- `All` and `Only(vec![])` are both fully-specified values, and
 /// the only "is this tenant restricted at all" question lives one level up,
-/// at `TenantPolicy::model_access` vs. `TenantPolicy::default()`.
+/// at `TenantPolicy::model_access` being `Some` or `None`.
 /// `TenantBudget` has that identical two-level shape, restated for money:
 /// `None` (no ceiling configured -- unlimited) vs. `Some(TenantBudget {
 /// max_micros: MicroUsd::from_micros(0), .. })` (a ceiling IS configured, and

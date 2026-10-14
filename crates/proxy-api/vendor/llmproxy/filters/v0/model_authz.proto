@@ -14,14 +14,29 @@ package llmproxy.filters.v0;
 //
 // The filter is fail CLOSED on both axes that feed it -- an unauthenticated
 // stream (no `StreamInfo::auth.tenant`) and a request with no extractable
-// `model` (no `StreamInfo::requested_model`) are both refused, never admitted
-// -- but authorization defaults OPEN: a tenant with no configured policy
-// may use every model. Deny patterns, when present, subtract from the grant.
+// `model` (no `StreamInfo::requested_model`) are both refused, never admitted.
+// A tenant with no stored model policy is refused too, unless
+// `tenants_without_policy` is `ALLOW`. Deny patterns, when present, subtract
+// from the grant.
 message ModelAuthz {
-  // The configured tenants' model access policies. A tenant authenticated by
-  // an earlier `llmproxy.auth` filter but absent from this list is granted
-  // every model. An empty list is legal and imposes no model restrictions.
+  // What a tenant with no stored model policy may use. The zero value is
+  // `DENY`, so leaving the field unset never grants anything (unset never
+  // means open).
+  enum TenantsWithoutPolicy {
+    // Refuse every model (403 `model_not_permitted`).
+    DENY = 0;
+    // Grant every model. Logged as a warning when the filter is built,
+    // because every authenticated tenant without a policy is then
+    // unrestricted.
+    ALLOW = 1;
+  }
+
+  // The configured tenants' model access policies, seeded into the
+  // control-plane store at load. An empty list is legal.
   repeated TenantModelPolicy policies = 1;
+
+  // See `TenantsWithoutPolicy`. An enum number outside it is a load error.
+  TenantsWithoutPolicy tenants_without_policy = 2;
 }
 
 // One tenant's model access policy. `tenant` must match a value the

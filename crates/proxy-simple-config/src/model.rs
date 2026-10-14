@@ -421,6 +421,23 @@ pub struct AuthEnforce {
     pub model_policy: bool,
     #[serde(default = "default_true")]
     pub spend: bool,
+    /// What a tenant with no stored model policy may use. Absent means
+    /// `deny`. Only meaningful with `model_policy: true`; set alongside
+    /// `model_policy: false` it is a load error, since nothing would read it.
+    #[serde(default)]
+    pub tenants_without_policy: Option<TenantsWithoutPolicy>,
+}
+
+/// `auth.enforce.tenants_without_policy`. Mirrors
+/// `llmproxy.filters.v0.ModelAuthz.TenantsWithoutPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantsWithoutPolicy {
+    /// Refuse every model (403) until a policy is stored for the tenant.
+    Deny,
+    /// Grant every model. Loud at load: every tenant without a policy is
+    /// unrestricted.
+    Allow,
 }
 
 fn default_true() -> bool {
@@ -432,6 +449,7 @@ impl Default for AuthEnforce {
         Self {
             model_policy: true,
             spend: true,
+            tenants_without_policy: None,
         }
     }
 }

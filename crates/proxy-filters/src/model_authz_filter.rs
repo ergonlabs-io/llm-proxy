@@ -38,9 +38,9 @@
 //! least loud, unlike the two existing LLM-layer ordering traps this one joins
 //! (`token_limit_filter`'s module doc).
 //!
-//! # Fail closed on missing inputs; OPEN on an unconfigured tenant
+//! # Fail closed on missing inputs and on a tenant with no policy
 //!
-//! Two ways this filter refuses a request, both with the SAME wire response
+//! Three ways this filter refuses a request, all with the SAME wire response
 //! and the SAME generic `%RESPONSE_CODE_DETAILS%` (`model_not_permitted` --
 //! never naming which applied, and never rendering a policy's contents or a
 //! tenant's allow-list):
@@ -53,24 +53,16 @@
 //! 2. **No requested model** (`StreamInfo::requested_model` is `None`) -- a
 //!    body with no extractable `model` cannot be checked against a model
 //!    allow-list.
+//! 3. **No stored model policy for the tenant**, unless
+//!    `typed_config.tenants_without_policy` is `ALLOW` (review H4). This
+//!    reverses the earlier open default: absence of policy must not mean
+//!    allow-all (AGENTS.md "Fail-open controls": unset never means open).
+//!    The first refusal per tenant is logged once at `warn`, naming the
+//!    tenant and the fix, so an operator upgrading into this default can see
+//!    why; `ALLOW` logs a warning when the filter is built.
 //!
-//! A tenant found in the snapshot's `policies` but whose model isn't
-//! permitted (`ModelAccess::Only` with no matching pattern) is a third,
-//! ordinary denial sharing the same treatment.
-//!
-//! **An authenticated tenant ABSENT from the snapshot's `policies` is
-//! ALLOWED**, not refused -- this reverses the filter's
-//! original behavior (refuse), an owner decision. Authorization
-//! defaults OPEN (`ModelAccess::default()` is `All`; see
-//! `crate::model_authz::ModelAccess`'s doc), and that
-//! default applies uniformly whether the tenant is missing because this
-//! filter is absent from the chain OR because it is present but nothing
-//! ever wrote a policy for that tenant -- the two are no longer
-//! distinguished. The accepted consequence: an operator who configures
-//! policies for tenants A and B and forgets C grants C full access rather
-//! than refusing it. If that surprises an operator, the fix is a policy
-//! (`Only(vec![])` denies every model for a tenant), not a filter behavior
-//! change here.
+//! A tenant whose policy does not permit the model (`ModelAccess::Only` with
+//! no matching pattern) is a fourth, ordinary denial with the same treatment.
 //!
 //! # Config: a vendored proto, same reasoning as `auth.proto`
 //!
@@ -142,6 +134,55 @@ pub struct ModelAuthzEnforced;
 /// issues -- see the module doc's "Fail closed" section for why all four
 /// reasons collapse into one generic string rather than distinguishing them.
 const DENY_DETAILS: &str = "model_not_permitted";
+
+/// Singleton key for [`NoPolicyLog`], one per chain.
+const NO_POLICY_LOG_KEY: &str = "llmproxy.internal.model_authz.no_policy_log";
+
+/// Most tenants [`NoPolicyLog`] remembers. Tenants come from authenticated
+/// keys, so the set is bounded by the operator's own key inventory; the cap
+/// keeps a pathological inventory from growing it without limit. Past it,
+/// refusals are still counted in the access log, just not logged again.
+const NO_POLICY_LOG_CAP: usize = 1024;
+
+/// Warn-once state for the "no stored policy" refusal and the `ALLOW`
+/// setting, shared by every worker building the same chain. Touched only on
+/// a refusal and at filter build, never on a permitted request (AGENTS.md
+/// "Fail-open controls": keep suppression state off the healthy hot path).
+#[derive(Default)]
+struct NoPolicyLog {
+    refused: std::sync::Mutex<std::collections::HashSet<String>>,
+    allow_warned: std::sync::atomic::AtomicBool,
+}
+
+impl NoPolicyLog {
+    fn note_refused(&self, tenant: &str) {
+        let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        if refused.len() >= NO_POLICY_LOG_CAP || !refused.insert(tenant.to_string()) {
+            return;
+        }
+        tracing::warn!(
+            tenant,
+            "model request refused: this tenant has no model policy, and              llmproxy.model_authz denies tenants without one; grant models with              PUT /tenants/{{id}}/policy, or set tenants_without_policy: ALLOW              (dialect: auth.enforce.tenants_without_policy: allow)"
+        );
+    }
+}
+
+/// Reads `typed_config.tenants_without_policy`: `true` for `ALLOW`. Unset is
+/// `DENY` (the proto3 zero value); a number outside the enum is a load error.
+fn parse_tenants_without_policy(config: &DynamicMessage) -> Result<bool, ConfigError> {
+    let number = config
+        .get_field_by_name("tenants_without_policy")
+        .and_then(|v| v.as_enum_number())
+        .unwrap_or(0);
+    match number {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(invalid(
+            "typed_config.tenants_without_policy",
+            format!("unknown value {other}; expected DENY or ALLOW"),
+        )),
+    }
+}
 
 fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigError {
     ConfigError::InvalidValue {
@@ -313,7 +354,7 @@ pub fn parse_config(config: &DynamicMessage) -> Result<TenantPolicyMap, ConfigEr
         map.insert(
             tenant,
             Arc::new(TenantPolicy {
-                model_access,
+                model_access: Some(model_access),
                 budget: None,
             }),
         );
@@ -392,8 +433,31 @@ impl HttpFilterFactory for ModelAuthzFilterFactory {
             Ok(Arc::new(ModelAuthzEnforced) as Arc<dyn std::any::Any + Send + Sync>)
         })?;
 
+        let allow_without_policy = parse_tenants_without_policy(config)?;
+        let no_policy_log = ctx
+            .get_or_try_init(NO_POLICY_LOG_KEY, || {
+                Ok(Arc::new(NoPolicyLog::default()) as Arc<dyn std::any::Any + Send + Sync>)
+            })?
+            .downcast::<NoPolicyLog>()
+            .map_err(|_| invalid("typed_config", "model_authz log state type collision"))?;
+        // Loud, once per chain: this setting opens every tenant without a
+        // policy to every model (AGENTS.md "Fail-open controls").
+        if allow_without_policy
+            && !no_policy_log
+                .allow_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                chain = ctx.stat_prefix.as_str(),
+                "llmproxy.model_authz: tenants_without_policy is ALLOW, so every \
+                 authenticated tenant without a stored model policy may use every model"
+            );
+        }
+
         Ok(Box::new(ModelAuthzInstanceFactory {
             snapshot: control_plane.handle(),
+            allow_without_policy,
+            no_policy_log,
         }))
     }
 }
@@ -405,6 +469,9 @@ struct ModelAuthzInstanceFactory {
     /// kind of handle for the identical reason (see `control.rs`'s module
     /// doc).
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
+    /// `typed_config.tenants_without_policy == ALLOW`.
+    allow_without_policy: bool,
+    no_policy_log: Arc<NoPolicyLog>,
 }
 
 impl FilterInstanceFactory for ModelAuthzInstanceFactory {
@@ -412,6 +479,8 @@ impl FilterInstanceFactory for ModelAuthzInstanceFactory {
         Box::new(ModelAuthzFilterInstance {
             decided: false,
             snapshot: Arc::clone(&self.snapshot),
+            allow_without_policy: self.allow_without_policy,
+            no_policy_log: Arc::clone(&self.no_policy_log),
         })
     }
 }
@@ -426,6 +495,9 @@ struct ModelAuthzFilterInstance {
     /// bodyless request) and must run exactly once -- see
     /// [`Self::authorize_model`].
     decided: bool,
+    /// See [`ModelAuthzInstanceFactory::allow_without_policy`].
+    allow_without_policy: bool,
+    no_policy_log: Arc<NoPolicyLog>,
 }
 
 impl ModelAuthzFilterInstance {
@@ -505,15 +577,21 @@ impl ModelAuthzFilterInstance {
         // pattern and the module doc's "Reads the ControlPlaneSnapshot"
         // section.
         let snapshot = self.snapshot.load();
-        let permitted = match snapshot.policies.get(&tenant) {
-            Some(policy) => policy.model_access.permits(&model),
-            // No policy configured for this tenant in the published
-            // snapshot -- `ModelAccess::default()` is `All`, so this falls
-            // out to the OPEN default rather than a denial. XX (see the module doc);
-            // the `None` arm is written out explicitly, not folded into
-            // `is_some_and`, so which way "absent" falls is visible without
-            // reconstructing combinator semantics.
-            None => true,
+        let access = snapshot
+            .policies
+            .get(&tenant)
+            .and_then(|policy| policy.model_access.as_ref());
+        let permitted = match access {
+            Some(access) => access.permits(&model),
+            // No model policy stored for this tenant (review H4): refused
+            // unless the operator chose `ALLOW`. Written out rather than
+            // folded into a combinator so which way "absent" falls is
+            // visible at a glance.
+            None if self.allow_without_policy => true,
+            None => {
+                self.no_policy_log.note_refused(&tenant);
+                false
+            }
         };
 
         if !permitted {
@@ -715,10 +793,10 @@ mod tests {
         let map = parse_config(&config).expect("valid config must parse");
 
         assert_eq!(map.len(), 2);
-        assert_eq!(map["tenant-a"].model_access, ModelAccess::All);
+        assert_eq!(map["tenant-a"].model_access, Some(ModelAccess::All));
         assert_eq!(
             map["tenant-b"].model_access,
-            ModelAccess::Only(vec![ModelPattern::new("gpt-4*")])
+            Some(ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]))
         );
     }
 
@@ -730,7 +808,7 @@ mod tests {
             prost_reflect::Value::List(vec![prost_reflect::Value::String("gpt-5*".into())]),
         );
         let map = parse_config(&model_authz(vec![policy])).unwrap();
-        let access = &map["tenant-a"].model_access;
+        let access = map["tenant-a"].model_access.as_ref().unwrap();
         assert!(access.permits("gpt-4o"));
         assert!(!access.permits("gpt-5-mini"));
     }
@@ -836,7 +914,10 @@ mod tests {
     fn only_with_an_empty_pattern_list_parses_as_deny_all() {
         let config = model_authz(vec![policy_only("tenant-a", &[])]);
         let map = parse_config(&config).expect("an empty patterns list is legal");
-        assert_eq!(map["tenant-a"].model_access, ModelAccess::Only(vec![]));
+        assert_eq!(
+            map["tenant-a"].model_access,
+            Some(ModelAccess::Only(vec![]))
+        );
     }
 
     // --- test scaffolding for filter-behaviour tests ---------------------------
@@ -987,6 +1068,8 @@ mod tests {
         ModelAuthzFilterInstance {
             snapshot,
             decided: false,
+            allow_without_policy: false,
+            no_policy_log: Arc::new(NoPolicyLog::default()),
         }
     }
 
@@ -997,7 +1080,7 @@ mod tests {
                 (
                     tenant.to_string(),
                     Arc::new(TenantPolicy {
-                        model_access,
+                        model_access: Some(model_access),
                         budget: None,
                     }),
                 )
@@ -1133,24 +1216,125 @@ mod tests {
         assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
     }
 
-    // --- an authenticated tenant absent from the snapshot is
-    //     ALLOWED -- the reversal of 3a's case 3. Mutation pin 1: flipping
-    //     the `None` arm in `decode_headers` to `false` must red this test.
+    // --- a tenant with no stored model policy (review H4) ---------------
+    //
+    // Absence of policy must not mean allow-all. These go through the real
+    // factory and a real `ControlPlane`, so the config field, the snapshot
+    // merge and the request-time check are all on the path.
+
+    /// A `ControlPlane` registered the way `llmproxy.auth` registers it, and
+    /// the filter built over it with `tenants_without_policy` as given.
+    fn built_over_control_plane(
+        allow: bool,
+    ) -> (Arc<ControlPlane>, Box<dyn FilterInstanceFactory>) {
+        let ctx = FactoryContext::default();
+        let cp = Arc::new(
+            ControlPlane::new(
+                Box::new(InMemoryControlPlaneStore::default()),
+                HmacSecret::new(b"operator-secret"),
+                KeySet::new(),
+            )
+            .unwrap(),
+        );
+        ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .unwrap();
+        let mut config = model_authz(vec![]);
+        if allow {
+            config.set_field_by_name(
+                "tenants_without_policy",
+                prost_reflect::Value::EnumNumber(1),
+            );
+        }
+        let factory = match ModelAuthzFilterFactory.create(&config, &ctx) {
+            Ok(factory) => factory,
+            Err(e) => panic!("valid config must build: {e:?}"),
+        };
+        (cp, factory)
+    }
+
+    fn refused(factory: &dyn FilterInstanceFactory, tenant: &str) -> bool {
+        let mut filter = factory.create_filter();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant(tenant);
+        cb.set_requested_model("gpt-4o");
+        decode_request(&mut *filter, &mut cb);
+        cb.local_reply
+            .map(|reply| reply.status == HttpStatusCode::FORBIDDEN)
+            .unwrap_or(false)
+    }
+
+    /// The default: a tenant known only by its keys, and a tenant with a
+    /// budget but no model policy, are both refused, and the refusal is
+    /// logged once per tenant with the fix. Mutation: make the `None` arm in
+    /// `authorize_model` return `true` and this reds.
+    #[test]
+    fn a_tenant_without_a_model_policy_is_refused_by_default_and_logged_once() {
+        let (cp, factory) = built_over_control_plane(false);
+        cp.set_budget(
+            &TenantId::new("budget-only"),
+            Some(&crate::spend::TenantBudget {
+                max_micros: crate::spend::MicroUsd::from_micros(1_000_000),
+                period: crate::spend::Period::Daily,
+                credential_source: proxy_http::tenant_credentials::CredentialSource::Platform,
+            }),
+        )
+        .unwrap();
+        let (capture, _guard) = crate::control::log_capture::Capture::start();
+        for tenant in ["keys-only", "budget-only", "keys-only"] {
+            assert!(
+                refused(&*factory, tenant),
+                "{tenant}: no model policy must be refused"
+            );
+        }
+        let warnings = capture.rendered_at_or_above(tracing::Level::WARN);
+        assert_eq!(warnings.len(), 2, "once per tenant: {warnings:?}");
+        assert!(
+            warnings[0].contains("tenant=\"keys-only\"")
+                && warnings[0].contains("tenants_without_policy"),
+            "the warning names the tenant and the fix: {}",
+            warnings[0]
+        );
+
+        cp.set_policy(&TenantId::new("keys-only"), &ModelAccess::All)
+            .unwrap();
+        assert!(
+            !refused(&*factory, "keys-only"),
+            "an explicit `all` policy is a grant"
+        );
+    }
+
+    /// The fail-open option has its own test (AGENTS.md "Fail-open
+    /// controls"): `ALLOW` admits a tenant with no policy and says so, loudly,
+    /// when the filter is built.
+    #[test]
+    fn tenants_without_policy_allow_admits_them_and_warns_at_build() {
+        let (capture, _guard) = crate::control::log_capture::Capture::start();
+        let (_cp, factory) = built_over_control_plane(true);
+        assert!(!refused(&*factory, "keys-only"));
+        let warnings = capture.rendered_at_or_above(tracing::Level::WARN);
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("tenants_without_policy is ALLOW")),
+            "ALLOW must warn when the filter is built: {warnings:?}"
+        );
+    }
 
     #[test]
-    fn a_tenant_absent_from_the_snapshot_is_allowed() {
-        let policies = policies_map(vec![("tenant-a", ModelAccess::All)]);
-        let mut filter = filter_with(policies);
-        let mut cb = TestCallbacks::new(Some(route_named("r1")));
-        cb.set_tenant("tenant-unknown-to-this-snapshot");
-        cb.set_requested_model("gpt-4o");
-        decode_request(&mut filter, &mut cb);
-        assert!(
-            cb.local_reply.is_none(),
-            "a tenant absent from the published snapshot must be ALLOWED -- authorization \
-             defaults OPEN, and this reverses the original refuse behavior (see the module \
-             doc's \"Fail closed on missing inputs; OPEN on an unconfigured tenant\" section)"
+    fn an_unknown_tenants_without_policy_value_is_a_load_error() {
+        let mut config = model_authz(vec![]);
+        config.set_field_by_name(
+            "tenants_without_policy",
+            prost_reflect::Value::EnumNumber(7),
         );
+        match parse_tenants_without_policy(&config) {
+            Err(ConfigError::InvalidValue { field_path, .. }) => {
+                assert_eq!(field_path, "typed_config.tenants_without_policy")
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 
     // --- config load: model_authz with no llmproxy.auth in the chain -------
@@ -1221,15 +1405,16 @@ mod tests {
             .expect("valid config with llmproxy.auth already registered must build");
         let mut filter = instance_factory.create_filter();
 
-        // Before any admin write: tenant-a is absent from the snapshot, so
-        // it is allowed (the OPEN default).
+        // Before any admin write: tenant-a has a permissive policy.
+        cp.set_policy(&TenantId::new("tenant-a"), &ModelAccess::All)
+            .expect("set_policy must succeed");
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_tenant("tenant-a");
         cb.set_requested_model("claude-3");
         decode_request(&mut *filter, &mut cb);
         assert!(
             cb.local_reply.is_none(),
-            "tenant-a has no policy yet, so it must be allowed"
+            "tenant-a may use every model before the write"
         );
 
         // The admin endpoint's exact call.

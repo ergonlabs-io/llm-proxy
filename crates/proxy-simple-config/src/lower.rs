@@ -403,6 +403,13 @@ fn warn_unenforced_tenant_controls(config: &SimpleConfig, warnings: &mut Vec<Con
     let Some(auth) = &config.auth else {
         return;
     };
+    if allows_tenants_without_policy(config) {
+        warnings.push(warning(
+            "auth.enforce.tenants_without_policy",
+            "every authenticated tenant without a stored model policy may use every model; \
+             remove this to refuse them until PUT /tenants/{id}/policy grants models",
+        ));
+    }
     if !auth.enforce.model_policy {
         warnings.push(warning(
             "auth.enforce.model_policy",
@@ -1340,6 +1347,15 @@ fn enforces_model_policy(config: &SimpleConfig) -> bool {
         .is_some_and(|auth| auth.enforce.model_policy)
 }
 
+/// `auth.enforce.tenants_without_policy: allow` on a chain that enforces
+/// model policy.
+fn allows_tenants_without_policy(config: &SimpleConfig) -> bool {
+    enforces_model_policy(config)
+        && config.auth.as_ref().is_some_and(|auth| {
+            auth.enforce.tenants_without_policy == Some(TenantsWithoutPolicy::Allow)
+        })
+}
+
 /// `auth` is set and `auth.enforce.spend` is on: the chain carries
 /// `llmproxy.spend_limit`.
 fn enforces_spend(config: &SimpleConfig) -> bool {
@@ -2023,6 +2039,15 @@ fn lower_auth(
         ));
     }
 
+    if !auth.enforce.model_policy && auth.enforce.tenants_without_policy.is_some() {
+        return Err(ConfigError::InvalidValue {
+            field_path: "auth.enforce.tenants_without_policy".to_string(),
+            reason: "has no effect with `model_policy: false`, which omits the filter that \
+                     reads it; remove one of the two"
+                .to_string(),
+        });
+    }
+
     let mut typed_config = json!({
         "@type": AUTH_FILTER_TYPE_URL,
         "hmac_secret": hmac_secret,
@@ -2611,11 +2636,17 @@ fn lower_listener(
         // After auth (reads `StreamInfo::auth.tenant`), body_rewrite (publishes
         // the requested model) and the resolver when present (publishes the
         // routing model it authorizes); decode runs in config order.
-        // `policies` stays empty: live policy comes from the admin store, and
-        // a tenant with no stored policy stays open.
+        // `policies` stays empty: live policy comes from the admin store. A
+        // tenant with no stored policy is refused unless the operator set
+        // `auth.enforce.tenants_without_policy: allow`; the default adds no
+        // field, which the proto reads as DENY.
+        let mut typed_config = json!({ "@type": MODEL_AUTHZ_FILTER_TYPE_URL });
+        if allows_tenants_without_policy(config) {
+            typed_config["tenants_without_policy"] = json!("ALLOW");
+        }
         http_filters.push(json!({
             "name": "llmproxy.model_authz",
-            "typed_config": { "@type": MODEL_AUTHZ_FILTER_TYPE_URL },
+            "typed_config": typed_config,
         }));
     }
     if let Some(token_limit_filter) = token_limit_filter {

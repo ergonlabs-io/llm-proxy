@@ -3387,8 +3387,13 @@ impl ControlPlane {
                 );
                 continue;
             }
+            // `parse_config` always yields `Some`; a policy without a model
+            // grant has nothing to seed.
+            let Some(access) = &policy.model_access else {
+                continue;
+            };
             self.store
-                .set_policy(&TenantId::new(tenant.clone()), &policy.model_access)?;
+                .set_policy(&TenantId::new(tenant.clone()), access)?;
             existing.insert(tenant.clone());
         }
 
@@ -3485,10 +3490,10 @@ impl ControlPlane {
         // `policies` is populated from the store only -- there is no
         // config-bootstrap policy source yet (bootstrap virtual keys carry no
         // `ModelAccess`), so there is nothing to layer under it. A tenant
-        // absent here simply falls back to `TenantPolicy::default()`
-        // (`ModelAccess::All`) wherever a policy lookup misses, exactly as it
-        // does today via `model_authz_filter`'s own `typed_config`, which
-        // this snapshot does not yet replace.
+        // with no model policy row gets `model_access: None`, whether it is
+        // absent here or present only for its budget; `llmproxy.model_authz`
+        // decides what `None` permits (`tenants_without_policy`, deny by
+        // default).
         //
         // `loaded.budgets` is a SEPARATE store
         // table from `loaded.policies` (see `StoredControlPlane::budgets`'s
@@ -3522,7 +3527,7 @@ impl ControlPlane {
             policies.insert(
                 tenant.as_str().to_string(),
                 Arc::new(TenantPolicy {
-                    model_access: access,
+                    model_access: Some(access),
                     budget,
                 }),
             );
@@ -3531,7 +3536,8 @@ impl ControlPlane {
             policies.insert(
                 tenant.as_str().to_string(),
                 Arc::new(TenantPolicy {
-                    model_access: ModelAccess::default(),
+                    // A budget row is not a model grant (review H4).
+                    model_access: None,
                     budget: Some(budget),
                 }),
             );
@@ -4623,7 +4629,7 @@ mod tests {
             .policies
             .get("tenant-a")
             .expect("policy must appear in the snapshot after set_policy's republish");
-        assert_eq!(policy.model_access, access);
+        assert_eq!(policy.model_access, Some(access));
 
         cp.delete_tenant(&TenantId::new("tenant-a"))
             .expect("delete_tenant must succeed");
@@ -4722,7 +4728,7 @@ mod tests {
         bootstrap.insert(
             "tenant-a".to_string(),
             Arc::new(TenantPolicy {
-                model_access: access.clone(),
+                model_access: Some(access.clone()),
                 budget: None,
             }),
         );
@@ -4735,7 +4741,7 @@ mod tests {
             .policies
             .get("tenant-a")
             .expect("a bootstrap policy for a tenant absent from the store must be seeded");
-        assert_eq!(policy.model_access, access);
+        assert_eq!(policy.model_access, Some(access));
     }
 
     #[test]
@@ -4757,7 +4763,7 @@ mod tests {
         bootstrap.insert(
             "tenant-a".to_string(),
             Arc::new(TenantPolicy {
-                model_access: bootstrap_access,
+                model_access: Some(bootstrap_access),
                 budget: None,
             }),
         );
@@ -4767,7 +4773,8 @@ mod tests {
 
         let snapshot = cp.handle().load();
         assert_eq!(
-            snapshot.policies["tenant-a"].model_access, store_access,
+            snapshot.policies["tenant-a"].model_access,
+            Some(store_access),
             "the store's policy must win a tenant collision against the bootstrap map"
         );
     }
@@ -4793,7 +4800,7 @@ mod tests {
         bootstrap.insert(
             "tenant-a".to_string(),
             Arc::new(TenantPolicy {
-                model_access: bootstrap_access.clone(),
+                model_access: Some(bootstrap_access.clone()),
                 budget: None,
             }),
         );
@@ -4804,7 +4811,7 @@ mod tests {
             .expect("first seed must succeed");
         assert_eq!(
             cp.handle().load().policies["tenant-a"].model_access,
-            bootstrap_access
+            Some(bootstrap_access)
         );
 
         // An admin `PUT /tenants/tenant-a/policy` lands in between two
@@ -4815,7 +4822,7 @@ mod tests {
             .expect("admin set_policy must succeed");
         assert_eq!(
             cp.handle().load().policies["tenant-a"].model_access,
-            admin_access
+            Some(admin_access.clone())
         );
 
         // A second worker's `create()` seeds the exact same bootstrap map
@@ -4824,7 +4831,7 @@ mod tests {
             .expect("re-seeding an identical bootstrap map must succeed");
         assert_eq!(
             cp.handle().load().policies["tenant-a"].model_access,
-            admin_access,
+            Some(admin_access),
             "re-seeding identical bootstrap policies must not clobber a store policy \
              that landed in between -- this is the silent-policy-revert \
              `seed_bootstrap_policies`'s idempotence exists to prevent"
@@ -5020,7 +5027,8 @@ mod tests {
             .get("tenant-a")
             .expect("tenant must exist");
         assert_eq!(
-            policy.model_access, access,
+            policy.model_access,
+            Some(access),
             "setting a budget must not clobber the tenant's already-configured model_access"
         );
         assert_eq!(policy.budget, Some(budget));
@@ -5060,7 +5068,7 @@ mod tests {
             Some(budget),
             "setting a policy must not clobber the tenant's already-configured budget"
         );
-        assert_eq!(policy.model_access, access);
+        assert_eq!(policy.model_access, Some(access));
     }
 
     #[test]
@@ -5123,7 +5131,7 @@ mod tests {
             );
             assert_eq!(
                 cp.handle().load().policies["tenant-a"].model_access,
-                ModelAccess::Only(vec![ModelPattern::new("allowed")])
+                Some(ModelAccess::Only(vec![ModelPattern::new("allowed")]))
             );
             let generation = cp.store().policy_generation().unwrap();
             assert!(matches!(

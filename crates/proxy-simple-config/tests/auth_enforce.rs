@@ -250,3 +250,57 @@ fn unknown_key_under_enforce_is_rejected_with_its_dotted_path() {
         other => panic!("expected UnknownField, got {other:?}"),
     }
 }
+
+/// The lowered `llmproxy.model_authz` typed_config, as JSON.
+fn model_authz_config(config_text: &str) -> serde_json::Value {
+    let lowered = lower(&parse(config_text).expect("must parse")).expect("must lower");
+    lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+        ["typed_config"]["http_filters"]
+        .as_array()
+        .expect("http_filters")
+        .iter()
+        .find(|f| f["name"] == "llmproxy.model_authz")
+        .expect("model_authz in the chain")["typed_config"]
+        .clone()
+}
+
+/// `tenants_without_policy` (review H4): absent and `deny` add no field (the
+/// proto's zero value is DENY); `allow` lowers to `ALLOW`, warns at load, and
+/// the strict loader accepts it.
+#[test]
+fn tenants_without_policy_lowers_deny_by_default_and_allow_loudly() {
+    for extra in ["", "  enforce: { tenants_without_policy: deny }\n"] {
+        let typed = model_authz_config(&with_auth(extra, PRICING));
+        assert!(
+            typed.get("tenants_without_policy").is_none(),
+            "{extra:?}: {typed}"
+        );
+    }
+
+    let text = with_auth("  enforce: { tenants_without_policy: allow }\n", PRICING);
+    assert_eq!(model_authz_config(&text)["tenants_without_policy"], "ALLOW");
+    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    assert!(
+        lowered
+            .warnings
+            .iter()
+            .any(|w| w.field_path == "auth.enforce.tenants_without_policy"),
+        "{:?}",
+        lowered.warnings
+    );
+    lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts ALLOW");
+}
+
+#[test]
+fn tenants_without_policy_with_model_policy_off_is_a_load_error() {
+    let text = with_auth(
+        "  enforce: { model_policy: false, tenants_without_policy: allow }\n",
+        PRICING,
+    );
+    match lower(&parse(&text).unwrap()) {
+        Err(ConfigError::InvalidValue { field_path, .. }) => {
+            assert_eq!(field_path, "auth.enforce.tenants_without_policy")
+        }
+        other => panic!("expected InvalidValue, got {:?}", other.map(|_| ())),
+    }
+}

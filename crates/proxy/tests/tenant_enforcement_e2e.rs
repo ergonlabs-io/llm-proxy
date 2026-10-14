@@ -33,6 +33,7 @@ fn an_empty_only_policy_makes_the_next_request_403() {
     let dir = scratch_dir("policy");
     let proxy = Proxy::start(&dir, &config_text(""));
     let key = mint_key(&proxy);
+    allow_all_models(&proxy);
 
     let before = chat(&proxy, &key);
     assert!(
@@ -100,6 +101,30 @@ fn a_zero_budget_refuses_the_next_request() {
     );
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review H4: absence of policy is not a grant. A minted key whose tenant has
+/// no stored model policy is refused by default; the dialect's
+/// `tenants_without_policy: allow` (the fail-open option, warned at load)
+/// admits it.
+#[test]
+fn a_tenant_without_a_policy_is_refused_unless_the_config_allows_it() {
+    for (tag, extra, expected) in [
+        ("default-deny", "", "HTTP/1.1 403"),
+        (
+            "allow",
+            "  enforce: { tenants_without_policy: allow }\n",
+            "HTTP/1.1 200",
+        ),
+    ] {
+        let dir = scratch_dir(tag);
+        let proxy = Proxy::start(&dir, &config_text(extra));
+        let key = mint_key(&proxy);
+        let response = chat(&proxy, &key);
+        assert!(response.starts_with(expected), "{tag}:\n{response}");
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Offboarding (review H4): `DELETE /tenants/{id}` revokes the tenant's keys,

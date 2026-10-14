@@ -119,6 +119,7 @@ listen: "127.0.0.1:{listener_port}"
 admin: "127.0.0.1:{admin_port}"
 auth:
   hmac_secret: "{HMAC_SECRET}"
+  enforce: {{ tenants_without_policy: allow }}
   keys:
     - {{ id: "{CLIENT_KEY_ID}", tenant: tenant-a, digest: "{digest}" }}
 providers:

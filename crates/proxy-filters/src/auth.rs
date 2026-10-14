@@ -215,46 +215,46 @@ impl fmt::Debug for KeyId {
 /// struct rather than a signature change through every call site that
 /// carries a `Principal`.
 ///
-/// # The default grants everything (owner decision, 2026-08-08)
+/// # No model policy is not a grant
 ///
-/// A tenant with no policy configured may use every model and every provider.
-/// Restriction is opt-in: an operator adds an allow-list when they want one.
+/// [`Self::model_access`] is `None` when no model policy is stored for the
+/// tenant (a tenant known only by its keys, or by a budget). What `None`
+/// permits is decided by `llmproxy.model_authz`'s `tenants_without_policy`
+/// setting, which denies by default (review H4; AGENTS.md "Fail-open
+/// controls": unset never means open). `Some(ModelAccess::All)` is an
+/// explicit grant of every model.
 ///
-/// **This does not contradict the module's fail-closed rule, and the two axes
-/// must not be confused.** *Authentication* fails closed — an unknown or
-/// revoked credential is a 401, always. *Authorization* defaults open — once
-/// we know who you are, absent any configured restriction, you may proceed.
+/// *Authentication* and *authorization* are separate axes: an unknown or
+/// revoked credential is a 401; a known tenant asking for a model it may not
+/// use is a 403.
 ///
-/// # The trap this creates, for whoever adds a field
+/// # The trap, for whoever adds a field
 ///
 /// "No policy configured" and "a configured policy that failed to load" must
-/// **not** produce the same value. The first is this `Default` and grants
-/// everything; the second is a config error and must fail loudly with its
-/// dotted path (AGENTS.md invariant 1), because silently substituting the permissive
-/// default for a policy the operator *wrote* would turn a typo into a
-/// privilege escalation. [`crate::model_authz_filter::parse_config`] is the
-/// one place that loads this struct's `model_access` field from configuration,
+/// **not** produce the same value. A configured policy that fails to load is
+/// a config error with its dotted path (AGENTS.md invariant 1), never `None`
+/// and never `All`. [`crate::model_authz_filter::parse_config`] is the one
+/// place that loads this struct's `model_access` field from configuration,
 /// and it is careful about exactly this: see that function's doc.
 #[derive(Clone, Default)]
 pub struct TenantPolicy {
-    /// Which models this tenant may use. See
+    /// Which models this tenant may use, or `None` when no model policy is
+    /// stored for it (see the type doc). See
     /// [`crate::model_authz::ModelAccess`]'s doc for why this is an explicit
     /// enum (`All` / `Only(Vec<ModelPattern>)`) rather than a bare `Vec`
     /// whose emptiness would have to be interpreted as either "everything" or
     /// "nothing".
-    pub model_access: crate::model_authz::ModelAccess,
+    pub model_access: Option<crate::model_authz::ModelAccess>,
     /// This tenant's spend ceiling, if any. See
     /// [`crate::spend::TenantBudget`]'s doc for the full reasoning; in short:
     ///
-    /// **`None` means unlimited, and that is the deliberate default** -- the
-    /// exact same reasoning as [`crate::model_authz::ModelAccess::default`]:
+    /// **`None` means unlimited, and that is the deliberate default**:
     /// a budget is an opt-in ceiling, not a default-deny, so an operator
     /// enabling the (separate) spend enforcement filter must not have it
     /// silently deny every tenant's very first request. Restriction is
     /// opt-in: an operator sets a ceiling when they want one.
     ///
-    /// **Unlike `model_access` above, though, `None` here is genuinely a
-    /// different fact from a configured ceiling of zero.** `Some(TenantBudget
+    /// `None` is a different fact from a configured ceiling of zero. `Some(TenantBudget
     /// { max_micros: MicroUsd::from_micros(0), .. })` is a real, legitimate,
     /// deliberate policy -- deny every priced request this period -- exactly
     /// like `ModelAccess::Only(vec![])` denying every model. Storage and admin

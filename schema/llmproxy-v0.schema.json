@@ -30,7 +30,7 @@
       "examples": ["127.0.0.1:9901"]
     },
     "auth": {
-      "description": "Downstream authentication: verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is the opposite axis and defaults OPEN: an authenticated tenant with no configured policy may use every model and provider. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
+      "description": "Downstream authentication: verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is a separate axis: an authenticated tenant with no stored model policy is refused (403) unless `enforce.tenants_without_policy` is `allow`. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
       "$ref": "#/$defs/Auth"
     },
     "providers": {
@@ -230,8 +230,9 @@
       "description": "Which tenant controls the proxy enforces when `auth` is set. Both default to `true`. Setting one to `false` removes that filter from the chain and logs a load-time warning; the matching admin writes (`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`) are then refused with 409.",
       "additionalProperties": false,
       "properties": {
-        "model_policy": { "type": "boolean", "default": true, "description": "Enforce per-tenant model allow-lists set through the admin API (`llmproxy.model_authz`). A tenant with no policy stays open." },
-        "spend": { "type": "boolean", "default": true, "description": "Enforce per-tenant and per-key spend budgets (`llmproxy.spend_limit`). Cost comes from the `pricing` rate card." }
+        "model_policy": { "type": "boolean", "default": true, "description": "Enforce per-tenant model allow-lists set through the admin API (`llmproxy.model_authz`). What a tenant with no stored policy may use is `tenants_without_policy`." },
+        "spend": { "type": "boolean", "default": true, "description": "Enforce per-tenant and per-key spend budgets (`llmproxy.spend_limit`). Cost comes from the `pricing` rate card." },
+        "tenants_without_policy": { "enum": ["deny", "allow"], "default": "deny", "description": "What an authenticated tenant with no stored model policy may use. `deny` (the default) refuses every model with 403 until `PUT /tenants/{id}/policy` grants some; the first refusal per tenant is logged. `allow` grants every model and logs a load-time warning. A load error with `model_policy: false`, which omits the filter that reads it." }
       }
     },
     "AuthStore": {

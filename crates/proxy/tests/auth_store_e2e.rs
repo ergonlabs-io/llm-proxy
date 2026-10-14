@@ -99,6 +99,7 @@ routes:
   - {{ model: "*", provider: openai }}
 auth:
   hmac_secret: "{HMAC_SECRET}"
+  enforce: {{ tenants_without_policy: allow }}
 {store}"#,
         listen = free_port(),
         admin = free_port(),

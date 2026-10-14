@@ -597,6 +597,7 @@ version: 0
 listen: 127.0.0.1:{listener_port}
 auth:
   hmac_secret_file: {secret_file}
+  enforce: {{ tenants_without_policy: allow }}
   keys:
     - id: alice-laptop
       tenant: acme

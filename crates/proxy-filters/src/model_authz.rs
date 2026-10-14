@@ -83,8 +83,9 @@ impl ModelPattern {
 /// module doc above for the `All` vs `Only(vec![])` distinction.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ModelAccess {
-    /// Every model is permitted. The default -- see `TenantPolicy`'s doc:
-    /// "no policy configured" must grant everything.
+    /// Every model is permitted. An explicit grant, never a default: "no
+    /// policy configured" is `TenantPolicy::model_access == None`, which
+    /// `llmproxy.model_authz` denies unless configured otherwise (review H4).
     All,
     /// Only a model matching at least one of these patterns is permitted. An
     /// EMPTY `Vec` here is not the same as `All` -- it denies every model for
@@ -108,16 +109,6 @@ impl std::fmt::Debug for ModelAccess {
                 .field("deny", deny)
                 .finish(),
         }
-    }
-}
-
-impl Default for ModelAccess {
-    /// See `TenantPolicy`'s doc: "no policy configured" grants everything,
-    /// and this `Default` is precisely that state -- never the "configured
-    /// but failed to load" state, which must be a hard [`proxy_config::ConfigError`]
-    /// instead (see `model_authz_filter::parse_config`).
-    fn default() -> Self {
-        ModelAccess::All
     }
 }
 
@@ -219,11 +210,6 @@ mod tests {
             !access.permits("anything"),
             "Only(vec![]) must deny everything -- it is NOT the same as All"
         );
-    }
-
-    #[test]
-    fn default_model_access_is_all() {
-        assert_eq!(ModelAccess::default(), ModelAccess::All);
     }
 
     #[test]

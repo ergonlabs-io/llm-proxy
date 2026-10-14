@@ -179,6 +179,7 @@ routes:
   - {{ model: "llama*", provider: ollama }}
 auth:
   hmac_secret: "{HMAC_SECRET}"
+  enforce: {{ tenants_without_policy: allow }}
   keys:
     - {{ id: "key-1", tenant: "tenant-a", digest: "{digest}" }}
 "#

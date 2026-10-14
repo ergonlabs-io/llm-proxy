@@ -1734,7 +1734,7 @@ async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
             .get("tenant-all")
             .unwrap()
             .model_access,
-        ModelAccess::All
+        Some(ModelAccess::All)
     );
 
     let (status, _headers, _body) = request(
@@ -1753,9 +1753,9 @@ async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
             .get("tenant-only")
             .unwrap()
             .model_access,
-        ModelAccess::Only(vec![proxy_filters::model_authz::ModelPattern::new(
-            "gpt-4*"
-        )])
+        Some(ModelAccess::Only(vec![
+            proxy_filters::model_authz::ModelPattern::new("gpt-4*")
+        ]))
     );
 
     let (status, _headers, _body) = request(
@@ -1774,7 +1774,7 @@ async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
             .get("tenant-empty")
             .unwrap()
             .model_access,
-        ModelAccess::Only(vec![]),
+        Some(ModelAccess::Only(vec![])),
         "an empty `only: []` must deny every model (Only(vec![])), NOT collapse to All"
     );
 }
@@ -1798,7 +1798,8 @@ async fn put_policy_deny_overrides_allow_and_is_visible_in_snapshot() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let access = &handle.load().policies["tenant-a"].model_access;
+    let snapshot = handle.load();
+    let access = snapshot.policies["tenant-a"].model_access.as_ref().unwrap();
     assert!(access.permits("gpt-4o"));
     assert!(!access.permits("gpt-5-mini"));
 
@@ -2030,9 +2031,9 @@ async fn put_budget_and_put_policy_do_not_clobber_each_other() {
         .clone();
     assert_eq!(
         policy.model_access,
-        ModelAccess::Only(vec![proxy_filters::model_authz::ModelPattern::new(
-            "gpt-4*"
-        )]),
+        Some(ModelAccess::Only(vec![
+            proxy_filters::model_authz::ModelPattern::new("gpt-4*")
+        ])),
         "PUT .../budget must not clobber the tenant's already-set policy"
     );
     assert!(policy.budget.is_some());

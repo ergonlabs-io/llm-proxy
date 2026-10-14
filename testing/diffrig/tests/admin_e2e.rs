@@ -920,16 +920,32 @@ async fn a_tenant_policy_write_changes_model_authorization_live() {
     let headers = [("authorization", format!("Bearer {minted_key}"))];
     let header_pairs: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
-    // Baseline: no policy configured yet, so a tenant is permitted every
-    // model (authorization defaults open) -- including the one the
+    // No policy stored yet: the tenant is refused (a tenant without a model
+    // policy is denied by default, review H4).
+    let unconfigured = send_chat_request(listener_addr, &header_pairs, MODEL_DENIED).await;
+    assert_eq!(
+        unconfigured.status, 403,
+        "with no policy stored, the tenant must be refused (default deny), got {}: {}",
+        unconfigured.status, unconfigured.body
+    );
+
+    // Baseline: an `all` policy permits every model -- including the one the
     // policy write below is about to deny. Asserting this first is what
     // proves the LATER denial is caused by the write, not by something else
     // about this model name.
+    let all = admin_request_retrying(
+        admin_addr,
+        "PUT",
+        "/tenants/tenant-a/policy",
+        Some(ADMIN_TOKEN),
+        &json!({ "access": "all" }),
+    )
+    .await;
+    assert_eq!(all.status, 204, "PUT all policy: {}", all.body);
     let baseline = send_chat_request(listener_addr, &header_pairs, MODEL_DENIED).await;
     assert_eq!(
         baseline.status, 200,
-        "sanity: with no policy configured, every model must be permitted (default open), \
-         got {}: {}",
+        "sanity: an `all` policy must permit every model, got {}: {}",
         baseline.status, baseline.body
     );
 
