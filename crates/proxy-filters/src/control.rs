@@ -352,15 +352,15 @@ pub struct FlushToken<'a> {
 ///
 /// The policy poller calls [`Self::policy_generation`] and [`Self::load`] (the
 /// whole policy state in one call) and the admin API calls the tier-2 writes.
-/// The spend flusher calls [`Self::add_spend`] once per bucket in sequence,
-/// plus [`Self::last_flush_seq`], and bind-time prefetch calls
-/// [`Self::load_spend`]. A store that funnels both groups through one shared
-/// resource (a connection, a lock) lets each delay the other: a long flush
-/// delays a revocation pickup, a large load delays reconciliation. ADR-0006
-/// §4 keeps the two on separate intervals for the same reason, and a store
-/// with such a resource gives the spend group its own, as
-/// [`crate::control_redis::RedisControlPlaneStore`] does with a connection per
-/// group.
+/// The spend flusher calls [`Self::add_spend_batch`],
+/// [`Self::last_flush_seq_batch`] and [`Self::load_spend_batch`], and
+/// bind-time prefetch calls [`Self::load_spend_batch`]. A store that funnels
+/// both groups through one shared resource (a connection, a lock) lets each
+/// delay the other: a long flush delays a revocation pickup, a large load
+/// delays reconciliation. ADR-0006 §4 keeps the two on separate intervals for
+/// the same reason, and a store with such a resource gives the spend group its
+/// own, as [`crate::control_redis::RedisControlPlaneStore`] does with a
+/// connection per group.
 pub trait ControlPlaneStore: Send + Sync {
     /// The snapshot-build read: everything a rebuild needs, in one call.
     fn load(&self) -> Result<StoredControlPlane, StoreError>;
@@ -553,10 +553,11 @@ pub trait ControlPlaneStore: Send + Sync {
     /// the accepted attempt, it was). The caller cannot tell the difference
     /// and must not need to.
     ///
-    /// A `delta_micros` of `0` is legal and expected -- an idle replica still
-    /// calls this every flush interval to learn what the other replicas have
-    /// spent. It is a reconciliation read that happens to be spelled as a
-    /// write.
+    /// A `delta_micros` of `0` is legal: it applies nothing and returns the
+    /// total. [`crate::spend::SpendAccumulator`] does not send one; it learns
+    /// what the other replicas spent on a row it owes nothing with
+    /// [`Self::load_spend_batch`] instead, which neither writes nor uses up a
+    /// flush sequence.
     fn add_spend(
         &self,
         stat_prefix: &str,
@@ -629,6 +630,78 @@ pub trait ControlPlaneStore: Send + Sync {
         tenant: &TenantId,
         period: &PeriodKey,
     ) -> Result<u64, StoreError>;
+
+    // Batched spend calls. The flusher and the bind-time prefetch touch every
+    // live spend row, so one round trip per row grows with the number of keys
+    // (review H5: 20k keys made 80k sequential reads before a listener could
+    // bind). A store with a network hop sends a batch in as few round trips
+    // as it can; the defaults below call the single-row methods in order,
+    // which is right for a store with no round trip to save.
+    //
+    // Every batch answers one result per input row, in input order. A store
+    // that sends rows in groups may fail a whole group together (every row of
+    // it gets the error), and a row of a failed group may still have been
+    // applied: the caller retries under the same token, and the store's
+    // dedup makes that a no-op, exactly as for a single `add_spend` whose
+    // response was lost.
+
+    /// [`Self::add_spend`] for many rows of one `stat_prefix`, all written by
+    /// `node_id`. Each result is that row's new total or its error.
+    fn add_spend_batch(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[SpendDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        rows.iter()
+            .map(|row| {
+                self.add_spend(
+                    stat_prefix,
+                    row.tenant,
+                    row.period,
+                    row.delta_micros,
+                    FlushToken {
+                        node_id,
+                        seq: row.seq,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// [`Self::last_flush_seq`] for many rows of one `stat_prefix`.
+    fn last_flush_seq_batch(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[(TenantId, PeriodKey)],
+    ) -> Vec<Result<u64, StoreError>> {
+        rows.iter()
+            .map(|(tenant, period)| self.last_flush_seq(stat_prefix, tenant, period, node_id))
+            .collect()
+    }
+
+    /// [`Self::load_spend`] for many rows of one `stat_prefix`.
+    fn load_spend_batch(
+        &self,
+        stat_prefix: &str,
+        rows: &[(TenantId, PeriodKey)],
+    ) -> Vec<Result<u64, StoreError>> {
+        rows.iter()
+            .map(|(tenant, period)| self.load_spend(stat_prefix, tenant, period))
+            .collect()
+    }
+}
+
+/// One row of [`ControlPlaneStore::add_spend_batch`]: the spend row, the delta
+/// to add, and the flush sequence it is sent under (the other half of its
+/// [`FlushToken`] is the batch's `node_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendDelta<'a> {
+    pub tenant: &'a TenantId,
+    pub period: &'a PeriodKey,
+    pub delta_micros: u64,
+    pub seq: u64,
 }
 
 /// The two things the data plane reads per request, built wholesale by
