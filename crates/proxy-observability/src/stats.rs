@@ -857,6 +857,20 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// The rate card a chain is pricing with: one series per card version this
+    /// process has held, value 1 for the active card and 0 for each retired
+    /// one, and no series at 1 while the chain has no card. `scope` is the
+    /// operator-chosen HCM `stat_prefix`; `version` is the card's
+    /// content-addressed version, the same string `PUT /pricing` returns and
+    /// access logs record. Compare it across replicas to see a card that has
+    /// not propagated. Prometheus surface only.
+    pub const USAGE_RATE_CARD_ACTIVE: Instrument = Instrument {
+        name: "llmproxy_usage_rate_card_active",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{card}",
+        attribute_keys: &["scope", "version"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

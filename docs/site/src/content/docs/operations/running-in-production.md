@@ -357,6 +357,11 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
   wins over a different `pricing` at start. Only a `persistent` or `shared`
   store keeps the rate card across a restart; the default `in_memory` store does
   not, and `PUT /pricing` says `"persisted": false` for it.
+  To check that every replica prices with the same card, compare the
+  `envoy_llmproxy_usage_rate_card_active` series on `/stats/prometheus`. Its
+  `scope` label is the chain and its `version` label is the card version that
+  `PUT /pricing` returns. The active card has the value 1. A version that this
+  process retired has the value 0. A chain with no card has no series at 1.
 
   Without an `auth` section, the rate card stays in the memory of each process.
   `PUT /pricing` then changes only the replica that receives it, a restart loads

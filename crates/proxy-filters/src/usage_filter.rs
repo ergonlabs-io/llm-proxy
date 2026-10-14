@@ -82,6 +82,23 @@ pub struct PricingRegistry {
     /// configuration is applied or a card is published.
     current: RwLock<Option<PricingContext>>,
     config: Mutex<ConfigState>,
+    /// Exports the active card's version; see [`RateCardGauge`].
+    gauge: Mutex<RateCardGauge>,
+}
+
+/// Ceiling on `llmproxy_usage_rate_card_active` series. Each published card
+/// version adds one, and retired versions stay at 0, so a process that
+/// publishes more than this folds the rest into one overflow series.
+const RATE_CARD_SERIES_CEILING: usize = 64;
+
+/// The `llmproxy_usage_rate_card_active` series of one chain: which version
+/// holds the 1. Updated from [`PricingRegistry::sync_gauge`], never on the
+/// request path.
+#[derive(Default)]
+struct RateCardGauge {
+    registry: Option<Arc<Registry>>,
+    /// The version currently exported as 1, with its series.
+    exported: Option<(String, Handle)>,
 }
 
 #[derive(Default)]
@@ -121,6 +138,43 @@ impl PricingRegistry {
             chain: chain.into(),
             current: RwLock::new(None),
             config: Mutex::new(ConfigState::default()),
+            gauge: Mutex::new(RateCardGauge::default()),
+        }
+    }
+
+    /// Exports the active card's version to `registry` from now on.
+    pub(crate) fn export_to(&self, registry: Arc<Registry>) {
+        self.gauge
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .registry = Some(registry);
+        self.sync_gauge();
+    }
+
+    /// Brings the exported version in line with the installed card. Reads the
+    /// card under the gauge lock, so concurrent installs cannot leave two
+    /// series at 1 whatever order they reach here.
+    fn sync_gauge(&self) {
+        let mut gauge = self.gauge.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(registry) = gauge.registry.clone() else {
+            return;
+        };
+        let version = self.snapshot().map(|card| card.list.version().to_string());
+        if gauge.exported.as_ref().map(|(v, _)| v) == version.as_ref() {
+            return;
+        }
+        if let Some((_, handle)) = gauge.exported.take() {
+            registry.add(WorkerId(0), handle, -1);
+        }
+        if let Some(version) = version {
+            let handle = registry.resolve_capped(
+                &instruments::USAGE_RATE_CARD_ACTIVE,
+                &[("scope", &self.chain), ("version", &version)],
+                RATE_CARD_SERIES_CEILING,
+                &[("scope", "overflow"), ("version", "overflow")],
+            );
+            registry.add(WorkerId(0), handle, 1);
+            gauge.exported = Some((version, handle));
         }
     }
 
@@ -228,6 +282,7 @@ impl PricingRegistry {
             .current
             .write()
             .expect("pricing registry lock poisoned") = Some(card);
+        self.sync_gauge();
     }
 
     /// Applies one usage filter's configuration. Called by every worker's
@@ -401,7 +456,10 @@ impl PricingRegistry {
                     .current
                     .write()
                     .expect("pricing registry lock poisoned");
-                if current.take().is_some() {
+                let cleared = current.take().is_some();
+                drop(current);
+                if cleared {
+                    self.sync_gauge();
                     tracing::warn!(
                         chain = %self.chain,
                         "pricing was removed from the configuration; the rate card is cleared \
@@ -452,6 +510,7 @@ impl PricingRegistry {
         let version = card.list.version().to_string();
         *current = Some(card);
         drop(current);
+        self.sync_gauge();
         tracing::info!(
             chain = %self.chain,
             version = %version,
@@ -567,10 +626,19 @@ fn check_effective_from(
 pub(crate) fn registry_for_chain(
     ctx: &FactoryContext,
 ) -> Result<Arc<PricingRegistry>, ConfigError> {
+    // Looked up before `get_or_try_init`, whose closure runs under the lock
+    // `get` takes (see `stats_of`).
+    let stats = ctx
+        .shared
+        .get("", STATS_REGISTRY_KEY)
+        .and_then(|any| any.downcast::<Registry>().ok());
     ctx.shared
         .get_or_try_init(&ctx.scope, &ctx.stat_prefix, TYPE_URL, || {
-            Ok(Arc::new(PricingRegistry::new(ctx.stat_prefix.clone()))
-                as Arc<dyn std::any::Any + Send + Sync>)
+            let registry = PricingRegistry::new(ctx.stat_prefix.clone());
+            if let Some(stats) = stats.clone() {
+                registry.export_to(stats);
+            }
+            Ok(Arc::new(registry) as Arc<dyn std::any::Any + Send + Sync>)
         })?
         .downcast::<PricingRegistry>()
         .map_err(|_| invalid_config("pricing registry type collision"))

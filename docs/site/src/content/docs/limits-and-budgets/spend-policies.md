@@ -36,6 +36,17 @@ counts in `unpriced_requests`
 `an_unpriced_model_without_a_budget_stays_silent` and
 `the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary`).
 
+The proxy does not reject a request because its model has no price. It serves
+the request, adds $0 to the budget, and logs the warning above. This is a
+choice for availability, not an oversight. The proxy learns the provider that
+serves a request only when the router dials it, after the spend filter has
+admitted the request. A model that the rate card prices on one provider can be
+unpriced on its fallback provider. Rejecting at admission would therefore
+refuse requests that are priced correctly. To close the gap, give every model
+on every provider of a route a price. Then watch the warning and the
+`unpriced_requests` count in the spend reports, and treat a non-zero value as
+unbilled traffic.
+
 ## Key lifecycle and API version
 
 Set a budget through the bearer-gated admin API:

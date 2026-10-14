@@ -217,8 +217,10 @@ enum Lane {
     Spend,
 }
 
-/// [`ControlPlaneStore::add_spend`]'s Lua script, verbatim from ADR-0006
-/// §2's worked example.
+/// [`ControlPlaneStore::add_spend`]'s Lua script. ADR-0006 §2 decides that
+/// `add_spend` is a script and what it must do (dedup on the per-writer
+/// sequence, then `INCRBY`); the script text lives here, and this store's
+/// tests are its specification.
 ///
 /// # Why a script, not a `MULTI`/`EXEC` pipeline
 ///

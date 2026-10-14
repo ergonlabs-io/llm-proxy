@@ -759,3 +759,87 @@ fn a_concurrent_publish_from_another_replica_wins_on_the_publishing_replica() {
     assert_eq!(active(&a), Some(want_b.clone()));
     assert_eq!(active(&b), Some(want_b));
 }
+
+// --- the exported active version --------------------------------------------
+
+/// The `llmproxy_usage_rate_card_active` series of `chain`, as
+/// `(version, value)` pairs read from the rendered Prometheus text that
+/// `/stats/prometheus` serves.
+fn exported_cards(registry: &Registry, chain: &str) -> Vec<(String, u64)> {
+    let rendered = proxy_observability::stats::prometheus_render::render(registry);
+    let scope = format!(r#"scope="{chain}""#);
+    let mut cards: Vec<(String, u64)> = rendered
+        .lines()
+        .filter(|l| l.starts_with("envoy_llmproxy_usage_rate_card_active{") && l.contains(&scope))
+        .map(|line| {
+            let version = line
+                .split(r#"version=""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("a version label")
+                .to_string();
+            let value = line.rsplit(' ').next().unwrap().parse().unwrap();
+            (version, value)
+        })
+        .collect();
+    cards.sort();
+    cards
+}
+
+/// Operators compare this series across replicas to see a card that has not
+/// propagated, so the 1 must follow the card however it was installed: a local
+/// publish, another replica's write arriving by poll, or the card going away.
+#[test]
+fn the_active_rate_card_version_is_exported_through_publish_poll_and_clear() {
+    let control = proxy_observability::stats::StatsControl::new(1);
+    let stats = control.registry();
+    let (store, _) = SharedMemoryStore::new();
+    let (cp_a, cp_b) = (control_plane(&store), control_plane(&store));
+    let (a, b) = (registry(), registry());
+    a.export_to(stats.clone());
+    assert!(
+        exported_cards(&stats, CHAIN).is_empty(),
+        "no card, no series"
+    );
+    apply(&a, None, Some(&cp_a)).unwrap();
+    apply(&b, None, Some(&cp_b)).unwrap();
+
+    let v1 = a
+        .publish_json(&card_json("v1", 10))
+        .unwrap()
+        .rate_card_version;
+    assert_eq!(exported_cards(&stats, CHAIN), vec![(v1.clone(), 1)]);
+
+    let v2 = a
+        .publish_json(&card_json("v2", 20))
+        .unwrap()
+        .rate_card_version;
+    let mut want = vec![(v1.clone(), 0), (v2.clone(), 1)];
+    want.sort();
+    assert_eq!(
+        exported_cards(&stats, CHAIN),
+        want,
+        "the retired version drops to 0, never stays at 1"
+    );
+
+    // The other replica exports what it received from the store, on its own
+    // stats registry, only after its poll.
+    let other = proxy_observability::stats::StatsControl::new(1).registry();
+    b.export_to(other.clone());
+    assert!(exported_cards(&other, CHAIN).is_empty());
+    cp_b.poll_once().unwrap();
+    assert_eq!(exported_cards(&other, CHAIN), vec![(v2, 1)]);
+
+    // Removing the configured card with no store clears the series to 0.
+    let solo = registry();
+    let solo_stats = proxy_observability::stats::StatsControl::new(1).registry();
+    solo.export_to(solo_stats.clone());
+    apply(&solo, Some(&card_json("solo", 5)), None).unwrap();
+    let solo_version = version_of(&card_json("solo", 5));
+    assert_eq!(
+        exported_cards(&solo_stats, CHAIN),
+        vec![(solo_version.clone(), 1)]
+    );
+    apply(&solo, None, None).unwrap();
+    assert_eq!(exported_cards(&solo_stats, CHAIN), vec![(solo_version, 0)]);
+}

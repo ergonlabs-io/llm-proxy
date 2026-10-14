@@ -34,6 +34,9 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - The admin API answers `429` with `Retry-After` after 10 bad bearer tokens from one
   peer in 60 seconds, and logs the peer address on every refusal. The admin UI keeps
   its token in `sessionStorage`.
+- `envoy_llmproxy_usage_rate_card_active{scope,version}` on `/stats/prometheus` reports
+  the rate card each chain prices with (1 for the active version, 0 for a retired one).
+  Compare it across replicas to see a card that has not propagated.
 
 ## [0.3.4] - 2026-10-13
 
