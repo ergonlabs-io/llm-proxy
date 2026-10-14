@@ -1,10 +1,11 @@
 ---
 title: Listener TLS and downstream admission
-summary: How to terminate TLS on the listener in both config front-ends, and
+summary: How to terminate TLS on the listener in both config front-ends, how
+  to encrypt the xDS control-plane channel, and
   the limits that decide whether a client connection is admitted - the TLS
   handshake deadline, the global connection cap, and the request header and
   request timeouts.
-last_updated: 2026-10-13
+last_updated: 2026-10-14
 related:
   - ../configuration/configuration-file/
   - ../providers-and-routing/timeouts-and-retries/
@@ -71,6 +72,71 @@ checks (`DownstreamTlsSpec`, `crates/proxy-config/src/ir.rs:1776-1830`).
 Setting both `tls_certificates` and `tls_certificate_sds_secret_configs`
 is a load error. Envoy ignores the second field instead
 (`internal-docs/envoy-divergences.md` row 5).
+
+## TLS to the xDS control plane
+
+This applies to Envoy mode only. The `llmproxy` dialect has no
+`dynamic_resources`.
+
+The control plane can send provider credentials in cluster headers. Thus
+the proxy encrypts the ADS channel with the `transport_socket` of the ADS
+cluster. The type is `UpstreamTlsContext`, the same as for a provider
+cluster.
+
+```yaml
+static_resources:
+  clusters:
+    - name: xds_cluster
+      type: STRICT_DNS
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: xds.example.internal
+          common_tls_context:
+            validation_context:
+              trusted_ca: { filename: /etc/llmproxy/xds-ca.pem }
+            # Optional: a client certificate for mTLS.
+            tls_certificates:
+              - certificate_chain: { filename: /etc/llmproxy/xds-client.crt }
+                private_key: { filename: /etc/llmproxy/xds-client.key }
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: xds.example.internal, port_value: 18000 }
+```
+
+The proxy offers ALPN `h2` if `alpn_protocols` is empty. If the handshake
+fails, the proxy logs a warning with the cause, for example an unknown
+issuer. Then it tries again with backoff.
+
+If you do not set `validation_context`, the proxy accepts all server
+certificates. This is the same as Envoy. The proxy logs a warning at
+startup.
+
+### Plaintext
+
+Plaintext is permitted only when all endpoints of the ADS cluster are
+loopback addresses (`127.0.0.0/8`, `::1`, or `localhost`). For other
+addresses, the load fails with this path:
+`static_resources.clusters[N].transport_socket`. Envoy does not do this
+check (`internal-docs/envoy-divergences.md` row 32).
+
+To permit plaintext to a remote control plane, set this key:
+
+```yaml
+node:
+  id: proxy-1
+  metadata:
+    io.llmproxy.ads: { allow_plaintext: true }
+```
+
+The proxy then logs a warning at startup that names the target. Other keys
+in `io.llmproxy.ads` cause a load error. The key also causes a load error if
+the bootstrap has no ADS gRPC service.
 
 ## TLS handshake deadline
 

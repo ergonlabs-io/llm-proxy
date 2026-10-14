@@ -55,6 +55,11 @@ landed).
    identity at all).
 3. The client receives a CDS (cluster) response and accepts it.
 4. go-control-plane observes that acceptance as an ACK, not a NACK.
+5. The same exchange over TLS: go-control-plane terminates TLS with
+   `grpc-go`'s own credentials, and the client dials it through the channel
+   the binary builds from the ADS cluster's `UpstreamTlsContext`
+   (`proxy_core::ads_transport::ads_channel`). A server certificate from a
+   CA the client does not trust fails the stream before any request is sent.
 
 ## What it does not check
 
@@ -116,7 +121,7 @@ cargo test --test go_control_plane -- --ignored --nocapture --test-threads=1
 
 `testing/xds-conformance` is its own Cargo workspace, not a member of the
 root one, so `cargo build --workspace` and `make ci` at the repo root never
-see it. It depends on `proxy-xds`, `proxy-api`, and `proxy-config` by path —
+see it. It depends on `proxy-xds`, `proxy-api`, `proxy-config`, and `proxy-core` by path —
 the real crates, not a copy.
 
 ## The pinned reference version

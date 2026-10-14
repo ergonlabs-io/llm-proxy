@@ -25,6 +25,7 @@ use proxy_xds::{AdsClient, FnHandler, Subscription, SubscriptionState, Verdict};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tonic::transport::Channel;
 
 /// Keep in sync with `fixture/go.mod`'s `require` line and `fixture/Dockerfile`'s
 /// pinned digest comment, and with README.md's "pinned version" line. An
@@ -98,18 +99,22 @@ impl Container {
     /// host port, and waits for the "READY" log line before returning --
     /// never a fixed sleep, and never unbounded.
     async fn start(name: &str) -> Container {
+        Self::start_with_env(name, &[]).await
+    }
+
+    /// Like [`Container::start`], with environment variables passed into
+    /// the container. Values travel through `docker run`'s environment
+    /// (`-e NAME`), not its argv.
+    async fn start_with_env(name: &str, env: &[(&str, &str)]) -> Container {
         let port_mapping = format!("127.0.0.1::{CONTAINER_PORT}");
+        let mut args = vec!["run", "-d", "--rm", "--name", name, "-p", &port_mapping];
+        for (key, _) in env {
+            args.extend(["-e", key]);
+        }
+        args.push(IMAGE_TAG);
         let output = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                name,
-                "-p",
-                &port_mapping,
-                IMAGE_TAG,
-            ])
+            .args(&args)
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -215,10 +220,17 @@ impl Drop for Container {
 /// of this fixture: a bug in the real client's transport is exactly what
 /// this is supposed to catch (see README.md).
 async fn exchange_one_cds_response(addr: &str, node_id: &str) -> Option<Verdict> {
-    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{addr}"))
+    let client = AggregatedDiscoveryServiceClient::connect(format!("http://{addr}"))
         .await
         .unwrap_or_else(|e| panic!("failed to connect to the fixture at {addr}: {e}"));
+    exchange_on(client, node_id).await
+}
 
+/// [`exchange_one_cds_response`] on an already-built client.
+async fn exchange_on(
+    mut client: AggregatedDiscoveryServiceClient<Channel>,
+    node_id: &str,
+) -> Option<Verdict> {
     let node = NodeIdentity {
         id: node_id.to_string(),
         cluster: String::new(),
@@ -340,4 +352,143 @@ async fn wrong_node_id_produces_a_named_rejection_not_a_hang() {
             container.logs().await,
         ),
     }
+}
+
+// ----------------------------------------------------------------- TLS --
+
+/// A CA and a `localhost` server certificate it signed, as PEM:
+/// (ca, server cert, server key).
+fn mint_server_certificate() -> (String, String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    let mut ca_params = CertificateParams::new(Vec::new()).expect("CA params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().expect("CA key");
+    let ca = ca_params.self_signed(&ca_key).expect("self-sign CA");
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let leaf = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("leaf params")
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .expect("sign leaf");
+    (ca.pem(), leaf.pem(), leaf_key.serialize_pem())
+}
+
+/// The ADS channel the binary would build: a bootstrap whose xds cluster
+/// carries an `UpstreamTlsContext` trusting `ca_pem`, lowered by the real
+/// loader and handed to `proxy_core::ads_transport::ads_channel`.
+fn production_tls_channel(port: u16, ca_pem: &str) -> Channel {
+    // Rust note: `{:?}` renders the PEM as a double-quoted YAML string with
+    // its newlines escaped, which YAML reads back unchanged.
+    let yaml = format!(
+        r#"node: {{ id: {CORRECT_NODE_ID} }}
+dynamic_resources:
+  ads_config:
+    api_type: GRPC
+    transport_api_version: V3
+    grpc_services:
+      - envoy_grpc: {{ cluster_name: xds_cluster }}
+  cds_config: {{ ads: {{}}, resource_api_version: V3 }}
+static_resources:
+  clusters:
+    - name: xds_cluster
+      type: STATIC
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: localhost
+          common_tls_context:
+            validation_context:
+              trusted_ca: {{ inline_string: {ca_pem:?} }}
+      load_assignment:
+        cluster_name: xds_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: {port} }}
+"#
+    );
+    let loaded = proxy_config::parse_bootstrap(
+        yaml.as_bytes(),
+        proxy_config::ConfigFormat::Yaml,
+        proxy_config::StrictMode::Strict,
+    )
+    .expect("bootstrap parses");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("bootstrap lowers");
+    let ads = snapshot.ads.as_ref().expect("ADS configured");
+    let cluster = snapshot.clusters.get("xds_cluster").expect("xds cluster");
+    proxy_core::ads_transport::ads_channel(cluster, ads)
+        .expect("ADS channel builds")
+        .channel
+}
+
+/// ADS over TLS against the reference server: go-control-plane terminates
+/// TLS with grpc-go's own credentials, and our production channel completes
+/// the handshake (ALPN h2, CA validation) and the CDS exchange on it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker; run via `make xds-conformance`"]
+async fn our_client_interops_with_go_control_plane_over_tls() {
+    build_image().await;
+    let (ca, cert, key) = mint_server_certificate();
+    let container = Container::start_with_env(
+        "xds-conformance-tls",
+        &[("GCP_TLS_CERT_PEM", &cert), ("GCP_TLS_KEY_PEM", &key)],
+    )
+    .await;
+    let port = container.host_port().await;
+
+    let client = AggregatedDiscoveryServiceClient::new(production_tls_channel(port, &ca));
+    let verdict = exchange_on(client, CORRECT_NODE_ID).await;
+
+    assert_eq!(
+        verdict,
+        Some(Verdict::Accept),
+        "expected a CDS response accepted over TLS within {EXCHANGE_TIMEOUT:?}. Container \
+         logs:\n{}",
+        container.logs().await,
+    );
+}
+
+/// The negative: the reference server's certificate chains to a CA our
+/// channel does not trust, so the stream fails with an error and
+/// go-control-plane never sees a discovery request.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker; run via `make xds-conformance`"]
+async fn an_untrusted_go_control_plane_certificate_is_refused() {
+    build_image().await;
+    let (_ca, cert, key) = mint_server_certificate();
+    let (other_ca, _, _) = mint_server_certificate();
+    let container = Container::start_with_env(
+        "xds-conformance-tls-untrusted",
+        &[("GCP_TLS_CERT_PEM", &cert), ("GCP_TLS_KEY_PEM", &key)],
+    )
+    .await;
+    let port = container.host_port().await;
+
+    let mut client = AggregatedDiscoveryServiceClient::new(production_tls_channel(port, &other_ca));
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(
+        CDS_TYPE_URL,
+        Subscription::Wildcard,
+    )])
+    .with_node(NodeIdentity {
+        id: CORRECT_NODE_ID.to_string(),
+        cluster: String::new(),
+    });
+    let always_accept: proxy_xds::Validator = Box::new(|_resp: &DiscoveryResponse| Verdict::Accept);
+    let result = timeout(
+        EXCHANGE_TIMEOUT,
+        ads.run_once(&mut client, &mut FnHandler(always_accept)),
+    )
+    .await
+    .expect("an untrusted certificate must fail the stream, not hang it");
+
+    let logs = container.logs().await;
+    assert!(
+        result.is_err(),
+        "the stream must fail on an untrusted certificate. Container logs:\n{logs}"
+    );
+    assert!(
+        logs.contains("(tls,") && !logs.contains(" opened, typeURL="),
+        "go-control-plane must have served TLS and never opened a stream:\n{logs}"
+    );
 }

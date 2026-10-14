@@ -26,6 +26,14 @@ publish = false
 proxy-xds = { path = "../../crates/proxy-xds" }
 proxy-api = { path = "../../crates/proxy-api" }
 proxy-config = { path = "../../crates/proxy-config" }
+# The production ADS channel builder (TLS from the xds cluster's
+# transport_socket), so the TLS scenarios dial go-control-plane exactly as
+# the binary does.
+proxy-core = { path = "../../crates/proxy-core" }
+# Mints the CA and server certificate for the TLS scenarios.
+rcgen = "0.13"
+# Names the `Channel` type that channel builder returns.
+tonic = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
 
 [lints.rust]

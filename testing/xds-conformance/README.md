@@ -28,6 +28,15 @@ talks to in production.
    received something it read as a NACK, so the exchange completing is itself the
    proof.
 
+5. **TLS.** `our_client_interops_with_go_control_plane_over_tls` starts the
+   fixture with `GCP_TLS_CERT_PEM`/`GCP_TLS_KEY_PEM`, so go-control-plane
+   serves with `grpc-go`'s own TLS credentials, and dials it through
+   `proxy_core::ads_transport::ads_channel` -- the channel the binary builds
+   from the xds cluster's `UpstreamTlsContext`, lowered by the real loader.
+   `an_untrusted_go_control_plane_certificate_is_refused` is the negative:
+   a CA the client does not trust fails the stream and the fixture never
+   opens one.
+
 ## What this does NOT check
 
 - **LDS, RDS, EDS, or SDS.** The fixture serves one CDS resource. LDS, RDS and SDS are
@@ -110,7 +119,7 @@ cargo test --test go_control_plane -- --ignored --nocapture --test-threads=1
 `testing/xds-conformance` is deliberately its OWN Cargo workspace (an empty
 `[workspace]` table in its `Cargo.toml`), not a member of the root one, so
 `cargo build --workspace` / `make ci` at the repo root cannot see it. It depends
-on `proxy-xds`, `proxy-api`, and `proxy-config` by path -- a real dependency on
+on `proxy-xds`, `proxy-api`, `proxy-config`, and `proxy-core` by path -- a real dependency on
 the real crates, resolved and built independently of the root workspace's own
 `Cargo.lock`.
 

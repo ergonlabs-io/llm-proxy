@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -22,6 +23,7 @@ import (
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // The one node ID this fixture's snapshot is set for. go-control-plane's
@@ -115,7 +117,20 @@ func main() {
 	}
 
 	srv := serverv3.NewServer(context.Background(), snapshotCache, callbacks)
-	grpcServer := grpc.NewServer()
+	// TLS when the test passes a PEM certificate and key, so the same
+	// reference server checks our ADS client's TLS origination. grpc-go
+	// offers ALPN h2 on its own.
+	var serverOpts []grpc.ServerOption
+	tlsMode := "plaintext"
+	if certPEM := os.Getenv("GCP_TLS_CERT_PEM"); certPEM != "" {
+		cert, err := tls.X509KeyPair([]byte(certPEM), []byte(os.Getenv("GCP_TLS_KEY_PEM")))
+		if err != nil {
+			log.Fatalf("load TLS certificate: %v", err)
+		}
+		serverOpts = append(serverOpts, grpc.Creds(credentials.NewServerTLSFromCert(&cert)))
+		tlsMode = "tls"
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 	discoveryv3.RegisterAggregatedDiscoveryServiceServer(grpcServer, srv)
 
 	lis, err := net.Listen("tcp", listenAddr)
@@ -125,7 +140,7 @@ func main() {
 	// The Rust test polls for this exact substring in `docker logs` as its
 	// readiness check (see testing/xds-conformance/tests/go_control_plane.rs)
 	// -- do not reword "READY" without updating it there too.
-	log.Printf("READY go-control-plane conformance fixture listening on %s (node.id=%q)", listenAddr, expectedNodeID)
+	log.Printf("READY go-control-plane conformance fixture listening on %s (%s, node.id=%q)", listenAddr, tlsMode, expectedNodeID)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
