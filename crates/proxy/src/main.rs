@@ -1248,6 +1248,10 @@ async fn run_serve(
         token_usage: token_usage_stat_handles.clone(),
     };
     let mut current_version = snapshot.version;
+    // Keyed on the bootstrap, not on whether a client actually started: the
+    // reload would break the same contract either way, and an operator
+    // should not find SIGHUP's behavior depending on control-plane wiring.
+    let dynamic_resources_configured = snapshot.ads.is_some();
 
     // Build the ADS client, if bootstrap
     // `dynamic_resources` asks for one, from this same boot snapshot --
@@ -1394,6 +1398,19 @@ async fn run_serve(
         tokio::select! {
             signal = control_signals.recv() => match signal {
                 ControlSignal::Shutdown => break,
+                // Review C4: the reloaded file yields a static-only snapshot,
+                // which would drop every xDS-delivered resource, and the
+                // applier's static base would bring the boot-time file back
+                // on its next publish. Refused instead; see
+                // internal-docs/envoy-divergences.md "SIGHUP with dynamic_resources".
+                ControlSignal::Reload if dynamic_resources_configured => {
+                    tracing::error!(
+                        "SIGHUP ignored: this bootstrap configures dynamic_resources, so the \
+                         control plane owns the dynamic configuration and a file reload would \
+                         replace it; the running configuration is unchanged. Restart the \
+                         process to apply bootstrap changes"
+                    );
+                }
                 ControlSignal::Reload => {
                     if let Some(new_version) = reload(
                         &config_source,

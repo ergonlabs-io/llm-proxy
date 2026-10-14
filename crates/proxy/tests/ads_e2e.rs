@@ -845,11 +845,138 @@ async fn a_cds_cluster_that_fails_to_build_is_nacked_and_last_good_keeps_serving
         "the rejected response must never be ACKed"
     );
 
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "listener at 127.0.0.1:{listener_port} never became connectable"
+    );
     let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
     let response = get(listener_addr, "/", "test.local");
     assert!(
         response.starts_with("HTTP/1.1 200"),
         "the last-good `{TEST_B_DYNAMIC_CLUSTER}` must keep serving; got:\n{response}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}
+
+/// A mock upstream answering every request with `204 No Content`, so a test
+/// can tell which upstream served it.
+fn spawn_no_content_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
+    let addr = listener.local_addr().expect("no local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            });
+        }
+    });
+    addr
+}
+
+/// Review C4: with `dynamic_resources` configured, SIGHUP is refused loudly
+/// and changes nothing. The file is edited before the signal to route to a
+/// static cluster on a 204 upstream; the old reload applied that static-only
+/// snapshot, which dropped the CDS-delivered cluster and served the file's
+/// route. The proxy must keep serving 200 from the CDS cluster.
+#[tokio::test(flavor = "multi_thread")]
+async fn sighup_is_refused_when_dynamic_resources_are_configured() {
+    let upstream_addr = spawn_mock_upstream();
+    let file_upstream = spawn_no_content_upstream();
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![any_of(
+                &minimal_cluster(TEST_B_DYNAMIC_CLUSTER, upstream_addr.port() as u32),
+                CLUSTER_TYPE,
+            )],
+        },
+        Step::WaitForAck {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "v1".to_string(),
+            response_nonce: "n1".to_string(),
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let listener_port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-sighup-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    let boot = bootstrap_static_listener_dynamic_cluster(listener_port, harness.addr);
+    std::fs::write(&config_path, &boot).expect("write config");
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    wait_for_ack(&harness, &stderr_rx, CDS_TYPE_URL, "v1", "n1").await;
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "listener at 127.0.0.1:{listener_port} never became connectable"
+    );
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let before = get(listener_addr, "/", "test.local");
+    assert!(
+        before.starts_with("HTTP/1.1 200"),
+        "before SIGHUP: {before}"
+    );
+
+    let edited = boot.replace(
+        &format!("cluster: {TEST_B_DYNAMIC_CLUSTER}"),
+        "cluster: file_backend",
+    ) + &format!(
+        r#"    - name: file_backend
+      type: STATIC
+      load_assignment:
+        cluster_name: file_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: {} }}
+"#,
+        file_upstream.port()
+    );
+    std::fs::write(&config_path, edited).expect("rewrite config");
+    let status = Command::new("kill")
+        .args(["-HUP", &child.0.id().to_string()])
+        .status()
+        .expect("failed to send SIGHUP");
+    assert!(status.success(), "kill -HUP failed");
+
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    let mut seen = Vec::new();
+    // Either outcome of the signal logs a line once handled (`SIGHUP: config
+    // reload ...` or `SIGHUP ignored`); wait for it, then judge by traffic
+    // first and by the log second.
+    while !seen
+        .iter()
+        .any(|l: &String| l.contains("SIGHUP:") || l.contains("SIGHUP ignored"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the SIGHUP was never handled; stderr: {seen:?}"
+        );
+        if let Ok(line) = stderr_rx.recv_timeout(Duration::from_millis(50)) {
+            seen.push(line);
+        }
+    }
+
+    let after = get(listener_addr, "/", "test.local");
+    assert!(
+        after.starts_with("HTTP/1.1 200"),
+        "after a refused SIGHUP the CDS cluster must keep serving, got:\n{after}"
+    );
+    assert!(
+        seen.iter().any(|l| l.contains("SIGHUP ignored")),
+        "the refusal must be logged: {seen:?}"
     );
 
     terminate(&mut child);
