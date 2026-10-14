@@ -601,3 +601,177 @@ async fn a_body_over_1_mib_fails_over_when_the_buffer_limit_allows_it() {
     );
     assert_eq!(received, Some(BODY_LEN), "b must receive the whole body");
 }
+
+/// A handler routing `/v1/` to the aggregate `["a", "b"]` over two live
+/// upstreams, retrying `retry_on` (and 429 under `retriable-status-codes`) up
+/// to `num_retries` times.
+async fn build_failover_handler(
+    a: SocketAddr,
+    b: SocketAddr,
+    retry_on: &str,
+    num_retries: u32,
+) -> FilterChainHandler {
+    let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
+    let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
+    snapshot.insert(
+        "a".to_string(),
+        Arc::new(member_cluster("a", a, Vec::new())),
+    );
+    snapshot.insert(
+        "b".to_string(),
+        Arc::new(member_cluster("b", b, Vec::new())),
+    );
+    snapshot.insert("providers".to_string(), Arc::new(aggregate_cluster()));
+    manager.update_from_snapshot(&snapshot).await;
+    let mut fwd = forward_to_providers();
+    let mut policy = retry_policy(retry_on, num_retries);
+    policy.retriable_status_codes = vec![429];
+    fwd.retry_policy = Some(policy);
+    let route_table = RouteTable::new(
+        "test-routes".to_string(),
+        vec![VirtualHostIR {
+            name: "vh".to_string(),
+            domains: vec!["*".to_string()],
+            routes: vec![Arc::new(RouteEntry {
+                name: None,
+                matcher: prefix_matcher("/v1/"),
+                action: RouteActionIR::Forward(fwd),
+                request_headers_to_add: Vec::new(),
+                streaming_strict: false,
+                typed_per_filter_config: BTreeMap::new(),
+                route_index: 0,
+                include_request_attempt_count: false,
+                include_attempt_count_in_response: false,
+            })],
+            typed_per_filter_config: BTreeMap::new(),
+        }],
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+        Arc::new(RouterFilterFactory::new(
+            Arc::new(manager),
+            test_router_stats(&["a", "b", "providers"]),
+        ));
+    FilterChainHandler::new_with_access_logs(
+        Vec::new(),
+        terminal_factory,
+        Arc::new(route_table),
+        false,
+        false,
+        0,
+        &[],
+    )
+    .unwrap()
+}
+
+/// Reads one request head, then writes `response` verbatim and, if `endless`,
+/// keeps appending chunks until the peer goes away. Resolves to the number of
+/// extra bytes written.
+async fn spawn_scripted_upstream(
+    response: &'static [u8],
+    endless: bool,
+) -> (SocketAddr, tokio::task::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                return 0;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        if stream.write_all(response).await.is_err() {
+            return 0;
+        }
+        let mut written = 0;
+        if endless {
+            let piece = format!("2000\r\n{}\r\n", "x".repeat(0x2000));
+            while stream.write_all(piece.as_bytes()).await.is_ok() {
+                written += piece.len();
+            }
+        }
+        written
+    });
+    (addr, task)
+}
+
+/// With every aggregate member answering 429 and retries to spare, the client
+/// must get the last member's real 429 (status, `retry-after`, body), not a
+/// synthesized `503 no healthy upstream`. Member `a`'s answer is distinct so a
+/// first-response or mixed-up reply fails too.
+#[tokio::test(flavor = "current_thread")]
+async fn exhausting_every_member_returns_the_last_upstream_response() {
+    LocalSet::new()
+        .run_until(async {
+            let (a, _) = spawn_scripted_upstream(
+                b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\nContent-Length: 7\r\nConnection: close\r\n\r\na-limit",
+                false,
+            )
+            .await;
+            let (b, _) = spawn_scripted_upstream(
+                b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 42\r\nContent-Length: 7\r\nConnection: close\r\n\r\nb-limit",
+                false,
+            )
+            .await;
+            let handler = build_failover_handler(a, b, "retriable-status-codes", 3).await;
+
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                handler.handle(request("/v1/chat/completions")),
+            )
+            .await
+            .expect("request bounded");
+            assert_eq!(resp.head.status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(resp.head.headers["retry-after"], "42");
+            let body = tokio::time::timeout(Duration::from_secs(10), resp.body.collect())
+                .await
+                .expect("body bounded")
+                .unwrap()
+                .to_bytes();
+            assert_eq!(&body[..], b"b-limit");
+        })
+        .await;
+}
+
+/// A failed attempt whose body never ends must not stall or grow the proxy:
+/// the drain is capped, the attempt is abandoned (its connection closed, which
+/// ends the upstream's writer), and the retry reaches the healthy member.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_attempt_with_an_endless_body_is_abandoned_not_drained() {
+    LocalSet::new()
+        .run_until(async {
+            let (a, a_task) = spawn_scripted_upstream(
+                b"HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                true,
+            )
+            .await;
+            let (b, _) = spawn_scripted_upstream(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                false,
+            )
+            .await;
+            let handler = build_failover_handler(a, b, "5xx", 3).await;
+
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                handler.handle(request("/v1/chat/completions")),
+            )
+            .await
+            .expect("an unbounded drain of a's body would hang the retry");
+            assert_eq!(resp.head.status, StatusCode::OK);
+            let body = resp.body.collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"ok");
+
+            let written = tokio::time::timeout(Duration::from_secs(10), a_task)
+                .await
+                .expect("a's writer must be cut off when the attempt is abandoned")
+                .unwrap();
+            assert!(written > 0, "the endless body must have started");
+        })
+        .await;
+}

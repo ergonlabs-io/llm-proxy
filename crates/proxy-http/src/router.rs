@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -1161,6 +1161,11 @@ impl RouterHandler {
         // hedge). It crosses the loop boundary because the budget is held for
         // the retry attempt's full response stream, just like max_requests.
         let mut retry_guard: Option<CbGuard> = None;
+        // The last retriable upstream response, kept (body unread) while the
+        // next attempt is being set up. If that attempt finds no host left
+        // (every aggregate member already tried), the client gets this real
+        // response instead of a synthesized `503 no healthy upstream`.
+        let mut held_failed_response: Option<HeldFailedResponse> = None;
 
         // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
         // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
@@ -1214,6 +1219,27 @@ impl RouterHandler {
                             Some("tenant_credential_missing".to_string());
                         return tenant_credential_missing_reply(provider.as_deref());
                     }
+                    Err(NoHost::Unhealthy) if held_failed_response.is_some() => {
+                        // A retry was admitted but nothing is left to dial.
+                        // Envoy retries against already-tried hosts, so a
+                        // client there still sees an upstream answer; return
+                        // the last one rather than inventing a 503.
+                        let held = held_failed_response.take().expect("checked above");
+                        tracing::debug!(
+                            cluster = %cluster_name,
+                            "retry found no untried host; returning the last upstream response"
+                        );
+                        let service_time_ms =
+                            u64::try_from(held.dispatched_at.elapsed().as_millis())
+                                .unwrap_or(u64::MAX);
+                        return finalize_upstream_response(
+                            held.response,
+                            service_time_ms,
+                            fwd.idle_timeout,
+                            Some(rq_guard),
+                            None,
+                        );
+                    }
                     Err(NoHost::Unhealthy) => {
                         tracing::debug!(response_flag = "UH", cluster = %cluster_name, "no healthy upstream host");
                         let mut info = dcb.stream_info();
@@ -1223,6 +1249,12 @@ impl RouterHandler {
                     }
                 };
                 let host = sel.host;
+                if let Some(held) = held_failed_response.take() {
+                    // A new attempt is going out, so the earlier failure is
+                    // not needed any more. Free its connection if the body is
+                    // small, otherwise drop it.
+                    drain_failed_attempt_body(held.response.body).await;
+                }
                 // `LEAST_REQUEST` reads this count. It lives and dies with
                 // `rq_guard` (response body, hedge task, or the end of this
                 // iteration on retry/error), so each attempt counts once.
@@ -1972,7 +2004,7 @@ impl RouterHandler {
                 };
 
                 match attempt_result {
-                    Ok(mut resp) => {
+                    Ok(resp) => {
                         let winning_entry = earlier_winner
                             .as_ref()
                             .and_then(|winner| self.clusters.cluster(&winner.0));
@@ -2038,10 +2070,16 @@ impl RouterHandler {
                             )
                             .await
                         {
-                            // Drain the failed attempt's response body before
-                            // retrying so its connection isn't left dangling
-                            // mid-read.
-                            let _ = resp.body.collect().await;
+                            if response_already_guarded || response_from_hedge {
+                                // Hedge bookkeeping owns this response's
+                                // guards; just release it.
+                                drain_failed_attempt_body(resp.body).await;
+                            } else {
+                                held_failed_response = Some(HeldFailedResponse {
+                                    response: resp,
+                                    dispatched_at: winning_attempt_dispatched_at,
+                                });
+                            }
                             continue;
                         }
                         // This is the one `URX` site that isn't
@@ -2059,39 +2097,25 @@ impl RouterHandler {
                         let service_time_ms =
                             u64::try_from(winning_attempt_dispatched_at.elapsed().as_millis())
                                 .unwrap_or(u64::MAX);
-                        resp.head.headers.insert(
-                            "x-envoy-upstream-service-time",
-                            HeaderValue::from(service_time_ms),
+                        return finalize_upstream_response(
+                            resp,
+                            service_time_ms,
+                            fwd.idle_timeout,
+                            if response_already_guarded {
+                                None
+                            } else {
+                                Some(
+                                    rq_guard
+                                        .take()
+                                        .expect("normal response owns this attempt guard"),
+                                )
+                            },
+                            if !response_already_guarded || response_from_hedge {
+                                retry_guard.take()
+                            } else {
+                                None
+                            },
                         );
-                        // Rust note: the route `timeout` bounds the whole
-                        // attempt loop, not just this last attempt's
-                        // `send` -- once headers arrive here the timeout is
-                        // fully out of the picture: the *body* stream
-                        // returned below has no further deadline (S4 -- this
-                        // is what makes LLM-streaming routes safe to bound
-                        // this way).
-                        if let Some(idle) = fwd.idle_timeout {
-                            resp.body = local_boxed(IdleTimeoutBody::new(resp.body, idle));
-                        }
-                        // S5: wrap outermost (after any idle_timeout wrap) so
-                        // the `max_requests` permit is held until the very
-                        // last response frame is produced or the body is
-                        // dropped, whichever comes first -- not just until
-                        // headers arrive.
-                        if !response_already_guarded {
-                            resp.body = local_boxed(GuardedBody::new(
-                                resp.body,
-                                rq_guard
-                                    .take()
-                                    .expect("normal response owns this attempt guard"),
-                            ));
-                        }
-                        if !response_already_guarded || response_from_hedge {
-                            if let Some(guard) = retry_guard.take() {
-                                resp.body = local_boxed(GuardedBody::new(resp.body, guard));
-                            }
-                        }
-                        return resp;
                     }
                     Err(err) => {
                         self.stats
@@ -2196,6 +2220,71 @@ impl RouterHandler {
         }
         resp
     }
+}
+
+/// The most bytes read from a failed attempt's body before the attempt is
+/// abandoned. Draining lets a small error body finish so its connection can be
+/// reused; a body past this size, or one that never ends, is dropped (which
+/// resets the stream) instead of being buffered without bound.
+const FAILED_ATTEMPT_DRAIN_LIMIT: usize = 64 * 1024;
+
+/// A retriable upstream response kept, body unread, until the next attempt is
+/// set up.
+struct HeldFailedResponse {
+    response: HttpResponseParts,
+    /// When the attempt that produced `response` was dispatched, for
+    /// `x-envoy-upstream-service-time`.
+    dispatched_at: std::time::Instant,
+}
+
+/// Read and discard a failed attempt's body, at most
+/// [`FAILED_ATTEMPT_DRAIN_LIMIT`] bytes.
+async fn drain_failed_attempt_body(mut body: StreamBody) {
+    let mut seen = 0usize;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else { return };
+        if let Some(data) = frame.data_ref() {
+            seen = seen.saturating_add(data.len());
+            if seen > FAILED_ATTEMPT_DRAIN_LIMIT {
+                return;
+            }
+        }
+    }
+}
+
+/// Final touches on the response that goes back to the client: the
+/// `x-envoy-upstream-service-time` header of this proxy's last attempt
+/// (`insert` deliberately replaces a value supplied by an upstream proxy), the
+/// route `idle_timeout`, then the guards held until the body ends.
+fn finalize_upstream_response<G: Unpin + 'static>(
+    mut resp: HttpResponseParts,
+    service_time_ms: u64,
+    idle_timeout: Option<Duration>,
+    request_guard: Option<G>,
+    retry_guard: Option<CbGuard>,
+) -> HttpResponseParts {
+    resp.head.headers.insert(
+        "x-envoy-upstream-service-time",
+        HeaderValue::from(service_time_ms),
+    );
+    // The route `timeout` bounds the attempt loop, not the body returned
+    // here: once headers arrive it has no further deadline (S4), which is what
+    // makes LLM-streaming routes safe to bound this way.
+    // A zero route `idle_timeout` means "no idle timeout on this route"
+    // (Envoy treats 0 as disabled); a zero `IdleTimeoutBody` would instead
+    // cut the stream at once.
+    if let Some(idle) = idle_timeout {
+        resp.body = local_boxed(IdleTimeoutBody::new(resp.body, idle));
+    }
+    // S5: wrap outermost (after the idle wrap) so the `max_requests` permit
+    // lasts until the last response frame or the body is dropped.
+    if let Some(guard) = request_guard {
+        resp.body = local_boxed(GuardedBody::new(resp.body, guard));
+    }
+    if let Some(guard) = retry_guard {
+        resp.body = local_boxed(GuardedBody::new(resp.body, guard));
+    }
+    resp
 }
 
 /// Sleep this attempt's S3.3 backoff delay, then record it against the

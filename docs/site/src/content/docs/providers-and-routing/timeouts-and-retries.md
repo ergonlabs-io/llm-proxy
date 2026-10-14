@@ -99,6 +99,25 @@ listener's request body limit is rejected with `413` before it reaches the route
 retry limit and the body limit are the same value (default 1 MiB). When you raise the
 limit with `listen.max_request_body_bytes`, larger requests also fail over.
 
+The retry rules do not look at the HTTP method. A `POST` is retried on the same
+outcomes as a `GET`: there is no idempotency check. This is deliberate for LLM
+calls, where a retried completion is safe to repeat. A retry after a `5xx` or
+`429` can send the same prompt to a provider twice, and the first attempt may
+have been billed. If your route fronts a provider call with side effects, set
+`attempts: 0` and do not use `fallbacks`.
+
+When no retry remains, the client gets the last provider response unchanged:
+its status, headers (for example `retry-after`) and body. This includes the
+case where a route has `fallbacks` and every member has already been tried: the
+last member's answer is returned, not a proxy-made `503`. The proxy reads at
+most 64 KiB of the body of an earlier failed attempt before it drops that
+attempt, so a provider that never ends an error body cannot hold the retry or
+grow proxy memory.
+
+Proof: `exhausting_every_member_returns_the_last_upstream_response` and
+`a_failed_attempt_with_an_endless_body_is_abandoned_not_drained` in
+`crates/proxy-http/tests/router_aggregate.rs`.
+
 Backoff between retries is fully jittered exponential: attempt *n* waits a
 duration drawn uniformly from `[0, min((2ⁿ-1) × 25ms, 250ms)]` — fixed
 defaults in this configuration format (there is no field to change
