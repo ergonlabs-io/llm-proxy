@@ -105,6 +105,20 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
+    // --- Request-field policy: lowered by the IR commit, enforced by the
+    //     router commit that follows it. Delete these two entries there.
+    AllowlistEntry {
+        struct_name: "ProviderRuntimeConfig",
+        field_name: "request_field_policy",
+        kind: EntryKind::KnownInert,
+        reason: "the router enforces it in the next change; this entry is removed there.",
+    },
+    AllowlistEntry {
+        struct_name: "RequestFieldPolicy",
+        field_name: "strip",
+        kind: EntryKind::KnownInert,
+        reason: "the router enforces it in the next change; this entry is removed there.",
+    },
     // --- The ADS config surface, lowered but not yet consumed. One of the
     //     original five has left: `AdsConfig.node` now reaches the wire, and
     //     the change that noticed found this entry's own reason had been

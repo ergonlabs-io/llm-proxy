@@ -267,6 +267,7 @@ static_resources:
             credential: None,
             path_template: None,
             model_rewrites: Vec::new(),
+            request_field_policy: Default::default(),
             tenant_credential: Some(TenantCredentialSlot {
                 provider: "openrouter".to_string(),
                 header: "authorization".to_string(),
@@ -627,4 +628,69 @@ fn tenant_credential_verify_path_invalid_values_are_hard_errors() {
             Err(other) => panic!("`{verify_path_yaml}`: expected InvalidValue, got: {other}"),
         }
     }
+}
+
+fn policy_yaml(policy: &str) -> String {
+    format!(
+        r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            request_field_policy: {policy}
+"#
+    )
+}
+
+const POLICY_PATH: &str = "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].request_field_policy";
+
+/// A policy alone is enough to produce a `ProviderRuntimeConfig`, and the
+/// lists are kept in order.
+#[test]
+fn request_field_policy_lowers_deny_and_strip() {
+    let snapshot =
+        snapshot_from(&policy_yaml("{ deny: [models, route], strip: [plugins] }")).expect("lower");
+    let runtime = snapshot.clusters["c1"]
+        .provider_runtime
+        .clone()
+        .expect("runtime");
+    assert_eq!(runtime.request_field_policy.deny, ["models", "route"]);
+    assert_eq!(runtime.request_field_policy.strip, ["plugins"]);
+}
+
+/// An absent or empty policy leaves `provider_runtime` unset.
+#[test]
+fn empty_request_field_policy_is_no_runtime() {
+    let snapshot = snapshot_from(&policy_yaml("{}")).expect("lower");
+    assert_eq!(snapshot.clusters["c1"].provider_runtime, None);
+}
+
+#[test]
+fn request_field_policy_unknown_key_is_a_hard_error() {
+    let err = snapshot_from(&policy_yaml("{ deny: [a], allow: [b] }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.allow"));
+}
+
+#[test]
+fn request_field_policy_wrong_types_are_hard_errors() {
+    let err = snapshot_from(&policy_yaml("[a]")).unwrap_err();
+    assert_eq!(err_path(&err), POLICY_PATH);
+    let err = snapshot_from(&policy_yaml("{ deny: a }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.deny"));
+    let err = snapshot_from(&policy_yaml("{ strip: [a, 3] }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.strip[1]"));
+}
+
+#[test]
+fn request_field_policy_empty_name_is_a_hard_error() {
+    let err = snapshot_from(&policy_yaml("{ deny: [\"\"] }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.deny[0]"));
+}
+
+#[test]
+fn request_field_in_both_deny_and_strip_is_a_hard_error() {
+    let err = snapshot_from(&policy_yaml("{ deny: [a, b], strip: [c, b] }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.strip[1]"));
 }

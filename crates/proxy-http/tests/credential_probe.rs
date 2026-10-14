@@ -136,6 +136,7 @@ fn cluster(name: &str, addr: SocketAddr) -> ClusterConfig {
             credential: None,
             path_template: None,
             model_rewrites: Vec::new(),
+            request_field_policy: Default::default(),
             tenant_credential: Some(slot()),
         }),
         usage_dialect: None,

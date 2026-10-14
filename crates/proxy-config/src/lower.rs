@@ -4358,6 +4358,7 @@ fn convert_provider_auth_metadata(
                     | "session_token"
                     | "models"
                     | "tenant_credential"
+                    | "request_field_policy"
             )
         })
         .collect();
@@ -4366,7 +4367,7 @@ fn convert_provider_auth_metadata(
         return Err(unsupported(
             format!("{auth_path}.{key}"),
             format!(
-                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers`, provider credential fields, `models`, and `tenant_credential`"
+                "`{PROVIDER_AUTH_METADATA_KEY}` contains an unsupported field; supported fields are `headers`, provider credential fields, `models`, `tenant_credential`, and `request_field_policy`"
             ),
         ));
     }
@@ -4456,8 +4457,19 @@ fn convert_provider_runtime_metadata(
                 ));
             }
             let allowed = match scheme {
-                None => &["headers", "models", "tenant_credential"][..],
-                Some("vertex-oauth2") => &["headers", "scheme", "access_token", "models"][..],
+                None => &[
+                    "headers",
+                    "models",
+                    "tenant_credential",
+                    "request_field_policy",
+                ][..],
+                Some("vertex-oauth2") => &[
+                    "headers",
+                    "scheme",
+                    "access_token",
+                    "models",
+                    "request_field_policy",
+                ][..],
                 Some("bedrock-sigv4") => &[
                     "headers",
                     "scheme",
@@ -4466,6 +4478,7 @@ fn convert_provider_runtime_metadata(
                     "secret_access_key",
                     "session_token",
                     "models",
+                    "request_field_policy",
                 ][..],
                 Some(_) => &[][..],
             };
@@ -4587,9 +4600,20 @@ fn convert_provider_runtime_metadata(
             None => None,
         };
 
+    let request_field_policy =
+        match metadata.and_then(|m| m.filter_metadata.get(PROVIDER_AUTH_METADATA_KEY)) {
+            Some(auth) => {
+                let auth_path =
+                    format!("{path}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"]");
+                convert_request_field_policy(auth, &auth_path)?
+            }
+            None => RequestFieldPolicy::default(),
+        };
+
     if credential.is_none()
         && path_template.is_none()
         && model_rewrites.is_empty()
+        && request_field_policy.is_empty()
         && tenant_credential.is_none()
     {
         Ok(None)
@@ -4598,9 +4622,78 @@ fn convert_provider_runtime_metadata(
             credential,
             path_template,
             model_rewrites,
+            request_field_policy,
             tenant_credential,
         }))
     }
+}
+
+/// Lower the optional `request_field_policy` object under
+/// `io.llmproxy.provider_auth`: `deny` and `strip` are lists of non-empty
+/// top-level body key names. Unknown keys, wrong types, empty names, and a
+/// name in both lists are load errors with their full dotted path.
+fn convert_request_field_policy(
+    auth: &prost_types::Struct,
+    auth_path: &str,
+) -> Result<RequestFieldPolicy, ConfigError> {
+    let Some(value) = auth.fields.get("request_field_policy") else {
+        return Ok(RequestFieldPolicy::default());
+    };
+    let policy_path = format!("{auth_path}.request_field_policy");
+    let Some(prost_types::value::Kind::StructValue(policy)) = value.kind.as_ref() else {
+        return Err(invalid(
+            &policy_path,
+            "must be an object with `deny` and/or `strip` lists",
+        ));
+    };
+    let mut unknown: Vec<&String> = policy
+        .fields
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "deny" | "strip"))
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{policy_path}.{key}"),
+            "only `deny` and `strip` are supported",
+        ));
+    }
+    let names = |field: &str| -> Result<Vec<String>, ConfigError> {
+        let Some(value) = policy.fields.get(field) else {
+            return Ok(Vec::new());
+        };
+        let list_path = format!("{policy_path}.{field}");
+        let Some(prost_types::value::Kind::ListValue(list)) = value.kind.as_ref() else {
+            return Err(invalid(&list_path, "must be a list of strings"));
+        };
+        let mut out = Vec::with_capacity(list.values.len());
+        for (i, item) in list.values.iter().enumerate() {
+            let Some(prost_types::value::Kind::StringValue(name)) = item.kind.as_ref() else {
+                return Err(invalid(format!("{list_path}[{i}]"), "must be a string"));
+            };
+            if name.is_empty() {
+                return Err(invalid(
+                    format!("{list_path}[{i}]"),
+                    "field name must not be empty",
+                ));
+            }
+            out.push(name.clone());
+        }
+        Ok(out)
+    };
+    let deny = names("deny")?;
+    let strip = names("strip")?;
+    // A name in both lists has no sensible meaning (refuse or remove?), so
+    // make the operator choose.
+    for (i, name) in strip.iter().enumerate() {
+        if deny.contains(name) {
+            return Err(invalid(
+                format!("{policy_path}.strip[{i}]"),
+                format!("`{name}` is also in `deny`; a field cannot be both denied and stripped"),
+            ));
+        }
+    }
+    Ok(RequestFieldPolicy { deny, strip })
 }
 
 /// Lower the optional `tenant_credential` object under
