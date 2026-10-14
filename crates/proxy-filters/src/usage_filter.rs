@@ -23,28 +23,32 @@
 //! [`LegacyUsageFilterFactory`].
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
-use http::HeaderMap;
+use http::{HeaderMap, Method};
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
 
 use proxy_http::filter::{
-    EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus, FilterInstanceFactory,
-    FilterTrailersStatus, HttpFilter, HttpFilterFactory, PerRouteConfig, ResponseHeaders,
-    ResponseTrailers,
+    DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
+    FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, PerRouteConfig,
+    RequestHeaders, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::GenAiSystem;
 use proxy_http::{LlmListCost, LlmTokenUsage};
+use proxy_observability::stats::{instruments, Handle, Registry, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use crate::auth_filter;
 use crate::control::{ControlPlane, StoredRateCard};
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
-use crate::usage::{extract_json_usage, Dialect, SseUsageScanner, TokenUsage};
+use crate::usage::{
+    extract_json_usage, extract_json_usage_from_tail, Dialect, SseUsageScanner, TokenUsage,
+};
 
 /// Canonical type URL for the owned usage configuration.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
@@ -548,6 +552,22 @@ pub(crate) fn registry_for_chain(
         .map_err(|_| invalid_config("pricing registry type collision"))
 }
 
+/// This chain's usage stats, shared by every factory built for the chain.
+fn stats_of(ctx: &FactoryContext) -> Result<Arc<UsageStats>, ConfigError> {
+    // Looked up before `get_or_try_init`: its init closure runs under the
+    // singleton map's lock, and `get` takes the same lock.
+    let registry = ctx
+        .shared
+        .get("", STATS_REGISTRY_KEY)
+        .and_then(|any| any.downcast::<Registry>().ok());
+    ctx.get_or_try_init(STATS_SINGLETON_KEY, || {
+        Ok(Arc::new(UsageStats::new(registry, &ctx.stat_prefix))
+            as Arc<dyn std::any::Any + Send + Sync>)
+    })?
+    .downcast::<UsageStats>()
+    .map_err(|_| invalid_config("usage stats type collision"))
+}
+
 /// This chain's control plane, if `llmproxy.auth` has been built for it yet.
 fn control_plane_of(ctx: &FactoryContext) -> Option<Arc<ControlPlane>> {
     ctx.get(auth_filter::TYPE_URL)?
@@ -563,6 +583,95 @@ pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.DataSo
 /// streams through to the client untouched (see [`UsageFilterInstance::encode_data`]) —
 /// this cap only decides whether *we* keep trying to compute usage for it.
 pub const MAX_JSON_BODY_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Bytes kept from the end of a JSON body once it passes
+/// [`MAX_JSON_BODY_BYTES`]. Providers emit `usage` as the last top-level
+/// member, so it normally lies inside this window. Whatever is found there is
+/// accepted only if it is structurally the top-level `usage` object (see
+/// [`extract_json_usage_from_tail`]), so the "never a partial count" rule
+/// still holds: a usage object is read whole or not at all.
+pub const JSON_TAIL_WINDOW_BYTES: usize = 64 << 10;
+
+/// Minimum gap between repeats of the oversized-body warning. Repeats are
+/// suppressed, or the log becomes the incident (AGENTS.md "Fail-open controls").
+const OVERSIZED_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Counters shared by every stream of one usage filter instance factory.
+///
+/// Failing to meter is a fail-open for spend and token limits, which read the
+/// usage this filter records, so each miss is counted and warned about
+/// (rate-limited). The healthy path never touches this struct.
+#[derive(Default)]
+pub struct UsageStats {
+    /// Oversized JSON responses whose `usage` could not be recovered from the
+    /// tail window. These requests were not metered.
+    oversized_unrecoverable: AtomicU64,
+    last_oversized_warning: Mutex<Option<Instant>>,
+    /// The process stats registry and this chain's series, when the listener
+    /// seeded [`STATS_REGISTRY_KEY`]. `None` only where no registry exists
+    /// (unit tests that build the filter directly).
+    exported: Option<(Arc<Registry>, Handle)>,
+}
+
+/// `SharedFactoryState` key under which the listener seeds the process
+/// `Arc<Registry>` (scope `""`) for filters that export counters.
+pub const STATS_REGISTRY_KEY: &str = "llmproxy.internal.stats_registry";
+
+/// Type URL key of the per-chain [`UsageStats`] singleton. One per chain, so
+/// the warning's suppression state survives per-worker and per-rebuild
+/// `create` calls instead of repeating for each.
+const STATS_SINGLETON_KEY: &str = "llmproxy.internal.usage_stats";
+
+impl UsageStats {
+    fn new(registry: Option<Arc<Registry>>, scope: &str) -> Self {
+        let exported = registry.map(|registry| {
+            let handle = registry.resolve_capped(
+                &instruments::USAGE_OVERSIZED_BODY_UNMETERED,
+                &[("scope", scope)],
+                256,
+                &[("scope", "overflow")],
+            );
+            (registry, handle)
+        });
+        UsageStats {
+            exported,
+            ..Default::default()
+        }
+    }
+
+    pub fn oversized_unrecoverable(&self) -> u64 {
+        self.oversized_unrecoverable.load(Ordering::Relaxed)
+    }
+
+    fn note_oversized_unrecoverable(&self, cluster: Option<&str>) {
+        self.oversized_unrecoverable.fetch_add(1, Ordering::Relaxed);
+        if let Some((registry, handle)) = &self.exported {
+            registry.incr(WorkerId(0), *handle, 1);
+        }
+        let now = Instant::now();
+        let mut last = self
+            .last_oversized_warning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|at| now.duration_since(at) < OVERSIZED_WARN_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        // This control fails open: the response is delivered, but nothing is
+        // metered or charged for it. Only the operator-chosen cluster name is
+        // logged, never any body content.
+        tracing::warn!(
+            cluster = ?cluster,
+            max_body_bytes = MAX_JSON_BODY_BYTES,
+            tail_window_bytes = JSON_TAIL_WINDOW_BYTES,
+            "usage: a JSON response over the size cap carried no recoverable `usage` object \
+             in its tail window, so this request was NOT metered (no usage, no cost, spend and \
+             token limits did not count it). Exported as envoy_llmproxy_usage_oversized_body_unmetered_total; \
+             this warning repeats at most once per minute."
+        );
+    }
+}
 
 /// Convert a [`TokenUsage`] into the [`LlmTokenUsage`] that `StreamInfo`
 /// carries. All four cost buckets cross the boundary intact — dropping the
@@ -613,6 +722,7 @@ impl HttpFilterFactory for UsageFilterFactory {
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
             registry,
+            stats: stats_of(ctx)?,
         }))
     }
 
@@ -1003,6 +1113,7 @@ impl HttpFilterFactory for LegacyUsageFilterFactory {
         Ok(Box::new(UsageFilterInstanceFactory {
             dialect: parsed.dialect,
             registry,
+            stats: stats_of(ctx)?,
         }))
     }
 
@@ -1028,6 +1139,7 @@ impl PerRouteConfig for UsagePerRouteConfig {
 struct UsageFilterInstanceFactory {
     dialect: Dialect,
     registry: Arc<PricingRegistry>,
+    stats: Arc<UsageStats>,
 }
 
 impl FilterInstanceFactory for UsageFilterInstanceFactory {
@@ -1035,6 +1147,8 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
         Box::new(UsageFilterInstance {
             dialect: self.dialect,
             pricing: self.registry.snapshot(),
+            request_dialect: None,
+            stats: Arc::clone(&self.stats),
             mode: BodyMode::Inert,
             headers_at: None,
             last_chunk_at: None,
@@ -1054,10 +1168,37 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
 enum BodyMode {
     /// `text/event-stream`: feed chunks to the incremental SSE scanner.
     Sse(SseUsageScanner),
-    /// `application/json`: accumulate the body, up to [`MAX_JSON_BODY_BYTES`].
-    Json(BytesMut),
+    /// `application/json`: accumulate the body, up to [`MAX_JSON_BODY_BYTES`],
+    /// then keep only the last [`JSON_TAIL_WINDOW_BYTES`].
+    Json(JsonBody),
     /// Anything else (including "haven't seen headers yet"): do nothing.
     Inert,
+}
+
+/// A JSON body being accumulated for usage extraction.
+#[derive(Default)]
+struct JsonBody {
+    /// The whole body until it passes the cap; afterwards only its tail.
+    buf: BytesMut,
+    /// The body passed [`MAX_JSON_BODY_BYTES`]; `buf` is now a tail window.
+    overflowed: bool,
+}
+
+impl JsonBody {
+    fn push(&mut self, data: &[u8]) {
+        if !self.overflowed && self.buf.len() + data.len() <= MAX_JSON_BODY_BYTES {
+            self.buf.extend_from_slice(data);
+            return;
+        }
+        self.overflowed = true;
+        self.buf.extend_from_slice(data);
+        if self.buf.len() > JSON_TAIL_WINDOW_BYTES {
+            // Rust note: `split_to` hands back the front part and leaves the
+            // rest in place, so this discards the head without copying the tail.
+            let excess = self.buf.len() - JSON_TAIL_WINDOW_BYTES;
+            drop(self.buf.split_to(excess));
+        }
+    }
 }
 
 /// Per-stream instance. One of these is created per response, per the frozen
@@ -1065,7 +1206,16 @@ enum BodyMode {
 /// state (plain fields here, no `Rc`/`RefCell` needed) is safe: it never
 /// leaves the worker thread that owns this stream.
 struct UsageFilterInstance {
+    /// The cluster's (or route's) configured dialect. Also labels
+    /// `gen_ai.system`, which names the provider and so follows the cluster.
     dialect: Dialect,
+    /// Parser chosen from the request's method and path, when it names an API
+    /// whose response shape differs from the cluster's dialect. Only the
+    /// parser follows the path; the provider label does not, since a gateway
+    /// serving `/v1/messages` from an OpenAI-dialect cluster is still that
+    /// cluster's provider.
+    request_dialect: Option<Dialect>,
+    stats: Arc<UsageStats>,
     pricing: Option<PricingContext>,
     mode: BodyMode,
     /// When response headers were flushed — the TTFT baseline. `Instant`
@@ -1105,13 +1255,34 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
     if media_type.eq_ignore_ascii_case("text/event-stream") {
         BodyMode::Sse(SseUsageScanner::new(dialect))
     } else if media_type.eq_ignore_ascii_case("application/json") {
-        BodyMode::Json(BytesMut::new())
+        BodyMode::Json(JsonBody::default())
     } else {
         BodyMode::Inert
     }
 }
 
+/// Pick the response parser from the downstream request. Only POST creates a
+/// generation; a GET that retrieves a stored response must not be metered as a
+/// new one, so it keeps the cluster dialect.
+fn dialect_for_request(method: &Method, path: &str) -> Option<Dialect> {
+    if method != Method::POST {
+        return None;
+    }
+    if path.ends_with("/responses") {
+        Some(Dialect::OpenAiResponses)
+    } else if path.ends_with("/messages") {
+        Some(Dialect::Anthropic)
+    } else {
+        None
+    }
+}
+
 impl UsageFilterInstance {
+    /// The dialect used to read the response body.
+    fn parse_dialect(&self) -> Dialect {
+        self.request_dialect.unwrap_or(self.dialect)
+    }
+
     /// Update chunk-timing bookkeeping for one arriving body chunk. Called
     /// once per `encode_data`, before the chunk is handed to the body-mode
     /// scanner, so timing is tracked even in [`BodyMode::Inert`].
@@ -1154,7 +1325,10 @@ impl UsageFilterInstance {
     fn compute_usage(&self) -> Option<TokenUsage> {
         match &self.mode {
             BodyMode::Sse(scanner) => scanner.usage(),
-            BodyMode::Json(buf) => extract_json_usage(self.dialect, buf),
+            BodyMode::Json(body) if body.overflowed => {
+                extract_json_usage_from_tail(self.parse_dialect(), &body.buf)
+            }
+            BodyMode::Json(body) => extract_json_usage(self.parse_dialect(), &body.buf),
             BodyMode::Inert => None,
         }
     }
@@ -1169,6 +1343,10 @@ impl UsageFilterInstance {
         self.finalized = true;
 
         let usage = self.compute_usage();
+        if usage.is_none() && matches!(&self.mode, BodyMode::Json(body) if body.overflowed) {
+            let cluster = cb.stream_info().upstream_cluster.clone();
+            self.stats.note_oversized_unrecoverable(cluster.as_deref());
+        }
         // Rust note: `stream_info()` hands back a `RefMut` guard, not a plain
         // `&mut` — the stream's single `StreamInfo` is shared (`Rc<RefCell<_>>`)
         // between the filter chain and the router. `RefMut` derefs to
@@ -1211,6 +1389,17 @@ impl UsageFilterInstance {
 }
 
 impl HttpFilter for UsageFilterInstance {
+    fn decode_headers(
+        &mut self,
+        _cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        // `Uri::path` already excludes the query string.
+        self.request_dialect = dialect_for_request(&headers.method, headers.uri.path());
+        FilterHeadersStatus::Continue
+    }
+
     fn encode_headers(
         &mut self,
         cb: &mut dyn EncoderCallbacks,
@@ -1229,7 +1418,7 @@ impl HttpFilter for UsageFilterInstance {
             .map(Self::resolve_cluster_dialect);
         let dialect = cluster_dialect.or(route_dialect).unwrap_or(self.dialect);
         self.dialect = dialect;
-        self.mode = classify_body(&headers.headers, dialect);
+        self.mode = classify_body(&headers.headers, self.parse_dialect());
 
         // A response with no body at all (e.g. a 204, or a HEAD reply) — there's
         // nothing more to observe, so finalize right here.
@@ -1261,17 +1450,11 @@ impl HttpFilter for UsageFilterInstance {
 
         match &mut self.mode {
             BodyMode::Sse(scanner) => scanner.push(data),
-            BodyMode::Json(buf) => {
-                if buf.len() + data.len() > MAX_JSON_BODY_BYTES {
-                    // Drop into inert mode rather than keep a truncated
-                    // prefix: a partial JSON parse could silently produce a
-                    // wrong (not just missing) token count, and this number
-                    // feeds billing.
-                    self.mode = BodyMode::Inert;
-                } else {
-                    buf.extend_from_slice(data);
-                }
-            }
+            // Past the cap `JsonBody` keeps only a tail window, never a
+            // truncated prefix: a partial parse could silently produce a
+            // wrong (not just missing) token count, and this number feeds
+            // billing. The tail is read only for a whole `usage` object.
+            BodyMode::Json(body) => body.push(data),
             BodyMode::Inert => {}
         }
 
@@ -1368,6 +1551,45 @@ mod tests {
         }
     }
 
+    impl DecoderCallbacks for TestCallbacks {
+        fn send_local_reply(
+            &mut self,
+            _code: StatusCode,
+            _body: &str,
+            _modify_headers: Option<proxy_http::filter::HeaderMutationFn>,
+            _details: &str,
+        ) {
+            unimplemented!("usage filter must not send local replies")
+        }
+        fn continue_decoding(&mut self) {
+            unimplemented!()
+        }
+        fn add_decoded_data(&mut self, _data: Bytes, _streaming: bool) {
+            unimplemented!()
+        }
+        fn inject_decoded_data_to_filter_chain(&mut self, _data: Bytes, _end_stream: bool) {
+            unimplemented!()
+        }
+        fn decoding_buffer(&self) -> Option<&BufferedBody> {
+            unimplemented!()
+        }
+        fn modify_decoding_buffer(&mut self, _f: &mut dyn FnMut(&mut BytesMut)) {
+            unimplemented!()
+        }
+        fn route(&mut self) -> Option<Arc<proxy_config::ir::RouteEntry>> {
+            None
+        }
+        fn clear_route_cache(&mut self) {
+            unimplemented!()
+        }
+        fn per_route_config(&mut self) -> Option<Arc<dyn PerRouteConfig>> {
+            None
+        }
+        fn stream_info(&mut self) -> std::cell::RefMut<'_, StreamInfo> {
+            self.stream_info.borrow_mut()
+        }
+    }
+
     impl EncoderCallbacks for TestCallbacks {
         fn continue_encoding(&mut self) {
             unimplemented!("usage filter must not call continue_encoding")
@@ -1411,6 +1633,8 @@ mod tests {
     fn filter_for(dialect: Dialect) -> UsageFilterInstance {
         UsageFilterInstance {
             dialect,
+            request_dialect: None,
+            stats: Arc::new(UsageStats::default()),
             pricing: None,
             mode: BodyMode::Inert,
             headers_at: None,
@@ -1591,27 +1815,180 @@ mod tests {
         assert_eq!(usage.output_tokens, 2);
     }
 
+    /// A JSON body of `MAX + 1 MiB` bytes: `usage_at_start` puts the usage
+    /// object first (beyond the tail window), otherwise last.
+    fn oversized_json_chunks(usage_at_start: bool) -> Vec<Bytes> {
+        let usage = r#""usage":{"prompt_tokens":11,"completion_tokens":13}"#;
+        let filler = format!(r#""pad":"{}""#, "x".repeat(2 << 20));
+        let body = if usage_at_start {
+            format!("{{{usage},{filler}}}")
+        } else {
+            format!("{{{filler},{usage}}}")
+        };
+        body.into_bytes()
+            .chunks(64 << 10)
+            .map(Bytes::copy_from_slice)
+            .collect()
+    }
+
+    fn run_json(filter: &mut UsageFilterInstance, cb: &mut TestCallbacks, chunks: Vec<Bytes>) {
+        let mut headers = response_headers("application/json");
+        filter.encode_headers(cb, &mut headers, false);
+        let last = chunks.len() - 1;
+        for (i, mut chunk) in chunks.into_iter().enumerate() {
+            filter.encode_data(cb, &mut chunk, i == last);
+        }
+    }
+
     #[test]
-    fn oversized_json_body_yields_no_usage_not_a_partial_count() {
+    fn oversized_json_body_with_usage_in_the_tail_is_still_metered() {
         let mut filter = filter_for(Dialect::OpenAi);
         let mut cb = TestCallbacks::new();
+        run_json(&mut filter, &mut cb, oversized_json_chunks(false));
 
+        let usage = cb.llm().usage.expect("usage recovered from the tail");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (11, 13));
+        assert_eq!(filter.stats.oversized_unrecoverable(), 0);
+        if let BodyMode::Json(body) = &filter.mode {
+            assert!(body.overflowed);
+            assert!(
+                body.buf.len() <= JSON_TAIL_WINDOW_BYTES,
+                "tail stays bounded"
+            );
+        } else {
+            panic!("expected JSON mode");
+        }
+    }
+
+    #[test]
+    fn oversized_json_body_with_usage_before_the_tail_yields_none_and_is_counted() {
+        let mut filter = filter_for(Dialect::OpenAi);
+        let mut cb = TestCallbacks::new();
+        run_json(&mut filter, &mut cb, oversized_json_chunks(true));
+
+        // Never a partial count: no usage and no cost, but the miss is counted.
+        assert_eq!(cb.llm().usage, None);
+        assert_eq!(filter.stats.oversized_unrecoverable(), 1);
+    }
+
+    #[test]
+    fn oversized_json_body_of_only_whitespace_then_usage_is_metered() {
+        // The former behaviour dropped everything after the cap, including a
+        // well-formed trailing usage object.
+        let mut filter = filter_for(Dialect::OpenAi);
+        let mut cb = TestCallbacks::new();
         let mut headers = response_headers("application/json");
         filter.encode_headers(&mut cb, &mut headers, false);
-
-        // One chunk bigger than the cap, followed by the well-formed tail
-        // that (if this were parsed at all) would carry real usage. If the
-        // filter mistakenly kept a truncated prefix, this would produce a
-        // parse error but *could* in principle still be Some via a lenient
-        // parser — assert None explicitly, not just "not the real answer".
         let mut oversized = Bytes::from(vec![b' '; MAX_JSON_BODY_BYTES + 1]);
         filter.encode_data(&mut cb, &mut oversized, false);
-
         let mut tail =
             Bytes::from_static(br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#);
         filter.encode_data(&mut cb, &mut tail, true);
+        assert_eq!(cb.llm().usage.map(|u| u.input_tokens), Some(1));
+    }
 
-        assert_eq!(cb.llm().usage, None);
+    #[test]
+    fn oversized_warning_is_rate_limited_but_every_miss_is_counted() {
+        let stats = UsageStats::default();
+        stats.note_oversized_unrecoverable(Some("c"));
+        let first = *stats.last_oversized_warning.lock().unwrap();
+        stats.note_oversized_unrecoverable(Some("c"));
+        assert_eq!(stats.oversized_unrecoverable(), 2);
+        assert_eq!(
+            *stats.last_oversized_warning.lock().unwrap(),
+            first,
+            "second miss inside the interval must not re-warn"
+        );
+    }
+
+    // --- request-path dialect selection ------------------------------------
+
+    fn request(method: Method, uri: &str) -> RequestHeaders {
+        RequestHeaders {
+            method,
+            uri: uri.parse().unwrap(),
+            headers: HeaderMap::new(),
+        }
+    }
+
+    /// Drive one request/response through an OpenAI-dialect cluster filter.
+    fn run_on_openai_cluster(
+        method: Method,
+        uri: &str,
+        content_type: &str,
+        body: &'static [u8],
+    ) -> proxy_http::LlmStats {
+        let mut filter = filter_for(Dialect::OpenAi);
+        let mut cb = TestCallbacks::new();
+        cb.stream_info.borrow_mut().upstream_usage_dialect =
+            Some(proxy_config::ir::UsageDialect::OpenAi);
+        filter.decode_headers(&mut cb, &mut request(method, uri), true);
+        filter.encode_headers(&mut cb, &mut response_headers(content_type), false);
+        filter.encode_data(&mut cb, &mut Bytes::from_static(body), true);
+        cb.llm()
+    }
+
+    #[test]
+    fn post_responses_on_an_openai_cluster_reads_responses_usage_json() {
+        let llm = run_on_openai_cluster(
+            Method::POST,
+            "/v1/responses?x=1",
+            "application/json",
+            br#"{"usage":{"input_tokens":20,"output_tokens":4,"input_tokens_details":{"cached_tokens":5}}}"#,
+        );
+        let usage = llm.usage.expect("responses usage");
+        assert_eq!(
+            (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
+            (15, 5, 4)
+        );
+        assert_eq!(llm.system, Some(GenAiSystem::OpenAi));
+    }
+
+    #[test]
+    fn post_responses_on_an_openai_cluster_reads_the_completed_sse_frame() {
+        let llm = run_on_openai_cluster(
+            Method::POST,
+            "/v1/responses",
+            "text/event-stream",
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}\n\n",
+        );
+        let usage = llm.usage.expect("responses sse usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (8, 3));
+    }
+
+    #[test]
+    fn post_messages_on_an_openai_cluster_reads_anthropic_usage() {
+        let llm = run_on_openai_cluster(
+            Method::POST,
+            "/v1/messages",
+            "application/json",
+            br#"{"usage":{"input_tokens":6,"output_tokens":2,"cache_read_input_tokens":4}}"#,
+        );
+        let usage = llm.usage.expect("anthropic usage");
+        assert_eq!(
+            (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
+            (6, 4, 2)
+        );
+        // The provider label follows the cluster, not the path.
+        assert_eq!(llm.system, Some(GenAiSystem::OpenAi));
+    }
+
+    #[test]
+    fn get_of_a_stored_response_keeps_the_cluster_dialect_and_is_not_metered() {
+        let llm = run_on_openai_cluster(
+            Method::GET,
+            "/v1/responses/resp_abc",
+            "application/json",
+            br#"{"usage":{"input_tokens":20,"output_tokens":4}}"#,
+        );
+        assert_eq!(llm.usage, None);
+        let get_collection = run_on_openai_cluster(
+            Method::GET,
+            "/v1/responses",
+            "application/json",
+            br#"{"usage":{"input_tokens":20,"output_tokens":4}}"#,
+        );
+        assert_eq!(get_collection.usage, None);
     }
 
     #[test]
@@ -1726,6 +2103,24 @@ mod tests {
     }
 
     #[test]
+    fn gateway_cache_write_tokens_are_charged_the_cache_write_rate() {
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+        }
+        filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
+        let mut body = Bytes::from_static(
+            br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":10,"cache_write_tokens":30}}}"#,
+        );
+        filter.encode_data(&mut cb, &mut body, true);
+        // 60 input * 10 + 10 cached * 1 + 30 cache-write * 20 + 5 output * 100
+        assert_eq!(cb.llm().list_cost.expect("priced").nanodollars, 1710);
+    }
+
+    #[test]
     fn encode_data_never_buffers() {
         let mut filter = filter_for(Dialect::OpenAi);
         let mut cb = TestCallbacks::new();
@@ -1829,6 +2224,54 @@ mod tests {
                 assert_eq!(field_path, "typed_config.dialect");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    /// Built through the real factory with the registry seeded the way the
+    /// listener seeds it, then read back from the rendered Prometheus text
+    /// that `/stats/prometheus` serves.
+    #[test]
+    fn unmetered_oversized_body_is_exported_on_the_prometheus_surface() {
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let ctx = FactoryContext {
+            stat_prefix: "ingress".into(),
+            ..Default::default()
+        };
+        let registry = control.registry();
+        ctx.shared
+            .get_or_try_init("", "", STATS_REGISTRY_KEY, || {
+                Ok(registry.clone() as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+        let instance_factory = UsageFilterFactory
+            .create(&usage_config("openai"), &ctx)
+            .expect("valid config builds a factory");
+
+        let mut filter = instance_factory.create_filter();
+        let mut cb = TestCallbacks::new();
+        run_json_boxed(&mut *filter, &mut cb, oversized_json_chunks(true));
+        // A metered oversized response must not count.
+        let mut metered = instance_factory.create_filter();
+        run_json_boxed(
+            &mut *metered,
+            &mut TestCallbacks::new(),
+            oversized_json_chunks(false),
+        );
+
+        let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+        let line = rendered
+            .lines()
+            .find(|l| l.starts_with("envoy_llmproxy_usage_oversized_body_unmetered_total{"))
+            .unwrap_or_else(|| panic!("counter missing from export:\n{rendered}"));
+        assert!(line.contains(r#"scope="ingress""#), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    fn run_json_boxed(filter: &mut dyn HttpFilter, cb: &mut TestCallbacks, chunks: Vec<Bytes>) {
+        filter.encode_headers(cb, &mut response_headers("application/json"), false);
+        let last = chunks.len() - 1;
+        for (i, mut chunk) in chunks.into_iter().enumerate() {
+            filter.encode_data(cb, &mut chunk, i == last);
         }
     }
 
