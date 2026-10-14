@@ -145,6 +145,10 @@ pub enum FormatOp {
     LlmUserId,
     LlmRequestedModel,
     LlmSelectedModel,
+    /// `%LLM_SERVED_MODEL%` -- the model the provider's response says it
+    /// served, which can differ from the selected model (dated snapshots,
+    /// provider-side fallback). `-` when the response named none.
+    LlmServedModel,
     LlmRateCardVersion,
 }
 
@@ -435,6 +439,10 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmSelectedModel
         }
+        "LLM_SERVED_MODEL" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmServedModel
+        }
         "LLM_RATE_CARD_VERSION" => {
             bare(name, args, truncate, input)?;
             FormatOp::LlmRateCardVersion
@@ -530,6 +538,8 @@ pub struct LogContext<'a> {
     pub llm_user_id: Option<&'a str>,
     pub llm_requested_model: Option<&'a str>,
     pub llm_selected_model: Option<&'a str>,
+    /// The model the provider reported serving; `None` when the response named none.
+    pub llm_served_model: Option<&'a str>,
     pub llm_rate_card_version: Option<&'a str>,
 
     /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
@@ -699,6 +709,7 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::LlmUserId => out.push_str(ctx.llm_user_id.unwrap_or("-")),
         FormatOp::LlmRequestedModel => out.push_str(ctx.llm_requested_model.unwrap_or("-")),
         FormatOp::LlmSelectedModel => out.push_str(ctx.llm_selected_model.unwrap_or("-")),
+        FormatOp::LlmServedModel => out.push_str(ctx.llm_served_model.unwrap_or("-")),
         FormatOp::LlmRateCardVersion => out.push_str(ctx.llm_rate_card_version.unwrap_or("-")),
         FormatOp::LlmListCost => match ctx.llm_list_cost_nanodollars {
             Some(cost) => {
@@ -1002,6 +1013,7 @@ mod tests {
             llm_user_id: None,
             llm_requested_model: None,
             llm_selected_model: None,
+            llm_served_model: None,
             llm_rate_card_version: None,
 
             request_method: Some("POST"),
@@ -1041,6 +1053,18 @@ mod tests {
         c.llm_credential_source = Some("platform");
         assert_eq!(render(&fs, &c), "platform tenant-a");
         assert!(parse_format("%LLM_CREDENTIAL_SOURCE(x)%").is_err());
+    }
+
+    #[test]
+    fn renders_served_model_and_dash_when_the_response_named_none() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%LLM_SELECTED_MODEL% %LLM_SERVED_MODEL%");
+        c.llm_selected_model = Some("gpt-4o-mini");
+        assert_eq!(render(&fs, &c), "gpt-4o-mini -");
+        c.llm_served_model = Some("gpt-4o-mini-2024-07-18");
+        assert_eq!(render(&fs, &c), "gpt-4o-mini gpt-4o-mini-2024-07-18");
+        assert!(parse_format("%LLM_SERVED_MODEL(x)%").is_err());
     }
 
     #[test]

@@ -218,6 +218,34 @@ pub fn extract_json_usage_from_tail(dialect: Dialect, tail: &[u8]) -> Option<Tok
     None
 }
 
+/// Longest model name accepted from a response. Real model identifiers are
+/// short; a longer value is a malformed or hostile response, and it feeds a
+/// price lookup and an audit record, so it is dropped rather than truncated
+/// (a truncated name could collide with a different model's card).
+pub const MAX_SERVED_MODEL_BYTES: usize = 128;
+
+/// Accept a provider-reported model name only if it is non-empty, within
+/// [`MAX_SERVED_MODEL_BYTES`], and free of control characters (it reaches
+/// access logs and records).
+fn bounded_served_model(model: &str) -> Option<String> {
+    if model.is_empty()
+        || model.len() > MAX_SERVED_MODEL_BYTES
+        || model.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(model.to_owned())
+}
+
+/// The model the provider says it served, from a complete JSON response body.
+/// All three dialects carry it as the top-level `model` string. The oversized
+/// tail path has no counterpart: providers emit `model` near the start of the
+/// document, which the tail window has already dropped.
+pub fn extract_json_served_model(body: &[u8]) -> Option<String> {
+    let json_body: serde_json::Value = serde_json::from_slice(body).ok()?;
+    bounded_served_model(json_body.get("model")?.as_str()?)
+}
+
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
     while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
         i += 1;
@@ -529,6 +557,8 @@ pub struct SseUsageScanner {
     partial: Vec<u8>,
     /// Best usage known so far.
     usage: Option<TokenUsage>,
+    /// The first model name any frame reported; later frames never replace it.
+    served_model: Option<String>,
 }
 
 impl SseUsageScanner {
@@ -537,6 +567,7 @@ impl SseUsageScanner {
             dialect,
             partial: Vec::new(),
             usage: None,
+            served_model: None,
         }
     }
 
@@ -563,7 +594,12 @@ impl SseUsageScanner {
             // from `partial` and yields them; we collect into an owned `Vec` so
             // the borrow on `partial` ends before we touch `self.usage`.
             let line: Vec<u8> = self.partial.drain(..=newline_pos).collect();
-            merge_line(&mut self.usage, self.dialect, &line[..line.len() - 1]);
+            merge_line(
+                &mut self.usage,
+                &mut self.served_model,
+                self.dialect,
+                &line[..line.len() - 1],
+            );
         }
         // What remains has no newline. If it has grown past the cap, this is an
         // upstream that never emits a newline; discard it (usage is best-effort
@@ -582,8 +618,21 @@ impl SseUsageScanner {
     pub fn usage(&self) -> Option<TokenUsage> {
         let mut result = self.usage;
         if !self.partial.is_empty() {
-            merge_line(&mut result, self.dialect, &self.partial);
+            merge_line(&mut result, &mut None, self.dialect, &self.partial);
         }
+        result
+    }
+
+    /// The model the provider reported serving: the first frame that names one
+    /// wins (OpenAI chunks repeat it on every frame; Anthropic names it once in
+    /// `message_start`; Responses in `response.created`). Like [`Self::usage`],
+    /// folds in an unterminated final line without mutating state.
+    pub fn served_model(&self) -> Option<String> {
+        if self.served_model.is_some() || self.partial.is_empty() {
+            return self.served_model.clone();
+        }
+        let mut result = None;
+        merge_line(&mut None, &mut result, self.dialect, &self.partial);
         result
     }
 
@@ -618,6 +667,18 @@ fn frame_usage_object(dialect: Dialect, value: &serde_json::Value) -> Option<&se
     }
 }
 
+/// Locate the served-model string inside one parsed SSE data frame, per
+/// dialect: top level for chat-completions, under `message` for Anthropic's
+/// `message_start`, under `response` for the Responses API.
+fn frame_served_model(dialect: Dialect, value: &serde_json::Value) -> Option<&str> {
+    match dialect {
+        Dialect::OpenAi => value.get("model"),
+        Dialect::Anthropic => value.get("message").and_then(|m| m.get("model")),
+        Dialect::OpenAiResponses => value.get("response").and_then(|r| r.get("model")),
+    }?
+    .as_str()
+}
+
 /// Merge the token counts a single frame carries into `target`.
 ///
 /// A field is updated only when the frame actually carries it, so an Anthropic
@@ -650,7 +711,12 @@ fn merge_usage(target: &mut Option<TokenUsage>, dialect: Dialect, usage: &serde_
 /// merge any usage it carries into `target`. Shared by [`SseUsageScanner::push`]
 /// (per newline-terminated line) and [`SseUsageScanner::usage`] (the final
 /// unterminated line at end-of-stream).
-fn merge_line(target: &mut Option<TokenUsage>, dialect: Dialect, line: &[u8]) {
+fn merge_line(
+    target: &mut Option<TokenUsage>,
+    served_model: &mut Option<String>,
+    dialect: Dialect,
+    line: &[u8],
+) {
     // Tolerate CRLF endings: strip a trailing `\r` left after the `\n`.
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     // Only `data:` lines carry payloads; ignore `event:`, `id:`, comments, blanks.
@@ -668,6 +734,9 @@ fn merge_line(target: &mut Option<TokenUsage>, dialect: Dialect, line: &[u8]) {
     };
     if let Some(usage) = frame_usage_object(dialect, &value) {
         merge_usage(target, dialect, usage);
+    }
+    if served_model.is_none() {
+        *served_model = frame_served_model(dialect, &value).and_then(bounded_served_model);
     }
 }
 
@@ -1378,5 +1447,88 @@ mod tests {
     fn openai_responses_scanner_does_not_misread_anthropic_events() {
         let anthropic = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n";
         assert_eq!(scan_all(Dialect::OpenAiResponses, anthropic), None);
+    }
+
+    // ---- served model --------------------------------------------------------
+
+    fn sse_served_model(dialect: Dialect, stream: &str) -> Option<String> {
+        let mut scanner = SseUsageScanner::new(dialect);
+        scanner.push(stream.as_bytes());
+        scanner.served_model()
+    }
+
+    #[test]
+    fn json_served_model_is_the_top_level_model_for_every_dialect() {
+        // Nested `model` keys (here under `choices[0]`) must not be mistaken
+        // for the top-level one.
+        let body = br#"{"choices":[{"model":"nested"}],"model":"gpt-4o-mini-2024-07-18","usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        assert_eq!(
+            extract_json_served_model(body).as_deref(),
+            Some("gpt-4o-mini-2024-07-18")
+        );
+        assert_eq!(extract_json_served_model(br#"{"usage":{}}"#), None);
+        assert_eq!(extract_json_served_model(br#"{"model":7}"#), None);
+        assert_eq!(extract_json_served_model(b"not json"), None);
+    }
+
+    #[test]
+    fn sse_served_model_openai_chat_first_chunk_wins() {
+        let stream = "data: {\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[]}\n\n\
+                      data: {\"model\":\"other\",\"choices\":[]}\n\n";
+        assert_eq!(
+            sse_served_model(Dialect::OpenAi, stream).as_deref(),
+            Some("gpt-4o-mini-2024-07-18")
+        );
+    }
+
+    #[test]
+    fn sse_served_model_anthropic_reads_message_start_only() {
+        let stream = "event: message_start\n\
+            data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n\
+            event: message_delta\n\
+            data: {\"type\":\"message_delta\",\"model\":\"top-level-ignored\",\"usage\":{\"output_tokens\":2}}\n\n";
+        assert_eq!(
+            sse_served_model(Dialect::Anthropic, stream).as_deref(),
+            Some("claude-haiku")
+        );
+    }
+
+    #[test]
+    fn sse_served_model_responses_reads_response_object() {
+        let stream = "event: response.created\n\
+            data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5-2025-08-07\"}}\n\n\
+            event: response.completed\n\
+            data: {\"type\":\"response.completed\",\"response\":{\"model\":\"later\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        assert_eq!(
+            sse_served_model(Dialect::OpenAiResponses, stream).as_deref(),
+            Some("gpt-5-2025-08-07")
+        );
+    }
+
+    #[test]
+    fn sse_served_model_survives_split_chunks_and_an_unterminated_last_line() {
+        let line = "data: {\"model\":\"m-1\"}";
+        let mut scanner = SseUsageScanner::new(Dialect::OpenAi);
+        scanner.push(&line.as_bytes()[..9]);
+        assert_eq!(scanner.served_model(), None);
+        scanner.push(&line.as_bytes()[9..]);
+        assert_eq!(scanner.served_model().as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn over_long_or_control_character_served_model_is_dropped_not_stored() {
+        let at_limit = "m".repeat(MAX_SERVED_MODEL_BYTES);
+        let over = "m".repeat(MAX_SERVED_MODEL_BYTES + 1);
+        let json = |m: &str| format!(r#"{{"model":"{m}"}}"#);
+        assert_eq!(
+            extract_json_served_model(json(&at_limit).as_bytes()).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert_eq!(extract_json_served_model(json(&over).as_bytes()), None);
+        assert_eq!(extract_json_served_model(br#"{"model":"a\nb"}"#), None);
+        assert_eq!(
+            sse_served_model(Dialect::OpenAi, &format!("data: {}\n", json(&over))),
+            None
+        );
     }
 }

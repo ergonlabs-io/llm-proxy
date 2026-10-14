@@ -832,6 +832,18 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Requests priced at the model the provider said it served instead of the
+    /// requested one, because the active rate card lists the served model for
+    /// the dialled provider type. Requests whose served model has no card entry
+    /// (dated snapshots) keep the requested price and are not counted. `scope`
+    /// is the operator-chosen HCM `stat_prefix`. Prometheus surface only.
+    pub const USAGE_SERVED_MODEL_REPRICED: Instrument = Instrument {
+        name: "llmproxy_usage_served_model_repriced_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

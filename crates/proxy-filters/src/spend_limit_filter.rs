@@ -805,13 +805,14 @@ impl SpendLimitFilterInstance {
         // before calling `self.accumulator.record` below -- `stream_info()`
         // must not be held across another call (see its doc), same pattern
         // as `token_limit_filter::record_if_present`.
-        let (usage, cluster, model, selected_model, credential_source) = {
+        let (usage, cluster, model, selected_model, served_model, credential_source) = {
             let info = cb.stream_info();
             (
                 info.llm.usage,
                 info.upstream_cluster.clone(),
                 info.requested_model.clone(),
                 info.selected_model.clone(),
+                info.llm.served_model.clone(),
                 info.credential_source,
             )
         };
@@ -830,10 +831,15 @@ impl SpendLimitFilterInstance {
             cache_creation_tokens: usage.cache_creation_tokens,
             output_tokens: usage.output_tokens,
         };
-        let charge = PricingRegistry::cost_micro_usd_for(
+        // Price at the same model the usage filter priced the logged cost at,
+        // so the spend charge and the record agree when a provider served a
+        // different model than the one sent.
+        let sent_model = selected_model.as_deref().or(model.as_deref());
+        let charge = PricingRegistry::cost_micro_usd_served(
             self.pricing_snapshot.as_ref(),
             cluster.as_deref(),
-            selected_model.as_deref().or(model.as_deref()),
+            sent_model,
+            served_model.as_deref(),
             &usage,
         )
         .map(|micros| Charge::Priced(MicroUsd::from_micros(micros)))
@@ -2104,6 +2110,46 @@ mod tests {
             lines[0].contains("no entry for provider type `openai`"),
             "the reason names what is missing: {}",
             lines[0]
+        );
+    }
+
+    /// The charge follows the model the provider served when the card lists
+    /// it, and stays on the requested model's price when it does not.
+    ///
+    /// Mutation: pass `sent_model` instead of the repriced model in
+    /// `cost_micro_usd_served`.
+    #[test]
+    fn spend_is_charged_at_the_served_models_card_entry() {
+        let card = r#"{"price_list":{"effective_from":"2026-01-01T00:00:00Z","entries":[
+            {"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":1000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":1000}]},
+            {"provider_type":"openai","model":"gpt-5-mini","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":100,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":100}]}
+            ]},"providers":{"cluster-a":"openai"}}"#;
+        let charged_for = |served: Option<&str>| {
+            let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+            let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+            harness.pricing_registry.publish_json(card).unwrap();
+            let mut filter = harness.new_instance();
+            let mut cb = TestCallbacks::new();
+            cb.set_tenant("tenant-a");
+            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            cb.set_upstream("cluster-a", "gpt-5");
+            cb.stream_info.borrow_mut().llm.served_model = served.map(str::to_owned);
+            cb.set_usage(usage(5000));
+            filter.encode_data(&mut cb, &mut Bytes::new(), true);
+            harness
+                .accumulator
+                .current_total_key(&test_key_id("tenant-a"), &Period::Daily.key_for_now())
+        };
+        assert_eq!(charged_for(None), 5000, "no served model: requested price");
+        assert_eq!(
+            charged_for(Some("gpt-5-mini")),
+            500,
+            "served model has a card"
+        );
+        assert_eq!(
+            charged_for(Some("gpt-5-2025-08-07")),
+            5000,
+            "served model without a card keeps the requested price"
         );
     }
 

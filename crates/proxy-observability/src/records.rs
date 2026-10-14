@@ -114,6 +114,11 @@ pub struct AttemptRecord {
     pub cluster: Option<String>,
     pub provider: Option<String>,
     pub upstream_model: Option<String>,
+    /// The model the provider reported serving (response `model`), set on the
+    /// selected attempt only. Often a dated snapshot of `upstream_model`.
+    /// `null` when the response named none; absent in records from older builds.
+    #[serde(default)]
+    pub served_model: Option<String>,
     pub started_at: String,
     pub finished_at: String,
     pub duration_ms: u64,
@@ -242,6 +247,7 @@ impl RequestRecord {
                 &attempt.cluster,
                 &attempt.provider,
                 &attempt.upstream_model,
+                &attempt.served_model,
                 &attempt.retry_reason,
             ]
             .into_iter()
