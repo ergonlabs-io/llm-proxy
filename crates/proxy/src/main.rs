@@ -949,6 +949,17 @@ async fn run_serve(
             }
         }
     };
+    // Delivery to the capture agent's spool is experimental (review M7): the
+    // agent has no reader, acknowledgement, retention or replay dedup, and
+    // stops when its disk limit is reached. Say so where the operator will
+    // see it; the JSONL file sink is the supported destination.
+    if request_records_agent.is_some() || snapshot.end_user_capture_configured {
+        tracing::warn!(
+            "request capture to the llm-capture-agent spool is EXPERIMENTAL: acknowledged records \
+             are never removed, there is no retention or replay deduplication, and capture stops \
+             when the spool reaches its disk limit; use --request-records-file for supported delivery"
+        );
+    }
     let legacy_agent = request_records_agent.clone();
     let collector = match (request_records_file, request_records_agent) {
         (Some(path), None) => Some(proxy_observability::metadata::MetadataDelivery::start(

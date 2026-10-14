@@ -19,6 +19,14 @@ request body, no response body, and no headers.
 
 Capture is off by default. It starts only when you supply a destination.
 
+**Experimental.**
+Delivery to the `llm-capture-agent` spool is experimental. The agent writes
+records and nothing reads them back. It never removes acknowledged records.
+It has no retention, and it does not remove duplicates when a batch is sent
+again. When the spool reaches its disk limit, capture stops. Free space does
+not restart it. For supported delivery, use `--request-records-file`.
+The proxy and the agent print a warning at startup when the spool is in use.
+
 **A record contains end-user identities and model history.** Protect the
 destination. The spool is the place to restrict access.
 

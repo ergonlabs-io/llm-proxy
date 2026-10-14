@@ -377,6 +377,71 @@ fn gated_mock(release: Arc<AtomicBool>, arrived: Arc<std::sync::atomic::AtomicUs
     }
 }
 
+/// The spool is experimental (review M7): a proxy that delivers to the agent
+/// says so at startup, in the log the operator reads.
+#[test]
+fn capture_to_the_agent_spool_warns_that_it_is_experimental() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = temp.path().join("agent.sock");
+    let control_socket = temp.path().join("control.sock");
+    let key = temp.path().join("key");
+    std::fs::write(&key, [9; 32]).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let uid = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::net::UnixStream::pair()
+                .unwrap()
+                .0
+                .peer_cred()
+                .unwrap()
+                .uid()
+        });
+    let agent_config = serde_json::json!({
+        "version":1,"mode":"metadata_spool_only","socket_path":socket,"node_id":"test-node",
+        "producers":[{"producer_id":"test-proxy","uid":uid,"tenants":["default"]}],
+        "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,
+            "max_disk_bytes":4194304,"cache_bytes":4194304},
+        "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]
+    });
+    let _agent = collector(serde_json::from_value(agent_config).unwrap());
+    let upstream = mock();
+    let (listener, admin) = (port(), port());
+    let capture = serde_json::json!({
+        "version":1,"metadata":{"enabled":true,"max_attempts":8},"policy":{"version":"warn"},
+        "endpoint":{"unix_socket_path":socket,"expected_agent_uid":uid,
+            "expected_node_id":"test-node","producer_id":"test-proxy"},
+        "emergency_control":{"unix_socket_path":control_socket,"operator_uid":uid}
+    });
+    let bootstrap = temp.path().join("proxy.yaml");
+    std::fs::write(
+        &bootstrap,
+        declarative_bootstrap(listener, admin, upstream.address.port(), &capture),
+    )
+    .unwrap();
+    let stderr_path = temp.path().join("stderr.log");
+    let proxy = Proxy(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&bootstrap)
+            .args(["--concurrency", "1"])
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    wait(|| TcpStream::connect(("127.0.0.1", listener)).is_ok());
+    let log = std::fs::read_to_string(&stderr_path).unwrap();
+    drop(proxy);
+    assert!(
+        log.contains("EXPERIMENTAL"),
+        "startup log must label the capture spool experimental: {log}"
+    );
+}
+
 /// A request that spans SIGTERM completes during the drain and its record is
 /// still delivered to the agent before the process exits: capture delivery is
 /// flushed only after the workers have drained.

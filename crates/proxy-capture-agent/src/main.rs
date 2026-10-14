@@ -19,6 +19,11 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    eprintln!(
+        "warning: llm-capture-agent is EXPERIMENTAL: acknowledged records are never removed, \
+         there is no retention or replay deduplication, and capture stops when the spool \
+         reaches its disk limit"
+    );
     let agent = match Agent::start(config) {
         Ok(agent) => agent,
         Err(error) => {
