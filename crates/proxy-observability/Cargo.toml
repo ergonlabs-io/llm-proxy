@@ -12,7 +12,7 @@ chrono = { workspace = true }
 # Rate-limited warnings when an access-log sink fails to write.
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 # `stats::Registry` publishes its per-handle metadata and
 # shard storage through `ArcSwap<Snapshot>` so resolution can grow the
 # registry under `&self`, surviving a config swap -- the same pattern

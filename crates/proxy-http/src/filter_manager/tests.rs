@@ -3766,6 +3766,101 @@ fn a_filter_chain_local_reply_still_produces_an_access_log_line() {
     });
 }
 
+/// Stamps `StreamInfo::llm.usage` from `on_stream_complete` only, never from an
+/// encode callback: the shape of a filter recording what a stream never
+/// finished delivering.
+struct StampsUsageOnStreamCompleteFilter;
+
+impl HttpFilter for StampsUsageOnStreamCompleteFilter {
+    fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
+        cb.stream_info().llm.usage = Some(crate::stream_info::LlmTokenUsage {
+            input_tokens: 7,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 0,
+        });
+    }
+}
+
+struct StampsUsageOnStreamCompleteFilterFactory;
+
+impl FilterInstanceFactory for StampsUsageOnStreamCompleteFilterFactory {
+    fn create_filter(&self) -> Box<dyn HttpFilter> {
+        Box::new(StampsUsageOnStreamCompleteFilter)
+    }
+}
+
+/// Which way the stream under test ends.
+#[derive(Clone, Copy, Debug)]
+enum StreamEnd {
+    /// The client reads the whole body.
+    Clean,
+    /// The client drops the body without polling it.
+    Abandoned,
+    /// A decode filter replies locally, so the router terminal never runs.
+    LocalReply,
+}
+
+/// A value written in `on_stream_complete` must be in the rendered access-log
+/// line however the stream ends. This drives the real `FilterChainHandler`, so
+/// it fails if `LoggingBody` renders before the encoder's filters are
+/// completed (the abandoned case is the one the old drop order got wrong).
+#[test]
+fn on_stream_complete_write_reaches_the_access_log_however_the_stream_ends() {
+    for end in [
+        StreamEnd::Clean,
+        StreamEnd::Abandoned,
+        StreamEnd::LocalReply,
+    ] {
+        block_on(async {
+            let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
+                Arc::new(RecordingTerminalFactory {
+                    seen_body: Arc::new(Mutex::new(Bytes::new())),
+                    seen_request_id: Arc::new(Mutex::new(None)),
+                    seen_headers: None,
+                    term_log: None,
+                });
+            let path = temp_log_path("on-stream-complete");
+            let mut factories: Vec<Arc<dyn FilterInstanceFactory>> =
+                vec![Arc::new(StampsUsageOnStreamCompleteFilterFactory)];
+            if matches!(end, StreamEnd::LocalReply) {
+                factories.push(Arc::new(LocalReplyFilterFactory));
+            }
+            let handler = FilterChainHandler::new_with_access_logs(
+                factories,
+                terminal_factory,
+                empty_route_table(),
+                false,
+                false,
+                0,
+                &[text_access_log(
+                    &path,
+                    "%LLM_INPUT_TOKENS% %RESPONSE_FLAGS%\n",
+                )],
+            )
+            .expect("temp file sink always opens cleanly");
+
+            let resp = handler.handle(request(b"hi")).await;
+            match end {
+                StreamEnd::Abandoned => drop(resp.body),
+                StreamEnd::Clean | StreamEnd::LocalReply => {
+                    resp.body.collect().await.expect("resp body must collect");
+                }
+            }
+
+            let line = read_log(&path);
+            assert!(
+                line.starts_with("7 "),
+                "{end:?}: on_stream_complete's write must be in the log line, got {line:?}"
+            );
+            if matches!(end, StreamEnd::Abandoned) {
+                assert!(line.contains("DC"), "{end:?}: {line:?}");
+            }
+            std::fs::remove_file(&path).ok();
+        });
+    }
+}
+
 // --- ADR-0004 step 2: async decode filters (`poll_pending`) ----------------
 
 /// A decode filter that returns `StopIteration` from `decode_headers` on its

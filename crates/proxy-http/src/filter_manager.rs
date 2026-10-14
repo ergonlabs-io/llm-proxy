@@ -1608,7 +1608,7 @@ impl FilterManager {
                         info.response_code_details =
                             Some("encode_header_phase_overflow".to_string());
                     }
-                    destroy_filters(terminal.as_mut(), &mut filters);
+                    destroy_filters(terminal.as_mut(), &mut filters, &mut ctx);
                     return synth_response(status, "response rejected by filter chain");
                 }
             };
@@ -1668,10 +1668,31 @@ impl FilterManager {
 /// whether or not it ever actually ran (a local reply short-circuits before
 /// the terminal's own callbacks fire, but the instance still exists and still
 /// needs tearing down).
-fn destroy_filters(terminal: &mut dyn TerminalHttpFilter, filters: &mut [Box<dyn HttpFilter>]) {
+fn destroy_filters(
+    terminal: &mut dyn TerminalHttpFilter,
+    filters: &mut [Box<dyn HttpFilter>],
+    ctx: &mut ChainCtx,
+) {
+    complete_filters(filters, ctx);
     terminal.on_destroy();
     for filter in filters.iter_mut().rev() {
         filter.on_destroy();
+    }
+}
+
+/// Run every filter's `on_stream_complete` (reverse creation order, like
+/// `on_destroy`), each with callbacks bound to its own encode position so
+/// `per_route_config` resolves for the calling filter. The caller guards
+/// against a second call.
+fn complete_filters(filters: &mut [Box<dyn HttpFilter>], ctx: &mut ChainCtx) {
+    let n = filters.len();
+    for (index, filter) in filters.iter_mut().enumerate().rev() {
+        // Encode position `p` = filter index `n - 1 - p` (see `StreamingEncoder`).
+        let mut cb = EncoderCallbacksAdapter {
+            ctx: &mut *ctx,
+            pos: n - 1 - index,
+        };
+        filter.on_stream_complete(&mut cb);
     }
 }
 
@@ -1756,7 +1777,7 @@ async fn respond_with_local_reply(
             // response (bypassing the chain), same as the pre-S2.5 behavior.
             // Teardown still has to happen: `on_destroy` normally rides on
             // `StreamingEncoder`'s `Drop`, and this path never builds one.
-            destroy_filters(terminal.as_mut(), &mut filters);
+            destroy_filters(terminal.as_mut(), &mut filters, &mut ctx);
             synth_response(status, "response rejected by filter chain")
         }
     }
@@ -2091,7 +2112,8 @@ struct StreamingEncoder {
     /// one position's worth, advancing this cursor, so multiple stopped
     /// positions each get their own frame in position order.
     flush_pos: usize,
-    /// Guards [`Drop::drop`] so `on_destroy` fires exactly once.
+    /// Guards [`Drop::drop`] so `on_stream_complete` and `on_destroy` each
+    /// fire exactly once.
     destroyed: bool,
     /// Bytes remaining per the response's `content-length` header, decremented
     /// as each real upstream data frame is delivered (see
@@ -2599,6 +2621,10 @@ impl Drop for StreamingEncoder {
         // something ever calls `drop` explicitly.
         if !self.destroyed {
             self.destroyed = true;
+            // Filters get their callbacks-carrying completion hook before any
+            // teardown, and (when an access-log body wraps this one) before
+            // the log reads `StreamInfo`: see `LoggingBody::finish`.
+            complete_filters(&mut self.filters, &mut self.ctx);
             // Reverse creation order (S2.1), same as decode's teardown --
             // `terminal` first (created last), then the configured filters.
             self.terminal.on_destroy();

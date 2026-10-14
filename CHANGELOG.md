@@ -11,6 +11,26 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Fixed
+
+- A stream the client abandons, or the upstream cuts off, was never metered: no usage, no cost,
+  no spend or token-limit charge, and the record claimed `completeness: complete`. It is now
+  recorded `partial`, priced through the rate card from an estimate (4 bytes per token: input
+  from the request size, output from streamed text; provider figures that arrived are kept),
+  and charged by `spend_limit` and `token_limit`. Marked by `usage.provenance: estimate`,
+  `cost.kind: estimate`, `%LLM_USAGE_COMPLETENESS%` and `%LLM_COST_KIND%`; counted in
+  `llmproxy_usage_partial_total` and `llmproxy_usage_estimated_total`.
+
+### Added
+
+- `%LLM_UPSTREAM_ID%` and `%LLM_UPSTREAM_USAGE%` access-log operators, and
+  `upstream_response_id` / `upstream_usage` on request and attempt records (schema version
+  1, additive): the provider's response id and its `usage` object exactly as sent. Evidence
+  only; cost still comes from the rate card. Misses over the size bounds are counted in
+  `llmproxy_usage_upstream_usage_oversized_total` and `llmproxy_usage_upstream_id_oversized_total`.
+- `HttpFilter::on_stream_complete`: a callbacks-carrying hook that runs once per filter, before
+  the access log reads `StreamInfo`, for clean ends, local replies and abandoned streams.
+
 ## [0.3.4] - 2026-10-13
 
 Fixes from a production metering review of an OpenRouter deployment run in config mode,

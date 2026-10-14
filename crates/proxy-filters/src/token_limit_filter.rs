@@ -1000,6 +1000,27 @@ impl HttpFilter for TokenLimitFilterInstance {
         self.record_if_present(cb);
         FilterTrailersStatus::Continue
     }
+
+    /// A stream cut off before its terminal frame never reaches the
+    /// end-of-stream callbacks above. The usage filter, which completes before
+    /// this filter (completion runs in reverse chain order), has by now written
+    /// a partial estimate; charge it, so a client that keeps aborting still
+    /// consumes its budget. A clean end already set `recorded`, so this cannot
+    /// charge twice, and a stream with no partial usage (a denial, a local
+    /// reply) is left alone, not reported as missing usage.
+    fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
+        if self.recorded {
+            return;
+        }
+        let partial_usage = {
+            let info = cb.stream_info();
+            info.llm.completeness == Some(proxy_observability::records::UsageCompleteness::Partial)
+                && info.llm.usage.is_some()
+        };
+        if partial_usage {
+            self.record_if_present(cb);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1408,6 +1429,61 @@ mod tests {
             reply.is_some(),
             "request 4 is the exact index at which a 429 must first appear"
         );
+    }
+
+    // --- cut-off streams ----------------------------------------------------
+
+    /// One request whose stream ends part-way (`abort`) or cleanly, carrying
+    /// usage the way the usage filter leaves it, then completed the way the
+    /// filter manager completes every stream.
+    fn run_stream(
+        store: &Arc<dyn BudgetStore>,
+        abort: bool,
+    ) -> Option<(StatusCode, HeaderMap, String)> {
+        let mut filter = filter_with(Arc::clone(store));
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        let mut head = request_headers(Some("Bearer sk-1"));
+        filter.decode_headers(&mut cb, &mut head, true);
+        if cb.local_reply.is_some() {
+            return cb.local_reply;
+        }
+        cb.set_usage(usage(10));
+        cb.stream_info.borrow_mut().llm.completeness = Some(if abort {
+            proxy_observability::records::UsageCompleteness::Partial
+        } else {
+            proxy_observability::records::UsageCompleteness::Complete
+        });
+        filter.encode_headers(&mut cb, &mut response_headers(), false);
+        if !abort {
+            filter.encode_data(&mut cb, &mut Bytes::new(), true);
+        }
+        filter.on_stream_complete(&mut cb);
+        None
+    }
+
+    /// A client that keeps aborting still consumes its budget: three partial
+    /// streams of 10 tokens exhaust a 25-token budget.
+    #[test]
+    fn aborted_streams_are_charged_their_partial_usage() {
+        let store = store_with(25, Duration::from_secs(60));
+        for i in 1..=3 {
+            assert!(run_stream(&store, true).is_none(), "stream {i} admitted");
+        }
+        assert!(run_stream(&store, true).is_some(), "30 tokens exhausted 25");
+    }
+
+    /// A clean stream is charged once even though completion runs after it:
+    /// two of them are 20 tokens, so a third is still admitted.
+    #[test]
+    fn a_clean_stream_is_not_charged_again_at_completion() {
+        let store = store_with(25, Duration::from_secs(60));
+        assert!(run_stream(&store, false).is_none());
+        assert!(run_stream(&store, false).is_none());
+        assert!(
+            run_stream(&store, false).is_none(),
+            "double charge would deny"
+        );
+        assert!(run_stream(&store, false).is_some());
     }
 
     // --- 429 headers --------------------------------------------------------

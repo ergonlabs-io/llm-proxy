@@ -51,6 +51,10 @@ becomes `envoy_llm_client_token_usage`.
 | `gen_ai.server.time_per_output_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.system` | Mean time for each output token after the first token. 13 bucket boundaries from 0.01 to 2.5. | Not shown |
 | `ext_authz` | counter | `scope`, `outcome` | Decisions of the external authorization filter. | `http.<scope>.<outcome>` |
 | `llmproxy_tenant_credential_requests_total` | counter | `provider`, `outcome` | Tenant-mode credential decisions: `applied`, `missing`, `unusable`. | Not shown |
+| `llmproxy_usage_partial_total` | counter | `scope` | Streams that ended before the provider's final usage (client abort, upstream death). Each is recorded with `completeness: partial` and metered from an estimate. `scope` is the listener `stat_prefix`. Prometheus only. | Not shown |
+| `llmproxy_usage_estimated_total` | counter | `scope` | Partial records whose token counts, and so cost, include an estimate. Prometheus only. | Not shown |
+| `llmproxy_usage_upstream_usage_oversized_total` | counter | `scope` | Responses whose `usage` object was over 4096 bytes, so the record carries no `upstream_usage`. Prometheus only. | Not shown |
+| `llmproxy_usage_upstream_id_oversized_total` | counter | `scope` | Responses whose provider response id was over 256 bytes, so the record carries no `upstream_response_id`. Prometheus only. | Not shown |
 
 Notes on the traffic metrics:
 

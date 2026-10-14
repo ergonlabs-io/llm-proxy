@@ -32,7 +32,7 @@ base64 = { workspace = true }
 # below was already a dependency and does the actual encoding.
 redb = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 # `RedbControlPlaneStore`'s Redis-backed sibling -- see

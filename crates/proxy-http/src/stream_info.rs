@@ -96,6 +96,26 @@ pub struct LlmStats {
     /// evidence, and the price key when the rate card lists it. `None` when the
     /// response named none.
     pub served_model: Option<String>,
+    /// The provider's own id for this response (`chatcmpl-...`, `msg_...`,
+    /// `resp_...`), bounded by the usage filter. Audit evidence for matching
+    /// our record against the provider's dashboard.
+    pub upstream_response_id: Option<String>,
+    /// The provider's `usage` object exactly as sent (the last one, for a
+    /// stream carrying several), as JSON text. Evidence only: nothing reads a
+    /// field of it, and cost comes from the rate card alone.
+    pub upstream_usage: Option<String>,
+    /// Whether `usage` and `list_cost` describe a finished response.
+    /// `Some(Partial)` is a stream cut off before the provider's final usage:
+    /// the usage filter wrote an estimate (see `input_estimated` /
+    /// `output_estimated`) so the request is still metered and charged.
+    /// `None` means no usage filter ran.
+    pub completeness: Option<proxy_observability::records::UsageCompleteness>,
+    /// The input token count in `usage` is an estimate from the request body
+    /// size, not a provider figure.
+    pub input_estimated: bool,
+    /// The output token count in `usage` is an estimate from the generated
+    /// text that was streamed, not a provider figure.
+    pub output_estimated: bool,
     /// The response dialect selected from the route's usage-filter config.
     /// `None` means no usage filter ran, so GenAI latency metrics must not
     /// guess a system from a cluster name.
@@ -167,6 +187,12 @@ pub struct AttemptInfo {
     /// The model the provider reported serving on this attempt, written by the
     /// usage filter onto the selected attempt only.
     pub served_model: Option<String>,
+    /// The provider's response id on this attempt (selected attempt only),
+    /// written by the usage filter. See [`LlmStats::upstream_response_id`].
+    pub upstream_response_id: Option<String>,
+    /// The provider's `usage` object as sent (selected attempt only). See
+    /// [`LlmStats::upstream_usage`].
+    pub upstream_usage: Option<String>,
     pub started_at: SystemTime,
     pub started_instant: Instant,
     pub finished_at: Option<SystemTime>,
@@ -403,6 +429,8 @@ impl StreamInfo {
             host: proxy_observability::records::bounded_field(host),
             upstream_model: upstream_model.map(|m| proxy_observability::records::bounded_field(&m)),
             served_model: None,
+            upstream_response_id: None,
+            upstream_usage: None,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
             finished_at: None,
