@@ -315,6 +315,98 @@ async fn a_valid_virtual_key_reaches_the_upstream_and_returns_200() {
     drop(scratch);
 }
 
+/// Review M9: the access log never carries a credential, even when the
+/// operator's format names the header. An admitted request's key is stripped
+/// by `llmproxy.auth` before the log renders, but a refused one keeps it (an
+/// unknown key may be a typo of a real one), and a provider key a client sends
+/// in `x-api-key` is never stripped. So the renderer redacts credential
+/// headers; this drives it through the real binary, for an admitted request
+/// and a refused one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_access_log_never_renders_the_virtual_key_or_a_provider_key() {
+    let upstream = OpenAiUpstream::spawn(upstream_config())
+        .await
+        .expect("spawn mock upstream");
+    let scratch = ScratchDir::new("auth-access-log-redaction");
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let log_path = scratch.path().join("access.log");
+    let access_log = format!(
+        r#"          access_log:
+          - name: envoy.access_loggers.file
+            typed_config:
+              '@type': type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+              path: {}
+              log_format:
+                text_format: "status=%RESPONSE_CODE% auth=%REQ(authorization)% api_key=%REQ(X-Api-Key)% fallback=%REQ(missing?authorization)%\n"
+          http_filters:
+"#,
+        log_path.display()
+    );
+    let config_yaml = envoy_config(
+        listener_port,
+        upstream.port(),
+        AMPLE_MAX_TOKENS,
+        AMPLE_FILL_RATE,
+    )
+    .replacen("          http_filters:\n", &access_log, 1);
+    let config_path = scratch.write("envoy.yaml", &config_yaml);
+    let mut proxy = ProxyProcess::spawn_envoy(
+        &resolve_llm_proxy_bin(),
+        &config_path,
+        &scratch.path().join("proxy.log"),
+    );
+    proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
+
+    let provider_key = "sk-client-sent-provider-key";
+    for key in [KEY_LIVE, "llmp_unknown-key"] {
+        let bearer = format!("Bearer {key}");
+        send_chat_request(
+            listener_addr,
+            &[("authorization", &bearer), ("x-api-key", provider_key)],
+        )
+        .await;
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let log = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.lines().count() >= 2 || std::time::Instant::now() >= deadline {
+            break log;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(log.lines().count(), 2, "one line per request:\n{log}");
+    assert!(
+        log.contains("status=200") && log.contains("status=401"),
+        "{log}"
+    );
+    for (status, expected) in [
+        ("200", "auth=- api_key=[REDACTED] fallback=-"),
+        (
+            "401",
+            "auth=[REDACTED] api_key=[REDACTED] fallback=[REDACTED]",
+        ),
+    ] {
+        let line = log
+            .lines()
+            .find(|line| line.starts_with(&format!("status={status} ")))
+            .unwrap_or_else(|| panic!("no {status} line:\n{log}"));
+        assert!(
+            line.ends_with(expected),
+            "a credential header renders as present, never its value: {line}"
+        );
+    }
+    assert!(
+        !log.contains("llmp_") && !log.contains(provider_key),
+        "no credential may reach the access log:\n{log}"
+    );
+
+    drop(proxy);
+    upstream.shutdown().await;
+    drop(scratch);
+}
+
 /// 2. An unknown `llmp_`-prefixed key gets 401, AND the upstream is never
 /// contacted. The second half is the real assertion: a filter that 401s only
 /// AFTER forwarding would still bill the provider.

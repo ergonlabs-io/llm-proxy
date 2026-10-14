@@ -796,7 +796,39 @@ fn resolve_req_pseudo<'a>(ctx: &LogContext<'a>, name: &str) -> Option<&'a str> {
             _ => None,
         };
     }
-    header_lookup(ctx.request_headers, name)
+    let value = header_lookup(ctx.request_headers, name)?;
+    if is_credential_header(name) {
+        return Some(REDACTED);
+    }
+    Some(value)
+}
+
+/// What `%REQ(X)%` renders for a credential header that is present: its
+/// presence, never its value.
+const REDACTED: &str = "[REDACTED]";
+
+/// Request headers that carry a credential: the client's `llmp_` virtual key
+/// or JWT (`authorization`), a provider key a client sends itself, a proxy
+/// credential, or a session cookie. `llmproxy.auth` strips the key only from a
+/// request it admits; a refused request keeps it (an unknown key may be a typo
+/// of a real one), and a client-sent provider key is never stripped. Without
+/// this, a format naming `%REQ(authorization)%` would write those to the log
+/// (review M9).
+/// Envoy renders these headers verbatim; this departure is recorded in
+/// `internal-docs/envoy-divergences.md`.
+const CREDENTIAL_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "cookie",
+];
+
+fn is_credential_header(name: &str) -> bool {
+    CREDENTIAL_HEADERS
+        .iter()
+        .any(|credential| credential.eq_ignore_ascii_case(name))
 }
 
 /// `%RESP(X)%`/`%RESP(X?Y)%`: only `:status` is a recognized response

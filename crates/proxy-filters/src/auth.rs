@@ -45,25 +45,19 @@
 //! functions are spelled "hash a credential"; that they solve different
 //! problems is exactly the trap to avoid.
 //!
-//! # Constant-time comparison: `ring::hmac::verify`, not `constant_time::verify_slices_are_equal`
+//! # No byte comparison of secrets happens here
 //!
-//! The obvious choice would be `ring::constant_time::verify_slices_are_equal`.
-//! In the `ring` version this workspace pins (0.17.14), that function has
-//! been deprecated with the note "Internal function not intended for
-//! external use with **no promises regarding side channels**" -- i.e. `ring`
-//! itself no longer documents it as constant-time for callers outside the
-//! crate, which is the entire property this module needs. `ring::hmac::verify`
-//! is the documented replacement for exactly this shape of check ("The
-//! verification will be done in constant time to prevent timing attacks.")
-//! and is implemented in terms of the same internal primitive, so this module
-//! uses it instead. [`KeySet::find`] derives the digest with
-//! `ring::hmac::sign` to look the record up, then calls
-//! `ring::hmac::verify(secret, presented_bytes, digest)` **once**, on the
-//! single candidate — so the byte comparison that actually decides
-//! authentication is the documented constant-time one rather than
-//! `HashMap`'s `Eq`, which short-circuits. `ring::hmac::sign` is also what
-//! *produces* a digest when a record is inserted into a [`KeySet`] (there is
-//! nothing to verify at insert time).
+//! [`KeySet::find`] derives `HMAC-SHA256(secret, presented_key)` with
+//! `ring::hmac::sign` and looks that digest up in a `HashMap`. The lookup is
+//! the decision. There is no second, "constant-time" comparison after it: an
+//! earlier version called `ring::hmac::verify(secret, presented, digest)` on
+//! the digest it had just computed from the same input, which always succeeds
+//! and so verified nothing (review M9). Why the lookup itself is not a timing
+//! side channel is the next section. Where two secrets ARE compared byte for
+//! byte (the admin bearer token), `proxy-admin`'s `secrets_match` uses the
+//! double-HMAC compare, because `ring::constant_time::verify_slices_are_equal`
+//! is deprecated in the pinned `ring` (0.17.14) with "no promises regarding
+//! side channels".
 //!
 //! # `KeySet` is a `HashMap` keyed on the digest
 //!
@@ -86,8 +80,7 @@
 //! cannot steer without the secret, so they can neither aim at a bucket nor
 //! walk the digest byte by byte. And the only coarse fact a lookup could leak
 //! — whether that digest exists — is exactly what the response already tells
-//! them (200 vs 401). The comparison that decides authentication is still the
-//! documented constant-time one, performed once on the single candidate.
+//! them (200 vs 401).
 //!
 //! # Nothing here leaks key material through `Debug`
 //!
@@ -616,8 +609,7 @@ impl fmt::Debug for KeyRecord {
 /// attacker cannot steer without the secret, so they cannot aim at buckets or
 /// walk the digest byte by byte. And the coarse signal a table lookup could
 /// leak -- "does this digest exist" -- is already the response the caller
-/// gets (200 vs 401). The constant-time comparison that matters is still
-/// performed, once, on the single candidate: see [`KeySet::find`].
+/// gets (200 vs 401).
 pub struct KeySet {
     entries: HashMap<Vec<u8>, KeyRecord>,
 }
@@ -652,21 +644,14 @@ impl KeySet {
         self.entries.insert(digest, record);
     }
 
-    /// Finds the record for `presented`: one HMAC to derive the digest, one
-    /// table lookup, then one constant-time verification of the candidate.
-    ///
-    /// The `hmac::verify` call is deliberately kept even though the lookup
-    /// already matched. It costs one HMAC on the success path only, and it
-    /// means the byte comparison that decides authentication is the
-    /// documented constant-time one rather than `HashMap`'s `Eq`, which
-    /// short-circuits. See [`KeySet`]'s doc for why the lookup itself is not
-    /// a meaningful side channel.
+    /// Finds the record for `presented`: one HMAC to derive the digest, then
+    /// one table lookup, which is the whole decision. See the module doc's
+    /// "No byte comparison of secrets happens here" for why there is no
+    /// verify step after it, and [`KeySet`]'s doc for why the lookup is not a
+    /// meaningful side channel.
     fn find(&self, secret: &HmacSecret, presented: &str) -> Option<&KeyRecord> {
         let digest = ring::hmac::sign(&secret.0, presented.as_bytes());
-        let record = self.entries.get(digest.as_ref())?;
-        ring::hmac::verify(&secret.0, presented.as_bytes(), digest.as_ref())
-            .ok()
-            .map(|()| record)
+        self.entries.get(digest.as_ref())
     }
 
     /// Iterates this set's `(digest, record)` pairs.
