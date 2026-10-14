@@ -459,6 +459,29 @@ impl LoggingBody {
             return;
         };
         let stream_duration = ctx.start_instant.elapsed();
+        // Settle the selected attempt's termination from the stream's flags
+        // before the inner body drops: the upstream body's own drop handlers
+        // would otherwise record a less specific reason first.
+        {
+            let info = ctx.stream_info.borrow();
+            if let Some(attempt) = &info.selected_attempt {
+                attempt.borrow_mut().finish(metadata_termination(
+                    info.response_flags(),
+                    ctx.response_code,
+                    info.is_local_reply,
+                ));
+            }
+        }
+        // Tear the filter chain down now, not when this body is dropped. Its
+        // `StreamingEncoder` runs every filter's `on_stream_complete` as it
+        // drops, and a filter may write `StreamInfo` there (the usage filter
+        // records a partial count for a stream cut short). The log reads
+        // `StreamInfo` below, so it has to come after.
+        //
+        // Rust note: `mem::replace` swaps a fresh empty body into the field
+        // and hands back the old one, which then drops at the end of the
+        // statement. A struct field cannot simply be moved out of `&mut self`.
+        drop(std::mem::replace(&mut self.inner, empty_body()));
         #[cfg(unix)]
         ctx.stream_info.borrow_mut().check_capture_gate();
         #[cfg(unix)]
@@ -937,6 +960,16 @@ fn metadata_termination(
 
 fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A body that is already at its end, left in place of a torn-down inner body.
+fn empty_body() -> StreamBody {
+    use http_body_util::BodyExt as _;
+    // `Empty`'s error type is `Infallible`, which has no values, so the
+    // conversion closure is unreachable.
+    crate::handler::local_boxed(
+        http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}),
+    )
 }
 
 impl Body for LoggingBody {
