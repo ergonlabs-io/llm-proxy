@@ -401,8 +401,9 @@ Minting a key, revoking one, creating or deleting a tenant, and setting a
 tenant's model allow-list or key's spend budget are all bearer-gated HTTP calls
 against the admin server, not config-file edits: `POST /keys`,
 `DELETE /keys/{id}`, `POST /tenants`, `DELETE /tenants/{id}`,
-`PUT /tenants/{id}/policy`, `PUT /keys/{id}/budget`, a read-only
-`GET /keys` listing every key (id, tenant, revocation, budget -- no
+`PUT /tenants/{id}/policy`, `PUT /keys/{id}/budget`,
+`PUT /keys/{id}/policy`, a read-only
+`GET /keys` listing every key (id, tenant, revocation, policy, budget -- no
 plaintext), and a read-only `GET /keys/{id}/spend`
 (`crates/proxy-admin/src/server.rs`'s `AVAILABLE_ENDPOINTS`, and its
 `WriteRoute::expected_method` table). Each of these
@@ -440,6 +441,19 @@ every write plus the two financial/identity reads, `GET .../spend` and
 
 See [Spend policies and recovery](../../limits-and-budgets/spend-policies/) for
 rotation, permanent revocation tombstones, API versioning, and migration.
+
+### Per-user controls inside a tenant
+
+To control each user separately, issue one key for each user. Use the key as
+the user identity. Then set a spend budget and a model policy on each key:
+
+- `PUT /keys/{id}/budget` sets the spend ceiling of the key.
+- `PUT /keys/{id}/policy` sets the model allow-list of the key.
+
+A key policy only narrows the model grant of its tenant. It never widens
+it. A key with no policy keeps the grant of its tenant. For the body, the
+status codes, and the rules, see "Key model policy" in
+[Admin endpoints](../../observability/admin-endpoints/#key-model-policy).
 
 ### Tenant provider credentials
 

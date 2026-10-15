@@ -155,14 +155,15 @@ model and examples.
 
 | Route | Method | Success | What it does |
 |---|---|---|---|
-| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `budget`. Sorted by tenant, then key id. |
+| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`. Sorted by tenant, then key id. |
 | `/keys` | POST | `201` | Mints a key. Body: `tenant`, `key_id`. The answer holds the key text `key` once. |
 | `/keys/{id}` | DELETE | `204` | Revokes a key. |
 | `/keys/{id}/budget` | PUT | `204` | Sets or clears a key budget. |
+| `/keys/{id}/policy` | PUT | `204` | Sets the model allow-list of one key. The key can only narrow its tenant grant. See "Key model policy". |
 | `/keys/{id}/spend` | GET | `200` | Reads the spend of a key. |
 | `/tenants` | POST | `201` | Creates a tenant. Body: `tenant`. |
 | `/tenants/{id}` | DELETE | `204` | Deletes a tenant and revokes every key that authenticates as it. Minted keys are revoked and their rows stay. Config-file `auth.keys` entries for the tenant are revoked by a revoked store row with the same key id. That row wins on every replica that shares the store, and across restarts. Revoked key ids are permanent. The next request with any of those keys gets `401`. |
-| `/tenants/{id}/policy` | PUT | `204` | Sets the model-access policy. Body: `access` (`all` or `{"only": [...]}`) and optional `deny`. |
+| `/tenants/{id}/policy` | PUT | `204` | Sets the model-access policy. Body: `access` (`all` or `{"only": [...]}`) and optional `deny`. An invalid pattern gives `400`. |
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
 
@@ -175,6 +176,69 @@ tenant budget use the same body shape (`handle_set_key_budget`,
 `handle_set_budget`). See
 [Spend policies](../../limits-and-budgets/spend-policies/) for periods, the
 spend response, and how the proxy counts spend.
+
+## Key model policy
+
+`PUT /keys/{id}/policy` sets a model allow-list on one key. The scoped form
+is `PUT /chains/{stat_prefix}/keys/{id}/policy`. The call needs the admin
+token, like the other writes. The body is the same as the body of
+`PUT /tenants/{id}/policy` (`parse_model_policy`, `server.rs:2489`).
+
+```bash
+curl -X PUT http://$ADMIN_ADDR/keys/k1/policy \
+  -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
+  -d '{"access":{"only":["gpt-4o"]},"deny":["gpt-4-old"]}'
+```
+
+| Status | Cause |
+|---|---|
+| `204` | The proxy stored the policy. |
+| `400` | A pattern in `access.only` or `deny` is not an exact model name or one trailing `*`. The proxy stores nothing. |
+| `404` | The key does not exist. The proxy stores nothing. |
+| `409` | No chain runs `llmproxy.model_authz`. The body is `{"error":"not_enforced", ...}`. The proxy stores nothing. |
+
+Proof: `handle_set_key_policy` (`server.rs:2521`), `store_error_response`
+(`server.rs:1759`), `ControlPlane::set_key_policy` (`control.rs:3377`), and the
+tests `put_key_policy_invalid_pattern_is_400_and_stores_nothing`,
+`put_key_policy_unknown_key_is_404_and_stores_nothing`, and
+`put_key_policy_without_model_authz_is_409_and_stores_nothing`.
+
+The effective models of a request are the tenant grant intersected with the
+key list. These rules apply:
+
+- A key only narrows. It never widens the grant of its tenant.
+- A key with no policy keeps the grant of its tenant.
+- `{"access":"all"}` returns the key to the grant of its tenant.
+- A key policy also narrows when `tenants_without_policy` is `ALLOW`.
+- A refusal by a key policy is the same `403` as a refusal by a tenant
+  policy. The `response_code_details` value is `model_not_permitted`.
+- The change applies to the next request. No reload is needed.
+- The policy persists with the configured store. It survives a restart on
+  the persistent store.
+
+Proof: `authorize_model` (`model_authz_filter.rs:535`), the unit tests
+`key_only_narrows_tenant_all`, `key_policy_never_widens_tenant_grant`,
+`sibling_key_without_policy_inherits_tenant_all`,
+`key_all_inherits_restricted_tenant_grant`,
+`key_policy_narrows_tenants_without_policy_allow`, and
+`key_policy_write_changes_next_request_without_reload`. The end-to-end tests
+are `a_key_policy_narrows_its_tenant_grant_and_never_widens_it`
+(`admin_e2e.rs:987`) and `a_key_policy_survives_a_restart_with_a_persistent_store`
+(`auth_store_e2e.rs:52`).
+
+`GET /keys` reports the policy of each key in the `policy` field. The value
+is `null` when the key has no policy. Otherwise it has the shape of the
+request body:
+
+```json
+{"key_id": "k1", "tenant": "tenant-a", "revoked": false,
+ "policy": {"access": {"only": ["gpt-4o"]}, "deny": ["gpt-4-old"]},
+ "budget": null}
+```
+
+A key set to `{"access":"all"}` lists as `{"access":"all"}`, not `null`
+(`render_model_access`, `server.rs:1941`, and the test
+`put_key_policy_all_lists_as_inherit_equivalent_all`).
 
 ## Tenant provider credentials
 
