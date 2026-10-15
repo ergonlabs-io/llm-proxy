@@ -217,6 +217,7 @@ fn opting_out_of_enforcement_makes_the_admin_writes_409() {
 /// limits row is bounded by the tenant alone.
 #[test]
 fn a_key_limit_narrows_its_tenant_and_a_sibling_keeps_the_tenant_limit() {
+    start_away_from_a_window_edge();
     let dir = scratch_dir("limits-narrow");
     let proxy = Proxy::start(&dir, &config_text(""));
     let key1 = mint_key(&proxy);
@@ -252,6 +253,7 @@ fn a_key_limit_narrows_its_tenant_and_a_sibling_keeps_the_tenant_limit() {
 /// A key limit above its tenant's never widens it.
 #[test]
 fn a_key_limit_never_widens_its_tenant() {
+    start_away_from_a_window_edge();
     let dir = scratch_dir("limits-widen");
     let proxy = Proxy::start(&dir, &config_text(""));
     let key = mint_key(&proxy);
@@ -623,4 +625,18 @@ fn assert_rate_limited(response: &str, what: &str) {
         response.starts_with("HTTP/1.1 429") && response.contains("request rate exceeded"),
         "{what}:\n{response}"
     );
+}
+
+/// Windows are aligned to the minute (ADR-0006 amendment B). A test that
+/// counts requests in one window waits out the last few seconds of a minute
+/// first, so its requests cannot straddle a boundary.
+fn start_away_from_a_window_edge() {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs();
+    let into_minute = secs % 60;
+    if into_minute >= 50 {
+        std::thread::sleep(Duration::from_secs(61 - into_minute));
+    }
 }

@@ -48,20 +48,19 @@
 //! task. The warner tracks at most `UsageMissingWarner::MAX_TRACKED_KEYS`
 //! keys; past that, warnings fold into one line that names no key.
 //!
-//! # Fail open on a store error
+//! # Local admission, reconciled counters
 //!
-//! [`crate::token_limit::BudgetStore::check`] can return
-//! `Err(BudgetUnavailable)` (never from [`crate::token_limit::InProcessBudgetStore`]
-//! today, but the trait is shaped for a future remote store — see its module
-//! doc). This filter treats `Err` the same as `Allow`: the request proceeds.
-//! A limiter that hard-denies (or 500s) every request the instant its budget
-//! backend blips is a worse failure mode than briefly over-admitting a few
-//! requests — this is Envoy's own `failure_mode_deny: false` default for its
-//! rate-limit filter. The store call is isolated to exactly one function,
-//! [`TokenLimitFilterInstance::check_budget`], so a future async/remote store
-//! (which will need to hold the stream with `StopIteration` and resume via
-//! `continue_decoding()`, per `token_limit`'s "Making this distributed"
-//! section) only has one call site to change.
+//! Every limit is checked against local counters
+//! ([`crate::window_counter`]): admission never calls the store (ADR-0006
+//! addendum §1). The counters reconcile with the configured `auth.store`
+//! backend on a control-side thread about once a second, and early when a
+//! subject nears its limit. If reconciling fails, the filter keeps enforcing
+//! against the last known fleet totals plus local counts and, once past the
+//! reconciliation bound, counts and warns about each admission it makes
+//! (fail open, loudly; AGENTS.md "Fail-open controls").
+//!
+//! Windows are aligned to the Unix epoch, so a caller's first window can be
+//! shorter than the configured length.
 //!
 //! # Config: `llmproxy.filters.v0.TokenLimit`
 //!
@@ -174,9 +173,9 @@
 //! This filter also intercepts `GET /v1/usage` in `decode_headers`, before
 //! any budget check, and answers it directly rather than proxying it
 //! upstream — see [`TokenLimitFilterInstance::handle_usage_request`] for the
-//! implementation and its status-code policy. No new storage: it queries
-//! [`BudgetStore::usage_for_tenant`], which every [`BudgetStore`]
-//! implementation must now provide alongside `check`/`record`.
+//! implementation and its status-code policy. It reports the static rule's
+//! per-route tenant buckets from this replica's counters, which is exact
+//! with one replica.
 //!
 //! **The security property is the design, not a detail: the key
 //! authenticates AND scopes.** The tenant comes ONLY from
@@ -197,7 +196,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::header::AUTHORIZATION;
 use http::StatusCode;
@@ -216,13 +215,16 @@ use arc_swap::ArcSwap;
 
 use crate::auth::{KeyId, TenantId};
 use crate::auth_filter;
-use crate::control::{ControlPlane, ControlPlaneSnapshot, LimitPolicy};
-use crate::token_limit::{
-    BudgetStore, BudgetUnavailable, ConcurrencyLimiter, InProcessBudgetStore,
-    InProcessConcurrencyLimiter, LimitDecision, LimitKey, LimitOn, LimitRule, RequestLimit,
-    StreamLease, TenantUsage,
+use crate::control::{
+    ControlPlane, ControlPlaneSnapshot, ControlPlaneStore, InMemoryControlPlaneStore, LimitPolicy,
+    WindowDimension, WindowKey,
 };
+use crate::token_limit::{LimitDecision, LimitKey, LimitOn, LimitRule, StreamLease, TenantUsage};
 use crate::usage::TokenUsage;
+use crate::window_counter::{
+    unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, WindowAccumulator,
+    DEFAULT_LEASE_PUBLISH_INTERVAL, DEFAULT_WINDOW_FLUSH_INTERVAL,
+};
 
 /// Canonical owned type URL for this filter.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
@@ -433,19 +435,29 @@ fn create_filter_factory(
     config_type_url: &'static str,
     ctx: &FactoryContext,
 ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+    create_filter_factory_with_clock(rule, config_type_url, ctx, SystemTime::now)
+}
+
+/// [`create_filter_factory`] with the wall-clock source the filter reads,
+/// so tests can pin windows.
+fn create_filter_factory_with_clock(
+    rule: Option<LimitRule>,
+    config_type_url: &'static str,
+    ctx: &FactoryContext,
+    clock: fn() -> SystemTime,
+) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
     // Tenant and key limits live in the `ControlPlane` that `llmproxy.auth`
     // registers in this chain (the same `ctx.get` resolution
     // `model_authz_filter` uses). Without it only a static rule can apply,
     // and a filter with neither would enforce nothing, which must be a load
     // error rather than a silent no-op (AGENTS.md invariant 1).
-    let policy = ctx.get(auth_filter::TYPE_URL).map(|cp| {
-        cp.downcast::<ControlPlane>()
-            .expect(
-                "the control-plane singleton registered under auth_filter::TYPE_URL \
-                 is always a ControlPlane",
-            )
-            .handle()
+    let control_plane = ctx.get(auth_filter::TYPE_URL).map(|cp| {
+        cp.downcast::<ControlPlane>().expect(
+            "the control-plane singleton registered under auth_filter::TYPE_URL \
+             is always a ControlPlane",
+        )
     });
+    let policy = control_plane.as_ref().map(|cp| cp.handle());
     if rule.is_none() && policy.is_none() {
         return Err(ConfigError::InvalidValue {
             field_path: "typed_config".to_string(),
@@ -456,75 +468,56 @@ fn create_filter_factory(
         });
     }
 
-    // One store (and one `UsageMissingWarner`) per (filter config,
-    // listener) -- exactly the lifetime the budget needs: it must
-    // outlive any single stream (that's the whole point of a *budget*),
-    // but a fresh listener config gets a fresh one. The HTTP filter
-    // chain is rebuilt once PER WORKER (ADR-0003; `build_hcm_handler` in
-    // `proxy-core`), and `create` runs once per worker for the same
-    // chain -- so a bare `Arc::new` here (the pre-follow-up shape) built
-    // a FRESH, unshared store on every worker, and a configured
-    // 1000-tokens/minute budget admitted roughly `1000 * worker_count`
-    // per minute: a real quota bypass, not a theoretical one.
+    // One set of counters (and one `UsageMissingWarner`) per chain. The
+    // HTTP filter chain is rebuilt once PER WORKER (ADR-0003;
+    // `build_hcm_handler` in `proxy-core`), and `create` runs once per worker
+    // for the same chain, so the counters live in a `SharedFactoryState`
+    // slot: every worker building this chain resolves the same `Arc`, and a
+    // limit is not multiplied by the worker count.
     //
-    // The fix is `SharedFactoryState` (`ctx.shared`, from `proxy-http`):
-    // every worker building THIS SAME CHAIN resolves the SAME slot and
-    // gets back the SAME `Arc<SharedTokenLimitState>`, so the budget is
-    // actually shared process-wide -- see `auth_filter::create`'s
-    // `ControlPlane` resolution for the identical pattern.
-    //
-    // This filter uses the UNDERLYING form (`ctx.shared.get_or_try_init`
-    // with a scope built here) rather than `ctx.get_or_try_init` (which
-    // would use `ctx.scope` alone), because `ctx.scope` names a whole
-    // CHAIN, not a filter instance within it: two `llmproxy.token_limit`
-    // filters with DIFFERENT rules in the SAME chain are expressible
-    // config, and keying on `ctx.scope` alone would let the second one's
-    // `create` silently find the first one's slot already filled and
-    // inherit ITS rule and ITS budget -- the same bug class this whole
-    // change fixes, one level down. So the scope is `ctx.scope` plus a
-    // deterministic rendering of every `LimitRule` field that changes
-    // the budget's MEANING (`on`, `max_tokens`, `window` -- all three; a
-    // rendering that dropped one would let two differently-configured
-    // limiters collide on that field), plus the decoded config type URL.
-    // The latter keeps a deliberate chain that contains both the legacy
-    // and canonical one-release entries from silently sharing one store.
-    // This gives exactly the property needed: identical across workers
-    // (same chain, same parsed config -> same string -> one shared store)
-    // and distinct for a different configured filter. `{:?}` on
-    // `Duration`/`LimitOn` is stable enough for a same-process string
-    // key (this is not a wire format, unlike `hash_credential`, which
-    // has to survive a different toolchain on the other end).
-    let scope = match rule {
-        Some(rule) => format!(
-            "{}::token_limit(type_url={config_type_url},on={:?},max_tokens={},window={:?})",
-            ctx.scope, rule.on, rule.max_tokens, rule.window
-        ),
-        None => format!(
-            "{}::token_limit(type_url={config_type_url},policy_only)",
-            ctx.scope
-        ),
-    };
+    // The slot is keyed by the chain and the decoded type URL, not by the
+    // rule: counters are keyed by subject, dimension and window, never by
+    // the limit (ADR-0006 amendment C), so changing a rule keeps the counts.
+    // Two `llmproxy.token_limit` filters in one chain therefore share
+    // counters wherever their route, subject, dimension and window length
+    // coincide.
+    let scope = format!("{}::token_limit(type_url={config_type_url})", ctx.scope);
 
-    // `ctx.stat_prefix` is passed through unchanged here so
-    // the call compiles against the new two-identity signature; nothing
-    // in `proxy-admin` addresses a `token_limit` singleton by name today,
-    // so the by-name index this populates is inert for this filter. If
-    // that changes, note that two `llmproxy.token_limit` filters in one
-    // chain (distinguished above by `scope`, not `ctx.stat_prefix`) would
-    // collide on the SAME `(stat_prefix, TYPE_URL)` name-index slot --
-    // the narrow uniqueness check in `proxy-config`'s lowering only
-    // covers `llmproxy.auth`, deliberately (see that check's doc).
+    // Window rows go to the store `auth.store` selects when `llmproxy.auth`
+    // precedes this filter, so the counters are shared exactly when spend
+    // is. Without it there is nothing to share with, and the rows live in a
+    // private in-memory store: one code path either way (ADR-0006 §6).
+    let store: Arc<dyn ControlPlaneStore> = match &control_plane {
+        Some(cp) => cp.store(),
+        None => Arc::new(InMemoryControlPlaneStore::default()),
+    };
+    let node_id = if ctx.node_id().is_empty() {
+        unconfigured_node_id()
+    } else {
+        ctx.node_id().to_string()
+    };
+    let stat_prefix = ctx.stat_prefix.clone();
+
     let shared = ctx
         .shared
         .get_or_try_init(&scope, &ctx.stat_prefix, config_type_url, || {
-            let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new());
-            let concurrency: Arc<dyn ConcurrencyLimiter> =
-                Arc::new(InProcessConcurrencyLimiter::new());
+            let counters = Arc::new(WindowAccumulator::new(
+                stat_prefix.clone(),
+                Arc::clone(&store),
+                node_id.clone(),
+            ));
+            counters.start_flusher(DEFAULT_WINDOW_FLUSH_INTERVAL);
+            let streams = Arc::new(LeaseGauge::new(
+                stat_prefix.clone(),
+                Arc::new(InMemoryLeaseStore::default()),
+                node_id.clone(),
+                DEFAULT_LEASE_PUBLISH_INTERVAL * 3,
+            ));
+            streams.start_publisher(DEFAULT_LEASE_PUBLISH_INTERVAL);
             let usage_missing_warner = Arc::new(UsageMissingWarner::new());
             Ok(Arc::new(SharedTokenLimitState {
-                store,
-                concurrency,
-                rule,
+                counters,
+                streams,
                 usage_missing_warner,
             }) as Arc<dyn std::any::Any + Send + Sync>)
         })?
@@ -532,9 +525,10 @@ fn create_filter_factory(
         .expect("token_limit singleton is always a SharedTokenLimitState");
 
     Ok(Box::new(TokenLimitInstanceFactory {
-        store: Arc::clone(&shared.store),
-        concurrency: Arc::clone(&shared.concurrency),
-        rule: shared.rule,
+        clock,
+        counters: Arc::clone(&shared.counters),
+        streams: Arc::clone(&shared.streams),
+        rule,
         policy,
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
     }))
@@ -547,15 +541,15 @@ fn create_filter_factory(
 /// matching warner, never a stale or mismatched pairing left over from a
 /// different rule).
 struct SharedTokenLimitState {
-    store: Arc<dyn BudgetStore>,
-    concurrency: Arc<dyn ConcurrencyLimiter>,
-    rule: Option<LimitRule>,
+    counters: Arc<WindowAccumulator>,
+    streams: Arc<LeaseGauge>,
     usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
 struct TokenLimitInstanceFactory {
-    store: Arc<dyn BudgetStore>,
-    concurrency: Arc<dyn ConcurrencyLimiter>,
+    clock: fn() -> SystemTime,
+    counters: Arc<WindowAccumulator>,
+    streams: Arc<LeaseGauge>,
     rule: Option<LimitRule>,
     policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
@@ -564,8 +558,9 @@ struct TokenLimitInstanceFactory {
 impl FilterInstanceFactory for TokenLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(TokenLimitFilterInstance {
-            store: Arc::clone(&self.store),
-            concurrency: Arc::clone(&self.concurrency),
+            counters: Arc::clone(&self.counters),
+            streams: Arc::clone(&self.streams),
+            clock: self.clock,
             rule: self.rule,
             policy: self.policy.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
@@ -581,12 +576,17 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
 /// `tokens_per_minute` and `requests_per_minute`.
 const POLICY_WINDOW: Duration = Duration::from_secs(60);
 
-fn policy_token_rule(tokens_per_minute: u64) -> LimitRule {
-    LimitRule {
-        on: LimitOn::Total,
-        max_tokens: tokens_per_minute,
-        window: POLICY_WINDOW,
-    }
+/// A control-plane limits row and the counter key it is enforced under.
+type PolicyBucket = (LimitKey, LimitPolicy);
+
+fn policy_window(now_secs: u64) -> WindowKey {
+    WindowKey::containing(now_secs, POLICY_WINDOW.as_secs())
+}
+
+fn unix_secs(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Which control-plane limit refused a request; selects the 429's body and
@@ -777,8 +777,11 @@ impl UsageMissingWarner {
 /// cross-thread-shared piece, and it's an `Arc` clone, not shared interior
 /// state of this struct itself.
 struct TokenLimitFilterInstance {
-    store: Arc<dyn BudgetStore>,
-    concurrency: Arc<dyn ConcurrencyLimiter>,
+    counters: Arc<WindowAccumulator>,
+    streams: Arc<LeaseGauge>,
+    /// Wall-clock source for epoch-aligned windows; a field so tests can pin
+    /// time.
+    clock: fn() -> SystemTime,
     /// The configured static rule, keyed per route; `None` in policy-only
     /// mode.
     rule: Option<LimitRule>,
@@ -794,8 +797,8 @@ struct TokenLimitFilterInstance {
     /// assuming).
     key: Option<LimitKey>,
     /// Tenant and key token buckets this admitted request is charged to at
-    /// stream end, with the rule each was checked against.
-    policy_charges: Vec<(LimitKey, LimitRule)>,
+    /// stream end, with the tokens-per-minute limit each was checked against.
+    policy_charges: Vec<(LimitKey, u64)>,
     /// Concurrent-stream slots held for the life of this stream. Dropping a
     /// lease frees its slot, so they are cleared when the stream completes.
     leases: Vec<StreamLease>,
@@ -812,22 +815,24 @@ impl TokenLimitFilterInstance {
     ///
     /// Both levels are enforced, so a key only narrows its tenant (a key
     /// with no row adds no bucket and is bounded by the tenant alone). Token
-    /// budgets are checked first because the check does not mutate; stream
-    /// slots and request counts are taken only after. The key is admitted
-    /// before the tenant, so a refusal at the key level leaves the counters
-    /// its sibling keys share untouched. A tenant refusal after the key was
-    /// admitted can still count one request against that key; that errs
-    /// toward the narrower bucket.
+    /// budgets are checked first because the check counts nothing; stream
+    /// permits and request counts are taken only after. Stream permits are
+    /// taken tenant first, then key, and a refused key drops the tenant
+    /// permit with it (ADR-0006 amendment E). Request counts are taken key
+    /// first, so a key refusal leaves the count its sibling keys share
+    /// untouched; a tenant refusal after the key was admitted still counts
+    /// that one request against the key, which errs toward the narrower
+    /// bucket.
     ///
-    /// A backend error admits the request, as the static rule does (module
-    /// doc, "Fail open"); the in-process counters never return one.
+    /// Admission reads only local counters (ADR-0006 addendum §1).
     fn admit_policy(
         &mut self,
         tenant: Option<&str>,
         key_id: Option<&str>,
+        now_secs: u64,
     ) -> Option<(LimitDecision, Refusal)> {
         let tenant = tenant?;
-        let buckets: Vec<(LimitKey, LimitPolicy)> = {
+        let (tenant_bucket, key_bucket): (Option<PolicyBucket>, Option<PolicyBucket>) = {
             let snapshot = self.policy.as_ref()?.load();
             let key_bucket = key_id.and_then(|id| {
                 snapshot
@@ -839,70 +844,70 @@ impl TokenLimitFilterInstance {
                 .tenant_limits
                 .get(&TenantId::new(tenant))
                 .map(|limits| (LimitKey::for_tenant_policy(tenant), *limits));
-            key_bucket.into_iter().chain(tenant_bucket).collect()
+            (tenant_bucket, key_bucket)
         };
-        if buckets.is_empty() {
+        if tenant_bucket.is_none() && key_bucket.is_none() {
             return None;
         }
-        let now = Instant::now();
+        let window = policy_window(now_secs);
+        let tenant_first: Vec<&PolicyBucket> =
+            tenant_bucket.iter().chain(key_bucket.iter()).collect();
+        let key_first: Vec<&PolicyBucket> = key_bucket.iter().chain(tenant_bucket.iter()).collect();
 
-        for (key, limits) in &buckets {
+        for (key, limits) in &tenant_first {
             if let Some(tokens) = limits.tokens_per_minute {
-                if let Ok(deny @ LimitDecision::Deny { .. }) =
-                    self.store.check(key, &policy_token_rule(tokens), now)
-                {
-                    return Some((deny, Refusal::Tokens));
+                let used = self
+                    .counters
+                    .used(key, WindowDimension::TotalTokens, window);
+                let decision = LimitDecision::for_window(used, tokens, window, now_secs);
+                if matches!(decision, LimitDecision::Deny { .. }) {
+                    return Some((decision, Refusal::Tokens));
                 }
             }
         }
 
         let mut leases = Vec::new();
-        for (key, limits) in &buckets {
+        for (key, limits) in &tenant_first {
             if let Some(max_streams) = limits.concurrent_streams {
-                match self.concurrency.try_acquire(key, max_streams) {
-                    Ok(Ok(lease)) => leases.push(lease),
-                    // Leases taken so far drop with `leases` here.
-                    Ok(Err(deny)) => return Some((deny, Refusal::Streams)),
-                    Err(BudgetUnavailable) => {}
+                match self.streams.try_acquire(key, max_streams) {
+                    Ok(lease) => leases.push(lease),
+                    // Permits taken so far drop with `leases` here.
+                    Err(deny) => return Some((deny, Refusal::Streams)),
                 }
             }
         }
 
-        for (key, limits) in &buckets {
+        for (key, limits) in &key_first {
             if let Some(max_requests) = limits.requests_per_minute {
-                let limit = RequestLimit {
-                    max_requests,
-                    window: POLICY_WINDOW,
-                };
-                if let Ok(deny @ LimitDecision::Deny { .. }) =
-                    self.store.admit_request(key, &limit, now)
+                if let Admission::Refused { used } =
+                    self.counters
+                        .admit(key, WindowDimension::Requests, window, max_requests)
                 {
-                    return Some((deny, Refusal::Requests));
+                    let decision = LimitDecision::for_window(used, max_requests, window, now_secs);
+                    return Some((decision, Refusal::Requests));
                 }
             }
         }
 
         self.leases = leases;
-        self.policy_charges = buckets
+        self.policy_charges = tenant_first
             .into_iter()
             .filter_map(|(key, limits)| {
-                limits
-                    .tokens_per_minute
-                    .map(|tokens| (key, policy_token_rule(tokens)))
+                limits.tokens_per_minute.map(|tokens| (key.clone(), tokens))
             })
             .collect();
         None
     }
 
-    /// Read `StreamInfo::llm.usage` and, if present, record it against
-    /// `self.key`. Never fails the request: a missing key (shouldn't
-    /// happen), a missing usage (no usage was ever reported for this
-    /// stream), and a successful record are all handled without
+    /// Read `StreamInfo::llm.usage` and, if present, record it against the
+    /// static rule's bucket and every control-plane token bucket this
+    /// request was admitted against. Never fails the request: a missing key,
+    /// a missing usage and a successful record are all handled without
     /// propagating anything back to the caller.
     ///
-    /// A missing usage on a request a budget actually applies to (`self.key`
-    /// is `Some`) is no longer silent: see the module doc's "Loud on
-    /// unreadable usage" section and [`UsageMissingWarner`].
+    /// A missing usage on a request a budget actually applies to is not
+    /// silent: see the module doc's "Loud on unreadable usage" section and
+    /// [`UsageMissingWarner`].
     fn record_if_present(&mut self, cb: &mut dyn EncoderCallbacks) {
         if self.recorded {
             return;
@@ -920,18 +925,13 @@ impl TokenLimitFilterInstance {
         };
 
         // Rust note: read the field out of the `RefMut` guard and drop it
-        // before calling `self.store.record` below -- `stream_info()` must
-        // not be held across another call (see its doc), and `record` isn't
-        // a call on `cb` but the borrow checker doesn't know that; scoping it
-        // like this keeps the rule visibly satisfied either way.
+        // before recording -- `stream_info()` must not be held across another
+        // call (see its doc).
         let usage: Option<LlmTokenUsage> = cb.stream_info().llm.usage;
 
         // `None` must stay unrecorded -- inventing a zero-cost record would
         // be wrong (nothing happened) and a nonzero guess would be worse
         // (this feeds a real budget). See `token_limit`'s central semantic.
-        // A budget applies here (`key` is `Some`, checked above), so this is
-        // exactly the case that must not stay invisible -- see the module
-        // doc's "Loud on unreadable usage" section.
         let Some(usage) = usage else {
             self.usage_missing_warner
                 .warn_if_due(warn_key, Instant::now());
@@ -944,16 +944,27 @@ impl TokenLimitFilterInstance {
             cache_creation_tokens: usage.cache_creation_tokens,
             output_tokens: usage.output_tokens,
         };
-        // Thin slice: weight is always 1.0 -- see the module doc. `record`
-        // is infallible from here regardless of backend (best-effort for a
-        // remote store; see `token_limit`'s module doc), so there is nothing
-        // to check on the return value.
-        let now = Instant::now();
+        // Usage lands in the window containing the moment it is recorded
+        // (ADR-0006 amendment B), which can be later than the admission's.
+        let now_secs = unix_secs((self.clock)());
         if let (Some(key), Some(rule)) = (&self.key, &self.rule) {
-            self.store.record(key, rule, &usage, 1.0, now);
+            self.counters.add(
+                key,
+                rule.on.dimension(),
+                rule.window_at(now_secs),
+                rule.on.amount(&usage),
+                rule.max_tokens,
+            );
         }
-        for (key, rule) in &self.policy_charges {
-            self.store.record(key, rule, &usage, 1.0, now);
+        let window = policy_window(now_secs);
+        for (key, tokens_per_minute) in &self.policy_charges {
+            self.counters.add(
+                key,
+                WindowDimension::TotalTokens,
+                window,
+                usage.total(),
+                *tokens_per_minute,
+            );
         }
     }
 
@@ -1023,9 +1034,6 @@ impl TokenLimitFilterInstance {
     ///   ONLY branch reachable. It must never fall back to a credential-keyed
     ///   lookup -- that would let an unauthenticated caller probe by
     ///   presenting an arbitrary `authorization` header.
-    /// - `503` on [`BudgetUnavailable`] -- see
-    ///   [`BudgetStore::usage_for_tenant`]'s doc for why this endpoint does
-    ///   NOT fail open like the rest of this filter.
     /// - `200` otherwise, with a JSON body -- including a tenant with no
     ///   configured budgets at all, which gets `200` and an empty `routes`
     ///   array (a true answer), never an error.
@@ -1045,33 +1053,42 @@ impl TokenLimitFilterInstance {
             return;
         };
 
-        match self.store.usage_for_tenant(&tenant, Instant::now()) {
-            Ok(routes) => {
-                let body = render_usage_response(&tenant, &routes);
-                cb.send_local_reply(
-                    StatusCode::OK,
-                    &body,
-                    Some(Box::new(|response_headers: &mut http::HeaderMap| {
-                        response_headers.insert(
-                            http::header::CONTENT_TYPE,
-                            http::HeaderValue::from_static("application/json"),
-                        );
-                    })),
-                    "usage_endpoint",
-                );
+        // Answered from this replica's counters. With one replica that is
+        // exact. With a shared store it is this replica's reconciled view,
+        // which reads zero for a route it has never served; ADR-0006's
+        // addendum §4 moves that case to a control-side store read, which
+        // this filter does not do yet.
+        let now_secs = unix_secs((self.clock)());
+        let routes: Vec<TenantUsage> = match &self.rule {
+            Some(rule) => {
+                let window = rule.window_at(now_secs);
+                let reset_after = Duration::from_secs(window.end_secs().saturating_sub(now_secs));
+                self.counters
+                    .tenant_totals(&tenant, rule.on.dimension(), window)
+                    .into_iter()
+                    .map(|(route, used)| TenantUsage {
+                        route,
+                        used: used as f64,
+                        limit: rule.max_tokens as f64,
+                        remaining: rule.max_tokens.saturating_sub(used) as f64,
+                        reset_after,
+                    })
+                    .collect()
             }
-            Err(BudgetUnavailable) => {
-                // Deliberately NOT the fail-open behavior the rest of this
-                // filter uses -- see `usage_for_tenant`'s doc for why a
-                // read-only reporting endpoint inverts that policy.
-                cb.send_local_reply(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "usage temporarily unavailable",
-                    None,
-                    "usage_endpoint_store_unavailable",
+            None => Vec::new(),
+        };
+        let body = render_usage_response(&tenant, &routes);
+        cb.send_local_reply(
+            StatusCode::OK,
+            &body,
+            Some(Box::new(|response_headers: &mut http::HeaderMap| {
+                response_headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
                 );
-            }
-        }
+            })),
+            "usage_endpoint",
+        );
     }
 }
 
@@ -1143,6 +1160,8 @@ impl HttpFilter for TokenLimitFilterInstance {
             return FilterHeadersStatus::Continue;
         }
 
+        let now = (self.clock)();
+        let now_secs = unix_secs(now);
         let route_name = cb
             .route()
             .and_then(|route| route.name.clone())
@@ -1178,11 +1197,13 @@ impl HttpFilter for TokenLimitFilterInstance {
                     LimitKey::for_credential(route_name.as_str(), credential)
                 }
             };
-            // Fail open: a store error is treated exactly like `Allow` (see
-            // the module doc).
-            let decision = self.store.check(&key, &rule, Instant::now());
+            // A local read only: admission never waits on the store
+            // (ADR-0006 addendum §1).
+            let window = rule.window_at(now_secs);
+            let used = self.counters.used(&key, rule.on.dimension(), window);
+            let decision = LimitDecision::for_window(used, rule.max_tokens, window, now_secs);
             self.key = Some(key);
-            if let Ok(deny @ LimitDecision::Deny { .. }) = decision {
+            if let deny @ LimitDecision::Deny { .. } = decision {
                 self.refuse(cb, deny, Refusal::Tokens);
                 // Rust note: the returned status is irrelevant here --
                 // `drive_decode` checks `ctx.local_reply.is_some()` right
@@ -1194,8 +1215,16 @@ impl HttpFilter for TokenLimitFilterInstance {
             }
         }
 
-        if let Some((deny, refusal)) = self.admit_policy(tenant.as_deref(), key_id.as_deref()) {
+        if let Some((deny, refusal)) =
+            self.admit_policy(tenant.as_deref(), key_id.as_deref(), now_secs)
+        {
             self.refuse(cb, deny, refusal);
+            return FilterHeadersStatus::Continue;
+        }
+        // Counted (and warned about) only while the counters are past their
+        // reconciliation bound; see `window_counter`'s "Store outage".
+        if self.key.is_some() || !self.policy_charges.is_empty() || !self.leases.is_empty() {
+            self.counters.note_admission(now);
         }
         FilterHeadersStatus::Continue
     }
@@ -1573,21 +1602,69 @@ mod tests {
         }
     }
 
+    /// 20 seconds into a minute, so a test's requests never straddle a
+    /// window boundary.
+    fn fixed_clock() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + 20)
+    }
+
+    /// One minute after [`fixed_clock`]: the next window.
+    fn next_minute_clock() -> SystemTime {
+        fixed_clock() + Duration::from_secs(60)
+    }
+
+    /// A chain's counters over a private in-memory store, never flushed:
+    /// with one replica everything lives in `pending`, which is exact.
     struct TestStore {
-        store: Arc<dyn BudgetStore>,
+        counters: Arc<WindowAccumulator>,
+        streams: Arc<LeaseGauge>,
         rule: LimitRule,
     }
 
-    impl std::ops::Deref for TestStore {
-        type Target = dyn BudgetStore;
-        fn deref(&self) -> &Self::Target {
-            &*self.store
+    impl TestStore {
+        /// The current window's total for `key` under the test rule.
+        fn used(&self, key: &LimitKey) -> u64 {
+            let window = self.rule.window_at(unix_secs(fixed_clock()));
+            self.counters.used(key, self.rule.on.dimension(), window)
         }
+
+        /// Record `amount` against `key` as a completed request would.
+        fn seed(&self, key: &LimitKey, amount: u64) {
+            let window = self.rule.window_at(unix_secs(fixed_clock()));
+            self.counters.add(
+                key,
+                self.rule.on.dimension(),
+                window,
+                amount,
+                self.rule.max_tokens,
+            );
+        }
+    }
+
+    /// Never stale: these counters are never reconciled, and tests that
+    /// count warnings must not see the stale-counter one.
+    fn test_counters() -> Arc<WindowAccumulator> {
+        Arc::new(WindowAccumulator::with_reconciliation_bound(
+            "test".to_string(),
+            Arc::new(InMemoryControlPlaneStore::default()),
+            "test-node".to_string(),
+            Duration::MAX,
+        ))
+    }
+
+    fn test_streams() -> Arc<LeaseGauge> {
+        Arc::new(LeaseGauge::new(
+            "test".to_string(),
+            Arc::new(InMemoryLeaseStore::default()),
+            "test-node".to_string(),
+            Duration::from_secs(3),
+        ))
     }
 
     fn store_with(max_tokens: u64, window: Duration) -> Arc<TestStore> {
         Arc::new(TestStore {
-            store: Arc::new(InProcessBudgetStore::new()),
+            counters: test_counters(),
+            streams: test_streams(),
             rule: LimitRule {
                 on: LimitOn::Total,
                 max_tokens,
@@ -1597,10 +1674,15 @@ mod tests {
     }
 
     fn filter_with(store: Arc<TestStore>) -> TokenLimitFilterInstance {
+        filter_at(store, fixed_clock)
+    }
+
+    fn filter_at(store: Arc<TestStore>, clock: fn() -> SystemTime) -> TokenLimitFilterInstance {
         TokenLimitFilterInstance {
             rule: Some(store.rule),
-            store: Arc::clone(&store.store),
-            concurrency: Arc::new(InProcessConcurrencyLimiter::new()),
+            counters: Arc::clone(&store.counters),
+            streams: Arc::clone(&store.streams),
+            clock,
             policy: None,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             key: None,
@@ -1608,6 +1690,14 @@ mod tests {
             leases: Vec::new(),
             recorded: false,
         }
+    }
+
+    /// A factory over `ctx` with the clock pinned to [`fixed_clock`].
+    fn pinned_factory(
+        config: &DynamicMessage,
+        ctx: &FactoryContext,
+    ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+        create_filter_factory_with_clock(parse_config(config)?, TYPE_URL, ctx, fixed_clock)
     }
 
     /// Drive one full request/response cycle: a FRESH `TokenLimitFilterInstance`
@@ -1870,16 +1960,8 @@ mod tests {
 
         // Nothing was recorded: the budget must still show fully available.
         assert_eq!(
-            store.check(
-                &LimitKey::for_credential("r1", "Bearer sk-1"),
-                &store.rule,
-                Instant::now()
-            ),
-            Ok(LimitDecision::Allow {
-                limit: 10,
-                remaining: 10,
-                reset_after: Duration::from_secs(60),
-            }),
+            store.used(&LimitKey::for_credential("r1", "Bearer sk-1")),
+            0,
             "recording nothing must leave the budget untouched"
         );
     }
@@ -1969,17 +2051,8 @@ mod tests {
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
     ) -> Option<(StatusCode, HeaderMap, String)> {
-        let mut filter = TokenLimitFilterInstance {
-            store: Arc::clone(&store.store),
-            concurrency: Arc::new(InProcessConcurrencyLimiter::new()),
-            rule: Some(store.rule),
-            policy: None,
-            usage_missing_warner: Arc::clone(warner),
-            key: None,
-            policy_charges: Vec::new(),
-            leases: Vec::new(),
-            recorded: false,
-        };
+        let mut filter = filter_with(Arc::clone(store));
+        filter.usage_missing_warner = Arc::clone(warner);
         let mut cb = TestCallbacks::new(Some(route_named(route)));
         let mut head = request_headers(credential);
         filter.decode_headers(&mut cb, &mut head, true);
@@ -2272,12 +2345,10 @@ mod tests {
         };
         let config = token_limit(10, 1.0); // max_tokens=10, window=10s
 
-        let mut filter_worker_1 = TokenLimitFilterFactory
-            .create(&config, &ctx)
+        let mut filter_worker_1 = pinned_factory(&config, &ctx)
             .expect("worker 1's create must succeed")
             .create_filter();
-        let mut filter_worker_2 = TokenLimitFilterFactory
-            .create(&config, &ctx)
+        let mut filter_worker_2 = pinned_factory(&config, &ctx)
             .expect("worker 2's create must succeed")
             .create_filter();
 
@@ -2321,12 +2392,10 @@ mod tests {
         let config_a = token_limit(10, 1.0); // max_tokens=10, window=10s
         let config_b = token_limit(500, 1.0); // a different rule, same chain
 
-        let mut filter_a = TokenLimitFilterFactory
-            .create(&config_a, &ctx)
+        let mut filter_a = pinned_factory(&config_a, &ctx)
             .expect("filter A's create must succeed")
             .create_filter();
-        let mut filter_b = TokenLimitFilterFactory
-            .create(&config_b, &ctx)
+        let mut filter_b = pinned_factory(&config_b, &ctx)
             .expect("filter B's create must succeed")
             .create_filter();
 
@@ -2481,24 +2550,12 @@ mod tests {
         // is the half that a re-key which quietly changed the fallback's
         // descriptor name would fail -- the `denied.is_some()` above would
         // still pass, because SOME bucket got exhausted.
-        //
-        // `reset_after`/`retry_after` count down from the window start, so
-        // only the variant and its two stable fields are asserted.
-        match store.check(
-            &LimitKey::for_credential("r1", "Bearer sk-a"),
-            &store.rule,
-            Instant::now(),
-        ) {
-            Ok(LimitDecision::Deny {
-                limit, remaining, ..
-            }) => {
-                assert_eq!((limit, remaining), (10, 0));
-            }
-            other => panic!(
-                "an unauthenticated stream must still bucket on the hashed credential, \
-                 so THIS key must be the exhausted one; got {other:?}"
-            ),
-        }
+        assert_eq!(
+            store.used(&LimitKey::for_credential("r1", "Bearer sk-a")),
+            10,
+            "an unauthenticated stream must still bucket on the hashed credential, so THIS \
+             key must be the exhausted one"
+        );
     }
 
     // --- credential care ------------------------------------------------------
@@ -2549,7 +2606,7 @@ mod tests {
 
     #[test]
     fn window_rollover_restores_budget_through_the_filter() {
-        let store = store_with(10, Duration::from_millis(10));
+        let store = store_with(10, Duration::from_secs(60));
 
         run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(10)));
         let denied = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(0)));
@@ -2558,78 +2615,50 @@ mod tests {
             "budget must be exhausted immediately after"
         );
 
-        std::thread::sleep(Duration::from_millis(15));
-
-        let allowed = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(0)));
-        assert!(allowed.is_none(), "the window must have rolled over by now");
+        // The next epoch-aligned window starts with nothing counted.
+        let mut filter = filter_at(Arc::clone(&store), next_minute_clock);
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        filter.decode_headers(&mut cb, &mut request_headers(Some("Bearer sk-1")), true);
+        assert!(cb.local_reply.is_none(), "the window must have rolled over");
     }
 
     // --- fail open ----------------------------------------------------------
 
-    /// A `BudgetStore` double whose `check` always errors -- proves the
-    /// filter admits the request rather than denying or erroring it. See the
-    /// module doc's "Fail open on a store error" section.
-    struct AlwaysErrorsStore;
-
-    impl BudgetStore for AlwaysErrorsStore {
-        fn check(
-            &self,
-            _key: &LimitKey,
-            _rule: &LimitRule,
-            _now: Instant,
-        ) -> Result<LimitDecision, BudgetUnavailable> {
-            Err(BudgetUnavailable)
-        }
-        fn record(
-            &self,
-            _key: &LimitKey,
-            _rule: &LimitRule,
-            _usage: &TokenUsage,
-            _weight: f64,
-            _now: Instant,
-        ) {
-            panic!("record must not be called by this test -- it never gets past decode_headers if fail-open is broken in the deny direction, and this test only exercises decode_headers")
-        }
-        fn admit_request(
-            &self,
-            _key: &LimitKey,
-            _limit: &crate::token_limit::RequestLimit,
-            _now: Instant,
-        ) -> Result<LimitDecision, BudgetUnavailable> {
-            Err(BudgetUnavailable)
-        }
-        fn usage_for_tenant(
-            &self,
-            _tenant: &str,
-            _now: Instant,
-        ) -> Result<Vec<TenantUsage>, BudgetUnavailable> {
-            // Doubles as the usage endpoint's "store unavailable" stub --
-            // see `usage_endpoint_returns_503_when_the_budget_store_is_unavailable`.
-            Err(BudgetUnavailable)
-        }
-    }
-
+    /// Counters that have never reconciled with the store, past their
+    /// bound: the filter still admits against what it knows locally (fail
+    /// open), and the accumulator counts the admission so the bypass is
+    /// visible (AGENTS.md "Fail-open controls").
     #[test]
-    fn a_store_error_fails_open_and_admits_the_request() {
+    fn unreconciled_counters_admit_and_count_the_admission() {
+        let counters = Arc::new(WindowAccumulator::with_reconciliation_bound(
+            "test".to_string(),
+            Arc::new(InMemoryControlPlaneStore::default()),
+            "test-node".to_string(),
+            Duration::ZERO,
+        ));
         let store = Arc::new(TestStore {
-            store: Arc::new(AlwaysErrorsStore),
+            counters: Arc::clone(&counters),
+            streams: test_streams(),
             rule: LimitRule {
                 on: LimitOn::Total,
                 max_tokens: 10,
                 window: Duration::from_secs(60),
             },
         });
-        let mut filter = filter_with(store);
+        // A real clock: the bound is measured against construction time.
+        let mut filter = filter_at(store, SystemTime::now);
+        std::thread::sleep(Duration::from_millis(5));
 
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
-        let mut head = request_headers(Some("Bearer sk-1"));
-        let status = filter.decode_headers(&mut cb, &mut head, true);
+        let status =
+            filter.decode_headers(&mut cb, &mut request_headers(Some("Bearer sk-1")), true);
 
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert!(
             cb.local_reply.is_none(),
-            "a budget-store error must admit the request (fail open), not deny it"
+            "an unreconciled counter must admit (fail open)"
         );
+        assert_eq!(counters.unreconciled_admissions(), 1);
     }
 
     // --- GET /v1/usage ------------------------------------
@@ -2673,16 +2702,7 @@ mod tests {
     /// number to assert on, without driving a whole request/response cycle
     /// through the filter for each one.
     fn seed_tenant_usage(store: &Arc<TestStore>, route: &str, tenant: &str, used: u64) {
-        store.record(
-            &LimitKey::for_tenant(route, tenant),
-            &store.rule,
-            &TokenUsage {
-                input_tokens: used,
-                ..Default::default()
-            },
-            1.0,
-            Instant::now(),
-        );
+        store.seed(&LimitKey::for_tenant(route, tenant), used);
     }
 
     /// **Acceptance case 1**: an authenticated tenant with budgets on more
@@ -2851,31 +2871,6 @@ mod tests {
         );
     }
 
-    /// **Acceptance case 4**: the store side, not the request path, is what
-    /// must NOT fail open here -- see `BudgetStore::usage_for_tenant`'s doc
-    /// for why this endpoint inverts the rest of this filter's fail-open
-    /// policy.
-    #[test]
-    fn usage_endpoint_returns_503_when_the_budget_store_is_unavailable() {
-        let store = Arc::new(TestStore {
-            store: Arc::new(AlwaysErrorsStore),
-            rule: LimitRule {
-                on: LimitOn::Total,
-                max_tokens: 10,
-                window: Duration::from_secs(60),
-            },
-        });
-
-        let (status, _headers, body) = run_usage_request(&store, Some("acme"), "/v1/usage", None)
-            .expect("a store error must still produce a reply, not a silent proxy-through");
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            !body.contains("routes"),
-            "a 503 must not carry a (necessarily wrong) usage body, got: {body}"
-        );
-    }
-
     /// **Acceptance case 5**: a tenant that is authenticated but has no
     /// configured budget anywhere gets a true, empty answer -- `200`, not an
     /// error, and not a nonexistent-tenant error either (there is no such
@@ -2996,7 +2991,7 @@ mod tests {
             Ok(Arc::clone(cp) as Arc<dyn std::any::Any + Send + Sync>)
         })
         .unwrap();
-        match TokenLimitFilterFactory.create(&DynamicMessage::new(token_limit_desc()), &ctx) {
+        match pinned_factory(&DynamicMessage::new(token_limit_desc()), &ctx) {
             Ok(factory) => factory,
             Err(e) => panic!("a policy-only config with auth must build: {e:?}"),
         }
@@ -3236,11 +3231,10 @@ mod tests {
             Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
         })
         .unwrap();
-        let factory =
-            match TokenLimitFilterFactory.create(&token_limit(1_000, 1_000.0 / 60.0), &ctx) {
-                Ok(factory) => factory,
-                Err(e) => panic!("valid config must build: {e:?}"),
-            };
+        let factory = match pinned_factory(&token_limit(1_000, 1_000.0 / 60.0), &ctx) {
+            Ok(factory) => factory,
+            Err(e) => panic!("valid config must build: {e:?}"),
+        };
 
         assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
         assert_eq!(

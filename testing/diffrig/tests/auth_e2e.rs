@@ -639,7 +639,11 @@ async fn all_three_failure_modes_are_byte_identical_on_the_wire() {
 async fn two_virtual_keys_on_the_same_tenant_share_one_token_budget() {
     // A budget of 2 is exhausted by exactly one exchange -- see this file's
     // module doc for the "hi" (1 token) + "ok" (1 token) = 2 total accounting.
-    let (addr, upstream, scratch, proxy) = spawn_suite("auth-shared-tenant-budget", 2, 0.1).await;
+    // An hour-long window: windows are aligned to the epoch (ADR-0006
+    // amendment B), so a short one could roll over between the two requests
+    // and hand the second a fresh budget.
+    let (addr, upstream, scratch, proxy) =
+        spawn_suite("auth-shared-tenant-budget", 2, 2.0 / 3600.0).await;
 
     let first = send_chat_request(addr, &[("authorization", &format!("Bearer {KEY_LIVE}"))]).await;
     assert_eq!(
