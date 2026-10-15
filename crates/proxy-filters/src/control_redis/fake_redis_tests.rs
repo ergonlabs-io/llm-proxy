@@ -52,6 +52,8 @@ enum Gate {
     SpendFlush,
     /// The `EXEC` that carries `load()`'s five reads.
     PolicyLoad,
+    /// A `GET` of a window row: a usage read or a reconcile's read-back.
+    WindowRead,
 }
 
 #[derive(Default)]
@@ -373,6 +375,12 @@ fn answer(
         }
         "EVALSHA" => b":1\r\n".to_vec(),
         "GET" if mentions(":generation") => bulk_number(GENERATION),
+        "GET" if mentions(":win:") => {
+            if !pass(shared, Gate::WindowRead) {
+                return None;
+            }
+            bulk_number(STORED_SPEND)
+        }
         "GET" => bulk_number(STORED_SPEND),
         "HGET" => bulk_number(LAST_SEQ),
         "SET" | "CLIENT" => b"+OK\r\n".to_vec(),
@@ -1339,4 +1347,66 @@ fn add_window_script_dedups_on_the_node_id_hash_and_always_expires() {
     assert!(ADD_WINDOW_LUA.contains("if seq <= last then"));
     assert!(ADD_WINDOW_LUA.contains("redis.call('EXPIREAT', KEYS[1], expires_at)"));
     assert!(ADD_WINDOW_LUA.contains("redis.call('EXPIREAT', KEYS[2], expires_at)"));
+}
+
+/// `GET /v1/usage` with a shared store reads through the real Redis store:
+/// one pipelined `GET` per route on one connection, each naming the tenant's
+/// window row, and every route the store counts is reported. A connection
+/// that drops mid-read reaches the caller as an error, which the filter
+/// answers with 503, never as zero usage.
+#[test]
+fn a_usage_read_pipelines_one_get_per_route_and_a_dropped_connection_is_an_error() {
+    use crate::control::{WindowDimension, WindowKey};
+    use crate::window_usage::{UsageReader, USAGE_READ_REUSE};
+
+    let fake = FakeRedis::start();
+    let store: Arc<dyn ControlPlaneStore> = Arc::new(fake.store());
+    store.policy_generation().expect("policy_generation");
+    let reader = UsageReader::new("chain".into(), Arc::clone(&store));
+    let window = WindowKey::containing(1_000_000, 60);
+    let read = |now: std::time::Instant| {
+        reader
+            .read(
+                "acme",
+                WindowDimension::TotalTokens,
+                window,
+                vec!["images".to_string(), "chat".to_string()],
+                now,
+            )
+            .blocking_recv()
+            .expect("the reader always answers")
+    };
+    let mark = fake.wire_len();
+
+    let totals = read(std::time::Instant::now()).expect("the fake answers every GET");
+
+    assert_eq!(
+        totals.as_ref(),
+        &[
+            ("chat".to_string(), STORED_SPEND),
+            ("images".to_string(), STORED_SPEND)
+        ]
+    );
+    let gets: Vec<(usize, Vec<String>)> = fake
+        .wire_since(mark)
+        .into_iter()
+        .filter(|(_, args)| args[0] == "GET")
+        .collect();
+    assert_eq!(gets.len(), 2, "one GET per route: {gets:?}");
+    let conns: HashSet<usize> = gets.iter().map(|(conn, _)| *conn).collect();
+    assert_eq!(conns.len(), 1, "one pipeline on one connection");
+    for ((_, args), route) in gets.iter().zip(["chat", "images"]) {
+        assert!(args[1].contains(":win:{"), "{args:?}");
+        assert!(
+            args[1].contains(&format!("route={route}%7Ctenant=acme|total_tokens|")),
+            "{args:?}"
+        );
+    }
+
+    fake.kill_next(Gate::WindowRead);
+    let failed = read(std::time::Instant::now() + USAGE_READ_REUSE);
+    assert!(
+        matches!(failed, Err(StoreError::Unavailable(_))),
+        "{failed:?}"
+    );
 }

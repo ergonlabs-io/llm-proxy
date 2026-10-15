@@ -225,6 +225,9 @@ use crate::window_counter::{
     unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, WindowAccumulator,
     DEFAULT_LEASE_PUBLISH_INTERVAL, DEFAULT_WINDOW_FLUSH_INTERVAL,
 };
+use crate::window_usage::{
+    ChainRouteNames, RouteTotals, UsageAnswer, UsageReader, ROUTE_NAMES_KEY, USAGE_READ_TIMEOUT,
+};
 
 /// Canonical owned type URL for this filter.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
@@ -497,6 +500,11 @@ fn create_filter_factory_with_clock(
         ctx.node_id().to_string()
     };
     let stat_prefix = ctx.stat_prefix.clone();
+    // Published by the connection manager before it builds the chain's
+    // filters; absent only where no connection manager built this chain.
+    let route_names = ctx
+        .get(ROUTE_NAMES_KEY)
+        .and_then(|names| names.downcast::<ChainRouteNames>().ok());
 
     let shared = ctx
         .shared
@@ -515,10 +523,17 @@ fn create_filter_factory_with_clock(
             ));
             streams.start_publisher(DEFAULT_LEASE_PUBLISH_INTERVAL);
             let usage_missing_warner = Arc::new(UsageMissingWarner::new());
+            // Only a shared store holds counts this replica's counters lack
+            // (ADR-0006 addendum §4); otherwise the local answer is exact
+            // and no reader thread is started.
+            let usage_reader = store
+                .is_shared()
+                .then(|| Arc::new(UsageReader::new(stat_prefix.clone(), Arc::clone(&store))));
             Ok(Arc::new(SharedTokenLimitState {
                 counters,
                 streams,
                 usage_missing_warner,
+                usage_reader,
             }) as Arc<dyn std::any::Any + Send + Sync>)
         })?
         .downcast::<SharedTokenLimitState>()
@@ -531,6 +546,8 @@ fn create_filter_factory_with_clock(
         rule,
         policy,
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
+        usage_reader: shared.usage_reader.clone(),
+        route_names,
     }))
 }
 
@@ -544,6 +561,8 @@ struct SharedTokenLimitState {
     counters: Arc<WindowAccumulator>,
     streams: Arc<LeaseGauge>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    /// `Some` exactly when the store is shared.
+    usage_reader: Option<Arc<UsageReader>>,
 }
 
 struct TokenLimitInstanceFactory {
@@ -553,6 +572,8 @@ struct TokenLimitInstanceFactory {
     rule: Option<LimitRule>,
     policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    usage_reader: Option<Arc<UsageReader>>,
+    route_names: Option<Arc<ChainRouteNames>>,
 }
 
 impl FilterInstanceFactory for TokenLimitInstanceFactory {
@@ -564,6 +585,9 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
             rule: self.rule,
             policy: self.policy.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
+            usage_reader: self.usage_reader.clone(),
+            route_names: self.route_names.clone(),
+            usage_read: UsageRead::Idle,
             key: None,
             policy_charges: Vec::new(),
             leases: Vec::new(),
@@ -791,6 +815,13 @@ struct TokenLimitFilterInstance {
     /// Shared across every stream this listener serves -- see
     /// [`UsageMissingWarner`]'s doc for why it needs to outlive one stream.
     usage_missing_warner: Arc<UsageMissingWarner>,
+    /// Reads `GET /v1/usage` totals from the store; `Some` exactly when the
+    /// store is shared.
+    usage_reader: Option<Arc<UsageReader>>,
+    /// The chain's route names, the rows a store read asks for.
+    route_names: Option<Arc<ChainRouteNames>>,
+    /// Where a held `GET /v1/usage` stands.
+    usage_read: UsageRead,
     /// Set in `decode_headers`, from the route + hashed credential. `None`
     /// only if `decode_headers` never ran (can't happen in practice for an
     /// HTTP filter, but this makes `record_if_present` total rather than
@@ -1037,7 +1068,30 @@ impl TokenLimitFilterInstance {
     /// - `200` otherwise, with a JSON body -- including a tenant with no
     ///   configured budgets at all, which gets `200` and an empty `routes`
     ///   array (a true answer), never an error.
-    fn handle_usage_request(&self, cb: &mut dyn DecoderCallbacks) {
+    /// - `503` with a shared store when the store read fails or does not
+    ///   answer within [`USAGE_READ_TIMEOUT`]. It never falls back to this
+    ///   replica's counters, which would report a route only another replica
+    ///   served as unused (ADR-0006 addendum §4).
+    ///
+    /// # Where the numbers come from
+    ///
+    /// With an in-memory or persistent store there is one replica, and its
+    /// counters are exact. With a shared store the request is held (S2
+    /// `StopIteration`) while [`UsageReader`] reads the fleet totals on its
+    /// own thread; [`HttpFilter::poll_pending`] waits for the answer and the
+    /// filter manager then calls `decode_headers` again (ADR-0004), which
+    /// replies from it. The worker never touches the store.
+    fn handle_usage_request(&mut self, cb: &mut dyn DecoderCallbacks) -> FilterHeadersStatus {
+        if let UsageRead::Answered { held, answer } =
+            std::mem::replace(&mut self.usage_read, UsageRead::Idle)
+        {
+            match answer {
+                Ok(totals) => self.reply_usage(cb, &held, &totals),
+                Err(failure) => reply_usage_unavailable(cb, failure),
+            }
+            return FilterHeadersStatus::Continue;
+        }
+
         // Rust note: same "clone out of the RefMut guard, let it drop"
         // pattern as `decode_headers`'s own tenant read above -- `stream_info()`
         // must not be held across the `send_local_reply` call below.
@@ -1050,46 +1104,127 @@ impl TokenLimitFilterInstance {
                 None,
                 "usage_endpoint_no_authenticated_tenant",
             );
-            return;
+            return FilterHeadersStatus::Continue;
         };
 
-        // Answered from this replica's counters. With one replica that is
-        // exact. With a shared store it is this replica's reconciled view,
-        // which reads zero for a route it has never served; ADR-0006's
-        // addendum §4 moves that case to a control-side store read, which
-        // this filter does not do yet.
         let now_secs = unix_secs((self.clock)());
-        let routes: Vec<TenantUsage> = match &self.rule {
-            Some(rule) => {
-                let window = rule.window_at(now_secs);
-                let reset_after = Duration::from_secs(window.end_secs().saturating_sub(now_secs));
-                self.counters
-                    .tenant_totals(&tenant, rule.on.dimension(), window)
-                    .into_iter()
-                    .map(|(route, used)| TenantUsage {
-                        route,
-                        used: used as f64,
-                        limit: rule.max_tokens as f64,
-                        remaining: rule.max_tokens.saturating_sub(used) as f64,
-                        reset_after,
-                    })
-                    .collect()
-            }
+        let Some(rule) = self.rule else {
+            send_usage_body(cb, &render_usage_response(&tenant, &[]));
+            return FilterHeadersStatus::Continue;
+        };
+        let window = rule.window_at(now_secs);
+        let local = self
+            .counters
+            .tenant_totals(&tenant, rule.on.dimension(), window);
+
+        let Some(reader) = &self.usage_reader else {
+            let routes = usage_rows(rule, window, now_secs, &local);
+            send_usage_body(cb, &render_usage_response(&tenant, &routes));
+            return FilterHeadersStatus::Continue;
+        };
+
+        // Every route of the chain, plus any this replica holds a bucket for
+        // that the published names lack (an unnamed route, or a test chain
+        // with no connection manager).
+        let mut routes: Vec<String> = self
+            .route_names
+            .as_ref()
+            .map(|names| names.load().as_ref().clone())
+            .unwrap_or_default();
+        routes.extend(local.into_iter().map(|(route, _)| route));
+        let answer = reader.read(&tenant, rule.on.dimension(), window, routes, Instant::now());
+        self.usage_read = UsageRead::Waiting {
+            tenant,
+            window,
+            answer,
+        };
+        FilterHeadersStatus::StopIteration
+    }
+
+    /// Reply 200 with `totals`, read for `held`.
+    fn reply_usage(&self, cb: &mut dyn DecoderCallbacks, held: &Held, totals: &RouteTotals) {
+        let now_secs = unix_secs((self.clock)());
+        let routes = match self.rule {
+            Some(rule) => usage_rows(rule, held.window, now_secs, totals),
             None => Vec::new(),
         };
-        let body = render_usage_response(&tenant, &routes);
-        cb.send_local_reply(
-            StatusCode::OK,
-            &body,
-            Some(Box::new(|response_headers: &mut http::HeaderMap| {
-                response_headers.insert(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("application/json"),
-                );
-            })),
-            "usage_endpoint",
-        );
+        send_usage_body(cb, &render_usage_response(&held.tenant, &routes));
     }
+}
+
+/// A `GET /v1/usage` waiting on, or answered by, a shared-store read.
+enum UsageRead {
+    Idle,
+    Waiting {
+        tenant: String,
+        window: WindowKey,
+        answer: tokio::sync::oneshot::Receiver<UsageAnswer>,
+    },
+    Answered {
+        held: Held,
+        answer: Result<RouteTotals, UsageFailure>,
+    },
+}
+
+/// The tenant and window a held usage read was made for.
+struct Held {
+    tenant: String,
+    window: WindowKey,
+}
+
+/// Why a shared-store usage read produced no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageFailure {
+    Store,
+    Timeout,
+}
+
+fn usage_rows(
+    rule: LimitRule,
+    window: WindowKey,
+    now_secs: u64,
+    totals: &[(String, u64)],
+) -> Vec<TenantUsage> {
+    let reset_after = Duration::from_secs(window.end_secs().saturating_sub(now_secs));
+    totals
+        .iter()
+        .map(|(route, used)| TenantUsage {
+            route: route.clone(),
+            used: *used as f64,
+            limit: rule.max_tokens as f64,
+            remaining: rule.max_tokens.saturating_sub(*used) as f64,
+            reset_after,
+        })
+        .collect()
+}
+
+fn send_usage_body(cb: &mut dyn DecoderCallbacks, body: &str) {
+    cb.send_local_reply(
+        StatusCode::OK,
+        body,
+        Some(Box::new(|response_headers: &mut http::HeaderMap| {
+            response_headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+        })),
+        "usage_endpoint",
+    );
+}
+
+fn reply_usage_unavailable(cb: &mut dyn DecoderCallbacks, failure: UsageFailure) {
+    let details = match failure {
+        UsageFailure::Store => "usage_endpoint_store_unavailable",
+        UsageFailure::Timeout => "usage_endpoint_store_timeout",
+    };
+    cb.send_local_reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "usage unavailable",
+        Some(Box::new(|headers: &mut http::HeaderMap| {
+            headers.insert("retry-after", http::HeaderValue::from_static("1"));
+        })),
+        details,
+    );
 }
 
 /// The exact path `GET /v1/usage` is matched against -- see
@@ -1156,8 +1291,7 @@ impl HttpFilter for TokenLimitFilterInstance {
         // the query string at all -- there is no code path from a query
         // parameter, a header, or a path segment to a tenant identity here.
         if headers.method == http::Method::GET && headers.uri.path() == USAGE_PATH {
-            self.handle_usage_request(cb);
-            return FilterHeadersStatus::Continue;
+            return self.handle_usage_request(cb);
         }
 
         let now = (self.clock)();
@@ -1289,6 +1423,36 @@ impl HttpFilter for TokenLimitFilterInstance {
         // The stream is over: free its concurrent-stream slots now rather
         // than whenever the filter instance is dropped.
         self.leases.clear();
+    }
+
+    /// Waits for a held `GET /v1/usage` read, at most [`USAGE_READ_TIMEOUT`].
+    /// The answer is applied when the filter manager calls `decode_headers`
+    /// again.
+    fn poll_pending<'a>(
+        &'a mut self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>> {
+        if !matches!(self.usage_read, UsageRead::Waiting { .. }) {
+            return None;
+        }
+        let UsageRead::Waiting {
+            tenant,
+            window,
+            answer,
+        } = std::mem::replace(&mut self.usage_read, UsageRead::Idle)
+        else {
+            unreachable!("checked just above");
+        };
+        Some(Box::pin(async move {
+            let answer = match tokio::time::timeout(USAGE_READ_TIMEOUT, answer).await {
+                Ok(Ok(Ok(totals))) => Ok(totals),
+                Ok(Ok(Err(_))) | Ok(Err(_)) => Err(UsageFailure::Store),
+                Err(_) => Err(UsageFailure::Timeout),
+            };
+            self.usage_read = UsageRead::Answered {
+                held: Held { tenant, window },
+                answer,
+            };
+        }))
     }
 }
 
@@ -1685,6 +1849,9 @@ mod tests {
             clock,
             policy: None,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            usage_reader: None,
+            route_names: None,
+            usage_read: UsageRead::Idle,
             key: None,
             policy_charges: Vec::new(),
             leases: Vec::new(),
@@ -3241,5 +3408,226 @@ mod tests {
             refusal(&*factory, "tenant-a", "key-a").as_deref(),
             Some("request rate exceeded")
         );
+    }
+
+    // --- GET /v1/usage with a shared store -------------------------------------
+
+    use crate::control::SharedMemoryStore;
+    use crate::window_usage::test_store::ProbeStore;
+
+    /// One replica of a fleet: its own factory state (its own process), a
+    /// control plane over `store`, the chain's published route names, and a
+    /// 10 000-token, 60-second static rule.
+    struct Replica {
+        ctx: FactoryContext,
+        factory: Box<dyn FilterInstanceFactory>,
+    }
+
+    impl Replica {
+        fn over(store: Box<dyn ControlPlaneStore>, routes: &[&str]) -> Self {
+            let ctx = FactoryContext {
+                stat_prefix: "ingress".to_string(),
+                ..FactoryContext::default()
+            };
+            let cp = Arc::new(
+                ControlPlane::new(store, HmacSecret::new(b"operator-secret"), KeySet::new())
+                    .unwrap(),
+            );
+            ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+                Ok(cp as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+            let names = Arc::new(ChainRouteNames::default());
+            names.publish(routes.iter().map(|route| route.to_string()));
+            ctx.get_or_try_init(ROUTE_NAMES_KEY, || {
+                Ok(names as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+            let factory = match pinned_factory(&token_limit(10_000, 10_000.0 / 60.0), &ctx) {
+                Ok(factory) => factory,
+                Err(e) => panic!("valid config must build: {e:?}"),
+            };
+            Replica { ctx, factory }
+        }
+
+        fn counters(&self) -> Arc<WindowAccumulator> {
+            let scope = format!("{}::token_limit(type_url={TYPE_URL})", self.ctx.scope);
+            let state = self
+                .ctx
+                .shared
+                .get(&scope, TYPE_URL)
+                .expect("the factory registered its counters")
+                .downcast::<SharedTokenLimitState>()
+                .unwrap();
+            Arc::clone(&state.counters)
+        }
+
+        /// This replica's own counters for `tenant` in the test window.
+        fn local_totals(&self, tenant: &str) -> Vec<(String, u64)> {
+            let window = WindowKey::containing(unix_secs(fixed_clock()), 60);
+            self.counters()
+                .tenant_totals(tenant, LimitOn::Total.dimension(), window)
+        }
+
+        /// Serve one request for `tenant` on `route` that used `tokens`.
+        fn serve(&self, tenant: &str, route: &str, tokens: u64) {
+            let mut filter = self.factory.create_filter();
+            let mut cb = TestCallbacks::new(Some(route_named(route)));
+            cb.set_authenticated_tenant(tenant);
+            filter.decode_headers(&mut cb, &mut request_headers(Some("Bearer llmp_x")), true);
+            assert!(cb.local_reply.is_none(), "setup request must be admitted");
+            cb.set_usage(usage(tokens));
+            filter.encode_headers(&mut cb, &mut response_headers(), true);
+        }
+
+        /// `GET /v1/usage` for `tenant`, driven the way the filter manager
+        /// drives a held request: `decode_headers`, await `poll_pending` on a
+        /// runtime with a timer, then `decode_headers` again. Returns whether
+        /// the request was held, and the reply.
+        fn usage_reply(&self, tenant: &str) -> (bool, (StatusCode, HeaderMap, String)) {
+            let mut filter = self.factory.create_filter();
+            let mut cb = TestCallbacks::new(None);
+            cb.set_authenticated_tenant(tenant);
+            let mut head = RequestHeaders {
+                method: Method::GET,
+                uri: "/v1/usage".parse().unwrap(),
+                headers: HeaderMap::new(),
+            };
+            let held = filter.decode_headers(&mut cb, &mut head, true)
+                == FilterHeadersStatus::StopIteration;
+            if held {
+                assert!(cb.local_reply.is_none(), "a held request has no reply yet");
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                let pending = filter
+                    .poll_pending()
+                    .expect("a held usage request has a read pending");
+                runtime.block_on(pending);
+                assert!(filter.poll_pending().is_none(), "one read per hold");
+                filter.decode_headers(&mut cb, &mut head, true);
+            }
+            (
+                held,
+                cb.local_reply.expect("the usage endpoint always replies"),
+            )
+        }
+    }
+
+    fn reported_routes(body: &str) -> Vec<(String, u64)> {
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        parsed["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|route| {
+                (
+                    route["route"].as_str().unwrap().to_string(),
+                    route["used"].as_f64().unwrap() as u64,
+                )
+            })
+            .collect()
+    }
+
+    /// Two replicas on one shared store. Replica A serves the tenant; B never
+    /// does, so B's own counters know nothing, which is what the endpoint
+    /// used to report. B must read the fleet total from the store instead.
+    #[test]
+    fn a_replica_that_never_served_a_route_reports_the_fleet_total_from_a_shared_store() {
+        let (store, _) = SharedMemoryStore::new();
+        let a = Replica::over(Box::new(store.handle()), &["chat", "images"]);
+        let b = Replica::over(Box::new(store.handle()), &["chat", "images"]);
+        a.serve("acme", "chat", 700);
+        a.serve("acme", "images", 50);
+        a.serve("other", "chat", 9);
+        a.counters().flush_now().unwrap();
+
+        assert!(b.local_totals("acme").is_empty(), "B never served acme");
+        let (held, (status, headers, body)) = b.usage_reply("acme");
+
+        assert!(held, "a shared store is read off the worker");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            reported_routes(&body),
+            [("chat".to_string(), 700), ("images".to_string(), 50)]
+        );
+    }
+
+    /// With an in-memory store there is one replica: the local counters are
+    /// exact, so the request is answered at once, without a store read.
+    #[test]
+    fn a_single_replica_store_answers_from_local_counters_without_holding() {
+        let a = Replica::over(Box::new(InMemoryControlPlaneStore::default()), &["chat"]);
+        a.serve("acme", "chat", 700);
+
+        let (held, (status, _, body)) = a.usage_reply("acme");
+
+        assert!(!held);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reported_routes(&body), [("chat".to_string(), 700)]);
+    }
+
+    /// A failed store read answers 503, never the local view: here the local
+    /// counters hold a number, so a fallback would have answered 200.
+    #[test]
+    fn a_store_error_answers_503_and_never_the_local_view() {
+        let store = ProbeStore::default();
+        let a = Replica::over(Box::new(store.clone()), &["chat"]);
+        a.serve("acme", "chat", 700);
+        assert!(!a.local_totals("acme").is_empty());
+        store.fail.store(true, Ordering::SeqCst);
+
+        let (held, (status, headers, body)) = a.usage_reply("acme");
+
+        assert!(held);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "usage unavailable");
+        assert_eq!(headers.get("retry-after").unwrap(), "1");
+    }
+
+    /// A store that does not answer within the read timeout also answers
+    /// 503, and the worker is not blocked while it waits.
+    #[test]
+    fn a_store_that_does_not_answer_in_time_answers_503() {
+        let store = ProbeStore::default();
+        let a = Replica::over(Box::new(store.clone()), &["chat"]);
+        a.serve("acme", "chat", 700);
+        store.hold();
+        // Released however the test ends: the counters' final flush on drop
+        // reads the store too, and would wait on the hold forever.
+        struct Release(ProbeStore);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _release = Release(store.clone());
+
+        let (held, (status, _, _)) = a.usage_reply("acme");
+
+        assert!(held);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The tenant still comes only from authentication on the held path.
+    #[test]
+    fn an_unauthenticated_usage_request_on_a_shared_store_is_refused_without_a_read() {
+        let store = ProbeStore::default();
+        let a = Replica::over(Box::new(store.clone()), &["chat"]);
+        let mut filter = a.factory.create_filter();
+        let mut cb = TestCallbacks::new(None);
+        let mut head = RequestHeaders {
+            method: Method::GET,
+            uri: "/v1/usage?tenant=acme".parse().unwrap(),
+            headers: HeaderMap::new(),
+        };
+
+        let status = filter.decode_headers(&mut cb, &mut head, true);
+
+        assert_eq!(status, FilterHeadersStatus::Continue);
+        assert_eq!(cb.local_reply.unwrap().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
     }
 }

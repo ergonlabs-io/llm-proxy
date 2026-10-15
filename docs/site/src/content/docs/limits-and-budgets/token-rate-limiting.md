@@ -3,7 +3,7 @@ title: Token rate limiting
 summary: How the token limiter buckets and enforces a budget, and the
   `GET /v1/usage` endpoint an authenticated caller uses to read its own
   current standing.
-last_updated: 2026-09-07
+last_updated: 2026-10-15
 related:
   - ../authentication/virtual-keys/
   - ../configuration/configuration-file/
@@ -155,11 +155,24 @@ Do not parse this response positionally; parse it as JSON.
 |---|---|---|
 | `200` | An authenticated tenant. | The JSON body above — including an empty `routes: []` for a tenant with no budgets anywhere. |
 | `401` | No authenticated tenant: no `auth:` block on the listener, no credential presented, or the credential was rejected. | `unauthorized` (plain text, no usage data). |
-The endpoint answers from the counters of the replica that receives the
-request. With one replica the answer is exact. With a `shared` store, a
-replica reports the reconciled fleet total for the routes it has served, but
-reports a route it has never served as absent. Reading the store for this
-endpoint is planned and is not available now.
+| `503` | `auth.store` is `shared`, and the store returned an error or did not answer within about 2 seconds. | `usage unavailable` (plain text), with `retry-after: 1`. |
+
+Where the numbers come from depends on `auth.store`:
+
+- **`in_memory` or `persistent`:** one replica. The endpoint answers from the
+  counters of that replica, and the answer is exact.
+- **`shared`:** the endpoint reads the fleet totals from the store, for every
+  route of the listener. A replica that has never served a route still
+  reports the usage that other replicas counted on it. The read does not
+  block the worker: the proxy holds the request while a background thread
+  reads the store. Requests for the same tenant share one read, and the
+  proxy reuses an answer for about 1 second, so frequent calls do not add
+  load on the store. The numbers can lag the replica's own most recent
+  requests by up to one reconcile interval (about 1 second).
+
+If the store read fails, the endpoint answers `503`. It does not fall back to
+the counters of the replica, because a replica that has not served a route
+would report 0 for it, which is a wrong number.
 
 ### What this endpoint deliberately does not do
 

@@ -1483,6 +1483,39 @@ fn build_hcm_handler(
             context: context.to_string(),
             reason: format!("stats registry: {e}"),
         })?;
+    let route_table = match &hcm.rds_route_config_name {
+        Some(name) => routes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| HttpFilterChainBuildError {
+                context: context.to_string(),
+                reason: format!("RDS route configuration `{name}` is not warmed"),
+            })?,
+        None => hcm.route_table.clone(),
+    };
+    // The token limiter's shared-store `GET /v1/usage` reads one store row
+    // per route, so it needs this chain's route names. Published before the
+    // filters are built, and on every build, so an RDS update reaches it.
+    runtime
+        .factory_state
+        .get_or_try_init(
+            context,
+            "",
+            proxy_filters::window_usage::ROUTE_NAMES_KEY,
+            || {
+                Ok(
+                    Arc::new(proxy_filters::window_usage::ChainRouteNames::default())
+                        as Arc<dyn std::any::Any + Send + Sync>,
+                )
+            },
+        )
+        .map_err(|e| HttpFilterChainBuildError {
+            context: context.to_string(),
+            reason: format!("route names: {e}"),
+        })?
+        .downcast::<proxy_filters::window_usage::ChainRouteNames>()
+        .expect("the route-names singleton is always ChainRouteNames")
+        .publish_from(&route_table);
     let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
     for f in &hcm.http_filters {
         if f.is_router {
@@ -1624,16 +1657,6 @@ fn build_hcm_handler(
     // was wired end to end everywhere except here, so `token_stats` was
     // always `None` and `llm.client.token.usage` was never recorded no
     // matter what a route configured.
-    let route_table = match &hcm.rds_route_config_name {
-        Some(name) => routes
-            .get(name)
-            .cloned()
-            .ok_or_else(|| HttpFilterChainBuildError {
-                context: context.to_string(),
-                reason: format!("RDS route configuration `{name}` is not warmed"),
-            })?,
-        None => hcm.route_table.clone(),
-    };
     let mut handler = FilterChainHandler::new_with_filters_and_access_logs(
         filters,
         terminal_factory,
@@ -5146,6 +5169,130 @@ static_resources:
             scopes.iter().any(|s| s.contains("listener 'l1'"))
                 && scopes.iter().any(|s| s.contains("listener 'l2'")),
             "each scope must be traceable back to the listener that registered it, got: {scopes:?}"
+        );
+    }
+
+    // --- route names for the token limiter's usage read ----------------------
+
+    /// A one-listener bootstrap whose route table holds `routes` (YAML route
+    /// entries, already indented), for the route-names tests below.
+    fn bootstrap_with_routes(routes: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: l1
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: 0 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: l1
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: rc1
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+{routes}
+  clusters:
+    - name: up
+      type: STATIC
+      connect_timeout: 5s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: up
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 1 }}
+"#
+        )
+    }
+
+    /// Build `yaml`'s listener `l1` against `factory_state` and return the
+    /// route names its chain published.
+    fn published_route_names(yaml: &str, factory_state: &Arc<SharedFactoryState>) -> Vec<String> {
+        use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
+
+        let loaded = parse_bootstrap(yaml.as_bytes(), ConfigFormat::Yaml, StrictMode::Strict)
+            .expect("bootstrap YAML must parse");
+        let snapshot = build_snapshot(&loaded).expect("bootstrap YAML must lower");
+        let cluster_manager = Arc::new(ClusterManager::new(
+            Arc::new(proxy_cluster::resolver::TokioResolver),
+            crate::tls::transport_socket_builder(),
+        ));
+        let stats_control = proxy_observability::stats::StatsControl::new(1);
+        let router_stats = router_stats_for(&stats_control, &snapshot);
+        let token_stats = token_stats_for(&stats_control, &snapshot);
+        let latency_stats = latency_stats_for(&stats_control);
+        let hcm_runtime = HcmRuntime {
+            snapshot_version: snapshot.version,
+            routes: &snapshot.routes,
+            cluster_manager: &cluster_manager,
+            router_stats: &router_stats,
+            token_stats: &token_stats,
+            latency_stats: &latency_stats,
+            tracing_handles: None,
+            metadata: None,
+            factory_state,
+        };
+        build_listener_hcm(
+            snapshot.listeners.get("l1").expect("listener l1"),
+            &hcm_runtime,
+        )
+        .expect("the chain must build");
+        factory_state
+            .get(
+                "listener 'l1' filter_chains[0]",
+                proxy_filters::window_usage::ROUTE_NAMES_KEY,
+            )
+            .expect("the chain publishes its route names")
+            .downcast::<proxy_filters::window_usage::ChainRouteNames>()
+            .expect("the route-names singleton is always ChainRouteNames")
+            .load()
+            .as_ref()
+            .clone()
+    }
+
+    /// A shared-store `GET /v1/usage` reads one store row per route, so the
+    /// chain must publish every route's name (an unnamed route under the
+    /// empty name, as the token limiter buckets it), and a rebuild of the
+    /// same chain from a changed route table must replace them: a stale list
+    /// would leave a new route out of every tenant's usage.
+    #[test]
+    fn a_chain_build_publishes_its_route_names_and_a_rebuild_replaces_them() {
+        let factory_state = Arc::new(SharedFactoryState::default());
+        let first = bootstrap_with_routes(
+            r#"                        - name: images
+                          match: { prefix: "/v1/images" }
+                          route: { cluster: up }
+                        - name: chat
+                          match: { prefix: "/v1/chat" }
+                          route: { cluster: up }
+                        - match: { prefix: "/" }
+                          route: { cluster: up }"#,
+        );
+        assert_eq!(
+            published_route_names(&first, &factory_state),
+            ["", "chat", "images"]
+        );
+
+        let updated = bootstrap_with_routes(
+            r#"                        - name: embeddings
+                          match: { prefix: "/v1/embeddings" }
+                          route: { cluster: up }"#,
+        );
+        assert_eq!(
+            published_route_names(&updated, &factory_state),
+            ["embeddings"]
         );
     }
 
