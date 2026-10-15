@@ -61,11 +61,13 @@ enforce these policies, `llmproxy.model_authz` and `llmproxy.spend_limit`
 tenant's allow-list or budget through the admin write API — see "Managing
 keys and tenants at runtime" below.
 
-In the `llmproxy` dialect, an `auth:` block turns both filters on. You do not
+In the `llmproxy` dialect, an `auth:` block turns both filters on. It also
+adds `llmproxy.token_limit`, which enforces tenant and key rate limits (see
+"Per-user controls inside a tenant" below). You do not
 list them: the config file has no allow-list or budget field, because policies
 and budgets live in the control-plane store and change at runtime. To turn one
 off, set `auth.enforce.model_policy: false` or `auth.enforce.spend: false`
-(both default to `true`). The proxy then logs a warning at load that names what
+(both default to `true`). The same applies to `auth.enforce.limits`. The proxy then logs a warning at load that names what
 is not enforced, and the admin API answers `PUT /tenants/{id}/policy` or
 `PUT /tenants/{id}/budget` with `409` and `{"error":"not_enforced", ...}`
 rather than storing a rule nothing reads. Spend budgets need a `pricing` rate
@@ -398,13 +400,14 @@ is a load error. The gauge `envoy_llmproxy_policy_snapshot_age_seconds` on
 ## Managing keys and tenants at runtime
 
 Minting a key, revoking one, creating or deleting a tenant, and setting a
-tenant's model allow-list or key's spend budget are all bearer-gated HTTP calls
+tenant's model allow-list, a key's spend budget, or a tenant or key's rate limits are all bearer-gated HTTP calls
 against the admin server, not config-file edits: `POST /keys`,
 `DELETE /keys/{id}`, `POST /tenants`, `DELETE /tenants/{id}`,
 `PUT /tenants/{id}/policy`, `PUT /keys/{id}/budget`,
-`PUT /keys/{id}/policy`, a read-only
-`GET /keys` listing every key (id, tenant, revocation, policy, budget -- no
-plaintext), and a read-only `GET /keys/{id}/spend`
+`PUT /keys/{id}/policy`, `PUT /tenants/{id}/limits`,
+`PUT /keys/{id}/limits`, a read-only
+`GET /keys` listing every key (id, tenant, revocation, policy, budget, limits --
+no plaintext), and a read-only `GET /keys/{id}/spend`
 (`crates/proxy-admin/src/server.rs`'s `AVAILABLE_ENDPOINTS`, and its
 `WriteRoute::expected_method` table). Each of these
 paths also has a scoped form, `/chains/{stat_prefix}/...`, that names the
@@ -445,15 +448,27 @@ rotation, permanent revocation tombstones, API versioning, and migration.
 ### Per-user controls inside a tenant
 
 To control each user separately, issue one key for each user. Use the key as
-the user identity. Then set a spend budget and a model policy on each key:
+the user identity. Then set a spend budget, a model policy, and rate limits
+on each key:
 
 - `PUT /keys/{id}/budget` sets the spend ceiling of the key.
 - `PUT /keys/{id}/policy` sets the model allow-list of the key.
+- `PUT /keys/{id}/limits` sets the rate limits of the key: tokens per
+  minute, requests per minute, and concurrent streams.
 
 A key policy only narrows the model grant of its tenant. It never widens
 it. A key with no policy keeps the grant of its tenant. For the body, the
 status codes, and the rules, see "Key model policy" in
 [Admin endpoints](../../observability/admin-endpoints/#key-model-policy).
+
+Rate limits follow the same rule. `PUT /tenants/{id}/limits` sets the
+ceiling. A request must pass the limits of its tenant and the limits of its
+key. A key with no limits is bound by its tenant alone. The limits persist
+with the configured store. The counters are per process, so with N replicas
+the fleet can admit up to N times a limit. A shared counter is planned.
+For the body, the `429` responses, and the rules, see "Tenant and key limits"
+in
+[Admin endpoints](../../observability/admin-endpoints/#tenant-and-key-limits).
 
 ### Tenant provider credentials
 

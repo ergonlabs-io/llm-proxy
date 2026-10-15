@@ -155,16 +155,18 @@ model and examples.
 
 | Route | Method | Success | What it does |
 |---|---|---|---|
-| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`. Sorted by tenant, then key id. |
+| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`, `limits`. Sorted by tenant, then key id. |
 | `/keys` | POST | `201` | Mints a key. Body: `tenant`, `key_id`. The answer holds the key text `key` once. |
 | `/keys/{id}` | DELETE | `204` | Revokes a key. |
 | `/keys/{id}/budget` | PUT | `204` | Sets or clears a key budget. |
 | `/keys/{id}/policy` | PUT | `204` | Sets the model allow-list of one key. The key can only narrow its tenant grant. See "Key model policy". |
+| `/keys/{id}/limits` | PUT | `204` | Sets or clears the rate limits of one key. The key can only narrow its tenant limits. See "Tenant and key limits". |
 | `/keys/{id}/spend` | GET | `200` | Reads the spend of a key. |
 | `/tenants` | POST | `201` | Creates a tenant. Body: `tenant`. |
 | `/tenants/{id}` | DELETE | `204` | Deletes a tenant and revokes every key that authenticates as it. Minted keys are revoked and their rows stay. Config-file `auth.keys` entries for the tenant are revoked by a revoked store row with the same key id. That row wins on every replica that shares the store, and across restarts. Revoked key ids are permanent. The next request with any of those keys gets `401`. |
 | `/tenants/{id}/policy` | PUT | `204` | Sets the model-access policy. Body: `access` (`all` or `{"only": [...]}`) and optional `deny`. An invalid pattern gives `400`. |
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
+| `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
 
 The mint answer is the only time the proxy returns the key text. The store
@@ -239,6 +241,92 @@ request body:
 A key set to `{"access":"all"}` lists as `{"access":"all"}`, not `null`
 (`render_model_access`, `server.rs:1941`, and the test
 `put_key_policy_all_lists_as_inherit_equivalent_all`).
+
+## Tenant and key limits
+
+`PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits` set rate limits. The
+scoped forms are `PUT /chains/{stat_prefix}/tenants/{id}/limits` and
+`PUT /chains/{stat_prefix}/keys/{id}/limits`. Both calls need the admin token
+(`handle_set_tenant_limits`, `handle_set_key_limits`, `server.rs`).
+
+The body has one required key, `limits`. It can have the optional key
+`schema_version`, which must be `1`.
+
+```bash
+curl -X PUT http://$ADMIN_ADDR/tenants/acme/limits \
+  -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
+  -d '{"limits":{"tokens_per_minute":100000,"requests_per_minute":600,"concurrent_streams":20}}'
+```
+
+| Field in `limits` | Type | Default | What it limits |
+|---|---|---|---|
+| `tokens_per_minute` | integer, 0 or more | no limit | Tokens in one minute. |
+| `requests_per_minute` | integer, 0 or more | no limit | Requests in one minute. |
+| `concurrent_streams` | integer, 0 or more | no limit | Requests in flight at the same time. |
+
+A field that you omit sets no limit of that kind. A value of `0` refuses
+every request that the counter measures. To clear the limits, send
+`{"limits": null}` or `{"limits": {}}`. A `limits` object with no limit
+fields clears the stored row (`LimitSpec::into_policy`, `server.rs`).
+
+| Status | Cause |
+|---|---|
+| `204` | The proxy stored the limits, or cleared them. |
+| `400` | The body is not valid. The `limits` key is missing, a field is unknown, or `schema_version` is not `1`. The proxy stores nothing. |
+| `404` | The key does not exist (`PUT /keys/{id}/limits` only). The proxy stores nothing. |
+| `409` | No chain runs `llmproxy.token_limit`. The body is `{"error":"not_enforced", ...}`. The proxy stores nothing. |
+
+Proof: `SetLimitsRequest` and `LimitSpec` (`deny_unknown_fields`),
+`token_limit_enforced`, and `store_error_response` in `server.rs`. The test
+`put_limits_unknown_key_and_unknown_fields_do_not_write` covers `400` and
+`404`. The test `put_limits_without_token_limit_is_409_and_stores_nothing`
+covers `409`. The test `scoped_put_limits_uses_named_chain_and_legacy_type_url`
+covers the scoped route (`server/tests/limits.rs`).
+
+These rules apply:
+
+- A request must pass the limits of its tenant and the limits of its key.
+  The tenant sets the ceiling. A key only narrows it.
+- A key with no limits is bound by its tenant alone.
+- A window is one minute (`POLICY_WINDOW`, `token_limit_filter.rs`).
+- A write applies to the next request. No reload is needed.
+- The limits persist with the configured store. They survive a restart on
+  the persistent store (test `limits_survive_a_restart_with_a_persistent_store`,
+  `tenant_enforcement_e2e.rs`).
+- The proxy holds a concurrent-stream slot until the stream ends.
+- The proxy checks token limits when the request arrives. It charges the
+  actual usage when the stream ends. A stream in flight is never cut.
+
+When a limit refuses a request, the proxy answers `429`. The body names the
+limit, and the response has the headers `x-ratelimit-limit`,
+`x-ratelimit-remaining`, `x-ratelimit-reset`, and `retry-after`
+(`Refusal::body` and `refuse`, `token_limit_filter.rs`):
+
+| Limit | `429` body |
+|---|---|
+| `tokens_per_minute` | `token budget exceeded` |
+| `requests_per_minute` | `request rate exceeded` |
+| `concurrent_streams` | `too many concurrent streams` |
+
+The dialect adds `llmproxy.token_limit` for you when `auth` is set. See
+`auth.enforce.limits` in
+[Configuration file](../../configuration/configuration-file/).
+
+Caution: the counters are per process. With N replicas, the fleet can admit
+up to N times a limit. A shared counter is planned and is not available
+now.
+
+`GET /v1/usage` does not report these limits. It reports only the `limits`
+rule of the route in the config file (`token_limit_filter.rs`, module doc).
+
+`GET /keys` reports the limits of each key in the `limits` field. The value
+is `null` when the key has no limits (`render_limits`, `handle_list_keys`).
+
+```json
+{"key_id": "k1", "tenant": "tenant-a", "revoked": false,
+ "policy": null, "budget": null,
+ "limits": {"requests_per_minute": 60}}
+```
 
 ## Tenant provider credentials
 
