@@ -288,7 +288,10 @@ These rules apply:
 - A request must pass the limits of its tenant and the limits of its key.
   The tenant sets the ceiling. A key only narrows it.
 - A key with no limits is bound by its tenant alone.
-- A window is one minute (`POLICY_WINDOW`, `token_limit_filter.rs`).
+- A window is one minute (`POLICY_WINDOW`, `token_limit_filter.rs`). Windows
+  start on whole minutes (they are aligned to the Unix epoch), so the first
+  window can be shorter than a minute. See
+  [Token rate limiting](../../limits-and-budgets/token-rate-limiting/#windows).
 - A write applies to the next request. No reload is needed.
 - The limits persist with the configured store. They survive a restart on
   the persistent store (test `limits_survive_a_restart_with_a_persistent_store`,
@@ -312,9 +315,12 @@ The dialect adds `llmproxy.token_limit` for you when `auth` is set. See
 `auth.enforce.limits` in
 [Configuration file](../../configuration/configuration-file/).
 
-Caution: the counters are per process. With N replicas, the fleet can admit
-up to N times a limit. A shared counter is planned and is not available
-now.
+Caution: token and request counts are shared between replicas only when
+`auth.store` is `shared`. They reconcile about once a second, so the fleet
+can admit a little over a limit between reconciles. With the `in_memory` or
+`persistent` store each replica counts alone, so N replicas can admit up to
+N times a limit. Concurrent-stream slots are counted per process with every
+store; sharing them between replicas is planned and is not available now.
 
 `GET /v1/usage` does not report these limits. It reports only the `limits`
 rule of the route in the config file (`token_limit_filter.rs`, module doc).

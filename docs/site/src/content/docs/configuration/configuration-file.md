@@ -247,7 +247,7 @@ a load error that names the full path, for example `auth.enforce.model_polcy`.
 | `model_policy` | boolean | no | `true` | Enforce tenant model allow-lists. A tenant with no stored policy is refused (`403`, response-code detail `model_not_permitted`) unless `tenants_without_policy` is `allow`. `false` omits `llmproxy.model_authz`. |
 | `tenants_without_policy` | `deny` or `allow` | no | `deny` | What `llmproxy.model_authz` does for a tenant with no stored policy. `deny` refuses the request. `allow` grants every model and logs a load-time warning. Setting it with `model_policy: false` is a load error at `auth.enforce.tenants_without_policy`. |
 | `spend` | boolean | no | `true` | Enforce tenant and key spend budgets. Cost comes from `pricing`. `false` omits `llmproxy.spend_limit`. |
-| `limits` | boolean | no | `true` | Enforce tenant and key rate limits set with `PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits`. A key only narrows its tenant. Counters are per process. `false` with no top-level `limits` entry omits `llmproxy.token_limit`. A top-level `limits` entry still adds it, and it then enforces these limits too. |
+| `limits` | boolean | no | `true` | Enforce tenant and key rate limits set with `PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits`. A key only narrows its tenant. Token and request counts are shared between replicas when `auth.store` is `shared`; concurrent streams are counted per process. `false` with no top-level `limits` entry omits `llmproxy.token_limit`. A top-level `limits` entry still adds it, and it then enforces these limits too. |
 
 Setting one to `false` logs a load-time warning that names what is not
 enforced. The matching admin write then returns `409` with

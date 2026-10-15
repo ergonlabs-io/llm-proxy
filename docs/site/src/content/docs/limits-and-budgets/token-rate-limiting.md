@@ -24,7 +24,26 @@ reference for the full field table, and
 on the authenticated tenant rather than the caller's raw header once `auth:`
 is configured.
 
-This page covers the read side: `GET /v1/usage`, an endpoint the proxy
+## Windows
+
+A window is a fixed period aligned to the Unix epoch: a 60-second window
+always starts on a whole minute (`floor(unix_time / length)`). Every replica
+therefore counts the same minute under the same name. As a result, the first
+window a caller sees can be shorter than the configured length. A caller whose
+first request arrives 50 seconds into a minute has 10 seconds of budget before
+the window resets. `x-ratelimit-reset` and `retry-after` count down to the end
+of the current window.
+
+Each replica checks a request against its own counters and never waits for
+the store. The counters reconcile with the store that `auth.store` selects
+about once a second, and sooner when a caller nears its limit. With a
+`shared` store, the token and request counts are shared by every replica, so
+the fleet can admit a little over a limit between reconciles. If the store
+cannot be reached, the proxy keeps enforcing against the last known totals,
+and logs a warning when the counters stay unreconciled past their bound. A
+`limits` rule on a listener with no `auth:` counts per process.
+
+This page also covers the read side: `GET /v1/usage`, an endpoint the proxy
 answers itself so an authenticated caller can see its own budget without an
 operator reading logs on its behalf.
 
@@ -134,18 +153,13 @@ Do not parse this response positionally; parse it as JSON.
 
 | Status | When | Body |
 |---|---|---|
-| `200` | An authenticated tenant, budget store reachable. | The JSON body above — including an empty `routes: []` for a tenant with no budgets anywhere. |
+| `200` | An authenticated tenant. | The JSON body above — including an empty `routes: []` for a tenant with no budgets anywhere. |
 | `401` | No authenticated tenant: no `auth:` block on the listener, no credential presented, or the credential was rejected. | `unauthorized` (plain text, no usage data). |
-| `503` | The budget store could not be read. | `usage temporarily unavailable` (plain text, no body fields). |
-
-The `503` case is deliberate, not an oversight: every other path through the
-token limiter fails open on a store error (an unreadable budget must never
-block real traffic), but this read-only reporting endpoint inverts that
-policy, because a caller silently shown a wrong or stale number is a worse
-outcome than a visible failure
-(`BudgetStore::usage_for_tenant`'s doc in
-`crates/proxy-filters/src/token_limit.rs`,
-`usage_endpoint_returns_503_when_the_budget_store_is_unavailable`).
+The endpoint answers from the counters of the replica that receives the
+request. With one replica the answer is exact. With a `shared` store, a
+replica reports the reconciled fleet total for the routes it has served, but
+reports a route it has never served as absent. Reading the store for this
+endpoint is planned and is not available now.
 
 ### What this endpoint deliberately does not do
 
