@@ -65,7 +65,7 @@
 //!
 //! # Config: `llmproxy.filters.v0.TokenLimit`
 //!
-//! The limiter has an owned, versioned config message.  Its required
+//! The limiter has an owned, versioned config message.  Its
 //! `max_tokens` and `fill_rate` fields map directly onto this filter's fixed
 //! window semantics; `fill_rate` is tokens per second and the window is
 //! `max_tokens / fill_rate` seconds.  Unlike the retired
@@ -86,6 +86,25 @@
 //! vendored proto, exactly like `body_rewrite_filter`'s and
 //! `usage_filter`'s module docs already predict for their own next config
 //! knob.
+//!
+//! The two fields are set together or not at all. With neither, there is no
+//! static rule and the filter enforces only the tenant and key limits below;
+//! that needs `llmproxy.auth` earlier in the chain, or the config is refused,
+//! since the filter would enforce nothing.
+//!
+//! # Tenant and key limits from the control plane
+//!
+//! When `llmproxy.auth` precedes this filter, it also enforces the limits set
+//! through `PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits`: tokens per
+//! minute, requests per minute and concurrent streams. A tenant sets the
+//! ceiling and each key can only narrow it, so a request must pass both its
+//! tenant's bucket and its key's; a key with no limits row is bounded by its
+//! tenant alone. These buckets are per tenant and per key across every route,
+//! in their own key spaces ([`crate::token_limit::LimitSubject::TenantPolicy`]
+//! and `KeyPolicy`), apart from the static rule's per-route buckets, which are
+//! still the only ones `GET /v1/usage` reports. A write applies on the next
+//! request. Counters are per process, so N replicas admit up to N times a
+//! limit until a shared counter backend exists.
 //!
 //! # The bucket key: an authenticated tenant if there is one, else the credential
 //!
@@ -193,9 +212,15 @@ use proxy_http::filter::{
 use proxy_http::LlmTokenUsage;
 use proxy_observability::ResponseFlag;
 
+use arc_swap::ArcSwap;
+
+use crate::auth::{KeyId, TenantId};
+use crate::auth_filter;
+use crate::control::{ControlPlane, ControlPlaneSnapshot, LimitPolicy};
 use crate::token_limit::{
-    BudgetStore, BudgetUnavailable, InProcessBudgetStore, LimitDecision, LimitKey, LimitOn,
-    LimitRule, TenantUsage,
+    BudgetStore, BudgetUnavailable, ConcurrencyLimiter, InProcessBudgetStore,
+    InProcessConcurrencyLimiter, LimitDecision, LimitKey, LimitOn, LimitRule, RequestLimit,
+    StreamLease, TenantUsage,
 };
 use crate::usage::TokenUsage;
 
@@ -258,11 +283,18 @@ fn parse_rule(
 
 /// Read the owned `TokenLimit` message. `optional` fields preserve presence,
 /// so omitted and explicitly-invalid values report distinct, exact paths.
-fn parse_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
+///
+/// A message with neither `max_tokens` nor `fill_rate` configures no static
+/// rule: the filter then enforces only tenant and key limits from the control
+/// plane (`Ok(None)`). Exactly one of the two is still an error.
+fn parse_config(config: &DynamicMessage) -> Result<Option<LimitRule>, ConfigError> {
     let invalid = |field_path: &str, reason: String| ConfigError::InvalidValue {
         field_path: field_path.to_string(),
         reason,
     };
+    if !config.has_field_by_name("max_tokens") && !config.has_field_by_name("fill_rate") {
+        return Ok(None);
+    }
 
     if !config.has_field_by_name("max_tokens") {
         return Err(invalid(
@@ -296,6 +328,7 @@ fn parse_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
         "typed_config.max_tokens",
         "typed_config.fill_rate",
     )
+    .map(Some)
 }
 
 /// Decode the borrowed one-release compatibility message.
@@ -388,7 +421,7 @@ impl HttpFilterFactory for LegacyTokenLimitFilterFactory {
             replacement_type_url = TYPE_URL,
             "llmproxy.token_limit uses a deprecated borrowed typed_config; migrate to llmproxy.filters.v0.TokenLimit before the next release"
         );
-        create_filter_factory(parse_legacy_config(config)?, LEGACY_TYPE_URL, ctx)
+        create_filter_factory(Some(parse_legacy_config(config)?), LEGACY_TYPE_URL, ctx)
     }
 }
 
@@ -396,10 +429,33 @@ impl HttpFilterFactory for LegacyTokenLimitFilterFactory {
 /// Both decoders converge before this point so the compatibility path cannot
 /// acquire different runtime semantics by accident.
 fn create_filter_factory(
-    rule: LimitRule,
+    rule: Option<LimitRule>,
     config_type_url: &'static str,
     ctx: &FactoryContext,
 ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
+    // Tenant and key limits live in the `ControlPlane` that `llmproxy.auth`
+    // registers in this chain (the same `ctx.get` resolution
+    // `model_authz_filter` uses). Without it only a static rule can apply,
+    // and a filter with neither would enforce nothing, which must be a load
+    // error rather than a silent no-op (AGENTS.md invariant 1).
+    let policy = ctx.get(auth_filter::TYPE_URL).map(|cp| {
+        cp.downcast::<ControlPlane>()
+            .expect(
+                "the control-plane singleton registered under auth_filter::TYPE_URL \
+                 is always a ControlPlane",
+            )
+            .handle()
+    });
+    if rule.is_none() && policy.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field_path: "typed_config".to_string(),
+            reason: "llmproxy.token_limit has no `max_tokens`/`fill_rate` rule and no \
+                     llmproxy.auth earlier in the same filter chain, so it would enforce \
+                     nothing; configure a rule or add llmproxy.auth"
+                .to_string(),
+        });
+    }
+
     // One store (and one `UsageMissingWarner`) per (filter config,
     // listener) -- exactly the lifetime the budget needs: it must
     // outlive any single stream (that's the whole point of a *budget*),
@@ -438,10 +494,16 @@ fn create_filter_factory(
     // `Duration`/`LimitOn` is stable enough for a same-process string
     // key (this is not a wire format, unlike `hash_credential`, which
     // has to survive a different toolchain on the other end).
-    let scope = format!(
-        "{}::token_limit(type_url={config_type_url},on={:?},max_tokens={},window={:?})",
-        ctx.scope, rule.on, rule.max_tokens, rule.window
-    );
+    let scope = match rule {
+        Some(rule) => format!(
+            "{}::token_limit(type_url={config_type_url},on={:?},max_tokens={},window={:?})",
+            ctx.scope, rule.on, rule.max_tokens, rule.window
+        ),
+        None => format!(
+            "{}::token_limit(type_url={config_type_url},policy_only)",
+            ctx.scope
+        ),
+    };
 
     // `ctx.stat_prefix` is passed through unchanged here so
     // the call compiles against the new two-identity signature; nothing
@@ -456,9 +518,12 @@ fn create_filter_factory(
         .shared
         .get_or_try_init(&scope, &ctx.stat_prefix, config_type_url, || {
             let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new());
+            let concurrency: Arc<dyn ConcurrencyLimiter> =
+                Arc::new(InProcessConcurrencyLimiter::new());
             let usage_missing_warner = Arc::new(UsageMissingWarner::new());
             Ok(Arc::new(SharedTokenLimitState {
                 store,
+                concurrency,
                 rule,
                 usage_missing_warner,
             }) as Arc<dyn std::any::Any + Send + Sync>)
@@ -468,7 +533,9 @@ fn create_filter_factory(
 
     Ok(Box::new(TokenLimitInstanceFactory {
         store: Arc::clone(&shared.store),
+        concurrency: Arc::clone(&shared.concurrency),
         rule: shared.rule,
+        policy,
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
     }))
 }
@@ -481,13 +548,16 @@ fn create_filter_factory(
 /// different rule).
 struct SharedTokenLimitState {
     store: Arc<dyn BudgetStore>,
-    rule: LimitRule,
+    concurrency: Arc<dyn ConcurrencyLimiter>,
+    rule: Option<LimitRule>,
     usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
 struct TokenLimitInstanceFactory {
     store: Arc<dyn BudgetStore>,
-    rule: LimitRule,
+    concurrency: Arc<dyn ConcurrencyLimiter>,
+    rule: Option<LimitRule>,
+    policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
@@ -495,11 +565,54 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(TokenLimitFilterInstance {
             store: Arc::clone(&self.store),
+            concurrency: Arc::clone(&self.concurrency),
             rule: self.rule,
+            policy: self.policy.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             key: None,
+            policy_charges: Vec::new(),
+            leases: Vec::new(),
             recorded: false,
         })
+    }
+}
+
+/// Control-plane limits are per minute, matching the dialect's
+/// `tokens_per_minute` and `requests_per_minute`.
+const POLICY_WINDOW: Duration = Duration::from_secs(60);
+
+fn policy_token_rule(tokens_per_minute: u64) -> LimitRule {
+    LimitRule {
+        on: LimitOn::Total,
+        max_tokens: tokens_per_minute,
+        window: POLICY_WINDOW,
+    }
+}
+
+/// Which control-plane limit refused a request; selects the 429's body and
+/// local-reply details so an operator can tell the three apart in logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Tokens,
+    Requests,
+    Streams,
+}
+
+impl Refusal {
+    fn body(self) -> &'static str {
+        match self {
+            Refusal::Tokens => "token budget exceeded",
+            Refusal::Requests => "request rate exceeded",
+            Refusal::Streams => "too many concurrent streams",
+        }
+    }
+
+    fn details(self) -> &'static str {
+        match self {
+            Refusal::Tokens => "token_limit_exceeded",
+            Refusal::Requests => "request_limit_exceeded",
+            Refusal::Streams => "concurrency_limit_exceeded",
+        }
     }
 }
 
@@ -665,7 +778,13 @@ impl UsageMissingWarner {
 /// state of this struct itself.
 struct TokenLimitFilterInstance {
     store: Arc<dyn BudgetStore>,
-    rule: LimitRule,
+    concurrency: Arc<dyn ConcurrencyLimiter>,
+    /// The configured static rule, keyed per route; `None` in policy-only
+    /// mode.
+    rule: Option<LimitRule>,
+    /// The published control-plane snapshot holding tenant and key limits;
+    /// `None` when no `llmproxy.auth` precedes this filter.
+    policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     /// Shared across every stream this listener serves -- see
     /// [`UsageMissingWarner`]'s doc for why it needs to outlive one stream.
     usage_missing_warner: Arc<UsageMissingWarner>,
@@ -674,6 +793,12 @@ struct TokenLimitFilterInstance {
     /// HTTP filter, but this makes `record_if_present` total rather than
     /// assuming).
     key: Option<LimitKey>,
+    /// Tenant and key token buckets this admitted request is charged to at
+    /// stream end, with the rule each was checked against.
+    policy_charges: Vec<(LimitKey, LimitRule)>,
+    /// Concurrent-stream slots held for the life of this stream. Dropping a
+    /// lease frees its slot, so they are cleared when the stream completes.
+    leases: Vec<StreamLease>,
     /// Guards against double-recording from more than one encode callback
     /// observing `end_stream` (mirrors `usage_filter::UsageFilterInstance`'s
     /// `finalized` flag).
@@ -681,11 +806,92 @@ struct TokenLimitFilterInstance {
 }
 
 impl TokenLimitFilterInstance {
-    /// The single call site for [`BudgetStore::check`] -- see the module
-    /// doc's "Fail open on a store error" section for why this isolation
-    /// matters for the eventual remote-store swap.
-    fn check_budget(&self, key: &LimitKey) -> Result<LimitDecision, BudgetUnavailable> {
-        self.store.check(key, &self.rule, Instant::now())
+    /// Admit a request against its tenant's and key's control-plane limits.
+    /// Returns the refusal when one applies; on admission, keeps the leases
+    /// and the token buckets to charge at stream end.
+    ///
+    /// Both levels are enforced, so a key only narrows its tenant (a key
+    /// with no row adds no bucket and is bounded by the tenant alone). Token
+    /// budgets are checked first because the check does not mutate; stream
+    /// slots and request counts are taken only after. The key is admitted
+    /// before the tenant, so a refusal at the key level leaves the counters
+    /// its sibling keys share untouched. A tenant refusal after the key was
+    /// admitted can still count one request against that key; that errs
+    /// toward the narrower bucket.
+    ///
+    /// A backend error admits the request, as the static rule does (module
+    /// doc, "Fail open"); the in-process counters never return one.
+    fn admit_policy(
+        &mut self,
+        tenant: Option<&str>,
+        key_id: Option<&str>,
+    ) -> Option<(LimitDecision, Refusal)> {
+        let tenant = tenant?;
+        let buckets: Vec<(LimitKey, LimitPolicy)> = {
+            let snapshot = self.policy.as_ref()?.load();
+            let key_bucket = key_id.and_then(|id| {
+                snapshot
+                    .key_limits
+                    .get(&KeyId::new(id))
+                    .map(|limits| (LimitKey::for_key_policy(id), *limits))
+            });
+            let tenant_bucket = snapshot
+                .tenant_limits
+                .get(&TenantId::new(tenant))
+                .map(|limits| (LimitKey::for_tenant_policy(tenant), *limits));
+            key_bucket.into_iter().chain(tenant_bucket).collect()
+        };
+        if buckets.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+
+        for (key, limits) in &buckets {
+            if let Some(tokens) = limits.tokens_per_minute {
+                if let Ok(deny @ LimitDecision::Deny { .. }) =
+                    self.store.check(key, &policy_token_rule(tokens), now)
+                {
+                    return Some((deny, Refusal::Tokens));
+                }
+            }
+        }
+
+        let mut leases = Vec::new();
+        for (key, limits) in &buckets {
+            if let Some(max_streams) = limits.concurrent_streams {
+                match self.concurrency.try_acquire(key, max_streams) {
+                    Ok(Ok(lease)) => leases.push(lease),
+                    // Leases taken so far drop with `leases` here.
+                    Ok(Err(deny)) => return Some((deny, Refusal::Streams)),
+                    Err(BudgetUnavailable) => {}
+                }
+            }
+        }
+
+        for (key, limits) in &buckets {
+            if let Some(max_requests) = limits.requests_per_minute {
+                let limit = RequestLimit {
+                    max_requests,
+                    window: POLICY_WINDOW,
+                };
+                if let Ok(deny @ LimitDecision::Deny { .. }) =
+                    self.store.admit_request(key, &limit, now)
+                {
+                    return Some((deny, Refusal::Requests));
+                }
+            }
+        }
+
+        self.leases = leases;
+        self.policy_charges = buckets
+            .into_iter()
+            .filter_map(|(key, limits)| {
+                limits
+                    .tokens_per_minute
+                    .map(|tokens| (key, policy_token_rule(tokens)))
+            })
+            .collect();
+        None
     }
 
     /// Read `StreamInfo::llm.usage` and, if present, record it against
@@ -703,7 +909,13 @@ impl TokenLimitFilterInstance {
         }
         self.recorded = true;
 
-        let Some(key) = &self.key else {
+        // The bucket named in a missing-usage warning: the static rule's key
+        // when there is one, else the first control-plane bucket.
+        let Some(warn_key) = self
+            .key
+            .as_ref()
+            .or(self.policy_charges.first().map(|(key, _)| key))
+        else {
             return;
         };
 
@@ -721,7 +933,8 @@ impl TokenLimitFilterInstance {
         // exactly the case that must not stay invisible -- see the module
         // doc's "Loud on unreadable usage" section.
         let Some(usage) = usage else {
-            self.usage_missing_warner.warn_if_due(key, Instant::now());
+            self.usage_missing_warner
+                .warn_if_due(warn_key, Instant::now());
             return;
         };
 
@@ -735,8 +948,61 @@ impl TokenLimitFilterInstance {
         // is infallible from here regardless of backend (best-effort for a
         // remote store; see `token_limit`'s module doc), so there is nothing
         // to check on the return value.
-        self.store
-            .record(key, &self.rule, &usage, 1.0, Instant::now());
+        let now = Instant::now();
+        if let (Some(key), Some(rule)) = (&self.key, &self.rule) {
+            self.store.record(key, rule, &usage, 1.0, now);
+        }
+        for (key, rule) in &self.policy_charges {
+            self.store.record(key, rule, &usage, 1.0, now);
+        }
+    }
+
+    /// Refuse with 429 and the decision's rate-limit headers. The one place
+    /// this filter refuses a request, so the one place `RL` is set.
+    fn refuse(&self, cb: &mut dyn DecoderCallbacks, decision: LimitDecision, refusal: Refusal) {
+        let LimitDecision::Deny {
+            limit,
+            remaining,
+            reset_after,
+            retry_after,
+        } = decision
+        else {
+            return;
+        };
+        // Set *before* `send_local_reply` so a `%RESPONSE_FLAGS%` logger
+        // reading `StreamInfo` after this callback returns already sees it,
+        // the same ordering `auth_filter`/`router.rs` use for their own flags.
+        // Never set on a fail-open path: that request was admitted.
+        cb.stream_info()
+            .set_response_flag(ResponseFlag::RateLimited);
+        let reset_secs = reset_after.as_secs();
+        let retry_secs = retry_after.as_secs();
+        cb.send_local_reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            refusal.body(),
+            Some(Box::new(move |headers: &mut http::HeaderMap| {
+                // Rust note: `HeaderValue::from` on formatted decimal
+                // strings never fails (ASCII digits are always a valid
+                // header value), so these unwraps are total.
+                headers.insert(
+                    "x-ratelimit-limit",
+                    http::HeaderValue::from_str(&limit.to_string()).unwrap(),
+                );
+                headers.insert(
+                    "x-ratelimit-remaining",
+                    http::HeaderValue::from_str(&remaining.to_string()).unwrap(),
+                );
+                headers.insert(
+                    "x-ratelimit-reset",
+                    http::HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
+                );
+                headers.insert(
+                    "retry-after",
+                    http::HeaderValue::from_str(&retry_secs.to_string()).unwrap(),
+                );
+            })),
+            refusal.details(),
+        );
     }
 
     /// Terminates a `GET /v1/usage` request with the
@@ -884,93 +1150,53 @@ impl HttpFilter for TokenLimitFilterInstance {
 
         // Rust note: `stream_info()` hands back a `RefMut` guard that must not
         // be held across another call on `cb` (see its doc). Cloning the
-        // `Option<String>` out and letting the guard drop at the end of this
-        // statement keeps that rule visibly satisfied.
-        let tenant: Option<String> = cb.stream_info().auth.tenant.clone();
-
-        let key = match tenant {
-            // An identity the proxy assigned. The client's `authorization`
-            // header is deliberately not consulted at all on this path -- it
-            // has no influence on which bucket the request lands in.
-            Some(tenant) => LimitKey::for_tenant(route_name.as_str(), &tenant),
-            // No auth filter authenticated this stream. See the module doc's
-            // bucket-key section: the descriptor NAME differs from the
-            // authenticated case, so these two key spaces can never collide.
-            // `for_credential` hashes the raw value internally -- see its doc
-            // -- so there is no separate hashing step to forget here.
-            None => {
-                let credential = headers
-                    .headers
-                    .get(AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default();
-                LimitKey::for_credential(route_name.as_str(), credential)
-            }
+        // fields out and letting the guard drop at the end of this block
+        // keeps that rule visibly satisfied.
+        let (tenant, key_id): (Option<String>, Option<String>) = {
+            let info = cb.stream_info();
+            (info.auth.tenant.clone(), info.auth.key_id.clone())
         };
 
-        match self.check_budget(&key) {
+        if let Some(rule) = self.rule {
+            let key = match &tenant {
+                // An identity the proxy assigned. The client's `authorization`
+                // header is deliberately not consulted at all on this path --
+                // it has no influence on which bucket the request lands in.
+                Some(tenant) => LimitKey::for_tenant(route_name.as_str(), tenant),
+                // No auth filter authenticated this stream. See the module
+                // doc's bucket-key section: the descriptor NAME differs from
+                // the authenticated case, so these two key spaces can never
+                // collide. `for_credential` hashes the raw value internally --
+                // see its doc -- so there is no separate hashing step to
+                // forget here.
+                None => {
+                    let credential = headers
+                        .headers
+                        .get(AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default();
+                    LimitKey::for_credential(route_name.as_str(), credential)
+                }
+            };
             // Fail open: a store error is treated exactly like `Allow` (see
             // the module doc).
-            Ok(LimitDecision::Allow { .. }) | Err(BudgetUnavailable) => {}
-            Ok(LimitDecision::Deny {
-                limit,
-                remaining,
-                reset_after,
-                retry_after,
-            }) => {
-                self.key = Some(key);
-                // This is the one place this filter actually REFUSES a
-                // request (as opposed to the fail-open paths above, which
-                // admit it) -- so it's the one place `RL` belongs. Set
-                // *before* `send_local_reply` so a `%RESPONSE_FLAGS%` logger
-                // reading `StreamInfo` after this callback returns already
-                // sees it, same ordering `auth_filter`/`router.rs` use for
-                // their own flags. Never set on the fail-open branch above
-                // (`Allow`/`Err(BudgetUnavailable)`): that request was
-                // admitted, and `RL` would misreport a refusal that never
-                // happened (see the module doc's "Loud on unreadable usage"
-                // section for the analogous rule on warnings).
-                cb.stream_info()
-                    .set_response_flag(ResponseFlag::RateLimited);
-                let reset_secs = reset_after.as_secs();
-                let retry_secs = retry_after.as_secs();
-                cb.send_local_reply(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "token budget exceeded",
-                    Some(Box::new(move |headers: &mut http::HeaderMap| {
-                        // Rust note: `HeaderValue::from` on formatted decimal
-                        // strings never fails (ASCII digits are always a
-                        // valid header value), so these unwraps are total.
-                        headers.insert(
-                            "x-ratelimit-limit",
-                            http::HeaderValue::from_str(&limit.to_string()).unwrap(),
-                        );
-                        headers.insert(
-                            "x-ratelimit-remaining",
-                            http::HeaderValue::from_str(&remaining.to_string()).unwrap(),
-                        );
-                        headers.insert(
-                            "x-ratelimit-reset",
-                            http::HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
-                        );
-                        headers.insert(
-                            "retry-after",
-                            http::HeaderValue::from_str(&retry_secs.to_string()).unwrap(),
-                        );
-                    })),
-                    "token_limit_exceeded",
-                );
+            let decision = self.store.check(&key, &rule, Instant::now());
+            self.key = Some(key);
+            if let Ok(deny @ LimitDecision::Deny { .. }) = decision {
+                self.refuse(cb, deny, Refusal::Tokens);
                 // Rust note: the returned status is irrelevant here --
                 // `drive_decode` checks `ctx.local_reply.is_some()` right
                 // after this callback returns and stops the chain
-                // unconditionally when it's set, regardless of what status
-                // this function returns (see `filter_manager.rs`). `Continue`
-                // is returned only because the trait requires *a* value.
+                // unconditionally when it's set (see `filter_manager.rs`).
+                // `Continue` is returned only because the trait requires *a*
+                // value.
                 return FilterHeadersStatus::Continue;
             }
         }
 
-        self.key = Some(key);
+        if let Some((deny, refusal)) = self.admit_policy(tenant.as_deref(), key_id.as_deref()) {
+            self.refuse(cb, deny, refusal);
+        }
         FilterHeadersStatus::Continue
     }
 
@@ -1020,17 +1246,20 @@ impl HttpFilter for TokenLimitFilterInstance {
     /// charge twice, and a stream with no partial usage (a denial, a local
     /// reply) is left alone, not reported as missing usage.
     fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
-        if self.recorded {
-            return;
+        if !self.recorded {
+            let partial_usage = {
+                let info = cb.stream_info();
+                info.llm.completeness
+                    == Some(proxy_observability::records::UsageCompleteness::Partial)
+                    && info.llm.usage.is_some()
+            };
+            if partial_usage {
+                self.record_if_present(cb);
+            }
         }
-        let partial_usage = {
-            let info = cb.stream_info();
-            info.llm.completeness == Some(proxy_observability::records::UsageCompleteness::Partial)
-                && info.llm.usage.is_some()
-        };
-        if partial_usage {
-            self.record_if_present(cb);
-        }
+        // The stream is over: free its concurrent-stream slots now rather
+        // than whenever the filter instance is dropped.
+        self.leases.clear();
     }
 }
 
@@ -1105,7 +1334,9 @@ mod tests {
     #[test]
     fn config_parses_max_tokens_and_derives_window_from_fill_rate() {
         // max_tokens=60, fill_rate=1.0 token/sec -> a 60s window.
-        let rule = parse_config(&token_limit(60, 1.0)).expect("valid config");
+        let rule = parse_config(&token_limit(60, 1.0))
+            .expect("valid config")
+            .expect("both fields configure a static rule");
         assert_eq!(rule.on, TlLimitOn::Total);
         assert_eq!(rule.max_tokens, 60);
         assert_eq!(rule.window, Duration::from_secs(60));
@@ -1115,7 +1346,8 @@ mod tests {
     fn owned_config_is_not_artificially_capped_at_the_legacy_uint32_limit() {
         let max_tokens = u64::from(u32::MAX) + 1;
         let rule = parse_config(&token_limit(max_tokens, 1.0))
-            .expect("the owned uint64 budget must decode");
+            .expect("the owned uint64 budget must decode")
+            .expect("both fields configure a static rule");
         assert_eq!(rule.max_tokens, max_tokens);
     }
 
@@ -1366,10 +1598,14 @@ mod tests {
 
     fn filter_with(store: Arc<TestStore>) -> TokenLimitFilterInstance {
         TokenLimitFilterInstance {
-            rule: store.rule,
+            rule: Some(store.rule),
             store: Arc::clone(&store.store),
+            concurrency: Arc::new(InProcessConcurrencyLimiter::new()),
+            policy: None,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             key: None,
+            policy_charges: Vec::new(),
+            leases: Vec::new(),
             recorded: false,
         }
     }
@@ -1735,9 +1971,13 @@ mod tests {
     ) -> Option<(StatusCode, HeaderMap, String)> {
         let mut filter = TokenLimitFilterInstance {
             store: Arc::clone(&store.store),
-            rule: store.rule,
+            concurrency: Arc::new(InProcessConcurrencyLimiter::new()),
+            rule: Some(store.rule),
+            policy: None,
             usage_missing_warner: Arc::clone(warner),
             key: None,
+            policy_charges: Vec::new(),
+            leases: Vec::new(),
             recorded: false,
         };
         let mut cb = TestCallbacks::new(Some(route_named(route)));
@@ -2729,6 +2969,283 @@ mod tests {
         assert!(
             reply.is_none(),
             "an ordinary chat-completions request must be admitted exactly as before"
+        );
+    }
+
+    // --- tenant and key limits from the control plane -------------------------
+
+    use crate::auth::{HmacSecret, KeySet};
+    use crate::control::InMemoryControlPlaneStore;
+
+    fn control_plane() -> Arc<ControlPlane> {
+        Arc::new(
+            ControlPlane::new(
+                Box::new(InMemoryControlPlaneStore::default()),
+                HmacSecret::new(b"operator-secret"),
+                KeySet::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A policy-only `TokenLimit` (no static rule) built through the real
+    /// factory over `cp`, registered the way `llmproxy.auth` registers it.
+    fn policy_factory(cp: &Arc<ControlPlane>) -> Box<dyn FilterInstanceFactory> {
+        let ctx = FactoryContext::default();
+        ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(Arc::clone(cp) as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .unwrap();
+        match TokenLimitFilterFactory.create(&DynamicMessage::new(token_limit_desc()), &ctx) {
+            Ok(factory) => factory,
+            Err(e) => panic!("a policy-only config with auth must build: {e:?}"),
+        }
+    }
+
+    fn mint(cp: &ControlPlane, tenant: &str, key: &str) {
+        cp.mint_key(&TenantId::new(tenant), &KeyId::new(key))
+            .unwrap();
+    }
+
+    fn limits(
+        tokens_per_minute: Option<u64>,
+        requests_per_minute: Option<u64>,
+        concurrent_streams: Option<u32>,
+    ) -> LimitPolicy {
+        LimitPolicy {
+            tokens_per_minute,
+            requests_per_minute,
+            concurrent_streams,
+        }
+    }
+
+    /// Run `decode_headers` for an authenticated `tenant`/`key`. Returns the
+    /// live filter (holding any stream slots) and its callbacks.
+    fn admit(
+        factory: &dyn FilterInstanceFactory,
+        tenant: &str,
+        key: &str,
+    ) -> (Box<dyn HttpFilter>, TestCallbacks) {
+        let mut filter = factory.create_filter();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_authenticated_tenant(tenant);
+        cb.stream_info.borrow_mut().auth.key_id = Some(key.to_string());
+        let mut head = request_headers(Some("Bearer llmp_test"));
+        filter.decode_headers(&mut cb, &mut head, true);
+        (filter, cb)
+    }
+
+    /// The 429 body when refused, `None` when admitted.
+    fn refusal(factory: &dyn FilterInstanceFactory, tenant: &str, key: &str) -> Option<String> {
+        let (_filter, cb) = admit(factory, tenant, key);
+        cb.local_reply.map(|(status, _, body)| {
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            body
+        })
+    }
+
+    /// Admit, then end the stream having used `tokens`.
+    fn complete_with_usage(
+        factory: &dyn FilterInstanceFactory,
+        tenant: &str,
+        key: &str,
+        tokens: u64,
+    ) {
+        let (mut filter, mut cb) = admit(factory, tenant, key);
+        assert!(cb.local_reply.is_none(), "setup request must be admitted");
+        cb.set_usage(usage(tokens));
+        filter.encode_headers(&mut cb, &mut response_headers(), true);
+        filter.on_stream_complete(&mut cb);
+    }
+
+    #[test]
+    fn a_policy_only_config_without_auth_is_a_load_error() {
+        let ctx = FactoryContext::default();
+        let err =
+            match TokenLimitFilterFactory.create(&DynamicMessage::new(token_limit_desc()), &ctx) {
+                Ok(_) => panic!("a filter that would enforce nothing must not load"),
+                Err(e) => e,
+            };
+        match err {
+            ConfigError::InvalidValue { field_path, .. } => assert_eq!(field_path, "typed_config"),
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tenant_with_no_limits_row_is_admitted() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        let factory = policy_factory(&cp);
+        for _ in 0..5 {
+            assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+        }
+    }
+
+    #[test]
+    fn a_key_request_limit_narrows_its_tenant_and_a_sibling_keeps_the_tenant_limit() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        mint(&cp, "tenant-a", "key-b");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(None, Some(3), None)),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(None, Some(1), None)))
+            .unwrap();
+        let factory = policy_factory(&cp);
+
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+        // The tenant still has room; key-a's own limit refuses it.
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("request rate exceeded")
+        );
+        // key-b has no row, so only the tenant bounds it: 3 - 1 = 2 more.
+        assert_eq!(refusal(&*factory, "tenant-a", "key-b"), None);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-b"), None);
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-b").as_deref(),
+            Some("request rate exceeded")
+        );
+    }
+
+    #[test]
+    fn a_key_limit_never_widens_its_tenant() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(Some(10), None, None)),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(Some(100), None, None)))
+            .unwrap();
+        let factory = policy_factory(&cp);
+
+        complete_with_usage(&*factory, "tenant-a", "key-a", 10);
+        // The key has 90 tokens left; the tenant has none.
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("token budget exceeded")
+        );
+    }
+
+    #[test]
+    fn a_key_token_limit_refuses_while_the_tenant_has_room() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        mint(&cp, "tenant-a", "key-b");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(Some(100), None, None)),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(Some(5), None, None)))
+            .unwrap();
+        let factory = policy_factory(&cp);
+
+        complete_with_usage(&*factory, "tenant-a", "key-a", 5);
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("token budget exceeded")
+        );
+        assert_eq!(refusal(&*factory, "tenant-a", "key-b"), None);
+    }
+
+    #[test]
+    fn concurrent_streams_are_held_until_the_stream_completes() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        mint(&cp, "tenant-a", "key-b");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(None, None, Some(2))),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(None, None, Some(1))))
+            .unwrap();
+        let factory = policy_factory(&cp);
+
+        let (mut first, mut first_cb) = admit(&*factory, "tenant-a", "key-a");
+        assert!(first_cb.local_reply.is_none());
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("too many concurrent streams")
+        );
+        // key-b takes the tenant's second slot; a third stream is over the tenant.
+        let (_second, second_cb) = admit(&*factory, "tenant-a", "key-b");
+        assert!(second_cb.local_reply.is_none());
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-b").as_deref(),
+            Some("too many concurrent streams")
+        );
+
+        first.on_stream_complete(&mut first_cb);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+    }
+
+    #[test]
+    fn a_key_refusal_does_not_count_against_its_tenant() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        mint(&cp, "tenant-a", "key-b");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(None, Some(2), None)),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(None, Some(0), None)))
+            .unwrap();
+        let factory = policy_factory(&cp);
+
+        for _ in 0..3 {
+            assert!(refusal(&*factory, "tenant-a", "key-a").is_some());
+        }
+        assert_eq!(refusal(&*factory, "tenant-a", "key-b"), None);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-b"), None);
+    }
+
+    #[test]
+    fn a_limits_write_applies_on_the_next_request() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        let factory = policy_factory(&cp);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(None, Some(0), None)))
+            .unwrap();
+        assert!(refusal(&*factory, "tenant-a", "key-a").is_some());
+
+        cp.set_key_limits(&KeyId::new("key-a"), None).unwrap();
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+    }
+
+    #[test]
+    fn a_static_rule_and_tenant_limits_are_both_enforced() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(None, Some(1), None)),
+        )
+        .unwrap();
+        let ctx = FactoryContext::default();
+        ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(Arc::clone(&cp) as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .unwrap();
+        let factory =
+            match TokenLimitFilterFactory.create(&token_limit(1_000, 1_000.0 / 60.0), &ctx) {
+                Ok(factory) => factory,
+                Err(e) => panic!("valid config must build: {e:?}"),
+            };
+
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("request rate exceeded")
         );
     }
 }

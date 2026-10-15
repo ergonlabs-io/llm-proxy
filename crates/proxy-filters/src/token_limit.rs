@@ -155,6 +155,14 @@ pub enum LimitSubject {
     /// [`MAX_CREDENTIAL_WINDOWS`] distinct ones already hold a window. See
     /// [`InProcessBudgetStore`]'s "Bounded" section.
     CredentialOverflow,
+    /// A tenant's control-plane limit (`PUT /tenants/{id}/limits`). One
+    /// bucket per tenant across every route, and a key space separate from
+    /// [`Self::Tenant`], whose buckets belong to a configured per-route rule
+    /// and are what `GET /v1/usage` reports.
+    TenantPolicy(String),
+    /// A key's control-plane limit (`PUT /keys/{id}/limits`). Enforced in
+    /// addition to its tenant's bucket, so a key only narrows.
+    KeyPolicy(String),
 }
 
 impl LimitKey {
@@ -177,6 +185,24 @@ impl LimitKey {
         LimitKey {
             route: route.to_string(),
             subject: LimitSubject::Credential(CredentialDigest::hash(raw_credential)),
+        }
+    }
+
+    /// The bucket for a tenant's control-plane limit; see
+    /// [`LimitSubject::TenantPolicy`]. Route-independent.
+    pub fn for_tenant_policy(tenant: &str) -> Self {
+        LimitKey {
+            route: String::new(),
+            subject: LimitSubject::TenantPolicy(tenant.to_string()),
+        }
+    }
+
+    /// The bucket for a key's control-plane limit; see
+    /// [`LimitSubject::KeyPolicy`]. Route-independent.
+    pub fn for_key_policy(key_id: &str) -> Self {
+        LimitKey {
+            route: String::new(),
+            subject: LimitSubject::KeyPolicy(key_id.to_string()),
         }
     }
 
@@ -212,6 +238,9 @@ impl std::fmt::Display for LimitKey {
             LimitSubject::Tenant(tenant) => write!(f, "tenant={tenant}"),
             LimitSubject::Credential(digest) => write!(f, "cred={digest}"),
             LimitSubject::CredentialOverflow => f.write_str("cred=overflow"),
+            // Key ids, like tenant ids, are operator-chosen identifiers.
+            LimitSubject::TenantPolicy(tenant) => write!(f, "tenant-policy={tenant}"),
+            LimitSubject::KeyPolicy(key_id) => write!(f, "key-policy={key_id}"),
         }
     }
 }

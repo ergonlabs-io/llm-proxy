@@ -11,8 +11,13 @@ syntax = "proto3";
 package llmproxy.filters.v0;
 
 // Configures `llmproxy.token_limit`.
+//
+// `max_tokens` and `fill_rate` are set together or not at all. With neither,
+// the filter has no static rule and enforces only the tenant and key limits
+// stored in the control plane, which requires llmproxy.auth earlier in the
+// same chain.
 message TokenLimit {
-  // Required. The largest total token cost admitted in one fixed window.
+  // The largest total token cost admitted in one fixed window.
   //
   // This is a uint64 rather than the uint32 wrapper on the retired Envoy
   // stand-in: a budget is our domain value and LimitRule already represents it
@@ -20,7 +25,7 @@ message TokenLimit {
   // precise configuration error instead of proto3's ambiguous zero default.
   optional uint64 max_tokens = 1;
 
-  // Required. Tokens earned per second.  The fixed-window implementation
+  // Tokens earned per second.  The fixed-window implementation
   // derives its window as max_tokens / fill_rate seconds.
   //
   // `optional` distinguishes an omitted value from an explicit zero, letting
