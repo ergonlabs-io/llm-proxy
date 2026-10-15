@@ -436,7 +436,17 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
 
     let auth_filter = lower_auth(config, &mut warnings)?;
     warn_unenforced_tenant_controls(config, &mut warnings);
-    let token_limit_filter = lower_limits(config, &mut warnings)?;
+    let token_limit_filter = lower_limits(config, &mut warnings)?.or_else(|| {
+        // Tenant and key limits live in the admin store, so the limiter must
+        // be in the chain whenever `auth` is set, even with no `limits` entry.
+        // A filter a `limits` entry already added enforces them as well.
+        enforces_tenant_limits(config).then(|| {
+            json!({
+                "name": TOKEN_LIMIT_FILTER_NAME,
+                "typed_config": { "@type": TOKEN_LIMIT_FILTER_TYPE_URL }
+            })
+        })
+    });
     let pricing = lower_pricing(config, &mut warnings)?;
 
     let access_log = config
@@ -526,6 +536,13 @@ fn warn_unenforced_tenant_controls(config: &SimpleConfig, warnings: &mut Vec<Con
             "tenant model allow-lists are NOT enforced: llmproxy.model_authz is omitted, so \
              every authenticated tenant can call every routed model, and the admin API \
              refuses PUT /tenants/{id}/policy",
+        ));
+    }
+    if !auth.enforce.limits && config.limits.is_empty() {
+        warnings.push(warning(
+            "auth.enforce.limits",
+            "tenant and key rate limits are NOT enforced: llmproxy.token_limit is omitted, so \
+             the admin API refuses PUT /tenants/{id}/limits and PUT /keys/{id}/limits",
         ));
     }
     if !auth.enforce.spend {
@@ -1464,6 +1481,12 @@ fn allows_tenants_without_policy(config: &SimpleConfig) -> bool {
         && config.auth.as_ref().is_some_and(|auth| {
             auth.enforce.tenants_without_policy == Some(TenantsWithoutPolicy::Allow)
         })
+}
+
+/// `auth` is set and `auth.enforce.limits` is on: the chain carries
+/// `llmproxy.token_limit` for tenant and key limits.
+fn enforces_tenant_limits(config: &SimpleConfig) -> bool {
+    config.auth.as_ref().is_some_and(|auth| auth.enforce.limits)
 }
 
 /// `auth` is set and `auth.enforce.spend` is on: the chain carries

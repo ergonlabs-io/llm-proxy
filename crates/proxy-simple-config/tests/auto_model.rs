@@ -399,6 +399,10 @@ async fn build_handler(
     registry.register(Arc::new(
         proxy_filters::spend_limit_filter::SpendLimitFilterFactory,
     ));
+    // ...and tenant and key rate limits.
+    registry.register(Arc::new(
+        proxy_filters::token_limit_filter::TokenLimitFilterFactory,
+    ));
     let factory_ctx = FactoryContext::default();
     let mut filters = Vec::new();
     for f in hcm.http_filters.iter().filter(|f| !f.is_router) {

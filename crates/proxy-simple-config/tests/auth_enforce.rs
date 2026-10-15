@@ -9,6 +9,7 @@ use proxy_config::ConfigError;
 use proxy_filters::auth_filter::AuthFilterFactory;
 use proxy_filters::model_authz_filter::ModelAuthzFilterFactory;
 use proxy_filters::spend_limit_filter::SpendLimitFilterFactory;
+use proxy_filters::token_limit_filter::TokenLimitFilterFactory;
 use proxy_http::filter::{FactoryContext, HttpFilterFactory};
 use proxy_simple_config::{lower, lower_to_loaded, parse_simple_config_with_env, SimpleConfig};
 
@@ -120,6 +121,19 @@ fn the_lowered_chain_loads_strictly_and_the_real_factories_accept_it() {
             &ctx,
         )
         .expect("spend_limit");
+    TokenLimitFilterFactory
+        .create(
+            &config_of(proxy_filters::token_limit_filter::TYPE_URL),
+            &ctx,
+        )
+        .expect("token_limit in policy-only mode, over auth's control plane");
+    assert!(
+        ctx.shared
+            .get_across_scopes(proxy_filters::token_limit_filter::TYPE_URL)
+            .expect("one scope")
+            .is_some(),
+        "token_limit registers where the admin API's limits check looks"
+    );
     assert!(
         ctx.shared
             .get_across_scopes(proxy_filters::model_authz_filter::TYPE_URL)
@@ -303,4 +317,78 @@ fn tenants_without_policy_with_model_policy_off_is_a_load_error() {
         }
         other => panic!("expected InvalidValue, got {:?}", other.map(|_| ())),
     }
+}
+
+#[test]
+fn auth_adds_a_policy_only_token_limit_between_auth_and_usage() {
+    let text = with_auth("", PRICING);
+    let chain = names(&text);
+    let auth = chain.iter().position(|n| n == "llmproxy.auth");
+    let limit = chain.iter().position(|n| n == "llmproxy.token_limit");
+    let usage = chain.iter().position(|n| n == "llmproxy.usage");
+    assert!(
+        auth.is_some() && limit.is_some() && auth < limit,
+        "{chain:?}"
+    );
+    if usage.is_some() {
+        assert!(limit < usage, "{chain:?}");
+    }
+    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    let filters = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["http_filters"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let typed = &filters
+        .iter()
+        .find(|f| f["name"] == "llmproxy.token_limit")
+        .unwrap()["typed_config"];
+    assert!(
+        typed.get("max_tokens").is_none() && typed.get("fill_rate").is_none(),
+        "no static rule without a `limits` entry: {typed}"
+    );
+    lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts it");
+}
+
+#[test]
+fn enforce_limits_false_omits_token_limit_and_warns() {
+    let text = with_auth("  enforce: { limits: false }\n", PRICING);
+    let chain = names(&text);
+    assert!(
+        !chain.contains(&"llmproxy.token_limit".to_string()),
+        "{chain:?}"
+    );
+    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    assert!(
+        lowered
+            .warnings
+            .iter()
+            .any(|w| w.field_path == "auth.enforce.limits" && w.message.contains("NOT enforced")),
+        "{:?}",
+        lowered.warnings
+    );
+}
+
+#[test]
+fn a_limits_entry_keeps_one_token_limit_with_its_static_rule() {
+    let tail = format!("{PRICING}limits:\n  - {{ key: tenant, tokens_per_minute: 1000 }}\n");
+    let text = with_auth("  enforce: { limits: false }\n", &tail);
+    let chain = names(&text);
+    assert_eq!(
+        chain
+            .iter()
+            .filter(|n| n.as_str() == "llmproxy.token_limit")
+            .count(),
+        1,
+        "{chain:?}"
+    );
+    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    assert!(
+        !lowered
+            .warnings
+            .iter()
+            .any(|w| w.field_path == "auth.enforce.limits"),
+        "the filter is present, so tenant and key limits are enforced: {:?}",
+        lowered.warnings
+    );
 }

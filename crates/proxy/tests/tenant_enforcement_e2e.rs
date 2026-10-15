@@ -170,7 +170,7 @@ fn opting_out_of_enforcement_makes_the_admin_writes_409() {
     let dir = scratch_dir("opt-out");
     let proxy = Proxy::start(
         &dir,
-        &config_text("  enforce: { model_policy: false, spend: false }\n"),
+        &config_text("  enforce: { model_policy: false, spend: false, limits: false }\n"),
     );
     let _key = mint_key(&proxy);
     let created = http_post(
@@ -200,6 +200,110 @@ fn opting_out_of_enforcement_makes_the_admin_writes_409() {
     );
     assert!(budget.starts_with("HTTP/1.1 409"), "PUT budget:\n{budget}");
     assert!(budget.contains("not_enforced") && budget.contains("llmproxy.spend_limit"));
+
+    let limits = http_put(
+        proxy.admin,
+        &format!("/tenants/{TENANT}/limits"),
+        r#"{"limits":{"requests_per_minute":0}}"#,
+    );
+    assert!(limits.starts_with("HTTP/1.1 409"), "PUT limits:\n{limits}");
+    assert!(limits.contains("not_enforced"));
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tenant and key request limits through the dialect's default chain. A key's
+/// limit refuses it while its tenant still has room; a sibling key with no
+/// limits row is bounded by the tenant alone.
+#[test]
+fn a_key_limit_narrows_its_tenant_and_a_sibling_keeps_the_tenant_limit() {
+    let dir = scratch_dir("limits-narrow");
+    let proxy = Proxy::start(&dir, &config_text(""));
+    let key1 = mint_key(&proxy);
+    let key2 = mint_key_as(&proxy, "minted-2");
+    allow_all_models(&proxy);
+    create_tenant(&proxy);
+    put_ok(
+        &proxy,
+        &format!("/tenants/{TENANT}/limits"),
+        r#"{"limits":{"requests_per_minute":3}}"#,
+    );
+    put_ok(
+        &proxy,
+        &format!("/keys/{KEY_ID}/limits"),
+        r#"{"limits":{"requests_per_minute":1}}"#,
+    );
+
+    assert_admitted(&chat(&proxy, &key1), "key1, first request");
+    assert_rate_limited(
+        &chat(&proxy, &key1),
+        "key1 is over its own limit while the tenant has room",
+    );
+    assert_admitted(&chat(&proxy, &key2), "key2, tenant request 2 of 3");
+    assert_admitted(&chat(&proxy, &key2), "key2, tenant request 3 of 3");
+    assert_rate_limited(
+        &chat(&proxy, &key2),
+        "key2 has no limit of its own but the tenant is spent",
+    );
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A key limit above its tenant's never widens it.
+#[test]
+fn a_key_limit_never_widens_its_tenant() {
+    let dir = scratch_dir("limits-widen");
+    let proxy = Proxy::start(&dir, &config_text(""));
+    let key = mint_key(&proxy);
+    allow_all_models(&proxy);
+    create_tenant(&proxy);
+    put_ok(
+        &proxy,
+        &format!("/tenants/{TENANT}/limits"),
+        r#"{"limits":{"requests_per_minute":1}}"#,
+    );
+    put_ok(
+        &proxy,
+        &format!("/keys/{KEY_ID}/limits"),
+        r#"{"limits":{"requests_per_minute":100}}"#,
+    );
+
+    assert_admitted(&chat(&proxy, &key), "first request");
+    assert_rate_limited(
+        &chat(&proxy, &key),
+        "the key allows 100 but its tenant allows 1",
+    );
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Limits are control-plane rows: on the persistent store they survive a
+/// restart of the binary.
+#[test]
+fn limits_survive_a_restart_with_a_persistent_store() {
+    let dir = scratch_dir("limits-restart");
+    let store = dir.join("control.redb");
+    let auth_extra = format!(
+        "  store:\n    persistent:\n      path: \"{}\"\n",
+        store.display()
+    );
+
+    let proxy = Proxy::start(&dir, &config_text(&auth_extra));
+    let key = mint_key(&proxy);
+    allow_all_models(&proxy);
+    put_ok(
+        &proxy,
+        &format!("/keys/{KEY_ID}/limits"),
+        r#"{"limits":{"requests_per_minute":0}}"#,
+    );
+    assert_rate_limited(
+        &chat(&proxy, &key),
+        "a zero key limit refuses before the restart",
+    );
+    drop(proxy);
+
+    let proxy = Proxy::start(&dir, &config_text(&auth_extra));
+    assert_rate_limited(&chat(&proxy, &key), "the key limit is reloaded from redb");
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -469,4 +573,54 @@ fn spawn_ok_upstream() -> SocketAddr {
         }
     });
     addr
+}
+
+/// `POST /keys` for `key_id` on [`TENANT`]; returns the plaintext key.
+fn mint_key_as(proxy: &Proxy, key_id: &str) -> String {
+    let response = http_post(
+        proxy.admin,
+        "/keys",
+        Some(&format!("Bearer {ADMIN_TOKEN}")),
+        "application/json",
+        &format!(r#"{{"tenant":"{TENANT}","key_id":"{key_id}"}}"#),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 201"),
+        "POST /keys:\n{response}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(response_body(&response)).expect("POST /keys returns JSON");
+    parsed["key"].as_str().expect("plaintext key").to_string()
+}
+
+fn create_tenant(proxy: &Proxy) {
+    let created = http_post(
+        proxy.admin,
+        "/tenants",
+        Some(&format!("Bearer {ADMIN_TOKEN}")),
+        "application/json",
+        &format!(r#"{{"tenant":"{TENANT}"}}"#),
+    );
+    assert!(
+        created.starts_with("HTTP/1.1 2"),
+        "POST /tenants:\n{created}"
+    );
+}
+
+fn put_ok(proxy: &Proxy, path: &str, body: &str) {
+    let put = http_put(proxy.admin, path, body);
+    assert!(put.starts_with("HTTP/1.1 204"), "PUT {path}:\n{put}");
+}
+
+fn assert_admitted(response: &str, what: &str) {
+    assert!(response.starts_with("HTTP/1.1 200"), "{what}:\n{response}");
+}
+
+/// A 429 from the limiter itself: the body names the refusing limit, which
+/// the mock upstream (always 200) never produces.
+fn assert_rate_limited(response: &str, what: &str) {
+    assert!(
+        response.starts_with("HTTP/1.1 429") && response.contains("request rate exceeded"),
+        "{what}:\n{response}"
+    );
 }

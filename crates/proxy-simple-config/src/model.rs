@@ -426,6 +426,10 @@ pub struct AuthEnforce {
     pub model_policy: bool,
     #[serde(default = "default_true")]
     pub spend: bool,
+    /// Enforce tenant and key rate limits set through the admin API
+    /// (`PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits`).
+    #[serde(default = "default_true")]
+    pub limits: bool,
     /// What a tenant with no stored model policy may use. Absent means
     /// `deny`. Only meaningful with `model_policy: true`; set alongside
     /// `model_policy: false` it is a load error, since nothing would read it.
@@ -454,6 +458,7 @@ impl Default for AuthEnforce {
         Self {
             model_policy: true,
             spend: true,
+            limits: true,
             tenants_without_policy: None,
         }
     }
