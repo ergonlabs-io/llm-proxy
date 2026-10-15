@@ -739,6 +739,7 @@ impl VirtualKeyAuthenticator {
             keys,
             policies: crate::model_authz::TenantPolicyMap::new(),
             key_budgets: Default::default(),
+            key_policies: Default::default(),
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
         })));
@@ -960,6 +961,7 @@ mod tests {
             keys,
             policies: crate::model_authz::TenantPolicyMap::new(),
             key_budgets: HashMap::new(),
+            key_policies: HashMap::new(),
             key_tenants: HashMap::new(),
             tenant_credentials: HashMap::from([(TenantId::new("tenant-t"), Arc::new(set))]),
         })))

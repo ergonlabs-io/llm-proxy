@@ -65,12 +65,23 @@ use zeroize::Zeroizing;
 // there. See `spend.rs`'s module doc for why the boundary is drawn there.
 use crate::spend::{key_spend_subject, PeriodKey, TenantBudget};
 
+/// Names a key's row in both the budgets and policies tables.
 fn key_budget_subject(key_id: &KeyId) -> TenantId {
     key_spend_subject(key_id)
 }
 
+/// Recovers the key identity from its budgets or policies table subject.
 fn key_id_from_budget_subject(subject: &TenantId) -> Option<KeyId> {
     subject.as_str().strip_prefix("\u{1f}key:").map(KeyId::new)
+}
+
+fn reject_control_characters(field: &str, id: &str) -> Result<(), StoreError> {
+    if id.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} contains an ASCII control character"
+        )));
+    }
+    Ok(())
 }
 
 /// One key row exactly as a [`ControlPlaneStore`] persists it -- the
@@ -715,6 +726,10 @@ pub struct ControlPlaneSnapshot {
     /// from tenant authorization policy: keys authenticate to tenants, but a
     /// key budget neither grants models nor shares spend with sibling keys.
     pub key_budgets: HashMap<KeyId, TenantBudget>,
+    /// A key's own allow-list. Effective models are the tenant grant
+    /// intersected with this list, so it only narrows access; absent means
+    /// the key inherits the tenant grant exactly.
+    pub key_policies: HashMap<KeyId, ModelAccess>,
     /// Ownership copied from the durable key rows so admin writes can reject
     /// budgets for unknown keys without a hot-path store lookup.
     pub key_tenants: HashMap<KeyId, TenantId>,
@@ -2295,6 +2310,8 @@ pub struct KeyListing {
     /// (unlimited) -- see [`crate::spend::TenantBudget`]'s doc for why an
     /// absent budget and an explicit zero ceiling are not the same thing.
     pub budget: Option<TenantBudget>,
+    /// The key's own model allow-list, or `None` when it inherits its tenant.
+    pub model_access: Option<ModelAccess>,
 }
 
 // Rust note: hand-written, not derived, matching every other `Debug` in this
@@ -2308,6 +2325,7 @@ impl std::fmt::Debug for KeyListing {
             .field("tenant", &self.tenant)
             .field("revoked", &self.revoked)
             .field("budget", &self.budget)
+            .field("model_access", &self.model_access)
             .finish()
     }
 }
@@ -3049,6 +3067,7 @@ impl ControlPlane {
                 tenant: record.tenant.clone(),
                 revoked: record.revoked,
                 budget: snapshot.key_budgets.get(&record.key_id).copied(),
+                model_access: snapshot.key_policies.get(&record.key_id).cloned(),
             })
             .collect();
         keys.sort_by(|a, b| {
@@ -3070,6 +3089,8 @@ impl ControlPlane {
         crate::auth::check_principal_id("tenant", tenant.as_str())
             .and_then(|()| crate::auth::check_principal_id("key_id", key_id.as_str()))
             .map_err(StoreError::InvalidInput)?;
+        reject_control_characters("tenant", tenant.as_str())?;
+        reject_control_characters("key_id", key_id.as_str())?;
         let snapshot = self.published.load();
         if let Some(owner) = snapshot.key_tenants.get(key_id) {
             if owner != tenant {
@@ -3113,6 +3134,7 @@ impl ControlPlane {
 
     /// Creates `tenant`, then republishes.
     pub fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+        reject_control_characters("tenant", tenant.as_str())?;
         self.store.create_tenant(tenant)?;
         self.rebuild();
         Ok(())
@@ -3345,6 +3367,18 @@ impl ControlPlane {
             return Err(StoreError::NotFound);
         }
         self.store.set_budget(&key_budget_subject(key_id), budget)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Sets a key's own model allow-list and republishes. `ModelAccess::All`
+    /// returns the key to inheriting its tenant because All intersected with
+    /// the tenant grant is the tenant grant.
+    pub fn set_key_policy(&self, key_id: &KeyId, access: &ModelAccess) -> Result<(), StoreError> {
+        if !self.handle().load().key_tenants.contains_key(key_id) {
+            return Err(StoreError::NotFound);
+        }
+        self.store.set_policy(&key_budget_subject(key_id), access)?;
         self.rebuild();
         Ok(())
     }
@@ -3650,7 +3684,12 @@ impl ControlPlane {
             }
         });
         let mut policies: TenantPolicyMap = HashMap::new();
+        let mut key_policies = HashMap::new();
         for (tenant, access) in loaded.policies {
+            if let Some(key_id) = key_id_from_budget_subject(&tenant) {
+                key_policies.insert(key_id, access);
+                continue;
+            }
             let budget = budgets.remove(&tenant);
             policies.insert(
                 tenant.as_str().to_string(),
@@ -3675,6 +3714,7 @@ impl ControlPlane {
             keys,
             policies,
             key_budgets,
+            key_policies,
             key_tenants,
             tenant_credentials: HashMap::new(),
         }
@@ -3838,6 +3878,7 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         keys,
         policies: TenantPolicyMap::new(),
         key_budgets: HashMap::new(),
+        key_policies: HashMap::new(),
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
     })))
@@ -4610,6 +4651,183 @@ mod tests {
     }
 
     // --- ControlPlane write methods ---------
+
+    #[test]
+    fn set_key_policy_publishes_separately_from_tenant_policies() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let key = KeyId::new("key-a");
+        cp.mint_key(&TenantId::new("tenant-a"), &key).unwrap();
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        cp.set_key_policy(&key, &access).unwrap();
+        let snapshot = cp.handle().load();
+        assert_eq!(snapshot.key_policies.get(&key), Some(&access));
+        assert!(!snapshot
+            .policies
+            .contains_key(key_budget_subject(&key).as_str()));
+        assert_eq!(
+            cp.store()
+                .load()
+                .unwrap()
+                .policies
+                .get(&key_budget_subject(&key)),
+            Some(&access)
+        );
+        cp.set_key_policy(&key, &ModelAccess::All).unwrap();
+        assert_eq!(
+            cp.handle().load().key_policies.get(&key),
+            Some(&ModelAccess::All)
+        );
+    }
+
+    #[test]
+    fn set_key_policy_unknown_key_writes_nothing() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let before = cp.store().policy_generation().unwrap();
+        let published = cp.handle().load_full();
+        assert_eq!(
+            cp.set_key_policy(&KeyId::new("missing"), &ModelAccess::All),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(cp.store().policy_generation().unwrap(), before);
+        assert!(cp.store().load().unwrap().policies.is_empty());
+        assert!(Arc::ptr_eq(&published, &cp.handle().load_full()));
+    }
+
+    #[test]
+    fn key_policy_and_budget_survive_both_write_orders() {
+        for policy_first in [true, false] {
+            let cp = ControlPlane::new(
+                Box::new(InMemoryControlPlaneStore::default()),
+                HmacSecret::new(b"secret"),
+                KeySet::new(),
+            )
+            .unwrap();
+            let key = KeyId::new("key-a");
+            cp.mint_key(&TenantId::new("tenant-a"), &key).unwrap();
+            let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+            let budget = TenantBudget {
+                max_micros: MicroUsd::from_micros(50),
+                period: Period::Daily,
+                credential_source: CredentialSource::Platform,
+            };
+            if policy_first {
+                cp.set_key_policy(&key, &access).unwrap();
+                cp.set_key_budget(&key, Some(&budget)).unwrap();
+            } else {
+                cp.set_key_budget(&key, Some(&budget)).unwrap();
+                cp.set_key_policy(&key, &access).unwrap();
+            }
+            let snapshot = cp.handle().load();
+            assert_eq!(snapshot.key_policies.get(&key), Some(&access));
+            assert_eq!(snapshot.key_budgets.get(&key), Some(&budget));
+            assert!(!snapshot
+                .policies
+                .contains_key(key_budget_subject(&key).as_str()));
+        }
+    }
+
+    #[test]
+    fn redb_key_policy_survives_reopen_and_rebuild() {
+        let path = temp_db_path("key-policy-survives-reopen");
+        let key = KeyId::new("key-a");
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        {
+            let cp = ControlPlane::new(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                HmacSecret::new(b"secret"),
+                KeySet::new(),
+            )
+            .unwrap();
+            cp.mint_key(&TenantId::new("tenant-a"), &key).unwrap();
+            cp.set_key_policy(&key, &access).unwrap();
+        }
+        let cp = ControlPlane::new(
+            Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        cp.rebuild();
+        assert_eq!(cp.handle().load().key_policies.get(&key), Some(&access));
+        assert!(!cp
+            .handle()
+            .load()
+            .policies
+            .contains_key(key_budget_subject(&key).as_str()));
+    }
+
+    #[test]
+    fn list_keys_reports_optional_key_model_access() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let tenant = TenantId::new("tenant-a");
+        let restricted = KeyId::new("restricted");
+        let inherited = KeyId::new("inherited");
+        cp.mint_key(&tenant, &restricted).unwrap();
+        cp.mint_key(&tenant, &inherited).unwrap();
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
+        cp.set_key_policy(&restricted, &access).unwrap();
+        let listing = cp.list_keys();
+        assert_eq!(
+            listing
+                .iter()
+                .find(|row| row.key_id == restricted)
+                .unwrap()
+                .model_access,
+            Some(access)
+        );
+        assert_eq!(
+            listing
+                .iter()
+                .find(|row| row.key_id == inherited)
+                .unwrap()
+                .model_access,
+            None
+        );
+    }
+
+    #[test]
+    fn control_characters_in_tenant_and_key_ids_write_nothing() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let before = cp.store().policy_generation().unwrap();
+        let bad_tenant = TenantId::new("\u{1f}key:x");
+        assert!(matches!(
+            cp.create_tenant(&bad_tenant),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cp.mint_key(&bad_tenant, &KeyId::new("ok")),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cp.mint_key(&TenantId::new("ok"), &KeyId::new("bad\nkey")),
+            Err(StoreError::InvalidInput(_))
+        ));
+        let loaded = cp.store().load().unwrap();
+        assert!(loaded.tenants.is_empty());
+        assert!(loaded.keys.is_empty());
+        assert!(loaded.policies.is_empty());
+        assert_eq!(cp.store().policy_generation().unwrap(), before);
+    }
 
     // --- mint_key produces a key that authenticates
 

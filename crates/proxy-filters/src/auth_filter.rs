@@ -2142,6 +2142,7 @@ mod tests {
             keys,
             policies: crate::model_authz::TenantPolicyMap::new(),
             key_budgets: std::collections::HashMap::new(),
+            key_policies: std::collections::HashMap::new(),
             key_tenants: std::collections::HashMap::new(),
             tenant_credentials: std::collections::HashMap::from([(
                 TenantId::new("tenant-t"),

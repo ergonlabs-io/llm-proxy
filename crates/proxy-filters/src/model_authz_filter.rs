@@ -1062,6 +1062,7 @@ mod tests {
             keys: KeySet::new(),
             policies,
             key_budgets: Default::default(),
+            key_policies: Default::default(),
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
         })));
