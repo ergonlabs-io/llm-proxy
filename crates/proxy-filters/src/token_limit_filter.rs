@@ -455,10 +455,11 @@ fn create_filter_factory(
     let shared = ctx
         .shared
         .get_or_try_init(&scope, &ctx.stat_prefix, config_type_url, || {
-            let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new(rule));
+            let store: Arc<dyn BudgetStore> = Arc::new(InProcessBudgetStore::new());
             let usage_missing_warner = Arc::new(UsageMissingWarner::new());
             Ok(Arc::new(SharedTokenLimitState {
                 store,
+                rule,
                 usage_missing_warner,
             }) as Arc<dyn std::any::Any + Send + Sync>)
         })?
@@ -467,6 +468,7 @@ fn create_filter_factory(
 
     Ok(Box::new(TokenLimitInstanceFactory {
         store: Arc::clone(&shared.store),
+        rule: shared.rule,
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
     }))
 }
@@ -479,11 +481,13 @@ fn create_filter_factory(
 /// different rule).
 struct SharedTokenLimitState {
     store: Arc<dyn BudgetStore>,
+    rule: LimitRule,
     usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
 struct TokenLimitInstanceFactory {
     store: Arc<dyn BudgetStore>,
+    rule: LimitRule,
     usage_missing_warner: Arc<UsageMissingWarner>,
 }
 
@@ -491,6 +495,7 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(TokenLimitFilterInstance {
             store: Arc::clone(&self.store),
+            rule: self.rule,
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             key: None,
             recorded: false,
@@ -660,6 +665,7 @@ impl UsageMissingWarner {
 /// state of this struct itself.
 struct TokenLimitFilterInstance {
     store: Arc<dyn BudgetStore>,
+    rule: LimitRule,
     /// Shared across every stream this listener serves -- see
     /// [`UsageMissingWarner`]'s doc for why it needs to outlive one stream.
     usage_missing_warner: Arc<UsageMissingWarner>,
@@ -679,7 +685,7 @@ impl TokenLimitFilterInstance {
     /// doc's "Fail open on a store error" section for why this isolation
     /// matters for the eventual remote-store swap.
     fn check_budget(&self, key: &LimitKey) -> Result<LimitDecision, BudgetUnavailable> {
-        self.store.check(key, Instant::now())
+        self.store.check(key, &self.rule, Instant::now())
     }
 
     /// Read `StreamInfo::llm.usage` and, if present, record it against
@@ -729,7 +735,8 @@ impl TokenLimitFilterInstance {
         // is infallible from here regardless of backend (best-effort for a
         // remote store; see `token_limit`'s module doc), so there is nothing
         // to check on the return value.
-        self.store.record(key, &usage, 1.0, Instant::now());
+        self.store
+            .record(key, &self.rule, &usage, 1.0, Instant::now());
     }
 
     /// Terminates a `GET /v1/usage` request with the
@@ -1334,17 +1341,33 @@ mod tests {
         }
     }
 
-    fn store_with(max_tokens: u64, window: Duration) -> Arc<dyn BudgetStore> {
-        Arc::new(InProcessBudgetStore::new(LimitRule {
-            on: LimitOn::Total,
-            max_tokens,
-            window,
-        }))
+    struct TestStore {
+        store: Arc<dyn BudgetStore>,
+        rule: LimitRule,
     }
 
-    fn filter_with(store: Arc<dyn BudgetStore>) -> TokenLimitFilterInstance {
+    impl std::ops::Deref for TestStore {
+        type Target = dyn BudgetStore;
+        fn deref(&self) -> &Self::Target {
+            &*self.store
+        }
+    }
+
+    fn store_with(max_tokens: u64, window: Duration) -> Arc<TestStore> {
+        Arc::new(TestStore {
+            store: Arc::new(InProcessBudgetStore::new()),
+            rule: LimitRule {
+                on: LimitOn::Total,
+                max_tokens,
+                window,
+            },
+        })
+    }
+
+    fn filter_with(store: Arc<TestStore>) -> TokenLimitFilterInstance {
         TokenLimitFilterInstance {
-            store,
+            rule: store.rule,
+            store: Arc::clone(&store.store),
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             key: None,
             recorded: false,
@@ -1361,7 +1384,7 @@ mod tests {
     /// `StreamInfo` beforehand exactly like the real usage filter would
     /// have. Returns whatever `send_local_reply` recorded, if any.
     fn run_request(
-        store: &Arc<dyn BudgetStore>,
+        store: &Arc<TestStore>,
         route: &str,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
@@ -1374,7 +1397,7 @@ mod tests {
     /// the ordering the module doc requires. `credential` is still passed
     /// through so a test can prove the header does NOT influence the bucket.
     fn run_request_as_tenant(
-        store: &Arc<dyn BudgetStore>,
+        store: &Arc<TestStore>,
         route: &str,
         tenant: &str,
         credential: Option<&str>,
@@ -1384,7 +1407,7 @@ mod tests {
     }
 
     fn run_request_inner(
-        store: &Arc<dyn BudgetStore>,
+        store: &Arc<TestStore>,
         route: &str,
         tenant: Option<&str>,
         credential: Option<&str>,
@@ -1440,10 +1463,7 @@ mod tests {
     /// One request whose stream ends part-way (`abort`) or cleanly, carrying
     /// usage the way the usage filter leaves it, then completed the way the
     /// filter manager completes every stream.
-    fn run_stream(
-        store: &Arc<dyn BudgetStore>,
-        abort: bool,
-    ) -> Option<(StatusCode, HeaderMap, String)> {
+    fn run_stream(store: &Arc<TestStore>, abort: bool) -> Option<(StatusCode, HeaderMap, String)> {
         let mut filter = filter_with(Arc::clone(store));
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         let mut head = request_headers(Some("Bearer sk-1"));
@@ -1616,6 +1636,7 @@ mod tests {
         assert_eq!(
             store.check(
                 &LimitKey::for_credential("r1", "Bearer sk-1"),
+                &store.rule,
                 Instant::now()
             ),
             Ok(LimitDecision::Allow {
@@ -1706,14 +1727,15 @@ mod tests {
     /// for every test except the ones in this section that need to observe
     /// suppression *across* requests.
     fn run_request_with_shared_warner(
-        store: &Arc<dyn BudgetStore>,
+        store: &Arc<TestStore>,
         warner: &Arc<UsageMissingWarner>,
         route: &str,
         credential: Option<&str>,
         usage: Option<LlmTokenUsage>,
     ) -> Option<(StatusCode, HeaderMap, String)> {
         let mut filter = TokenLimitFilterInstance {
-            store: Arc::clone(store),
+            store: Arc::clone(&store.store),
+            rule: store.rule,
             usage_missing_warner: Arc::clone(warner),
             key: None,
             recorded: false,
@@ -2224,6 +2246,7 @@ mod tests {
         // only the variant and its two stable fields are asserted.
         match store.check(
             &LimitKey::for_credential("r1", "Bearer sk-a"),
+            &store.rule,
             Instant::now(),
         ) {
             Ok(LimitDecision::Deny {
@@ -2312,12 +2335,28 @@ mod tests {
         fn check(
             &self,
             _key: &LimitKey,
+            _rule: &LimitRule,
             _now: Instant,
         ) -> Result<LimitDecision, BudgetUnavailable> {
             Err(BudgetUnavailable)
         }
-        fn record(&self, _key: &LimitKey, _usage: &TokenUsage, _weight: f64, _now: Instant) {
+        fn record(
+            &self,
+            _key: &LimitKey,
+            _rule: &LimitRule,
+            _usage: &TokenUsage,
+            _weight: f64,
+            _now: Instant,
+        ) {
             panic!("record must not be called by this test -- it never gets past decode_headers if fail-open is broken in the deny direction, and this test only exercises decode_headers")
+        }
+        fn admit_request(
+            &self,
+            _key: &LimitKey,
+            _limit: &crate::token_limit::RequestLimit,
+            _now: Instant,
+        ) -> Result<LimitDecision, BudgetUnavailable> {
+            Err(BudgetUnavailable)
         }
         fn usage_for_tenant(
             &self,
@@ -2332,7 +2371,14 @@ mod tests {
 
     #[test]
     fn a_store_error_fails_open_and_admits_the_request() {
-        let store: Arc<dyn BudgetStore> = Arc::new(AlwaysErrorsStore);
+        let store = Arc::new(TestStore {
+            store: Arc::new(AlwaysErrorsStore),
+            rule: LimitRule {
+                on: LimitOn::Total,
+                max_tokens: 10,
+                window: Duration::from_secs(60),
+            },
+        });
         let mut filter = filter_with(store);
 
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
@@ -2354,7 +2400,7 @@ mod tests {
     /// `tenant` stands in for whatever an upstream `llmproxy.auth` filter
     /// would have written; `None` mirrors no auth filter having run.
     fn run_usage_request(
-        store: &Arc<dyn BudgetStore>,
+        store: &Arc<TestStore>,
         tenant: Option<&str>,
         uri: &str,
         extra_header: Option<(&str, &str)>,
@@ -2386,9 +2432,10 @@ mod tests {
     /// store -- the fastest way to give a test a specific "current window"
     /// number to assert on, without driving a whole request/response cycle
     /// through the filter for each one.
-    fn seed_tenant_usage(store: &Arc<dyn BudgetStore>, route: &str, tenant: &str, used: u64) {
+    fn seed_tenant_usage(store: &Arc<TestStore>, route: &str, tenant: &str, used: u64) {
         store.record(
             &LimitKey::for_tenant(route, tenant),
+            &store.rule,
             &TokenUsage {
                 input_tokens: used,
                 ..Default::default()
@@ -2570,7 +2617,14 @@ mod tests {
     /// policy.
     #[test]
     fn usage_endpoint_returns_503_when_the_budget_store_is_unavailable() {
-        let store: Arc<dyn BudgetStore> = Arc::new(AlwaysErrorsStore);
+        let store = Arc::new(TestStore {
+            store: Arc::new(AlwaysErrorsStore),
+            rule: LimitRule {
+                on: LimitOn::Total,
+                max_tokens: 10,
+                window: Duration::from_secs(60),
+            },
+        });
 
         let (status, _headers, body) = run_usage_request(&store, Some("acme"), "/v1/usage", None)
             .expect("a store error must still produce a reply, not a silent proxy-through");
