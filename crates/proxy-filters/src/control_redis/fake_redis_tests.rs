@@ -353,8 +353,9 @@ fn answer(
             }
             b"+QUEUED\r\n".to_vec()
         }
-        // `add_spend`'s script is the only one whose keys are spend rows.
-        "EVALSHA" if mentions(":spend:") => {
+        // `add_spend`'s script is the only one whose keys are spend rows;
+        // window deliveries ride the same lane and gate.
+        "EVALSHA" if mentions(":spend:") || mentions(":win:") => {
             if !pass(shared, Gate::SpendFlush) {
                 return None;
             }
@@ -1280,4 +1281,62 @@ fn an_operator_overwrite_keeps_the_rows_expiry() {
         spend_expires_at(&period).to_string(),
         "and it is the period's"
     );
+}
+
+/// A window batch is pipelined like spend's: one `SCRIPT LOAD`, then one
+/// `EVALSHA` per row, and every delivery carries `EXPIREAT` window end plus
+/// the grace, on the spend lane.
+#[test]
+fn a_window_batch_is_pipelined_and_each_delivery_expires_after_its_window() {
+    use crate::control::{WindowDelta, WindowDimension, WindowKey, WindowRow};
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    store.policy_generation().expect("policy_generation");
+    let rows: Vec<WindowRow> = (0..3)
+        .map(|i| WindowRow {
+            subject: format!("subject-{i}"),
+            dimension: WindowDimension::TotalTokens,
+            window: WindowKey::containing(1_000_000 + i * 60, 60),
+        })
+        .collect();
+    let deltas: Vec<WindowDelta<'_>> = rows
+        .iter()
+        .map(|row| WindowDelta {
+            row,
+            delta: 9,
+            seq: 4,
+        })
+        .collect();
+    let mark = fake.wire_len();
+
+    let results = store.add_window_batch("chain", "node-a", &deltas);
+
+    assert_eq!(results, vec![Ok(SPEND_TOTAL); 3]);
+    let wire = fake.wire_since(mark);
+    let names: Vec<&str> = wire.iter().map(|(_, args)| args[0].as_str()).collect();
+    assert_eq!(names, ["SCRIPT", "EVALSHA", "EVALSHA", "EVALSHA"]);
+    let conns: HashSet<usize> = wire.iter().map(|(conn, _)| *conn).collect();
+    assert_eq!(conns.len(), 1, "one pipeline on one connection");
+    for ((_, args), row) in wire[1..].iter().zip(&rows) {
+        // EVALSHA sha 2 win_key winseq_key node seq delta expires_at
+        assert!(args[3].contains(":win:{"), "{args:?}");
+        assert!(args[4].contains(":winseq:{"), "{args:?}");
+        assert_eq!(args[5], "node-a");
+        assert_eq!(args[6], "4");
+        assert_eq!(args[7], "9");
+        assert_eq!(
+            args[8],
+            (row.window.end_secs() + crate::control::WINDOW_ROW_GRACE_SECS).to_string()
+        );
+    }
+}
+
+/// The fake runs no Lua, so dedup is guarded on the script text, the way the
+/// spend script is: the replay check reads the hash keyed by node id.
+#[test]
+fn add_window_script_dedups_on_the_node_id_hash_and_always_expires() {
+    assert!(ADD_WINDOW_LUA.contains("redis.call('HGET', KEYS[2], ARGV[1])"));
+    assert!(ADD_WINDOW_LUA.contains("if seq <= last then"));
+    assert!(ADD_WINDOW_LUA.contains("redis.call('EXPIREAT', KEYS[1], expires_at)"));
+    assert!(ADD_WINDOW_LUA.contains("redis.call('EXPIREAT', KEYS[2], expires_at)"));
 }

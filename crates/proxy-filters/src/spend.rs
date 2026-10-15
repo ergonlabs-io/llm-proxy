@@ -3020,6 +3020,29 @@ pub(crate) mod tests {
         struct AlwaysFailsLoadSpend(InMemoryControlPlaneStore);
 
         impl ControlPlaneStore for AlwaysFailsLoadSpend {
+            fn add_window_batch(
+                &self,
+                scope: &str,
+                node_id: &str,
+                rows: &[crate::control::WindowDelta<'_>],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.0.add_window_batch(scope, node_id, rows)
+            }
+            fn last_window_seq_batch(
+                &self,
+                scope: &str,
+                node_id: &str,
+                rows: &[crate::control::WindowRow],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.0.last_window_seq_batch(scope, node_id, rows)
+            }
+            fn load_window_batch(
+                &self,
+                scope: &str,
+                rows: &[crate::control::WindowRow],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.0.load_window_batch(scope, rows)
+            }
             fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
                 self.0.load()
             }
@@ -3317,6 +3340,29 @@ pub(crate) mod tests {
     struct AlwaysFailsAddSpend(InMemoryControlPlaneStore);
 
     impl ControlPlaneStore for AlwaysFailsAddSpend {
+        fn add_window_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[crate::control::WindowDelta<'_>],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.0.add_window_batch(scope, node_id, rows)
+        }
+        fn last_window_seq_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[crate::control::WindowRow],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.0.last_window_seq_batch(scope, node_id, rows)
+        }
+        fn load_window_batch(
+            &self,
+            scope: &str,
+            rows: &[crate::control::WindowRow],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.0.load_window_batch(scope, rows)
+        }
         fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
             self.0.load()
         }
@@ -3693,6 +3739,29 @@ pub(crate) mod tests {
         }
 
         impl ControlPlaneStore for LosesTheFirstResponse {
+            fn add_window_batch(
+                &self,
+                scope: &str,
+                node_id: &str,
+                rows: &[crate::control::WindowDelta<'_>],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.inner.add_window_batch(scope, node_id, rows)
+            }
+            fn last_window_seq_batch(
+                &self,
+                scope: &str,
+                node_id: &str,
+                rows: &[crate::control::WindowRow],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.inner.last_window_seq_batch(scope, node_id, rows)
+            }
+            fn load_window_batch(
+                &self,
+                scope: &str,
+                rows: &[crate::control::WindowRow],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.inner.load_window_batch(scope, rows)
+            }
             fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
                 self.inner.load()
             }
@@ -3870,6 +3939,29 @@ pub(crate) mod tests {
         struct PanicsOnOverwrite(InMemoryControlPlaneStore);
 
         impl ControlPlaneStore for PanicsOnOverwrite {
+            fn add_window_batch(
+                &self,
+                scope: &str,
+                node_id: &str,
+                rows: &[crate::control::WindowDelta<'_>],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.0.add_window_batch(scope, node_id, rows)
+            }
+            fn last_window_seq_batch(
+                &self,
+                scope: &str,
+                node_id: &str,
+                rows: &[crate::control::WindowRow],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.0.last_window_seq_batch(scope, node_id, rows)
+            }
+            fn load_window_batch(
+                &self,
+                scope: &str,
+                rows: &[crate::control::WindowRow],
+            ) -> Vec<Result<u64, crate::control::StoreError>> {
+                self.0.load_window_batch(scope, rows)
+            }
             fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
                 self.0.load()
             }
@@ -4247,6 +4339,29 @@ pub(crate) mod tests {
     }
 
     impl ControlPlaneStore for ProbeStore {
+        fn add_window_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[crate::control::WindowDelta<'_>],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.inner.add_window_batch(scope, node_id, rows)
+        }
+        fn last_window_seq_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[crate::control::WindowRow],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.inner.last_window_seq_batch(scope, node_id, rows)
+        }
+        fn load_window_batch(
+            &self,
+            scope: &str,
+            rows: &[crate::control::WindowRow],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.inner.load_window_batch(scope, rows)
+        }
         fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
             self.inner.load()
         }

@@ -621,6 +621,29 @@ struct RivalWritesAfterFirstPut {
 // Rust note: the trait has no default for most methods, so a wrapper must
 // forward every one; only `put_rate_card` adds behaviour.
 impl ControlPlaneStore for RivalWritesAfterFirstPut {
+    fn add_window_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[crate::control::WindowDelta<'_>],
+    ) -> Vec<Result<u64, crate::control::StoreError>> {
+        self.inner.add_window_batch(scope, node_id, rows)
+    }
+    fn last_window_seq_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[crate::control::WindowRow],
+    ) -> Vec<Result<u64, crate::control::StoreError>> {
+        self.inner.last_window_seq_batch(scope, node_id, rows)
+    }
+    fn load_window_batch(
+        &self,
+        scope: &str,
+        rows: &[crate::control::WindowRow],
+    ) -> Vec<Result<u64, crate::control::StoreError>> {
+        self.inner.load_window_batch(scope, rows)
+    }
     fn load(&self) -> Result<crate::control::StoredControlPlane, crate::control::StoreError> {
         self.inner.load()
     }

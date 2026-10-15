@@ -84,8 +84,8 @@ use crate::control::{
     decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
     EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
     EncodedTenantCredentialRow, FlushToken, LimitPolicy, SpendDelta, StoreError,
-    StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, SPEND_SCHEMA_VERSION,
-    TENANT_CREDENTIALS_SCHEMA_VERSION,
+    StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, WindowDelta, WindowRow,
+    SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
@@ -261,6 +261,27 @@ if expires_at > 0 then
   redis.call('EXPIREAT', KEYS[1], expires_at)
   redis.call('EXPIREAT', KEYS[2], expires_at)
 end
+return total
+"#;
+
+/// [`ControlPlaneStore::add_window_batch`]'s per-row script: the same shape as
+/// [`ADD_SPEND_LUA`] (read the node's high-water mark, drop a replay, `INCRBY`),
+/// with the expiry computed by the caller as the window end plus
+/// `WINDOW_ROW_GRACE_SECS`. `KEYS[1]` = the window total, `KEYS[2]` = the
+/// per-node sequence hash, `ARGV[1]` = node id, `ARGV[2]` = seq, `ARGV[3]` =
+/// delta, `ARGV[4]` = expiry as Unix seconds. Both keys always get the expiry
+/// so a window row cannot outlive its window by more than the grace.
+const ADD_WINDOW_LUA: &str = r#"
+local last = tonumber(redis.call('HGET', KEYS[2], ARGV[1]) or '0')
+local seq = tonumber(ARGV[2])
+if seq <= last then
+  return tonumber(redis.call('GET', KEYS[1]) or '0')
+end
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+local total = redis.call('INCRBY', KEYS[1], ARGV[3])
+local expires_at = tonumber(ARGV[4])
+redis.call('EXPIREAT', KEYS[1], expires_at)
+redis.call('EXPIREAT', KEYS[2], expires_at)
 return total
 "#;
 
@@ -515,6 +536,7 @@ pub struct RedisControlPlaneStore {
     io_timeout: Duration,
     namespace: String,
     add_spend_script: Script,
+    add_window_script: Script,
     revoke_key_script: Script,
     delete_tenant_credential_script: Script,
     delete_tenant_script: Script,
@@ -562,6 +584,7 @@ impl RedisControlPlaneStore {
             io_timeout: IO_TIMEOUT,
             namespace: namespace.into(),
             add_spend_script: Script::new(ADD_SPEND_LUA),
+            add_window_script: Script::new(ADD_WINDOW_LUA),
             revoke_key_script: Script::new(REVOKE_KEY_LUA),
             delete_tenant_credential_script: Script::new(DELETE_TENANT_CREDENTIAL_LUA),
             delete_tenant_script: Script::new(DELETE_TENANT_LUA),
@@ -692,6 +715,35 @@ impl RedisControlPlaneStore {
         )
     }
 
+    /// The shared hash tag of a window row's two keys, escaped like
+    /// [`Self::hash_tag`] and for the same reasons.
+    fn window_tag(scope: &str, row: &WindowRow) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            escape_component(scope),
+            escape_component(&row.subject),
+            row.dimension.as_str(),
+            row.window.length_secs,
+            row.window.index
+        )
+    }
+
+    fn window_key(&self, scope: &str, row: &WindowRow) -> String {
+        format!(
+            "{}:win:{{{}}}",
+            self.namespace,
+            Self::window_tag(scope, row)
+        )
+    }
+
+    fn window_seq_key(&self, scope: &str, row: &WindowRow) -> String {
+        format!(
+            "{}:winseq:{{{}}}",
+            self.namespace,
+            Self::window_tag(scope, row)
+        )
+    }
+
     fn spend_key(&self, stat_prefix: &str, tenant: &str, period: &str) -> String {
         format!(
             "{}:spend:{{{}}}",
@@ -719,13 +771,14 @@ impl RedisControlPlaneStore {
     /// round trips.
     fn pipelined<R>(
         &self,
+        preload: &str,
         rows: &[R],
         mut queue: impl FnMut(&mut redis::Pipeline, &R),
     ) -> Vec<Result<u64, StoreError>> {
         let mut results = Vec::with_capacity(rows.len());
         for chunk in rows.chunks(SPEND_PIPELINE_ROWS) {
             let mut pipe = redis::pipe();
-            pipe.cmd("SCRIPT").arg("LOAD").arg(ADD_SPEND_LUA).ignore();
+            pipe.cmd("SCRIPT").arg("LOAD").arg(preload).ignore();
             for row in chunk {
                 queue(&mut pipe, row);
             }
@@ -1271,7 +1324,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         node_id: &str,
         rows: &[SpendDelta<'_>],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(rows, |pipe, row| {
+        self.pipelined(ADD_SPEND_LUA, rows, |pipe, row| {
             pipe.cmd("EVALSHA")
                 .arg(self.add_spend_script.get_hash())
                 .arg(2)
@@ -1290,7 +1343,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         node_id: &str,
         rows: &[(TenantId, PeriodKey)],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(rows, |pipe, (tenant, period)| {
+        self.pipelined(ADD_SPEND_LUA, rows, |pipe, (tenant, period)| {
             pipe.cmd("HGET")
                 .arg(self.seq_key(stat_prefix, tenant.as_str(), period.as_str()))
                 .arg(node_id);
@@ -1302,9 +1355,56 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         stat_prefix: &str,
         rows: &[(TenantId, PeriodKey)],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(rows, |pipe, (tenant, period)| {
+        self.pipelined(ADD_SPEND_LUA, rows, |pipe, (tenant, period)| {
             pipe.cmd("GET")
                 .arg(self.spend_key(stat_prefix, tenant.as_str(), period.as_str()));
+        })
+    }
+
+    /// Window rows ride the spend lane and its pipelining; see
+    /// [`ADD_WINDOW_LUA`]. Every delivery carries `EXPIREAT` window end plus
+    /// grace, so rows expire without a sweeper.
+    fn add_window_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.pipelined(ADD_WINDOW_LUA, rows, |pipe, delta| {
+            pipe.cmd("EVALSHA")
+                .arg(self.add_window_script.get_hash())
+                .arg(2)
+                .arg(self.window_key(scope, delta.row))
+                .arg(self.window_seq_key(scope, delta.row))
+                .arg(node_id)
+                .arg(delta.seq)
+                .arg(delta.delta)
+                .arg(
+                    delta
+                        .row
+                        .window
+                        .end_secs()
+                        .saturating_add(WINDOW_ROW_GRACE_SECS),
+                );
+        })
+    }
+
+    fn last_window_seq_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowRow],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.pipelined(ADD_WINDOW_LUA, rows, |pipe, row| {
+            pipe.cmd("HGET")
+                .arg(self.window_seq_key(scope, row))
+                .arg(node_id);
+        })
+    }
+
+    fn load_window_batch(&self, scope: &str, rows: &[WindowRow]) -> Vec<Result<u64, StoreError>> {
+        self.pipelined(ADD_WINDOW_LUA, rows, |pipe, row| {
+            pipe.cmd("GET").arg(self.window_key(scope, row));
         })
     }
 
@@ -1480,6 +1580,58 @@ mod tests {
     /// applies, dedups a replay, and leaves both keys expiring at the
     /// period's end plus the retention; the batched reads see the same rows.
     /// The fake cannot show this, since it runs no Lua.
+    /// Window rows against a real Redis: the script adds, dedups a replay and
+    /// an older seq per node, and both keys expire at window end plus grace.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_window_batch_applies_dedups_and_expires_after_the_window() {
+        use crate::control::{WindowDimension, WindowKey};
+        let store = test_store("window");
+        let row = WindowRow {
+            subject: "tenant-a".to_string(),
+            dimension: WindowDimension::TotalTokens,
+            window: WindowKey::containing(chrono::Utc::now().timestamp() as u64 + 3600, 60),
+        };
+        let d = |delta, seq| WindowDelta {
+            row: &row,
+            delta,
+            seq,
+        };
+
+        assert_eq!(
+            store.add_window_batch("c", "node-a", &[d(10, 2)]),
+            vec![Ok(10)]
+        );
+        assert_eq!(
+            store.add_window_batch("c", "node-b", &[d(5, 1)]),
+            vec![Ok(15)]
+        );
+        assert_eq!(
+            store.add_window_batch("c", "node-a", &[d(10, 2)]),
+            vec![Ok(15)]
+        );
+        assert_eq!(
+            store.add_window_batch("c", "node-a", &[d(10, 1)]),
+            vec![Ok(15)]
+        );
+        let rows = [row.clone()];
+        assert_eq!(store.load_window_batch("c", &rows), vec![Ok(15)]);
+        assert_eq!(
+            store.last_window_seq_batch("c", "node-a", &rows),
+            vec![Ok(2)]
+        );
+
+        let want = (row.window.end_secs() + WINDOW_ROW_GRACE_SECS) as i64;
+        for key in [store.window_key("c", &row), store.window_seq_key("c", &row)] {
+            let at: i64 = store
+                .with_connection(Lane::Spend, |conn| {
+                    redis::cmd("EXPIRETIME").arg(&key).query(conn)
+                })
+                .unwrap();
+            assert_eq!(at, want, "{key}");
+        }
+    }
+
     #[test]
     #[ignore = "needs a real Redis -- see this module's doc comment"]
     fn redis_batched_spend_applies_dedups_and_expires_with_the_period() {

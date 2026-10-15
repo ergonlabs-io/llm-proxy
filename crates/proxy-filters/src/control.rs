@@ -731,6 +731,35 @@ pub trait ControlPlaneStore: Send + Sync {
             .map(|(tenant, period)| self.load_spend(stat_prefix, tenant, period))
             .collect()
     }
+
+    // Tier-3 window counters (ADR-0006 amendment C). They follow the spend
+    // contract: additive deltas, dedup that keeps the highest accepted `seq`
+    // per (scope, row, node_id), and a replayed or older `seq` is a no-op that
+    // returns the current total. They never bump `policy_generation`, and rows
+    // expire `WINDOW_ROW_GRACE_SECS` after their window ends. There are no
+    // defaults: every store decides how it retains and batches them. Every
+    // batch answers one result per row, in input order.
+
+    /// Adds each row's delta under `(scope, node_id)` and returns the new
+    /// total per row. `scope` plays the role `stat_prefix` plays for spend
+    /// (the filter chain), so two chains never share a row.
+    fn add_window_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>>;
+
+    /// The highest `seq` accepted from `node_id` per row, `0` if none.
+    fn last_window_seq_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowRow],
+    ) -> Vec<Result<u64, StoreError>>;
+
+    /// The total per row, `0` if absent.
+    fn load_window_batch(&self, scope: &str, rows: &[WindowRow]) -> Vec<Result<u64, StoreError>>;
 }
 
 /// One row of [`ControlPlaneStore::add_spend_batch`]: the spend row, the delta
@@ -742,6 +771,83 @@ pub struct SpendDelta<'a> {
     pub period: &'a PeriodKey,
     pub delta_micros: u64,
     pub seq: u64,
+}
+
+/// What a tier-3 window counter counts (ADR-0006 amendment C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WindowDimension {
+    InputTokens,
+    OutputTokens,
+    TotalTokens,
+    Requests,
+}
+
+impl WindowDimension {
+    /// The stable name stores key rows by. Never rename: it is part of the
+    /// persisted key.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowDimension::InputTokens => "input_tokens",
+            WindowDimension::OutputTokens => "output_tokens",
+            WindowDimension::TotalTokens => "total_tokens",
+            WindowDimension::Requests => "requests",
+        }
+    }
+}
+
+/// An epoch-aligned fixed window (amendment B): index = floor(unix_secs / length_secs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowKey {
+    pub length_secs: u64,
+    pub index: u64,
+}
+
+impl WindowKey {
+    /// The window of `length_secs` containing `unix_secs`. A zero length is
+    /// treated as 1 so the division cannot panic.
+    pub fn containing(unix_secs: u64, length_secs: u64) -> Self {
+        let length_secs = length_secs.max(1);
+        WindowKey {
+            length_secs,
+            index: unix_secs / length_secs,
+        }
+    }
+
+    pub fn start_secs(self) -> u64 {
+        self.index.saturating_mul(self.length_secs)
+    }
+
+    pub fn end_secs(self) -> u64 {
+        self.start_secs().saturating_add(self.length_secs)
+    }
+}
+
+/// One window counter row. `subject` is an opaque, bounded identifier the
+/// limiter builds (a tenant, a key id, or a hashed credential), never a raw credential.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WindowRow {
+    pub subject: String,
+    pub dimension: WindowDimension,
+    pub window: WindowKey,
+}
+
+/// One row of [`ControlPlaneStore::add_window_batch`]: the row, the delta to
+/// add, and the flush sequence it is sent under.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowDelta<'a> {
+    pub row: &'a WindowRow,
+    pub delta: u64,
+    pub seq: u64,
+}
+
+/// How long a window row outlives its window end, so a late flush still lands.
+pub const WINDOW_ROW_GRACE_SECS: u64 = 300;
+
+/// Unix seconds now; `0` if the clock is before the epoch.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The two things the data plane reads per request, built wholesale by
@@ -811,6 +917,12 @@ struct InMemoryState {
     // `FlushToken`'s doc for why "highest accepted wins" is the whole dedup
     // policy. `overwrite_spend` does NOT touch this map.
     spend_seq: HashMap<SpendWriter, u64>,
+    // Tier-3 window counters, keyed `(scope, row)`, and their per-writer
+    // high-water marks. Pruned on every `add_window_batch` (see
+    // `prune_windows`) because rows are per window and would otherwise grow
+    // without bound.
+    windows: HashMap<(String, WindowRow), u64>,
+    window_seq: HashMap<(String, WindowRow, String), u64>,
     // Bumped by every tier-2 write below, under this SAME mutex
     // acquisition -- see `ControlPlaneStore::policy_generation`'s doc for why
     // a spend write (`add_spend` above) must never touch this field.
@@ -845,9 +957,54 @@ impl InMemoryControlPlaneStore {
                 rate_cards: HashMap::new(),
                 spend: HashMap::new(),
                 spend_seq: HashMap::new(),
+                windows: HashMap::new(),
+                window_seq: HashMap::new(),
                 generation: 0,
             }),
         }
+    }
+}
+
+impl InMemoryControlPlaneStore {
+    fn prune_windows_locked(state: &mut InMemoryState, now_secs: u64) {
+        let expired = |row: &WindowRow| {
+            row.window.end_secs().saturating_add(WINDOW_ROW_GRACE_SECS) < now_secs
+        };
+        // Rust note: `retain` keeps the entries the closure returns true for.
+        state.windows.retain(|(_, row), _| !expired(row));
+        state.window_seq.retain(|(_, row, _), _| !expired(row));
+    }
+
+    fn add_window_batch_at(
+        &self,
+        now_secs: u64,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        Self::prune_windows_locked(&mut state, now_secs);
+        rows.iter()
+            .map(|delta| {
+                let row = (scope.to_string(), delta.row.clone());
+                let current = state.windows.get(&row).copied().unwrap_or(0);
+                let writer = (scope.to_string(), delta.row.clone(), node_id.to_string());
+                if state
+                    .window_seq
+                    .get(&writer)
+                    .is_some_and(|last| delta.seq <= *last)
+                {
+                    return Ok(current);
+                }
+                let total = current.saturating_add(delta.delta);
+                state.windows.insert(row, total);
+                state.window_seq.insert(writer, delta.seq);
+                Ok(total)
+            })
+            .collect()
     }
 }
 
@@ -1182,6 +1339,52 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .copied()
             .unwrap_or(0))
     }
+
+    fn add_window_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.add_window_batch_at(unix_now_secs(), scope, node_id, rows)
+    }
+
+    fn last_window_seq_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowRow],
+    ) -> Vec<Result<u64, StoreError>> {
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        rows.iter()
+            .map(|row| {
+                Ok(state
+                    .window_seq
+                    .get(&(scope.to_string(), row.clone(), node_id.to_string()))
+                    .copied()
+                    .unwrap_or(0))
+            })
+            .collect()
+    }
+
+    fn load_window_batch(&self, scope: &str, rows: &[WindowRow]) -> Vec<Result<u64, StoreError>> {
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        rows.iter()
+            .map(|row| {
+                Ok(state
+                    .windows
+                    .get(&(scope.to_string(), row.clone()))
+                    .copied()
+                    .unwrap_or(0))
+            })
+            .collect()
+    }
 }
 
 // --- redb tables -----------------------------------------------------------
@@ -1218,6 +1421,12 @@ const SPEND_TABLE: TableDefinition<(&str, &str, &str), u64> = TableDefinition::n
 // `FlushToken`'s doc.
 const SPEND_SEQ_TABLE: TableDefinition<(&str, &str, &str, &str), u64> =
     TableDefinition::new("spend_seq");
+// Tier-3 window counters: (scope, subject, dimension, length_secs, index).
+// The seq table adds the writing node, for the reason `SPEND_SEQ_TABLE` does.
+type WindowRowKey<'a> = (&'a str, &'a str, &'a str, u64, u64);
+const WINDOWS_TABLE: TableDefinition<WindowRowKey<'static>, u64> = TableDefinition::new("windows");
+const WINDOW_SEQ_TABLE: TableDefinition<(&str, &str, &str, u64, u64, &str), u64> =
+    TableDefinition::new("window_seq");
 // A single row, keyed `"policy"`, holding the tier-2 generation
 // counter -- see `ControlPlaneStore::policy_generation`'s doc. A dedicated
 // table (rather than a row inside, say, `TENANTS_TABLE`) so bumping it is one
@@ -1796,6 +2005,8 @@ impl RedbControlPlaneStore {
         txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
+        txn.open_table(WINDOWS_TABLE).map_err(store_err)?;
+        txn.open_table(WINDOW_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(GENERATION_TABLE).map_err(store_err)?;
         txn.commit().map_err(store_err)?;
         Ok(())
@@ -2408,6 +2619,197 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             .unwrap_or(0);
         Ok(total)
     }
+
+    fn add_window_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        match self.add_window_batch_inner(unix_now_secs(), scope, node_id, rows) {
+            Ok(results) => results.into_iter().map(Ok).collect(),
+            // One transaction: a failure fails every row of the batch.
+            Err(err) => rows.iter().map(|_| Err(err.clone())).collect(),
+        }
+    }
+
+    fn last_window_seq_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowRow],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.read_windows(rows, |table_txn, row| {
+            let table = table_txn.open_table(WINDOW_SEQ_TABLE).map_err(store_err)?;
+            let (dim, len, idx) = (
+                row.dimension.as_str(),
+                row.window.length_secs,
+                row.window.index,
+            );
+            Ok(table
+                .get((scope, row.subject.as_str(), dim, len, idx, node_id))
+                .map_err(store_err)?
+                .map(|guard| guard.value())
+                .unwrap_or(0))
+        })
+    }
+
+    fn load_window_batch(&self, scope: &str, rows: &[WindowRow]) -> Vec<Result<u64, StoreError>> {
+        self.read_windows(rows, |table_txn, row| {
+            let table = table_txn.open_table(WINDOWS_TABLE).map_err(store_err)?;
+            let (dim, len, idx) = (
+                row.dimension.as_str(),
+                row.window.length_secs,
+                row.window.index,
+            );
+            Ok(table
+                .get((scope, row.subject.as_str(), dim, len, idx))
+                .map_err(store_err)?
+                .map(|guard| guard.value())
+                .unwrap_or(0))
+        })
+    }
+}
+
+impl RedbControlPlaneStore {
+    /// Reads one value per row inside a single read transaction.
+    fn read_windows(
+        &self,
+        rows: &[WindowRow],
+        read: impl Fn(&redb::ReadTransaction, &WindowRow) -> Result<u64, StoreError>,
+    ) -> Vec<Result<u64, StoreError>> {
+        let txn = match self.db.begin_read().map_err(store_err) {
+            Ok(txn) => txn,
+            Err(err) => return rows.iter().map(|_| Err(err.clone())).collect(),
+        };
+        rows.iter().map(|row| read(&txn, row)).collect()
+    }
+
+    /// One write transaction for the whole batch: prune expired rows, then
+    /// the same read-modify-write `add_spend` does, per row.
+    fn add_window_batch_inner(
+        &self,
+        now_secs: u64,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Result<Vec<u64>, StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let mut totals = Vec::with_capacity(rows.len());
+        {
+            let mut windows = txn.open_table(WINDOWS_TABLE).map_err(store_err)?;
+            let mut seqs = txn.open_table(WINDOW_SEQ_TABLE).map_err(store_err)?;
+            prune_expired_windows(&mut windows, &mut seqs, now_secs)?;
+            for delta in rows {
+                let row = delta.row;
+                let (dim, len, idx) = (
+                    row.dimension.as_str(),
+                    row.window.length_secs,
+                    row.window.index,
+                );
+                let key = (scope, row.subject.as_str(), dim, len, idx);
+                let seq_key = (scope, row.subject.as_str(), dim, len, idx, node_id);
+                let current = windows
+                    .get(key)
+                    .map_err(store_err)?
+                    .map(|guard| guard.value())
+                    .unwrap_or(0);
+                let last = seqs
+                    .get(seq_key)
+                    .map_err(store_err)?
+                    .map(|guard| guard.value());
+                if last.is_some_and(|last| delta.seq <= last) {
+                    totals.push(current);
+                    continue;
+                }
+                let total = current.saturating_add(delta.delta);
+                windows.insert(key, total).map_err(store_err)?;
+                seqs.insert(seq_key, delta.seq).map_err(store_err)?;
+                totals.push(total);
+            }
+        }
+        txn.commit().map_err(store_err)?;
+        Ok(totals)
+    }
+}
+
+/// Deletes window rows and seq entries past end + grace. A full scan: the
+/// tables hold only live windows plus the grace tail, so they stay small.
+fn prune_expired_windows(
+    windows: &mut redb::Table<'_, WindowRowKey<'static>, u64>,
+    seqs: &mut redb::Table<
+        '_,
+        (
+            &'static str,
+            &'static str,
+            &'static str,
+            u64,
+            u64,
+            &'static str,
+        ),
+        u64,
+    >,
+    now_secs: u64,
+) -> Result<(), StoreError> {
+    let expired = |len: u64, idx: u64| {
+        let key = WindowKey {
+            length_secs: len,
+            index: idx,
+        };
+        key.end_secs().saturating_add(WINDOW_ROW_GRACE_SECS) < now_secs
+    };
+    let dead: Vec<(String, String, String, u64, u64)> = windows
+        .iter()
+        .map_err(store_err)?
+        .filter_map(|entry| {
+            let (k, _) = entry.ok()?;
+            let (scope, subject, dim, len, idx) = k.value();
+            expired(len, idx).then(|| {
+                (
+                    scope.to_string(),
+                    subject.to_string(),
+                    dim.to_string(),
+                    len,
+                    idx,
+                )
+            })
+        })
+        .collect();
+    for (scope, subject, dim, len, idx) in &dead {
+        windows
+            .remove((scope.as_str(), subject.as_str(), dim.as_str(), *len, *idx))
+            .map_err(store_err)?;
+    }
+    let dead: Vec<(String, String, String, u64, u64, String)> = seqs
+        .iter()
+        .map_err(store_err)?
+        .filter_map(|entry| {
+            let (k, _) = entry.ok()?;
+            let (scope, subject, dim, len, idx, node) = k.value();
+            expired(len, idx).then(|| {
+                (
+                    scope.to_string(),
+                    subject.to_string(),
+                    dim.to_string(),
+                    len,
+                    idx,
+                    node.to_string(),
+                )
+            })
+        })
+        .collect();
+    for (scope, subject, dim, len, idx, node) in &dead {
+        seqs.remove((
+            scope.as_str(),
+            subject.as_str(),
+            dim.as_str(),
+            *len,
+            *idx,
+            node.as_str(),
+        ))
+        .map_err(store_err)?;
+    }
+    Ok(())
 }
 
 /// A freshly minted virtual key, returned to the admin caller so the
@@ -4112,6 +4514,25 @@ impl SharedMemoryStore {
 
 #[cfg(test)]
 impl ControlPlaneStore for SharedMemoryStore {
+    fn add_window_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.inner.add_window_batch(scope, node_id, rows)
+    }
+    fn last_window_seq_batch(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[WindowRow],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.inner.last_window_seq_batch(scope, node_id, rows)
+    }
+    fn load_window_batch(&self, scope: &str, rows: &[WindowRow]) -> Vec<Result<u64, StoreError>> {
+        self.inner.load_window_batch(scope, rows)
+    }
     fn load(&self) -> Result<StoredControlPlane, StoreError> {
         self.inner.load()
     }
@@ -4318,6 +4739,29 @@ mod tests {
     struct SharedStore(Arc<InMemoryControlPlaneStore>);
 
     impl ControlPlaneStore for SharedStore {
+        fn add_window_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[WindowDelta<'_>],
+        ) -> Vec<Result<u64, StoreError>> {
+            self.0.add_window_batch(scope, node_id, rows)
+        }
+        fn last_window_seq_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[WindowRow],
+        ) -> Vec<Result<u64, StoreError>> {
+            self.0.last_window_seq_batch(scope, node_id, rows)
+        }
+        fn load_window_batch(
+            &self,
+            scope: &str,
+            rows: &[WindowRow],
+        ) -> Vec<Result<u64, StoreError>> {
+            self.0.load_window_batch(scope, rows)
+        }
         fn load(&self) -> Result<StoredControlPlane, StoreError> {
             self.0.load()
         }
@@ -4418,6 +4862,29 @@ mod tests {
     }
 
     impl ControlPlaneStore for ToggleStore {
+        fn add_window_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[WindowDelta<'_>],
+        ) -> Vec<Result<u64, StoreError>> {
+            self.inner.add_window_batch(scope, node_id, rows)
+        }
+        fn last_window_seq_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[WindowRow],
+        ) -> Vec<Result<u64, StoreError>> {
+            self.inner.last_window_seq_batch(scope, node_id, rows)
+        }
+        fn load_window_batch(
+            &self,
+            scope: &str,
+            rows: &[WindowRow],
+        ) -> Vec<Result<u64, StoreError>> {
+            self.inner.load_window_batch(scope, rows)
+        }
         fn load(&self) -> Result<StoredControlPlane, StoreError> {
             self.load_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
@@ -4517,6 +4984,29 @@ mod tests {
     struct FailingStore;
 
     impl ControlPlaneStore for FailingStore {
+        fn add_window_batch(
+            &self,
+            _scope: &str,
+            _node_id: &str,
+            rows: &[WindowDelta<'_>],
+        ) -> Vec<Result<u64, StoreError>> {
+            rows.iter().map(|_| Ok(0)).collect()
+        }
+        fn last_window_seq_batch(
+            &self,
+            _scope: &str,
+            _node_id: &str,
+            rows: &[WindowRow],
+        ) -> Vec<Result<u64, StoreError>> {
+            rows.iter().map(|_| Ok(0)).collect()
+        }
+        fn load_window_batch(
+            &self,
+            _scope: &str,
+            rows: &[WindowRow],
+        ) -> Vec<Result<u64, StoreError>> {
+            rows.iter().map(|_| Ok(0)).collect()
+        }
         fn load(&self) -> Result<StoredControlPlane, StoreError> {
             Err(StoreError::Unavailable(
                 "test double: load always fails".to_string(),
@@ -7235,6 +7725,213 @@ mod tests {
             "an admin correction must not reset the writer's sequence -- that would make \
              the replica's next flush look like a replay of its own seq 1"
         );
+    }
+
+    // --- tier-3 window counters ----
+
+    fn window_row(subject: &str, dimension: WindowDimension, window: WindowKey) -> WindowRow {
+        WindowRow {
+            subject: subject.to_string(),
+            dimension,
+            window,
+        }
+    }
+
+    /// A window far in the future, so the stores' real-clock pruning keeps it.
+    fn live_window() -> WindowKey {
+        WindowKey::containing(unix_now_secs(), 60)
+    }
+
+    fn add_one(
+        store: &dyn ControlPlaneStore,
+        scope: &str,
+        node: &str,
+        row: &WindowRow,
+        delta: u64,
+        seq: u64,
+    ) -> u64 {
+        store
+            .add_window_batch(scope, node, &[WindowDelta { row, delta, seq }])
+            .remove(0)
+            .unwrap()
+    }
+
+    fn load_one(store: &dyn ControlPlaneStore, scope: &str, row: &WindowRow) -> u64 {
+        store
+            .load_window_batch(scope, std::slice::from_ref(row))
+            .remove(0)
+            .unwrap()
+    }
+
+    fn assert_window_contract(store: &dyn ControlPlaneStore) {
+        let win = live_window();
+        let row = window_row("tenant-a", WindowDimension::TotalTokens, win);
+        assert_eq!(load_one(store, "chain", &row), 0, "absent row reads 0");
+        assert_eq!(
+            store.last_window_seq_batch("chain", "node-a", std::slice::from_ref(&row)),
+            vec![Ok(0)]
+        );
+
+        // Two nodes add to one row: the total is the sum.
+        assert_eq!(add_one(store, "chain", "node-a", &row, 100, 1), 100);
+        assert_eq!(add_one(store, "chain", "node-b", &row, 50, 1), 150);
+        // Replay and older seq are no-ops that return the current total.
+        assert_eq!(add_one(store, "chain", "node-a", &row, 100, 1), 150);
+        assert_eq!(add_one(store, "chain", "node-a", &row, 7, 3), 157);
+        assert_eq!(add_one(store, "chain", "node-a", &row, 999, 2), 157);
+        assert_eq!(load_one(store, "chain", &row), 157);
+
+        // High-water marks are per node.
+        assert_eq!(
+            store.last_window_seq_batch("chain", "node-a", std::slice::from_ref(&row)),
+            vec![Ok(3)]
+        );
+        assert_eq!(
+            store.last_window_seq_batch("chain", "node-b", std::slice::from_ref(&row)),
+            vec![Ok(1)]
+        );
+
+        // Other dimension, other window, other subject, other scope: separate rows.
+        let other_dim = window_row("tenant-a", WindowDimension::Requests, win);
+        let other_win = window_row(
+            "tenant-a",
+            WindowDimension::TotalTokens,
+            WindowKey {
+                length_secs: win.length_secs,
+                index: win.index + 1,
+            },
+        );
+        let other_subject = window_row("tenant-b", WindowDimension::TotalTokens, win);
+        assert_eq!(add_one(store, "chain", "node-a", &other_dim, 1, 1), 1);
+        assert_eq!(add_one(store, "chain", "node-a", &other_win, 2, 1), 2);
+        assert_eq!(add_one(store, "chain", "node-a", &other_subject, 3, 1), 3);
+        assert_eq!(add_one(store, "chain-2", "node-a", &row, 4, 1), 4);
+        assert_eq!(load_one(store, "chain", &row), 157);
+        assert_eq!(load_one(store, "chain-2", &row), 4);
+
+        // Results come back in input order, one per row.
+        let batch = [other_subject.clone(), row.clone(), other_dim.clone()];
+        assert_eq!(
+            store.load_window_batch("chain", &batch),
+            vec![Ok(3), Ok(157), Ok(1)]
+        );
+        let deltas = [
+            WindowDelta {
+                row: &other_dim,
+                delta: 10,
+                seq: 2,
+            },
+            WindowDelta {
+                row: &row,
+                delta: 1,
+                seq: 4,
+            },
+        ];
+        assert_eq!(
+            store.add_window_batch("chain", "node-a", &deltas),
+            vec![Ok(11), Ok(158)]
+        );
+    }
+
+    #[test]
+    fn memory_window_counters_satisfy_the_additive_and_dedup_contract() {
+        assert_window_contract(&InMemoryControlPlaneStore::new());
+    }
+
+    #[test]
+    fn redb_window_counters_satisfy_the_additive_and_dedup_contract() {
+        assert_window_contract(&RedbControlPlaneStore::in_memory());
+    }
+
+    #[test]
+    fn memory_prunes_window_rows_and_seq_entries_after_end_plus_grace() {
+        let store = InMemoryControlPlaneStore::new();
+        let old = window_row("t", WindowDimension::Requests, WindowKey::containing(0, 60));
+        let live = window_row(
+            "t",
+            WindowDimension::Requests,
+            WindowKey::containing(1000, 60),
+        );
+        let at = |now: u64, row: &WindowRow, seq: u64| {
+            store.add_window_batch_at(now, "c", "n", &[WindowDelta { row, delta: 1, seq }])
+        };
+        // `old` ends at 60, so it survives until 60 + grace.
+        at(60 + WINDOW_ROW_GRACE_SECS, &old, 1);
+        at(60 + WINDOW_ROW_GRACE_SECS, &live, 1);
+        assert_eq!(load_one(&store, "c", &old), 1, "inside the grace");
+        // One second past end + grace: pruned along with its seq entry.
+        at(61 + WINDOW_ROW_GRACE_SECS, &live, 2);
+        assert_eq!(load_one(&store, "c", &old), 0);
+        assert_eq!(load_one(&store, "c", &live), 2);
+        {
+            let state = store.state.lock().unwrap();
+            assert_eq!(state.windows.len(), 1);
+            assert_eq!(state.window_seq.len(), 1, "the seq entry is pruned too");
+        }
+        assert_eq!(
+            store.last_window_seq_batch("c", "n", std::slice::from_ref(&old)),
+            vec![Ok(0)]
+        );
+    }
+
+    #[test]
+    fn redb_prunes_window_rows_and_seq_entries_after_end_plus_grace() {
+        let store = RedbControlPlaneStore::in_memory();
+        let old = window_row("t", WindowDimension::Requests, WindowKey::containing(0, 60));
+        let live = window_row(
+            "t",
+            WindowDimension::Requests,
+            WindowKey::containing(1000, 60),
+        );
+        let at = |now: u64, row: &WindowRow, seq: u64| {
+            store
+                .add_window_batch_inner(now, "c", "n", &[WindowDelta { row, delta: 1, seq }])
+                .unwrap()
+        };
+        at(60 + WINDOW_ROW_GRACE_SECS, &old, 1);
+        at(60 + WINDOW_ROW_GRACE_SECS, &live, 1);
+        assert_eq!(load_one(&store, "c", &old), 1, "inside the grace");
+        at(61 + WINDOW_ROW_GRACE_SECS, &live, 2);
+        assert_eq!(load_one(&store, "c", &old), 0);
+        assert_eq!(load_one(&store, "c", &live), 2);
+        assert_eq!(
+            store.last_window_seq_batch("c", "n", std::slice::from_ref(&old)),
+            vec![Ok(0)],
+            "the seq entry is pruned too"
+        );
+    }
+
+    #[test]
+    fn redb_window_rows_survive_reopen() {
+        let path = temp_db_path("window-rows-survive-reopen");
+        let row = window_row("t", WindowDimension::InputTokens, live_window());
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            assert_eq!(add_one(&store, "c", "node-a", &row, 42, 5), 42);
+        }
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        assert_eq!(load_one(&store, "c", &row), 42);
+        assert_eq!(
+            store.last_window_seq_batch("c", "node-a", std::slice::from_ref(&row)),
+            vec![Ok(5)]
+        );
+        // The restored high-water mark still dedups.
+        assert_eq!(add_one(&store, "c", "node-a", &row, 42, 5), 42);
+    }
+
+    #[test]
+    fn window_writes_never_bump_the_policy_generation() {
+        let row = window_row("t", WindowDimension::Requests, live_window());
+        let stores: [Box<dyn ControlPlaneStore>; 2] = [
+            Box::new(InMemoryControlPlaneStore::new()),
+            Box::new(RedbControlPlaneStore::in_memory()),
+        ];
+        for store in &stores {
+            let before = store.policy_generation().unwrap();
+            add_one(store.as_ref(), "c", "n", &row, 1, 1);
+            add_one(store.as_ref(), "c", "n", &row, 1, 1);
+            assert_eq!(store.policy_generation().unwrap(), before);
+        }
     }
 
     /// Every assertion above, against the persistent backend. ADR-0006 §5:
