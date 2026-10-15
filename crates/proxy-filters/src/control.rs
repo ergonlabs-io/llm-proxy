@@ -551,6 +551,18 @@ pub trait ControlPlaneStore: Send + Sync {
         false
     }
 
+    /// Whether other replicas read and write the same rows through their own
+    /// handles, so this replica's local counters are not the whole fleet.
+    /// Not the same question as [`Self::is_durable`]: redb survives a restart
+    /// but belongs to one process. `GET /v1/usage` uses it to decide between
+    /// the local exact answer and a store read (ADR-0006 addendum §4).
+    /// `false` is the safe default: a store wrongly called shared only costs
+    /// a store read, but one wrongly called local reports a replica's own
+    /// counters as the fleet's.
+    fn is_shared(&self) -> bool {
+        false
+    }
+
     // Spend rows, keyed `(stat_prefix, tenant,
     // period)`. `stat_prefix` is a plain `&str` (not this crate's
     // `TenantId`/`KeyId` newtypes) because it names a FILTER CHAIN by its
@@ -4475,7 +4487,8 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
 /// shared durable store (Redis) without a server: every handle forwards to one
 /// [`InMemoryControlPlaneStore`], so a write through one is visible to a poll
 /// through another, which is the property replica propagation depends on.
-/// Reports itself durable because it plays the part of a store that is.
+/// Reports itself durable and shared because it plays the part of a store
+/// that is both.
 #[cfg(test)]
 pub(crate) struct SharedMemoryStore {
     pub(crate) inner: Arc<InMemoryControlPlaneStore>,
@@ -4577,6 +4590,9 @@ impl ControlPlaneStore for SharedMemoryStore {
         self.inner.put_rate_card_if_absent(card)
     }
     fn is_durable(&self) -> bool {
+        true
+    }
+    fn is_shared(&self) -> bool {
         true
     }
     fn add_spend(
@@ -9063,6 +9079,22 @@ mod tests {
 
         let path = temp_db_path("durability-claim");
         assert!(RedbControlPlaneStore::open(&path).unwrap().is_durable());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// redb is durable but private to one process, so durability must not
+    /// stand in for sharing: `GET /v1/usage` would then read the store for a
+    /// single replica, or (the default flipped) answer a fleet from one
+    /// replica's counters. A store that does not say otherwise is local.
+    #[test]
+    fn only_a_store_other_replicas_write_through_reports_itself_shared() {
+        assert!(!InMemoryControlPlaneStore::default().is_shared());
+        assert!(!FailingStore.is_shared(), "the trait default is local");
+
+        let path = temp_db_path("sharing-claim");
+        let redb = RedbControlPlaneStore::open(&path).unwrap();
+        assert!(redb.is_durable() && !redb.is_shared());
+        drop(redb);
         std::fs::remove_file(&path).ok();
     }
 

@@ -1288,6 +1288,11 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         true
     }
 
+    /// Every replica pointed at one Redis reads and writes the same rows.
+    fn is_shared(&self) -> bool {
+        true
+    }
+
     /// See [`ADD_SPEND_LUA`]'s doc -- this is the whole method: build the two
     /// hash-tagged keys, invoke the script, and let `?`/`store_err` turn a
     /// `RedisError` into [`StoreError::Unavailable`].
@@ -1742,9 +1747,10 @@ mod tests {
     }
 
     #[test]
-    fn the_redis_store_claims_durability() {
+    fn the_redis_store_claims_durability_and_sharing() {
         let store = RedisControlPlaneStore::open("redis://127.0.0.1:6390").unwrap();
         assert!(store.is_durable());
+        assert!(store.is_shared());
     }
 
     #[test]
