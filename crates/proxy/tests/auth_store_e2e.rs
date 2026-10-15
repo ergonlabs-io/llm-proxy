@@ -48,6 +48,62 @@ fn a_minted_key_survives_a_restart_with_a_persistent_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_key_policy_survives_a_restart_with_a_persistent_store() {
+    let dir = scratch_dir("key-policy-persistent");
+    let db = dir.join("control.redb");
+    let config = config_text(&db, true);
+
+    let key = {
+        let proxy = Proxy::start(&dir, &config);
+        let key = mint_key(&proxy);
+        let created = http_post(
+            proxy.admin,
+            "/tenants",
+            Some(&format!("Bearer {ADMIN_TOKEN}")),
+            "application/json",
+            &format!(r#"{{"tenant":"{TENANT}"}}"#),
+        );
+        assert!(
+            created.starts_with("HTTP/1.1 2"),
+            "POST /tenants:\n{created}"
+        );
+        let tenant_policy = http_put(
+            proxy.admin,
+            &format!("/tenants/{TENANT}/policy"),
+            r#"{"access":"all"}"#,
+        );
+        assert!(
+            tenant_policy.starts_with("HTTP/1.1 204"),
+            "PUT tenant policy:\n{tenant_policy}"
+        );
+        let key_policy = http_put(
+            proxy.admin,
+            &format!("/keys/{KEY_ID}/policy"),
+            r#"{"access":{"only":["gpt-4*"]}}"#,
+        );
+        assert!(
+            key_policy.starts_with("HTTP/1.1 204"),
+            "PUT key policy:\n{key_policy}"
+        );
+        key
+    };
+
+    let restarted = Proxy::start(&dir, &config);
+    let denied = chat_model(&restarted, &key, "claude-3");
+    assert!(
+        denied.starts_with("HTTP/1.1 403"),
+        "key policy must deny claude-3 after restart:\n{denied}"
+    );
+    let allowed = chat_model(&restarted, &key, "gpt-4o");
+    assert!(
+        allowed.starts_with("HTTP/1.1 200"),
+        "key policy must allow gpt-4o after restart:\n{allowed}"
+    );
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Negative control: with no `store:` the minted key is lost on restart, so the
 /// 401 after restart is the expected outcome here.
 #[test]
@@ -206,8 +262,12 @@ fn mint_key(proxy: &Proxy) -> String {
 }
 
 fn chat(proxy: &Proxy, key: &str) -> String {
+    chat_model(proxy, key, MODEL)
+}
+
+fn chat_model(proxy: &Proxy, key: &str, model: &str) -> String {
     let body = format!(
-        r#"{{"model":"{MODEL}","max_tokens":8,"messages":[{{"role":"user","content":"hi"}}]}}"#
+        r#"{{"model":"{model}","max_tokens":8,"messages":[{{"role":"user","content":"hi"}}]}}"#
     );
     http_post(
         proxy.listen,
@@ -240,17 +300,42 @@ fn http_post(
     content_type: &str,
     body: &str,
 ) -> String {
-    let mut stream = TcpStream::connect(addr).expect("connect");
+    http_request("POST", addr, path, authorization, content_type, body)
+}
+
+fn http_put(addr: SocketAddr, path: &str, body: &str) -> String {
+    http_request(
+        "PUT",
+        addr,
+        path,
+        Some(&format!("Bearer {ADMIN_TOKEN}")),
+        "application/json",
+        body,
+    )
+}
+
+fn http_request(
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    authorization: Option<&str>,
+    content_type: &str,
+    body: &str,
+) -> String {
+    let mut stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT).expect("connect");
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .expect("set_read_timeout");
+    stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .expect("set_write_timeout");
     let auth = authorization
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
     stream
         .write_all(
             format!(
-                "POST {path} HTTP/1.1\r\nHost: proxy.local\r\n{auth}\
+                "{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n{auth}\
                  Content-Type: {content_type}\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
                 body.len()

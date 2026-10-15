@@ -983,6 +983,120 @@ async fn a_tenant_policy_write_changes_model_authorization_live() {
     drop(scratch);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_policy_narrows_its_tenant_grant_and_never_widens_it() {
+    let (listener, admin, upstream, scratch, proxy) =
+        spawn_suite("admin-key-policy", Some(ADMIN_TOKEN), true).await;
+
+    let tenant = admin_request_retrying(
+        admin,
+        "POST",
+        "/tenants",
+        Some(ADMIN_TOKEN),
+        &json!({ "tenant": "tenant-a" }),
+    )
+    .await;
+    assert_eq!(tenant.status, 201, "POST /tenants: {}", tenant.body);
+
+    let mut keys = Vec::new();
+    for id in ["k1", "k2", "k3"] {
+        let minted = admin_request_retrying(
+            admin,
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            &json!({ "tenant": "tenant-a", "key_id": id }),
+        )
+        .await;
+        assert_eq!(minted.status, 201, "POST /keys for {id}: {}", minted.body);
+        keys.push(format!(
+            "Bearer {}",
+            parse_json(&minted.body)["key"]
+                .as_str()
+                .expect("POST /keys returns the plaintext key")
+        ));
+    }
+
+    for (path, policy) in [
+        (
+            "/tenants/tenant-a/policy",
+            json!({ "access": { "only": ["gpt-4*", "claude-a"] } }),
+        ),
+        (
+            "/keys/k1/policy",
+            json!({ "access": { "only": ["gpt-4o"] } }),
+        ),
+        (
+            "/keys/k2/policy",
+            json!({ "access": { "only": ["claude-b"] } }),
+        ),
+    ] {
+        let response = admin_request_retrying(admin, "PUT", path, Some(ADMIN_TOKEN), &policy).await;
+        assert_eq!(response.status, 204, "PUT {path}: {}", response.body);
+    }
+
+    let listed = admin_request_retrying(admin, "GET", "/keys", Some(ADMIN_TOKEN), &json!({})).await;
+    assert_eq!(listed.status, 200, "GET /keys: {}", listed.body);
+    let listing = parse_json(&listed.body);
+    let entries = listing["keys"].as_array().expect("GET /keys returns keys");
+    let k1 = entries
+        .iter()
+        .find(|key| key["key_id"] == "k1")
+        .expect("K1 listed");
+    let k3 = entries
+        .iter()
+        .find(|key| key["key_id"] == "k3")
+        .expect("K3 listed");
+    assert_eq!(k1["policy"], json!({ "access": { "only": ["gpt-4o"] } }));
+    assert_eq!(k3["policy"], Value::Null);
+
+    let admitted = send_chat_request(listener, &[("authorization", &keys[0])], "gpt-4o").await;
+    assert_eq!(admitted.status, 200, "K1 gpt-4o: {}", admitted.body);
+    assert_eq!(upstream.log.requests().len(), 1);
+
+    let denied = send_chat_request(listener, &[("authorization", &keys[0])], "claude-a").await;
+    assert_eq!(denied.status, 403, "K1 claude-a: {}", denied.body);
+    assert_eq!(
+        upstream.log.requests().len(),
+        1,
+        "K1 denial reached upstream"
+    );
+
+    let denied = send_chat_request(listener, &[("authorization", &keys[1])], "claude-b").await;
+    assert_eq!(denied.status, 403, "K2 claude-b: {}", denied.body);
+    assert_eq!(
+        upstream.log.requests().len(),
+        1,
+        "K2 denial reached upstream"
+    );
+
+    let inherited = send_chat_request(listener, &[("authorization", &keys[2])], "claude-a").await;
+    assert_eq!(inherited.status, 200, "K3 claude-a: {}", inherited.body);
+    assert_eq!(upstream.log.requests().len(), 2);
+
+    let all = admin_request_retrying(
+        admin,
+        "PUT",
+        "/keys/k1/policy",
+        Some(ADMIN_TOKEN),
+        &json!({ "access": "all" }),
+    )
+    .await;
+    assert_eq!(all.status, 204, "PUT K1 all: {}", all.body);
+    let now_admitted =
+        send_chat_request(listener, &[("authorization", &keys[0])], "claude-a").await;
+    assert_eq!(
+        now_admitted.status, 200,
+        "K1 claude-a after PUT: {}",
+        now_admitted.body
+    );
+    assert_eq!(upstream.log.requests().len(), 3);
+
+    drop(proxy);
+    upstream.shutdown().await;
+    drop(scratch);
+}
+
 /// 5. `PUT /keys/{id}/budget` is enforced live against real priced
 /// traffic, and `GET /keys/{id}/spend` (admin-gated despite being a GET
 /// -- financial data) reports spend consistent with what was actually sent.
