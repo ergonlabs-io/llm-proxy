@@ -35,8 +35,10 @@
 //! `PUT /tenants/{id}/policy` (set model-access policy),
 //! `PUT /keys/{id}/policy` (narrow a key's model access),
 //! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling), and
+//! `PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits` (set or clear rate
+//! ceilings), plus `PUT /keys/{id}/budget`, and
 //! the reads described above, `GET /tenants/{id}/spend` and `GET /keys` (the
-//! key listing: `key_id`, `tenant`, `revoked`, `budget`, `policy`, sorted by
+//! key listing: `key_id`, `tenant`, `revoked`, `budget`, `limits`, `policy`, sorted by
 //! `(tenant, key_id)`). Unset (or
 //! empty/whitespace) token means every one of these -- write OR read -- is
 //! refused with 403 -- **unset never means open** (AGENTS.md "Fail-open controls"). See
@@ -53,13 +55,23 @@
 //! budget (unlimited) and an explicitly configured zero ceiling are kept
 //! distinct rather than collapsed.
 //!
+//! `PUT .../limits` accepts `{"limits": null}` to clear, or an object with
+//! optional `tokens_per_minute`, `requests_per_minute`, and
+//! `concurrent_streams` fields. Omitted fields set no limit; zero is an
+//! explicit refusal at that scope. A tenant limit bounds all its keys, and a
+//! key limit can narrow it. Counters are per process today, so N replicas
+//! can admit up to N times a configured limit until a shared counter backend
+//! exists.
+//!
 //! Every write endpoint also has a **scoped** form (as do the gated spend
 //! read and the `GET /keys` listing),
 //! `/chains/{stat_prefix}/keys` (POST to mint, GET to list), `/chains/{stat_prefix}/keys/{id}`,
 //! `/chains/{stat_prefix}/keys/{id}/policy`,
+//! `/chains/{stat_prefix}/keys/{id}/limits`,
 //! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
 //! `/chains/{stat_prefix}/tenants/{id}/policy`,
 //! `/chains/{stat_prefix}/tenants/{id}/budget`,
+//! `/chains/{stat_prefix}/tenants/{id}/limits`,
 //! `/chains/{stat_prefix}/tenants/{id}/spend` -- addressed by the target
 //! HTTP connection manager's own operator-chosen `stat_prefix`, ALWAYS
 //! correct regardless of how many chains in this serve configure

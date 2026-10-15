@@ -211,6 +211,7 @@ pub struct StoredControlPlane {
     // them by tenant rather than assuming one row implies the other. See
     // that function's doc for why this is deliberate, not an oversight.
     pub budgets: HashMap<TenantId, TenantBudget>,
+    pub limits: HashMap<TenantId, LimitPolicy>,
     /// Every tenant credential row. A store that does not support them yet
     /// returns an empty list here and refuses writes.
     pub tenant_credentials: Vec<StoredTenantCredential>,
@@ -219,6 +220,26 @@ pub struct StoredControlPlane {
     /// [`decode_rate_card_row`] for why a price must not hold up a
     /// revocation). A store without rate card support returns an empty list.
     pub rate_cards: Vec<StoredRateCard>,
+}
+
+/// Optional per-process rate ceilings. An absent field sets no ceiling at
+/// this level; zero explicitly refuses all traffic for that counter. Tenant
+/// and key ceilings are independent buckets, and both apply when configured.
+/// With N replicas, local counters can admit up to N times a ceiling until a
+/// shared counter backend exists (AGENTS.md "Policy Domains").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LimitPolicy {
+    pub tokens_per_minute: Option<u64>,
+    pub requests_per_minute: Option<u64>,
+    pub concurrent_streams: Option<u32>,
+}
+
+impl LimitPolicy {
+    fn is_empty(self) -> bool {
+        self.tokens_per_minute.is_none()
+            && self.requests_per_minute.is_none()
+            && self.concurrent_streams.is_none()
+    }
 }
 
 /// Version 2 uses stable key budget subjects; absent versions are legacy version 1.
@@ -467,6 +488,14 @@ pub trait ControlPlaneStore: Send + Sync {
         &self,
         tenant: &TenantId,
         budget: Option<&TenantBudget>,
+    ) -> Result<(), StoreError>;
+
+    /// An absent or all-empty policy removes the row. Each write bumps the
+    /// policy generation, including removals.
+    fn set_limits(
+        &self,
+        subject: &TenantId,
+        limits: Option<&LimitPolicy>,
     ) -> Result<(), StoreError>;
 
     /// Creates or replaces the rate card for `card.chain` and bumps the
@@ -726,6 +755,8 @@ pub struct ControlPlaneSnapshot {
     /// from tenant authorization policy: keys authenticate to tenants, but a
     /// key budget neither grants models nor shares spend with sibling keys.
     pub key_budgets: HashMap<KeyId, TenantBudget>,
+    pub tenant_limits: HashMap<TenantId, LimitPolicy>,
+    pub key_limits: HashMap<KeyId, LimitPolicy>,
     /// A key's own allow-list. Effective models are the tenant grant
     /// intersected with this list, so it only narrows access; absent means
     /// the key inherits the tenant grant exactly.
@@ -760,6 +791,7 @@ struct InMemoryState {
     // Independent of `policies` above -- see
     // `StoredControlPlane::budgets`'s doc.
     budgets: HashMap<TenantId, TenantBudget>,
+    limits: HashMap<TenantId, LimitPolicy>,
     // Credential rows keyed by `(tenant, provider)` -- the exact
     // create-or-replace identity `put_tenant_credential` names (ADR-0007
     // §2). A map rather than a `Vec` so a second put for the same pair
@@ -808,6 +840,7 @@ impl InMemoryControlPlaneStore {
                 keys: HashMap::new(),
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
+                limits: HashMap::new(),
                 tenant_credentials: HashMap::new(),
                 rate_cards: HashMap::new(),
                 spend: HashMap::new(),
@@ -840,6 +873,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             keys: state.keys.values().cloned().collect(),
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
+            limits: state.limits.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
             rate_cards: state.rate_cards.values().cloned().collect(),
         })
@@ -876,6 +910,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         // with it, the same "a deleted tenant carries no leftover
         // configuration" rule `set_policy`'s removal already follows.
         state.budgets.remove(tenant);
+        state.limits.remove(tenant);
         // A deleted tenant takes its credential rows with it too (ADR-0007
         // §2), under this SAME lock acquisition so the single generation
         // bump below covers the whole deletion -- a reader never observes
@@ -992,6 +1027,27 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             }
             None => {
                 state.budgets.remove(tenant);
+            }
+        }
+        state.generation += 1;
+        Ok(())
+    }
+
+    fn set_limits(
+        &self,
+        subject: &TenantId,
+        limits: Option<&LimitPolicy>,
+    ) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        match limits.filter(|limits| !limits.is_empty()) {
+            Some(limits) => {
+                state.limits.insert(subject.clone(), *limits);
+            }
+            None => {
+                state.limits.remove(subject);
             }
         }
         state.generation += 1;
@@ -1145,6 +1201,7 @@ const POLICIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("polic
 // `POLICIES_TABLE`: a tenant may have a row in one, the other, both, or
 // neither.
 const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budgets");
+const LIMITS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("limits");
 // A spend row's key is the 3-part
 // `(stat_prefix, tenant, period)` tuple, not a single `&str` like every
 // table above -- `redb::Key` has a native impl for tuples of `Key` types
@@ -1364,6 +1421,51 @@ impl From<EncodedTenantBudget> for TenantBudget {
             max_micros: crate::spend::MicroUsd::from_micros(encoded.max_micros),
             period: encoded.period.into(),
             credential_source: encoded.credential_source.into(),
+        }
+    }
+}
+
+/// Versioned durable row kept separate from budget and model policy rows.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EncodedLimitPolicy {
+    #[serde(
+        default = "legacy_schema_version",
+        deserialize_with = "read_limits_schema_version"
+    )]
+    schema_version: u32,
+    tokens_per_minute: Option<u64>,
+    requests_per_minute: Option<u64>,
+    concurrent_streams: Option<u32>,
+}
+
+fn read_limits_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if version == 1 {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported limits schema version {version}"
+        )))
+    }
+}
+
+impl From<&LimitPolicy> for EncodedLimitPolicy {
+    fn from(limits: &LimitPolicy) -> Self {
+        Self {
+            schema_version: 1,
+            tokens_per_minute: limits.tokens_per_minute,
+            requests_per_minute: limits.requests_per_minute,
+            concurrent_streams: limits.concurrent_streams,
+        }
+    }
+}
+
+impl From<EncodedLimitPolicy> for LimitPolicy {
+    fn from(encoded: EncodedLimitPolicy) -> Self {
+        Self {
+            tokens_per_minute: encoded.tokens_per_minute,
+            requests_per_minute: encoded.requests_per_minute,
+            concurrent_streams: encoded.concurrent_streams,
         }
     }
 }
@@ -1666,8 +1768,7 @@ impl RedbControlPlaneStore {
         Ok(store)
     }
 
-    /// Creates all tables if they do not already exist -- ten
-    /// (`RATE_CARDS_TABLE` is the newest).
+    /// Creates all tables if they do not already exist, including limits.
     ///
     /// Rust note: this runs a WRITE transaction even though it inserts no
     /// rows -- `WriteTransaction::open_table` is the only `redb` API that
@@ -1689,6 +1790,7 @@ impl RedbControlPlaneStore {
         txn.open_table(KEYS_BY_TENANT_TABLE).map_err(store_err)?;
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
         txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+        txn.open_table(LIMITS_TABLE).map_err(store_err)?;
         txn.open_table(TENANT_CREDENTIALS_TABLE)
             .map_err(store_err)?;
         txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
@@ -1830,6 +1932,17 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             budgets.insert(TenantId::new(key.value()), encoded.into());
         }
 
+        let limits_table = txn.open_table(LIMITS_TABLE).map_err(store_err)?;
+        let mut limits = HashMap::new();
+        for entry in limits_table.iter().map_err(store_err)? {
+            let (key, value) = entry.map_err(store_err)?;
+            let encoded: EncodedLimitPolicy = decode_json(value.value())?;
+            let policy: LimitPolicy = encoded.into();
+            if !policy.is_empty() {
+                limits.insert(TenantId::new(key.value()), policy);
+            }
+        }
+
         // Credential rows decode through their own fail-closed helper: one
         // row this build cannot fully understand makes the WHOLE load an
         // `Err`, so a half-understood store never becomes a snapshot that
@@ -1864,6 +1977,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             keys,
             policies,
             budgets,
+            limits,
             tenant_credentials,
             rate_cards,
         })
@@ -1902,6 +2016,10 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             // comment.
             let mut budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
             budgets_table.remove(tenant.as_str()).map_err(store_err)?;
+        }
+        {
+            let mut limits_table = txn.open_table(LIMITS_TABLE).map_err(store_err)?;
+            limits_table.remove(tenant.as_str()).map_err(store_err)?;
         }
         {
             // A deleted tenant's credential rows go with it (ADR-0007 §2),
@@ -2119,6 +2237,31 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Ok(())
     }
 
+    fn set_limits(
+        &self,
+        subject: &TenantId,
+        limits: Option<&LimitPolicy>,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(LIMITS_TABLE).map_err(store_err)?;
+            match limits.filter(|limits| !limits.is_empty()) {
+                Some(limits) => {
+                    let encoded: EncodedLimitPolicy = limits.into();
+                    table
+                        .insert(subject.as_str(), encode_json(&encoded).as_slice())
+                        .map_err(store_err)?;
+                }
+                None => {
+                    table.remove(subject.as_str()).map_err(store_err)?;
+                }
+            }
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
     fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
         // The row and the bump share one write transaction: they commit
         // together or not at all.
@@ -2310,6 +2453,7 @@ pub struct KeyListing {
     /// (unlimited) -- see [`crate::spend::TenantBudget`]'s doc for why an
     /// absent budget and an explicit zero ceiling are not the same thing.
     pub budget: Option<TenantBudget>,
+    pub limits: Option<LimitPolicy>,
     /// The key's own model allow-list, or `None` when it inherits its tenant.
     pub model_access: Option<ModelAccess>,
 }
@@ -2325,6 +2469,7 @@ impl std::fmt::Debug for KeyListing {
             .field("tenant", &self.tenant)
             .field("revoked", &self.revoked)
             .field("budget", &self.budget)
+            .field("limits", &self.limits)
             .field("model_access", &self.model_access)
             .finish()
     }
@@ -3067,6 +3212,7 @@ impl ControlPlane {
                 tenant: record.tenant.clone(),
                 revoked: record.revoked,
                 budget: snapshot.key_budgets.get(&record.key_id).copied(),
+                limits: snapshot.key_limits.get(&record.key_id).copied(),
                 model_access: snapshot.key_policies.get(&record.key_id).cloned(),
             })
             .collect();
@@ -3234,6 +3380,17 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Sets or clears a tenant's independent rate ceiling and republishes.
+    pub fn set_tenant_limits(
+        &self,
+        tenant: &TenantId,
+        limits: Option<&LimitPolicy>,
+    ) -> Result<(), StoreError> {
+        self.store.set_limits(tenant, limits)?;
+        self.rebuild();
+        Ok(())
+    }
+
     /// Creates or replaces `rec`'s credential row -- keyed
     /// (`rec.tenant`, `rec.provider`) -- then republishes. Store-then-
     /// `rebuild()`, exactly the shape [`Self::set_policy`] and
@@ -3367,6 +3524,20 @@ impl ControlPlane {
             return Err(StoreError::NotFound);
         }
         self.store.set_budget(&key_budget_subject(key_id), budget)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// A key's ceiling can only narrow its tenant's bucket at enforcement.
+    pub fn set_key_limits(
+        &self,
+        key_id: &KeyId,
+        limits: Option<&LimitPolicy>,
+    ) -> Result<(), StoreError> {
+        if !self.handle().load().key_tenants.contains_key(key_id) {
+            return Err(StoreError::NotFound);
+        }
+        self.store.set_limits(&key_budget_subject(key_id), limits)?;
         self.rebuild();
         Ok(())
     }
@@ -3683,6 +3854,16 @@ impl ControlPlane {
                 true
             }
         });
+        let mut tenant_limits = loaded.limits;
+        let mut key_limits = HashMap::new();
+        tenant_limits.retain(|subject, limits| {
+            if let Some(key_id) = key_id_from_budget_subject(subject) {
+                key_limits.insert(key_id, *limits);
+                false
+            } else {
+                true
+            }
+        });
         let mut policies: TenantPolicyMap = HashMap::new();
         let mut key_policies = HashMap::new();
         for (tenant, access) in loaded.policies {
@@ -3714,6 +3895,8 @@ impl ControlPlane {
             keys,
             policies,
             key_budgets,
+            tenant_limits,
+            key_limits,
             key_policies,
             key_tenants,
             tenant_credentials: HashMap::new(),
@@ -3878,6 +4061,8 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         keys,
         policies: TenantPolicyMap::new(),
         key_budgets: HashMap::new(),
+        tenant_limits: HashMap::new(),
+        key_limits: HashMap::new(),
         key_policies: HashMap::new(),
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
@@ -3954,6 +4139,13 @@ impl ControlPlaneStore for SharedMemoryStore {
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError> {
         self.inner.set_budget(tenant, budget)
+    }
+    fn set_limits(
+        &self,
+        subject: &TenantId,
+        limits: Option<&LimitPolicy>,
+    ) -> Result<(), StoreError> {
+        self.inner.set_limits(subject, limits)
     }
     fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
         self.check_rate_cards()?;
@@ -4164,6 +4356,13 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
         }
+        fn set_limits(
+            &self,
+            subject: &TenantId,
+            limits: Option<&LimitPolicy>,
+        ) -> Result<(), StoreError> {
+            self.0.set_limits(subject, limits)
+        }
         fn add_spend(
             &self,
             stat_prefix: &str,
@@ -4264,6 +4463,13 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
         }
+        fn set_limits(
+            &self,
+            subject: &TenantId,
+            limits: Option<&LimitPolicy>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_limits(subject, limits)
+        }
         fn add_spend(
             &self,
             stat_prefix: &str,
@@ -4350,6 +4556,13 @@ mod tests {
             &self,
             _tenant: &TenantId,
             _budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn set_limits(
+            &self,
+            _subject: &TenantId,
+            _limits: Option<&LimitPolicy>,
         ) -> Result<(), StoreError> {
             Ok(())
         }
@@ -4651,6 +4864,97 @@ mod tests {
     }
 
     // --- ControlPlane write methods ---------
+
+    #[test]
+    fn tenant_and_key_limits_publish_in_separate_buckets_and_clear() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let tenant = TenantId::new("tenant-a");
+        let key = KeyId::new("key-a");
+        cp.mint_key(&tenant, &key).unwrap();
+        let tenant_limit = LimitPolicy {
+            tokens_per_minute: Some(0),
+            ..Default::default()
+        };
+        let key_limit = LimitPolicy {
+            requests_per_minute: Some(4),
+            concurrent_streams: Some(1),
+            ..Default::default()
+        };
+        cp.set_tenant_limits(&tenant, Some(&tenant_limit)).unwrap();
+        cp.set_key_limits(&key, Some(&key_limit)).unwrap();
+        let snapshot = cp.handle().load();
+        assert_eq!(snapshot.tenant_limits.get(&tenant), Some(&tenant_limit));
+        assert_eq!(snapshot.key_limits.get(&key), Some(&key_limit));
+        assert!(!snapshot
+            .tenant_limits
+            .contains_key(&key_budget_subject(&key)));
+        assert_eq!(cp.list_keys()[0].limits, Some(key_limit));
+        drop(snapshot);
+        cp.set_key_limits(&key, Some(&LimitPolicy::default()))
+            .unwrap();
+        cp.set_tenant_limits(&tenant, None).unwrap();
+        assert!(cp.handle().load().key_limits.is_empty());
+        assert!(cp.handle().load().tenant_limits.is_empty());
+        assert!(cp.store().load().unwrap().limits.is_empty());
+        cp.set_tenant_limits(&tenant, Some(&tenant_limit)).unwrap();
+        cp.delete_tenant(&tenant).unwrap();
+        assert!(cp.store().load().unwrap().limits.is_empty());
+    }
+
+    #[test]
+    fn unknown_key_limits_write_does_not_change_store_or_generation() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let before = cp.store().policy_generation().unwrap();
+        let limits = LimitPolicy {
+            tokens_per_minute: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            cp.set_key_limits(&KeyId::new("missing"), Some(&limits)),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(cp.store().policy_generation().unwrap(), before);
+        assert!(cp.store().load().unwrap().limits.is_empty());
+    }
+
+    #[test]
+    fn key_limits_budget_and_model_policy_do_not_clobber_each_other() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let key = KeyId::new("key-a");
+        cp.mint_key(&TenantId::new("tenant-a"), &key).unwrap();
+        let limits = LimitPolicy {
+            concurrent_streams: Some(2),
+            ..Default::default()
+        };
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(8),
+            period: Period::Daily,
+            credential_source: CredentialSource::Platform,
+        };
+        let access = ModelAccess::Only(vec![ModelPattern::new("gpt-*")]);
+        cp.set_key_limits(&key, Some(&limits)).unwrap();
+        cp.set_key_budget(&key, Some(&budget)).unwrap();
+        cp.set_key_policy(&key, &access).unwrap();
+        let snapshot = cp.handle().load();
+        assert_eq!(snapshot.key_limits.get(&key), Some(&limits));
+        assert_eq!(snapshot.key_budgets.get(&key), Some(&budget));
+        assert_eq!(snapshot.key_policies.get(&key), Some(&access));
+    }
 
     #[test]
     fn set_key_policy_publishes_separately_from_tenant_policies() {
@@ -5917,6 +6221,43 @@ mod tests {
             loaded.budgets.get(&TenantId::new("tenant-a")),
             Some(&budget)
         );
+    }
+
+    #[test]
+    fn redb_limits_round_trip_across_reopen_and_delete_tenant() {
+        let path = temp_db_path("limits-round-trip");
+        let tenant = TenantId::new("tenant-a");
+        let limits = LimitPolicy {
+            tokens_per_minute: Some(0),
+            requests_per_minute: Some(8),
+            concurrent_streams: None,
+        };
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            store.create_tenant(&tenant).unwrap();
+            store.set_limits(&tenant, Some(&limits)).unwrap();
+        }
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            assert_eq!(store.load().unwrap().limits.get(&tenant), Some(&limits));
+            store.delete_tenant(&tenant).unwrap();
+            assert!(!store.load().unwrap().limits.contains_key(&tenant));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn redb_rejects_future_limits_schema_on_load() {
+        let store = RedbControlPlaneStore::in_memory();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(LIMITS_TABLE).unwrap();
+                table.insert("tenant-a", br#"{"schema_version":2,"tokens_per_minute":5,"requests_per_minute":null,"concurrent_streams":null}"#.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert!(matches!(store.load(), Err(StoreError::Unavailable(_))));
     }
 
     #[test]

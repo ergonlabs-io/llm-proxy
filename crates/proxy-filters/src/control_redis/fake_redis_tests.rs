@@ -101,6 +101,7 @@ struct Rows {
     keys: Vec<(String, Vec<u8>)>,
     policies: Vec<(String, Vec<u8>)>,
     budgets: Vec<(String, Vec<u8>)>,
+    limits: Vec<(String, Vec<u8>)>,
     credentials: Vec<(String, Vec<u8>)>,
     rate_cards: Vec<(String, Vec<u8>)>,
 }
@@ -126,6 +127,14 @@ fn sample_budget() -> TenantBudget {
         max_micros: MicroUsd::from_micros(5_000_000),
         period: Period::Monthly,
         credential_source: CredentialSource::Platform,
+    }
+}
+
+fn sample_limits() -> LimitPolicy {
+    LimitPolicy {
+        tokens_per_minute: Some(1200),
+        requests_per_minute: Some(0),
+        concurrent_streams: None,
     }
 }
 
@@ -168,6 +177,10 @@ impl Rows {
                 "tenant-b".into(),
                 encode_json(&EncodedTenantBudget::from(&sample_budget())),
             )],
+            limits: vec![(
+                "tenant-a".into(),
+                encode_json(&EncodedLimitPolicy::from(&sample_limits())),
+            )],
             credentials: vec![(
                 RedisControlPlaneStore::credential_field("tenant-a", "openai"),
                 encode_json(&EncodedTenantCredentialRow::from(&sample_credential())),
@@ -200,6 +213,7 @@ impl Rows {
             &self.keys,
             &self.policies,
             &self.budgets,
+            &self.limits,
             &self.credentials,
             &self.rate_cards,
         ]
@@ -210,10 +224,10 @@ impl Rows {
         tenants + hashes
     }
 
-    /// The `EXEC` reply to `load()`'s pipeline: an array of six replies.
+    /// The `EXEC` reply to `load()`'s pipeline: an array of seven replies.
     fn exec_reply(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        array_len(&mut out, 6);
+        array_len(&mut out, 7);
         array_len(&mut out, self.tenants.len());
         for tenant in &self.tenants {
             bulk(&mut out, tenant.as_bytes());
@@ -223,6 +237,7 @@ impl Rows {
             &self.keys,
             &self.policies,
             &self.budgets,
+            &self.limits,
             &self.credentials,
             &self.rate_cards,
         ] {
@@ -694,6 +709,14 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
             Box::new(|| store.set_budget(&tenant, None).is_ok()),
         ),
         (
+            "set_limits (set)",
+            Box::new(|| store.set_limits(&tenant, Some(&sample_limits())).is_ok()),
+        ),
+        (
+            "set_limits (clear)",
+            Box::new(|| store.set_limits(&tenant, None).is_ok()),
+        ),
+        (
             "put_tenant_credential",
             Box::new(|| store.put_tenant_credential(&sample_credential()).is_ok()),
         ),
@@ -889,6 +912,7 @@ fn a_load_exports_its_duration_and_size_as_stats() {
             &rows.keys,
             &rows.policies,
             &rows.budgets,
+            &rows.limits,
             &rows.credentials,
             &rows.rate_cards,
         ]
@@ -919,6 +943,10 @@ fn a_load_logs_its_duration_and_size_and_never_row_content() {
     drop(guard);
     assert_eq!(loaded.keys.len(), 3, "the rows decoded as served");
     assert_eq!(
+        loaded.limits.get(&TenantId::new("tenant-a")),
+        Some(&sample_limits())
+    );
+    assert_eq!(
         loaded.rate_cards.len(),
         3,
         "the unreadable rate card row is skipped, not fatal"
@@ -940,6 +968,7 @@ fn a_load_logs_its_duration_and_size_and_never_row_content() {
         ("keys", "3"),
         ("policies", "1"),
         ("budgets", "1"),
+        ("limits", "1"),
         ("tenant_credentials", "1"),
         ("rate_cards", "4"),
     ] {
@@ -977,6 +1006,66 @@ impl FakeRedis {
     fn wire_len(&self) -> usize {
         self.shared.lock().wire.len()
     }
+}
+
+#[test]
+fn limits_write_and_clear_are_atomic_with_generation() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    let subject = TenantId::new("tenant-a");
+    store.policy_generation().expect("open control connection");
+
+    let mark = fake.wire_len();
+    store
+        .set_limits(&subject, Some(&sample_limits()))
+        .expect("set limits");
+    let sent = fake.wire_since(mark);
+    let commands: Vec<&[String]> = sent.iter().map(|(_, args)| args.as_slice()).collect();
+    assert_eq!(commands.len(), 4);
+    assert_eq!(commands[0], ["MULTI"]);
+    assert_eq!(commands[1][..3], ["HSET", "lanes:limits", "tenant-a"]);
+    let encoded: EncodedLimitPolicy = decode_json(commands[1][3].as_bytes()).unwrap();
+    assert_eq!(LimitPolicy::from(encoded), sample_limits());
+    assert_eq!(commands[2], ["INCR", "lanes:generation"]);
+    assert_eq!(commands[3], ["EXEC"]);
+
+    let mark = fake.wire_len();
+    store.set_limits(&subject, None).expect("clear limits");
+    let sent = fake.wire_since(mark);
+    let commands: Vec<&[String]> = sent.iter().map(|(_, args)| args.as_slice()).collect();
+    assert_eq!(commands.len(), 4);
+    assert_eq!(commands[0], ["MULTI"]);
+    assert_eq!(commands[1], ["HDEL", "lanes:limits", "tenant-a"]);
+    assert_eq!(commands[2], ["INCR", "lanes:generation"]);
+    assert_eq!(commands[3], ["EXEC"]);
+}
+
+#[test]
+fn deleting_a_tenant_includes_its_limits_hash_in_the_atomic_script() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    let mark = fake.wire_len();
+
+    store
+        .delete_tenant(&TenantId::new("tenant-a"))
+        .expect("delete tenant");
+
+    let sent = fake.wire_since(mark);
+    assert_eq!(sent.len(), 1, "one script call: {sent:?}");
+    let args = &sent[0].1;
+    assert_eq!(args[0], "EVALSHA");
+    assert_eq!(args[2], "6");
+    assert_eq!(
+        args[3..9],
+        [
+            "lanes:tenants",
+            "lanes:policies",
+            "lanes:budgets",
+            "lanes:limits",
+            "lanes:tenant_credentials",
+            "lanes:generation",
+        ]
+    );
 }
 
 #[test]

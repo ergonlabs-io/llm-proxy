@@ -3052,6 +3052,13 @@ pub(crate) mod tests {
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
             }
+            fn set_limits(
+                &self,
+                subject: &TenantId,
+                limits: Option<&crate::control::LimitPolicy>,
+            ) -> Result<(), StoreError> {
+                self.0.set_limits(subject, limits)
+            }
             fn add_spend(
                 &self,
                 stat_prefix: &str,
@@ -3341,6 +3348,13 @@ pub(crate) mod tests {
             budget: Option<&TenantBudget>,
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
+        }
+        fn set_limits(
+            &self,
+            subject: &TenantId,
+            limits: Option<&crate::control::LimitPolicy>,
+        ) -> Result<(), StoreError> {
+            self.0.set_limits(subject, limits)
         }
         fn add_spend(
             &self,
@@ -3711,6 +3725,13 @@ pub(crate) mod tests {
             ) -> Result<(), StoreError> {
                 self.inner.set_budget(tenant, budget)
             }
+            fn set_limits(
+                &self,
+                subject: &TenantId,
+                limits: Option<&crate::control::LimitPolicy>,
+            ) -> Result<(), StoreError> {
+                self.inner.set_limits(subject, limits)
+            }
             fn add_spend(
                 &self,
                 stat_prefix: &str,
@@ -3880,6 +3901,13 @@ pub(crate) mod tests {
                 budget: Option<&TenantBudget>,
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
+            }
+            fn set_limits(
+                &self,
+                subject: &TenantId,
+                limits: Option<&crate::control::LimitPolicy>,
+            ) -> Result<(), StoreError> {
+                self.0.set_limits(subject, limits)
             }
             fn add_spend(
                 &self,
@@ -4250,6 +4278,13 @@ pub(crate) mod tests {
             budget: Option<&TenantBudget>,
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
+        }
+        fn set_limits(
+            &self,
+            subject: &TenantId,
+            limits: Option<&crate::control::LimitPolicy>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_limits(subject, limits)
         }
         fn add_spend(
             &self,

@@ -653,6 +653,13 @@ impl ControlPlaneStore for RivalWritesAfterFirstPut {
     ) -> Result<(), crate::control::StoreError> {
         self.inner.set_budget(t, b)
     }
+    fn set_limits(
+        &self,
+        subject: &crate::auth::TenantId,
+        limits: Option<&crate::control::LimitPolicy>,
+    ) -> Result<(), crate::control::StoreError> {
+        self.inner.set_limits(subject, limits)
+    }
     fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), crate::control::StoreError> {
         self.inner.put_rate_card(card)?;
         if self

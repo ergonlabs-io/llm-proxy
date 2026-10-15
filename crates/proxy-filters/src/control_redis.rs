@@ -33,7 +33,8 @@
 //! {ns}:tenants                              SET of tenant id
 //! {ns}:keys                                 HASH key_id -> encode_json(EncodedKeyRow)
 //! {ns}:policies                             HASH tenant -> encode_json(EncodedModelAccess)
-//! {ns}:budgets                              HASH tenant -> encode_json(EncodedTenantBudget)
+//! {ns}:budgets                              HASH subject -> encode_json(EncodedTenantBudget)
+//! {ns}:limits                               HASH subject -> encode_json(EncodedLimitPolicy)
 //! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
 //! {ns}:rate_cards                           HASH chain (the usage filter's stat_prefix) -> encode_json(EncodedRateCardRow)
 //! {ns}:generation                           STRING, INCR
@@ -81,9 +82,10 @@ use crate::auth::{KeyId, TenantId};
 use crate::control::decode_tenant_credential_row;
 use crate::control::{
     decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
-    EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget, EncodedTenantCredentialRow,
-    FlushToken, SpendDelta, StoreError, StoredControlPlane, StoredKey, StoredRateCard,
-    StoredTenantCredential, SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION,
+    EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
+    EncodedTenantCredentialRow, FlushToken, LimitPolicy, SpendDelta, StoreError,
+    StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, SPEND_SCHEMA_VERSION,
+    TENANT_CREDENTIALS_SCHEMA_VERSION,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
@@ -365,19 +367,20 @@ return 1
 /// same atomic write as the rest (the trait requires it). The credential
 /// fields are `<esc(tenant)>|<esc(provider)>`, so the prefix
 /// `<esc(tenant)>|` matches exactly that tenant: an escaped tenant contains
-/// no `|`. `KEYS` = tenants, policies, budgets, credentials, generation.
+/// no `|`. `KEYS` = tenants, policies, budgets, limits, credentials, generation.
 /// `ARGV[1]` = tenant, `ARGV[2]` = credential field prefix.
 const DELETE_TENANT_LUA: &str = r#"
 redis.call('SREM', KEYS[1], ARGV[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
+redis.call('HDEL', KEYS[4], ARGV[1])
 local prefix = ARGV[2]
-for _, field in ipairs(redis.call('HKEYS', KEYS[4])) do
+for _, field in ipairs(redis.call('HKEYS', KEYS[5])) do
   if string.sub(field, 1, #prefix) == prefix then
-    redis.call('HDEL', KEYS[4], field)
+    redis.call('HDEL', KEYS[5], field)
   end
 end
-redis.call('INCR', KEYS[5])
+redis.call('INCR', KEYS[6])
 return 1
 "#;
 
@@ -639,6 +642,10 @@ impl RedisControlPlaneStore {
         format!("{}:budgets", self.namespace)
     }
 
+    fn limits_key(&self) -> String {
+        format!("{}:limits", self.namespace)
+    }
+
     fn tenant_credentials_key(&self) -> String {
         format!("{}:tenant_credentials", self.namespace)
     }
@@ -743,9 +750,9 @@ impl RedisControlPlaneStore {
     }
 }
 
-/// The six replies [`RedisControlPlaneStore::load`]'s single pipeline comes
+/// The seven replies [`RedisControlPlaneStore::load`]'s single pipeline comes
 /// back with, in the order the commands were queued: the tenant set, then
-/// the keys, policies, budgets, tenant credentials and rate cards hashes as
+/// the keys, policies, budgets, limits, tenant credentials and rate cards hashes as
 /// raw `encode_json` bytes.
 ///
 /// Rust note: this annotation is not decoration. `redis`'s `query` is
@@ -762,11 +769,12 @@ type LoadReply = (
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
+    HashMap<String, Vec<u8>>,
 );
 
 impl ControlPlaneStore for RedisControlPlaneStore {
     /// One pipeline: `SMEMBERS tenants`, then `HGETALL` of keys, policies,
-    /// budgets, tenant credentials and rate cards -- run inside `MULTI`/`EXEC`
+    /// budgets, limits, tenant credentials and rate cards -- run inside `MULTI`/`EXEC`
     /// (`.atomic()`) so a rebuild sees one consistent point-in-time snapshot,
     /// the same property `RedbControlPlaneStore::load`'s single read
     /// transaction gives for free. Runs on [`Lane::Control`].
@@ -791,28 +799,38 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let keys_key = self.keys_key();
         let policies_key = self.policies_key();
         let budgets_key = self.budgets_key();
+        let limits_key = self.limits_key();
 
         let credentials_key = self.tenant_credentials_key();
         let rate_cards_key = self.rate_cards_key();
 
-        let (tenants_raw, keys_raw, policies_raw, budgets_raw, credentials_raw, rate_cards_raw): LoadReply =
-            self.with_connection(Lane::Control, |conn| {
-                redis::pipe()
-                    .atomic()
-                    .cmd("SMEMBERS")
-                    .arg(&tenants_key)
-                    .cmd("HGETALL")
-                    .arg(&keys_key)
-                    .cmd("HGETALL")
-                    .arg(&policies_key)
-                    .cmd("HGETALL")
-                    .arg(&budgets_key)
-                    .cmd("HGETALL")
-                    .arg(&credentials_key)
-                    .cmd("HGETALL")
-                    .arg(&rate_cards_key)
-                    .query(conn)
-            })?;
+        let (
+            tenants_raw,
+            keys_raw,
+            policies_raw,
+            budgets_raw,
+            limits_raw,
+            credentials_raw,
+            rate_cards_raw,
+        ): LoadReply = self.with_connection(Lane::Control, |conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("SMEMBERS")
+                .arg(&tenants_key)
+                .cmd("HGETALL")
+                .arg(&keys_key)
+                .cmd("HGETALL")
+                .arg(&policies_key)
+                .cmd("HGETALL")
+                .arg(&budgets_key)
+                .cmd("HGETALL")
+                .arg(&limits_key)
+                .cmd("HGETALL")
+                .arg(&credentials_key)
+                .cmd("HGETALL")
+                .arg(&rate_cards_key)
+                .query(conn)
+        })?;
         let fetched = started.elapsed();
 
         // Sized before the decode loops below consume the maps.
@@ -825,13 +843,15 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             + hash_bytes(&keys_raw)
             + hash_bytes(&policies_raw)
             + hash_bytes(&budgets_raw)
+            + hash_bytes(&limits_raw)
             + hash_bytes(&credentials_raw)
             + hash_bytes(&rate_cards_raw);
-        let (n_tenants, n_keys, n_policies, n_budgets, n_credentials, n_rate_cards) = (
+        let (n_tenants, n_keys, n_policies, n_budgets, n_limits, n_credentials, n_rate_cards) = (
             tenants_raw.len(),
             keys_raw.len(),
             policies_raw.len(),
             budgets_raw.len(),
+            limits_raw.len(),
             credentials_raw.len(),
             rate_cards_raw.len(),
         );
@@ -859,6 +879,12 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         for (tenant, bytes) in budgets_raw {
             let encoded: EncodedTenantBudget = decode_json(&bytes)?;
             budgets.insert(TenantId::new(tenant), encoded.into());
+        }
+
+        let mut limits = HashMap::new();
+        for (subject, bytes) in limits_raw {
+            let encoded: EncodedLimitPolicy = decode_json(&bytes)?;
+            limits.insert(TenantId::new(subject), encoded.into());
         }
 
         // Same fail-closed rule as redb: one row this build cannot read
@@ -890,7 +916,13 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             stats.record(
                 duration,
                 payload_bytes,
-                n_tenants + n_keys + n_policies + n_budgets + n_credentials + n_rate_cards,
+                n_tenants
+                    + n_keys
+                    + n_policies
+                    + n_budgets
+                    + n_limits
+                    + n_credentials
+                    + n_rate_cards,
             );
         }
         tracing::info!(
@@ -900,6 +932,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             keys = n_keys,
             policies = n_policies,
             budgets = n_budgets,
+            limits = n_limits,
             tenant_credentials = n_credentials,
             rate_cards = n_rate_cards,
             payload_bytes,
@@ -911,6 +944,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             keys,
             policies,
             budgets,
+            limits,
             tenant_credentials,
             rate_cards,
         })
@@ -952,6 +986,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .key(self.tenants_key())
                 .key(self.policies_key())
                 .key(self.budgets_key())
+                .key(self.limits_key())
                 .key(self.tenant_credentials_key())
                 .key(self.generation_key())
                 .arg(tenant.as_str())
@@ -1105,6 +1140,50 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     .cmd("HDEL")
                     .arg(&budgets_key)
                     .arg(tenant.as_str())
+                    .ignore()
+                    .cmd("INCR")
+                    .arg(&generation_key)
+                    .ignore()
+                    .query::<()>(conn)
+            }),
+        }
+    }
+
+    fn set_limits(
+        &self,
+        subject: &TenantId,
+        limits: Option<&LimitPolicy>,
+    ) -> Result<(), StoreError> {
+        let limits_key = self.limits_key();
+        let generation_key = self.generation_key();
+        match limits.filter(|policy| {
+            policy.tokens_per_minute.is_some()
+                || policy.requests_per_minute.is_some()
+                || policy.concurrent_streams.is_some()
+        }) {
+            Some(limits) => {
+                let encoded: EncodedLimitPolicy = limits.into();
+                let bytes = encode_json(&encoded);
+                self.with_connection(Lane::Control, |conn| {
+                    redis::pipe()
+                        .atomic()
+                        .cmd("HSET")
+                        .arg(&limits_key)
+                        .arg(subject.as_str())
+                        .arg(&bytes)
+                        .ignore()
+                        .cmd("INCR")
+                        .arg(&generation_key)
+                        .ignore()
+                        .query::<()>(conn)
+                })
+            }
+            None => self.with_connection(Lane::Control, |conn| {
+                redis::pipe()
+                    .atomic()
+                    .cmd("HDEL")
+                    .arg(&limits_key)
+                    .arg(subject.as_str())
                     .ignore()
                     .cmd("INCR")
                     .arg(&generation_key)
@@ -1761,7 +1840,7 @@ mod tests {
 
     #[test]
     #[ignore = "needs a real Redis -- see this module's doc comment"]
-    fn redis_load_round_trips_tenants_keys_policies_and_budgets() {
+    fn redis_load_round_trips_tenants_keys_policies_budgets_and_limits() {
         let store = test_store("load-roundtrip");
         let tenant = TenantId::new("tenant-a");
         store.create_tenant(&tenant).unwrap();
@@ -1784,6 +1863,12 @@ mod tests {
                 }),
             )
             .unwrap();
+        let limits = LimitPolicy {
+            tokens_per_minute: Some(1_000),
+            requests_per_minute: Some(0),
+            concurrent_streams: None,
+        };
+        store.set_limits(&tenant, Some(&limits)).unwrap();
 
         let loaded = store.load().unwrap();
         assert_eq!(loaded.tenants, vec![tenant.clone()]);
@@ -1794,6 +1879,7 @@ mod tests {
             Some(ModelAccess::All)
         ));
         assert!(loaded.budgets.contains_key(&tenant));
+        assert_eq!(loaded.limits.get(&tenant), Some(&limits));
     }
 
     // ------------------------------------------------------------------
@@ -1955,9 +2041,24 @@ mod tests {
                 .unwrap();
         }
         store.create_tenant(&TenantId::new("a")).unwrap();
+        let limits = LimitPolicy {
+            tokens_per_minute: Some(10),
+            requests_per_minute: None,
+            concurrent_streams: None,
+        };
+        store
+            .set_limits(&TenantId::new("a"), Some(&limits))
+            .unwrap();
+        store
+            .set_limits(&TenantId::new("other"), Some(&limits))
+            .unwrap();
         let before = store.policy_generation().unwrap();
 
         store.delete_tenant(&TenantId::new("a")).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert!(!loaded.limits.contains_key(&TenantId::new("a")));
+        assert_eq!(loaded.limits.get(&TenantId::new("other")), Some(&limits));
 
         let mut left: Vec<(String, String)> = store
             .load()

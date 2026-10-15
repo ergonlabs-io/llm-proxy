@@ -47,7 +47,7 @@ use hyper_util::rt::TokioIo;
 use proxy_core::lifecycle::LifecycleState;
 use proxy_core::WorkerConfigHandle;
 use proxy_filters::auth::{KeyId, TenantId};
-use proxy_filters::control::{ControlPlane, CredentialStoreError, StoreError};
+use proxy_filters::control::{ControlPlane, CredentialStoreError, LimitPolicy, StoreError};
 use proxy_filters::model_authz::{ModelAccess, ModelPattern};
 use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
@@ -93,12 +93,14 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/keys",
     "/keys/{id}",
     "/keys/{id}/budget",
+    "/keys/{id}/limits",
     "/keys/{id}/policy",
     "/keys/{id}/spend",
     "/tenants",
     "/tenants/{id}",
     "/tenants/{id}/policy",
     "/tenants/{id}/budget",
+    "/tenants/{id}/limits",
     "/tenants/{id}/provider_credentials",
     "/tenants/{id}/provider_credentials/{provider}",
     // A READ, but gated like a write -- see
@@ -107,12 +109,14 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/keys",
     "/chains/{stat_prefix}/keys/{id}",
     "/chains/{stat_prefix}/keys/{id}/budget",
+    "/chains/{stat_prefix}/keys/{id}/limits",
     "/chains/{stat_prefix}/keys/{id}/policy",
     "/chains/{stat_prefix}/keys/{id}/spend",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
     "/chains/{stat_prefix}/tenants/{id}/policy",
     "/chains/{stat_prefix}/tenants/{id}/budget",
+    "/chains/{stat_prefix}/tenants/{id}/limits",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider}",
     "/chains/{stat_prefix}/tenants/{id}/spend",
@@ -796,6 +800,9 @@ async fn handle(
         WriteRoute::KeyBudget(id) | WriteRoute::ScopedKeyBudget(_, id) => {
             handle_set_key_budget(&control_plane, id, &body)
         }
+        WriteRoute::KeyLimits(id) | WriteRoute::ScopedKeyLimits(_, id) => {
+            handle_set_key_limits(factory_state, stat_prefix_opt, &control_plane, id, &body)
+        }
         WriteRoute::KeyPolicy(id) | WriteRoute::ScopedKeyPolicy(_, id) => {
             handle_set_key_policy(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
@@ -813,6 +820,9 @@ async fn handle(
         }
         WriteRoute::TenantBudget(id) | WriteRoute::ScopedTenantBudget(_, id) => {
             handle_set_budget(factory_state, stat_prefix_opt, &control_plane, id, &body)
+        }
+        WriteRoute::TenantLimits(id) | WriteRoute::ScopedTenantLimits(_, id) => {
+            handle_set_tenant_limits(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
             handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
@@ -941,12 +951,14 @@ enum WriteRoute<'a> {
     Keys,
     KeyById(&'a str),
     KeyBudget(&'a str),
+    KeyLimits(&'a str),
     KeyPolicy(&'a str),
     KeySpend(&'a str),
     Tenants,
     TenantById(&'a str),
     TenantPolicy(&'a str),
     TenantBudget(&'a str),
+    TenantLimits(&'a str),
     TenantSpend(&'a str),
     /// `GET /tenants/{id}/provider_credentials` -- metadata only, gated like
     /// the other identity reads (ADR-0007 decision 9).
@@ -963,12 +975,14 @@ enum WriteRoute<'a> {
     ScopedKeys(&'a str),
     ScopedKeyById(&'a str, &'a str),
     ScopedKeyBudget(&'a str, &'a str),
+    ScopedKeyLimits(&'a str, &'a str),
     ScopedKeyPolicy(&'a str, &'a str),
     ScopedKeySpend(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
     ScopedTenantPolicy(&'a str, &'a str),
     ScopedTenantBudget(&'a str, &'a str),
+    ScopedTenantLimits(&'a str, &'a str),
     ScopedTenantSpend(&'a str, &'a str),
     Pricing,
     ScopedPricing(&'a str),
@@ -985,12 +999,14 @@ impl<'a> WriteRoute<'a> {
         match self {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
-            WriteRoute::KeyBudget(_) | WriteRoute::KeyPolicy(_) => Method::PUT,
+            WriteRoute::KeyBudget(_) | WriteRoute::KeyLimits(_) | WriteRoute::KeyPolicy(_) => {
+                Method::PUT
+            }
             WriteRoute::KeySpend(_) => Method::GET,
             // The gated list read: GET on the collection path.
             WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => Method::GET,
             WriteRoute::TenantPolicy(_) => Method::PUT,
-            WriteRoute::TenantBudget(_) => Method::PUT,
+            WriteRoute::TenantBudget(_) | WriteRoute::TenantLimits(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::TenantCredentials(_) | WriteRoute::ScopedTenantCredentials(..) => {
                 Method::GET
@@ -1006,10 +1022,12 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::DrainListeners => Method::POST,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
-            WriteRoute::ScopedKeyBudget(..) | WriteRoute::ScopedKeyPolicy(..) => Method::PUT,
+            WriteRoute::ScopedKeyBudget(..)
+            | WriteRoute::ScopedKeyLimits(..)
+            | WriteRoute::ScopedKeyPolicy(..) => Method::PUT,
             WriteRoute::ScopedKeySpend(..) => Method::GET,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
-            WriteRoute::ScopedTenantBudget(..) => Method::PUT,
+            WriteRoute::ScopedTenantBudget(..) | WriteRoute::ScopedTenantLimits(..) => Method::PUT,
         }
     }
 
@@ -1032,12 +1050,14 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::Keys
             | WriteRoute::KeyById(_)
             | WriteRoute::KeyBudget(_)
+            | WriteRoute::KeyLimits(_)
             | WriteRoute::KeyPolicy(_)
             | WriteRoute::KeySpend(_)
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
             | WriteRoute::TenantPolicy(_)
             | WriteRoute::TenantBudget(_)
+            | WriteRoute::TenantLimits(_)
             | WriteRoute::TenantSpend(_)
             | WriteRoute::TenantCredentials(_)
             | WriteRoute::TenantCredentialPut(..)
@@ -1050,11 +1070,13 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenants(s)
             | WriteRoute::ScopedKeyById(s, _)
             | WriteRoute::ScopedKeyBudget(s, _)
+            | WriteRoute::ScopedKeyLimits(s, _)
             | WriteRoute::ScopedKeyPolicy(s, _)
             | WriteRoute::ScopedKeySpend(s, _)
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
             | WriteRoute::ScopedTenantBudget(s, _)
+            | WriteRoute::ScopedTenantLimits(s, _)
             | WriteRoute::ScopedTenantSpend(s, _)
             | WriteRoute::ScopedTenantCredentials(s, _)
             | WriteRoute::ScopedTenantCredentialPut(s, ..)
@@ -1098,12 +1120,14 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["keys"] => Some(WriteRoute::Keys),
         ["keys", id] => Some(WriteRoute::KeyById(id)),
         ["keys", id, "budget"] => Some(WriteRoute::KeyBudget(id)),
+        ["keys", id, "limits"] => Some(WriteRoute::KeyLimits(id)),
         ["keys", id, "policy"] => Some(WriteRoute::KeyPolicy(id)),
         ["keys", id, "spend"] => Some(WriteRoute::KeySpend(id)),
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
         ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
+        ["tenants", id, "limits"] => Some(WriteRoute::TenantLimits(id)),
         // A GET, gated like a write -- see `WriteRoute`'s doc.
         ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
         ["tenants", id, "provider_credentials"] => Some(WriteRoute::TenantCredentials(id)),
@@ -1140,6 +1164,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["chains", stat_prefix, "keys", id, "budget"] => {
             Some(WriteRoute::ScopedKeyBudget(stat_prefix, id))
         }
+        ["chains", stat_prefix, "keys", id, "limits"] => {
+            Some(WriteRoute::ScopedKeyLimits(stat_prefix, id))
+        }
         ["chains", stat_prefix, "keys", id, "policy"] => {
             Some(WriteRoute::ScopedKeyPolicy(stat_prefix, id))
         }
@@ -1155,6 +1182,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "tenants", id, "budget"] => {
             Some(WriteRoute::ScopedTenantBudget(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "limits"] => {
+            Some(WriteRoute::ScopedTenantLimits(stat_prefix, id))
         }
         ["chains", stat_prefix, "tenants", id, "spend"] => {
             Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
@@ -1714,6 +1744,21 @@ fn model_authz_enforced(factory_state: &SharedFactoryState, stat_prefix: Option<
     }
 }
 
+/// The addressed chain must register either token-limit config type URL.
+/// Counters remain per process, so N replicas can admit up to N times a
+/// configured limit until a shared counter backend is available.
+fn token_limit_enforced(factory_state: &SharedFactoryState, stat_prefix: Option<&str>) -> bool {
+    [
+        proxy_filters::token_limit_filter::TYPE_URL,
+        proxy_filters::token_limit_filter::LEGACY_TYPE_URL,
+    ]
+    .iter()
+    .any(|type_url| match stat_prefix {
+        Some(name) => factory_state.get_by_name(name, type_url).is_some(),
+        None => !matches!(factory_state.get_across_scopes(type_url), Ok(None)),
+    })
+}
+
 fn no_content() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -1833,6 +1878,64 @@ struct SetBudgetRequest {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SetLimitsRequest {
+    #[serde(
+        default,
+        rename = "schema_version",
+        deserialize_with = "read_limits_api_schema_version"
+    )]
+    _schema_version: (),
+    // `deserialize_with` without `default` keeps the field required: a
+    // missing `limits` is a 400, while an explicit `null` clears the row.
+    // A bare `Option` field would treat a missing key as `null`.
+    #[serde(deserialize_with = "nullable_limits")]
+    limits: Option<LimitSpec>,
+}
+
+fn read_limits_api_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<(), D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if version == 1 {
+        Ok(())
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported limits API schema version {version}"
+        )))
+    }
+}
+
+fn nullable_limits<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<LimitSpec>, D::Error> {
+    <Option<LimitSpec> as serde::Deserialize>::deserialize(de)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitSpec {
+    tokens_per_minute: Option<u64>,
+    requests_per_minute: Option<u64>,
+    concurrent_streams: Option<u32>,
+}
+
+impl LimitSpec {
+    fn into_policy(self) -> Option<LimitPolicy> {
+        let policy = LimitPolicy {
+            tokens_per_minute: self.tokens_per_minute,
+            requests_per_minute: self.requests_per_minute,
+            concurrent_streams: self.concurrent_streams,
+        };
+        (policy != LimitPolicy::default()).then_some(policy)
+    }
+}
+
+// See `parse_json_body`'s identical `#[allow]`: a cold admin-write path
+// whose `Err` is the ready-made response.
+#[allow(clippy::result_large_err)]
+fn parse_limits(body: &[u8]) -> Result<Option<LimitPolicy>, Response<Full<Bytes>>> {
+    let request: SetLimitsRequest = parse_json_body(body)?;
+    Ok(request.limits.and_then(LimitSpec::into_policy))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BudgetSpec {
     /// A decimal-string ceiling, e.g. `"500.00"` -- parsed by
     /// [`parse_micro_usd`], the SAME parser a configured price uses (see
@@ -1928,6 +2031,7 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                     "period": PeriodSpec::from(budget.period),
                     "credential_source": budget.credential_source.as_str(),
                 })),
+                "limits": listing.limits.map(render_limits),
             })
         })
         .collect();
@@ -1936,6 +2040,20 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
         StatusCode::OK,
         &serde_json::json!({ "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION, "keys": rendered, "count": count }),
     )
+}
+
+fn render_limits(limits: LimitPolicy) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    if let Some(value) = limits.tokens_per_minute {
+        fields.insert("tokens_per_minute".into(), serde_json::json!(value));
+    }
+    if let Some(value) = limits.requests_per_minute {
+        fields.insert("requests_per_minute".into(), serde_json::json!(value));
+    }
+    if let Some(value) = limits.concurrent_streams {
+        fields.insert("concurrent_streams".into(), serde_json::json!(value));
+    }
+    serde_json::Value::Object(fields)
 }
 
 fn render_model_access(access: &ModelAccess) -> serde_json::Value {
@@ -2486,6 +2604,9 @@ fn handle_set_policy(
     }
 }
 
+// See `parse_json_body`'s identical `#[allow]`: a cold admin-write path
+// whose `Err` is the ready-made response.
+#[allow(clippy::result_large_err)]
 fn parse_model_policy(body: &[u8]) -> Result<ModelAccess, Response<Full<Bytes>>> {
     let request: SetPolicyRequest = parse_json_body(body)?;
     let allow = match request.access {
@@ -2672,6 +2793,59 @@ fn handle_set_key_budget(
     match control_plane.set_key_budget(&KeyId::new(key_id), budget.as_ref()) {
         Ok(()) => no_content(),
         Err(err) => store_error_response("/keys/{id}/budget", err),
+    }
+}
+
+/// `PUT /tenants/{id}/limits`: absent fields impose no limit at this level;
+/// explicit zero refuses all traffic measured by that counter.
+fn handle_set_tenant_limits(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    control_plane: &ControlPlane,
+    tenant: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let limits = match parse_limits(body) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
+    if !token_limit_enforced(factory_state, stat_prefix) {
+        return not_enforced(
+            "no listener chain runs llmproxy.token_limit; limits would not be enforced",
+        );
+    }
+    match control_plane.set_tenant_limits(&TenantId::new(tenant), limits.as_ref()) {
+        Ok(()) => no_content(),
+        Err(err) => store_error_response("/tenants/{id}/limits", err),
+    }
+}
+
+/// `PUT /keys/{id}/limits`: a key's counters narrow its tenant's counters.
+fn handle_set_key_limits(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    control_plane: &ControlPlane,
+    key_id: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if key_id.is_empty() {
+        return bad_request("key_id must not be empty");
+    }
+    let limits = match parse_limits(body) {
+        Ok(limits) => limits,
+        Err(response) => return response,
+    };
+    if !token_limit_enforced(factory_state, stat_prefix) {
+        return not_enforced(
+            "no listener chain runs llmproxy.token_limit; limits would not be enforced",
+        );
+    }
+    match control_plane.set_key_limits(&KeyId::new(key_id), limits.as_ref()) {
+        Ok(()) => no_content(),
+        Err(err) => store_error_response("/keys/{id}/limits", err),
     }
 }
 

@@ -3418,5 +3418,6 @@ mod admin_rate_limit;
 mod budget_scope;
 mod capture_spool;
 mod credentials;
+mod limits;
 mod pricing;
 mod tenant_budget_cutover;
