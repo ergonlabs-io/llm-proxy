@@ -33,9 +33,10 @@
 //! here): `POST /keys` (mint), `DELETE /keys/{id}` (revoke),
 //! `POST /tenants` (create), `DELETE /tenants/{id}` (delete),
 //! `PUT /tenants/{id}/policy` (set model-access policy),
+//! `PUT /keys/{id}/policy` (narrow a key's model access),
 //! `PUT /tenants/{id}/budget` (set or clear a tenant's spend ceiling), and
 //! the reads described above, `GET /tenants/{id}/spend` and `GET /keys` (the
-//! key listing: `key_id`, `tenant`, `revoked`, `budget`, sorted by
+//! key listing: `key_id`, `tenant`, `revoked`, `budget`, `policy`, sorted by
 //! `(tenant, key_id)`). Unset (or
 //! empty/whitespace) token means every one of these -- write OR read -- is
 //! refused with 403 -- **unset never means open** (AGENTS.md "Fail-open controls"). See
@@ -55,6 +56,7 @@
 //! Every write endpoint also has a **scoped** form (as do the gated spend
 //! read and the `GET /keys` listing),
 //! `/chains/{stat_prefix}/keys` (POST to mint, GET to list), `/chains/{stat_prefix}/keys/{id}`,
+//! `/chains/{stat_prefix}/keys/{id}/policy`,
 //! `/chains/{stat_prefix}/tenants`, `/chains/{stat_prefix}/tenants/{id}`,
 //! `/chains/{stat_prefix}/tenants/{id}/policy`,
 //! `/chains/{stat_prefix}/tenants/{id}/budget`,

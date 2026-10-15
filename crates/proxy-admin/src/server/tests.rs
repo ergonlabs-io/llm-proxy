@@ -40,6 +40,201 @@ use crate::server::{
     serve, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe, UiAssets,
 };
 
+async fn mint_policy_test_key(addr: SocketAddr) {
+    let (status, _, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-a","key_id":"key-a"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn put_key_policy_updates_snapshot_and_key_listing() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    mint_policy_test_key(addr).await;
+    let (status, _, body) = request(
+        addr,
+        "PUT",
+        "/keys/key-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":["gpt-4*"]},"deny":["gpt-4-old"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let access = handle.load().key_policies[&KeyId::new("key-a")].clone();
+    assert!(access.permits("gpt-4o"));
+    assert!(!access.permits("gpt-4-old"));
+    let (status, _, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["keys"][0]["policy"],
+        serde_json::json!({"access":{"only":["gpt-4*"]},"deny":["gpt-4-old"]})
+    );
+}
+
+#[tokio::test]
+async fn put_key_policy_unknown_key_is_404_and_stores_nothing() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    let (status, _, _) = request(
+        addr,
+        "PUT",
+        "/keys/missing/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":"all"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(handle.load().key_policies.is_empty());
+}
+
+#[tokio::test]
+async fn scoped_put_key_policy_updates_named_chain() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    mint_policy_test_key(addr).await;
+    let (status, _, body) = request(
+        addr,
+        "PUT",
+        "/chains/test-chain/keys/key-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":["gpt-4*"]}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(handle
+        .load()
+        .key_policies
+        .contains_key(&KeyId::new("key-a")));
+    let (status, _, body) = request(
+        addr,
+        "GET",
+        "/chains/test-chain/keys",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["keys"][0]["policy"],
+        serde_json::json!({"access":{"only":["gpt-4*"]}})
+    );
+}
+
+#[tokio::test]
+async fn put_key_policy_without_model_authz_is_409_and_stores_nothing() {
+    let factory_state = Arc::new(SharedFactoryState::default());
+    let handle = register_control_plane(
+        &factory_state,
+        TEST_CHAIN_SCOPE,
+        TEST_CHAIN_STAT_PREFIX,
+        TEST_HMAC_SECRET,
+    );
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    mint_policy_test_key(addr).await;
+    let (status, _, body) = request(
+        addr,
+        "PUT",
+        "/keys/key-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":"all"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"],
+        "not_enforced"
+    );
+    assert!(handle.load().key_policies.is_empty());
+}
+
+#[tokio::test]
+async fn put_key_policy_all_lists_as_inherit_equivalent_all() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    mint_policy_test_key(addr).await;
+    let (status, _, body) = request(
+        addr,
+        "PUT",
+        "/keys/key-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":"all"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        handle.load().key_policies[&KeyId::new("key-a")],
+        ModelAccess::All
+    );
+    let (status, _, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["keys"][0]["policy"],
+        serde_json::json!({"access":"all"})
+    );
+}
+
+#[tokio::test]
+async fn put_key_policy_invalid_pattern_is_400_and_stores_nothing() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    mint_policy_test_key(addr).await;
+    let (status, _, _) = request(
+        addr,
+        "PUT",
+        "/keys/key-a/policy",
+        Some(ADMIN_TOKEN),
+        r#"{"access":{"only":["gpt-*-bad"]}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(handle.load().key_policies.is_empty());
+}
+
 /// The HMAC secret every write-API test's `ControlPlane` and matching
 /// [`VirtualKeyAuthenticator`] are built with -- arbitrary, but shared
 /// between the two so a plaintext key minted through the admin API actually
@@ -2798,6 +2993,10 @@ async fn get_keys_lists_tenant_revocation_and_budget_without_a_plaintext() {
 
     assert_eq!(keys[0]["key_id"], "key-a");
     assert_eq!(keys[0]["tenant"], "tenant-a");
+    assert!(
+        keys[0]["policy"].is_null(),
+        "a key with no policy inherits its tenant"
+    );
     assert_eq!(
         keys[0]["revoked"], true,
         "a revoked key stays listable -- \

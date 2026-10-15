@@ -93,6 +93,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/keys",
     "/keys/{id}",
     "/keys/{id}/budget",
+    "/keys/{id}/policy",
     "/keys/{id}/spend",
     "/tenants",
     "/tenants/{id}",
@@ -106,6 +107,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/keys",
     "/chains/{stat_prefix}/keys/{id}",
     "/chains/{stat_prefix}/keys/{id}/budget",
+    "/chains/{stat_prefix}/keys/{id}/policy",
     "/chains/{stat_prefix}/keys/{id}/spend",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
@@ -794,6 +796,9 @@ async fn handle(
         WriteRoute::KeyBudget(id) | WriteRoute::ScopedKeyBudget(_, id) => {
             handle_set_key_budget(&control_plane, id, &body)
         }
+        WriteRoute::KeyPolicy(id) | WriteRoute::ScopedKeyPolicy(_, id) => {
+            handle_set_key_policy(factory_state, stat_prefix_opt, &control_plane, id, &body)
+        }
         WriteRoute::KeySpend(id) | WriteRoute::ScopedKeySpend(_, id) => {
             handle_get_key_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
         }
@@ -936,6 +941,7 @@ enum WriteRoute<'a> {
     Keys,
     KeyById(&'a str),
     KeyBudget(&'a str),
+    KeyPolicy(&'a str),
     KeySpend(&'a str),
     Tenants,
     TenantById(&'a str),
@@ -957,6 +963,7 @@ enum WriteRoute<'a> {
     ScopedKeys(&'a str),
     ScopedKeyById(&'a str, &'a str),
     ScopedKeyBudget(&'a str, &'a str),
+    ScopedKeyPolicy(&'a str, &'a str),
     ScopedKeySpend(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
@@ -978,7 +985,7 @@ impl<'a> WriteRoute<'a> {
         match self {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
-            WriteRoute::KeyBudget(_) => Method::PUT,
+            WriteRoute::KeyBudget(_) | WriteRoute::KeyPolicy(_) => Method::PUT,
             WriteRoute::KeySpend(_) => Method::GET,
             // The gated list read: GET on the collection path.
             WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => Method::GET,
@@ -999,7 +1006,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::DrainListeners => Method::POST,
             WriteRoute::ScopedKeys(_) | WriteRoute::ScopedTenants(_) => Method::POST,
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
-            WriteRoute::ScopedKeyBudget(..) => Method::PUT,
+            WriteRoute::ScopedKeyBudget(..) | WriteRoute::ScopedKeyPolicy(..) => Method::PUT,
             WriteRoute::ScopedKeySpend(..) => Method::GET,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
             WriteRoute::ScopedTenantBudget(..) => Method::PUT,
@@ -1025,6 +1032,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::Keys
             | WriteRoute::KeyById(_)
             | WriteRoute::KeyBudget(_)
+            | WriteRoute::KeyPolicy(_)
             | WriteRoute::KeySpend(_)
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
@@ -1042,6 +1050,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenants(s)
             | WriteRoute::ScopedKeyById(s, _)
             | WriteRoute::ScopedKeyBudget(s, _)
+            | WriteRoute::ScopedKeyPolicy(s, _)
             | WriteRoute::ScopedKeySpend(s, _)
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
@@ -1089,6 +1098,7 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["keys"] => Some(WriteRoute::Keys),
         ["keys", id] => Some(WriteRoute::KeyById(id)),
         ["keys", id, "budget"] => Some(WriteRoute::KeyBudget(id)),
+        ["keys", id, "policy"] => Some(WriteRoute::KeyPolicy(id)),
         ["keys", id, "spend"] => Some(WriteRoute::KeySpend(id)),
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
@@ -1129,6 +1139,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["chains", stat_prefix, "keys", id] => Some(WriteRoute::ScopedKeyById(stat_prefix, id)),
         ["chains", stat_prefix, "keys", id, "budget"] => {
             Some(WriteRoute::ScopedKeyBudget(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "keys", id, "policy"] => {
+            Some(WriteRoute::ScopedKeyPolicy(stat_prefix, id))
         }
         ["chains", stat_prefix, "keys", id, "spend"] => {
             Some(WriteRoute::ScopedKeySpend(stat_prefix, id))
@@ -1902,6 +1915,7 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                 "key_id": listing.key_id.as_str(),
                 "tenant": listing.tenant.as_str(),
                 "revoked": listing.revoked,
+                "policy": listing.model_access.as_ref().map(render_model_access),
                 // `null` means "no ceiling configured" (unlimited); an
                 // explicitly configured zero ceiling serializes as its own
                 // real number -- see `proxy_filters::spend::TenantBudget`'s
@@ -1922,6 +1936,22 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
         StatusCode::OK,
         &serde_json::json!({ "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION, "keys": rendered, "count": count }),
     )
+}
+
+fn render_model_access(access: &ModelAccess) -> serde_json::Value {
+    let allow = match access {
+        ModelAccess::All => serde_json::json!("all"),
+        ModelAccess::Only(patterns) => serde_json::json!({
+            "only": patterns.iter().map(ModelPattern::as_str).collect::<Vec<_>>()
+        }),
+        ModelAccess::WithDeny { allow, deny } => {
+            let mut rendered = render_model_access(allow);
+            rendered["deny"] =
+                serde_json::json!(deny.iter().map(ModelPattern::as_str).collect::<Vec<_>>());
+            return rendered;
+        }
+    };
+    serde_json::json!({ "access": allow })
 }
 
 fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<Bytes>> {
@@ -2432,31 +2462,10 @@ fn handle_set_policy(
     if tenant.is_empty() {
         return bad_request("tenant must not be empty");
     }
-    let request: SetPolicyRequest = match parse_json_body(body) {
-        Ok(request) => request,
+    let access = match parse_model_policy(body) {
+        Ok(access) => access,
         Err(response) => return response,
     };
-    let allow = match request.access {
-        AccessSpec::All => ModelAccess::All,
-        // An empty `only: []` is a legitimate, deliberate policy -- "deny
-        // every model for this tenant" -- and MUST stay `Only(vec![])`
-        // rather than collapsing to `All`. Doing so would be a silent
-        // privilege escalation: an operator meaning to lock a tenant out of
-        // every model until patterns are added would instead grant it
-        // access to everything. See `ModelAccess`'s own doc for the same
-        // point made from the type's side.
-        AccessSpec::Only(patterns) => {
-            ModelAccess::Only(patterns.into_iter().map(ModelPattern::new).collect())
-        }
-    };
-    for (index, pattern) in request.deny.iter().enumerate() {
-        if !ModelPattern::is_valid(pattern) {
-            return bad_request(&format!(
-                "deny[{index}] must be an exact model name or a single trailing `*` glob"
-            ));
-        }
-    }
-    let access = allow.with_deny(request.deny.into_iter().map(ModelPattern::new).collect());
     // A policy no filter reads is a silent hole: the write succeeds and the
     // operator believes the tenant is restricted. Refuse it, naming why.
     if !model_authz_enforced(factory_state, stat_prefix) {
@@ -2474,6 +2483,70 @@ fn handle_set_policy(
             no_content()
         }
         Err(err) => store_error_response("/tenants/{id}/policy", err),
+    }
+}
+
+fn parse_model_policy(body: &[u8]) -> Result<ModelAccess, Response<Full<Bytes>>> {
+    let request: SetPolicyRequest = parse_json_body(body)?;
+    let allow = match request.access {
+        AccessSpec::All => ModelAccess::All,
+        // An empty `only: []` is a legitimate, deliberate policy -- "deny
+        // every model for this tenant" -- and MUST stay `Only(vec![])`
+        // rather than collapsing to `All`. Doing so would be a silent
+        // privilege escalation: an operator meaning to lock a tenant out of
+        // every model until patterns are added would instead grant it
+        // access to everything. See `ModelAccess`'s own doc for the same
+        // point made from the type's side.
+        AccessSpec::Only(patterns) => {
+            for (index, pattern) in patterns.iter().enumerate() {
+                if !ModelPattern::is_valid(pattern) {
+                    return Err(bad_request(&format!(
+                        "access.only[{index}] must be an exact model name or a single trailing `*` glob"
+                    )));
+                }
+            }
+            ModelAccess::Only(patterns.into_iter().map(ModelPattern::new).collect())
+        }
+    };
+    for (index, pattern) in request.deny.iter().enumerate() {
+        if !ModelPattern::is_valid(pattern) {
+            return Err(bad_request(&format!(
+                "deny[{index}] must be an exact model name or a single trailing `*` glob"
+            )));
+        }
+    }
+    Ok(allow.with_deny(request.deny.into_iter().map(ModelPattern::new).collect()))
+}
+
+fn handle_set_key_policy(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    control_plane: &ControlPlane,
+    key_id: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if key_id.is_empty() {
+        return bad_request("key_id must not be empty");
+    }
+    let access = match parse_model_policy(body) {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    if !model_authz_enforced(factory_state, stat_prefix) {
+        return not_enforced(
+            "no listener chain runs llmproxy.model_authz; key policies would not be enforced",
+        );
+    }
+    match control_plane.set_key_policy(&KeyId::new(key_id), &access) {
+        Ok(()) => {
+            tracing::info!(
+                endpoint = "/keys/{id}/policy",
+                key_id,
+                "admin: set a key's model-access policy"
+            );
+            no_content()
+        }
+        Err(err) => store_error_response("/keys/{id}/policy", err),
     }
 }
 

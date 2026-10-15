@@ -5,7 +5,7 @@
 //! # Decode-path only, and it must run LAST among the LLM-layer filters it needs
 //!
 //! This filter needs two facts that only exist once two OTHER decode-path
-//! filters have already run: `StreamInfo::auth.tenant` (written by
+//! filters have already run: `StreamInfo::auth.tenant` and `auth.key_id` (written by
 //! `llmproxy.auth`) and `StreamInfo::requested_model` (written by
 //! `llmproxy.body_rewrite`). Both of those filters must be configured
 //! BEFORE `llmproxy.model_authz` in a listener's `http_filters` list;
@@ -63,6 +63,9 @@
 //!
 //! A tenant whose policy does not permit the model (`ModelAccess::Only` with
 //! no matching pattern) is a fourth, ordinary denial with the same treatment.
+//! A key's own policy intersects the tenant grant and can only narrow it;
+//! a key without a policy inherits its tenant's decision. A key refusal uses
+//! the same 403, including when `tenants_without_policy` is `ALLOW`.
 //!
 //! # Config: a vendored proto, same reasoning as `auth.proto`
 //!
@@ -114,7 +117,7 @@ use proxy_http::filter::{
     FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders, RequestTrailers,
 };
 
-use crate::auth::TenantPolicy;
+use crate::auth::{KeyId, TenantPolicy};
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
@@ -510,7 +513,7 @@ impl ModelAuthzFilterInstance {
         cb.send_local_reply(StatusCode::FORBIDDEN, "forbidden", None, DENY_DETAILS);
     }
 
-    /// Cases 2 and 3 of the module doc: the checks that need
+    /// Cases 2 and 3 of the module doc: the tenant and key checks that need
     /// `StreamInfo::requested_model`, and therefore cannot run before
     /// `llmproxy.body_rewrite`'s `decode_data` has published it.
     ///
@@ -537,12 +540,13 @@ impl ModelAuthzFilterInstance {
 
         // Rust note: same `RefMut`-guard discipline as `decode_headers` --
         // clone out and let the guard drop before any other call on `cb`.
-        let (tenant, model) = {
+        let (tenant, key_id, model) = {
             let info = cb.stream_info();
             // The resolver's choice when one ran: a trigger such as `auto`
             // is never itself granted, only the model it resolved to.
             (
                 info.auth.tenant.clone(),
+                info.auth.key_id.clone(),
                 info.routing_model().map(str::to_owned),
             )
         };
@@ -594,6 +598,13 @@ impl ModelAuthzFilterInstance {
             }
         };
 
+        // A key policy only narrows the tenant decision, including the
+        // operator's explicit no-tenant-policy ALLOW choice.
+        let permitted = permitted
+            && key_id
+                .as_deref()
+                .and_then(|id| snapshot.key_policies.get(&KeyId::new(id)))
+                .is_none_or(|access| access.permits(&model));
         if !permitted {
             self.deny(cb);
         }
@@ -971,6 +982,10 @@ mod tests {
             self.stream_info.borrow_mut().auth.tenant = Some(tenant.to_string());
         }
 
+        fn set_key_id(&self, key_id: &str) {
+            self.stream_info.borrow_mut().auth.key_id = Some(key_id.to_string());
+        }
+
         fn set_requested_model(&self, model: &str) {
             self.stream_info.borrow_mut().requested_model = Some(model.to_string());
         }
@@ -1264,6 +1279,105 @@ mod tests {
         cb.local_reply
             .map(|reply| reply.status == HttpStatusCode::FORBIDDEN)
             .unwrap_or(false)
+    }
+
+    fn key_model_refused(factory: &dyn FilterInstanceFactory, key: &str, model: &str) -> bool {
+        let mut filter = factory.create_filter();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        cb.set_tenant("tenant-a");
+        cb.set_key_id(key);
+        cb.set_requested_model(model);
+        decode_request(&mut *filter, &mut cb);
+        match cb.local_reply {
+            Some(reply) => {
+                assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+                assert_eq!(reply.details, DENY_DETAILS);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn key_access(pattern: &str) -> ModelAccess {
+        ModelAccess::Only(vec![ModelPattern::new(pattern)])
+    }
+
+    #[test]
+    fn key_only_narrows_tenant_all() {
+        let (cp, factory) = built_over_control_plane(false);
+        cp.mint_key(&TenantId::new("tenant-a"), &KeyId::new("key-a"))
+            .unwrap();
+        cp.set_policy(&TenantId::new("tenant-a"), &ModelAccess::All)
+            .unwrap();
+        cp.set_key_policy(&KeyId::new("key-a"), &key_access("gpt-4*"))
+            .unwrap();
+        assert!(!key_model_refused(&*factory, "key-a", "gpt-4o"));
+        assert!(key_model_refused(&*factory, "key-a", "claude-3"));
+    }
+
+    #[test]
+    fn key_policy_never_widens_tenant_grant() {
+        let (cp, factory) = built_over_control_plane(false);
+        cp.mint_key(&TenantId::new("tenant-a"), &KeyId::new("key-a"))
+            .unwrap();
+        cp.set_policy(&TenantId::new("tenant-a"), &key_access("gpt-4*"))
+            .unwrap();
+        cp.set_key_policy(&KeyId::new("key-a"), &key_access("claude*"))
+            .unwrap();
+        assert!(key_model_refused(&*factory, "key-a", "claude-3"));
+        assert!(key_model_refused(&*factory, "key-a", "gpt-4o"));
+    }
+
+    #[test]
+    fn sibling_key_without_policy_inherits_tenant_all() {
+        let (cp, factory) = built_over_control_plane(false);
+        for key in ["restricted", "sibling"] {
+            cp.mint_key(&TenantId::new("tenant-a"), &KeyId::new(key))
+                .unwrap();
+        }
+        cp.set_policy(&TenantId::new("tenant-a"), &ModelAccess::All)
+            .unwrap();
+        cp.set_key_policy(&KeyId::new("restricted"), &key_access("gpt-4*"))
+            .unwrap();
+        assert!(key_model_refused(&*factory, "restricted", "claude-3"));
+        assert!(!key_model_refused(&*factory, "sibling", "claude-3"));
+    }
+
+    #[test]
+    fn key_all_inherits_restricted_tenant_grant() {
+        let (cp, factory) = built_over_control_plane(false);
+        cp.mint_key(&TenantId::new("tenant-a"), &KeyId::new("key-a"))
+            .unwrap();
+        cp.set_policy(&TenantId::new("tenant-a"), &key_access("gpt-4*"))
+            .unwrap();
+        cp.set_key_policy(&KeyId::new("key-a"), &ModelAccess::All)
+            .unwrap();
+        assert!(!key_model_refused(&*factory, "key-a", "gpt-4o"));
+        assert!(key_model_refused(&*factory, "key-a", "claude-3"));
+    }
+
+    #[test]
+    fn key_policy_narrows_tenants_without_policy_allow() {
+        let (cp, factory) = built_over_control_plane(true);
+        cp.mint_key(&TenantId::new("tenant-a"), &KeyId::new("key-a"))
+            .unwrap();
+        cp.set_key_policy(&KeyId::new("key-a"), &key_access("gpt-4*"))
+            .unwrap();
+        assert!(key_model_refused(&*factory, "key-a", "claude-3"));
+        assert!(!key_model_refused(&*factory, "key-a", "gpt-4o"));
+    }
+
+    #[test]
+    fn key_policy_write_changes_next_request_without_reload() {
+        let (cp, factory) = built_over_control_plane(false);
+        cp.mint_key(&TenantId::new("tenant-a"), &KeyId::new("key-a"))
+            .unwrap();
+        cp.set_policy(&TenantId::new("tenant-a"), &ModelAccess::All)
+            .unwrap();
+        assert!(!key_model_refused(&*factory, "key-a", "claude-3"));
+        cp.set_key_policy(&KeyId::new("key-a"), &key_access("gpt-4*"))
+            .unwrap();
+        assert!(key_model_refused(&*factory, "key-a", "claude-3"));
     }
 
     /// The default: a tenant known only by its keys, and a tenant with a
