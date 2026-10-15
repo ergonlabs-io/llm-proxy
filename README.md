@@ -460,13 +460,14 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.3.2** | Dynamic configuration — ADS/xDS gate, plus live-defect fixes | Shipped 2026-10-14 in tag v0.3.5 |
 | **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 |
 | **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Shipped 2026-10-14 in tag v0.3.5 |
-| **v0.4.0** | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Planned |
+| **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Current |
+| — | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Unscheduled |
 | **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
 
 Ship gates, evidence, and deliberate caveats for each release:
-[`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md). The v0.4.0 gate is
-a corpus scorecard that climbs only when real-world bootstrap configs stop being
-rejected — it cannot be gamed by adding tests.
+[`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md). Data-plane parity
+keeps its instrument, a corpus scorecard that climbs only when real-world bootstrap
+configs stop being rejected, but it is not scheduled.
 
 ## What is not built yet
 
