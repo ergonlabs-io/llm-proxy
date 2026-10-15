@@ -94,7 +94,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -108,6 +108,7 @@ mod recovery;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::control::{ControlPlaneStore, SpendDelta, StoreError};
+use crate::reconciliation_age::{ReconciliationAgeGauge, Seam};
 use crate::usage::TokenUsage;
 use proxy_http::tenant_credentials::CredentialSource;
 
@@ -1069,9 +1070,18 @@ struct Inner {
     /// process; it counts an operational event, not a per-period quantity,
     /// so it deliberately does NOT reset on a period rollover.
     unreconciled_admissions: AtomicU64,
+    /// The `spend` series of `llmproxy_counter_reconciliation_age_seconds`,
+    /// once exported; the flusher sets it after every tick.
+    age_gauge: OnceLock<ReconciliationAgeGauge>,
 }
 
 impl Inner {
+    fn publish_age(&self, now: DateTime<Utc>) {
+        if let Some(gauge) = self.age_gauge.get() {
+            gauge.publish(self.reconciliation_age(now));
+        }
+    }
+
     /// Locks the buckets with `key`'s bucket in `active`, inserting a freshly
     /// LOADED one on first touch if this process has not seen that period
     /// before. Both [`SpendAccumulator::record`] (which then mutates it)
@@ -1680,6 +1690,7 @@ impl SpendAccumulator {
                 created_at_millis: Utc::now().timestamp_millis(),
                 reconciliation,
                 unreconciled_admissions: AtomicU64::new(0),
+                age_gauge: OnceLock::new(),
             }),
             flusher: Mutex::new(None),
         }
@@ -1996,6 +2007,23 @@ impl SpendAccumulator {
         self.inner.reconciliation_age(now)
     }
 
+    /// Export [`Self::reconciliation_age`] as the `spend` series of
+    /// `llmproxy_counter_reconciliation_age_seconds` under this
+    /// accumulator's `stat_prefix` (ADR-0006 §5). The flusher updates it
+    /// after every tick. Idempotent.
+    pub fn export_reconciliation_age(&self, registry: Arc<proxy_observability::stats::Registry>) {
+        let gauge = self.inner.age_gauge.get_or_init(|| {
+            ReconciliationAgeGauge::new(registry, &self.inner.stat_prefix, Seam::Spend)
+        });
+        gauge.publish(self.inner.reconciliation_age(Utc::now()));
+    }
+
+    /// Set the exported gauge to the age as of `now`. A no-op until
+    /// [`Self::export_reconciliation_age`] has run.
+    pub fn publish_reconciliation_age(&self, now: DateTime<Utc>) {
+        self.inner.publish_age(now);
+    }
+
     /// Whether this replica is within its configured reconciliation bound.
     pub fn is_reconciled(&self, now: DateTime<Utc>) -> bool {
         self.reconciliation_age(now) <= self.inner.reconciliation.bound
@@ -2236,7 +2264,9 @@ fn run_flusher(inner: Arc<Inner>, shutdown: Arc<ShutdownSignal>, interval: Durat
             // shutdown request must never wait on this tick's flush to
             // finish before it can even set the flag.
             drop(guard);
-            if let Err(err) = inner.flush_now() {
+            let flushed = inner.flush_now();
+            inner.publish_age(Utc::now());
+            if let Err(err) = flushed {
                 // Two log lines, not one, because they say different things
                 // and an operator acts on them differently: the first is
                 // "this tick failed", the second is "enforcement has been
@@ -3475,6 +3505,59 @@ pub(crate) mod tests {
             "a FAILED flush must not advance last_flush_at -- doing so would claim \
              durability the store does not actually have"
         );
+    }
+
+    /// ADR-0006 §5's spend reconciliation-age gauge, read back from the
+    /// `/stats/prometheus` render: measured from construction until a flush
+    /// succeeds, then 0.
+    #[test]
+    fn the_spend_age_gauge_resets_on_a_successful_flush() {
+        use crate::reconciliation_age::test_support::rendered_age;
+        use crate::reconciliation_age::Seam;
+
+        let (accumulator, _store) = test_accumulator(Period::Daily);
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        accumulator.export_reconciliation_age(Arc::clone(&registry));
+        let age = || rendered_age(&registry, "test-chain", Seam::Spend);
+
+        accumulator.publish_reconciliation_age(Utc::now() + chrono::Duration::seconds(90));
+        assert!(age().is_some_and(|age| age >= 90), "got {:?}", age());
+
+        accumulator.flush_now().expect("flush must succeed");
+        accumulator.publish_reconciliation_age(Utc::now());
+        assert_eq!(age(), Some(0));
+    }
+
+    /// The flusher thread publishes the gauge after every tick, including a
+    /// failed one, so a store outage shows while spend admits against local
+    /// accrual (fail open).
+    #[test]
+    fn the_spend_flusher_publishes_the_age_while_flushes_fail() {
+        use crate::reconciliation_age::test_support::wait_for_age;
+        use crate::reconciliation_age::Seam;
+
+        let store: Arc<dyn ControlPlaneStore> =
+            Arc::new(AlwaysFailsAddSpend(InMemoryControlPlaneStore::default()));
+        let accumulator = Arc::new(SpendAccumulator::new(
+            "test-chain".to_string(),
+            store,
+            Period::Daily,
+            "test-node".to_string(),
+        ));
+        accumulator.record(
+            &TenantId::new("tenant-a"),
+            Utc::now(),
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(1_000_000)),
+            Some("cluster-a"),
+            Some("model-a"),
+        );
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        accumulator.export_reconciliation_age(Arc::clone(&registry));
+
+        accumulator.start_flusher(Duration::from_millis(20));
+
+        assert!(wait_for_age(&registry, "test-chain", Seam::Spend, 1));
     }
 
     #[test]

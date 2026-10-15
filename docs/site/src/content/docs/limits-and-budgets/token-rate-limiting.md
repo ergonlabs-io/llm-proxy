@@ -40,8 +40,12 @@ about once a second, and sooner when a caller nears its limit. With a
 `shared` store, the token and request counts are shared by every replica, so
 the fleet can admit a little over a limit between reconciles. If the store
 cannot be reached, the proxy keeps enforcing against the last known totals,
-and logs a warning when the counters stay unreconciled past their bound. A
-`limits` rule on a listener with no `auth:` counts per process.
+and logs a warning when the counters stay unreconciled past their bound. The
+gauge `envoy_llmproxy_counter_reconciliation_age_seconds` on
+`/stats/prometheus` shows how long ago the counters last reconciled, with
+`seam="rate_window"` for token and request counts and
+`seam="stream_lease"` for concurrent streams. A `limits` rule on a listener
+with no `auth:` counts per process.
 
 This page also covers the read side: `GET /v1/usage`, an endpoint the proxy
 answers itself so an authenticated caller can see its own budget without an

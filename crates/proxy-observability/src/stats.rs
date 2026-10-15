@@ -857,6 +857,22 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Seconds since one of a chain's counter seams last reconciled with the
+    /// store `auth.store` selects (ADR-0006 §5 and its 2026-10-15 amendment
+    /// F), as of the seam's last control-side tick. `seam` is `rate_window`
+    /// (token and request windows), `stream_lease` (concurrent-stream leases)
+    /// or `spend` (spend budgets). Grows while the store is unreachable,
+    /// during which admission continues against the last known fleet totals
+    /// (fail open). A tick blocked on a store call holds the last value until
+    /// that call returns or times out. `scope` is the operator-chosen HCM
+    /// `stat_prefix`. Prometheus surface only (no Envoy equivalent).
+    pub const COUNTER_RECONCILIATION_AGE_SECONDS: Instrument = Instrument {
+        name: "llmproxy_counter_reconciliation_age_seconds",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "s",
+        attribute_keys: &["scope", "seam"],
+        buckets: None,
+    };
     /// The rate card a chain is pricing with: one series per card version this
     /// process has held, value 1 for the active card and 0 for each retired
     /// one, and no series at 1 while the chain has no card. `scope` is the

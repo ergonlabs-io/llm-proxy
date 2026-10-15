@@ -56,16 +56,18 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::control::{
     ControlPlaneStore, StoreError, WindowDelta, WindowDimension, WindowKey, WindowRow,
 };
+use crate::reconciliation_age::{ReconciliationAgeGauge, Seam};
 use crate::token_limit::{
     LeaseRelease, LimitDecision, LimitKey, StreamLease, MAX_CREDENTIAL_WINDOWS,
 };
+use proxy_observability::stats::Registry;
 
 /// How often the flusher reconciles window counters by default (addendum §2:
 /// about one second, separate from spend's flush and the policy poll).
@@ -237,6 +239,7 @@ struct Inner {
     bound: Duration,
     unreconciled_admissions: AtomicU64,
     last_stale_warn_millis: AtomicI64,
+    age_gauge: OnceLock<ReconciliationAgeGauge>,
 }
 
 /// Tier-3 window counters for one filter chain. See the module doc.
@@ -282,6 +285,7 @@ impl WindowAccumulator {
                 bound,
                 unreconciled_admissions: AtomicU64::new(0),
                 last_stale_warn_millis: AtomicI64::new(NEVER),
+                age_gauge: OnceLock::new(),
             }),
             flusher: Mutex::new(None),
         }
@@ -405,6 +409,22 @@ impl WindowAccumulator {
         self.inner.reconciliation_age(now)
     }
 
+    /// Export [`Self::reconciliation_age`] as the `rate_window` series of
+    /// `llmproxy_counter_reconciliation_age_seconds` under this accumulator's
+    /// scope. The flusher updates it after every tick. Idempotent.
+    pub fn export_reconciliation_age(&self, registry: Arc<Registry>) {
+        let gauge = self.inner.age_gauge.get_or_init(|| {
+            ReconciliationAgeGauge::new(registry, &self.inner.scope, Seam::RateWindow)
+        });
+        gauge.publish(self.inner.reconciliation_age(SystemTime::now()));
+    }
+
+    /// Set the exported gauge to the age as of `now`. A no-op until
+    /// [`Self::export_reconciliation_age`] has run.
+    pub fn publish_reconciliation_age(&self, now: SystemTime) {
+        self.inner.publish_age(now);
+    }
+
     /// Reconcile every bucket with the store once. See [`Inner::flush_at`].
     pub fn flush_at(&self, now: SystemTime) -> Result<(), StoreError> {
         self.inner.flush_at(now)
@@ -495,6 +515,12 @@ impl Inner {
         self.signal.cond.notify_one();
     }
 
+    fn publish_age(&self, now: SystemTime) {
+        if let Some(gauge) = self.age_gauge.get() {
+            gauge.publish(self.reconciliation_age(now));
+        }
+    }
+
     fn reconciliation_age(&self, now: SystemTime) -> Duration {
         let last = self.last_flush_millis.load(Ordering::Acquire);
         let since = if last == NEVER {
@@ -568,6 +594,7 @@ impl Inner {
                          the last known fleet totals");
                 }
             }
+            self.publish_age(SystemTime::now());
         }
     }
 
@@ -818,6 +845,7 @@ struct GaugeInner {
     created_at_millis: i64,
     last_publish_millis: AtomicI64,
     last_stale_warn_millis: AtomicI64,
+    age_gauge: OnceLock<ReconciliationAgeGauge>,
 }
 
 /// Tier-4 concurrent-stream gauges for one filter chain. See the module doc.
@@ -840,6 +868,7 @@ impl LeaseGauge {
                 created_at_millis: unix_millis(SystemTime::now()),
                 last_publish_millis: AtomicI64::new(NEVER),
                 last_stale_warn_millis: AtomicI64::new(NEVER),
+                age_gauge: OnceLock::new(),
             }),
             publisher: Mutex::new(None),
         }
@@ -899,6 +928,28 @@ impl LeaseGauge {
     /// Publish this replica's counts once. See [`GaugeInner::publish_at`].
     pub fn publish_now(&self) -> Result<(), StoreError> {
         self.inner.publish_at(SystemTime::now())
+    }
+
+    /// Time since the last successful lease publish, or since construction
+    /// if none has succeeded: how stale `others_last_known` may be.
+    pub fn reconciliation_age(&self, now: SystemTime) -> Duration {
+        self.inner.reconciliation_age(now)
+    }
+
+    /// Export [`Self::reconciliation_age`] as the `stream_lease` series of
+    /// `llmproxy_counter_reconciliation_age_seconds` under this gauge's
+    /// scope. The publisher updates it after every tick. Idempotent.
+    pub fn export_reconciliation_age(&self, registry: Arc<Registry>) {
+        let gauge = self.inner.age_gauge.get_or_init(|| {
+            ReconciliationAgeGauge::new(registry, &self.inner.scope, Seam::StreamLease)
+        });
+        gauge.publish(self.inner.reconciliation_age(SystemTime::now()));
+    }
+
+    /// Set the exported gauge to the age as of `now`. A no-op until
+    /// [`Self::export_reconciliation_age`] has run.
+    pub fn publish_reconciliation_age(&self, now: SystemTime) {
+        self.inner.publish_age(now);
     }
 
     /// Start the control-side publisher thread. Idempotent.
@@ -975,6 +1026,22 @@ impl GaugeInner {
         self.slots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn reconciliation_age(&self, now: SystemTime) -> Duration {
+        let last = self.last_publish_millis.load(Ordering::Acquire);
+        let since = if last == NEVER {
+            self.created_at_millis
+        } else {
+            last
+        };
+        Duration::from_millis(unix_millis(now).saturating_sub(since).max(0) as u64)
+    }
+
+    fn publish_age(&self, now: SystemTime) {
+        if let Some(gauge) = self.age_gauge.get() {
+            gauge.publish(self.reconciliation_age(now));
+        }
+    }
+
     fn run_publisher(&self, interval: Duration) {
         loop {
             {
@@ -997,13 +1064,10 @@ impl GaugeInner {
                 }
             }
             let now = SystemTime::now();
-            if let Err(e) = self.publish_at(now) {
-                let last = self.last_publish_millis.load(Ordering::Acquire);
-                let since = if last == NEVER {
-                    self.created_at_millis
-                } else {
-                    last
-                };
+            let published = self.publish_at(now);
+            self.publish_age(SystemTime::now());
+            if let Err(e) = published {
+                let lease_age = self.reconciliation_age(now);
                 let warn_last = self.last_stale_warn_millis.load(Ordering::Acquire);
                 let now_ms = unix_millis(now);
                 if warn_last == NEVER
@@ -1011,7 +1075,7 @@ impl GaugeInner {
                 {
                     self.last_stale_warn_millis.store(now_ms, Ordering::Release);
                     tracing::warn!(error = %e, scope = %self.scope,
-                        lease_age_seconds = now_ms.saturating_sub(since) / 1000,
+                        lease_age_seconds = lease_age.as_secs(),
                         "llmproxy.token_limit: stream-lease publish failed; enforcing concurrency \
                          against the last known fleet counts (fail open)");
                 }
@@ -1372,5 +1436,132 @@ mod tests {
             b.try_acquire(&key, 1).is_ok(),
             "the silent replica's expired row no longer counts"
         );
+    }
+
+    // --- reconciliation-age gauges (ADR-0006 amendment F) ----------------------
+
+    use crate::reconciliation_age::test_support::{rendered_age, wait_for_age};
+    use crate::reconciliation_age::Seam;
+    use crate::window_usage::test_store::ProbeStore;
+
+    fn registry() -> Arc<Registry> {
+        proxy_observability::stats::StatsControl::new(1).registry()
+    }
+
+    /// A window that has not ended, so every reconcile reads it back from
+    /// the store whatever minute the test runs in.
+    fn open_window() -> WindowKey {
+        WindowKey::containing(unix_secs(SystemTime::now()) + 3_600, MINUTE)
+    }
+
+    #[test]
+    fn the_rate_window_age_gauge_resets_on_a_reconcile_and_grows_while_the_store_fails() {
+        let store = ProbeStore::default();
+        let acc = WindowAccumulator::with_reconciliation_bound(
+            "ingress".to_string(),
+            Arc::new(store.clone()),
+            "a".to_string(),
+            Duration::MAX,
+        );
+        let registry = registry();
+        acc.export_reconciliation_age(Arc::clone(&registry));
+        let now = SystemTime::now();
+        let age = || rendered_age(&registry, "ingress", Seam::RateWindow);
+
+        acc.publish_reconciliation_age(now + Duration::from_secs(90));
+        assert!(
+            age().is_some_and(|age| age >= 90),
+            "never reconciled: measured from construction, got {:?}",
+            age()
+        );
+
+        acc.add(&tenant("chat", "acme"), TOTAL, open_window(), 5, 100);
+        acc.flush_at(now).unwrap();
+        acc.publish_reconciliation_age(now);
+        assert_eq!(age(), Some(0));
+
+        store.fail.store(true, Ordering::SeqCst);
+        assert!(acc.flush_at(now).is_err(), "the read-back fails");
+        acc.publish_reconciliation_age(now + Duration::from_secs(30));
+        assert_eq!(age(), Some(30), "a failed reconcile does not reset the age");
+    }
+
+    /// The flusher thread publishes after every tick, including a failed one,
+    /// so the outage shows without anything else calling the accumulator.
+    #[test]
+    fn the_flusher_publishes_the_rate_window_age_while_reconciles_fail() {
+        let store = ProbeStore::default();
+        let acc = WindowAccumulator::with_reconciliation_bound(
+            "ingress".to_string(),
+            Arc::new(store.clone()),
+            "a".to_string(),
+            Duration::MAX,
+        );
+        acc.add(&tenant("chat", "acme"), TOTAL, open_window(), 5, 100);
+        acc.flush_now().unwrap();
+        store.fail.store(true, Ordering::SeqCst);
+        let registry = registry();
+        acc.export_reconciliation_age(Arc::clone(&registry));
+
+        acc.start_flusher(Duration::from_millis(20));
+
+        assert!(wait_for_age(&registry, "ingress", Seam::RateWindow, 1));
+        store.fail.store(false, Ordering::SeqCst);
+    }
+
+    struct FailingLeaseStore;
+
+    impl LeaseStore for FailingLeaseStore {
+        fn publish_leases(
+            &self,
+            _scope: &str,
+            _node_id: &str,
+            rows: &[LeaseRow],
+            _ttl: Duration,
+        ) -> Vec<Result<u64, StoreError>> {
+            rows.iter()
+                .map(|_| Err(StoreError::Unavailable("lease store down".into())))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_stream_lease_age_gauge_resets_on_a_publish() {
+        let gauge = LeaseGauge::new(
+            "ingress".to_string(),
+            Arc::new(InMemoryLeaseStore::default()),
+            "a".to_string(),
+            Duration::from_secs(3),
+        );
+        let registry = registry();
+        gauge.export_reconciliation_age(Arc::clone(&registry));
+        let now = SystemTime::now();
+        let age = || rendered_age(&registry, "ingress", Seam::StreamLease);
+
+        gauge.publish_reconciliation_age(now + Duration::from_secs(90));
+        assert!(age().is_some_and(|age| age >= 90), "got {:?}", age());
+
+        let _lease = gauge.try_acquire(&tenant("", "acme"), 5).unwrap();
+        gauge.publish_now().unwrap();
+        gauge.publish_reconciliation_age(SystemTime::now());
+        assert_eq!(age(), Some(0));
+    }
+
+    #[test]
+    fn the_publisher_publishes_the_stream_lease_age_while_publishes_fail() {
+        let gauge = LeaseGauge::new(
+            "ingress".to_string(),
+            Arc::new(FailingLeaseStore),
+            "a".to_string(),
+            Duration::from_secs(3),
+        );
+        let _lease = gauge.try_acquire(&tenant("", "acme"), 5).unwrap();
+        let registry = registry();
+        gauge.export_reconciliation_age(Arc::clone(&registry));
+
+        gauge.start_publisher(Duration::from_millis(20));
+
+        assert!(wait_for_age(&registry, "ingress", Seam::StreamLease, 1));
+        assert!(gauge.reconciliation_age(SystemTime::now()) >= Duration::from_secs(1));
     }
 }

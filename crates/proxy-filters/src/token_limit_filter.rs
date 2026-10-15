@@ -505,6 +505,12 @@ fn create_filter_factory_with_clock(
     let route_names = ctx
         .get(ROUTE_NAMES_KEY)
         .and_then(|names| names.downcast::<ChainRouteNames>().ok());
+    // Looked up before `get_or_try_init`: its closure runs under the
+    // singleton map's lock, which `get` also takes.
+    let stats_registry = ctx
+        .shared
+        .get("", crate::usage_filter::STATS_REGISTRY_KEY)
+        .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok());
 
     let shared = ctx
         .shared
@@ -522,6 +528,13 @@ fn create_filter_factory_with_clock(
                 DEFAULT_LEASE_PUBLISH_INTERVAL * 3,
             ));
             streams.start_publisher(DEFAULT_LEASE_PUBLISH_INTERVAL);
+            // ADR-0006 amendment F: each seam publishes how long it has gone
+            // without reconciling, so a fail-open outage shows on
+            // `/stats/prometheus` before the warning bound trips.
+            if let Some(registry) = &stats_registry {
+                counters.export_reconciliation_age(Arc::clone(registry));
+                streams.export_reconciliation_age(Arc::clone(registry));
+            }
             let usage_missing_warner = Arc::new(UsageMissingWarner::new());
             // Only a shared store holds counts this replica's counters lack
             // (ADR-0006 addendum §4); otherwise the local answer is exact
@@ -3629,5 +3642,46 @@ mod tests {
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert_eq!(cb.local_reply.unwrap().0, StatusCode::UNAUTHORIZED);
         assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    }
+
+    /// Through the real factory: each counter seam's reconciliation age is
+    /// exported under the chain's `stat_prefix`, with no tenant or key label.
+    #[test]
+    fn the_factory_exports_the_rate_window_and_stream_lease_reconciliation_ages() {
+        use crate::reconciliation_age::test_support::rendered_age;
+        use crate::reconciliation_age::Seam;
+
+        let ctx = FactoryContext {
+            stat_prefix: "ingress".to_string(),
+            ..FactoryContext::default()
+        };
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        ctx.shared
+            .get_or_try_init("", "", crate::usage_filter::STATS_REGISTRY_KEY, || {
+                Ok(Arc::clone(&registry) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+        let cp = control_plane();
+        ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+            Ok(cp as Arc<dyn std::any::Any + Send + Sync>)
+        })
+        .unwrap();
+        if let Err(e) = pinned_factory(&token_limit(1_000, 1_000.0 / 60.0), &ctx) {
+            panic!("valid config must build: {e:?}");
+        }
+
+        assert!(rendered_age(&registry, "ingress", Seam::RateWindow).is_some());
+        assert!(rendered_age(&registry, "ingress", Seam::StreamLease).is_some());
+        let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+        for line in rendered
+            .lines()
+            .filter(|line| line.contains("counter_reconciliation_age"))
+            .filter(|line| !line.starts_with('#'))
+        {
+            assert!(
+                !line.contains("tenant") && !line.contains("key"),
+                "only scope and seam label the series: {line}"
+            );
+        }
     }
 }

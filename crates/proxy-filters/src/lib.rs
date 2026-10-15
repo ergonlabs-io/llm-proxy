@@ -42,6 +42,7 @@ pub mod model_authz;
 pub mod model_authz_filter;
 pub mod model_resolver_filter;
 pub mod pricing;
+pub mod reconciliation_age;
 pub mod spend;
 pub mod spend_limit_filter;
 pub mod tenant_credential_crypto;

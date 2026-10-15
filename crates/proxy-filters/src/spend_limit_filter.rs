@@ -461,6 +461,12 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         // accrued spend on restart -- a ceiling an operator could escape by
         // bouncing the proxy.
         let store = control_plane.store();
+        // Looked up before `get_or_try_init`: its closure runs under the
+        // singleton map's lock, which `get` also takes.
+        let stats_registry = ctx
+            .shared
+            .get("", crate::usage_filter::STATS_REGISTRY_KEY)
+            .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok());
         let shared = ctx
             .get_or_try_init(TYPE_URL, || {
                 let mut accumulator = SpendAccumulator::with_reconciliation(
@@ -493,6 +499,9 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                     warn_prefetch_failed(&ctx.stat_prefix, &err);
                 }
                 let accumulator = Arc::new(accumulator);
+                if let Some(registry) = &stats_registry {
+                    accumulator.export_reconciliation_age(Arc::clone(registry));
+                }
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
                     accumulator,
@@ -3427,5 +3436,36 @@ mod tests {
                  deny a platform-mode request"
             );
         }
+    }
+
+    /// Through the real factory: the spend seam's reconciliation age is
+    /// exported under the chain's `stat_prefix` (ADR-0006 §5).
+    #[test]
+    fn the_factory_exports_the_spend_reconciliation_age() {
+        use crate::reconciliation_age::test_support::rendered_age;
+        use crate::reconciliation_age::Seam;
+
+        let cp = control_plane_with(&[]);
+        let ctx = FactoryContext {
+            stat_prefix: "ingress".to_string(),
+            ..FactoryContext::default()
+        };
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        ctx.shared
+            .get_or_try_init("", "", crate::usage_filter::STATS_REGISTRY_KEY, || {
+                Ok(Arc::clone(&registry) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+        ctx.shared
+            .get_or_try_init(&ctx.scope, &ctx.stat_prefix, auth_filter::TYPE_URL, || {
+                Ok(cp as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+
+        assert!(SpendLimitFilterFactory
+            .create(&spend_limit_config(vec![]), &ctx)
+            .is_ok());
+
+        assert_eq!(rendered_age(&registry, "ingress", Seam::Spend), Some(0));
     }
 }
