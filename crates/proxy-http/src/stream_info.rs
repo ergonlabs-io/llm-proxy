@@ -229,6 +229,12 @@ impl AttemptInfo {
 #[derive(Debug)]
 pub struct StreamInfo {
     pub downstream: Option<crate::handler::DownstreamInfo>,
+    /// The client address limits and logs should attribute this request to.
+    /// It is the TCP peer, except behind `xff_num_trusted_hops` trusted
+    /// proxies on a non-edge HCM, where it is the `x-forwarded-for` entry
+    /// those hops vouch for. With no trusted hops it is never read from
+    /// `x-forwarded-for`, which the client itself can write.
+    pub client_address: Option<std::net::IpAddr>,
     /// Monotonic baseline established when this stream enters the HCM. Kept
     /// private to this crate; filters publish only derived durations so no
     /// cross-crate API can accidentally compare `Instant`s from unrelated
@@ -350,6 +356,7 @@ impl Default for StreamInfo {
         Self {
             request_started_at: Instant::now(),
             downstream: None,
+            client_address: None,
             response_flags: Vec::new(),
             response_code_details: None,
             is_local_reply: false,

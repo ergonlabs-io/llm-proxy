@@ -112,6 +112,19 @@ pub fn apply_xff(headers: &mut HeaderMap, remote: IpAddr, opts: &XffOptions) {
 /// appended as the new rightmost entry.
 ///
 /// Never panics on a garbage (non-IP) token: falls back to `remote`.
+/// The client address limits attribute a request to (`StreamInfo::
+/// client_address`). It is the TCP peer unless this is a non-edge HCM with
+/// `xff_num_trusted_hops` set, where it is the `x-forwarded-for` entry those
+/// trusted hops vouch for. With no trusted hops `x-forwarded-for` is never
+/// read: the client can write it, and a limit keyed on it could be dodged by
+/// sending a fresh value per request.
+pub fn client_address(headers: &HeaderMap, remote: IpAddr, opts: &XffOptions) -> IpAddr {
+    if opts.use_remote_address || opts.xff_num_trusted_hops == 0 {
+        return remote;
+    }
+    resolve_trusted_address(headers, remote, opts)
+}
+
 pub fn resolve_trusted_address(headers: &HeaderMap, remote: IpAddr, opts: &XffOptions) -> IpAddr {
     if opts.use_remote_address {
         return remote;

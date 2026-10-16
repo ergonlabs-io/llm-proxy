@@ -795,7 +795,19 @@ impl StreamHandler for FilterChainHandler {
             // every filter (including an encode filter's end-of-stream
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
-            stream_info.borrow_mut().downstream = Some(req.downstream);
+            let client_address = crate::headers::client_address(
+                &req.head.headers,
+                req.downstream.remote.ip(),
+                &crate::headers::XffOptions {
+                    use_remote_address: self.use_remote_address,
+                    xff_num_trusted_hops: self.xff_num_trusted_hops,
+                },
+            );
+            {
+                let mut info = stream_info.borrow_mut();
+                info.downstream = Some(req.downstream);
+                info.client_address = Some(client_address);
+            }
             if let Some(sink) = &self.request_record_sink {
                 #[cfg(unix)]
                 let admission = sink.try_admit();

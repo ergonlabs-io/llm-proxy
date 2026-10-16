@@ -652,3 +652,24 @@ fn empty_header_map_does_not_panic_anywhere() {
     let _ = ensure_request_id(&mut headers, &mut || generate_request_id(&mut state, false));
     assert!(!headers.is_empty());
 }
+
+// --- client_address: what rate limits key a request on ---
+
+#[test]
+fn client_address_ignores_x_forwarded_for_without_trusted_hops() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+    let remote = v4(10, 0, 0, 9);
+    // A client can write this header itself, so it must not choose the
+    // bucket on a mesh HCM with no trusted hops, nor at the edge.
+    assert_eq!(client_address(&headers, remote, &opts(false, 0)), remote);
+    assert_eq!(client_address(&headers, remote, &opts(true, 1)), remote);
+}
+
+#[test]
+fn client_address_uses_the_entry_trusted_hops_vouch_for() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4, 10.0.0.1"));
+    let remote = v4(10, 0, 0, 9);
+    assert_eq!(client_address(&headers, remote, &opts(false, 1)), v4(1, 2, 3, 4));
+}
