@@ -106,6 +106,12 @@ auth:
     - id: {DEFAULT_KEY_ID}
       tenant: {DEFAULT_TENANT}
       digest: {digest}
+  # Lets every tenant without a stored model policy use every model, so the
+  # key above works at once. The proxy warns about it at startup. Before you
+  # issue keys to other people, grant models per tenant with
+  # PUT /tenants/{{id}}/policy and remove this block.
+  enforce:
+    tenants_without_policy: allow
 
 providers:
   # Local default; install Ollama and pull a model before sending requests.
@@ -132,6 +138,8 @@ providers:
   #   base_url: https://api.x.ai
   #   api_key: replace-with-XAI_API_KEY
 
+# To serve every model from another provider, uncomment it above, set its key
+# and name it here.
 routes:
   - model: "*"
     provider: ollama
@@ -163,6 +171,17 @@ mod tests {
                 "missing provider example {provider}"
             );
         }
+    }
+
+    #[test]
+    fn starter_allows_tenants_without_policy_so_the_printed_key_works() {
+        let text = starter_config(&"a".repeat(64));
+        let config = proxy_simple_config::parse_simple_config(&text).expect("starter must parse");
+        let auth = config.auth.expect("starter configures auth");
+        assert_eq!(
+            auth.enforce.tenants_without_policy,
+            Some(proxy_simple_config::model::TenantsWithoutPolicy::Allow)
+        );
     }
 
     #[test]

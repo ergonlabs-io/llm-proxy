@@ -69,7 +69,10 @@ impl NoPolicyLog {
         }
         tracing::warn!(
             tenant,
-            "model request refused: this tenant has no model policy, and              llmproxy.model_authz denies tenants without one; grant models with              PUT /tenants/{{id}}/policy, or set tenants_without_policy: ALLOW              (dialect: auth.enforce.tenants_without_policy: allow)"
+            "model request refused: this tenant has no model policy, and \
+             llmproxy.model_authz denies tenants without one; grant models with \
+             PUT /tenants/{{id}}/policy, or set tenants_without_policy: ALLOW \
+             (dialect: auth.enforce.tenants_without_policy: allow)"
         );
     }
 }

@@ -123,7 +123,10 @@ files (`crates/proxy/src/init.rs`):
 
 - `llmproxy.yaml`: a starter `llmproxy` config that routes every model to a
   local Ollama at `127.0.0.1:11434`, with `listen: 0.0.0.0:53421` and
-  `admin: 127.0.0.1:53422`.
+  `admin: 127.0.0.1:53422`. It sets
+  `auth.enforce.tenants_without_policy: allow`, so the printed key works
+  before any tenant policy is stored. Remove that block before you issue
+  keys to other people.
 - `auth-secret`: a random HMAC secret, with mode `0600` on Unix.
 
 The command also prints a key for the `default` tenant (key ID

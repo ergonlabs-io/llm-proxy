@@ -69,6 +69,46 @@ Run the proxy from that directory. The config names `./auth-secret` relative
 to the working directory. From another directory, validation fails with
 `failed to read ./auth-secret: No such file or directory`.
 
+### Use OpenAI instead of Ollama
+
+The starter config sends every model to a local Ollama. To use OpenAI, edit
+`llmproxy.yaml`. Uncomment the `openai` provider, refer to your key through
+an environment variable, and point the route at it:
+
+```yaml
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+
+routes:
+  - model: "*"
+    provider: openai
+```
+
+Start the proxy with the key in its environment. Then send a streaming request
+with the key that `init` printed:
+
+```sh
+export OPENAI_API_KEY=sk-...
+llm-proxy --config llmproxy.yaml
+```
+
+```sh
+curl -N http://127.0.0.1:53421/v1/chat/completions \
+  -H "authorization: Bearer llmp_<the key init printed>" \
+  -H "content-type: application/json" \
+  -d '{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The response streams back as `data:` lines. The proxy writes one access log
+line per request to `./llmproxy-access.log`.
+
+The starter config sets `auth.enforce.tenants_without_policy: allow`, so the
+printed key can use every model without a stored tenant policy. The proxy
+warns about this at startup. Before you issue keys to other people, grant
+models per tenant with `PUT /tenants/{id}/policy` and remove the `enforce`
+block. See [Virtual keys](../../authentication/virtual-keys/).
+
 ## Prerequisites
 
 Install `protoc` before you build. llm-proxy compiles bundled protobuf
