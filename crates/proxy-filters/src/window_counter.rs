@@ -51,8 +51,10 @@
 //! [`StreamLease`] that frees the slot when dropped. A publisher thread
 //! writes this replica's in-flight count per subject to a [`LeaseStore`] with
 //! a TTL and keeps `fleet_sum - own_published` as `others_last_known`
-//! (amendment E). With [`InMemoryLeaseStore`] there are no other replicas, so
-//! the gauge is exact.
+//! (amendment E). Each publish returns the fleet sums of every subject in the
+//! scope, so a replica that has never served a subject still counts the
+//! streams other replicas hold for it. With [`InMemoryLeaseStore`] there are
+//! no other replicas, so the gauge is exact.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -760,11 +762,21 @@ pub struct LeaseRow {
     pub in_flight: u64,
 }
 
+/// The fleet sum of unexpired lease rows, by subject, for every subject in
+/// one scope that has at least one such row.
+pub type FleetLeases = HashMap<String, u64>;
+
 /// Tier-4 seam (ADR-0006 amendment E): per-replica lease rows with a TTL.
 /// Each publish writes this replica's count per subject (zero removes the
-/// row) and returns the fleet sum of unexpired rows, one result per row in
-/// input order. A crashed replica's rows expire one TTL after its last
-/// publish, so no reaper is needed.
+/// row) and returns [`FleetLeases`] for the whole scope, including subjects
+/// this replica did not publish. A crashed replica's rows expire one TTL
+/// after its last publish, so no reaper is needed.
+///
+/// The answer covers the whole scope, not only the rows written, so a
+/// replica that has never served a subject still knows what the fleet
+/// holds for it. Without that, its first stream for the subject reads zero
+/// others and is admitted while other replicas hold the whole ceiling, and
+/// the over-admission lasts as long as that stream.
 pub trait LeaseStore: Send + Sync {
     fn publish_leases(
         &self,
@@ -772,7 +784,7 @@ pub trait LeaseStore: Send + Sync {
         node_id: &str,
         rows: &[LeaseRow],
         ttl: Duration,
-    ) -> Vec<Result<u64, StoreError>>;
+    ) -> Result<FleetLeases, StoreError>;
 }
 
 /// [`LeaseStore`] for one process. It still keeps rows per node id with
@@ -792,28 +804,31 @@ impl LeaseStore for InMemoryLeaseStore {
         node_id: &str,
         rows: &[LeaseRow],
         ttl: Duration,
-    ) -> Vec<Result<u64, StoreError>> {
+    ) -> Result<FleetLeases, StoreError> {
         let now = Instant::now();
         let mut all = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
-        rows.iter()
-            .map(|row| {
-                let key = (scope.to_string(), row.subject.clone());
-                let nodes = all.entry(key.clone()).or_default();
-                nodes.retain(|_, (_, expires)| *expires > now);
-                if row.in_flight == 0 {
-                    nodes.remove(node_id);
-                } else {
-                    nodes.insert(node_id.to_string(), (row.in_flight, now + ttl));
-                }
+        for row in rows {
+            let nodes = all
+                .entry((scope.to_string(), row.subject.clone()))
+                .or_default();
+            if row.in_flight == 0 {
+                nodes.remove(node_id);
+            } else {
+                nodes.insert(node_id.to_string(), (row.in_flight, now + ttl));
+            }
+        }
+        let mut fleet = FleetLeases::new();
+        all.retain(|(row_scope, subject), nodes| {
+            nodes.retain(|_, (_, expires)| *expires > now);
+            if row_scope == scope && !nodes.is_empty() {
                 let sum = nodes
                     .values()
                     .fold(0u64, |acc, (count, _)| acc.saturating_add(*count));
-                if nodes.is_empty() {
-                    all.remove(&key);
-                }
-                Ok(sum)
-            })
-            .collect()
+                fleet.insert(subject.clone(), sum);
+            }
+            !nodes.is_empty()
+        });
+        Ok(fleet)
     }
 }
 
@@ -831,6 +846,10 @@ struct Slot {
 #[derive(Default)]
 struct Slots {
     by_key: HashMap<LimitKey, Slot>,
+    /// The fleet sums of the last publish for subjects this replica holds no
+    /// slot for. A new slot starts from its entry here, so the first stream
+    /// a replica sees for a subject still counts the rest of the fleet.
+    unserved: FleetLeases,
     credential_entries: usize,
     overflow_warned: bool,
 }
@@ -894,10 +913,14 @@ impl LeaseGauge {
                 key.clone()
             };
             let is_new = !slots.by_key.contains_key(&key);
-            let (local, others) = slots
-                .by_key
-                .get(&key)
-                .map_or((0, 0), |slot| (slot.local, slot.others));
+            let (local, others) = match slots.by_key.get(&key) {
+                Some(slot) => (slot.local, slot.others),
+                None if slots.unserved.is_empty() => (0, 0),
+                None => (
+                    0,
+                    slots.unserved.get(&key.to_string()).copied().unwrap_or(0),
+                ),
+            };
             let in_use = u64::from(local).saturating_add(others);
             let outcome = if in_use >= u64::from(max_streams) {
                 Err(LimitDecision::Deny {
@@ -912,6 +935,7 @@ impl LeaseGauge {
                 }
                 let slot = slots.by_key.entry(key.clone()).or_default();
                 slot.local = slot.local.saturating_add(1);
+                slot.others = others;
                 Ok(StreamLease::new(
                     key,
                     Arc::clone(&self.inner) as Arc<dyn LeaseRelease>,
@@ -1084,8 +1108,12 @@ impl GaugeInner {
     }
 
     /// Publish every slot's local count (including a final zero for a slot
-    /// that has gone idle), adopt `fleet_sum - own` as `others`, and drop
-    /// slots with nothing local, nothing elsewhere and nothing published.
+    /// that has gone idle), adopt `fleet_sum - own` as `others`, keep the
+    /// fleet sums of subjects with no slot here as `unserved`, and drop slots
+    /// with nothing local, nothing elsewhere and nothing published.
+    ///
+    /// Publishes even with no slots: that read is how a replica learns what
+    /// the fleet holds for subjects it has not served yet.
     fn publish_at(&self, now: SystemTime) -> Result<(), StoreError> {
         let rows: Vec<(LimitKey, LeaseRow)> = {
             let slots = self.lock_slots();
@@ -1104,28 +1132,19 @@ impl GaugeInner {
                 })
                 .collect()
         };
-        if rows.is_empty() {
-            self.last_publish_millis
-                .store(unix_millis(now), Ordering::Release);
-            return Ok(());
-        }
         let lease_rows: Vec<LeaseRow> = rows.iter().map(|(_, row)| row.clone()).collect();
-        let results = self
-            .store
-            .publish_leases(&self.scope, &self.node_id, &lease_rows, self.ttl);
-        let mut first_error = None;
+        let mut fleet =
+            self.store
+                .publish_leases(&self.scope, &self.node_id, &lease_rows, self.ttl)?;
         let mut slots = self.lock_slots();
-        for ((key, row), result) in rows.iter().zip(results) {
-            match result {
-                Ok(fleet) => {
-                    if let Some(slot) = slots.by_key.get_mut(key) {
-                        slot.published = row.in_flight;
-                        slot.others = fleet.saturating_sub(row.in_flight);
-                    }
-                }
-                Err(e) => {
-                    first_error.get_or_insert(e);
-                }
+        for (key, row) in &rows {
+            if let Some(slot) = slots.by_key.get_mut(key) {
+                slot.published = row.in_flight;
+                slot.others = fleet
+                    .get(&row.subject)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(row.in_flight);
             }
         }
         let idle: Vec<LimitKey> = slots
@@ -1140,15 +1159,16 @@ impl GaugeInner {
                 slots.credential_entries = slots.credential_entries.saturating_sub(1);
             }
         }
-        drop(slots);
-        match first_error {
-            None => {
-                self.last_publish_millis
-                    .store(unix_millis(now), Ordering::Release);
-                Ok(())
-            }
-            Some(e) => Err(e),
+        // A slot opened while the publish was in flight took its `others`
+        // from the previous `unserved`; it is published on the next tick.
+        for key in slots.by_key.keys() {
+            fleet.remove(&key.to_string());
         }
+        slots.unserved = fleet;
+        drop(slots);
+        self.last_publish_millis
+            .store(unix_millis(now), Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1415,6 +1435,94 @@ mod tests {
         assert!(b.try_acquire(&key, 3).is_err());
     }
 
+    /// A replica learns the fleet's count for a subject it has never served
+    /// from its own publish, so its first stream for that subject is refused
+    /// while another replica holds the ceiling.
+    #[test]
+    fn a_replica_that_never_served_a_subject_counts_the_fleet_after_a_publish() {
+        let store = Arc::new(InMemoryLeaseStore::default());
+        let a = gauge(&store, "a", Duration::from_secs(30));
+        let b = gauge(&store, "b", Duration::from_secs(30));
+        let key = tenant("", "t");
+        let held = a.try_acquire(&key, 1).unwrap();
+        a.publish_now().unwrap();
+
+        b.publish_now().unwrap();
+        assert_eq!(b.tracked_slots(), 0, "b holds no slot for the subject");
+        assert!(
+            b.try_acquire(&key, 1).is_err(),
+            "a holds the only slot, so b's first stream is refused"
+        );
+        assert!(
+            b.try_acquire(&tenant("", "other"), 1).is_ok(),
+            "a subject nobody holds is free"
+        );
+        // Under a ceiling of 2, b's first stream fits beside a's, and the
+        // slot it opens keeps counting a's stream.
+        let _mine = b.try_acquire(&key, 2).expect("1 elsewhere + 0 here < 2");
+        assert!(
+            b.try_acquire(&key, 2).is_err(),
+            "1 elsewhere + 1 here reaches the ceiling of 2"
+        );
+        drop(_mine);
+
+        drop(held);
+        a.publish_now().unwrap();
+        b.publish_now().unwrap();
+        assert!(
+            b.try_acquire(&key, 1).is_ok(),
+            "once a releases and both publish, b admits"
+        );
+    }
+
+    /// A failed publish keeps the last known fleet counts: enforcement fails
+    /// open against them rather than forgetting them.
+    #[test]
+    fn a_failed_publish_keeps_the_last_known_fleet_counts() {
+        let store = Arc::new(InMemoryLeaseStore::default());
+        let a = gauge(&store, "a", Duration::from_secs(30));
+        let key = tenant("", "t");
+        let _held = a.try_acquire(&key, 1).unwrap();
+        a.publish_now().unwrap();
+        let flaky = Arc::new(FlakyLeaseStore {
+            inner: Arc::clone(&store),
+            fail: AtomicBool::new(false),
+        });
+        let b = LeaseGauge::new(
+            "chain".to_string(),
+            Arc::clone(&flaky) as Arc<dyn LeaseStore>,
+            "b".to_string(),
+            Duration::from_secs(30),
+        );
+        b.publish_now().unwrap();
+        flaky.fail.store(true, Ordering::SeqCst);
+        assert!(b.publish_now().is_err());
+        assert!(
+            b.try_acquire(&key, 1).is_err(),
+            "the last known count still applies during the outage"
+        );
+    }
+
+    struct FlakyLeaseStore {
+        inner: Arc<InMemoryLeaseStore>,
+        fail: AtomicBool,
+    }
+
+    impl LeaseStore for FlakyLeaseStore {
+        fn publish_leases(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[LeaseRow],
+            ttl: Duration,
+        ) -> Result<FleetLeases, StoreError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(StoreError::Unavailable("lease store down".into()));
+            }
+            self.inner.publish_leases(scope, node_id, rows, ttl)
+        }
+    }
+
     #[test]
     fn a_silent_replicas_leases_expire_after_the_ttl() {
         let store = Arc::new(InMemoryLeaseStore::default());
@@ -1516,12 +1624,10 @@ mod tests {
             &self,
             _scope: &str,
             _node_id: &str,
-            rows: &[LeaseRow],
+            _rows: &[LeaseRow],
             _ttl: Duration,
-        ) -> Vec<Result<u64, StoreError>> {
-            rows.iter()
-                .map(|_| Err(StoreError::Unavailable("lease store down".into())))
-                .collect()
+        ) -> Result<FleetLeases, StoreError> {
+            Err(StoreError::Unavailable("lease store down".into()))
         }
     }
 
