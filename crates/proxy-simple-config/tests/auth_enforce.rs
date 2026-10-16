@@ -305,6 +305,86 @@ fn tenants_without_policy_lowers_deny_by_default_and_allow_loudly() {
     lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts ALLOW");
 }
 
+/// `GET /v1/models` lists exact names from both `routes` and `models`, sorted
+/// and deduplicated, never a `*` pattern. With model policy enforced the same
+/// list reaches `llmproxy.model_authz`, which answers with the caller's subset
+/// before the unfiltered catalogue route is reached; the strict loader and the
+/// real factory accept it.
+#[test]
+fn the_model_catalogue_reaches_model_authz_and_the_catalogue_route() {
+    let text = format!(
+        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+         routes:\n  - {{ model: gpt-4o, provider: openai }}\n  - {{ model: \"claude-*\", provider: openai }}\n\
+         models:\n  text-embedding-3-small: {{ providers: [openai] }}\n  gpt-4o: {{ providers: [openai] }}\n  \
+         \"*\": {{ providers: [openai] }}\n\
+         auth:\n  hmac_secret: \"test-operator-secret\"\n  keys: []\n"
+    );
+    let expected = ["gpt-4o", "text-embedding-3-small"];
+    assert_eq!(
+        model_authz_config(&text)["model_catalog"],
+        serde_json::json!(expected)
+    );
+
+    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    let routes = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+        ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"]
+        .as_array()
+        .unwrap();
+    let catalog_route = routes
+        .iter()
+        .find(|route| route["name"] == "llmproxy_model_catalog")
+        .expect("catalogue route");
+    let body: serde_json::Value = serde_json::from_str(
+        catalog_route["direct_response"]["body"]["inline_string"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, expected);
+
+    let loaded = lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts it");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    let listener = snapshot.listeners.values().next().expect("one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    let config_of = |type_url: &str| {
+        hcm.http_filters
+            .iter()
+            .find(|f| f.type_url == type_url)
+            .unwrap()
+            .config
+            .clone()
+            .unwrap()
+    };
+    let ctx = FactoryContext::default();
+    AuthFilterFactory
+        .create(&config_of(proxy_filters::auth_filter::TYPE_URL), &ctx)
+        .expect("auth");
+    ModelAuthzFilterFactory
+        .create(
+            &config_of(proxy_filters::model_authz_filter::TYPE_URL),
+            &ctx,
+        )
+        .expect("model_authz accepts the catalogue");
+}
+
+/// A config with no exact model name has nothing to list: no catalogue field,
+/// no catalogue route.
+#[test]
+fn a_wildcard_only_config_has_no_model_catalogue() {
+    let typed = model_authz_config(&with_auth("", ""));
+    assert!(typed.get("model_catalog").is_none(), "{typed}");
+}
+
 #[test]
 fn tenants_without_policy_with_model_policy_off_is_a_load_error() {
     let text = with_auth(

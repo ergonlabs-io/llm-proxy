@@ -37,6 +37,14 @@ message ModelAuthz {
 
   // See `TenantsWithoutPolicy`. An enum number outside it is a load error.
   TenantsWithoutPolicy tenants_without_policy = 2;
+
+  // The model IDs this listener serves. When the list is not empty, the
+  // filter answers `GET /v1/models` itself with the IDs the caller's effective
+  // policy permits (the tenant grant intersected with the key policy), in this
+  // order, and never forwards the request. When it is empty, `GET /v1/models`
+  // is authorized like any other request, so it is refused: it names no model.
+  // Each entry must be an exact model ID (no `*`), and must be unique.
+  repeated string model_catalog = 3;
 }
 
 // One tenant's model access policy. `tenant` must match a value the

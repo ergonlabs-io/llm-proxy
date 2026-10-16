@@ -102,8 +102,20 @@
 //! configured without `llmproxy.auth` anywhere in the chain. That combination used to be legal and silently denied every request
 //! (case 1 above, no tenant ever gets set); an explicit load-time error is
 //! strictly better and is what AGENTS.md invariant 1 asks for.
+//!
+//! # `GET /v1/models` answers from the configured catalogue
+//!
+//! With a non-empty `typed_config.model_catalog`, this filter answers
+//! `GET /v1/models` itself, in `decode_headers`, with the catalogue entries the
+//! caller's effective policy permits: the tenant grant intersected with the key
+//! policy, by the same check a model request gets. A caller therefore lists
+//! only the models it may call. The listing is not forwarded to a provider: the
+//! catalogue is the set of names this listener routes, which no single provider
+//! knows, and a provider's own list would name models the route table does not
+//! serve. Without a catalogue the request is authorized like any other, and is
+//! refused because it names no model.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -366,6 +378,54 @@ pub fn parse_config(config: &DynamicMessage) -> Result<TenantPolicyMap, ConfigEr
     Ok(map)
 }
 
+/// Reads `typed_config.model_catalog`: exact model IDs, unique, in order.
+/// A `*` is refused because a pattern is a routing rule, not a model a client
+/// can name in a request.
+fn parse_model_catalog(config: &DynamicMessage) -> Result<Arc<[String]>, ConfigError> {
+    let raw: Vec<prost_reflect::Value> = config
+        .get_field_by_name("model_catalog")
+        .and_then(|v| v.as_list().map(<[_]>::to_vec))
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut catalog = Vec::with_capacity(raw.len());
+    for (i, value) in raw.iter().enumerate() {
+        let path = format!("typed_config.model_catalog[{i}]");
+        let id = value.as_str().unwrap_or_default();
+        if id.is_empty() {
+            return Err(invalid(path, "must not be empty"));
+        }
+        if id.contains('*') {
+            return Err(invalid(
+                path,
+                "must be an exact model ID; a `*` pattern is a routing rule, not a model",
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(invalid(path, format!("duplicate model ID `{id}`")));
+        }
+        catalog.push(id.to_string());
+    }
+    Ok(catalog.into())
+}
+
+/// The path this filter answers from the catalogue. Compared with
+/// [`http::Uri::path`], which excludes the query string.
+const MODELS_PATH: &str = "/v1/models";
+
+/// `%RESPONSE_CODE_DETAILS%` for a catalogue answer.
+const CATALOG_DETAILS: &str = "model_catalog";
+
+/// The OpenAI list shape, one entry per permitted model. Built with
+/// `serde_json` so a model ID with a quote or backslash is escaped.
+fn render_model_list<'a>(models: impl Iterator<Item = &'a str>) -> String {
+    let data: Vec<serde_json::Value> = models
+        .map(|id| {
+            serde_json::json!({ "id": id, "object": "model", "created": 0, "owned_by": "llm-proxy" })
+        })
+        .collect();
+    serde_json::json!({ "object": "list", "data": data }).to_string()
+}
+
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override --
 /// this filter has no per-route config; the trait default
 /// (`ConfigError::Unimplemented`) is correct.
@@ -437,6 +497,7 @@ impl HttpFilterFactory for ModelAuthzFilterFactory {
         })?;
 
         let allow_without_policy = parse_tenants_without_policy(config)?;
+        let model_catalog = parse_model_catalog(config)?;
         let no_policy_log = ctx
             .get_or_try_init(NO_POLICY_LOG_KEY, || {
                 Ok(Arc::new(NoPolicyLog::default()) as Arc<dyn std::any::Any + Send + Sync>)
@@ -460,6 +521,7 @@ impl HttpFilterFactory for ModelAuthzFilterFactory {
         Ok(Box::new(ModelAuthzInstanceFactory {
             snapshot: control_plane.handle(),
             allow_without_policy,
+            model_catalog,
             no_policy_log,
         }))
     }
@@ -474,6 +536,9 @@ struct ModelAuthzInstanceFactory {
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
     /// `typed_config.tenants_without_policy == ALLOW`.
     allow_without_policy: bool,
+    /// `typed_config.model_catalog`; empty means `GET /v1/models` is not
+    /// answered here.
+    model_catalog: Arc<[String]>,
     no_policy_log: Arc<NoPolicyLog>,
 }
 
@@ -483,6 +548,7 @@ impl FilterInstanceFactory for ModelAuthzInstanceFactory {
             decided: false,
             snapshot: Arc::clone(&self.snapshot),
             allow_without_policy: self.allow_without_policy,
+            model_catalog: Arc::clone(&self.model_catalog),
             no_policy_log: Arc::clone(&self.no_policy_log),
         })
     }
@@ -500,10 +566,70 @@ struct ModelAuthzFilterInstance {
     decided: bool,
     /// See [`ModelAuthzInstanceFactory::allow_without_policy`].
     allow_without_policy: bool,
+    /// See [`ModelAuthzInstanceFactory::model_catalog`].
+    model_catalog: Arc<[String]>,
     no_policy_log: Arc<NoPolicyLog>,
 }
 
 impl ModelAuthzFilterInstance {
+    /// The one policy decision: does `tenant`'s grant, narrowed by `key_id`'s
+    /// policy, permit `model`? Shared by request authorization and the
+    /// catalogue listing, so a listed model is exactly one a request may use.
+    /// `None` from the tenant side means the tenant has no stored policy; the
+    /// caller decides whether to log that.
+    fn permits(
+        &self,
+        snapshot: &ControlPlaneSnapshot,
+        tenant: &str,
+        key_id: Option<&str>,
+        model: &str,
+    ) -> Option<bool> {
+        let tenant_permits = match snapshot
+            .policies
+            .get(tenant)
+            .and_then(|policy| policy.model_access.as_ref())
+        {
+            Some(access) => access.permits(model),
+            // No model policy stored for this tenant (review H4): refused
+            // unless the operator chose `ALLOW`.
+            None if self.allow_without_policy => true,
+            None => return None,
+        };
+        // A key policy only narrows the tenant decision, including the
+        // operator's explicit no-tenant-policy ALLOW choice.
+        Some(
+            tenant_permits
+                && key_id
+                    .and_then(|id| snapshot.key_policies.get(&KeyId::new(id)))
+                    .is_none_or(|access| access.permits(model)),
+        )
+    }
+
+    /// Answer `GET /v1/models` with the catalogue entries this caller may use.
+    /// A tenant with no stored policy (and no `ALLOW`) may use nothing, so it
+    /// gets an empty list rather than an error: the listing is truthful.
+    fn answer_catalog(&self, cb: &mut dyn DecoderCallbacks, tenant: &str) {
+        let key_id = { cb.stream_info().auth.key_id.clone() };
+        let snapshot = self.snapshot.load();
+        let body = render_model_list(self.model_catalog.iter().map(String::as_str).filter(
+            |model| {
+                self.permits(&snapshot, tenant, key_id.as_deref(), model)
+                    .unwrap_or(false)
+            },
+        ));
+        cb.send_local_reply(
+            StatusCode::OK,
+            &body,
+            Some(Box::new(|headers: &mut http::HeaderMap| {
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/json"),
+                );
+            })),
+            CATALOG_DETAILS,
+        );
+    }
+
     /// The single call site for this filter's 403 -- see the module doc's
     /// "Fail closed" section for why every denial reason shares one generic
     /// wire response and detail string. No `modify_headers` closure (unlike
@@ -581,30 +707,13 @@ impl ModelAuthzFilterInstance {
         // pattern and the module doc's "Reads the ControlPlaneSnapshot"
         // section.
         let snapshot = self.snapshot.load();
-        let access = snapshot
-            .policies
-            .get(&tenant)
-            .and_then(|policy| policy.model_access.as_ref());
-        let permitted = match access {
-            Some(access) => access.permits(&model),
-            // No model policy stored for this tenant (review H4): refused
-            // unless the operator chose `ALLOW`. Written out rather than
-            // folded into a combinator so which way "absent" falls is
-            // visible at a glance.
-            None if self.allow_without_policy => true,
+        let permitted = match self.permits(&snapshot, &tenant, key_id.as_deref(), &model) {
+            Some(permitted) => permitted,
             None => {
                 self.no_policy_log.note_refused(&tenant);
                 false
             }
         };
-
-        // A key policy only narrows the tenant decision, including the
-        // operator's explicit no-tenant-policy ALLOW choice.
-        let permitted = permitted
-            && key_id
-                .as_deref()
-                .and_then(|id| snapshot.key_policies.get(&KeyId::new(id)))
-                .is_none_or(|access| access.permits(&model));
         if !permitted {
             self.deny(cb);
         }
@@ -624,7 +733,7 @@ impl HttpFilter for ModelAuthzFilterInstance {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        _headers: &mut RequestHeaders,
+        headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
         // Rust note: `stream_info()` hands back a `RefMut` guard that must
@@ -644,12 +753,23 @@ impl HttpFilter for ModelAuthzFilterInstance {
         let tenant = { cb.stream_info().auth.tenant.clone() };
 
         // Case 1: no authenticated tenant -- see the module doc.
-        if tenant.is_none() {
+        let Some(tenant) = tenant else {
             // Nothing further can authorize this stream, so record the
             // decision here too: `decode_data` must not send a second local
             // reply behind this one.
             self.decided = true;
             self.deny(cb);
+            return FilterHeadersStatus::Continue;
+        };
+
+        // See the module doc's "`GET /v1/models`" section. Answered after the
+        // tenant check, so only an authenticated caller ever sees a list.
+        if !self.model_catalog.is_empty()
+            && headers.method == http::Method::GET
+            && headers.uri.path() == MODELS_PATH
+        {
+            self.decided = true;
+            self.answer_catalog(cb, &tenant);
         }
 
         // Rust note: the returned status is irrelevant on the deny path --
@@ -957,6 +1077,8 @@ mod tests {
     struct LocalReply {
         status: HttpStatusCode,
         details: String,
+        body: String,
+        headers: HeaderMap,
     }
 
     /// A `DecoderCallbacks` + `EncoderCallbacks` double, following
@@ -995,17 +1117,25 @@ mod tests {
         fn send_local_reply(
             &mut self,
             code: HttpStatusCode,
-            _body: &str,
+            body: &str,
             modify_headers: Option<HeaderMutationFn>,
             details: &str,
         ) {
-            assert!(
-                modify_headers.is_none(),
-                "model_authz_filter's 403 carries no header mutation"
-            );
+            if code == HttpStatusCode::FORBIDDEN {
+                assert!(
+                    modify_headers.is_none(),
+                    "model_authz_filter's 403 carries no header mutation"
+                );
+            }
+            let mut headers = HeaderMap::new();
+            if let Some(modify) = modify_headers {
+                modify(&mut headers);
+            }
             self.local_reply = Some(LocalReply {
                 status: code,
                 details: details.to_string(),
+                body: body.to_string(),
+                headers,
             });
         }
         fn continue_decoding(&mut self) {
@@ -1073,13 +1203,20 @@ mod tests {
     /// convention of not sharing test scaffolding across files -- the same
     /// one `auth_filter`'s and this file's own `TestCallbacks` follow).
     fn filter_with(policies: TenantPolicyMap) -> ModelAuthzFilterInstance {
+        filter_with_keys(policies, Default::default())
+    }
+
+    fn filter_with_keys(
+        policies: TenantPolicyMap,
+        key_policies: HashMap<KeyId, ModelAccess>,
+    ) -> ModelAuthzFilterInstance {
         let snapshot = Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
             keys: KeySet::new(),
             policies,
             key_budgets: Default::default(),
             tenant_limits: Default::default(),
             key_limits: Default::default(),
-            key_policies: Default::default(),
+            key_policies,
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
         })));
@@ -1087,7 +1224,184 @@ mod tests {
             snapshot,
             decided: false,
             allow_without_policy: false,
+            model_catalog: Arc::from(Vec::<String>::new()),
             no_policy_log: Arc::new(NoPolicyLog::default()),
+        }
+    }
+
+    // --- GET /v1/models from the catalogue ------------------------------------
+
+    fn with_catalog(
+        mut filter: ModelAuthzFilterInstance,
+        ids: &[&str],
+    ) -> ModelAuthzFilterInstance {
+        filter.model_catalog = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .into();
+        filter
+    }
+
+    fn get(path: &'static str) -> RequestHeaders {
+        RequestHeaders {
+            method: Method::GET,
+            uri: Uri::from_static(path),
+            headers: HeaderMap::new(),
+        }
+    }
+
+    /// The IDs a `GET /v1/models` answer lists, after asserting it is a 200
+    /// JSON list answered here.
+    fn listed(cb: &TestCallbacks) -> Vec<String> {
+        let reply = cb.local_reply.as_ref().expect("answered locally");
+        assert_eq!(reply.status, HttpStatusCode::OK);
+        assert_eq!(reply.details, "model_catalog");
+        assert_eq!(
+            reply.headers.get("content-type").unwrap(),
+            "application/json"
+        );
+        let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body["object"], "list");
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry["object"], "model");
+                entry["id"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    fn list_models(
+        filter: &mut ModelAuthzFilterInstance,
+        tenant: &str,
+        key_id: Option<&str>,
+    ) -> TestCallbacks {
+        let mut cb = TestCallbacks::new(None);
+        cb.set_tenant(tenant);
+        if let Some(key_id) = key_id {
+            cb.set_key_id(key_id);
+        }
+        filter.decode_headers(&mut cb, &mut get("/v1/models"), true);
+        // The data phase must not add a second reply (the model check would
+        // refuse a request that names no model).
+        filter.decode_data(&mut cb, &mut Bytes::new(), true);
+        cb
+    }
+
+    #[test]
+    fn models_lists_the_catalogue_entries_the_tenant_and_key_permit() {
+        let policies = policies_map(vec![(
+            "tenant-a",
+            ModelAccess::Only(vec![ModelPattern::new("gpt-*"), ModelPattern::new("embed")]),
+        )]);
+        let catalog = ["gpt-4o", "embed", "claude-3", "gpt-5"];
+        let mut filter = with_catalog(filter_with(policies), &catalog);
+        assert_eq!(
+            listed(&list_models(&mut filter, "tenant-a", None)),
+            ["gpt-4o", "embed", "gpt-5"],
+            "the tenant grant filters the catalogue, in catalogue order"
+        );
+
+        // A key policy narrows the tenant grant; it never adds to it.
+        let key_policies = HashMap::from([(
+            KeyId::new("k1"),
+            ModelAccess::Only(vec![
+                ModelPattern::new("gpt-4*"),
+                ModelPattern::new("claude-3"),
+            ]),
+        )]);
+        let mut filter = with_catalog(
+            filter_with_keys(filter.snapshot.load().policies.clone(), key_policies),
+            &catalog,
+        );
+        assert_eq!(
+            listed(&list_models(&mut filter, "tenant-a", Some("k1"))),
+            ["gpt-4o"],
+            "claude-3 is in the key policy but not the tenant grant"
+        );
+        assert_eq!(
+            listed(&list_models(&mut filter, "tenant-a", Some("k2"))),
+            ["gpt-4o", "embed", "gpt-5"],
+            "a key without a policy inherits the tenant grant"
+        );
+    }
+
+    #[test]
+    fn models_for_a_tenant_without_a_policy_is_empty_unless_allowed() {
+        let mut filter = with_catalog(filter_with(HashMap::new()), &["gpt-4o", "embed"]);
+        assert!(listed(&list_models(&mut filter, "tenant-b", None)).is_empty());
+        filter.allow_without_policy = true;
+        assert_eq!(
+            listed(&list_models(&mut filter, "tenant-b", None)),
+            ["gpt-4o", "embed"]
+        );
+    }
+
+    #[test]
+    fn models_without_a_tenant_is_refused_not_listed() {
+        let mut filter = with_catalog(filter_with(HashMap::new()), &["gpt-4o"]);
+        let mut cb = TestCallbacks::new(None);
+        filter.decode_headers(&mut cb, &mut get("/v1/models"), true);
+        let reply = cb.local_reply.expect("refused");
+        assert_eq!(reply.status, HttpStatusCode::FORBIDDEN);
+    }
+
+    /// Only the exact `GET /v1/models` is answered. A model ID path, another
+    /// method, or no catalogue goes through ordinary authorization, which
+    /// refuses a request that names no model.
+    #[test]
+    fn only_get_v1_models_with_a_catalogue_is_answered() {
+        let policies = policies_map(vec![("tenant-a", ModelAccess::All)]);
+        for (catalog, mut head) in [
+            (&["gpt-4o"][..], get("/v1/models/gpt-4o")),
+            (
+                &["gpt-4o"][..],
+                RequestHeaders {
+                    method: Method::POST,
+                    ..get("/v1/models")
+                },
+            ),
+            (&[][..], get("/v1/models")),
+        ] {
+            let mut filter = with_catalog(filter_with(policies.clone()), catalog);
+            let mut cb = TestCallbacks::new(None);
+            cb.set_tenant("tenant-a");
+            filter.decode_headers(&mut cb, &mut head, true);
+            filter.decode_data(&mut cb, &mut Bytes::new(), true);
+            let reply = cb.local_reply.expect("no model named: refused");
+            assert_eq!(reply.status, HttpStatusCode::FORBIDDEN, "{}", head.uri);
+        }
+    }
+
+    #[test]
+    fn a_catalogue_parses_in_order_and_rejects_patterns_duplicates_and_empties() {
+        let with = |ids: &[&str]| {
+            let mut msg = model_authz(vec![]);
+            msg.set_field_by_name(
+                "model_catalog",
+                prost_reflect::Value::List(
+                    ids.iter()
+                        .map(|id| prost_reflect::Value::String(id.to_string()))
+                        .collect(),
+                ),
+            );
+            parse_model_catalog(&msg)
+        };
+        assert_eq!(&*with(&["b", "a"]).unwrap(), ["b", "a"]);
+        assert!(with(&[]).unwrap().is_empty());
+        for (ids, path) in [
+            (&["a", "gpt-*"][..], "typed_config.model_catalog[1]"),
+            (&["a", "a"][..], "typed_config.model_catalog[1]"),
+            (&[""][..], "typed_config.model_catalog[0]"),
+        ] {
+            let err = with(ids).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field_path, .. } if field_path == path),
+                "{ids:?}: {err:?}"
+            );
         }
     }
 

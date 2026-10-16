@@ -1490,6 +1490,11 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
 /// Pick the response parser from the downstream request. Only POST creates a
 /// generation; a GET that retrieves a stored response must not be metered as a
 /// new one, so it keeps the cluster dialect.
+///
+/// `/embeddings` is the OpenAI wire shape on every provider that serves it
+/// (`usage.prompt_tokens`, no output tokens), so it is read with the OpenAI
+/// parser even behind a cluster whose dialect is Anthropic: that parser would
+/// look for `input_tokens` and meter nothing.
 fn dialect_for_request(method: &Method, path: &str) -> Option<Dialect> {
     if method != Method::POST {
         return None;
@@ -1498,6 +1503,8 @@ fn dialect_for_request(method: &Method, path: &str) -> Option<Dialect> {
         Some(Dialect::OpenAiResponses)
     } else if path.ends_with("/messages") {
         Some(Dialect::Anthropic)
+    } else if path.ends_with("/embeddings") {
+        Some(Dialect::OpenAi)
     } else {
         None
     }
@@ -2328,6 +2335,81 @@ mod tests {
         );
         // The provider label follows the cluster, not the path.
         assert_eq!(llm.system, Some(GenAiSystem::OpenAi));
+    }
+
+    /// An embeddings response carries `prompt_tokens` and `total_tokens` and
+    /// no completion count: input is metered, output is zero.
+    #[test]
+    fn post_embeddings_on_an_openai_cluster_meters_input_and_no_output() {
+        let llm = run_on_openai_cluster(
+            Method::POST,
+            "/v1/embeddings",
+            "application/json",
+            br#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,-0.2]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":12,"total_tokens":12}}"#,
+        );
+        let usage = llm.usage.expect("embeddings usage");
+        assert_eq!(
+            (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
+            (12, 0, 0)
+        );
+        assert_eq!(llm.system, Some(GenAiSystem::OpenAi));
+    }
+
+    /// The parser follows the path: an Anthropic-dialect cluster serving
+    /// `/v1/embeddings` still returns the OpenAI shape, which the Anthropic
+    /// parser would not meter.
+    #[test]
+    fn post_embeddings_on_an_anthropic_cluster_reads_openai_usage() {
+        let mut filter = filter_for(Dialect::Anthropic);
+        let mut cb = TestCallbacks::new();
+        filter.decode_headers(&mut cb, &mut request(Method::POST, "/v1/embeddings"), true);
+        filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
+        filter.encode_data(
+            &mut cb,
+            &mut Bytes::from_static(br#"{"data":[],"usage":{"prompt_tokens":7,"total_tokens":7}}"#),
+            true,
+        );
+        let usage = cb.llm().usage.expect("embeddings usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (7, 0));
+        // The provider label still follows the cluster.
+        assert_eq!(cb.llm().system, Some(GenAiSystem::Anthropic));
+    }
+
+    /// A batch of embeddings is a large body with `usage` after the vectors.
+    /// Past the whole-body bound only the tail is kept, and the usage object
+    /// is still read from it.
+    #[test]
+    fn embeddings_usage_after_a_body_larger_than_the_json_bound_is_read_from_the_tail() {
+        let mut filter = filter_for(Dialect::OpenAi);
+        let mut cb = TestCallbacks::new();
+        filter.decode_headers(&mut cb, &mut request(Method::POST, "/v1/embeddings"), true);
+        filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
+        let vector = format!("[{}0.5]", "0.125,".repeat(1024));
+        let mut sent = 0;
+        let mut head = br#"{"object":"list","data":["#.to_vec();
+        let mut index = 0;
+        while sent + head.len() <= MAX_JSON_BODY_BYTES {
+            if index > 0 {
+                head.push(b',');
+            }
+            head.extend_from_slice(
+                format!(r#"{{"object":"embedding","index":{index},"embedding":{vector}}}"#)
+                    .as_bytes(),
+            );
+            index += 1;
+            if head.len() > 64 << 10 {
+                sent += head.len();
+                filter.encode_data(&mut cb, &mut Bytes::from(std::mem::take(&mut head)), false);
+            }
+        }
+        head.extend_from_slice(
+            br#"],"model":"text-embedding-3-small","usage":{"prompt_tokens":4096,"total_tokens":4096}}"#,
+        );
+        sent += head.len();
+        assert!(sent > MAX_JSON_BODY_BYTES, "the body must pass the bound");
+        filter.encode_data(&mut cb, &mut Bytes::from(head), true);
+        let usage = cb.llm().usage.expect("usage read from the tail window");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (4096, 0));
     }
 
     #[test]

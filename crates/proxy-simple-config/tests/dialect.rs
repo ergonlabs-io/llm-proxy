@@ -321,12 +321,23 @@ routes:
     assert_eq!(header(0)["string_match"]["exact"], "gpt-5");
     assert_eq!(header(1)["string_match"]["prefix"], "gpt-5");
     assert_eq!(header(2)["string_match"]["safe_regex"]["regex"], "a.*b");
+    // The exact name is listed by `GET /v1/models`, whose route sits before
+    // the catch-all; the patterns are routing rules and are not listed.
+    assert_eq!(routes[3]["name"], "llmproxy_model_catalog");
+    let catalog: serde_json::Value = serde_json::from_str(
+        routes[3]["direct_response"]["body"]["inline_string"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(catalog["data"][0]["id"], "gpt-5");
+    assert_eq!(catalog["data"].as_array().unwrap().len(), 1);
     assert!(
-        routes[3]["match"]["headers"].is_null(),
+        routes[4]["match"]["headers"].is_null(),
         "catch-all matches all"
     );
     // A `*` rule exists, so no synthetic 404 route is appended.
-    assert_eq!(routes.as_array().unwrap().len(), 4);
+    assert_eq!(routes.as_array().unwrap().len(), 5);
 }
 
 /// Without a `*` rule, a 404 direct-response backstop is appended.

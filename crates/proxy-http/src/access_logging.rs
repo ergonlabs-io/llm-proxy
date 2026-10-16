@@ -237,10 +237,11 @@ pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestS
     }
 }
 
-/// Maps the three GenAI request targets this proxy understands to OTel's
+/// Maps the GenAI request targets this proxy understands to OTel's
 /// operation label. `responses` is deliberately the documented custom value
-/// for OpenAI's Responses API: semconv v1.27 only standardizes `chat` and
-/// `text_completion`, and calling Responses "chat" would be a false label.
+/// for OpenAI's Responses API: semconv v1.27 only standardizes `chat`,
+/// `text_completion` and `embeddings`, and calling Responses "chat" would be a
+/// false label.
 fn gen_ai_operation(path: &str) -> Option<&'static str> {
     if path.ends_with("/chat/completions") || path.ends_with("/messages") {
         Some("chat")
@@ -248,6 +249,8 @@ fn gen_ai_operation(path: &str) -> Option<&'static str> {
         Some("text_completion")
     } else if path.ends_with("/responses") {
         Some("responses")
+    } else if path.ends_with("/embeddings") {
+        Some("embeddings")
     } else {
         None
     }
@@ -2336,5 +2339,19 @@ mod tests {
             0,
             "a clean end-of-stream must not warn"
         );
+    }
+
+    #[test]
+    fn gen_ai_operation_labels_each_served_target_and_nothing_else() {
+        for (path, expected) in [
+            ("/v1/chat/completions", Some("chat")),
+            ("/v1/messages", Some("chat")),
+            ("/v1/completions", Some("text_completion")),
+            ("/v1/responses", Some("responses")),
+            ("/v1/embeddings", Some("embeddings")),
+            ("/v1/models", None),
+        ] {
+            assert_eq!(gen_ai_operation(path), expected, "{path}");
+        }
     }
 }

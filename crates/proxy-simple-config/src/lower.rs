@@ -401,11 +401,14 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
             }
         }));
     }
-    // A configured model catalog is served locally from the same immutable
-    // snapshot as routing. Wildcard patterns are routing rules, not model IDs.
-    if !config.models.is_empty() {
-        let data: Vec<Value> = config.models.keys()
-            .filter(|name| !name.contains('*'))
+    // The model catalogue is served locally from the same immutable snapshot
+    // as routing. With model policy enforced, `llmproxy.model_authz` answers
+    // first with the caller's permitted subset, so this unfiltered route only
+    // answers chains where every routed model is open to every caller.
+    let catalog = model_catalog(config);
+    if !catalog.is_empty() {
+        let data: Vec<Value> = catalog
+            .iter()
             .map(|name| json!({ "id": name, "object": "model", "created": 0, "owned_by": "llm-proxy" }))
             .collect();
         let body = json!({ "object": "list", "data": data }).to_string();
@@ -1462,6 +1465,23 @@ fn needs_body_rewrite_filter(config: &SimpleConfig) -> bool {
 
 /// `auth` is set and `auth.enforce.model_policy` is on: the chain carries
 /// `llmproxy.model_authz`.
+/// The model IDs `GET /v1/models` lists: every `routes[].model` and `models`
+/// key that names one model, sorted and deduplicated. A name with `*` is a
+/// routing rule, not a model a client can request by that name, so it is not
+/// listed; neither is the `auto` trigger, which is never itself granted.
+fn model_catalog(config: &SimpleConfig) -> Vec<String> {
+    config
+        .routes
+        .iter()
+        .map(|rule| rule.model.as_str())
+        .chain(config.models.keys().map(String::as_str))
+        .filter(|name| !name.contains('*'))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 fn enforces_model_policy(config: &SimpleConfig) -> bool {
     config
         .auth
@@ -2760,6 +2780,12 @@ fn lower_listener(
         let mut typed_config = json!({ "@type": MODEL_AUTHZ_FILTER_TYPE_URL });
         if allows_tenants_without_policy(config) {
             typed_config["tenants_without_policy"] = json!("ALLOW");
+        }
+        // The filter answers `GET /v1/models` with the subset of this
+        // catalogue the caller's tenant grant and key policy permit.
+        let catalog = model_catalog(config);
+        if !catalog.is_empty() {
+            typed_config["model_catalog"] = json!(catalog);
         }
         http_filters.push(json!({
             "name": "llmproxy.model_authz",
