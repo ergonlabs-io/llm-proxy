@@ -145,11 +145,6 @@ const TOKEN_LIMIT_FILTER_NAME: &str = "llmproxy.token_limit";
 /// `dialect.rs`'s IR-survival test pins the two together the same way.
 const TOKEN_LIMIT_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.TokenLimit";
 
-/// The only `LimitKey` the thin-slice token limiter enforces: its bucket key
-/// is hardcoded to the `authorization` header (see `token_limit_filter`'s
-/// module doc, "Config" section).
-const ENFORCED_LIMIT_HEADER: &str = "authorization";
-
 /// The `typed_extension_protocol_options` map key, and (prefixed with
 /// `type.googleapis.com/`) its `@type` -- must match
 /// `proxy_config::lower::HTTP_PROTOCOL_OPTIONS_TYPE` exactly, for the same
@@ -436,7 +431,7 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
 
     let auth_filter = lower_auth(config, &mut warnings)?;
     warn_unenforced_tenant_controls(config, &mut warnings);
-    let token_limit_filter = lower_limits(config, &mut warnings)?.or_else(|| {
+    let token_limit_filter = lower_limits(config)?.or_else(|| {
         // Tenant and key limits live in the admin store, so the limiter must
         // be in the chain whenever `auth` is set, even with no `limits` entry.
         // A filter a `limits` entry already added enforces them as well.
@@ -2392,154 +2387,107 @@ fn check_readable_non_empty_file(file: &str, field_path: &str) -> Result<(), Con
 
 // ------------------------------------------------------------------ limits --
 
-/// `limits` -> at most one `llmproxy.token_limit` `http_filters` entry.
+/// `limits` -> one `llmproxy.token_limit` `http_filters` entry carrying one
+/// `rules[]` element per `limits[i]`, in order.
 ///
-/// The dialect's `limits` surface is richer than what `token_limit_filter`
-/// enforces today: that filter is a thin slice — a
-/// single global token-total budget, bucketed on `(route name, the
-/// `authorization` header)`, no per-descriptor config. So exactly one shape
-/// lowers for real: `key: header:authorization` with `tokens_per_minute`
-/// set. Everything else -- `global`/`client-ip` keys, any other header,
-/// `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded in
-/// the dialect but not enforced yet, and gets an explicit per-field warning
-/// naming its exact dotted path (AGENTS.md invariant 1: never silently drop a
-/// field). Only the FIRST supported entry is honored -- the filter has room
-/// for exactly one budget rule -- and any later one is warned about too.
-fn lower_limits(
-    config: &SimpleConfig,
-    warnings: &mut Vec<ConfigWarning>,
-) -> Result<Option<Value>, ConfigError> {
-    let mut token_limit_filter: Option<Value> = None;
+/// Every `limits` field is enforced as written (AGENTS.md invariant 1), so no
+/// warning is emitted from here. Rule buckets are route-independent, windows
+/// are one epoch-aligned minute, and a request must pass every rule that
+/// applies to it; the filter owns those semantics, this function only
+/// translates fields.
+///
+/// Behavior note: `key: header:authorization` buckets on the hashed
+/// `authorization` value as written, even when `auth:` is configured. It used
+/// to switch to the authenticated tenant silently; write `key: tenant` for
+/// that.
+fn lower_limits(config: &SimpleConfig) -> Result<Option<Value>, ConfigError> {
+    let mut rules: Vec<Value> = Vec::with_capacity(config.limits.len());
 
     for (i, limit) in config.limits.iter().enumerate() {
         let path = format!("limits[{i}]");
 
         // `key: tenant` needs an `auth:` block to mean anything -- without
-        // one, nothing authenticates a tenant, so the limiter would silently
-        // fall back to bucketing on the client-supplied `authorization`
-        // header (see `token_limit_filter`'s module doc, "bucket key" table)
-        // while the config claims "per tenant". AGENTS.md invariant 1: a hard
-        // error, not a warning -- this is a config that lies about what it
-        // enforces, not merely a feature that isn't wired up yet.
+        // one, nothing authenticates a tenant, so the bucket would have no
+        // identity to count against. AGENTS.md invariant 1: a hard error,
+        // not a warning -- this is a config that lies about what it enforces.
         if matches!(&limit.key, LimitKey::Tenant) && config.auth.is_none() {
             return Err(ConfigError::InvalidValue {
                 field_path: format!("{path}.key"),
                 reason: "`key: tenant` requires an `auth:` block; with none configured, \
-                         nothing would authenticate a tenant, and the limiter would silently \
-                         fall back to bucketing on the client-supplied `authorization` header \
-                         instead -- add `auth:`, or use a different key"
+                         nothing would authenticate a tenant -- add `auth:`, or use a \
+                         different key"
                     .to_string(),
             });
         }
-        // The inverse mismatch: an `auth:` block changes what a HEADER key
-        // actually buckets on at runtime (the limiter prefers the
-        // authenticated tenant whenever one exists -- see
-        // `token_limit_filter`'s bucket-key table), regardless of which
-        // header this config names. `key: header:authorization` still
-        // *lowers* (it remains the one enforced header key absent auth), so
-        // this is a warning, not an error: it tells the truth about what
-        // will actually happen rather than what the config's key literally
-        // says.
-        if let LimitKey::Header(name) = &limit.key {
-            if config.auth.is_some() {
-                warnings.push(warning(
-                    format!("{path}.key"),
-                    format!(
-                        "`header:{name}` is recorded, but with `auth:` configured the token \
-                         limiter buckets on the authenticated tenant regardless of this header \
-                         -- write `key: tenant` to say what will actually happen"
-                    ),
-                ));
+
+        // Rust note: `serde_json::Map` keeps this rule's JSON object mutable
+        // so absent optional fields can simply be skipped.
+        let mut rule = serde_json::Map::new();
+        match &limit.key {
+            LimitKey::Global => {
+                rule.insert("key".into(), json!("GLOBAL"));
+            }
+            LimitKey::ClientIp => {
+                rule.insert("key".into(), json!("CLIENT_IP"));
+            }
+            LimitKey::Tenant => {
+                rule.insert("key".into(), json!("TENANT"));
+            }
+            LimitKey::Header(name) => {
+                rule.insert("key".into(), json!("HEADER"));
+                // HTTP header names are case-insensitive; the filter looks
+                // them up lowercased.
+                rule.insert("header".into(), json!(name.to_ascii_lowercase()));
             }
         }
-
-        let key_supported = matches!(
-            &limit.key,
-            LimitKey::Header(name) if name.eq_ignore_ascii_case(ENFORCED_LIMIT_HEADER)
-        ) || matches!(&limit.key, LimitKey::Tenant);
-        if !key_supported {
-            let key_desc = match &limit.key {
-                LimitKey::Global => "`global`".to_string(),
-                LimitKey::ClientIp => "`client-ip`".to_string(),
-                LimitKey::Header(name) => format!("`header:{name}`"),
-                // Unreachable: `key_supported` is always true for `Tenant`
-                // once we reach here (the hard error above already returned
-                // for the unauthenticated case). Kept for match
-                // exhaustiveness, not because this arm can fire.
-                LimitKey::Tenant => "`tenant`".to_string(),
-            };
-            warnings.push(warning(
-                format!("{path}.key"),
-                format!(
-                    "{key_desc} is not enforced; the token limiter derives its \
-                     bucket key from the authenticated tenant when there is one and from \
-                     the `{ENFORCED_LIMIT_HEADER}` header otherwise, and has no per-key \
-                     configurability, so only `key: tenant` (with `auth:` configured) and \
-                     `key: header:{ENFORCED_LIMIT_HEADER}` are enforced today"
-                ),
-            ));
+        if let Some(tokens) = limit.tokens_per_minute {
+            rule.insert("tokens_per_minute".into(), json!(tokens.0));
         }
-
-        if let Some(tokens_per_minute) = limit.tokens_per_minute {
-            if key_supported {
-                if token_limit_filter.is_some() {
-                    warnings.push(warning(
-                        format!("{path}.tokens_per_minute"),
-                        "not enforced; the token limiter emits at most one budget per \
-                         listener, and an earlier `limits` entry already claimed it",
-                    ));
-                } else {
-                    let max_tokens = u32::try_from(tokens_per_minute.0).map_err(|_| {
-                        ConfigError::InvalidValue {
-                            field_path: format!("{path}.tokens_per_minute"),
-                            reason: format!(
-                                "`{}` exceeds the token limiter's maximum ({})",
-                                tokens_per_minute.0,
-                                u32::MAX
-                            ),
-                        }
-                    })?;
-                    // 60s fixed window: `token_limit_filter::parse_config`
-                    // derives its window as `max_tokens / fill_rate` seconds,
-                    // so a per-*minute* dialect value needs `fill_rate =
-                    // max_tokens / 60.0` to land on a 60-second window.
-                    let fill_rate = f64::from(max_tokens) / 60.0;
-                    token_limit_filter = Some(json!({
-                        "name": TOKEN_LIMIT_FILTER_NAME,
-                        "typed_config": {
-                            "@type": TOKEN_LIMIT_FILTER_TYPE_URL,
-                            "max_tokens": max_tokens,
-                            "fill_rate": fill_rate,
-                        }
-                    }));
-                }
-            }
-            // else: the key warning above already explains why this
-            // `tokens_per_minute` value produces no enforcement.
+        if let Some(requests) = limit.requests_per_minute {
+            rule.insert("requests_per_minute".into(), json!(requests.0));
         }
-
-        if limit.requests_per_minute.is_some() {
-            warnings.push(warning(
-                format!("{path}.requests_per_minute"),
-                "not enforced; the token limiter enforces total token budgets, not a \
-                 request-rate cap -- that would be a different feature",
-            ));
-        }
-        if limit.concurrent_sessions.is_some() {
-            warnings.push(warning(
-                format!("{path}.concurrent_sessions"),
-                "not enforced; concurrent-session limits are not supported yet",
-            ));
+        if let Some(sessions) = limit.concurrent_sessions {
+            // `concurrent_sessions` counts streams in flight.
+            let streams = u32::try_from(sessions).map_err(|_| ConfigError::InvalidValue {
+                field_path: format!("{path}.concurrent_sessions"),
+                reason: format!("`{sessions}` exceeds the maximum ({})", u32::MAX),
+            })?;
+            rule.insert("concurrent_streams".into(), json!(streams));
         }
         if !limit.models.is_empty() {
-            warnings.push(warning(
-                format!("{path}.models"),
-                "not enforced; the token limiter has no per-model scoping today",
-            ));
+            for (j, model) in limit.models.iter().enumerate() {
+                if !is_valid_limit_model_pattern(model) {
+                    return Err(ConfigError::InvalidValue {
+                        field_path: format!("{path}.models[{j}]"),
+                        reason: format!(
+                            "`{model}` must be an exact model name or a single trailing `*`"
+                        ),
+                    });
+                }
+            }
+            rule.insert("models".into(), json!(limit.models));
         }
+        rules.push(Value::Object(rule));
     }
 
-    Ok(token_limit_filter)
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "name": TOKEN_LIMIT_FILTER_NAME,
+        "typed_config": {
+            "@type": TOKEN_LIMIT_FILTER_TYPE_URL,
+            "rules": rules,
+        }
+    })))
+}
+
+/// An exact model name, or a name with a single trailing `*`. Mirrors
+/// `proxy_filters::model_authz::ModelPattern::is_valid`, which this crate
+/// cannot call (`proxy-filters` is a dev-dependency only).
+fn is_valid_limit_model_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && (!pattern.contains('*') || (pattern.matches('*').count() == 1 && pattern.ends_with('*')))
 }
 
 // ------------------------------------------------------------- access logs --

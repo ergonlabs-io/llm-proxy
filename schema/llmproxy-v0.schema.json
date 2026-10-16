@@ -68,7 +68,7 @@
       "items": { "$ref": "#/$defs/Route" }
     },
     "limits": {
-      "description": "Rate limits and quotas. Today only `key: header:authorization` limits with `tokens_per_minute` set are actually enforced (a 429 with `x-ratelimit-*` headers before the request is forwarded; token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated). Every other combination -- `key: global`/`client-ip`, any other `header:<name>`, `requests_per_minute`, `concurrent_sessions`, `models` -- is recorded but not enforced yet, and produces a load-time warning naming the exact field. NOTE: limits are enforced PER PROXY INSTANCE in v0, and a fleet-wide token rate limit has no store to be enforced against. Do not read the shared `ControlPlaneStore` as covering this: it reconciles CURRENCY SPEND for the Envoy-mode `llmproxy.spend_limit` filter and holds no token-rate-limit counters. `auth.store` selects that same store type for minted keys and tenant policy only, and no `limits` entry reads it, so `auth.store: shared` does not make a token limit fleet-wide. Two replicas each admit up to `tokens_per_minute`.",
+      "description": "Rate limits and quotas. Every field is enforced as written. Each entry becomes one rule; a request must pass every rule that applies to it, and the first rule it exceeds rejects it with a 429 carrying `x-ratelimit-*` headers before the request is forwarded. Rule buckets are independent of the route. Token and request windows are one minute and epoch-aligned (they reset on the wall-clock minute, not a minute after first use). Token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated. NOTE: limits are enforced PER PROXY INSTANCE in v0, and a fleet-wide rate limit has no store to be enforced against. Do not read the shared `ControlPlaneStore` as covering this: it reconciles CURRENCY SPEND for the Envoy-mode `llmproxy.spend_limit` filter and holds no rate-limit counters. `auth.store` selects that same store type for minted keys and tenant policy only, and no `limits` entry reads it, so `auth.store: shared` does not make a limit fleet-wide. Two replicas each admit up to the configured rate.",
       "type": "array",
       "items": { "$ref": "#/$defs/Limit" }
     },
@@ -725,27 +725,27 @@
       "properties": {
         "key": {
           "type": "string",
-          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header — e.g. `header:x-api-key` for per-caller quotas). `header:authorization` and `tenant` are enforced today (the token limiter's bucket key is hardcoded to the `authorization` header, but automatically prefers the authenticated tenant instead whenever `auth:` is configured -- so a `header:<name>` limit alongside `auth:` produces a not-enforced-as-written warning suggesting `key: tenant`). `global`, `client-ip`, and every other `header:<name>` without `auth:` are recorded but produce a not-enforced warning.",
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per TCP peer address; behind a load balancer that is the balancer's address, because the dialect has no trusted-hops setting), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header, e.g. `header:x-api-key` for per-caller quotas). The header value is hashed, never stored or logged raw, and a request without that header is not counted against this limit. `header:authorization` buckets on the hashed `authorization` value as written, even when `auth:` is configured; write `tenant` to bucket on the authenticated tenant.",
           "pattern": "^(global|client-ip|tenant|header:[A-Za-z0-9-]+)$",
           "examples": ["header:authorization", "tenant", "global", "client-ip", "header:x-api-key"]
         },
         "tokens_per_minute": {
           "$ref": "#/$defs/TokenAmount",
-          "description": "Total (input + output) tokens allowed per minute per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected — in-flight streams are never truncated). Enforced only when paired with `key: header:authorization`; any other key still records this field but produces a not-enforced warning instead."
+          "description": "Total (input + output) tokens allowed per one-minute epoch-aligned window per bucket. Usage is extracted from provider responses, including streamed ones; enforcement is at request admission (the request that would exceed the budget is rejected; in-flight streams are never truncated). Enforced for every key."
         },
         "requests_per_minute": {
           "$ref": "#/$defs/TokenAmount",
-          "description": "Requests allowed per minute per bucket. Not enforced yet by any key -- the current limiter enforces total token budgets, not a request-rate cap (a different feature); recorded, and produces a not-enforced warning."
+          "description": "Requests allowed per one-minute epoch-aligned window per bucket. Counted at admission, for every key."
         },
         "concurrent_sessions": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum simultaneous long-lived sessions (WebSocket realtime connections and active SSE streams) per bucket. Enforced at connection/upgrade time — the 429 happens before the session starts, never mid-session. Not enforced yet; recorded, and produces a not-enforced warning.",
+          "description": "Maximum streams in flight per bucket (an active request/response stream, including SSE; released when the stream ends). Enforced at admission, so the 429 happens before the stream starts, never mid-stream. Values above 4294967295 are a load error.",
           "examples": [10]
         },
         "models": {
           "type": "array",
-          "description": "Restrict this limit to requests whose model matches one of these patterns. Omit to apply to all traffic. Not enforced yet -- the current limiter has no per-model scoping; recorded, and produces a not-enforced warning.",
+          "description": "Restrict this limit to requests whose model matches one of these patterns (an exact name or a single trailing `*`). Omit to apply to all traffic. Requests for other models neither count against nor are rejected by this limit.",
           "items": { "$ref": "#/$defs/ModelPattern" }
         }
       }

@@ -488,7 +488,7 @@ fn tenant_key_with_auth_lowers_and_emits_the_token_limit_filter() {
 }
 
 #[test]
-fn header_authorization_key_with_auth_lowers_and_warns() {
+fn header_authorization_key_with_auth_lowers_without_warning() {
     let secret = "test-operator-secret";
     let digest = digest_hex(secret.as_bytes(), "llmp_test-key");
     let config_text = format!(
@@ -501,15 +501,15 @@ fn header_authorization_key_with_auth_lowers_and_warns() {
     let filters = http_filters(&lowered.bootstrap);
     assert!(
         filters.iter().any(|f| f["name"] == "llmproxy.token_limit"),
-        "`header:authorization` is still the one enforced header key even with `auth:` \
-         configured -- only the RUNTIME bucket changes, not whether the filter is emitted"
+        "`header:authorization` lowers to a rule even with `auth:` configured"
     );
+    // It buckets on the header as written now, so there is nothing to warn about.
     assert!(
-        lowered
+        !lowered
             .warnings
             .iter()
-            .any(|w| w.field_path == "limits[0].key" && w.message.contains("tenant")),
-        "expected a warning steering the operator toward `key: tenant`, got: {:?}",
+            .any(|w| w.field_path.starts_with("limits")),
+        "no limits warning expected, got: {:?}",
         lowered.warnings
     );
 }
