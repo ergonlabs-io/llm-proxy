@@ -1,11 +1,7 @@
-//! Owner-boundary proof of downstream admission limits: the global connection
-//! cap (`overload_manager` `global_downstream_max_connections`,
-//! `ignore_global_conn_limit`), HCM `request_headers_timeout` and HCM
-//! `request_timeout`. Everything runs through the real bootstrap -> IR path,
-//! `initial_bind` + `run_listener_manager`, real accept loops, the HTTP/1
-//! codec and real loopback sockets on ephemeral ports. Timeouts are short
-//! configured values; assertions are on outcomes inside the generous `WAIT`
-//! bound, never on a wall-clock window (AGENTS.md "Build And Test").
+//! Owner-boundary proof of downstream admission limits: the global connection cap, `ignore_global_conn_limit`, and
+//! HCM `request_headers_timeout` and `request_timeout`. Runs through the real bootstrap, IR, `initial_bind`, and
+//! `run_listener_manager` path, with real accept loops and sockets. Assertions are on outcomes inside the bounded
+//! `WAIT`, never on a wall-clock window (AGENTS.md "Build And Test").
 use super::*;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

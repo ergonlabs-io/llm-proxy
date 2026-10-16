@@ -42,27 +42,16 @@ use crate::usage::TokenUsage;
 /// The identity a budget is tracked against: which route, and who the budget
 /// belongs to (see [`LimitSubject`]).
 ///
-/// Previously this was a flattened, opaque `String` built by
-/// `from_descriptors(&[("route", ..), ("tenant", ..)])` -- enough for
-/// an in-process `HashMap` to compare
-/// keys, but with no way back out to "which route" or "which tenant" short of
-/// parsing a separator format that existed only by accident. The
-/// per-tenant usage query needs exactly that (enumerating a tenant's keys
-/// across routes), so this is now a struct with named fields -- The struct also does something
-/// the flattened string could not: it makes "a credential was hashed before
-/// it became part of a key" a property [`LimitSubject::Credential`] enforces
-/// by only ever holding a [`CredentialDigest`], not a comment resting on every
-/// call site remembering to hash first.
+/// Named fields let per-tenant usage queries enumerate keys across routes.
+/// The subject type also ensures credentials are hashed before entering a key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LimitKey {
     route: String,
     subject: LimitSubject,
 }
 
-/// Who a [`LimitKey`]'s budget belongs to. The two variants are two disjoint
-/// key spaces -- previously that separation was enforced only by the
-/// descriptor NAME differing (`tenant=` vs `cred=`) inside one flattened
-/// string; as an enum it is enforced by the type. See
+/// Who a [`LimitKey`]'s budget belongs to. The variants are disjoint key
+/// spaces enforced by the type. See
 /// `token_limit_filter`'s module doc ("The two key spaces never overlap")
 /// for why that separation is a security property, not a preference.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -185,9 +174,7 @@ impl std::fmt::Display for LimitKey {
 /// `From<String>`, no public tuple constructor, and no `new` that accepts an
 /// unhashed value, so a raw credential cannot become a
 /// [`LimitSubject::Credential`] without going through [`Self::hash`] first.
-/// That is the type-level version of what used to be a comment on
-/// `token_limit_filter::hash_credential` (moved here as [`Self::hash`], see
-/// its doc for the FNV-1a reasoning, carried forward unchanged).
+/// Callers must use [`Self::hash`] before a credential can become a subject.
 ///
 /// `Debug` is derived rather than hand-rolled: it prints the hex digest, not
 /// anything a raw credential could be recovered from, since a `CredentialDigest`

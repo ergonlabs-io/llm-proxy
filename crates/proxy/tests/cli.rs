@@ -115,22 +115,9 @@ fn validate_exits_nonzero_for_a_bad_config() {
     assert!(!status.success(), "expected a nonzero exit, got {status:?}");
 }
 
-/// Spawns a background thread that reads `reader` line by line and forwards
-/// each line over the returned channel until EOF/error.
-///
-/// Rust note: `BufReader::read_line` blocks, so it has to run on its own
-/// thread; the important bit here is that *the caller* owns the returned
-/// `Receiver` (and thus decides when the underlying pipe's read end actually
-/// closes) rather than a short-lived helper dropping it early. Dropping the
-/// receiver -- and with it the reader thread's `ChildStdio` -- while the
-/// child process is still writing to that pipe closes the read end out from
-/// under it, and the next write earns the child an `EPIPE`. Keeping the
-/// channel (and thus the pipe) open for the process's whole lifetime avoids
-/// that race, which is why callers hang on to the `Receiver` for the child's
-/// whole lifetime. Note that no test *gates* on these lines -- they are
-/// captured purely so a failure message can show what the child printed
-/// before it gave up (see `drain_available_lines`); readiness is always a
-/// real TCP connect via `wait_for_connectable`.
+/// Reads child output on a background thread. Callers retain the receiver for
+/// the child's lifetime so dropping the pipe cannot cause the child to hit EPIPE.
+/// Output is diagnostic only; readiness uses a TCP connection.
 fn spawn_line_reader(
     mut reader: BufReader<impl std::io::Read + Send + 'static>,
 ) -> mpsc::Receiver<String> {
@@ -152,28 +139,16 @@ fn spawn_line_reader(
     rx
 }
 
-/// How long to wait for a freshly spawned `llm-proxy` process to reach a
-/// startup milestone (bind its listener / log "started").
+/// How long to wait for a freshly spawned `llm-proxy` to bind its listener or
+/// log "started".
 ///
-/// Deliberately generous: this is wall-clock time for an unoptimized debug
-/// binary to start on a machine that, under `make ci`, is simultaneously
-/// running every other crate's test binaries. A 5s budget here was observed to
-/// pass standalone but flake inside the full gate. The timeout is a
-/// liveness backstop, not an assertion about speed -- the test still fails if
-/// the process never binds, it just doesn't fail because the box was busy.
+/// Deliberately generous. A debug binary under `make ci` shares the machine
+/// with every other test binary, and a 5s budget flaked. This is a liveness
+/// backstop, not a speed assertion.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Polls `addr` until a TCP connection succeeds or `timeout` elapses,
-/// returning whether it connected.
-///
-/// This is the *only* readiness primitive these tests have, deliberately.
-/// There used to be a `wait_for_line(rx, "listener bound", ..)` helper
-/// alongside it, and both tests that used it flaked: a log line is emitted
-/// *around* the bind rather than *by* it, so it can be observed before the
-/// socket accepts (and, for SIGTERM, before the signal handler is installed).
-/// Asking the OS directly whether the listener is accepting connections is
-/// the real readiness condition, so the log-line helper was removed rather
-/// than left around to be reached for again.
+/// Polls until the OS accepts a TCP connection; log lines can precede actual
+/// listener readiness.
 fn wait_for_connectable(addr: (&str, u16), timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {

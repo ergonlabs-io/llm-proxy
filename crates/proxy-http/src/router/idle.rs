@@ -1,9 +1,5 @@
-//! S4 route `idle_timeout` (response direction): wraps the upstream
-//! response's [`StreamBody`] so that a gap of more than `idle` between body
-//! frames resets the stream with a [`BodyError::Upstream`] rather than
-//! letting a stalled upstream (e.g. a wedged token stream) hang the
-//! downstream connection forever. See `router.rs`'s module doc for how this
-//! composes with the route `timeout` (which only bounds time-to-headers).
+//! S4 route `idle_timeout` wraps the upstream response body and fails with
+//! [`BodyError::Upstream`] when no frame arrives within `idle`.
 
 use std::error::Error;
 use std::fmt;
@@ -17,13 +13,8 @@ use hyper::body::{Body, Frame};
 
 use crate::handler::{BodyError, StreamBody};
 
-/// The error surfaced through `BodyError::Upstream` when `poll_frame` has
-/// gone `idle` seconds without a frame from the inner body.
-///
-/// `pub(crate)`, not `pub(super)`: `access_logging::LoggingBody` (a sibling
-/// module of `router`, not a child) downcasts a `BodyError::Upstream`'s boxed
-/// source against this type to tell "the upstream went quiet" (SI) apart
-/// from "the upstream connection died" (UC) -- see its `poll_frame`.
+/// Distinguishes an upstream idle timeout (SI) from a connection failure (UC)
+/// when `access_logging::LoggingBody` downcasts the upstream error.
 #[derive(Debug)]
 pub(crate) struct IdleTimeoutError {
     idle: Duration,
@@ -37,8 +28,7 @@ impl fmt::Display for IdleTimeoutError {
 
 impl Error for IdleTimeoutError {}
 
-/// A [`Body`] combinator that resets an idle timer on every frame produced
-/// by `inner`, and fails the stream once `idle` elapses without one.
+/// Resets the idle timer on each frame and fails the stream when it expires.
 ///
 /// Rust note: `inner` is a [`StreamBody`] (already `Pin<Box<dyn Body<..>>>`,
 /// which is `Unpin` regardless of what it boxes -- the box itself owns the
@@ -48,10 +38,6 @@ impl Error for IdleTimeoutError {}
 /// `&mut self.inner`/`&mut self.sleep` directly instead of needing a manual
 /// (`unsafe`) pin projection -- `unsafe` is denied workspace-wide, so this
 /// field shape is what makes the safe projection possible.
-/// `pub(crate)`: constructed by `router.rs` in production, and directly by
-/// `access_logging`'s tests to drive a real idle-timeout `BodyError` (rather
-/// than hand-rolling one) when proving `LoggingBody` classifies it as SI, not
-/// UC.
 pub(crate) struct IdleTimeoutBody {
     inner: StreamBody,
     idle: Duration,
@@ -76,22 +62,18 @@ impl Body for IdleTimeoutBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // Rust note: `self` is `Unpin` (see the struct doc), so `get_mut`
-        // gives a plain `&mut Self` -- no `unsafe` needed to reach the
-        // fields below.
+        // Rust note: `Unpin` permits safe field access through `get_mut`.
         let this = self.get_mut();
 
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                // A frame arrived: the upstream is alive, so push the
-                // deadline back out to a full `idle` window from now.
+                // Start a fresh idle window after each frame.
                 this.sleep
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
                 Poll::Ready(Some(Ok(frame)))
             }
-            // Errors and end-of-stream pass through unchanged -- the idle
-            // timer only matters while we're still waiting on more frames.
+            // The idle timer only applies while waiting for another frame.
             ready @ (Poll::Ready(Some(Err(_))) | Poll::Ready(None)) => ready,
             Poll::Pending => match this.sleep.as_mut().poll(cx) {
                 Poll::Ready(()) => {
@@ -113,11 +95,7 @@ impl Body for IdleTimeoutBody {
     }
 }
 
-/// The error surfaced through `BodyError::Upstream` when HCM
-/// `max_stream_duration` ends a stream whose headers were already sent.
-///
-/// `pub(crate)` for the same reason as [`IdleTimeoutError`]: `LoggingBody`
-/// downcasts it to record `UMSDR` instead of `UC`.
+/// Lets `LoggingBody` classify an HCM `max_stream_duration` cut as UMSDR.
 #[derive(Debug)]
 pub(crate) struct MaxStreamDurationError;
 
@@ -129,9 +107,7 @@ impl fmt::Display for MaxStreamDurationError {
 
 impl Error for MaxStreamDurationError {}
 
-/// A [`Body`] combinator that fails the stream once `deadline` passes,
-/// however recently a frame arrived. Unlike [`IdleTimeoutBody`] the timer is
-/// never reset, so it also cuts a stream that is still producing data.
+/// Fails the stream at `deadline`, even if frames are still arriving.
 ///
 /// The deadline is checked before the inner body is polled: a body that is
 /// always ready would otherwise never yield to the timer.

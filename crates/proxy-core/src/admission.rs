@@ -1,21 +1,14 @@
 //! Process-wide downstream connection admission.
 //!
-//! Envoy's `global_downstream_max_connections` overload-manager resource caps
-//! the number of open downstream connections across every worker and listener
-//! (`internal-docs/envoy-semantics.md` S4 for the sibling HCM timeouts; the
-//! deliberate departures are listed in `internal-docs/envoy-divergences.md`).
-//! Workers are single-threaded `LocalSet`s (ADR-0003), but the cap is global,
-//! so the counter is the one piece of admission state that must be `Send +
-//! Sync`.
+//! Envoy's `global_downstream_max_connections` caps open downstream connections across every worker and listener
+//! (`internal-docs/envoy-semantics.md` S4; departures are in `envoy-divergences.md`). Workers are single-threaded
+//! `LocalSet`s (ADR-0003), but the cap is global, so this counter must be `Send + Sync`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Shared counter of live downstream connections. Cloning shares the count.
-///
-/// The limit itself is not stored here: each accept reads it from the
-/// current config snapshot, so a reload applies to the next accept without
-/// any push into this type.
+/// Shared counter of live downstream connections. Cloning shares the count. The limit is not stored here: each accept
+/// reads it from the current snapshot, so a reload applies to the next accept.
 #[derive(Clone, Default)]
 pub struct ConnectionLimiter {
     inner: Arc<LimiterInner>,
@@ -29,9 +22,7 @@ struct LimiterInner {
     warned_unlimited: AtomicBool,
 }
 
-/// RAII claim on one connection slot. Dropping it releases the slot, so every
-/// way a connection task can end (return, early `return`, handshake failure,
-/// panic unwinding) gives the slot back.
+/// RAII claim on one connection slot. Dropping it releases the slot, however the connection task ends.
 pub struct ConnectionSlot {
     // `None` for exempt listeners (`ignore_global_conn_limit`), which are
     // neither checked against nor counted toward the limit.
@@ -47,13 +38,9 @@ impl Drop for ConnectionSlot {
 }
 
 impl ConnectionLimiter {
-    /// Try to admit one connection. `limit` is
-    /// `ConfigSnapshot::max_downstream_connections` (`None` = unlimited);
-    /// `exempt` is the listener's `ignore_global_conn_limit`.
-    ///
-    /// Returns `None` when the connection must be closed. The check and the
-    /// increment are one compare-and-swap loop, so two workers cannot both
-    /// take the last slot.
+    /// Tries to admit one connection. `limit` is `ConfigSnapshot::max_downstream_connections` (`None` is unlimited).
+    /// `exempt` is the listener's `ignore_global_conn_limit`. Returns `None` when the connection must close. The check
+    /// and the increment are one compare-and-swap loop, so two workers cannot both take the last slot.
     pub fn try_acquire(&self, limit: Option<u64>, exempt: bool) -> Option<ConnectionSlot> {
         if exempt {
             return Some(ConnectionSlot { counted: None });

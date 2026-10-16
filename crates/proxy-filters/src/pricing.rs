@@ -1,8 +1,5 @@
-//! Versioned, four-bucket list pricing for LLM requests.
-//!
-//! This is deliberately a rate-card library: it computes an immutable
-//! request-time list price but does not enforce a budget.  Money stays in
-//! integer nanodollars and an unpriced model is `None`, never a free zero.
+//! Computes immutable four-bucket request prices without enforcing budgets.
+//! Money uses integer nanodollars; an unpriced model is `None`, not zero.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;

@@ -1,12 +1,7 @@
 //! Per-stream result recording and aggregation.
 //!
-//! Concurrency note (see crate-level constraint on avoiding shared-mutex
-//! contention at load): every stream task computes its own
-//! [`StreamResult`] locally and hands it to a single collector task over an
-//! `mpsc` channel (see `driver.rs`). The collector is the sole owner of the
-//! [`Aggregator`]'s histograms -- there is no `Mutex`, and no lock is ever
-//! held across an `.await`, because nothing is ever shared: results are
-//! *moved* to their one owner instead.
+//! Stream tasks send locally computed results to one collector task over `mpsc`;
+//! the collector owns the histograms, avoiding shared locks under load.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -23,11 +18,7 @@ pub enum Outcome {
     HttpError(u16),
     TransportError,
     Timeout,
-    /// The body ended without the dialect's terminal SSE frame ever
-    /// arriving -- kept distinct from `TransportError` (see `driver.rs`'s
-    /// `ExecError::Truncated`): a broken connection and a stream the proxy
-    /// cut short are different bugs, and a capacity report that merges them
-    /// sends someone hunting the wrong one.
+    /// The body ended without its terminal SSE frame; distinct from transport errors.
     Truncated,
 }
 
@@ -35,13 +26,8 @@ pub enum Outcome {
 /// runs and sent, whole, to the aggregator once it ends.
 #[derive(Debug, Clone)]
 pub struct StreamResult {
-    /// The stream's *intended* start time -- for closed-loop this equals
-    /// `send_start`; for open-loop it is the fixed-rate schedule slot, which
-    /// can precede `send_start` if the driver fell behind. This is the
-    /// coordinated-omission correction: every "from_scheduled" duration
-    /// below is measured against this, not against when the request
-    /// actually went out, so driver backlog shows up as inflated latency
-    /// instead of being silently absorbed.
+    /// Intended start time. Open-loop latency uses the schedule slot so driver
+    /// backlog contributes to measurement (coordinated-omission correction).
     pub scheduled_start: Instant,
     /// When the request was actually dispatched (connect started).
     pub send_start: Instant,
@@ -52,11 +38,7 @@ pub struct StreamResult {
     pub ttft_from_send: Option<Duration>,
     pub total_from_scheduled: Duration,
     pub total_from_send: Duration,
-    /// Gaps between successive content-delta frames within this one stream.
-    /// Small (bounded by tokens-per-response), so collecting them per
-    /// stream and merging into the aggregator's histogram on receipt is
-    /// cheap -- no per-frame allocation happens on the hot path, only a
-    /// `Duration` push per token.
+    /// Gaps between content frames, merged into the histogram when the stream ends.
     pub inter_token_gaps: Vec<Duration>,
     pub tokens_received: u64,
     pub bytes_received: u64,

@@ -1,15 +1,7 @@
 //! Proto -> IR conversion ("lowering").
 //!
-//! Two passes over a loaded bootstrap:
-//!
-//! 1. **Surface check** (dynamic): walk every SET field reflectively and
-//!    reject any field outside the supported surface with its full dotted
-//!    path. This is AGENTS.md invariant 1's teeth — a field we have not implemented
-//!    can never be silently ignored, and a proto upgrade that adds fields
-//!    fails loudly instead of drifting.
-//! 2. **Typed conversion**: build the [`crate::ir`] types from the typed
-//!    protos, pre-computing matchers (S1 domain index, compiled regexes,
-//!    weighted-cluster cumulative arrays) so the hot path never does it.
+//! A reflective surface check rejects unsupported set fields with dotted paths
+//! before typed conversion builds the immutable IR and precomputes matchers.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -72,11 +64,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     // See `convert_tracing_metadata`'s doc for why this
     // reads `node.metadata` rather than a `static_resources`-adjacent field.
     snapshot.tracing = convert_tracing_metadata(b.node.as_ref(), "node")?;
-    // Deliberately a SEPARATE namespace key and a separate IR field from the
-    // `tracing` block above, not a mode of it: `docs/telemetry-design.md` §5.3
-    // requires metric export to be configurable with tracing off, and a shared
-    // block could not express that without a flag whose false value would still
-    // require the operator to write the tracing namespace at all.
+    // Metrics export remains independently configurable when tracing is off.
     snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
     snapshot.end_user_capture_configured = b
         .node
@@ -121,9 +109,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     }
 
     let Some(sr) = &b.static_resources else {
-        // An ADS config naming a cluster is only legal with static resources
-        // to declare that cluster in -- catch it here rather than letting the
-        // early return skip the existence check.
+        // Check the ADS cluster before returning for a missing static section.
         if let Some(ads) = &ads_pending {
             return Err(invalid(
                 "dynamic_resources.ads_config.grpc_services[0].envoy_grpc.cluster_name",
@@ -136,11 +122,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         return Ok(snapshot);
     };
 
-    // `seen_stat_prefixes` accumulates across EVERY listener in
-    // this bootstrap, not just within one -- two listeners each configuring
-    // `llmproxy.auth` with the same `stat_prefix` is exactly the ambiguity
-    // this check exists to reject. See `check_admin_addressable_stat_prefixes`'s
-    // doc for why only `llmproxy.auth`-configuring chains are covered.
+    // Auth stat prefixes must be unique across listeners for admin addressing.
     let mut seen_stat_prefixes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (i, l) in sr.listeners.iter().enumerate() {
@@ -172,15 +154,10 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
             ));
         }
     }
-    // Aggregate members refer to other clusters by
-    // name, so they can only be checked once the whole map exists -- this
-    // cannot fold into the loop above, because a member may be declared
-    // after the aggregate that names it.
+    // Validate references after all clusters exist; members may be declared later.
     validate_cluster_graph(sr, &snapshot)?;
 
-    // The proto is explicit -- "The cluster with name `cluster_name`
-    // must be statically defined". Checked here, once the cluster map is
-    // complete, for the same reason `validate_cluster_graph` is.
+    // ADS cluster references must resolve against the complete static cluster map.
     if let Some(ads) = &ads_pending {
         if let Some(cluster) = &ads.cluster {
             if !snapshot.clusters.contains_key(cluster) {
@@ -205,14 +182,11 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
 }
 
 /// Namespace key for ADS transport options in `Bootstrap.node.metadata`.
-/// Envoy has no field for "allow a plaintext control plane", so the opt-in
-/// rides the same `node.metadata` carrier as `io.llmproxy.tracing`, which
-/// Envoy itself ignores.
+/// The opt-in uses `node.metadata`, which Envoy ignores.
 const ADS_METADATA_KEY: &str = "io.llmproxy.ads";
 
 /// Lower `node.metadata["io.llmproxy.ads"]`: `{ allow_plaintext: bool }`.
-/// `None` when the key is absent, so the caller can reject the key on a
-/// bootstrap without ADS instead of ignoring it (AGENTS.md invariant 1).
+/// Returns `None` when absent so a bootstrap without ADS can reject the key.
 fn convert_ads_metadata(
     node: Option<&core_v3::Node>,
     path: &str,
@@ -3262,10 +3236,8 @@ fn convert_upstream_certificate(
 
 /// Lower bootstrap `dynamic_resources` into [`AdsConfig`].
 ///
-/// **This widens a deliberate refusal, it does not fix a silent drop.** Before
-/// this increment `Bootstrap`'s allowed-field list named only
-/// `node`/`admin`/`static_resources`, so a config carrying `dynamic_resources`
-/// failed strict-mode validation by name -- AGENTS.md invariant 1 working correctly.
+/// This supports a narrow `dynamic_resources` surface and rejects other fields
+/// with dotted paths (AGENTS.md invariant 1).
 ///
 /// v1 accepts a narrow surface and refuses everything else with its full
 /// dotted path: `api_type: GRPC`, `transport_api_version: V3`, and exactly one

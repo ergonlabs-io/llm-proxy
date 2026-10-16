@@ -1,11 +1,5 @@
-//! Provider credentials applied after the decode chain has produced the final
-//! upstream request body.
-//!
-//! Static API keys, Vertex OAuth bearer tokens, and Bedrock SigV4 all travel
-//! through one per-attempt seam. The latter two need different handling:
-//! Bedrock signs the final payload hash, while Vertex applies a published
-//! control-side token. Keeping them at this call site ensures fallback uses
-//! credential material belonging to the cluster actually dialled.
+//! Applies cluster credentials per upstream attempt, after request transforms,
+//! so fallback uses the credentials of the cluster actually dialled.
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -16,16 +10,11 @@ use crate::filter::RequestHeaders;
 
 /// Applies credentials for the cluster selected for one upstream attempt.
 ///
-/// The request has already passed every decode filter when this is called, so
-/// `body` is exactly what reaches the upstream.  Implementations must fail
-/// closed: a signer/minting failure must return an error instead of sending an
-/// unauthenticated request to a provider.
+/// `body` is the final upstream payload. Implementations fail closed on
+/// signing or credential errors.
 pub(crate) trait CredentialProvider {
-    /// Completion is asynchronous because minted credentials must be
-    /// refreshed before the request may be sent.  A future OAuth provider
-    /// must keep its token cache and refresh work off the request worker;
-    /// this method only awaits a published/ongoing refresh and fails closed
-    /// if no usable token is available.
+    /// Async providers must keep token refresh off the request worker and fail
+    /// closed when no usable token is available.
     fn apply<'a>(
         &'a self,
         request: &'a mut RequestHeaders,
@@ -37,16 +26,13 @@ pub(crate) trait CredentialProvider {
 #[error("provider credential could not be applied")]
 pub(crate) struct CredentialProviderError;
 
-/// The existing static-header mechanism, now expressed through the same
-/// post-body seam that body-dependent schemes will use.
+/// Applies configured static credential headers.
 pub(crate) struct StaticHeaderCredentials<'a> {
     headers: &'a [proxy_config::ir::HeaderMutation],
 }
 
-/// Applies one cluster's provider-specific credential after all request
-/// transforms. Static headers remain available for the existing providers;
-/// Vertex and Bedrock use the same seam without leaking credentials across a
-/// fallback aggregate.
+/// Applies the selected cluster's credentials after request transforms, so
+/// credentials do not leak across a fallback aggregate.
 pub(crate) struct ProviderCredentials<'a> {
     runtime: Option<&'a proxy_config::ir::ProviderRuntimeConfig>,
     headers: &'a [proxy_config::ir::HeaderMutation],
@@ -127,14 +113,11 @@ impl CredentialProvider for ProviderCredentials<'_> {
                     secret.expose()
                 ))
                 .map_err(|_| CredentialProviderError)?;
-                // Sensitive values are skipped by HPACK indexing and print as
-                // `Sensitive` in Debug, so the key cannot leak through either.
+                // Prevent credential exposure through HPACK indexing or Debug.
                 value.set_sensitive(true);
-                // ADR-0007 decision 5 and AGENTS.md invariant 6: an operator
-                // credential never accompanies a tenant credential, whatever
-                // header the slot uses. The cluster's static headers may put
-                // its key on a different header than the slot, so every
-                // supported credential header shape is cleared first.
+                // ADR-0007 decision 5 and AGENTS.md invariant 6: clear every
+                // supported credential header to prevent sending the operator
+                // key alongside the tenant credential.
                 for shape in ["authorization", "x-api-key", "api-key"] {
                     request.headers.remove(shape);
                 }
@@ -310,11 +293,7 @@ impl CredentialProvider for StaticHeaderCredentials<'_> {
         _body: &'a Bytes,
     ) -> BoxFuture<'a, Result<(), CredentialProviderError>> {
         Box::pin(async move {
-            // `apply_header_mutations` intentionally preserves the existing
-            // Envoy-compatible malformed-header behavior (warn and skip). The
-            // dialect validates its own emitted values before they reach this
-            // point; a future signing/minting implementation instead returns
-            // a `CredentialProviderError`, which the router maps to a 503.
+            // Preserve Envoy's malformed-header behavior: warn and skip.
             crate::router::apply_header_mutations(self.headers, &mut request.headers);
             Ok(())
         })

@@ -1,80 +1,23 @@
-//! Renders a [`Registry`] into Prometheus text exposition
-//! format. See `stats.rs` Decision 4 for the naming
-//! rules this module implements, and [`envoy_render`](super::envoy_render)
-//! for the sibling renderer this one deliberately does *not* copy the shape
-//! of (see "Names vs. labels" below).
+//! Renders a [`Registry`] into Prometheus text exposition format. The naming
+//! rules are in `stats.rs` Decision 4.
 //!
-//! # Names vs. labels — why this renderer does not expand attribute values
+//! Unlike [`envoy_render`](super::envoy_render), this renderer does not expand
+//! attribute values into names. Every attribute becomes a label, and every
+//! instrument renders, including `llm.*` instruments that have no Envoy name.
 //!
-//! [`envoy_render`](super::envoy_render) expands an attribute *value* into a
-//! name segment (`upstream_rq` `{cluster, status_class="2xx"}` becomes the
-//! name `cluster.<cluster>.upstream_rq_2xx`) because Envoy's flat `/stats`
-//! text format has no concept of a label. Prometheus does, so that expansion
-//! is not needed here and — per `stats.rs` Decision 4 — must not be
-//! copied over: **every attribute becomes a label**, and the metric name is
-//! just the instrument's own (sanitized, `envoy_`-prefixed) name. This is
-//! also why, unlike `envoy_render`, this renderer has **no per-instrument
-//! name table and omits nothing** — `llm.*` (no Envoy `/stats` text
-//! equivalent at all) renders here exactly like `upstream_rq` does, which is
-//! Decision 4, point 2 in `stats.rs`: those instruments "exist in
-//! Prometheus/OTLP output only".
+//! Sanitization follows Envoy's `source/server/admin/prometheus_stats.cc`.
+//! Metric and label names replace every character outside `[a-zA-Z0-9_]` with
+//! `_`. Label names additionally forbid `:`. Label values are escaped rather
+//! than sanitized, with backslash escaped first.
 //!
-//! # Name and label sanitization — confirmed against Envoy's own source
+//! `# TYPE` is emitted once per metric family, even when several attribute sets
+//! share it. `UpDownCounter` renders as `gauge`.
 //!
-//! Verified against `envoyproxy/envoy` commit `d57118924c85fcaa07758dddbb9c5da4e89045af`
-//! (`main`, fetched 2026-08-09), `source/server/admin/prometheus_stats.cc`:
+//! Histograms render cumulative `_bucket` lines in ascending order, then
+//! `+Inf`, `_sum` and `_count`. The registry stores per-bucket counts, so the
+//! running prefix sum is computed here.
 //!
-//! - **Metric names**: prefixed with `envoy_`, then every character outside
-//!   `[a-zA-Z0-9_]` is replaced with `_` (`sanitizeNameInPlace`). Envoy's own
-//!   comment notes the `envoy_` prefix already guarantees the result can't
-//!   start with a digit, so it does not special-case that — this module's
-//!   [`sanitize_metric_name`] still guards it explicitly (see that
-//!   function's doc) so the function is correct standing on its own, not
-//!   just correct because its one caller happens to always prepend a
-//!   letter-starting prefix first.
-//! - **Label (tag) names**: exactly the same `[^a-zA-Z0-9_]` -> `_` rule
-//!   (`sanitizeNameInPlace` is reused verbatim for tag names in
-//!   `formattedTags`) — Prometheus label names allow no `:`, unlike metric
-//!   names, so this is a distinct function from the metric-name one despite
-//!   the identical character class.
-//! - **Label values are escaped, not sanitized**: backslash -> `\\`,
-//!   newline -> `\n`, double-quote -> `\"`, applied in exactly that order
-//!   (`sanitizeValue`, which cites
-//!   <https://github.com/prometheus/common/blob/88f1636b699ae4fb949d292ffb904c205bf542c9/expfmt/text_create.go#L419-L420>
-//!   as its own source). Order matters: escaping the backslash first is what
-//!   stops the newline/quote escapes from being re-escaped.
-//!
-//! # `# TYPE` lines, once per family
-//!
-//! `Counter` -> `counter`, `UpDownCounter` -> `gauge` (Envoy's own C++ code
-//! doesn't have an `UpDownCounter` concept — it only ever emits `counter` or
-//! `gauge` from its native `Stats::Counter`/`Stats::Gauge` types — but
-//! `gauge` is the correct target for a value that can move in both
-//! directions, matching the OTel Collector's own Prometheus exporter
-//! convention), `Histogram` -> `histogram`. One `# TYPE` line per rendered
-//! metric *family* (i.e. per rendered name, before any `_bucket`/`_sum`/
-//! `_count` suffix), even when several attribute sets ("series") share that
-//! family — confirmed by `TextFormat::generateNumericOutput`/
-//! `generateHistogramOutput` in the same source file, both of which call
-//! `generateTypeOutput` exactly once before looping over every series.
-//!
-//! # Histogram bucket lines — cumulative counts, confirmed shape
-//!
-//! `TextFormat::generateHistogramOutput` (same source file) confirms the
-//! exact shape this module produces: `<name>_bucket{<labels>le="<boundary>"} <cumulative>`
-//! for each declared boundary in ascending order, then
-//! `<name>_bucket{<labels>le="+Inf"} <total count>`, then
-//! `<name>_sum{<labels>} <sum>` and `<name>_count{<labels>} <count>` (no
-//! `le` label on the last two). [`Registry`] stores **non-cumulative**
-//! per-bucket counts (see `stats.rs`'s module doc), so
-//! [`render_histogram_series`] computes the running prefix sum itself —
-//! Envoy's own `computed_buckets_`/`computedBuckets()` do the equivalent
-//! summation on their side before this exact rendering step.
-//!
-//! # What this module does not do
-//!
-//! No periodic flush, no `?filter=`/`?histogram_buckets=` query parameters,
-//! no protobuf exposition format, no OpenMetrics. All out of scope for this module.
+//! No periodic flush, no query parameters, no protobuf or OpenMetrics output.
 
 use std::collections::BTreeMap;
 
@@ -98,34 +41,14 @@ type CounterFamilies = BTreeMap<String, (InstrumentKind, Vec<(Labels, u64)>)>;
 /// (for bucket boundaries) and resolved attrs.
 type HistogramFamilies = BTreeMap<String, Vec<(HistogramHandle, &'static Instrument, Labels)>>;
 
-/// The `Content-Type` this crate's renderer's callers (`proxy-admin`'s
-/// `/stats/prometheus` route) must answer with.
-///
-/// Confirmed, not guessed: Envoy's admin server never sets a `Content-Type`
-/// for the `/stats/prometheus` handler specifically
-/// (`StatsHandler::prometheusRender`, `source/server/admin/stats_handler.cc`)
-/// so it falls through to the admin-wide default,
-/// `source/server/admin/utils.cc`'s `populateFallbackResponseHeaders`:
-/// `Http::Headers::get().ContentTypeValues.TextUtf8`, which
-/// `source/common/http/headers.h` defines as exactly this string (modulo the
-/// `UTF-8`/`utf-8` casing, which HTTP treats as equivalent). This also
-/// matches `proxy-admin`'s own existing `text()` helper, so `/stats/prometheus`
-/// can reuse it rather than needing a second response-building path.
+/// The `Content-Type` `proxy-admin`'s `/stats/prometheus` route must answer
+/// with. This matches the admin-wide text default in Envoy's
+/// `source/server/admin/utils.cc`.
 pub const CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
-/// Renders `registry`'s current state into Prometheus text exposition
-/// format: a `# TYPE` line per metric family, then one series line per
-/// resolved `(instrument, attrs)` pair (or, for histograms, one `_bucket`
-/// line per boundary plus `_sum`/`_count`) — see the module doc for the
-/// exact rules.
-///
-/// **Reads only**, same guarantee as [`envoy_render::render`](super::envoy_render::render):
-/// no I/O, no blocking, safe to call from an admin request handler.
-///
-/// Unlike `envoy_render::render`, **every** resolved instrument renders here
-/// — there is no "no Envoy equivalent, omit it" case, because there is no
-/// per-instrument name table to miss an entry from (see the module doc's
-/// "Names vs. labels" section). An empty registry renders `""`.
+/// Renders `registry` into Prometheus text exposition format. Reads only, with
+/// no I/O or blocking. Every resolved instrument renders, and an empty registry
+/// renders `""`.
 pub fn render(registry: &Registry) -> String {
     let mut out = String::new();
 
@@ -200,16 +123,9 @@ fn prometheus_labels(attrs: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Replaces every character outside `[a-zA-Z0-9_]` with `_`, matching
-/// Envoy's `sanitizeNameInPlace` (see the module doc). Additionally, if the
-/// result would start with a digit, prepends `_` -- Prometheus metric names
-/// must match `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a name starting with a digit is
-/// invalid. Every real call site here goes through [`prometheus_name`],
-/// which always prepends `envoy_` first and so can never actually hit this
-/// case (matching Envoy's own reasoning for not checking it) -- this guard
-/// exists so the function is correct on its own terms, independent of its
-/// only current caller, and so `tests::name_starting_with_digit_is_prefixed`
-/// has something real to test.
+/// Replaces every character outside `[a-zA-Z0-9_]` with `_`. If the result
+/// would start with a digit, it prepends `_`. Every current caller prepends
+/// `envoy_` first, so this guard is defensive and is tested on its own.
 fn sanitize_metric_name(name: &str) -> String {
     sanitize_leading_digit(sanitize_chars(name, false))
 }
@@ -221,13 +137,8 @@ fn sanitize_label_name(name: &str) -> String {
     sanitize_leading_digit(sanitize_chars(name, false))
 }
 
-/// Shared sanitization core. `allow_colon` exists for documentation clarity
-/// at each call site even though both current callers pass `false` --
-/// Envoy's own metric names and tag names both exclude `:` in practice (only
-/// the *Prometheus spec's* metric-name grammar allows it), so nothing here
-/// actually needs the `true` branch yet; it is wired through rather than
-/// hard-coded so a future difference between the two doesn't require
-/// threading a new parameter through both functions above.
+/// Shared sanitization core. Both callers pass `allow_colon = false`, so the
+/// `true` branch is not used yet.
 fn sanitize_chars(name: &str, allow_colon: bool) -> String {
     name.chars()
         .map(|c| {
@@ -312,11 +223,8 @@ fn render_histogram_series(
     };
     let bucket_name = format!("{name}_bucket");
 
-    // `snapshot.bucket_counts` is non-cumulative (stats.rs's module doc) --
-    // this prefix sum is the "cumulative" step Envoy's own computedBuckets()
-    // performs before this exact rendering step, done here instead because
-    // this registry deliberately never stores the cumulative form (see the
-    // module doc).
+    // `snapshot.bucket_counts` is non-cumulative, so this prefix sum produces
+    // the cumulative `le` counts.
     let mut cumulative: u64 = 0;
     for (i, boundary) in boundaries.iter().enumerate() {
         cumulative = cumulative.wrapping_add(snapshot.bucket_counts[i]);
@@ -328,11 +236,8 @@ fn render_histogram_series(
             &cumulative.to_string(),
         ));
     }
-    // The overflow bucket (index == boundaries.len(), see stats.rs's module
-    // doc) is Prometheus's own `+Inf` bucket -- rolling it into the running
-    // sum here means this final count is, by construction, exactly
-    // `snapshot.count` (every non-cumulative bucket, including overflow,
-    // has now been added exactly once).
+    // The overflow bucket is Prometheus's `+Inf`. Including it here makes the
+    // final count equal `snapshot.count`.
     cumulative = cumulative.wrapping_add(snapshot.bucket_counts[boundaries.len()]);
     let mut inf_labels = labels.to_vec();
     inf_labels.push(("le".to_string(), "+Inf".to_string()));
@@ -354,11 +259,9 @@ fn render_histogram_series(
     ));
 }
 
-/// Formats one bucket boundary for a Prometheus `le` label. Rust's default
-/// `f64` `Display` already produces the shortest round-tripping decimal
-/// (`1000.0` -> `"1000"`, `0.5` -> `"0.5"`) with no trailing `.0`, which is
-/// exactly the shape every boundary in
-/// [`super::ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS`] needs.
+/// Formats one bucket boundary for a Prometheus `le` label. Rust's `f64`
+/// `Display` gives `1000` for `1000.0`, which is the shape the default
+/// boundaries need.
 fn format_bucket_boundary(boundary: f64) -> String {
     format_f64(boundary)
 }

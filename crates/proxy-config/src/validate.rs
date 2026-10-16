@@ -1,25 +1,9 @@
 //! PGV (protoc-gen-validate) validation engine.
 //!
-//! Envoy's protos carry constraint annotations — `validate.rules` on fields
-//! (e.g. `connect_timeout` must be `> 0s`, `port_value <= 65535`, `stat_prefix`
-//! non-empty) and `validate.required` on oneofs. Envoy generates C++ validators
-//! from them and rejects violating configs at load/xDS time. We interpret the
-//! same annotations at runtime, reading them out of the embedded descriptor
-//! pool — one engine covering every message type, no codegen step.
-//!
-//! Runs on every config entry point: bootstrap files after parsing, and
-//! (later) every xDS resource before ACK — a failure here becomes a NACK.
-//!
-//! Supported rule subset (the ones Envoy actually uses on our surface):
-//! `message.required`/`message.skip`, oneof `required`, `duration.{required,
-//! gt,gte,lt,lte}`, numeric `{const,lt,lte,gt,gte,in,not_in}` for
-//! (u)int32/64/double/float, `string.{const,min_len,max_len,min_bytes,
-//! max_bytes,prefix,suffix,contains,in,not_in,pattern,well_known_regex}`,
-//! `repeated.{min_items,max_items}`, `enum.defined_only`. Wrapper types
-//! (`google.protobuf.UInt32Value` etc.) are unwrapped so scalar rules apply to
-//! the wrapped value. Unsupported rule kinds are skipped, never mis-enforced —
-//! meaning we can only be *more permissive* than Envoy, never less; the
-//! diff rig is what shrinks that gap over time.
+//! Interpret PGV annotations from the embedded descriptor pool during config
+//! loading. The supported subset covers required fields, durations, numeric and
+//! string constraints, repeated bounds, and defined enums. Unsupported rule
+//! kinds are skipped, so this validator can be more permissive than Envoy.
 
 use std::sync::OnceLock;
 

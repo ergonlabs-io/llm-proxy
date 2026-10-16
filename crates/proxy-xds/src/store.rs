@@ -1,51 +1,24 @@
-//! SotW resource-set semantics (S8).
+//! SotW resource-set semantics (S8, `internal-docs/envoy-semantics.md`). Pure
+//! logic: no protobuf, no I/O, and no `proxy-config` edge.
 //!
-//! **Pure logic. No protobuf, no I/O, no `proxy-config` edge.**
-//! `subscription.rs` isolates the ACK/NACK state machine because S8
-//! conformance is testable without a socket; this module is the same move for
-//! the subtle half of S8 (`internal-docs/envoy-semantics.md` S8): LDS/CDS
-//! responses are the complete set (absence = removal), EDS/RDS are per-name
-//! (absence != removal). It decides what a response's resource list actually
-//! *does* to the set already held.
+//! S8 says: LDS and CDS are full sets, so absence means removal. EDS and RDS
+//! are per-name, so absence is not removal. This module decides what a
+//! response's resource list does to the set already held. Five rules, each
+//! with its own test:
 //!
-//! # The rule this encodes, quoting S8
+//! 1. **`FullState` (LDS/CDS):** a name the response omits is removed.
+//! 2. **`PerName` (RDS/EDS):** a name the response omits is left alone.
+//! 3. **Static names are immune.** A static name is never applied or stored. It
+//!    is reported in `shadowed_by_static`. Envoy's CDS reference draws the same
+//!    line: statically defined clusters cannot be modified or removed via CDS.
+//! 4. **`unchanged` vs `updated`:** an equal value is `unchanged`, so it does
+//!    not churn.
+//! 5. **A duplicate name in one response is an error, and nothing is applied.**
+//!    Envoy's tracker crashes on this (issues #3214, #3987). Refusing it loudly
+//!    is deliberate.
 //!
-//! > SotW: LDS/CDS full-set semantics (absence = removal); **EDS/RDS absence
-//! > != removal**.
-//!
-//! Five consequences that are easy to get subtly wrong, and each has its own
-//! test below:
-//!
-//! 1. **`FullState` (LDS/CDS): a name the response does not carry is
-//!    REMOVED.** An empty response removes everything already held.
-//! 2. **`PerName` (RDS/EDS): a name the response does not carry is LEFT
-//!    ALONE.** An empty response removes nothing -- the explicit mirror of
-//!    rule 1, over the same fixture.
-//! 3. **Static names are immune.** A name in `static_names` is never applied,
-//!    never stored, and is reported in `shadowed_by_static` instead. Static
-//!    and dynamic are two disjoint namespaces -- xDS manages only its own --
-//!    so refusing a shadowed name must not disturb any other dynamic entry,
-//!    including under a `FullState` response that removes everything else.
-//!    Envoy's CDS reference draws the same line: "Any clusters that are
-//!    statically defined within the Envoy configuration cannot be modified or
-//!    removed via the CDS API."
-//! 4. **`unchanged` vs `updated`.** A name already present whose value
-//!    compares equal is `unchanged`, not `updated` -- a resource that did not
-//!    change must not churn, which is what makes the
-//!    make-before-break swap cheap.
-//! 5. **A duplicate name within one response is an error, and nothing is
-//!    applied.** All-or-nothing, the same shape as S8's "discard entire
-//!    response". Envoy's own tracker carries crashes on duplicate cluster
-//!    names in a CDS response (issues #3214, #3987); refusing loudly is the
-//!    deliberate improvement here.
-//!
-//! # Ordering is the caller's job, not this module's
-//!
-//! S8's apply ordering is `CDS -> EDS -> LDS -> RDS -> removes`: a caller
-//! sequencing from an [`ApplyOutcome`] must apply `added`/`updated` before
-//! `removed`, so a resource in flight between two types is never dropped by a
-//! removal that runs first. This module does not sequence anything -- it only
-//! produces the outcome that `apply.rs` sequences from.
+//! The caller sequences `added`/`updated` before `removed` (S8's
+//! `CDS -> EDS -> LDS -> RDS` ordering). This module only produces the outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -169,17 +142,11 @@ impl<T> SotwSet<T> {
     }
 
     /// Discard the named dynamic entries as though `apply` had never stored
-    /// them. A name not currently held is a silent no-op.
+    /// them. A name not currently held is a no-op.
     ///
-    /// `apply.rs`'s EDS and SDS paths are the reason this
-    /// exists: `apply` records a resource in the store BEFORE its caller gets
-    /// a chance to hand it to a downstream sink, so a sink that then fails
-    /// leaves the store believing the resource is installed. Left alone, an
-    /// identical retransmission of that resource would compare equal
-    /// (rule 4's `unchanged`) and never reach the sink again -- a resource
-    /// stuck permanently uninstalled while the store reports it fine.
-    /// Forgetting it here makes the next delivery of the same bytes read as
-    /// `added` again, so the sink is retried instead of skipped.
+    /// `apply` records a resource before its sink runs. If the sink fails, an
+    /// identical retransmission would read `unchanged` and never reach the sink
+    /// again. Forgetting the name makes it read `added`, so the sink is retried.
     pub fn forget(&mut self, names: &BTreeSet<String>) {
         for name in names {
             self.dynamic.remove(name);
@@ -276,12 +243,9 @@ impl<T: PartialEq> SotwSet<T> {
         let mut updated = Vec::new();
         let mut unchanged = Vec::new();
         let mut shadowed_by_static = Vec::new();
-        // The names this response actually declares into the dynamic
-        // namespace -- excludes anything shadowed by a static resource,
-        // since rule 3 keeps the two namespaces disjoint: a static name was
-        // never in `self.dynamic` and a `FullState` removal pass must not
-        // treat its absence here as removing something that was never
-        // dynamic to begin with.
+        // Names this response declares into the dynamic namespace. Static
+        // names are excluded, so a `FullState` removal pass never treats one
+        // as a removal (rule 3).
         let mut declared = BTreeSet::new();
 
         for (name, value, aliases) in resources {
@@ -326,10 +290,8 @@ impl<T: PartialEq> SotwSet<T> {
             }
         }
 
-        // `added`/`updated`/`unchanged` were pushed in the response's own
-        // order, not sorted order; `shadowed_by_static` likewise. `removed`
-        // already came out of a `BTreeMap::keys()` iterator sorted. Sort the
-        // rest so every vector in the outcome is deterministic.
+        // Sort the vectors so the outcome is deterministic. `removed` is
+        // already sorted by its `BTreeMap` source.
         added.sort();
         updated.sort();
         unchanged.sort();

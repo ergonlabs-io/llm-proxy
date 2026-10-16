@@ -1,44 +1,25 @@
-//! The per-type xDS subscription state machine (S8).
+//! The per-type xDS subscription state machine (S8). Pure logic: no I/O, no
+//! gRPC, no protobuf. `client.rs` owns the stream that carries these requests.
 //!
-//! **Pure logic. No I/O, no gRPC, no protobuf.** This module owns the rules
-//! that decide what a `DiscoveryRequest` says; `client.rs` owns the tonic
-//! stream that carries it. Keeping them apart is deliberate: S8 conformance
-//! is a set of claims about version and nonce bookkeeping, and every one of
-//! them is testable here without a socket, a runtime, or a control plane.
+//! S8 per type: `state = {subscribed, acked_version, last_nonce}`. On response,
+//! all resources are validated and applied, then ACK(version, nonce). Any
+//! failure is NACK(previous version, nonce, error_detail), and the entire
+//! response is discarded. Four rules, each with a test:
 //!
-//! # The rules this encodes, quoting S8
-//!
-//! > Per type: `state = {subscribed: Set<Name>, acked_version, last_nonce}`.
-//! > On response: validate **all** resources -> all-or-nothing accept -> apply
-//! > -> ACK(version, nonce); any failure -> NACK(prev version, nonce,
-//! > error_detail) and **discard entire response**.
-//!
-//! Four consequences that are easy to get subtly wrong, and each has its own
-//! test below:
-//!
-//! 1. **A NACK carries the PREVIOUS acked version, not the rejected one.**
-//!    Echoing the rejected version would tell the control plane we accepted
-//!    it. This is the single most important rule in the module.
-//! 2. **A NACK'd response changes nothing else.** Not the acked version, not
-//!    the subscription set. S8's "discard entire response" is all-or-nothing:
-//!    there is no partial application.
-//! 3. **The nonce advances on ACK and NACK alike**, because a request must
-//!    echo the *latest* nonce whatever the verdict was. Freezing it on
-//!    rejection would make every subsequent request look stale.
-//! 4. **Across a reconnect the version persists and the nonce does not.** S8:
-//!    "re-send all subscriptions with acked versions ... versions persist
-//!    across streams for same server". A nonce belongs to one stream, so the
-//!    first request on a new stream carries none.
+//! 1. **A NACK carries the PREVIOUS acked version.** Echoing the rejected
+//!    version would tell the control plane we accepted it.
+//! 2. **A NACK changes nothing else.** Neither the acked version nor the
+//!    subscription set moves.
+//! 3. **The nonce advances on ACK and NACK alike**, so the next request echoes
+//!    the latest one.
+//! 4. **Across a reconnect the version persists and the nonce does not.** The
+//!    first request on a new stream carries no nonce.
 
 use std::collections::BTreeSet;
 
-/// What a subscription covers. S8: "Resource-name matching is exact-string
-/// incl. wildcard `*` subscription for LDS/CDS."
-///
-/// These are not interchangeable, and the distinction is load-bearing rather
-/// than cosmetic: LDS/CDS subscribe to everything the control plane has, while
-/// RDS/EDS subscribe to names derived from accepted LDS/CDS resources. Sending
-/// an empty name list where a wildcard was meant asks for nothing at all.
+/// What a subscription covers. LDS/CDS use a wildcard. RDS/EDS use names taken
+/// from accepted LDS/CDS resources. An empty name list means "everything" on
+/// the wire, so the two must not be confused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subscription {
     /// Every resource of this type -- the LDS/CDS form. On the wire this is an
@@ -46,10 +27,7 @@ pub enum Subscription {
     Wildcard,
     /// Exactly these names -- the RDS/EDS form.
     ///
-    /// Rust note: `BTreeSet` rather than `HashSet` so the rendered
-    /// `resource_names` are deterministically ordered. A request that reorders
-    /// its own names between retries is harder to read in a packet capture and
-    /// harder to assert on in a test, for no benefit.
+    /// Rust note: a `BTreeSet` keeps the rendered names in a stable order.
     Names(BTreeSet<String>),
 }
 
@@ -137,14 +115,9 @@ impl SubscriptionState {
         &self.subscribed
     }
 
-    /// True when this is a name-based subscription with no names -- which
-    /// renders identically to a wildcard on the wire and would therefore ask
-    /// for **every** resource of the type.
-    ///
-    /// RDS/EDS names are derived from accepted LDS/CDS resources, so an empty
-    /// set is the ordinary state before the first LDS/CDS response arrives.
-    /// The caller must skip the request rather than send it; this is the check
-    /// that makes that skip a deliberate decision instead of an accident.
+    /// True for a name-based subscription with no names. On the wire that is
+    /// identical to a wildcard, so the caller must skip the request rather than
+    /// ask for every resource of the type.
     pub fn has_nothing_to_request(&self) -> bool {
         matches!(&self.subscribed, Subscription::Names(n) if n.is_empty())
     }

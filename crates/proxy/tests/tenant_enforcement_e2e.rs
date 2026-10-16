@@ -1,8 +1,6 @@
 //! Tenant model allow-lists and spend budgets set through the admin API are
 //! enforced on the data plane when the dialect has an `auth` block.
 //!
-//! Before the dialect lowered `llmproxy.model_authz` and `llmproxy.spend_limit`,
-//! `PUT /tenants/{id}/policy` and `/budget` answered 204 and nothing read them.
 //! This drives the real `llm-proxy` binary through `--config`: mint a key for a
 //! tenant, write a policy or budget over the admin listener, and check the next
 //! request. The `auth.enforce` opt-out is the negative control: the same write
@@ -103,7 +101,7 @@ fn a_zero_budget_refuses_the_next_request() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Review H4: absence of policy is not a grant. A minted key whose tenant has
+/// Absence of policy is not a grant. A minted key whose tenant has
 /// no stored model policy is refused by default; the dialect's
 /// `tenants_without_policy: allow` (the fail-open option, warned at load)
 /// admits it.
@@ -127,7 +125,7 @@ fn a_tenant_without_a_policy_is_refused_unless_the_config_allows_it() {
     }
 }
 
-/// Offboarding (review H4): `DELETE /tenants/{id}` revokes the tenant's keys,
+/// Offboarding: `DELETE /tenants/{id}` revokes the tenant's keys,
 /// so the next request with a key minted for it is 401, not admitted.
 #[test]
 fn deleting_a_tenant_makes_its_keys_stop_authenticating() {
@@ -279,8 +277,8 @@ fn a_key_limit_never_widens_its_tenant() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Limits are control-plane rows: on the persistent store they survive a
-/// restart of the binary.
+/// Limits are control-plane rows. On the persistent store they survive a
+/// restart.
 #[test]
 fn limits_survive_a_restart_with_a_persistent_store() {
     let dir = scratch_dir("limits-restart");

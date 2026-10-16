@@ -1,20 +1,13 @@
-//! SIGHUP config-reload acceptance tests: the trigger `internal-docs/MILESTONES.md`'s
-//! v0.2.0 section (paragraph beginning "Found 2026-08-09") calls the missing
-//! prerequisite for the config-swap ship-gate clause. `crates/proxy/src/main.rs`
-//! (`reload`, `ConfigSource`, `ControlSignals`) is what this drives; the
-//! downstream machinery (`ConfigPublisher::publish`, `run_listener_manager`'s
-//! `reconcile`) is already covered by `proxy-core`'s own unit tests and is not
-//! re-proven here.
+//! SIGHUP config-reload acceptance tests. They drive `reload` in
+//! `crates/proxy/src/main.rs`; the downstream publish and reconcile machinery
+//! is covered by `proxy-core`'s own unit tests.
 //!
-//! Requirement 1 is the load-bearing one: a broken reload must never take the
-//! process down. `sighup_with_a_broken_config_keeps_serving_and_logs_error`
-//! is that test.
+//! A broken reload must never take the process down.
+//! `sighup_with_a_broken_config_keeps_serving_and_logs_error` is that test.
 //!
-//! Rust note: same shape as `tests/stats_e2e.rs` -- a separate compiled crate
-//! per `tests/*.rs` file, so helpers are duplicated rather than shared, and
-//! `env!("CARGO_BIN_EXE_llm-proxy")` + `Command::new(BIN).spawn()` drive the
-//! real binary, since `crates/proxy` has no `[lib]` target an integration
-//! test could link against directly.
+//! Rust note: each `tests/*.rs` file is its own crate, so helpers are
+//! duplicated, and `env!("CARGO_BIN_EXE_llm-proxy")` drives the real binary
+//! because `crates/proxy` has no `[lib]` target to link against.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -70,14 +63,10 @@ fn spawn_line_reader(
     rx
 }
 
-/// Strips `ESC '[' ... 'm'` ANSI SGR sequences. `init_tracing` (main.rs) does
-/// not disable color output, and it turns out `tracing_subscriber`'s default
-/// formatter emits color codes even when stderr is a pipe, not a terminal --
-/// confirmed by hand against this binary's real output. A message like
-/// `SIGHUP: config reload succeeded` survives intact (nothing is colorized
-/// *inside* the message text), but a field render like `version=2` does not
-/// (the `=` and the value each get their own escape-wrapped span), so any
-/// assertion against a field value needs this first.
+/// Strips `ESC '[' ... 'm'` ANSI SGR sequences. The tracing formatter colors
+/// output even when stderr is a pipe, and it splits field renders such as
+/// `version=2` into escape-wrapped spans, so assertions on field values need
+/// this first.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -447,21 +436,10 @@ fn sighup_with_a_broken_config_keeps_serving_and_logs_error() {
         harness.log
     );
 
-    // The proxy must still be running, and the OLD config must still be the
-    // one serving -- both checked, since either one alone could pass by
-    // accident (a crashed-and-respawned process would still answer "not
-    // connectable" here, and a hung-but-alive process could still answer
-    // `try_wait` with `None`).
-    //
-    // Both are also checked repeatedly over a settle window, not once: a
-    // process that is mid-exit still reads as alive to a single `try_wait`,
-    // and its listener socket can still accept a connection briefly after
-    // the process has decided to die. Sampling once right after the log line
-    // proves "it had not died yet", not "it stayed alive" -- confirmed by
-    // mutation-testing this test against a `std::process::exit(1)` swapped
-    // into the reload-failure branch in `main.rs`, which the single-sample
-    // version only caught in 2 of 4 runs. Requiring both checks to hold for
-    // the whole window is what makes that mutation fail every time.
+    // The proxy must still be running and the OLD config must still serve.
+    // Both are checked over a settle window, not once: a process mid-exit
+    // still reads as alive to one `try_wait`, and its socket can accept
+    // briefly after it has decided to die.
     let settle_deadline = Instant::now() + Duration::from_millis(750);
     loop {
         assert!(
@@ -556,13 +534,9 @@ fn snapshot_version_advances_across_reloads() {
     harness.finish();
 }
 
-/// Not a new behavior, but a regression guard for one: the SIGTERM/SIGINT
-/// drain sequence (`tests/cli.rs`) has to survive `run_serve`'s signal-wait
-/// changing from a single `.await` into the shutdown/reload loop this file's
-/// other tests exercise. A reload followed by a clean SIGTERM exit is the
-/// sequence that would have broken if that loop mishandled the `Shutdown`
-/// arm (e.g. by not `break`ing, or by never reaching `graceful_shutdown` at
-/// all).
+/// Regression guard: a clean SIGTERM exit after a reload must still run the
+/// graceful shutdown path. A loop that mishandles the `Shutdown` arm would
+/// break this.
 #[test]
 fn sigterm_after_a_reload_still_drains_and_exits_cleanly() {
     let port = free_port();
@@ -610,17 +584,12 @@ fn sigterm_after_a_reload_still_drains_and_exits_cleanly() {
     let _ = std::fs::remove_file(&harness.config_path);
 }
 
-/// Defect 1 (found writing user documentation, 2026-08-09): `/config_dump`
-/// and `/clusters` used to keep serving the BOOT snapshot forever, because
-/// `start_admin` built its own `WorkerConfigHandle` outside the registry
-/// `ConfigPublisher::publish` walks. This is the load-bearing end-to-end
-/// proof the fix (`SnapshotHandles`, `crates/proxy-core/src/runtime.rs`) is
-/// actually wired all the way through the real binary: start the process,
-/// read both admin endpoints, SIGHUP a config that renames the cluster, wait
-/// for the reload-success log, then read both endpoints again and assert the
-/// NEW cluster name shows up and the OLD one is gone. A unit test that only
-/// checks a handle got `store`d would not catch a regression where the admin
-/// server's HTTP handler itself stopped reading through that handle.
+/// `/config_dump` and `/clusters` must follow a reload. They read through the
+/// same `SnapshotHandles` that `ConfigPublisher::publish` updates
+/// (`crates/proxy-core/src/runtime.rs`), not a boot-time copy. This test
+/// SIGHUPs a config that renames the cluster and checks both endpoints show
+/// the new name. A unit test on the handle would miss an admin handler that
+/// stopped reading through it.
 #[test]
 fn sighup_reload_is_reflected_in_config_dump_and_clusters() {
     let port = free_port();

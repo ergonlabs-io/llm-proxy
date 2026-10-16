@@ -1,25 +1,8 @@
-//! The aggregate cluster (`ClusterKind::Aggregate`) as a
-//! provider-fallback target. This file exists for exactly one guarantee --
-//! **credential isolation across failover**: a request that falls over from
-//! provider `"a"` to provider `"b"` must carry `"b"`'s credentials, and
-//! `"a"`'s must never reach `"b"`'s upstream at all (see
-//! `ClusterConfig::request_headers_to_add`'s doc for why a route-level or
-//! wrong-cluster credential is a real API-key disclosure to a third party,
-//! not just a wrong-header bug).
+//! Aggregate-cluster failover tests. Credentials must come from the member
+//! actually dialled; sending another provider's key would disclose it.
 //!
-//! Standalone (not `router.rs`'s own `#[cfg(test)]` module), same reasoning
-//! as `router_retry.rs`/`router_header_mutations.rs`: a fresh, focused
-//! upstream/cluster-snapshot helper rather than reusing the existing
-//! one-shot ones. Modeled closely on `router_header_mutations.rs` (the
-//! reflecting upstream that hands back the raw request text) and
-//! `router_retry.rs` (the closed-port-for-a-guaranteed-connect-failure
-//! trick, and the retry-policy helpers) plus `router_access_log.rs` (reading
-//! `StreamInfo::upstream_cluster` back out through a `%UPSTREAM_CLUSTER%`
-//! text logger -- there is no other public seam that exposes it).
-//!
-//! Rust note: same shape as those files' own tests -- `send_upstream_http1`
-//! spawns a non-`Send` connection driver task via `tokio::task::spawn_local`,
-//! so every test needs a `LocalSet` on a `current_thread` runtime.
+//! Rust note: connection drivers use `spawn_local`, so tests need a `LocalSet`
+//! on a current-thread runtime.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;

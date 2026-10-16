@@ -1,9 +1,5 @@
-//! End-to-end coverage for the scale-test profile extension: real HTTP
-//! requests against a real `AppState`-backed server, over an in-memory pipe
-//! (never a bound port -- see AGENTS.md "Running The Product", "a worktree does not
-//! isolate ports"). Exercises what `frames.rs`'/`handler.rs`'s unit tests
-//! can't: that profile selection, the terminal frame, and the usage count
-//! all survive a real hyper request/response round trip, for both dialects.
+//! Exercises profile selection, terminal frames, and usage counts through a
+//! real HTTP round trip over an in-memory pipe (AGENTS.md "Running The Product").
 
 use std::sync::Arc;
 
@@ -18,13 +14,7 @@ use mockupstream::profiles::{Dist, Profile, ProfileSet, DEFAULT_PROFILE};
 use serde_json::{json, Value};
 use tokio::io::duplex;
 
-/// Spin up one `AppState` behind a real http/1.1 server connection on one
-/// end of an in-memory `tokio::io::duplex` pipe, and hand back a low-level
-/// hyper client to drive it from the other end -- the same "server + client
-/// over an in-process pipe" technique
-/// `crates/proxy-http/tests/http1_codec.rs` uses, minus the `!Send`
-/// `LocalSet` machinery that file needs and this crate's handler doesn't
-/// (see the crate doc: this crate's bodies are all `Send`).
+/// Runs an HTTP/1.1 server and Hyper client over an in-memory duplex pipe.
 async fn spawn_server(state: Arc<AppState>) -> SendRequest<Full<Bytes>> {
     let (client_io, server_io) = duplex(4 * 1024 * 1024);
 
@@ -48,20 +38,8 @@ async fn spawn_server(state: Arc<AppState>) -> SendRequest<Full<Bytes>> {
     sender
 }
 
-/// A `ProfileSet` using the built-in profile *names* with test-scale
-/// timing/length instead of the real ones.
-///
-/// The real built-ins are production values for an actual scale run
-/// (`mock-slow-long` alone streams up to 2000 chunks at up to 60ms apart --
-/// minutes of real wall-clock sleeping per request, by design). Running
-/// this crate's own integration tests against those would make the suite
-/// itself the next `terminate-after` casualty (AGENTS.md "Build And Test"). What's
-/// under test here is the *selection and accounting* logic -- "the model
-/// picks the right profile", "the reported count matches what was actually
-/// sent" -- which holds at any scale, so the override keeps the same names
-/// (a real loadgen run selects profiles this same way) and the same
-/// *relative* ordering (fast-short < medium < slow-long) while shrinking
-/// every number enough to keep the whole suite well under a second.
+/// Uses built-in profile names with smaller timings so integration coverage stays
+/// fast while preserving profile selection and relative stream lengths.
 fn test_profiles() -> ProfileSet {
     let mut set = ProfileSet::with_builtins(Profile {
         name: DEFAULT_PROFILE.to_string(),

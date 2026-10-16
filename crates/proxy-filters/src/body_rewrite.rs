@@ -1,54 +1,10 @@
 //! Bounded request-body prefix scanner and splice engine.
 //!
-//! This module answers two questions without ever buffering a request body:
-//! **what does the top-level JSON object say** (`model`, `stream`, whether
-//! `stream_options` is already present), and **what bytes, if any, should be
-//! spliced in, and where.**
-//!
-//! # Why a bounded prefix scan, not "buffer the body and parse it"
-//!
-//! A multimodal chat-completion request carries megabytes of inline base64
-//! image data inside `messages`. Any cap large enough to admit that body is
-//! large enough that `cap × concurrent_streams` can exhaust the worker; any
-//! cap small enough to be safe silently drops exactly the requests a customer
-//! most wants metered. So this scanner never buffers the body: it holds at
-//! most `cap` bytes, no matter how large the body turns out to be.
-//!
-//! What makes that workable is that every field we care about — `model`,
-//! `stream`, `stream_options` — is a **top-level scalar/object, a sibling of
-//! `messages`, not a child of it**, and SDKs emit them early. So
-//! [`BodyPrefixScanner`] is a depth-tracking incremental tokenizer (the same
-//! shape as [`SseUsageScanner`](crate::usage::SseUsageScanner): fed arbitrary
-//! byte chunks, retains only bounded state) that walks the top-level object
-//! key by key, **skips over nested structures without materializing them**,
-//! and keeps only the handful of top-level facts this module needs.
-//!
-//! # Splice, don't re-serialize
-//!
-//! The injection point is immediately after the top-level opening `{`, which
-//! lives in the very first byte(s) of the held prefix. Mutation is therefore
-//! a **prefix splice**: emit the bytes up to `splice_at`, the injected bytes,
-//! then the rest of the body untouched. The body is never reassembled, so it
-//! never round-trips through a JSON serializer that could reorder keys or
-//! renormalize numbers.
-//!
-//! Splicing at the *front* is deliberate, not incidental: under
-//! last-key-wins JSON parsing (which every mainstream JSON decoder,
-//! including `serde_json` and every SDK's client library, implements), a
-//! client's own later `stream_options` key still wins over one spliced in
-//! near the start of the object. That is exactly why `ScanOutcome::CapExceeded`
-//! (we hit the cap before proving `stream_options` is absent) is still safe
-//! to inject into: if the client's real `stream_options` shows up later in
-//! the body (outside our window), it silently overrides ours instead of
-//! colliding with it.
-//!
-//! # Failure is "pass through untouched", never an error
-//!
-//! Non-JSON bodies, truncated bodies, and bodies whose interesting keys never
-//! appear inside the window all produce [`ScanOutcome::NotJson`] or
-//! "not found" facts — never a parse error. A proxy that rejects a request it
-//! merely failed to *understand* is worse than one that forwards it
-//! unmetered/unrouted.
+//! The scanner reads only top-level request fields while retaining at most a
+//! bounded prefix; nested content such as multimodal `messages` is skipped.
+//! Rewrites splice bytes into the prefix instead of reserializing JSON, which
+//! preserves the client's representation and lets later duplicate keys win.
+//! Non-JSON, truncated, or out-of-window input passes through unchanged.
 
 /// Default bound on how many prefix bytes a [`BodyPrefixScanner`] will ever
 /// hold. This bounds *how far in we look* for top-level keys, not how large a

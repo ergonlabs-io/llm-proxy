@@ -1,52 +1,12 @@
-//! Wires the [`crate::token_limit`] budget limiter into
-//! the real HTTP path as an enforcing `HttpFilter`.
+//! Token usage arrives only when the response ends. Admission checks current
+//! totals on decode; encode records completed usage, so an over-limit result
+//! denies the next request and never truncates an in-flight stream. Place this
+//! filter before `llmproxy.usage` in config order because encoder callbacks run
+//! in reverse (S2.1).
 //!
-//! # Retrospective enforcement (recap; see `token_limit`'s module doc)
-//!
-//! Token cost is unknown until a response completes, so this filter checks
-//! on the **decode** path (before a request is sent upstream) and records on
-//! the **encode** path, at response end. An over-limit key gets the *next*
-//! request denied; a stream already in flight is NEVER truncated — there is
-//! no code path here that touches response bytes at all.
-//!
-//! # Filter position: BEFORE `llmproxy.usage` in config order
-//!
-//! S2.1: encoder callbacks run in **reverse** config order. This filter's
-//! encode-side job is to read the [`proxy_http::LlmTokenUsage`] the
-//! usage filter (`crate::usage_filter`) wrote into `StreamInfo` at response
-//! end — but that only exists if the usage filter's own encode callback has
-//! *already run* by the time this filter's does. Reverse order means "already
-//! run" = "later in config order". So this filter MUST be configured BEFORE
-//! `llmproxy.usage` in `http_filters`. Get this backwards and
-//! `StreamInfo::llm.usage` simply reads `None` forever (see
-//! [`TokenLimitFilterInstance::record_if_present`]'s "absent usage" case),
-//! recording zero cost for every request that should have been charged. This
-//! used to be silent; it no longer is — see "Loud on unreadable usage" below.
-//! There is still no code assertion for the ordering itself — the module doc
-//! remains the only guard for *that* — but the symptom is no longer invisible.
-//!
-//! # Loud on unreadable usage, but never fail-closed
-//!
-//! A budget that applies to a request (`self.key` is `Some`, i.e. this
-//! request was actually bucketed) but whose usage reads `None` is exactly
-//! the "confirmed live" defect this section exists to close: a metering gap
-//! that silently charged nothing and never showed up anywhere an operator
-//! would look. [`TokenLimitFilterInstance::record_if_present`] now calls
-//! [`UsageMissingWarner::warn_if_due`] on that path — `warn!`, never an
-//! error and never a denial, because the request itself succeeded and the
-//! proxy behaved exactly as designed (see the module doc's "Fail open on a
-//! store error" section for the same philosophy applied to the store side).
-//! A route with no configured limit (`self.key` is `None`) never reaches
-//! this call at all, so an unlimited route stays silent — warning there
-//! would just be a second, noisier outage.
-//!
-//! Suppression is once-per-key-per-minute, not once-per-process: see
-//! [`UsageMissingWarner`]'s doc for why a periodic repeat was chosen over
-//! "warn once, ever" (an operator who starts reading logs after the first
-//! occurrence must still be able to see it), and why that repeat is cheap
-//! enough to keep on the same rare path rather than needing a background
-//! task. The warner tracks at most `UsageMissingWarner::MAX_TRACKED_KEYS`
-//! keys; past that, warnings fold into one line that names no key.
+//! Missing usage for an applicable budget is warned, then recorded as zero;
+//! it never denies a successful request. Unlimited routes stay silent, and
+//! warnings are periodically suppressed per key (AGENTS.md "Fail-open controls").
 //!
 //! # Local admission, reconciled counters
 //!

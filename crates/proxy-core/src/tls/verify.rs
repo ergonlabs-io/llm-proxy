@@ -12,11 +12,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 
-/// `validation: None` on an `UpstreamTlsSpec` means Envoy does not verify the
-/// upstream certificate at all -- this is documented (if dangerous) Envoy
-/// behavior, not a shortcut we're taking. `supported_verify_schemes` still
-/// constrains signature verification to the provider's algorithms so at
-/// least the handshake signature itself is checked.
+/// `validation: None` on an `UpstreamTlsSpec` means Envoy does not verify the upstream certificate at all. That is
+/// documented Envoy behavior, not a shortcut. `supported_verify_schemes` still limits signatures to the provider's
+/// algorithms, so the handshake signature is checked.
 #[derive(Debug)]
 pub(super) struct AcceptAnyServerCert {
     provider: Arc<CryptoProvider>,
@@ -75,13 +73,9 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
-/// `SanMatcherIR`/`StringMatcherIR` don't derive `Clone` in the IR (its
-/// public shape is frozen outside this module) -- the two verifier wrappers
-/// below need to own their matcher list past the borrowed `&ValidationContextIR`
-/// that `DownstreamTlsFactory::build`/`UpstreamTlsFactory::build` only see for
-/// the duration of the call, so this rebuilds an owned copy field-by-field.
-/// `regex::Regex` itself is `Clone` (cheap: an `Arc` inside), so this isn't
-/// recompiling anything.
+/// The IR's matchers are not `Clone`, but these wrappers must own their list past the borrowed `ValidationContextIR`
+/// that the factory build sees. So this rebuilds an owned copy field by field. A `Regex` clone is cheap (an `Arc`
+/// inside), so nothing is recompiled.
 pub(super) fn clone_san_matchers(matchers: &[SanMatcherIR]) -> Vec<SanMatcherIR> {
     matchers
         .iter()
@@ -124,10 +118,8 @@ struct ExtractedSans {
     ip: Vec<String>,
 }
 
-/// Parse `cert_der`'s `subjectAltName` extension. Any parse failure is
-/// reported as `Error::InvalidCertificate(BadEncoding)` -- same class of
-/// error webpki itself returns for a cert it can't decode, per that trait
-/// method's doc comment.
+/// Parses `cert_der`'s `subjectAltName` extension. A parse failure is `Error::InvalidCertificate(BadEncoding)`, the
+/// same error webpki returns for a certificate it cannot decode.
 fn extract_sans(cert_der: &CertificateDer<'_>) -> Result<ExtractedSans, Error> {
     let bad_encoding = || Error::InvalidCertificate(CertificateError::BadEncoding);
 
@@ -153,15 +145,11 @@ fn extract_sans(cert_der: &CertificateDer<'_>) -> Result<ExtractedSans, Error> {
                 if let Some(formatted) = format_ip_san(bytes) {
                     sans.ip.push(formatted);
                 }
-                // Malformed-length IP SANs (not 4 or 16 bytes) are simply not
-                // matchable -- Envoy's own `match_typed_subject_alt_names`
-                // has nothing to compare a matcher against either.
+                // A malformed-length IP SAN (not 4 or 16 bytes) cannot match anything, as in Envoy.
             }
             _ => {
-                // Envoy's SAN matcher config only supports DNS/URI/IP_ADDRESS
-                // (lowering already rejects EMAIL/OTHER_NAME matchers -- see
-                // `SanType`'s doc comment); a cert presenting other SAN kinds
-                // just has nothing to match against for those, not an error.
+                // Envoy's SAN matchers cover only DNS, URI, and IP address (lowering rejects the rest). A cert with
+                // other SAN kinds has nothing to match for those, which is not an error.
             }
         }
     }
@@ -184,10 +172,8 @@ fn format_ip_san(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Envoy `match_typed_subject_alt_names` semantics: accept if ANY matcher in
-/// `san_matchers` matches ANY of the peer cert's SANs of that matcher's type.
-/// Empty `san_matchers` is the caller's job to skip -- this function always
-/// enforces a match when called.
+/// Envoy `match_typed_subject_alt_names` semantics: accept if ANY matcher matches ANY SAN of that matcher's type.
+/// The caller skips this for an empty `san_matchers`. When called, it always enforces a match.
 fn check_san_matchers(
     cert_der: &CertificateDer<'_>,
     san_matchers: &[SanMatcherIR],
@@ -216,25 +202,16 @@ fn check_san_matchers(
     }
 }
 
-/// If `err` is rustls reporting an expired/not-yet-valid leaf *and* carries
-/// enough context to compute a timestamp inside that cert's validity window,
-/// return that timestamp.
+/// If `err` is rustls reporting an expired or not-yet-valid leaf, and carries enough context to compute a timestamp
+/// inside that certificate's validity window, returns that timestamp.
 ///
-/// Why not just catch the error and assert success (the way the hostname
-/// bypass above does)? Because webpki checks a certificate's own
-/// notBefore/notAfter before it finishes path building -- an expired leaf
-/// signed by a completely untrusted CA can come back as `Expired`/
-/// `ExpiredContext`, never reaching the `UnknownIssuer` check at all. Blindly
-/// trusting "the only error was expiry" would silently accept a cert from
-/// the wrong CA. So instead this re-runs the *entire* inner verification
-/// (chain trust, signatures, hostname -- everything) at a moment the cert
-/// was actually valid; any other problem still surfaces normally.
+/// Why not just accept the expiry error? webpki checks a leaf's validity before path building. An expired leaf signed
+/// by an untrusted CA can then come back as `Expired` and never reach the `UnknownIssuer` check. Trusting "the only
+/// error was expiry" would accept a certificate from the wrong CA. So this re-runs the entire inner verification
+/// (chain, signatures, hostname) at a moment the certificate was valid. Any other problem still surfaces normally.
 ///
-/// The plain (context-free) `Expired`/`NotValidYet` variants carry no
-/// timestamp to retry with -- per rustls's webpki glue they only occur for
-/// `InvalidCertValidity` (a malformed notBefore/notAfter ordering), which
-/// isn't a "just retry at a different time" situation anyway -- so those
-/// return `None` and the caller lets the original error propagate.
+/// The plain `Expired` and `NotValidYet` variants carry no timestamp. They arise only for `InvalidCertValidity`, a
+/// malformed validity range, which is not fixed by retrying, so they return `None` and the original error propagates.
 fn expiry_bypass_time(err: &Error) -> Option<UnixTime> {
     match err {
         Error::InvalidCertificate(CertificateError::ExpiredContext { not_after, .. }) => Some(
@@ -249,17 +226,14 @@ fn expiry_bypass_time(err: &Error) -> Option<UnixTime> {
 
 // ---------------------------------------------------- upstream (server) side --
 
-/// Wraps a `WebPkiServerVerifier` (chain-trust validation against
-/// `trusted_ca`/`system_root_certs`) and applies the Envoy-parity twists chunk
-/// B1/B2 need:
-/// - Envoy's `trusted_ca`-only validation context does *not* do RFC 6125
-///   hostname/SNI verification -- only `match_typed_subject_alt_names` does.
-///   So a hostname mismatch from the inner verifier is always downgraded to
-///   success; SAN matchers (below) are the real hostname-shaped check.
-/// - `allow_expired_certificate`: an expired/not-yet-valid leaf is downgraded
-///   to success too, but only when the IR asked for it.
-/// - `san_matchers`: after the inner verifier succeeds (including via either
-///   bypass above), the peer cert's SANs must satisfy at least one matcher.
+/// Wraps a `WebPkiServerVerifier` (chain-trust validation against `trusted_ca` and `system_root_certs`) and applies
+/// the Envoy-parity carve-outs:
+/// - Envoy's `trusted_ca`-only validation does not do RFC 6125 hostname or SNI verification. Only
+///   `match_typed_subject_alt_names` does, so a hostname mismatch from the inner verifier is downgraded to success.
+///   SAN matchers are the real hostname-shaped check.
+/// - `allow_expired_certificate`: an expired or not-yet-valid leaf is downgraded to success, only when the IR asks.
+/// - `san_matchers`: after the inner verifier succeeds, including through either bypass, the peer's SANs must satisfy
+///   at least one matcher.
 #[derive(Debug)]
 pub(super) struct HostnameBypassServerCertVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
@@ -282,13 +256,9 @@ impl HostnameBypassServerCertVerifier {
 }
 
 impl HostnameBypassServerCertVerifier {
-    /// Handle an inner-verifier error: downgrade a hostname mismatch to
-    /// success unconditionally (Envoy's `trusted_ca`-only model, see the
-    /// struct doc), and -- only when configured -- retry the whole
-    /// verification at a moment the leaf was valid when the failure looked
-    /// like expiry (see `expiry_bypass_time`'s doc comment for why a retry,
-    /// not a blind assert). Any other error, or a retry that still fails,
-    /// propagates unchanged.
+    /// Handles an inner-verifier error. A hostname mismatch is downgraded to success unconditionally, per the struct
+    /// doc. Only when configured, an expiry-shaped failure is retried at a moment the leaf was valid (see
+    /// `expiry_bypass_time`). Any other error, or a retry that still fails, propagates unchanged.
     fn retry_bypassing_hostname_and_expiry(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -386,14 +356,9 @@ impl ServerCertVerifier for HostnameBypassServerCertVerifier {
 
 // --------------------------------------------------- downstream (client) side --
 
-/// Downstream mirror of [`HostnameBypassServerCertVerifier`]: wraps a
-/// `WebPkiClientVerifier` (built from `validation.ca` +
-/// `require_client_certificate`) and applies the same
-/// `allow_expired_certificate`/`san_matchers` carve-outs to the *client*
-/// certificate a peer presents during mTLS. There's no hostname to bypass
-/// here -- `ClientCertVerifier::verify_client_cert` never took a
-/// `ServerName` in the first place, only `verify_server_cert` did -- so this
-/// wrapper is strictly smaller than the upstream one.
+/// Downstream mirror of [`HostnameBypassServerCertVerifier`]: wraps a `WebPkiClientVerifier` (built from `validation.ca`
+/// and `require_client_certificate`) and applies the same `allow_expired_certificate` and `san_matchers` carve-outs to
+/// the client certificate. There is no hostname to bypass, since `verify_client_cert` never takes a `ServerName`.
 #[derive(Debug)]
 pub(super) struct CarveoutClientCertVerifier {
     inner: Arc<dyn ClientCertVerifier>,
@@ -401,12 +366,9 @@ pub(super) struct CarveoutClientCertVerifier {
     allow_expired_certificate: bool,
 }
 
-/// Fail-closed verifier used while a downstream
-/// `validation_context_sds_secret_config` is named but has not arrived yet.
-/// A bare `with_no_client_auth` during that interval would silently turn an
-/// mTLS listener into a non-mTLS listener. Instead we request a certificate,
-/// require one, and reject every offered certificate until the real trust
-/// anchors atomically replace this verifier.
+/// Fail-closed verifier used while a downstream `validation_context_sds_secret_config` is named but not yet delivered.
+/// A bare `with_no_client_auth` would silently turn an mTLS listener into a non-mTLS one. This version requests a
+/// certificate, requires one, and rejects every offered certificate until real trust anchors replace it atomically.
 #[derive(Debug)]
 pub(super) struct PendingSdsClientCertVerifier {
     provider: Arc<CryptoProvider>,
@@ -490,9 +452,8 @@ impl CarveoutClientCertVerifier {
         }
     }
 
-    /// Same retry-at-a-valid-time strategy as
-    /// `HostnameBypassServerCertVerifier::retry_bypassing_hostname_and_expiry`,
-    /// minus the hostname carve-out (there's no `ServerName` on this side).
+    /// The same retry-at-a-valid-time strategy as `HostnameBypassServerCertVerifier::retry_bypassing_hostname_and_expiry`,
+    /// minus the hostname carve-out.
     fn retry_bypassing_expiry(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -510,12 +471,9 @@ impl CarveoutClientCertVerifier {
     }
 }
 
-// Rust note: `ClientCertVerifier` is the server-side-of-mTLS mirror of
-// `ServerCertVerifier` -- same shape (delegate signature checks, override
-// `verify_client_cert`), but its methods live under
-// `rustls::server::danger` instead of `rustls::client::danger`, and it adds
-// `offer_client_auth`/`client_auth_mandatory`/`root_hint_subjects`, which
-// have no upstream-side equivalent, so those are pure delegation too.
+// Rust note: `ClientCertVerifier` is the server side of mTLS, mirroring `ServerCertVerifier`. It lives under
+// `rustls::server::danger` rather than `rustls::client::danger`, and adds `offer_client_auth`,
+// `client_auth_mandatory`, and `root_hint_subjects`. Those have no upstream equivalent, so they simply delegate.
 impl ClientCertVerifier for CarveoutClientCertVerifier {
     fn offer_client_auth(&self) -> bool {
         self.inner.offer_client_auth()

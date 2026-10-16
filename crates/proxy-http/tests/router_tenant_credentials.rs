@@ -1,19 +1,9 @@
-//! Strict tenant mode in the router's per-attempt credential step (ADR-0007).
+//! Exercise the router's per-attempt tenant credentials (ADR-0007). A stand-in
+//! decode filter writes `StreamInfo::tenant_credentials`; live recording
+//! upstreams verify credential isolation, including across failover.
 //!
-//! The production writer of `StreamInfo::tenant_credentials` is the auth
-//! filter. These tests install a stand-in decode filter
-//! ([`InstallTenantCredentials`]) that writes the same field from
-//! `decode_headers`, so the real router path runs unchanged downstream of it.
-//!
-//! Every test follows AGENTS.md invariant 6's negative-assertion rule: the
-//! upstreams are live recording servers, and a test asserts both that the
-//! tenant key arrived where it should and that the operator key arrived
-//! nowhere (and that ineligible upstreams were never dialled at all).
-//!
-//! Rust note: the router spawns non-`Send` connection drivers with
-//! `spawn_local`, so these tests run on a `current_thread` runtime inside a
-//! `LocalSet`, like `router_aggregate.rs`. Every await on the router is
-//! bounded by `tokio::time::timeout`.
+//! Rust note: router drivers use `spawn_local`; tests use a local runtime and
+//! bound each router await with `tokio::time::timeout`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -98,11 +88,11 @@ fn tenant_set(entries: Vec<(&str, Option<&str>)>) -> TenantCredentialSet {
 
 // --- recording upstream -----------------------------------------------------
 
-/// Raw request texts (lowercased) one upstream received.
+/// Lowercased raw requests received by one upstream.
 type Seen = Arc<Mutex<Vec<String>>>;
 
-/// A live upstream that records every request's header block and answers
-/// `status` (101 with upgrade headers when `status == 101`).
+/// Record request headers and respond with `status` (including upgrade
+/// headers for 101).
 async fn spawn_upstream(status: u16) -> (SocketAddr, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -152,8 +142,7 @@ fn requests(seen: &Seen) -> Vec<String> {
 
 // --- cluster fixtures -------------------------------------------------------
 
-/// A member carrying an operator credential in `operator_header` and, when
-/// `slot` is `Some((provider, header, prefix))`, a tenant credential slot.
+/// Configure a member's operator credential and optional tenant slot.
 fn member(
     name: &str,
     addr: SocketAddr,
@@ -220,13 +209,11 @@ fn aggregate(members: &[&str]) -> ClusterConfig {
 struct Fixture {
     handler: FilterChainHandler,
     records: mpsc::Receiver<RequestRecord>,
-    /// The registry the router's `RouterStats` writes into, so a test can
-    /// read the tenant-credential counter back.
+    /// Registry used to inspect tenant-credential counters.
     registry: Arc<Registry>,
 }
 
-/// One route, `/` -> cluster `target`. `tenant` installs the stand-in auth
-/// filter; `None` is platform mode with no filter at all.
+/// Build `/` -> `target`, optionally installing the stand-in tenant filter.
 async fn build(
     clusters: Vec<ClusterConfig>,
     target: &str,
@@ -236,8 +223,7 @@ async fn build(
     build_with_access_logs(clusters, target, tenant, retry_on, &[]).await
 }
 
-/// [`build`], plus the given access loggers wired into the handler, so a test
-/// can read back what the router's own `StreamInfo` rendered.
+/// Build the handler with access loggers for inspecting rendered `StreamInfo`.
 async fn build_with_access_logs(
     clusters: Vec<ClusterConfig>,
     target: &str,
@@ -334,8 +320,7 @@ async fn build_with_access_logs(
     }
 }
 
-/// A unique path under the OS temp dir for a file access logger. Same
-/// technique as `router_aggregate.rs`'s `temp_path`.
+/// Return a unique temporary path for a file access logger.
 fn temp_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
@@ -351,8 +336,7 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 fn read_to_string(path: &Path) -> String {
-    // Access-log writes are asynchronous (background writer thread); wait
-    // for everything queued so far instead of sleeping.
+    // Flush queued writes instead of sleeping for the background writer.
     assert!(proxy_observability::sink::flush_all_queued(
         Duration::from_secs(5)
     ));
@@ -404,7 +388,7 @@ fn request(upgrade: bool) -> HttpRequestParts {
     }
 }
 
-/// Drive one request; returns status and body text.
+/// Send one request and return its status and body.
 async fn send(fixture: &Fixture, upgrade: bool) -> (StatusCode, String) {
     let resp = timeout(BOUND, fixture.handler.handle(request(upgrade)))
         .await
@@ -418,8 +402,7 @@ async fn send(fixture: &Fixture, upgrade: bool) -> (StatusCode, String) {
     (status, body)
 }
 
-/// Provider label values these tests can produce: the cluster slots' names,
-/// plus `-` for a refusal whose cluster has no slot.
+/// Possible provider labels, including `-` when a refusal has no slot.
 const CREDENTIAL_PROVIDERS: [&str; 3] = ["openai", "anthropic", "-"];
 const CREDENTIAL_OUTCOMES: [&str; 3] = [
     instruments::TENANT_CREDENTIAL_APPLIED,
@@ -427,9 +410,7 @@ const CREDENTIAL_OUTCOMES: [&str; 3] = [
     instruments::TENANT_CREDENTIAL_UNUSABLE,
 ];
 
-/// Reads one `(provider, outcome)` series through the public `resolve_capped`
-/// dedup path. An existing series returns its own handle, so this does not
-/// grow the registry for a series that is already there.
+/// Read a series through `resolve_capped`, reusing an existing handle.
 fn credential_requests(registry: &Registry, provider: &str, outcome: &str) -> u64 {
     let handle = registry.resolve_capped(
         &instruments::TENANT_CREDENTIAL_REQUESTS,
@@ -440,9 +421,7 @@ fn credential_requests(registry: &Registry, provider: &str, outcome: &str) -> u6
     registry.value(handle)
 }
 
-/// Asserts that `expected` reads exactly 1 and every other pair in the label
-/// grid reads 0. `None` asserts that the whole grid is zero, which is what a
-/// platform-mode request must leave behind.
+/// Assert that only `expected` has a count of 1; `None` requires all zeroes.
 fn assert_credential_counts(registry: &Registry, expected: Option<(&str, &str)>) {
     for provider in CREDENTIAL_PROVIDERS {
         for outcome in CREDENTIAL_OUTCOMES {
@@ -518,8 +497,7 @@ async fn tenant_key_replaces_operator_key_for_each_header_shape() {
     }
 }
 
-/// Aggregate [A, B] where A is ineligible (`a_slot`) and B holds the tenant's
-/// provider: the first attempt goes to B and A is never dialled.
+/// Skip ineligible A and send the first attempt to B, the eligible member.
 async fn ineligible_first_member_is_never_dialled(a_slot: Option<(&str, &str, &str)>) {
     LocalSet::new()
         .run_until(async {
@@ -612,8 +590,7 @@ async fn aggregate_with_no_eligible_member_is_403_and_dials_nothing() {
 async fn aggregate_with_no_healthy_host_stays_503_in_tenant_mode() {
     LocalSet::new()
         .run_until(async {
-            // The only eligible member has no endpoints, and the unfiltered
-            // probe finds nothing either: that is health, not eligibility.
+            // Eligibility does not make an endpoint healthy.
             let (addr, _seen) = spawn_upstream(200).await;
             let mut b = member(
                 "b",
@@ -638,8 +615,7 @@ async fn aggregate_with_no_healthy_host_stays_503_in_tenant_mode() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn plain_cluster_without_matching_slot_is_403_without_dialling() {
-    // No slot: the refusal names no provider, so it counts under `-`. A slot
-    // the tenant lacks: the refusal names that slot's provider.
+    // Refusals are labeled by the missing slot's provider, or `-` if absent.
     for (slot, expected) in [
         (None, ("-", instruments::TENANT_CREDENTIAL_MISSING)),
         (
@@ -687,8 +663,7 @@ async fn unusable_credential_fails_closed_with_503_and_no_credential_sent() {
             let (status, body) = send(&fixture, false).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(body, "provider credential failure");
-            // Nothing reached any upstream, so no request carried the
-            // operator credential as a fallback.
+            // No upstream received an operator credential.
             assert!(requests(&seen).is_empty());
             assert_credential_counts(
                 &fixture.registry,
@@ -728,8 +703,7 @@ async fn upstream_401_with_tenant_credential_is_one_attempt_and_passed_through()
 
 #[tokio::test(flavor = "current_thread")]
 async fn platform_mode_keeps_operator_credential_and_records_platform_source() {
-    // No filter at all, and a filter installing an empty set, are both
-    // platform mode.
+    // No filter and an empty credential set both mean platform mode.
     for tenant in [None, Some(tenant_set(Vec::new()))] {
         LocalSet::new()
             .run_until(async {
@@ -773,8 +747,7 @@ async fn platform_mode_keeps_operator_credential_and_records_platform_source() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn access_log_renders_the_credential_source_the_router_chose() {
-    // Tenant mode with a usable credential, tenant mode refused (no slot
-    // match, so the router never sets a source), and platform mode.
+    // Cover successful tenant mode, refused tenant mode, and platform mode.
     let cases = [
         (
             "tenant",
@@ -834,8 +807,7 @@ async fn websocket_upgrade_applies_the_tenant_credential() {
                 None,
             )
             .await;
-            // The tunnel never completes (the synthetic `OnUpgrade` never
-            // resolves), so only the upstream's view matters here.
+            // The synthetic `OnUpgrade` never resolves; inspect the upstream.
             let _ = timeout(BOUND, fixture.handler.handle(request(true))).await;
             assert_credential_counts(&fixture.registry, Some(("anthropic", "applied")));
             let got = requests(&seen);
@@ -873,9 +845,8 @@ async fn websocket_upgrade_without_a_matching_credential_is_403() {
         .await;
 }
 
-/// The operator credential sits on a different header than the tenant slot.
-/// Both must not reach the upstream (ADR-0007 decision 5), while a
-/// non-credential static header must still be sent.
+/// Keep both operator and tenant credentials off the wire while preserving
+/// a non-credential static header (ADR-0007 decision 5).
 #[tokio::test(flavor = "current_thread")]
 async fn operator_credential_on_a_different_header_than_the_slot_is_removed() {
     for (operator_header, slot_header, prefix, expected, absent) in [
@@ -937,14 +908,11 @@ async fn operator_credential_on_a_different_header_than_the_slot_is_removed() {
     }
 }
 
-/// Aggregate [A, B]. A holds the tenant's OpenAI key and answers 503, so the
-/// router falls back to B, which holds the tenant's Anthropic key. Each
-/// upstream must see only the credential of the member it dialled. A's
-/// operator key and B's operator key must reach neither upstream, and the
-/// fallback must not carry A's tenant key.
+/// After A returns 503, B must receive only its own tenant key. Neither
+/// operator key nor A's tenant key may reach B.
 #[tokio::test(flavor = "current_thread")]
 async fn tenant_credentials_are_isolated_across_failover() {
-    // The recorder lowercases every request, so the needles are lowercase.
+    // Request text is lowercased by the recorder.
     const OPERATOR_KEYS: [&str; 2] = ["operator-key-a", "operator-key-b"];
     LocalSet::new()
         .run_until(async {
@@ -957,8 +925,7 @@ async fn tenant_credentials_are_isolated_across_failover() {
                 Some(("openai", "authorization", "Bearer ")),
             );
             a.request_headers_to_add[0].value = "Bearer operator-key-A".to_string();
-            // B's operator key sits on a different header than its slot, so
-            // only the removal step keeps it off the wire.
+            // The removal step must strip B's separate operator header.
             let mut b = member(
                 "b",
                 b_addr,
@@ -979,14 +946,13 @@ async fn tenant_credentials_are_isolated_across_failover() {
             let (status, _) = send(&fixture, false).await;
             assert_eq!(status, StatusCode::OK);
 
-            // One 503 from A, then one success from B.
+            // Fail over from A to B.
             let a_got = requests(&a_seen);
             let b_got = requests(&b_seen);
             assert_eq!(a_got.len(), 1, "A dialled exactly once: {a_got:?}");
             assert_eq!(b_got.len(), 1, "B dialled exactly once: {b_got:?}");
 
-            // A carries its own tenant key and nothing from either operator
-            // or from B's tenant key.
+            // A receives only its own tenant key.
             assert!(
                 a_got[0].contains("authorization: bearer tenant-key-a"),
                 "A must carry its tenant key: {:?}",
@@ -1000,9 +966,7 @@ async fn tenant_credentials_are_isolated_across_failover() {
                 );
             }
 
-            // B carries its own tenant key on x-api-key, no authorization
-            // header at all, and nothing from either operator or from A's
-            // tenant key.
+            // B receives its own key only, on `x-api-key`.
             assert!(
                 b_got[0].contains("x-api-key: tenant-key-b"),
                 "B must carry its tenant key: {:?}",
@@ -1021,8 +985,7 @@ async fn tenant_credentials_are_isolated_across_failover() {
                 );
             }
 
-            // Each member applied its own provider's tenant credential once,
-            // and nothing else was counted.
+            // Each member applied its own provider credential once.
             let applied = instruments::TENANT_CREDENTIAL_APPLIED;
             for provider in CREDENTIAL_PROVIDERS {
                 for outcome in CREDENTIAL_OUTCOMES {

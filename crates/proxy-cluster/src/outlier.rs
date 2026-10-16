@@ -1,31 +1,20 @@
-//! Outlier detection (S6): ejects hosts that are misbehaving --
-//! consecutive errors or a statistically bad success/failure rate relative to
-//! their peers -- from load-balancer selection, without waiting for active
-//! health checking to notice.
+//! Outlier detection (S6): ejects hosts that misbehave (consecutive errors, or a bad success or failure rate
+//! against their peers) from load-balancer selection, without waiting for active health checks.
 //!
-//! **This module is the detection engine.** It is fully wired:
-//! [`crate::manager::ClusterManager`] builds an [`OutlierDetector`] per
-//! cluster from the lowered `outlier_detection` config, spawns its sweep, and
-//! the router feeds it one [`OutlierDetector::report_result`] per upstream
-//! attempt through [`crate::ClusterEntry::report_outlier_result`]. The tests
-//! in this file still drive the engine directly through its public API (that
-//! is the right level to pin the S6 state machine); the end-to-end path is
-//! covered by the manager tests (`outlier_detection_ejects_a_host_after_consecutive_5xx`)
-//! and the router tests.
+//! [`crate::manager::ClusterManager`] builds an [`OutlierDetector`] per cluster from the lowered
+//! `outlier_detection` config and spawns its sweep. The router reports each attempt through
+//! [`crate::ClusterEntry::report_outlier_result`]. The tests here drive the engine directly, which pins the
+//! S6 state machine; the end-to-end path is covered by the manager and router tests.
 //!
-//! The IR carries the config as `proxy_config::ir::OutlierDetectionIR`;
-//! [`OutlierDetectionConfig`] here is the runtime twin, built from it via
-//! `From<&OutlierDetectionIR>`. The two hold Envoy's S6 defaults independently
-//! (`proxy-config` cannot depend on `proxy-cluster`), and
-//! `ir_defaults_match_runtime_defaults` in this file's tests pins that they
-//! agree so they cannot silently drift.
+//! The IR carries the config as `proxy_config::ir::OutlierDetectionIR`. [`OutlierDetectionConfig`] is the
+//! runtime twin, built from it via `From<&OutlierDetectionIR>`. `proxy-config` cannot depend on this crate,
+//! so both hold Envoy's S6 defaults; `ir_defaults_match_runtime_defaults` pins that they agree.
 //!
-//! # Design notes worth reading before touching this file
+//! # Design notes
 //!
-//! **A gateway failure bumps *both* the consecutive-5xx and
-//! consecutive-gateway-failure counters.** This matches real Envoy, where a
-//! gateway error is a *subset* of 5xx, not a separate axis --
-//! `DetectorImpl::putHttpResponseCode` does:
+//! **A gateway failure bumps *both* the consecutive-5xx and consecutive-gateway-failure counters.** This
+//! matches Envoy, where a gateway error is a subset of 5xx, not a separate axis. `DetectorImpl::putHttpResponseCode`
+//! does:
 //!
 //! ```cpp
 //! if (Http::CodeUtility::is5xx(response_code)) {
@@ -36,23 +25,15 @@
 //! }
 //! ```
 //!
-//! The consequence, which is correct Envoy behaviour and not a bug: **five
-//! consecutive gateway failures do cause an ejection**, even though
-//! `enforcing_consecutive_gateway_failure` defaults to 0%. They eject
-//! through the consecutive-5xx detector (`enforcing_consecutive_5xx`
-//! defaults to 100%), which fires on the very same request that trips the
-//! gateway-failure counter. `enforcing_consecutive_gateway_failure = 0` only
-//! disables *that detector's own* ejections -- it cannot stop the 5xx
-//! detector from seeing (and enforcing on) the same failures. A
-//! [`RequestResult::Success`] (or any non-5xx result) resets both counters,
-//! as it does in Envoy.
+//! The consequence is correct Envoy behavior: five consecutive gateway failures do eject, even though
+//! `enforcing_consecutive_gateway_failure` defaults to 0%. They eject through the consecutive-5xx detector,
+//! which fires on the same request. Setting `enforcing_consecutive_gateway_failure = 0` only disables that
+//! detector's own ejections. A [`RequestResult::Success`] (or any non-5xx result) resets both counters, as in
+//! Envoy.
 //!
-//! **A threshold crossing always resets its counter**, whether or not the
-//! resulting ejection was actually enforced (blocked by the enforcement-
-//! percent dice roll or by [`OutlierDetectionConfig::max_ejection_percent`]).
-//! This matches Envoy's own edge-triggered counters: the *detection* fired
-//! either way, so the run restarts from zero rather than re-firing on every
-//! subsequent request.
+//! **A threshold crossing always resets its counter**, whether or not the ejection was enforced (the
+//! enforcement dice roll or `max_ejection_percent` may block it). This matches Envoy's edge-triggered
+//! counters: detection fired, so the run restarts from zero rather than re-firing on every later request.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -69,16 +50,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::host_set::HostSet;
 use crate::{HealthFlags, Host};
 
-/// What one completed request told us about the host that served it.
-/// [`RequestResult::GatewayFailure`] bumps *both* the consecutive-5xx and
-/// consecutive-gateway-failure counters -- see the module doc's note on why
-/// a gateway error is a subset of 5xx, not an independent axis.
+/// What one completed request told us about the host that served it. [`RequestResult::GatewayFailure`]
+/// bumps both the consecutive-5xx and consecutive-gateway-failure counters (see the module doc).
 ///
-/// [`RequestResult::LocalOriginFailure`] (connect failure, timeout, reset --
-/// anything that never got as far as an upstream HTTP status) is folded into
-/// the same bucket as [`RequestResult::Http5xx`], matching
-/// `split_external_local_origin_errors = false` (S6's default, and the only
-/// mode implemented here -- see [`OutlierDetectionConfig::split_external_local_origin_errors`]).
+/// [`RequestResult::LocalOriginFailure`] (connect failure, timeout, reset) folds into the
+/// [`RequestResult::Http5xx`] bucket, matching `split_external_local_origin_errors = false`, the only mode
+/// implemented (see [`OutlierDetectionConfig::split_external_local_origin_errors`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestResult {
     Success,
@@ -87,9 +64,8 @@ pub enum RequestResult {
     LocalOriginFailure,
 }
 
-/// Timing + thresholds for one cluster's outlier detector (Envoy's
-/// `OutlierDetection` message). Every field is commented with its S6 default;
-/// [`Default`] reproduces those defaults exactly.
+/// Timing and thresholds for one cluster's outlier detector (Envoy's `OutlierDetection`). [`Default`]
+/// reproduces the S6 defaults.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutlierDetectionConfig {
     /// How often the success-rate and failure-percentage detectors re-run
@@ -153,23 +129,14 @@ pub struct OutlierDetectionConfig {
     /// for failure-percentage detection. S6 default: 50.
     pub failure_percentage_request_volume: u32,
 
-    /// Whether locally-originated failures (connect failure, timeout, reset)
-    /// are tracked as a separate axis from externally-observed 5xx
-    /// responses. S6 default: false. **Only `false` is implemented** --
-    /// [`RequestResult::LocalOriginFailure`] always folds into the 5xx path
-    /// regardless of this field's value; setting it `true` is accepted (no
-    /// error) but has no additional effect, since nothing in this crate
-    /// exposes it through the IR yet for a caller to actually rely on the
-    /// split. Implementing the split is future work, not a silent
-    /// approximation of a reachable config surface.
+    /// Whether locally originated failures (connect failure, timeout, reset) are tracked as a separate axis from
+    /// 5xx. S6 default: false. Only `false` is implemented: `LocalOriginFailure` always folds into the 5xx path,
+    /// and `true` is accepted with no effect. The split is future work, not a silent approximation.
     pub split_external_local_origin_errors: bool,
-    /// Whether a host un-ejects the moment it passes an active health check
-    /// independent of its outlier ejection timer. S6 default: true.
-    /// Envoy *does* expose this as a configurable field --
-    /// `envoy.config.cluster.v3.OutlierDetection.successful_active_health_check_uneject_host`
-    /// (field 23, a `BoolValue` defaulting to true). It is modeled here so [`OutlierDetector`]
-    /// stays testable without requiring a real
-    /// [`crate::health_check::HealthCheckEngine`] wired up (see
+    /// Whether a host un-ejects as soon as it passes an active health check, independent of its ejection timer.
+    /// S6 default: true. Envoy exposes this as `successful_active_health_check_uneject_host`
+    /// (`envoy.config.cluster.v3.OutlierDetection`, field 23). It is modeled here so [`OutlierDetector`] is
+    /// testable without a real [`crate::health_check::HealthCheckEngine`] (see
     /// [`OutlierDetector::on_active_health_check_pass`]).
     pub uneject_on_healthy_active_hc: bool,
 }
@@ -201,14 +168,10 @@ impl Default for OutlierDetectionConfig {
 }
 
 impl From<&proxy_config::ir::OutlierDetectionIR> for OutlierDetectionConfig {
-    /// The lowered IR is this config minus
-    /// `split_external_local_origin_errors` (which lowering rejects unless
-    /// `false` -- see the IR type's doc), so that field always takes its only
-    /// implemented value here. Every other field maps 1:1; the two field-name
-    /// differences (`success_rate_min_hosts` / `failure_percentage_min_hosts`)
-    /// are spelled out below. The `ir_defaults_match_runtime_defaults` test in
-    /// this module pins that the two sides' defaults agree, so this mapping
-    /// and the IR cannot silently drift apart.
+    /// The lowered IR is this config minus `split_external_local_origin_errors`, which lowering accepts only as
+    /// `false` (see the IR type's doc), so that field takes its one implemented value here. The other fields map
+    /// 1:1, except the two `min_hosts` names below. `ir_defaults_match_runtime_defaults` pins the defaults, so
+    /// the mapping cannot drift.
     fn from(ir: &proxy_config::ir::OutlierDetectionIR) -> Self {
         Self {
             interval: ir.interval,
@@ -236,19 +199,13 @@ impl From<&proxy_config::ir::OutlierDetectionIR> for OutlierDetectionConfig {
     }
 }
 
-/// Per-host counters the detector needs between requests/intervals. Control-
-/// runtime-only state, guarded by a single [`Mutex`] on
-/// [`OutlierDetector::states`] -- unlike `Host::active_requests`, these
-/// counters are read/written far less often (once per request-completion,
-/// not once per in-flight-gauge check), so a `Mutex<HashMap<..>>` is simple
-/// and fast enough; there's no per-worker hot path touching this map.
+/// Per-host counters the detector needs between requests and intervals, guarded by one [`Mutex`] on
+/// [`OutlierDetector::states`]. They are touched once per request completion, so a `Mutex<HashMap<..>>` is fast enough.
 #[derive(Debug, Default, Clone)]
 struct HostState {
     consecutive_5xx: u32,
     consecutive_gateway_failure: u32,
-    /// How many times this host has been ejected in its lifetime --  drives
-    /// ejection-time growth (S6: `base_ejection_time * consecutive-ejection
-    /// count`).
+    /// Lifetime ejection count. Drives ejection-time growth (S6: `base_ejection_time * consecutive ejection count`).
     ejection_count: u32,
     /// Successes/failures accumulated since the last interval tick, for the
     /// success-rate/failure-percentage detectors.
@@ -301,13 +258,9 @@ pub enum EjectAction {
     Uneject,
 }
 
-/// Envoy's outlier-detection event-log JSON shape (diffable, S6's
-/// acceptance criterion). Field names/shape approximate Envoy's real
-/// `EventLoggerImpl` output; exact fidelity (e.g. `secs_since_last_action`,
-/// which needs cluster-wide last-event tracking we don't keep) is left for
-/// whoever wires this to a real diff-rig fixture -- what matters here is
-/// that every ejection/un-ejection decision produces one structured,
-/// serializable record a caller can capture and compare.
+/// Envoy's outlier-detection event-log JSON shape. Field names approximate Envoy's `EventLoggerImpl` output.
+/// Exact fidelity (for example `secs_since_last_action`, which needs cluster-wide last-event tracking) is left
+/// to whoever wires a real diff-rig fixture. Each ejection or un-ejection yields one serializable record.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutlierEvent {
     pub action: EjectAction,
@@ -330,18 +283,14 @@ pub struct OutlierEvent {
     pub eject_duration_ms: Option<u64>,
 }
 
-/// Where [`OutlierEvent`]s go. Behind a trait so tests can capture them
-/// in-process instead of this module opening a file -- production wiring
-/// (a real event-log sink file, per S6) is left to whoever calls
-/// [`OutlierDetector::new`], not this module's concern.
+/// Where [`OutlierEvent`]s go. A trait, so tests can capture events in-process. Production wiring (a real
+/// event-log file) belongs to whoever calls [`OutlierDetector::new`].
 pub trait OutlierEventSink: Send + Sync {
     fn record(&self, event: OutlierEvent);
 }
 
-/// Default sink: logs the event's JSON via `tracing` rather than opening a
-/// file. Real Envoy writes its event log to a configured file path; nothing
-/// in this crate owns file I/O, so a caller who wants that can implement
-/// [`OutlierEventSink`] over a file themselves.
+/// Default sink: logs the event's JSON via `tracing`. This crate does no file I/O; a caller that wants Envoy's
+/// file log can implement [`OutlierEventSink`] over a file.
 pub struct TracingEventSink;
 
 impl OutlierEventSink for TracingEventSink {
@@ -353,23 +302,14 @@ impl OutlierEventSink for TracingEventSink {
     }
 }
 
-/// Runs one cluster's outlier detection: immediate consecutive-error checks
-/// on every reported request result, plus a periodic (`interval`) pass of
-/// the statistical success-rate/failure-percentage detectors over the whole
+/// Runs one cluster's outlier detection: immediate consecutive-error checks on each reported result, plus a
+/// periodic (`interval`) pass of the statistical success-rate and failure-percentage detectors over the whole
 /// host set.
 ///
-/// Rust note: like [`crate::health_check::HealthCheckEngine`], this type
-/// only runs on the control runtime (the interval loop is a `tokio::spawn`ed
-/// task) but is `Send + Sync` so [`OutlierDetector::report_result`] can be
-/// called from any worker thread that just finished a request. The `Arc`
-/// wrapping `OutlierDetector::host_set`/`OutlierDetector::sink` (rather
-/// than borrowing) is what lets `OutlierDetector::eject` hand a cheap
-/// clone of "how to un-eject this host" to a detached `tokio::spawn`ed timer
-/// without needing the whole detector wrapped in an `Arc` itself -- unlike
-/// `HealthCheckEngine`, `report_result` is a plain `&self` method (matching
-/// the seam the router integration expects), so nothing here requires
-/// callers to hold an `Arc<OutlierDetector>` at all except to call
-/// [`OutlierDetector::spawn`].
+/// Rust note: like [`crate::health_check::HealthCheckEngine`], the interval loop is a spawned task on the
+/// control runtime, but the type is `Send + Sync` so [`OutlierDetector::report_result`] can run on any worker.
+/// `report_result` is a plain `&self` method. The `Arc`s on `host_set` and `sink` let an un-eject timer hold its
+/// own clone without wrapping the whole detector in an `Arc`.
 pub struct OutlierDetector {
     config: OutlierDetectionConfig,
     cluster_name: String,
@@ -377,16 +317,12 @@ pub struct OutlierDetector {
     states: Mutex<HashMap<SocketAddr, HostState>>,
     rng: Mutex<StdRng>,
     sink: Arc<dyn OutlierEventSink>,
-    /// Every pending un-eject timer. Owned here, not detached, so a removed
-    /// cluster's timers stop with it: [`OutlierDetector::shutdown`] and
-    /// dropping the detector both abort them (`JoinSet` aborts on drop). The
-    /// tests also join it to wait deterministically for a scheduled
-    /// un-ejection after advancing the virtual clock.
+    /// Pending un-eject timers. Owned here, so a removed cluster's timers stop with it:
+    /// [`OutlierDetector::shutdown`] and `Drop` both abort them (`JoinSet` aborts on drop). Tests join them to
+    /// wait for a scheduled un-ejection.
     unejects: Mutex<JoinSet<()>>,
-    /// The runtime that built the detector (the control runtime, where the
-    /// cluster manager runs). Timers are spawned there even when the
-    /// ejection is triggered from a worker thread, keeping the "control
-    /// computes, workers read" split.
+    /// The control runtime, where the cluster manager runs. Timers spawn there even when an ejection starts on a
+    /// worker, keeping the "control computes, workers read" split.
     runtime: Option<tokio::runtime::Handle>,
 }
 
@@ -400,12 +336,8 @@ impl OutlierDetector {
         Self::with_seed(config, cluster_name, host_set, sink, rand::random())
     }
 
-    /// Test/determinism seam: fixes the enforcement-percent dice roll's seed.
-    /// Every S6 default is 0% or 100% (never in between), so the roll is
-    /// deterministic regardless of seed for the tests in this file -- this
-    /// exists for parity with the rest of the crate's RNG-seeding
-    /// convention ([`crate::load_balancer`]'s `with_seed` constructors) and
-    /// for whoever configures a non-default enforcement percentage later.
+    /// Test and determinism seam: fixes the enforcement dice-roll seed. Every S6 default is 0% or 100%, so the
+    /// roll is deterministic regardless of seed. Matches the seeding convention of [`crate::load_balancer`].
     pub fn with_seed(
         config: OutlierDetectionConfig,
         cluster_name: impl Into<String>,
@@ -477,18 +409,14 @@ impl OutlierDetector {
                     state.interval_success += 1;
                 }
                 RequestResult::Http5xx | RequestResult::LocalOriginFailure => {
-                    // `split_external_local_origin_errors` is not
-                    // implemented (see the config field's doc comment) --
-                    // local-origin failures always fold in here.
+                    // `split_external_local_origin_errors` is not implemented (see its doc), so local-origin failures
+                    // always fold in here.
                     state.consecutive_5xx += 1;
                     state.interval_failure += 1;
                 }
                 RequestResult::GatewayFailure => {
-                    // Envoy's `DetectorImpl::putHttpResponseCode`: a gateway
-                    // error (502/503/504) is a *subset* of 5xx, so it bumps
-                    // both counters -- see the module doc for the full
-                    // reasoning and the consequence (five consecutive
-                    // gateway failures do eject, via the 5xx detector).
+                    // Envoy's `DetectorImpl::putHttpResponseCode`: a gateway error is a subset of 5xx, so both
+                    // counters bump (see the module doc).
                     state.consecutive_5xx += 1;
                     state.consecutive_gateway_failure += 1;
                     state.interval_failure += 1;
@@ -497,8 +425,7 @@ impl OutlierDetector {
             let fired_5xx = state.consecutive_5xx >= self.config.consecutive_5xx;
             let fired_gateway =
                 state.consecutive_gateway_failure >= self.config.consecutive_gateway_failure;
-            // Reset on crossing regardless of whether the ejection attempt
-            // below is actually enforced -- see the module doc.
+            // Reset on crossing even if the ejection is not enforced (see the module doc).
             if fired_5xx {
                 state.consecutive_5xx = 0;
             }
@@ -598,10 +525,8 @@ impl OutlierDetector {
         }
     }
 
-    /// S6 failure-percentage detection: eject hosts whose interval failure
-    /// rate is at or above `failure_percentage_threshold`, requiring at
-    /// least `failure_percentage_min_hosts` eligible hosts (each with at
-    /// least `failure_percentage_request_volume` requests).
+    /// S6 failure-percentage detection: ejects hosts whose interval failure rate is at or above
+    /// `failure_percentage_threshold`, given at least `failure_percentage_min_hosts` eligible hosts.
     fn run_failure_percentage_detection(&self, snapshot: &[(SocketAddr, u32, u32)]) {
         let eligible: Vec<(SocketAddr, u32)> = snapshot
             .iter()
@@ -642,9 +567,8 @@ impl OutlierDetector {
         self.eject(addr, cause);
     }
 
-    /// Actually eject `addr`, subject to `max_ejection_percent` and
-    /// "already ejected" short-circuits. Schedules the automatic un-eject
-    /// timer on success.
+    /// Ejects `addr`, subject to `max_ejection_percent` and "already ejected" short-circuits. Schedules the
+    /// automatic un-eject timer on success.
     fn eject(&self, addr: SocketAddr, cause: EjectionCause) {
         let snapshot = self.host_set.load();
         let all_hosts = snapshot.all_hosts();
@@ -673,11 +597,8 @@ impl OutlierDetector {
             allowed
         };
         if currently_ejected >= allowed {
-            // Detection fired, but the cluster-wide cap blocks enforcement.
-            // The consecutive counter that got us here was already reset in
-            // `report_result` (or, for the statistical detectors, there's no
-            // consecutive counter to reset) -- see the module doc for why a
-            // crossing always resets regardless of enforcement outcome.
+            // Detection fired, but the cluster-wide cap blocks enforcement. The counter was already reset in
+            // `report_result` (or, for the statistical detectors, there is none); see the module doc.
             self.emit_eject_event(addr, cause, false, None, 0);
             return;
         }
@@ -694,20 +615,15 @@ impl OutlierDetector {
         self.schedule_uneject(addr, duration);
     }
 
-    /// `base_ejection_time * ejection_count`, capped at
-    /// `max(max_ejection_time, base_ejection_time)` (S6: growth per
-    /// consecutive ejection, capped).
+    /// `base_ejection_time * ejection_count`, capped at `max(max_ejection_time, base_ejection_time)`.
     fn ejection_duration(&self, ejection_count: u32) -> Duration {
         let base = self.config.base_ejection_time;
         let cap = self.config.max_ejection_time.max(base);
         base.saturating_mul(ejection_count.max(1)).min(cap)
     }
 
-    /// Un-eject timer, owned by the detector. Deliberately does not need `Arc<Self>` --
-    /// only clones of `host_set`/`sink`/`cluster_name` cross into the
-    /// spawned task, so `report_result`/`eject` can stay plain `&self`
-    /// methods (matching the router-facing API shape the router expects) even
-    /// though ejection itself needs a background timer.
+    /// Un-eject timer, owned by the detector. Only clones of `host_set`, `sink`, and `cluster_name` cross into
+    /// the spawned task, so `report_result` and `eject` can stay plain `&self` methods.
     fn schedule_uneject(&self, addr: SocketAddr, duration: Duration) {
         let host_set = Arc::clone(&self.host_set);
         let sink = Arc::clone(&self.sink);
@@ -737,29 +653,13 @@ impl OutlierDetector {
         }
     }
 
-    /// Toggle one host's `failed_outlier_check` bit, preserving
-    /// `failed_active_hc` and `active_requests` untouched -- same discipline
-    /// as `health_check::apply_health_transition`, and a free-standing
-    /// associated function (not `&self`) so both instance methods and the
-    /// detached `schedule_uneject` task above can share it.
-    ///
-    /// Returns whether the flag actually changed (a no-op toggle -- e.g.
-    /// un-ejecting an already-healthy host -- returns `false` so callers
-    /// know not to emit a redundant event).
+    /// Toggles one host's `failed_outlier_check` bit, leaving `failed_active_hc` and `active_requests` alone. Same
+    /// discipline as `health_check::apply_health_transition`. A free function, so the detached `schedule_uneject`
+    /// task can share it. Returns whether the flag changed, so callers do not emit a redundant event.
     fn set_outlier_flag(host_set: &ArcSwap<HostSet>, addr: SocketAddr, ejected: bool) -> bool {
-        // Rust note: `rcu`, not `load()`/`store()` -- see
-        // `health_check::apply_health_transition`'s Rust note for the full
-        // lost-update argument. The interval sweep, the immediate
-        // consecutive-error path, and the un-eject timers can all publish to
-        // this same `ArcSwap` concurrently, so a plain read-modify-write
-        // would silently drop concurrent transitions on other hosts.
-        //
-        // `changed` is an `AtomicBool` (not a plain `bool`) captured by
-        // reference into the closure: `rcu` may invoke the closure more than
-        // once if it loses the compare-and-swap race, and a `Fn` closure
-        // can't capture a plain `&mut bool`. Only the matching host's branch
-        // ever touches it, so a retried invocation just overwrites it with
-        // the (same) correct answer for that retry's snapshot.
+        // Rust note: `rcu`, not `load()` then `store()`, so concurrent transitions on other hosts are not lost
+        // (see `health_check::apply_health_transition`). `changed` is an `AtomicBool` because `rcu` may run the
+        // closure more than once on a lost compare-and-swap, and an `Fn` closure cannot capture a plain `&mut bool`.
         let changed = std::sync::atomic::AtomicBool::new(false);
         host_set.rcu(|current| {
             let updated: Vec<Arc<Host>> = current
@@ -847,13 +747,10 @@ mod tests {
     use crate::LoadBalancerContext;
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// The IR duplicates every S6 default because `proxy-config` cannot
-    /// depend on `proxy-cluster` (the dependency runs the other way). This
-    /// crate can see both, so it is the only place that can prove the two
-    /// independent copies agree -- and that the IR->config `From` mapping
-    /// wires each field to its namesake. Without this, a default changed on
-    /// one side alone would silently give a config-built detector different
-    /// behavior from a `Default`-built one.
+    /// The IR duplicates every S6 default because `proxy-config` cannot depend on `proxy-cluster`. This crate
+    /// can see both copies, so it is the only place that can prove they agree, and that the IR-to-config `From`
+    /// mapping wires each field to its namesake. Otherwise a default changed on one side alone would silently
+    /// change behavior.
     #[test]
     fn ir_defaults_match_runtime_defaults() {
         let from_ir =
@@ -937,12 +834,9 @@ mod tests {
             .failed_outlier_check
     }
 
-    /// Most tests below use a 2-host cluster and want to isolate the
-    /// consecutive/statistical detectors from `max_ejection_percent`'s cap
-    /// (which its own dedicated test below exercises): S6's default 10% over
-    /// 2 hosts rounds down to `allowed = 0`, i.e. *no* ejection would ever
-    /// be enforced. Effectively-uncapped is the right default everywhere
-    /// else in this file.
+    /// Most tests use a 2-host cluster and want the consecutive and statistical detectors isolated from the
+    /// `max_ejection_percent` cap (which its own test exercises). The S6 default of 10% over 2 hosts rounds down
+    /// to zero, so nothing would ever eject. Effectively uncapped is the right default elsewhere.
     fn config_without_ejection_cap() -> OutlierDetectionConfig {
         OutlierDetectionConfig {
             max_ejection_percent: 100,
@@ -1108,9 +1002,8 @@ mod tests {
         );
     }
 
-    /// A removed cluster's un-eject timers must stop: after `shutdown` (and
-    /// after the detector is dropped) the pending timer never fires, so no
-    /// stale un-eject event is emitted and the orphaned host set is untouched.
+    /// A removed cluster's un-eject timers must stop: after `shutdown` (or dropping the detector), the pending
+    /// timer never fires, so no stale event is emitted and the orphaned host set is untouched.
     #[tokio::test(start_paused = true)]
     async fn shutdown_and_drop_stop_pending_uneject_timers() {
         let a = addr(1);
@@ -1145,13 +1038,9 @@ mod tests {
 
     // --------------------------------- gateway failure, 0% enforcement --
 
-    /// Envoy behaviour (`DetectorImpl::putHttpResponseCode`): a gateway
-    /// failure bumps *both* the consecutive-5xx and
-    /// consecutive-gateway-failure counters, so with S6 defaults (both
-    /// thresholds 5, `enforcing_consecutive_5xx` 100%,
-    /// `enforcing_consecutive_gateway_failure` 0%) five consecutive gateway
-    /// failures DO eject -- via the 5xx detector, not the gateway detector.
-    /// See the module doc for the full reasoning.
+    /// Envoy behavior (`DetectorImpl::putHttpResponseCode`): a gateway failure bumps both the consecutive-5xx and
+    /// consecutive-gateway-failure counters. With S6 defaults, five consecutive gateway failures DO eject, via
+    /// the 5xx detector, not the gateway detector. See the module doc.
     #[tokio::test]
     async fn five_consecutive_gateway_failures_eject_via_the_5xx_detector() {
         let a = addr(1);
@@ -1183,12 +1072,10 @@ mod tests {
         );
     }
 
-    /// Isolates the gateway detector by making `consecutive_5xx`
-    /// unreachable (100, but only 5 requests are fed): only the gateway
-    /// detector can fire, and at its default 0% enforcement it must not
-    /// eject. This is what `enforcing_consecutive_gateway_failure = 0`
-    /// actually guarantees -- not that gateway failures never eject at all
-    /// (they do, via the 5xx detector; see the sibling test).
+    /// Isolates the gateway detector by making `consecutive_5xx` unreachable (threshold 100, but only 5 requests
+    /// are fed). At its default 0% enforcement the gateway detector must not eject. This is what
+    /// `enforcing_consecutive_gateway_failure = 0` guarantees; gateway failures can still eject via the 5xx
+    /// detector (see the sibling test).
     #[test]
     fn gateway_failure_detector_alone_does_not_eject_at_zero_enforcement() {
         let a = addr(1);
@@ -1235,10 +1122,9 @@ mod tests {
 
     // --------------------------------------- success-rate volume gating --
 
-    /// Feeds `pattern` repeated `repeats` times, alternating success/failure
-    /// so the *immediate* consecutive-5xx detector (threshold 5, S6 default)
-    /// never fires and confounds these tests -- only the interval-driven
-    /// success-rate/failure-percentage detectors should be under test here.
+    /// Feeds `pattern` repeated `repeats` times, alternating success and failure so the immediate consecutive-5xx
+    /// detector (S6 default threshold 5) never fires and confounds the test. Only the interval-driven
+    /// success-rate and failure-percentage detectors should be under test here.
     fn feed_pattern(
         engine: &OutlierDetector,
         target: SocketAddr,
@@ -1254,10 +1140,8 @@ mod tests {
 
     #[tokio::test]
     async fn success_rate_detection_respects_min_hosts_and_request_volume() {
-        // Only 3 hosts (< min_hosts=5) each well past request_volume -- one
-        // host clearly failing most requests (in a S,F,F,F,F pattern so the
-        // consecutive-5xx detector never trips), the rest clean. Must not
-        // eject: not enough eligible hosts.
+        // Only 3 hosts (< min_hosts=5), each well past request_volume. One host fails most requests (S,F,F,F,F, so
+        // the consecutive-5xx detector never trips); the rest are clean. Must not eject: not enough eligible hosts.
         let hosts: Vec<Arc<Host>> = (1..=3).map(host).collect();
         let (engine, host_set, _sink) = detector(hosts, config_without_ejection_cap());
         feed_pattern(
@@ -1309,11 +1193,9 @@ mod tests {
 
     #[tokio::test]
     async fn success_rate_detection_ejects_a_clear_outlier_once_thresholds_are_met() {
-        // 5 hosts (== min_hosts), all with >= 100 requests. Host 1 succeeds
-        // only 1 request in every 5 (20%, in a S,F,F,F,F pattern so the
-        // consecutive-5xx detector never trips); hosts 2-5 are 100% --  a
-        // wide enough gap to clear a 1.9-sigma bar even with the low-variance
-        // peer group.
+        // 5 hosts (== min_hosts), all with >= 100 requests. Host 1 succeeds 1 request in 5 (S,F,F,F,F, so the
+        // consecutive-5xx detector never trips); hosts 2-5 are 100%. The gap is wide enough to clear a 1.9-sigma
+        // bar even with the low-variance peer group.
         let hosts: Vec<Arc<Host>> = (1..=5).map(host).collect();
         let (engine, host_set, _sink) = detector(hosts, config_without_ejection_cap());
         feed_pattern(
@@ -1386,9 +1268,8 @@ mod tests {
         let (engine, host_set, _sink) =
             detector(vec![host(1), host(2)], config_without_ejection_cap());
 
-        // Fail active HC directly on the snapshot (no HealthCheckEngine
-        // needed for this assertion -- we're testing HealthFlags rendering
-        // and is_healthy(), not the active health check engine).
+        // Fail active HC directly on the snapshot. This tests `HealthFlags` rendering and `is_healthy()`, not the
+        // active health check engine.
         host_set.rcu(|current| {
             let updated: Vec<Arc<Host>> = current
                 .all_hosts()

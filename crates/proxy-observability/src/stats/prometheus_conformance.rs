@@ -1,60 +1,21 @@
-//! Grafana-dashboard conformance test.
+//! Provisional Grafana-dashboard conformance check. It is **not** yet checked
+//! against Envoy's own dashboard.
 //!
-//! Status: **provisional — not yet checked against Envoy's own dashboard.**
+//! As of 2026-08-09, neither this repo nor `envoyproxy/envoy` contained an
+//! Envoy-published Grafana dashboard. A "Envoy Clusters" dashboard on
+//! grafana.com is a third-party contribution, so it was not used.
 //!
-//! # What was actually checked before writing this file
-//!
-//! The acceptance criterion is "Envoy's own Grafana dashboard
-//! queries populating against our Prometheus output". Before writing a
-//! fixture, this repo and `envoyproxy/envoy` were both searched for one:
-//!
-//! 1. **This repo** (`testing/`, `examples/`, anything vendored under
-//!    `crates/proxy-api/vendor/`): no Grafana JSON, no PromQL, nothing
-//!    dashboard-shaped anywhere.
-//! 2. **`envoyproxy/envoy` itself**, fetched directly (network available,
-//!    checked 2026-08-09): the repository's **full recursive git tree** at
-//!    `main` (commit `d57118924c85fcaa07758dddbb9c5da4e89045af`) was pulled
-//!    via GitHub's Git Trees API with `recursive=1` and confirmed
-//!    **not truncated** (`"truncated": false` — i.e. this really is every
-//!    path in the repo, not a partial listing), then searched case-
-//!    insensitively for `grafana` and `dashboard`. **Zero matches.** Envoy's
-//!    own repository does not vendor a Grafana dashboard anywhere.
-//! 3. **grafana.com's public dashboard catalog** (not the envoyproxy/envoy
-//!    repository the brief pointed at, so checked only as a fallback): a
-//!    dashboard titled "Envoy Clusters" exists there (catalog id `11021`,
-//!    downloadable, and it does download successfully). Its own metadata
-//!    (`orgName: "mischenkovn"`) shows it is a **third-party community
-//!    contribution**, not something published by the Envoy project. Per this
-//!    the brief's own instructions — "do NOT invent a dashboard and do NOT fake the
-//!    test" — an unverified third party's dashboard is treated the same as
-//!    having found nothing: it is not "Envoy's own dashboard", and building
-//!    a conformance test against it would risk exactly the kind of
-//!    unverified artifact this project has been bitten by before.
-//!
-//! **Conclusion: no obtainable artifact satisfies the brief's actual
-//! acceptance criterion.** This file is the honest fallback the design
-//! brief names for exactly this outcome.
-//!
-//! # What this file asserts instead
-//!
-//! A small, explicitly-listed set of Prometheus metric family names, taken
-//! directly from the instruments [`crate::stats::instruments`] defines
-//! today — nothing invented, nothing borrowed from an unverified source. It
-//! proves the renderer can produce a scrapeable series for every instrument
-//! this registry actually has, which is necessary but **not sufficient**
-//! for the brief's real bar. **Do not extend this file as a substitute for
-//! the real conformance test** — replace it outright once an authoritative
-//! Envoy dashboard (or its extracted PromQL metric list) is obtained, and
-//! delete this doc comment's caveats along with it.
+//! This file asserts that every instrument in [`crate::stats::instruments`]
+//! renders a Prometheus series. That is necessary but not sufficient. Replace
+//! it once an authoritative Envoy dashboard, or its PromQL metric list, is
+//! available.
 
 use super::prometheus_render::render;
 use super::{instruments, StatsControl, WorkerId};
 
-/// One Prometheus metric family name per instrument `crate::stats::instruments`
-/// defines, in `envoy_<sanitized instrument name>` form (see
-/// `prometheus_render`'s module doc for the naming rule). Update this list
-/// whenever an instrument is added or renamed — this test only proves the
-/// renderer covers *this* list, not "every instrument that will ever exist".
+/// One family name per instrument in `crate::stats::instruments`, in
+/// `envoy_<sanitized name>` form. Update this list when an instrument is added
+/// or renamed. The test covers only this list.
 const EXPECTED_METRIC_FAMILIES: &[&str] = &[
     "envoy_upstream_rq",
     "envoy_downstream_cx_total",
@@ -64,8 +25,7 @@ const EXPECTED_METRIC_FAMILIES: &[&str] = &[
 
 /// Resolves and records one measurement against every instrument named in
 /// [`EXPECTED_METRIC_FAMILIES`], then asserts the rendered Prometheus output
-/// contains each family name — failing with the list of whichever are
-/// missing, per the brief.
+/// contains each family name, and lists any that are missing on failure.
 #[test]
 fn renderer_produces_a_series_for_every_known_instrument() {
     let control = StatsControl::new(1);

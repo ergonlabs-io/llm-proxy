@@ -1,12 +1,9 @@
-//! Acceptance: the ADS gRPC request/response pump and
-//! the reconnect loop above it, run
-//! against `testing/controlplane`'s `ScriptedAds` over a real loopback
-//! socket -- the same model `testing/controlplane/tests/ads_selftest.rs`
-//! uses to drive the generated client stub directly.
+//! Acceptance tests for the ADS pump and reconnect loop, run against
+//! `testing/controlplane`'s `ScriptedAds` over a real loopback socket.
 //!
-//! Every test here bounds every wire wait with `tokio::time::timeout` (rule
-//! 14: a hang must fail loudly, not stall) and uses ephemeral ports only
-//! (`Harness::spawn` binds `127.0.0.1:0`; AGENTS.md "Running The Product").
+//! Every wire wait is bounded, so a hang fails instead of stalling (AGENTS.md
+//! "Build And Test", Hangs). Ports are ephemeral (`Harness::spawn` binds
+//! `127.0.0.1:0`; AGENTS.md "Running The Product").
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -225,9 +222,7 @@ async fn empty_name_subscription_is_never_requested() {
 /// of the range) so every recorded delay is the policy's exact cap for that
 /// attempt.
 ///
-/// Returning immediately is what keeps these tests at milliseconds: the
-/// assertion is "the loop asked for 500ms", which is the real claim -- that
-/// it actually slept is `tokio::time::sleep`'s problem.
+/// Returning at once keeps these tests fast. The claim is the delay requested.
 fn recording_reconnect(policy: BackoffPolicy) -> (Reconnect, Arc<Mutex<Vec<Duration>>>) {
     let recorded: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&recorded);
@@ -260,16 +255,9 @@ async fn wait_for_delays(delays: &Arc<Mutex<Vec<Duration>>>, want: usize) -> Vec
     }
 }
 
-/// The `reconnect-resync` acceptance scenario, and S8's reconnect rule:
-///
-/// > Reconnect: new stream, re-send all subscriptions with acked versions
-/// > (versions persist across streams for same server).
-///
-/// The script serves v1, drops the stream, then serves v2. The claim is
-/// about the FIRST request of the second stream: it must carry `v1` (the
-/// version survived) and an EMPTY nonce (the nonce did not). Sending `n1`
-/// there would echo a nonce the new stream never issued; sending an empty
-/// version would ask the control plane to re-send config we already have.
+/// S8 reconnect rule: versions persist across streams, nonces do not. The
+/// script serves v1, drops the stream, then serves v2. The first request of the
+/// second stream must carry `v1` and an empty nonce.
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnect_resends_the_acked_version_with_no_nonce() {
     let harness = Harness::spawn(vec![
@@ -441,20 +429,13 @@ async fn backoff_grows_across_dead_streams_and_resets_after_a_response() {
     harness.shutdown().await;
 }
 
-/// `run` must call [`SubscriptionState::reset_stream`] before each new
-/// stream, and this test observes the state directly rather than the wire.
+/// `run` must call [`SubscriptionState::reset_stream`] before each new stream.
+/// The wire cannot show this, because `initial_request()` never sets a nonce.
+/// The reset is state hygiene, visible only through `last_nonce()`.
 ///
-/// It has to, and the reason is worth recording: `initial_request()` hardcodes
-/// `response_nonce: None`, so a `run` that forgot the reset would still put a
-/// correct (nonce-free) resync request on the wire. The reset is therefore
-/// **state hygiene, not the wire guarantee** -- `last_nonce()` is public, and
-/// callers read it. A mutation removing the reset survives every
-/// wire-level assertion in this file and fails only here.
-///
-/// Rust note: `tokio::time::timeout` around `run` (whose return type is `!`)
-/// is what makes the client inspectable -- the timeout drops the future, which
-/// ends the `&mut ads` borrow, and the states are readable afterwards. That is
-/// why this test does not `tokio::spawn` the way its neighbours do.
+/// Rust note: the timeout drops the `run` future, which releases the `&mut`
+/// borrow, so the states can be read afterwards. That is why this test does
+/// not `tokio::spawn`.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_clears_the_nonce_but_keeps_the_version_across_a_reconnect() {
     let harness = Harness::spawn(vec![
@@ -524,12 +505,9 @@ fn test_node() -> NodeIdentity {
     }
 }
 
-/// The xDS protocol, and Envoy's own `GrpcMuxImpl`: a client sends its node
-/// identity on the FIRST request of a stream and omits it from every request
-/// after. An earlier version built the request and never set the field at all --
-/// `to_proto` filled five fields and then `..Default::default()` -- so every
-/// request went out anonymous, which a control plane keying on `node.id`
-/// (go-control-plane's snapshot cache does) has no way to serve.
+/// The node identity goes on the FIRST request of a stream and is omitted
+/// after (S8). A control plane keying on `node.id` cannot serve an anonymous
+/// client.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_request_of_a_stream_carries_the_node_and_later_ones_do_not() {
     let harness = Harness::spawn(vec![Step::Send {
@@ -701,15 +679,9 @@ impl ResponseHandler for DelayedHandler {
     }
 }
 
-/// The acceptance claim: with a handler whose future is
-/// still pending, the ACK for the response it is handling must not have
-/// reached the control plane yet. Once the gate is released, the ACK follows.
-///
-/// Both waits are bounded (AGENTS.md "Build And Test", Hangs): the first is expected to time out, and
-/// asserting that via `Result::expect_err` on a short `tokio::time::timeout`
-/// is what turns "the ACK went out early" into a named failure rather than a
-/// pass that just got lucky on timing, and what keeps this test itself from
-/// hanging if `run_once` never sends the ACK at all.
+/// While the handler's future is pending, the ACK must not be sent. Once the
+/// gate opens, the ACK follows. Both waits are bounded, and the early-ACK check
+/// is a short timeout that is expected to fail.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ack_does_not_reach_the_wire_until_the_handler_future_resolves() {
     let harness = Harness::spawn(vec![Step::Send {

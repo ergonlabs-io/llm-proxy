@@ -1,16 +1,9 @@
-//! The access-log *writer* half — turning a rendered
-//! [`crate::access_log::render`] line into bytes on stdout/stderr/disk.
+//! The access-log writer. It turns a rendered [`crate::access_log::render`]
+//! line into bytes on stdout, stderr or a file.
 //!
-//! [`AccessLogSink`] is defined **here**, not in `proxy-config`'s IR, and the
-//! IR re-exports it (`proxy_config::ir::AccessLogSink`). The dependency edge
-//! only runs one way — `proxy-config` depends on this crate for
-//! [`crate::access_log::FormatString`] and [`crate::ResponseFlag`] — so
-//! defining the enum on this side is what lets both crates name one type
-//! instead of two same-shaped twins that could silently drift apart.
-//!
-//! Wiring this into the router/filter manager and SIGUSR1-driven `reopen()`
-//! are both out of scope here; this module only has to make "write a line
-//! to the configured destination, and support logrotate-style reopen" true.
+//! [`AccessLogSink`] lives here and the IR re-exports it. `proxy-config`
+//! depends on this crate, not the reverse, so defining the enum here keeps one
+//! type instead of two that could drift apart.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -35,21 +28,12 @@ pub enum AccessLogSink {
 
 /// A destination for rendered access-log lines.
 ///
-/// Rust note: this is a trait object (`Arc<dyn AccessLogWriter>`) rather than
-/// an enum because the set of sinks is open-ended in spirit (stdout, stderr,
-/// file today; a network sink is a plausible future variant) and callers
-/// only ever need "write a line somewhere" — they don't match on which sink
-/// they got.
+/// Rust note: a trait object (`Arc<dyn AccessLogWriter>`), since callers only
+/// need "write a line somewhere" and never match on the sink kind.
 ///
-/// `write_line` deliberately does **not** return a `Result`: a broken log
-/// destination (disk full, permission revoked out from under us, a deleted
-/// stdout pipe) must never fail — or even slow down — the request whose line
-/// we're trying to log. Errors are swallowed here, but a write that starts
-/// failing tends to keep failing on every subsequent request, so an
-/// unfiltered `tracing::warn!` per call would just trade "silent data loss"
-/// for "log-flood self-DoS." We rate-limit the warning instead: the first
-/// failure (and at most one every few seconds after) is surfaced: enough to
-/// notice, not enough to make things worse.
+/// `write_line` returns no `Result`. A broken destination must never fail or
+/// slow the request being logged. Errors are counted, and the warning is
+/// rate-limited so a persistent failure cannot flood the log.
 pub trait AccessLogWriter: Send + Sync {
     /// Write one already-rendered line verbatim (no newline is added or
     /// assumed; Envoy format strings typically end with `\n` themselves).
@@ -62,13 +46,10 @@ pub trait AccessLogWriter: Send + Sync {
     fn reopen(&self) -> io::Result<()>;
 }
 
-/// Warns at most once per [`RATE_LIMIT_SECS`] seconds, no matter how many
-/// callers race to report a failure at once.
+/// Warns at most once per [`RATE_LIMIT_SECS`], however many callers race.
 ///
-/// Rust note: `AtomicU64` (not `Mutex<Instant>`) so `should_warn` never
-/// blocks — it's called from the hot write path of a sink that failed, and
-/// we don't want a failing log destination to also become a lock contention
-/// point.
+/// Rust note: an `AtomicU64`, not a `Mutex`, so a failing destination does not
+/// also become a lock contention point.
 struct RateLimiter {
     last_warn_unix_secs: AtomicU64,
 }
@@ -93,11 +74,8 @@ impl RateLimiter {
         if now.saturating_sub(last) < RATE_LIMIT_SECS {
             return false;
         }
-        // Rust note: compare_exchange, not a plain store — if two threads
-        // both decide "should warn" at once, only one wins the race and
-        // actually logs; the loser sees a fresh `last` and backs off. Either
-        // outcome is fine (we only promise *a* bound on warn frequency, not
-        // exactly one warn per window), `Ok`/`Err` just picks who logs here.
+        // Rust note: `compare_exchange` lets only one racing thread win the
+        // warn for this window.
         self.last_warn_unix_secs
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
@@ -273,13 +251,9 @@ impl AccessLogWriter for FileSink {
 
 // ------------------------------------------------------------ queued sink --
 
-/// Upper bound on bytes waiting in one [`QueuedSink`]. Bytes, not lines,
-/// because line size varies by an order of magnitude between a text format
-/// and a JSON format with many fields. 8 MiB is roughly 40k typical lines:
-/// several seconds of buffering at thousands of requests per second, enough
-/// to ride out a logrotate hiccup or a short collector stall, small enough
-/// that a destination that never recovers costs a bounded, known amount of
-/// memory per destination rather than growing with traffic.
+/// Upper bound on bytes waiting in one [`QueuedSink`]. It is measured in bytes
+/// because line sizes vary widely between formats. 8 MiB rides out a short
+/// stall, and a dead destination costs a bounded amount of memory.
 const QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// How long the blocking control calls (`flush`, `reopen`) wait for the
@@ -352,14 +326,9 @@ static WRITE_FAILURE_STAT: std::sync::RwLock<
     Option<(Arc<crate::stats::Registry>, crate::stats::Handle)>,
 > = std::sync::RwLock::new(None);
 
-/// Count every future dropped line in `llmproxy_access_log_dropped_lines`.
-/// Call once at boot, after the stats control exists. Registering again
-/// (tests, a second `run_serve` in one process) replaces the destination.
-/// Lines dropped before registration are not back-filled; sinks open at
-/// config load and a queue cannot overflow before traffic starts.
-///
-/// The drop path takes this read lock, which is fine: it only runs once a
-/// queue is already overflowing, never on the healthy path.
+/// Count future dropped lines in `llmproxy_access_log_dropped_lines`. Call once
+/// at boot. Registering again replaces the destination. The drop path takes this
+/// read lock, but only once a queue is already overflowing.
 pub fn register_dropped_lines_counter(control: &crate::stats::StatsControl) {
     let handle = control.resolve(&crate::stats::instruments::ACCESS_LOG_DROPPED_LINES, &[]);
     // Rust note: a poisoned lock only means another thread panicked while
@@ -437,29 +406,16 @@ impl QueueShared {
 
 /// Makes any [`AccessLogWriter`] non-blocking for the caller.
 ///
-/// `write_line` copies the line into a bounded queue and returns; a
-/// dedicated OS thread (`access-log-writer`) drains it in batches, writes
-/// each line to the inner sink, and flushes once per batch. A stalled stdout
-/// pipe or slow disk therefore stalls only that thread, never a request
-/// worker (and never the other workers, which previously serialized on the
-/// sink's lock).
+/// `write_line` copies the line into a bounded queue. A dedicated thread drains
+/// it, so a stalled pipe or slow disk never blocks a request worker.
 ///
-/// Drop policy (fail-open, loud): when the queue is full the NEW line is
-/// dropped and counted. Dropping the newest keeps the queue contents in
-/// order and costs nothing on the healthy path. Each drop bumps
-/// [`QueuedSink::dropped`] and the process-wide [`dropped_lines_total`]; a
-/// `tracing::warn!` names the destination and the running count, at most once
-/// per [`RATE_LIMIT_SECS`]. The limiter is only consulted after the queue has
-/// already refused a line, so the healthy path never touches it.
+/// Drop policy is fail-open and loud. When the queue is full the NEW line is
+/// dropped and counted, and a rate-limited warning names the destination. The
+/// limiter runs only after a refusal, so the healthy path never touches it.
 ///
-/// Semantics of the trait methods:
-/// - `flush()` BLOCKS (up to 5s) until the writer has written and flushed
-///   everything queued before the call. Call it from shutdown/control paths
-///   only, never per request.
-/// - `reopen()` is a control message ordered after earlier lines, so it
-///   cannot race in-flight writes; it returns the inner result.
-/// - Dropping the sink lets the writer drain the remainder and exit but does
-///   not wait; use [`flush_all_queued`] before process exit.
+/// - `flush()` blocks (up to 5s). Use it only on shutdown or control paths.
+/// - `reopen()` is queued after earlier lines, so it cannot race them.
+/// - Dropping the sink does not wait. Call [`flush_all_queued`] before exit.
 pub struct QueuedSink {
     shared: Arc<QueueShared>,
 }
@@ -629,12 +585,9 @@ fn shared_stdio(sink: &AccessLogSink) -> io::Result<Option<Arc<dyn AccessLogWrit
 
 // -------------------------------------------------------------- build_sink --
 
-/// Build a single writer for `sink`, queued so callers never block on I/O
-/// (stdout/stderr share one process-wide queue; file sinks share one per
-/// canonical path, see [`SinkRegistry`]). AGENTS.md invariant 1: every
-/// [`AccessLogSink`] variant is matched explicitly, so adding a variant
-/// without updating this function is a compile error, not a silent
-/// stdout-fallback.
+/// Build a queued writer for `sink`. Every [`AccessLogSink`] variant is matched
+/// explicitly, so a new variant is a compile error here, not a silent
+/// stdout fallback (AGENTS.md invariant 1).
 pub fn build_sink(sink: &AccessLogSink) -> io::Result<Arc<dyn AccessLogWriter>> {
     Ok(match sink {
         AccessLogSink::Stdout | AccessLogSink::Stderr => {
@@ -646,15 +599,10 @@ pub fn build_sink(sink: &AccessLogSink) -> io::Result<Arc<dyn AccessLogWriter>> 
 
 // ------------------------------------------------------------- registry --
 
-/// Canonicalize `path` into a stable dedup key without requiring the file to
-/// already exist (`Path::canonicalize` would fail on a not-yet-created log
-/// file, which is the common case).
+/// Canonicalize `path` into a dedup key without requiring the file to exist.
 ///
-/// Rust note: this resolves "relative vs. absolute", not symlinks — two
-/// different symlinks to the same inode are treated as different sinks. Good
-/// enough for the config-authoring pattern this dedups (the same
-/// `access_log.path` string reused across multiple listeners/filters), not a
-/// general filesystem-identity check.
+/// Rust note: this resolves relative vs. absolute paths, not symlinks. That is
+/// enough for the same `access_log.path` string reused across listeners.
 fn canonical_key(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -676,12 +624,9 @@ fn file_sinks() -> &'static Mutex<FileSinkMap> {
 }
 
 /// The one [`QueuedSink`] for `path` in this process, created on first use.
-///
-/// Every worker, HCM filter chain and config generation builds its own
-/// handler, so without this each would spawn its own writer thread and queue
-/// and append through a separate `BufWriter`. Sharing makes the 8 MiB queue
-/// bound per path. The file is opened outside the lock; if another thread
-/// registered the path meanwhile, ours is discarded (its thread exits on drop).
+/// Sharing keeps the queue bound per path, and avoids interleaved partial
+/// lines from separate buffers. The file opens outside the lock. If another
+/// thread won the race, the extra sink is dropped.
 fn shared_file(path: &str) -> io::Result<Arc<QueuedSink>> {
     let key = canonical_key(Path::new(path));
     if let Some(live) = file_sinks()
@@ -705,12 +650,9 @@ fn shared_file(path: &str) -> io::Result<Arc<QueuedSink>> {
     Ok(fresh)
 }
 
-/// Entry point for building writers from access-log config. Two configs
-/// naming the same file share one process-wide [`QueuedSink`] (one writer
-/// thread, one queue, one `BufWriter`) no matter which registry, worker,
-/// filter chain or config generation built them, instead of interleaving
-/// partial lines through independent buffers. The registry itself is
-/// stateless; the dedup map is process-wide.
+/// Entry point for building writers from access-log config. Configs that name
+/// the same file share one [`QueuedSink`]. The registry is stateless, and the
+/// dedup map is process-wide.
 pub struct SinkRegistry {
     _private: (),
 }

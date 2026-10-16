@@ -1,14 +1,8 @@
 //! `Cluster.metadata.filter_metadata["io.llmproxy.provider_auth"]`
-//! -> `ClusterConfig.request_headers_to_add`. This is the surface the
-//! `llmproxy` dialect uses to smuggle provider credentials onto the CLUSTER
-//! (see `ClusterConfig::request_headers_to_add`'s doc comment in
-//! `proxy-config/src/ir.rs` for why they can no longer live on the route),
-//! since Envoy has no proto field for per-provider auth headers and the
-//! dialect lowers through this identical strict-parse -> PGV -> IR pipeline.
-//!
-//! A hand-written Envoy config that never sets this namespace must be
-//! completely unaffected -- covered here alongside the malformed-shape
-//! cases, which must all be hard errors (AGENTS.md invariant 1).
+//! Tests lowering provider-auth metadata into cluster request headers. The
+//! namespace carries per-provider credentials because Envoy has no dedicated
+//! field for them. Unset metadata remains unaffected; malformed shapes fail
+//! with dotted paths (AGENTS.md invariant 1).
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -39,10 +33,8 @@ static_resources:
     assert!(cluster.request_headers_to_add.is_empty());
 }
 
-/// `metadata` present, but no `io.llmproxy.provider_auth` namespace: still
-/// empty, and a namespace belonging to some other consumer must not trip
-/// the surface check (AGENTS.md invariant 1 rejects unknown *fields*, not unknown
-/// map entries under an allowed field).
+/// Other metadata namespaces remain untouched; strict checks reject unknown
+/// fields, not entries inside an allowed metadata map.
 #[test]
 fn unrelated_metadata_namespace_is_left_alone() {
     let yaml = r#"

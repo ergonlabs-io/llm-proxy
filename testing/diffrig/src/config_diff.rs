@@ -93,16 +93,8 @@ pub struct ConfigDiff {
     pub verdict: Verdict,
 }
 
-/// Run the real Envoy validator against `config_path` inside a throwaway
-/// `--rm` container, mounting the file read-only at `/config.yaml`. Envoy's
-/// `--mode validate` prints `configuration '<path>' OK` to stdout and exits 0
-/// on success; on failure it exits nonzero and the useful diagnostic is on
-/// stderr (all of Envoy's own logging also goes to stderr, mixed in).
-///
-/// # Errors
-/// Only if `docker` itself cannot be invoked (not installed, daemon down) —
-/// a config that Envoy rejects is a *result* (`ValidationResult::Rejected`),
-/// never a tool error.
+/// Runs Envoy validation in a read-only, throwaway container. Rejected configs
+/// return `ValidationResult::Rejected`; errors are limited to invoking Docker.
 pub fn validate_with_envoy(
     config_path: &Path,
     envoy_image: &str,
@@ -125,13 +117,8 @@ pub fn validate_with_envoy(
     Ok(ValidationResult::from_output(&output))
 }
 
-/// Run `llm_proxy_bin --mode validate -c config_path` on the host and
-/// classify its exit status the same way as [`validate_with_envoy`] — see
-/// `crates/proxy/src/main.rs`'s `main`, which prints the same
-/// `OK`-on-stdout/error-on-stderr shape by design (it mirrors Envoy's CLI).
-///
-/// # Errors
-/// Only if the binary cannot be spawned at all (missing/not executable).
+/// Runs the proxy's validator and classifies its exit status like Envoy's.
+/// Returns an error only if the binary cannot be spawned.
 pub fn validate_with_llmproxy(
     config_path: &Path,
     llm_proxy_bin: &Path,

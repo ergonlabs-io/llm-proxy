@@ -27,25 +27,9 @@ pub enum BodyError {
     Upstream(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// A streaming HTTP body (request or response), boxed. Carries data frames
-/// and a final optional trailers frame, per the `http_body` model. Boxing
-/// (rather than naming a concrete type) is what lets this module -- and
-/// [`StreamHandler`] implementors -- stay decoupled from hyper's `Incoming`
-/// body type (AGENTS.md invariant 2 in spirit: the codec is the only place that talks
-/// hyper).
-///
-/// Deliberately **not** `Send` (ADR-0003: the data plane never hops threads).
-/// `http_body_util::combinators::BoxBody` requires `Send + Sync`, and its
-/// `UnsyncBoxBody` variant still requires `Send` -- so neither can hold `!Send`
-/// per-stream filter state (e.g. a `Box<dyn HttpFilter>` owning `Rc`/`RefCell`)
-/// inside a streaming body, which is exactly what streaming a response through
-/// the filter chain needs. This hand-rolled alias drops both bounds;
-/// hyper's http1 server only requires `B: Body + 'static`, not `B: Send`.
-///
-/// NOTE: this was verified against hyper's **http1** server
-/// bounds. Re-check the http2 path's bounds before wiring h2 downstream -- if
-/// it demands `B: Send`, the streaming filter pump needs a different shape
-/// (a spawn_local'd pump owning the filters, feeding a channel-backed body).
+/// Boxed streaming body with data and optional trailer frames. It is `!Send`
+/// so worker-local filter state can remain in the stream; hyper's connection
+/// runs on that same worker (ADR-0003).
 pub type StreamBody = Pin<Box<dyn hyper::body::Body<Data = Bytes, Error = BodyError>>>;
 
 /// Box and pin a concrete body into a [`StreamBody`].
@@ -63,16 +47,8 @@ where
     Box::pin(body)
 }
 
-/// A fully parsed request: head (reusing [`crate::filter::RequestHeaders`])
-/// plus its streaming body.
-///
-/// ADR-0004 step 3 deleted the `stream_info` and `route` fields this struct
-/// used to carry: both existed only to hand data across the seam between the
-/// filter manager and a router that was still a bespoke `StreamHandler`. Now
-/// that the router is an ordinary terminal `HttpFilter` living inside the
-/// filter chain, it reads the shared `StreamInfo` and the cached route
-/// through `DecoderCallbacks` — exactly like every other filter — so nothing
-/// needs to ride along on `HttpRequestParts` for it.
+/// Parsed request head, streaming body, connection context, and optional
+/// downstream upgrade. The router reads shared request state from callbacks.
 pub struct HttpRequestParts {
     pub head: RequestHeaders,
     pub body: StreamBody,

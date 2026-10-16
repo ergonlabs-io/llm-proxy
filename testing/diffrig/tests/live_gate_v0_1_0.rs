@@ -1,20 +1,8 @@
-//! **v0.1.0 live ship-gate drill.** `internal-docs/MILESTONES.md` holds v0.1.0 at
-//! `current`, not `shipped`, for one reason: its clauses are verified only
-//! against mock upstreams (`auth_e2e.rs`, `failover_e2e.rs`). v0.0.1 did not
-//! ship on code-complete either -- it shipped on `live_smoke.rs`, a live run
-//! against real OpenAI/Anthropic endpoints, actually executed and recorded.
-//! This file is that drill for v0.1.0's two clauses that have no live
-//! evidence yet: a token-based rate limit enforced against a **real**
-//! provider's usage report, and failover that **reaches** a real provider.
-//! (The third clause, token counts/TTFT/TPOT, already has live coverage --
-//! every request `live_smoke.rs` sends produces a real usage block.)
-//!
-//! Structural sibling of `live_smoke.rs`: same `#[ignore]` discipline, same
-//! "fail loudly naming the missing env var, never skip" rule, same cost
-//! warnings. Read that file first if this one is unfamiliar. The assertions
-//! below reuse the shape of two mock-based drills: the budget test mirrors
-//! `auth_e2e.rs::two_virtual_keys_on_the_same_tenant_share_one_token_budget`,
-//! and the credential-swap test mirrors its five single-key auth tests.
+//! Live drill: token rate limits against a real provider's usage
+//! report, and failover that reaches a real provider. The clauses are
+//! otherwise verified only against mock upstreams (`auth_e2e.rs`,
+//! `failover_e2e.rs`). Structural sibling of `live_smoke.rs`: same `#[ignore]`
+//! discipline, and it fails loudly on a missing env var rather than skipping.
 //!
 //! ## How to run
 //!
@@ -22,61 +10,31 @@
 //! OPENAI_API_KEY=sk-... cargo test -p diffrig --test live_gate_v0_1_0 -- --ignored
 //! ```
 //!
-//! `OPENAI_API_KEY` must be set. Every test that needs it fails loudly,
-//! naming the variable, rather than silently passing or skipping -- a green
-//! "skip" here would be exactly the false confidence this gate exists to
-//! rule out (`live_smoke.rs` states the same reasoning; it applies unchanged).
-//!
-//! **This bills your account.** Every prompt is one line and every
-//! `max_tokens` is in the single digits or teens, but the file still makes
-//! **3 real calls** against OpenAI's production endpoint:
-//! - Test 1 (token budget): 1 billable call. The first of its two requests is
-//!   admitted and reaches OpenAI; the second is denied by the limiter before
-//!   any upstream dial (see the test's own comment for why this is exact,
-//!   not probabilistic).
-//! - Test 2 (auth + credential swap): 1 billable call. The valid virtual key
-//!   reaches OpenAI; the unknown key is refused before routing and never
-//!   dials out (also see the test's comment) -- which is why running this
-//!   file repeatedly is cheap.
-//! - Test 3 (failover): 1 billable call. The primary is a closed local port,
-//!   not a second real provider, so the single real call is the fallback
-//!   attempt that lands after failover.
+//! **This bills your account.** Each test makes one real OpenAI call with a
+//! tiny prompt:
+//! - Test 1 (token budget): the first of two requests reaches OpenAI. The
+//!   second is denied by the limiter before any upstream dial.
+//! - Test 2 (auth + credential swap): the valid key reaches OpenAI. The
+//!   unknown key is refused before routing and never dials out.
+//! - Test 3 (failover): the primary is a closed local port, so the one real
+//!   call is the fallback attempt after failover.
 //!
 //! ## What Test 3 does and does not prove
 //!
-//! A real provider cannot be forced to fail on demand, so there is no way to
-//! build this test against two live endpoints. The primary here is a closed
-//! `127.0.0.1` port -- nothing listening, a real connect failure, one of the
-//! two retriable failure modes the failover chain is built to fail over on. This
-//! proves *failover reaches a real provider*: the request that lands at
-//! OpenAI genuinely went through the aggregate-cluster failover mechanism,
-//! not a route pointed at OpenAI directly. It does **not** prove *failover
-//! between two real providers* -- that both members behave correctly when
-//! both are real endpoints is not something this test can arrange, and it
-//! isn't the gap this drill exists to close: `failover_e2e.rs` already
-//! proves the primary-side mechanics (attempt accounting, credential
-//! isolation, host-rewrite-per-member) against two mocks, verified and
-//! mutation-tested. What no test before this one proved is that the fallback
-//! LEG of that chain is a real dial that a real provider answers.
+//! The primary is a closed `127.0.0.1` port, a real connect failure that the
+//! failover chain fails over on. The test proves that the request which lands
+//! at OpenAI went through the aggregate failover mechanism. It does not prove
+//! failover between two real providers. `failover_e2e.rs` covers the
+//! primary-side mechanics against two mocks.
 //!
 //! ## Harness
 //!
-//! `diffrig::harness` (the real `llm-proxy` binary, dialect config, polled
-//! listener readiness, plain-file captured stdout/stderr) exactly as
-//! `live_smoke.rs` uses it -- see that file's module doc for why no `ca_file`
-//! override is needed against `https://api.openai.com`. `${OPENAI_API_KEY}`
-//! is interpolated by the dialect at load time (`parse.rs::interpolate_env`),
-//! so the real key is never written to disk by this test.
+//! `${OPENAI_API_KEY}` is interpolated by the dialect at load time, so the
+//! real key is never written to disk.
 //!
-//! ## Why every request is `x-llmproxy-model`-free
-//!
-//! Earlier e2e files set an `x-llmproxy-model` header explicitly. That became
-//! redundant once `body_rewrite_filter` started deriving the routing header
-//! from the request body's own `model` field (and stripping any
-//! client-supplied one, since trusting a client header for routing would let a
-//! client route itself around a fallback chain), so
-//! every request below routes on `"model"` in its JSON body alone, the same
-//! way `auth_e2e.rs` already does.
+//! Requests route on the JSON `model` field alone. The body rewrite filter
+//! derives the routing header from it and strips any client-supplied one, so
+//! a client cannot route itself around a fallback chain.
 
 use std::net::SocketAddr;
 use std::time::Duration;

@@ -1,16 +1,7 @@
 //! Generated Envoy v3 API protos + embedded `FileDescriptorSet`.
 //!
-//! This crate is the ONLY place Envoy protos are generated. It pins the Envoy
-//! API version for the whole project (AGENTS.md invariant 9);
-//! the vendored `.proto` sources and their dependency pins live in `vendor/`,
-//! maintained by `scripts/vendor-protos.sh`.
-//!
-//! Two things are exported:
-//! - The generated Rust types and tonic service stubs, under their proto
-//!   package paths (e.g. [`envoy::config::bootstrap::v3::Bootstrap`]).
-//! - [`descriptor_pool`], a reflection view of every compiled proto. This is
-//!   what lets `proxy-config` parse Envoy YAML/JSON (the proto3 JSON mapping,
-//!   including `Any` by type URL) and detect unknown fields for strict mode.
+//! This crate generates the pinned Envoy protos (AGENTS.md invariant 9) and
+//! exports their Rust types plus a descriptor pool used for strict config parsing.
 //!
 //! Rust note: the generated code is produced by `build.rs` at compile time into
 //! `OUT_DIR`; `include!` splices that file into this crate as if written here.

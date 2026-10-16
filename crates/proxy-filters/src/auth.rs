@@ -5,94 +5,44 @@
 //! here (`auth_filter` does that). Scope is virtual keys, held in memory or
 //! in the `ControlPlane` snapshot.
 //!
-//! # Why an `Authenticator` trait, not "the virtual-key filter"
-//!
-//! OIDC/JWT is a second credential kind, so [`Authenticator`] is deliberately a
-//! trait ([`VirtualKeyAuthenticator`] and `JwtAuthenticator` implement it)
-//! rather than a concrete type baked into a filter -- a new credential kind
-//! slots in beside the existing ones without reshaping anything above.
+//! [`Authenticator`] lets virtual-key and JWT credentials share one filter
+//! boundary without coupling it to either credential type.
 //!
 //! # `NoCredential` vs `Rejected`: the load-bearing distinction
 //!
-//! See [`AuthOutcome`]'s doc. In short: a chain of authenticators must not
-//! become a probing oracle. A credential of a kind this authenticator
-//! doesn't recognize (absent header, wrong scheme, a JWT rather than a
-//! virtual key) is `NoCredential` -- try the next authenticator. A credential
-//! that *is* shaped like this authenticator's kind but fails verification is
-//! `Rejected` and terminal: falling through to another authenticator after a
-//! bad credential of a *known* kind would let a caller learn something (e.g.
-//! "that `llmp_`-prefixed value was recognized as a virtual key, just an
-//! invalid one") one probe at a time.
+//! `NoCredential` means the credential kind is unrecognized and another
+//! authenticator may try. A malformed credential of a recognized kind is
+//! terminal `Rejected`, preventing fallback from exposing recognized kinds.
 //!
 //! # Why keyed HMAC-SHA256, not Argon2/bcrypt, and not a plain hash
 //!
-//! Virtual keys are high-entropy values the proxy itself generates, not
-//! user-chosen passwords. Password hashing is deliberately slow to survive
-//! *low*-entropy secrets; that reasoning does not transfer here, and a
-//! per-request Argon2 on the hot path would be a denial-of-service the
-//! operator inflicts on themselves. A **keyed** hash (HMAC with an
-//! operator-configured secret) is used instead of a plain digest so that
-//! read access to the stored [`KeySet`] (a config file, a future
-//! `CredentialStore`) does not by itself permit offline precomputation of
-//! matching keys.
+//! Virtual keys are proxy-generated high-entropy secrets, so slow password
+//! hashing would waste hot-path CPU. HMAC with an operator secret prevents
+//! someone who reads the stored [`KeySet`] from checking candidate keys
+//! offline.
 //!
 //! Do **not** reach for [`crate::token_limit_filter::hash_credential`]
-//! (aliased for readers coming from that module: FNV-1a) for this. That
-//! function is a stable, *non-cryptographic* hash chosen so a distributed
-//! budget store derives the same bucket key on any toolchain for a
-//! *non-adversarial* input -- it offers neither preimage resistance nor a
-//! constant-time comparison, both of which this module requires. Both
-//! functions are spelled "hash a credential"; that they solve different
-//! problems is exactly the trap to avoid.
+//! (aliased for readers coming from that module: FNV-1a) for this. It is a
+//! stable, non-cryptographic bucket hash and provides neither preimage
+//! resistance nor secret comparison.
 //!
 //! # No byte comparison of secrets happens here
 //!
-//! [`KeySet::find`] derives `HMAC-SHA256(secret, presented_key)` with
-//! `ring::hmac::sign` and looks that digest up in a `HashMap`. The lookup is
-//! the decision. There is no second, "constant-time" comparison after it: an
-//! earlier version called `ring::hmac::verify(secret, presented, digest)` on
-//! the digest it had just computed from the same input, which always succeeds
-//! and so verified nothing (review M9). Why the lookup itself is not a timing
-//! side channel is the next section. Where two secrets ARE compared byte for
-//! byte (the admin bearer token), `proxy-admin`'s `secrets_match` uses the
-//! double-HMAC compare, because `ring::constant_time::verify_slices_are_equal`
-//! is deprecated in the pinned `ring` (0.17.14) with "no promises regarding
-//! side channels".
+//! [`KeySet::find`] computes HMAC-SHA256 and looks up its digest; verifying
+//! that freshly computed digest again would verify nothing. Byte comparisons
+//! of secrets elsewhere use the admin token's double-HMAC approach.
 //!
 //! # `KeySet` is a `HashMap` keyed on the digest
 //!
-//! An earlier version scanned a `Vec`, verifying every configured record with
-//! `hmac::verify`, to avoid a table lookup short-circuiting before a
-//! constant-time comparison could run. That reasoning does not survive
-//! contact with either the cost or the mechanism, and both halves are worth
-//! keeping written down:
-//!
-//! - **Cost.** It was O(n) HMAC-SHA256 per request. At roughly 1µs each, a
-//!   10,000-key deployment spends ~10ms of CPU on every request — and an
-//!   unauthenticated caller could force the full scan, so it was a
-//!   denial-of-service vector rather than a hardening measure.
-//! - **Mechanism.** The scan used `iter().find_map(..)`, which stops at the
-//!   first match. A key stored first cost one verification and a key stored
-//!   last cost n, so it leaked *position* while paying the full price. It did
-//!   not deliver the property it was chosen for.
-//!
-//! The digest is `HMAC-SHA256(secret, presented_key)`, which an attacker
-//! cannot steer without the secret, so they can neither aim at a bucket nor
-//! walk the digest byte by byte. And the only coarse fact a lookup could leak
-//! — whether that digest exists — is exactly what the response already tells
-//! them (200 vs 401).
+//! A digest-keyed `HashMap` avoids an attacker-triggerable O(n) HMAC scan.
+//! Because callers cannot steer a keyed digest, lookup reveals neither key
+//! position nor digest bytes; existence is already reflected in the response.
 //!
 //! # Nothing here leaks key material through `Debug`
 //!
-//! [`KeyRecord`], [`KeySet`], [`Principal`], [`HmacSecret`] and
-//! [`VirtualKeyAuthenticator`] all have hand-written `Debug` impls (nothing
-//! is `#[derive(Debug)]`d on a type that could carry a plaintext key, a
-//! digest, or the HMAC secret) so that a stray `tracing::debug!(?principal)`
-//! or similar can never become a leak channel. `tenant`/`key_id` are
-//! identifiers, not secrets -- they must stay nameable in audit logs -- so only the fields that touch key material are
-//! actually redacted; the rest are still hand-written, on purpose, so a
-//! future field addition to one of these types has to make the same call
-//! explicitly rather than inherit it from `#[derive]`.
+//! Hand-written `Debug` implementations keep plaintext keys, digests, and the
+//! HMAC secret out of logs while retaining tenant and key identifiers for
+//! audits. New fields require an explicit disclosure decision.
 
 use std::collections::HashMap;
 use std::fmt;

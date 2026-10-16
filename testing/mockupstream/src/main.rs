@@ -29,11 +29,7 @@ use mockupstream::stats;
 enum Protocol {
     Http1,
     Http2,
-    /// h2 prior-knowledge detection over plaintext (h2c), falling back to
-    /// http/1.1 -- see `serve` below. This is the point of `--protocol`:
-    /// the proxy dials plaintext h2c whenever a cluster sets
-    /// `http2_protocol_options`, and this mock needs to answer that the
-    /// same way a real provider's load balancer would.
+    /// Detects plaintext h2 prior knowledge and falls back to HTTP/1.1 for h2c.
     Auto,
 }
 

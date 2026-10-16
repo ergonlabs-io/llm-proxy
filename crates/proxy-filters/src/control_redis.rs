@@ -1,31 +1,7 @@
-//! [`RedisControlPlaneStore`], the shared, Redis-backed
-//! [`crate::control::ControlPlaneStore`]. `internal-docs/adr/0006-shared-state-tiers.md`
-//! is normative for everything this file implements; read its §§1-2 and 7
-//! before touching [`RedisControlPlaneStore::add_spend`] or
-//! [`RedisControlPlaneStore::policy_generation`].
-//!
-//! # Why this file, and what it must NOT do
-//!
-//! `control.rs`'s `RedbControlPlaneStore` is the embedded, single-process
-//! default. This is its multi-replica twin: same trait, the same row shapes
-//! (`EncodedKeyRow`/`EncodedModelAccess`/`EncodedTenantBudget`, and
-//! `encode_json`/`decode_json`/`store_err`, all made `pub(crate)` in
-//! `control.rs` for exactly this file to reuse rather than duplicate), a
-//! different backend. ADR-0006 §6 calls this "one code path; the difference
-//! is the store, and the bounds" -- this module must not grow behaviour
-//! `ControlPlaneStore`'s own trait doc does not already require, or the two
-//! stores stop being interchangeable.
-//!
-//! **Sync connections only.** `ControlPlaneStore` is a synchronous trait
-//! because nothing on the request path is meant to call it -- only the
-//! control runtime's policy poller and [`crate::spend::SpendAccumulator`]'s
-//! flusher thread do, both off the hot path (ADR-0005). This crate therefore
-//! depends on `redis` with its default (sync) transport and no
-//! `tokio-comp`/`aio` feature -- see the workspace `Cargo.toml`'s `redis`
-//! entry. Threading an async runtime through a trait that has none would buy
-//! nothing for a connection nothing on the hot path ever holds. There are
-//! two of them, one per [`Lane`], so those two callers never queue behind each
-//! other; see [`RedisControlPlaneStore`].
+//! The Redis implementation of [`crate::control::ControlPlaneStore`],
+//! sharing the embedded store's contract and row encoding (ADR-0006 §6).
+//! Synchronous calls run on separate control and spend lanes, off the request
+//! path (ADR-0005, ADR-0006 §4).
 //!
 //! # Key layout
 //!
@@ -44,36 +20,23 @@
 //! {ns}:lease:{<scope>}:expiry               ZSET <esc(subject)>|<esc(node_id)> -> expiry, Unix ms
 //! ```
 //!
-//! The two `lease` keys are this store's [`LeaseStore`] rows (ADR-0006
-//! amendment E): one row per replica per subject, with its own expiry in the
-//! sorted set. Both keys of a scope share the hash tag `{<scope>}`, so one
-//! script can write a replica's rows and sum the whole scope. See
+//! Lease rows are per replica and subject, with expiry in the sorted set.
+//! Both keys share a scope hash tag so one script can update and sum them. See
 //! [`PUBLISH_LEASES_LUA`].
 //!
-//! The `spend` and `seq` keys of a period expire together, a fixed retention
-//! after the period ends (`SPEND_RETENTION_AFTER_PERIOD`); every other key is
-//! permanent. The flusher and the bind-time prefetch reach them in pipelines,
-//! not one round trip per row.
+//! Period spend and sequence keys expire together after a fixed retention;
+//! the flusher and bind-time prefetch access them in pipelines.
 //!
-//! `{ns}` is a constructor parameter ([`RedisControlPlaneStore::open_with_namespace`],
-//! defaulting to [`DEFAULT_NAMESPACE`] via [`RedisControlPlaneStore::open`]) so
-//! two deployments can share one Redis. The braces around
-//! `<prefix>|<tenant>|<period>` are **literal** -- see
-//! [`RedisControlPlaneStore::hash_tag`]'s doc for why they are a Redis
-//! Cluster hash tag, not decoration, and [`escape_component`]'s doc for why
-//! the three components must be escaped before they are joined.
+//! `{ns}` is configurable so deployments can share Redis. Braces around
+//! spend components form a Redis Cluster hash tag; components are escaped
+//! before joining (see [`RedisControlPlaneStore::hash_tag`] and
+//! [`escape_component`]).
 //!
-//! The `rate_cards` field is the chain name as it is: one component, so there
-//! is no separator to protect. The row holds the pricing document as an opaque
-//! string, which this store never parses. Writing a card and bumping
-//! `{ns}:generation` are one `MULTI`/`EXEC` (replace) or one script (seed if
-//! absent), so a poller never sees the stamp move without the card.
+//! Rate-card rows use the chain name and keep pricing JSON opaque. Card writes
+//! and generation bumps are atomic so pollers cannot observe only one.
 //!
-//! The `tenant_credentials` field is the escaped tenant and the escaped
-//! provider joined by `|`. `escape_component` rewrites every `|` inside a
-//! component, so the first `|` in a field is always the separator and no
-//! two (tenant, provider) pairs share a field. The row value carries
-//! ciphertext only; this store never decrypts (ADR-0007 decision 2).
+//! Tenant credential fields join escaped tenant and provider names with `|`;
+//! values contain ciphertext only and are never decrypted here (ADR-0007).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

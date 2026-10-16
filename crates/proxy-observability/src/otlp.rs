@@ -2,59 +2,25 @@
 //! [`crate::trace::SpanSink`]'s [`Receiver`](tokio::sync::mpsc::Receiver) and
 //! ships batches of [`FinishedSpan`] to a real collector.
 //!
-//! This is the one module in the data-plane-adjacent crates that names a
-//! generated OTLP proto (`proxy_api::opentelemetry`). AGENTS.md invariant 2
-//! ("protos never escape `proxy-config`/`proxy-xds`") is about *Envoy
-//! config* protos never reaching request-handling code -- see `ir.rs`'s own
-//! module doc for why that boundary matters (strict-mode field coverage,
-//! IR as the one API surface every workstream codes against). OTLP export is a
-//! different protocol serving a different purpose: [`run_trace_exporter`] and
-//! [`run_metric_exporter`] run entirely on the CONTROL runtime
-//! (`crates/proxy/src/main.rs`'s `run_serve`, next to the config-publisher
-//! tasks), never touch a request, and their only job is to hand
-//! already-finished, already-owned [`FinishedSpan`] values (or a read-only
-//! snapshot of the stats registry) to a collector over the wire. Nothing here
-//! is parsed out of, or fed back into, the [`proxy_config::ir`] the data plane
-//! actually runs on.
+//! The OTLP/gRPC exporters. They run on the CONTROL runtime, never touch a
+//! request, and only hand already-owned data to a collector: finished spans,
+//! or a read-only snapshot of the stats registry. Nothing here feeds back into
+//! the data plane's [`proxy_config::ir`] (AGENTS.md invariant 2 covers Envoy
+//! config protos, and OTLP protos never reach request code).
 //!
-//! Four pieces:
-//! - [`map_span`]: pure `FinishedSpan -> proto Span` conversion, unit-tested
-//!   on its own (no network).
-//! - [`map_metrics`]: pure `Registry -> proto ExportMetricsServiceRequest`
-//!   conversion, same split.
-//! - [`run_trace_exporter`]: the span batching loop. Owns the `Receiver` end
-//!   of a `SpanSink` for its whole life; returns once every `SpanSink` clone
-//!   has been dropped (workers gone) and the last batch is flushed.
-//! - [`run_metric_exporter`]: the registry snapshot loop. **Independent of
-//!   the trace exporter** -- its own task, its own ticker, its own deadline,
-//!   and no dependency on a `SpanSink` existing at all.
+//! - [`map_span`] and [`map_metrics`]: pure conversions to the OTLP wire types.
+//! - [`run_trace_exporter`]: batches spans from a `SpanSink` until every sink
+//!   clone is dropped, then flushes the last batch.
+//! - [`run_metric_exporter`]: snapshots the registry on its own interval. It
+//!   does not depend on tracing being configured.
 //!
-//! # Why traces and metrics are two exporters, not one
-//!
-//! `docs/telemetry-design.md` §5.3 requires metric export to be configurable
-//! and schedulable independently of trace sampling. Before this split, both
-//! signals shared one task and one 5s ticker, which made three of the design
-//! doc's requirements unsatisfiable:
-//!
-//! - Metrics could not be exported at all unless tracing was configured, since
-//!   the only `MetricsServiceClient` was constructed inside the task spawned
-//!   for a `TracingConfig`.
-//! - A slow or unreachable *trace* RPC held the single `flush().await` open,
-//!   so the metric snapshot on the same tick could not proceed.
-//! - There was no deadline on either RPC at all, so a connection that
-//!   established and then went silent held the task's `.await` open forever.
-//!
-//! Each exporter now counts its own failures into
-//! [`crate::stats::instruments::OTEL_EXPORT_FAILURES`] under a finite `signal`
-//! label, so a collector outage is visible as a metric rather than only as a
-//! gap in someone else's dashboard. Span losses -- both queue drops and
-//! discarded batches -- ride in `llmproxy_otel_spans_dropped`, published by
-//! the TRACE exporter (the path that causes them), so a Prometheus-only
-//! deployment with no OTLP metric export still reports them. Each exporter
-//! also enforces its own per-RPC deadline (`MetricsExportConfig::
-//! export_deadline`, `TracingConfig::export_deadline`), so a collector that
-//! accepts a connection and then goes silent costs one bounded timeout per
-//! attempt instead of parking a task forever.
+//! Traces and metrics are separate exporters so that metrics export does not
+//! require tracing, and so that a slow trace RPC cannot delay a metric
+//! snapshot (`docs/telemetry-design.md` §5.3). Each exporter counts its own
+//! failures under a `signal` label, and enforces its own per-RPC deadline so a
+//! silent collector costs one bounded timeout per attempt. Span losses are
+//! published by the trace exporter, so they are visible even without OTLP
+//! metric export.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,35 +52,22 @@ use crate::stats::{
 };
 use crate::trace::{FinishedSpan, SpanDropCounter, SpanKind, SpanStatus};
 
-/// Flush whichever comes first: this many buffered spans, or
-/// [`BATCH_INTERVAL`] elapsing with at least one span buffered. Matches the
-/// module brief's "batches on an interval or a max-batch size" -- neither
-/// bound alone is right: a quiet proxy would otherwise hold a handful of
-/// spans indefinitely, and a busy one would otherwise buffer unboundedly
-/// between ticks.
+/// Flush at this many buffered spans, or after [`BATCH_INTERVAL`] with at least
+/// one span buffered. Neither bound alone is enough: a quiet proxy would hold
+/// spans indefinitely, and a busy one would buffer without limit.
 const MAX_BATCH: usize = 512;
 const BATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Upper bound on `TracingConfig::export_deadline`, exported so
-/// `proxy-config`'s loader can validate against the SAME number this module
-/// documents, rather than a copy that can drift. The trace batch interval is a
-/// fixed constant (`BATCH_INTERVAL`; tracing config exposes sampling, not
-/// cadence -- see `MetricsExportConfig::export_interval` for why the metric
-/// side did get a configurable one), so this cap is a sanity bound against
-/// absurd values, not a cross-field ordering rule: a deadline longer than a
-/// full batch cycle would let a wedged export hold every batch in memory
-/// across multiple cycles before being abandoned.
+/// Upper bound on `TracingConfig::export_deadline`. `proxy-config` validates
+/// against this constant, so the two cannot drift. A deadline longer than a
+/// batch cycle would let a wedged export hold batches in memory across cycles.
 pub const TRACE_EXPORT_DEADLINE_MAX: Duration = Duration::from_secs(60);
 
-/// Convert a [`FinishedSpan`] into the OTLP wire type. Pure -- no I/O, so
-/// this is unit-tested directly rather than only through
-/// [`run_trace_exporter`]'s network path.
+/// Convert a [`FinishedSpan`] into the OTLP wire type. Pure, so it is
+/// unit-tested without a network.
 ///
-/// Rust note: `..Default::default()` fills every `Span` field this proxy
-/// never populates (`trace_state`, `flags`, events, links, drop counts) --
-/// prost generates `Default` for every message type, and the zero value for
-/// each of those fields (empty string, `0`, empty `Vec`) is exactly what
-/// "not used" means on the wire, so there is nothing to write by hand here.
+/// Rust note: `..Default::default()` fills the `Span` fields this proxy never
+/// sets. Their zero values mean "not used" on the wire.
 pub fn map_span(span: &FinishedSpan) -> Span {
     Span {
         trace_id: span.context.trace_id.to_vec(),
@@ -144,10 +97,7 @@ fn string_attribute(key: &str, value: &str) -> KeyValue {
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),
-        // `key_strindex` (profiles-dictionary interning, a newer addition to
-        // this message) is left at its `Default` -- this proxy never emits
-        // profile signals, only traces, so there is no dictionary to index
-        // into.
+        // `key_strindex` is left at its default: this proxy emits no profiles.
         ..Default::default()
     }
 }
@@ -171,16 +121,11 @@ fn map_status(status: SpanStatus) -> Status {
     }
 }
 
-/// `SystemTime` -> unix-nanos, per [`FinishedSpan`]'s own doc comment on why
-/// its timestamps are `SystemTime` (wall clock, convertible to an absolute
-/// epoch offset) rather than `Instant` (monotonic, not convertible at all).
+/// `SystemTime` -> unix-nanos. Span timestamps are wall-clock, since OTLP needs
+/// an absolute epoch offset.
 ///
-/// Rust note: `duration_since` returns `Err` only when `t` is *before*
-/// `UNIX_EPOCH` -- a clock that has never been set, not a real failure this
-/// exporter can do anything about. `unwrap_or_default()` (zero duration, so
-/// unix-nanos `0`) is a saner span timestamp than propagating that error out
-/// of a best-effort telemetry path (this whole module's contract, per its
-/// module doc: never take the proxy down over an export detail).
+/// Rust note: `duration_since` fails only for a clock set before `UNIX_EPOCH`.
+/// Falling back to zero beats failing a best-effort export over it.
 fn unix_nanos(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
@@ -193,28 +138,17 @@ fn build_resource(service_name: &str) -> Resource {
 }
 
 /// Convert every resolved instrument in `registry` into an OTLP
-/// [`ExportMetricsServiceRequest`]. Pure -- no I/O, so unit-tested directly
-/// (mirroring [`map_span`]) rather than only through
-/// [`run_metric_exporter`]'s network path.
+/// [`ExportMetricsServiceRequest`]. Pure, so it is unit-tested without a
+/// network.
 ///
-/// # Grouping
+/// The registry yields one row per `(instrument, attribute set)`. OTLP wants
+/// one [`Metric`] per instrument name, with one data point per attribute set.
+/// Two `upstream_rq` rows must become one `Metric`, not two series.
 ///
-/// [`Registry::counters`]/[`Registry::histograms`] yield one row per
-/// `(instrument, attribute set)` pair -- exactly OTel's own measurement
-/// model (module doc, `stats.rs` Decision 1), but OTLP wants the opposite
-/// shape: **one [`Metric`] per instrument NAME**, carrying one data point per
-/// attribute set. Two `upstream_rq` rows (`cluster=openai`,
-/// `cluster=anthropic`) must become ONE `Metric` named `upstream_rq` with two
-/// [`NumberDataPoint`]s, not two separate `Metric`s that would each look like
-/// a distinct time series to a collector.
-///
-/// Rust note: `group` is a `HashMap` keyed by `instrument.name` whose value
-/// is `(&'static Instrument, Vec<data point>)` -- the first row seen for a
-/// name creates the entry (`or_insert_with`) and every later row for the
-/// same name only pushes a data point, never touches the key again. `order`
-/// is a plain `Vec<&str>` of names in first-seen order: a `HashMap`'s
-/// iteration order is unspecified, and this function's own doc promises a
-/// deterministic (first-seen) order so a test can assert on it.
+/// Rust note: `group` is keyed by instrument name. The first row for a name
+/// creates the entry, and later rows only push data points. `order` keeps the
+/// names in first-seen order, because a `HashMap`'s iteration order is not
+/// deterministic and the tests assert on it.
 pub fn map_metrics(registry: &Registry, resource: &Resource) -> ExportMetricsServiceRequest {
     let now = unix_nanos(SystemTime::now());
 
@@ -310,44 +244,22 @@ pub fn map_metrics(registry: &Registry, resource: &Resource) -> ExportMetricsSer
     }
 }
 
-/// The span batching export loop. Runs until `rx` is closed (every clone of
-/// the [`SpanSink`](crate::trace::SpanSink) that fed it has been dropped) and
-/// its last batch is flushed -- `crates/proxy/src/main.rs` spawns this on the
-/// control runtime only when `snapshot.tracing` is `Some`; tracing-off means
-/// this function is never called at all, matching the module brief's "zero cost
-/// when off".
-///
-/// **No longer exports metrics.** See the module doc's "Why traces and metrics
-/// are two exporters" section; [`run_metric_exporter`] owns that now and runs
-/// whether or not this function exists.
+/// The span batching export loop. Runs until every `SpanSink` clone is dropped
+/// and the last batch is flushed. `crates/proxy/src/main.rs` spawns it only
+/// when tracing is configured.
 ///
 /// # Failure handling
 ///
-/// Export failure (a connect error, the collector rejecting the batch, or a
-/// deadline expiry -- `tonic::Status` covers the first two uniformly, and
-/// `tokio::time::timeout` converts the third into this same match arm) logs,
-/// counts itself into `OTEL_EXPORT_FAILURES` under `signal="traces"`, counts
-/// the discarded batch's spans into the drop ledger, and drops the batch.
-/// Telemetry must never take the proxy down or fail a request over an
-/// unreachable collector; see `trace::SpanSink::emit` for the same trade one
-/// layer up (a full channel drops instead of blocking a request).
+/// A failed or timed-out export logs, counts itself under `signal="traces"`,
+/// counts the discarded spans into the drop ledger, and drops the batch.
+/// Telemetry must never fail a request over an unreachable collector.
 ///
-/// `export_deadline` bounds the RPC. Without it (the pre-review shape) a
-/// collector that accepted the connection and went silent parked this task's
-/// `.await` forever -- every later batch buffered, `MAX_BATCH` became the only
-/// further bound, and the sink behind it filled and dropped -- a stall that
-/// looked like telemetry degradation but was really an unbounded export. The
-/// deadline makes each hung attempt cost exactly one timeout, and the next
-/// tick's batch -- carrying everything served since -- still gets its chance.
-/// `crates/proxy/tests/otlp_trace_e2e.rs` pins this on the real binary against
-/// a collector that hangs its first export and answers the rest.
+/// `export_deadline` bounds each RPC. Without it, a collector that accepts a
+/// connection and then goes silent would park this task forever, and the sink
+/// behind it would fill and drop.
 ///
-/// Reconnection is deliberately NOT hand-rolled: `Endpoint::connect_lazy` builds
-/// a `Channel` that establishes its connection lazily on first use and
-/// reconnects on its own for every subsequent call through tower's built-in
-/// retry-connect behavior, so "try again next tick" falls out of just calling
-/// `export` again -- there is no retry loop here holding a batch hostage while a
-/// collector is down.
+/// Reconnection is left to `Endpoint::connect_lazy`, which reconnects on the
+/// next call. "Try again next tick" is just calling `export` again.
 pub async fn run_trace_exporter(
     mut rx: Receiver<FinishedSpan>,
     otlp_endpoint: String,
@@ -364,12 +276,10 @@ pub async fn run_trace_exporter(
 
     let mut batch: Vec<FinishedSpan> = Vec::with_capacity(MAX_BATCH);
     let mut ticker = tokio::time::interval(BATCH_INTERVAL);
-    // Rust note: the first tick of `tokio::time::interval` fires immediately
-    // (not after one full period) -- harmless here since `flush` is a no-op
-    // on an empty batch, but `MissedTickBehavior::Delay` (rather than the
-    // default `Burst`) still matters: if a flush itself runs long (a slow
-    // collector), the NEXT tick should be `BATCH_INTERVAL` after that flush
-    // finishes, not fire a burst of catch-up ticks back to back.
+    // Rust note: the first tick fires immediately, which is harmless because
+    // `flush` is a no-op on an empty batch. `MissedTickBehavior::Delay` matters
+    // more: after a slow flush, the next tick comes one interval later, not as a
+    // burst of catch-up ticks.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -383,12 +293,7 @@ pub async fn run_trace_exporter(
                         }
                     }
                     None => {
-                        // Every `SpanSink` clone is gone -- drain whatever's
-                        // left, then this task has nothing further to do. This
-                        // is the only "final flush on shutdown" in this
-                        // module: metrics are not involved, because
-                        // `run_metric_exporter` has its own independent
-                        // lifecycle and its own deadline.
+                        // Every `SpanSink` clone is gone. Drain what is left and stop.
                         flush(&mut client, &resource, &mut batch, &registry, &failures, export_deadline).await;
                         return;
                     }
@@ -401,30 +306,19 @@ pub async fn run_trace_exporter(
     }
 }
 
-/// The registry snapshot export loop. **Independent of
-/// [`run_trace_exporter`] in every dimension that matters**: it is a separate
-/// task, it is spawned whenever `snapshot.metrics` is `Some` whether or not
-/// tracing is configured, its interval and deadline are its own
-/// (`MetricsExportConfig`'s), and its only shared state with the trace path is
-/// the read-only [`Registry`].
+/// The registry snapshot export loop. It is independent of
+/// [`run_trace_exporter`]: its own task, interval and deadline, and a shared
+/// read-only [`Registry`] as its only link to the trace path.
 ///
-/// [`shutdown`] is how this task ends. There is no channel to close here (it
-/// consumes no events, only time), so without an explicit signal it would run
-/// until the runtime dropped it -- and the process's own shutdown sequence
-/// (the drain-then-stop sequence in `crates/proxy/src/main.rs`) is what a caller passes this. A
-/// receiver that fires mid-sleep still gets one last snapshot out: a metric
-/// snapshot is cheap, cumulative, and the natural last word on a run.
+/// [`shutdown`] ends the task. A receiver that fires mid-sleep still gets one
+/// last snapshot out.
 ///
 /// # Why there is no retry, and no disk spool
 ///
-/// Design doc §5.3: "Span queues and batches are bounded... No disk spool is
-/// required inside the proxy for operational signals", and a failed snapshot
-/// "can be superseded by a later snapshot" because the registry is cumulative
-/// and never cleared. Retaining a failed snapshot to retry it would be
-/// strictly worse: it would either hold unbounded memory across a long outage
-/// or need exactly the spool this design declines to build, in exchange for
-/// re-sending data the next tick already contains. The failure is counted
-/// instead, so the gap is visible rather than silent.
+/// The registry is cumulative, so a failed snapshot is superseded by the next
+/// one (`docs/telemetry-design.md` §5.3). Retrying would hold memory across an
+/// outage for data the next tick already contains. The failure is counted
+/// instead.
 pub async fn run_metric_exporter(
     registry: Arc<Registry>,
     otlp_endpoint: String,
@@ -441,10 +335,8 @@ pub async fn run_metric_exporter(
     let resource = build_resource(&service_name);
 
     let mut ticker = tokio::time::interval(export_interval);
-    // Same reasoning as the trace exporter's ticker, and here it is load-bearing
-    // rather than merely tidy: an export that runs up to `export_deadline`
-    // must not produce a burst of catch-up ticks afterwards. `Delay` makes the
-    // next tick `export_interval` after the previous one *finished*.
+    // `Delay`, as in the trace loop: the next tick is one interval after the
+    // previous export finished, not a burst of catch-up ticks.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -475,33 +367,16 @@ pub async fn run_metric_exporter(
     }
 }
 
-/// Pre-resolved handles for the two failure counters this module writes, one
-/// per signal, plus the span-drop republisher.
+/// Pre-resolved handles for the two failure counters this module writes, plus
+/// the span-drop republisher.
 ///
-/// Built once at boot by [`ExportCounters::resolve`] against the one
-/// `StatsControl` in the process, and then only *read* through. That matters
-/// because both exporter tasks call `Registry::incr`, which needs a
-/// [`WorkerId`](crate::stats::WorkerId) -- a shard index that is meaningful
-/// for a worker and arbitrary for a control-side task. Using `WorkerId(0)` is
-/// the honest encoding of "this is not a worker's increment": the value lands
-/// in one shard and every read sums across all of them, so which shard it
-/// lands in cannot change what any renderer or exporter reports. It is
-/// documented here rather than left as a bare `WorkerId(0)` at each call site
-/// so the next reader does not have to re-derive why it is safe.
+/// Resolved once at boot and only read afterwards. Both exporter tasks
+/// increment through `WorkerId(0)`, a shard that is meaningless for a worker
+/// but harmless here: every read sums across shards.
 ///
-/// Only two failure series exist for the life of the process, because `signal`
-/// has exactly two values ([`EXPORT_SIGNAL_TRACES`],
-/// [`EXPORT_SIGNAL_METRICS`]) and resolution happens once. Neither task
-/// resolves anything at runtime.
-///
-/// This is also the SOLE publisher of `llmproxy_otel_spans_dropped`, on
-/// purpose. The review found that while the METRIC exporter held that job, a
-/// tracing deployment WITHOUT OTLP metric export (Prometheus-scrape-only, the
-/// majority of deployments) reported zero span drops forever -- the one signal
-/// measuring the trace pipeline's losses was gated on a different pipeline's
-/// existence. Both drop sources live in the trace path (queue drops from
-/// `SpanSink::emit`, batch drops from failed exports), so the trace exporter
-/// publishes both, whatever the metric exporter is doing.
+/// This is the sole publisher of `llmproxy_otel_spans_dropped`. Prometheus-only
+/// deployments have no metric exporter, so the trace exporter must publish the
+/// drops itself.
 #[derive(Clone)]
 pub struct ExportCounters {
     trace_failures: Handle,
@@ -510,26 +385,21 @@ pub struct ExportCounters {
     /// owns the queue counter and this reads it; the batch counter is written
     /// by whoever flushes a failed export.
     drops: Arc<DropLedger>,
-    /// Last published combined total. Publish only its increase to the
+    /// Last published combined total. Only its increase is published to the
     /// monotonic registry counter.
     ///
-    /// Rust note: the shared atomic keeps references to this state `Sync`
-    /// across exporter awaits; a `Cell` would not. There is one publisher.
+    /// Rust note: an atomic keeps this `Sync` across awaits, where a `Cell`
+    /// would not.
     last_republished: Arc<AtomicU64>,
 }
 
 /// The two trace-path span-loss sources, summed by [`ExportCounters`].
 pub struct DropLedger {
-    /// Queue drops: the sink's own cumulative counter, shared with every
-    /// `SpanSink` clone (channel full, or receiver gone). `None` when tracing
-    /// is unconfigured -- there is no sink, hence no queue drops, and the
-    /// ledger must not invent any.
+    /// Queue drops: the sink's cumulative counter (channel full or receiver
+    /// gone). `None` when tracing is off, so the ledger invents no drops.
     queue: Option<SpanDropCounter>,
     /// Batch drops: spans discarded by a failed or timed-out export. Counted
-    /// at failure, in the one place that knows the batch's size, rather than
-    /// reconstructed later -- design doc §5.5's "aggregate drop counters are
-    /// the dependable signal" applies verbatim: the spans that could not be
-    /// exported are exactly the ones no per-span event could report.
+    /// where the batch size is known (`docs/telemetry-design.md` §5.5).
     batch: AtomicU64,
 }
 
@@ -541,23 +411,10 @@ impl DropLedger {
 }
 
 impl ExportCounters {
-    /// Resolve the trace-side handles, adopting the sink's drop counter when
-    /// tracing is configured (`Some`) and none when it is not.
-    ///
-    /// The SERIES are resolved unconditionally either way, so a dashboard sees
-    /// `signal="traces"` and `llmproxy_otel_spans_dropped` from the very first
-    /// scrape of a tracing-off process and can tell "zero failures / zero
-    /// drops" from "not instrumented" -- the design doc §5.5 requirement the
-    /// review round leaned on. The LEDGER, though, is honest about `None`:
-    /// with no `SpanSink` there are no queue drops, no exporter to drop
-    /// batches, and a series that claims otherwise would be lying. `None`
-    /// therefore publishes nothing, and the zero the dashboard sees is the
-    /// truth.
-    ///
-    /// Panics are not a concern: every attribute set here is a
-    /// `(&'static str, &'static str)` literal, so `Registry`'s attribute-key
-    /// validation (which is designed to catch caller typos) has nothing to
-    /// catch.
+    /// Resolve the trace-side handles. The series are resolved even with
+    /// tracing off, so a dashboard can tell "zero" from "not instrumented"
+    /// (`docs/telemetry-design.md` §5.5). The ledger takes `None` when there is
+    /// no sink, and then publishes nothing, so the zero stays honest.
     pub fn resolve(control: &StatsControl, sink_drops: Option<SpanDropCounter>) -> Self {
         let last = sink_drops.as_ref().map_or(0, SpanDropCounter::load);
         ExportCounters {
@@ -574,22 +431,15 @@ impl ExportCounters {
         }
     }
 
-    /// Count one failed trace export AND the spans the dropped batch carried.
-    /// The failure lands in the registry immediately; the drop lands in the
-    /// ledger and is published by the next [`Self::publish_drops`] -- same tick
-    /// for the batch-full path, next tick at worst for the interval path,
-    /// which is bounded by `BATCH_INTERVAL` and costs nothing a scrape
-    /// interval would not swamp anyway.
+    /// Count one failed trace export and the spans its batch carried. The
+    /// drops reach the registry on the next [`Self::publish_drops`].
     fn record_trace_failure(&self, registry: &Registry, batch_spans: u64) {
         registry.incr(WorkerId(0), self.trace_failures, 1);
         self.drops.batch.fetch_add(batch_spans, Ordering::Relaxed);
     }
 
-    /// Move the delta of the combined drop ledger into `spans_dropped`. Called
-    /// after every flush, successful or not, so queue drops accumulated since
-    /// the last tick are reflected without a failed export being a
-    /// precondition for visibility. Cheap when nothing changed: one load and
-    /// one compare.
+    /// Move the delta of the drop ledger into `spans_dropped`. Runs after every
+    /// flush, so queue drops show up without needing a failed export.
     fn publish_drops(&self, registry: &Registry) {
         let current = self.drops.total();
         let previous = self.last_republished.load(Ordering::Relaxed);
@@ -604,23 +454,16 @@ impl ExportCounters {
 
 /// The metric exporter's own self-instrument: the metric failure counter.
 ///
-/// Split out from [`ExportCounters`] because the two exporters need
-/// *different* subsets, and handing the metric exporter the trace failure
-/// handle would invite incrementing the wrong one. Span drops are NOT here:
-/// they are trace-path facts published by the trace exporter itself --
-/// gating them on metric export is exactly the underreporting bug [`ExportCounters`]'s
-/// doc records.
+/// The metric exporter's own failure counter. Split from [`ExportCounters`] so
+/// the metric exporter cannot increment the trace failure series. Span drops
+/// stay with the trace exporter (see [`ExportCounters`]).
 pub struct MetricExportHealth {
     failures: Handle,
 }
 
 impl MetricExportHealth {
-    /// Resolve the metric-side failure handle. Call once, control side, at
-    /// boot, and UNCONDITIONALLY -- even with no metric export configured, so
-    /// `llmproxy_otel_export_failures{signal="metrics"}` exists from the very
-    /// first scrape and a dashboard can tell "zero failures" from "not
-    /// instrumented" (`tests/otlp_trace_e2e.rs`'s
-    /// `prometheus_scrape_works_with_no_otlp_configured` pins that).
+    /// Resolve the metric-side failure handle. Call once at boot, even with
+    /// no metric export configured, so the series exists from the first scrape.
     pub fn resolve(control: &StatsControl) -> Self {
         MetricExportHealth {
             failures: control.resolve(
@@ -630,25 +473,20 @@ impl MetricExportHealth {
         }
     }
 
-    /// Count one failed metric export. See [`ExportCounters`]'s doc for why
-    /// `WorkerId(0)` is the correct shard for a control-side increment.
+    /// Count one failed metric export.
     fn record_metric_failure(&self, registry: &Registry) {
         registry.incr(WorkerId(0), self.failures, 1);
     }
 }
 
 /// Build a lazily-connecting [`TraceServiceClient`], or `None` (after logging)
-/// if the endpoint string cannot be parsed at all.
+/// if the endpoint string is not a valid URI.
 ///
-/// Rust note: this is the same "log once and give up" shape the pre-split
-/// single exporter had inline, factored out because both exporters now need
-/// the identical logic and the metric variant additionally needs its own
-/// client type. An endpoint string that can't be parsed into an `Endpoint`
-/// (`TracingConfig::otlp_endpoint` / `MetricsExportConfig::otlp_endpoint` are
-/// validated non-empty at config-lowering time, but not that they're
-/// well-formed URIs -- see those fields' docs) can never succeed on any later
-/// tick either, so there is nothing to reconnect: every event emitted from here
-/// on is dropped rather than held anywhere.
+/// A malformed endpoint can never succeed on a later tick, so the exporter
+/// gives up and drops events rather than holding them.
+///
+/// Rust note: the same "log once and give up" shape both exporters share, so
+/// the logic lives in one place.
 async fn trace_client(otlp_endpoint: &str) -> Option<TraceServiceClient<Channel>> {
     match Endpoint::from_shared(otlp_endpoint.to_string()) {
         Ok(endpoint) => Some(TraceServiceClient::new(endpoint.connect_lazy())),
@@ -663,13 +501,8 @@ async fn trace_client(otlp_endpoint: &str) -> Option<TraceServiceClient<Channel>
     }
 }
 
-/// The metric-path twin of [`trace_client`]. Separate `Endpoint` rather than a
-/// `clone()` of the trace one, so the two exporters hold genuinely independent
-/// connection state: a channel wedged behind a half-open trace connection
-/// cannot also stall the metric export, which is the same "no shared
-/// congestible resource" property `docs/telemetry-design.md` §4 asks for between
-/// operational export and content capture, applied here between the two
-/// operational signals.
+/// The metric-path twin of [`trace_client`]. Each exporter gets its own
+/// channel, so a wedged trace connection cannot stall metric export.
 async fn metrics_client(otlp_endpoint: &str) -> Option<MetricsServiceClient<Channel>> {
     match Endpoint::from_shared(otlp_endpoint.to_string()) {
         Ok(endpoint) => Some(MetricsServiceClient::new(endpoint.connect_lazy())),
@@ -684,15 +517,9 @@ async fn metrics_client(otlp_endpoint: &str) -> Option<MetricsServiceClient<Chan
     }
 }
 
-/// Export `batch` (if non-empty) and clear it, regardless of outcome -- see
-/// [`run_trace_exporter`]'s doc on why a failure logs and drops rather than
-/// retaining the batch for another attempt. A failed or timed-out batch is
-/// ALSO counted into both trace self-instruments: the failure under
-/// `signal="traces"`, and every span it discarded into the drop ledger that
-/// `publish_drops` moves into `llmproxy_otel_spans_dropped` -- the review
-/// flagged counting the failure while losing the batch size as underreporting,
-/// and a "1 failure" with no attached span count cannot answer the only
-/// question an operator asks it.
+/// Export `batch` (if non-empty) and clear it, whatever the outcome. A failed
+/// or timed-out batch counts both the failure and its span count, so a failure
+/// always comes with the number of spans lost.
 async fn flush(
     client: &mut TraceServiceClient<Channel>,
     resource: &Resource,
@@ -701,10 +528,8 @@ async fn flush(
     failures: &ExportCounters,
     export_deadline: Duration,
 ) {
-    // Publish BEFORE the empty-batch return, not after it: queue drops accrue
-    // whether or not there is anything to export, and a quiet-but-dropping
-    // pipeline is precisely when an operator most needs the counter live. The
-    // call is a load-compare-store against zero delta when nothing changed.
+    // Publish before the empty-batch return: queue drops accrue even when there
+    // is nothing to export.
     failures.publish_drops(registry);
     if batch.is_empty() {
         return;
@@ -721,19 +546,8 @@ async fn flush(
             ..Default::default()
         }],
     };
-    // Drop the batch either way -- `Vec::clear` after the `.await`, not
-    // before: `batch` (the caller's buffer) has to stay populated for the
-    // `spans`/`request` build above regardless of what `export` returns.
-    //
-    // The deadline bounds a collector that ACCEPTS the connection and then
-    // stops responding -- exactly the hazard the metric exporter's deadline
-    // exists for, and the review correctly refused to let traces keep running
-    // without one: without it, the first hung `export` parks this task's
-    // `.await` forever, every later batch buffers to `MAX_BATCH`, and the sink
-    // behind it fills and starts dropping -- an unbounded stall presented as
-    // best-effort telemetry. `ExportTraceServiceRequest` is moved into the
-    // timeout future and dropped with it on expiry; tonic's own docs say a
-    // cancelled request is safe, its outcome simply unknown to the client.
+    // The deadline bounds a collector that accepts the connection and then goes
+    // silent. A cancelled tonic request is safe; its outcome is just unknown.
     let outcome = tokio::time::timeout(export_deadline, client.export(request)).await;
     match outcome {
         Ok(Ok(_)) => {}
@@ -746,10 +560,7 @@ async fn flush(
             );
         }
         Err(_elapsed) => {
-            // A timed-out batch is exactly as lost as a rejected one, and the
-            // spans it carried were discarded either way -- count both, here
-            // and in `ExportCounters::record_trace_failure`, never just the
-            // failure alone.
+            // A timeout loses the batch just as a rejection does. Count both.
             failures.record_trace_failure(registry, span_count as u64);
             tracing::warn!(
                 deadline_ms = export_deadline.as_millis() as u64,
@@ -759,28 +570,15 @@ async fn flush(
         }
     }
     batch.clear();
-    // And publish again, now that this flush's own batch drops (if any) are
-    // in the ledger: a failed export's losses become scrape-visible in the
-    // same moment they happen, not one `BATCH_INTERVAL` later. The entry call
-    // above covers the case where THIS flush records nothing but the queue
-    // counter grew; this one covers the reverse. Together they make "drops
-    // recorded, registry not yet told" impossible at any return point of this
-    // function, at the cost of one no-op delta check.
+    // Publish again so this flush's batch drops are visible immediately.
     failures.publish_drops(registry);
 }
 
 /// Export the registry's current cumulative state, bounded by `deadline`.
 ///
-/// Same best-effort contract as [`flush`] -- a failure logs, counts itself, and
-/// moves on. There is nothing to hold hostage either way: [`map_metrics`] reads
-/// the registry fresh on every call, it does not accumulate a batch.
-///
-/// The registry is **not** cleared on failure, deliberately. Design doc §5.3:
-/// "An unsuccessful snapshot can be superseded by a later snapshot; interval
-/// histograms must not be cleared on failed export." This registry only ever
-/// holds cumulative values in the first place, so there is no interval state
-/// that could be lost by not clearing -- but the next snapshot would report the
-/// same cumulative totals regardless, and that is the property being relied on.
+/// Same best-effort contract as [`flush`]. The registry is cumulative and is
+/// **not** cleared on failure, so the next snapshot reports the totals anyway
+/// (`docs/telemetry-design.md` §5.3).
 async fn flush_metrics(
     client: &mut MetricsServiceClient<Channel>,
     registry: &Registry,
@@ -789,10 +587,8 @@ async fn flush_metrics(
     health: &MetricExportHealth,
 ) {
     let request = map_metrics(registry, resource);
-    // The deadline is the only thing bounding this `.await`. `connect_lazy`
-    // reconnects on its own, but a connection that establishes and then stops
-    // responding would otherwise park this task forever, taking every later
-    // tick with it.
+    // The deadline is the only bound on this `.await`. Without it a silent
+    // connection would park the task and stop every later tick.
     match tokio::time::timeout(deadline, client.export(request)).await {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
@@ -912,13 +708,9 @@ mod tests {
         }
     }
 
-    // `run_trace_exporter`/`run_metric_exporter` themselves need a real (or
-    // mock) collector -- exercised end
-    // to end by `crates/proxy/tests/otlp_trace_e2e.rs`, not here. This
-    // module's own tests stop at the pure mapping functions above, matching
-    // this crate's existing split (e.g. `access_log::render` is unit-tested
-    // here; the sink it writes through is exercised by whatever owns real
-    // I/O).
+    // The exporter loops need a collector and are covered end to end by
+    // `crates/proxy/tests/otlp_trace_e2e.rs`. These tests stop at the pure
+    // mapping functions and the counters.
 
     use crate::stats::{instruments, StatsControl, WorkerId};
 
@@ -1040,11 +832,8 @@ mod tests {
 
     // ---- self-instrumentation: failure counters and the drop ledger -------
 
-    /// Both failure series must exist as soon as both resolver types have run,
-    /// and carry distinct `signal` values. Two resolved series with the same
-    /// value would silently collapse into one -- an operator could not tell a
-    /// trace outage from a metric one, which is the entire reason the `signal`
-    /// label exists.
+    /// The two failure series must carry distinct `signal` values, or an
+    /// operator could not tell a trace outage from a metric one.
     #[test]
     fn both_export_failure_signals_resolve_to_distinct_series() {
         let control = StatsControl::new(1);
@@ -1070,10 +859,7 @@ mod tests {
         );
     }
 
-    /// Resolving the same counters twice (a boot-time resolve plus a reload
-    /// path, say) must not grow a second pair of series. `Registry`'s dedup is
-    /// keyed on `(instrument, attrs)`, so this is really a regression test on
-    /// the values above being distinct-but-stable rather than freshly minted.
+    /// Resolving twice must not create a second pair of series.
     #[test]
     fn resolving_export_counters_twice_still_yields_one_series_per_signal() {
         let control = StatsControl::new(1);
@@ -1095,13 +881,8 @@ mod tests {
         assert_eq!(drop_series, 1, "the drop series must not duplicate either");
     }
 
-    /// The review's P2 in its full form: a Prometheus-only deployment (tracing
-    /// ON, OTLP metric export OFF) must still see span drops. The trace
-    /// exporter publishes the ledger, so this needs no metric exporter at all
-    /// -- but it DOES need the series to exist, which is why `resolve` takes
-    /// the `Option`: the trace side resolves unconditionally from `main.rs`,
-    /// and this test pins that a `None` sink (the tracing-off shape) still
-    /// produces both series, publishes nothing, and reports zero.
+    /// A `None` sink (tracing off) still resolves both series, publishes
+    /// nothing, and reports zero.
     #[test]
     fn a_none_sink_still_resolves_both_series_and_publishes_zero() {
         let control = StatsControl::new(1);
@@ -1133,11 +914,7 @@ mod tests {
         );
     }
 
-    /// The ledger is a DELTA publisher, not a running-total setter: the source
-    /// counters are cumulative over the process's life and the registry handle
-    /// they feed must only ever see increases, so a publish that observes no
-    /// new drops must add nothing (rather than adding the running total again
-    /// and inflating the series without bound).
+    /// The ledger publishes deltas. A publish with no new drops adds nothing.
     #[test]
     fn publishing_reports_only_the_increase_in_drops() {
         let control = StatsControl::new(1);
@@ -1170,11 +947,8 @@ mod tests {
         assert_eq!(span_drops_value(&registry, &control), 3);
     }
 
-    /// The review's P2: a failed trace export counted the failure but dropped
-    /// the batch's span count on the floor -- "1 failure" with no attached
-    /// loss total cannot answer the only question an operator asks it. The
-    /// ledger must carry the batch's spans too, and both must land in the
-    /// registry after one publish.
+    /// A failed export must record the batch's span count as well as the
+    /// failure, and both must reach the registry after one publish.
     #[test]
     fn a_failed_trace_export_counts_its_batchs_spans_into_the_drop_ledger() {
         let control = StatsControl::new(1);
@@ -1195,10 +969,7 @@ mod tests {
         );
     }
 
-    /// Queue drops and batch drops must SUM, not overwrite: both are real
-    /// losses on the same pipeline, and an operator reading
-    /// `llmproxy_otel_spans_dropped` needs the total, not whichever happened
-    /// to be written last.
+    /// Queue and batch drops sum into one series rather than overwrite each other.
     #[test]
     fn queue_drops_and_batch_drops_sum_into_one_series() {
         let control = StatsControl::new(1);
@@ -1225,9 +996,7 @@ mod tests {
     #[test]
     fn a_failed_metric_export_is_counted_under_the_metrics_signal_only() {
         let control = StatsControl::new(1);
-        // Both signals resolved, so "the other one stayed at zero" is a real
-        // assertion about this counter rather than an artifact of the series
-        // not existing yet -- which is the state a tracing-off process is in.
+        // Both series are resolved, so a zero here is a real zero.
         let (sink, _rx) = crate::trace::SpanSink::new(1);
         let _counters = ExportCounters::resolve(&control, Some(sink.drop_counter()));
         let health = MetricExportHealth::resolve(&control);
@@ -1270,9 +1039,7 @@ mod tests {
         assert_eq!(span_drops_value(&registry, &control), 0);
     }
 
-    /// Read the current `llmproxy_otel_spans_dropped` total out of the
-    /// registry. Resolving is idempotent, so the test can resolve on every
-    /// call to read the value at that moment without adding a series.
+    /// Reads `llmproxy_otel_spans_dropped`. Resolving is idempotent.
     fn span_drops_value(registry: &Registry, control: &StatsControl) -> u64 {
         let handle = control.resolve(&instruments::OTEL_SPANS_DROPPED, &[]);
         registry.value(handle)

@@ -1,44 +1,18 @@
-//! Acceptance: boot the REAL `llm-proxy` binary against a
-//! scripted control plane (`testing/controlplane`'s `Harness`) and prove the
-//! ADS pipeline works end to end in the shipped process.
+//! Acceptance: boot the real `llm-proxy` binary against a scripted control
+//! plane (`testing/controlplane`'s `Harness`) and prove the ADS pipeline works
+//! end to end in the shipped process. A control-plane-delivered cluster
+//! reaches `/config_dump` and routes real traffic. The proxy also boots and
+//! serves its static config when the control plane is unreachable.
 //!
-//! # These tests do NOT catch the two ordering bugs, and that was measured
-//!
-//! This file was written to close the two gaps `crates/proxy/src/main.rs`
-//! records in its own comments: publish-before-cluster-install, and
-//! ACK-before-apply. **It does not close either.** Both mutations were run
-//! against these three tests on 2026-09-06 and all three stayed green:
-//!
-//! - deleting `start_ads`'s `reply_rx.await` (ACK before the snapshot is
-//!   applied): 3/3 pass.
-//! - moving `publish` above `update_from_snapshot` in `apply_snapshot`:
-//!   3/3 pass.
-//!
-//! The reasoning that said otherwise -- that an ACK observed in the harness
-//! log implies `apply_snapshot` has already returned, so a single unretried
-//! check afterwards must see the result -- is wrong in the direction that
-//! matters. Observing the ACK costs a network round trip plus a polling
-//! interval, orders of magnitude longer than the window either bug opens, so
-//! the racing apply always wins and the check passes either way. A test that
-//! passes whether or not the bug is present is not coverage.
-//!
-//! **The publish ordering is now enforced by the type system instead** --
-//! `install_clusters` returns a `ClustersInstalled` receipt that
-//! `publish_to_workers` consumes, so the wrong order does not compile. See
-//! `apply_snapshot`'s doc. ACK-before-apply remains pinned only one layer
-//! down, by `proxy-xds`'s
-//! `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`,
-//! which proves the seam works but not that `main.rs` uses it. That gap is
-//! still open and is recorded at the call site.
-//!
-//! # What these tests DO prove, which is worth having
-//!
-//! They are the first and only coverage of the ADS pipeline inside the real
-//! binary: a control-plane-delivered cluster reaches `/config_dump`, it is
-//! actually routable by real traffic, and the proxy boots and serves its
-//! static config when the control plane is unreachable. All three were
-//! untested before this file, and the last is the single most important
-//! behavioral property of the ADS wiring.
+//! These tests do not catch the two ordering bugs. Mutating the ACK to run
+//! before the snapshot is applied, or publishing before the clusters are
+//! installed, leaves all three green. Observing the ACK costs a round trip,
+//! so the racing apply nearly always wins. Publish order is now enforced by
+//! the type system: `install_clusters` returns a `ClustersInstalled` receipt
+//! that `publish_to_workers` consumes. ACK-before-apply is pinned one layer
+//! down by `proxy-xds`'s
+//! `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`, which
+//! proves the seam works but not that `main.rs` uses it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -751,7 +725,7 @@ fn cluster_with_unbuildable_tls(name: &str, port: u32) -> cluster_v3::Cluster {
     }
 }
 
-/// Review H1 / S8: a CDS response with one cluster the cluster manager cannot
+/// S8: a CDS response with one cluster the cluster manager cannot
 /// build is NACKed with that cluster's dotted path, and the whole response is
 /// discarded. The same response also repoints `dynamic_backend` at a dead
 /// port; serving 200 from the original upstream afterwards is the negative

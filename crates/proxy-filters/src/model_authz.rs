@@ -1,31 +1,16 @@
-//! Per-tenant model allow-lists, as a pure library.
-//!
-//! This module answers one question: **given a tenant's [`crate::auth::TenantPolicy`],
-//! is a requested model permitted?** It does not touch `HttpFilter`, proto
-//! decoding, or `StreamInfo` — those are [`crate::model_authz_filter`].
+//! Pure per-tenant model authorization. HTTP integration and config decoding
+//! live in [`crate::model_authz_filter`].
 //!
 //! # Matching rule: exact match, or one trailing `*` glob — no regex
 //!
-//! [`ModelPattern::matches`] is deliberately this simple. `gpt-4*` matches
-//! `gpt-4o`, `gpt-4-turbo`, and the literal string `gpt-4` itself (the `*`
-//! also matches zero characters); anything not ending in `*` must match a
-//! model name exactly. There is no other wildcard syntax, no character
-//! classes, no regex (do not invent a regex surface). [`crate::model_authz_filter::parse_config`] rejects a
-//! pattern with a `*` anywhere but the final character (or more than one)
-//! at config load, so a [`ModelPattern`] built from a validated config
-//! always has at most one trailing `*`; [`ModelPattern::matches`] itself
-//! stays total (never panics) even if handed something that validation
-//! wouldn't have allowed, treating any `*` that isn't trailing as a literal
-//! character no real model name will ever contain.
+//! A pattern is an exact name or a prefix ending in one `*`; the wildcard may
+//! match zero characters. Config parsing rejects other wildcard forms, while
+//! [`ModelPattern::matches`] remains total for directly constructed values.
 //!
 //! # `ModelAccess::All` vs `Only(vec![])`, restated
 //!
-//! See [`crate::auth::TenantPolicy`]'s doc for why this is an explicit enum:
-//! in short, a bare `Vec` cannot express "deny every model for this tenant"
-//! and "grant every model" as two different values without one of them being
-//! an interpretation of emptiness. [`ModelAccess::Only`] with an empty
-//! pattern list is a real, legal, distinct policy — "no models yet" — from
-//! [`ModelAccess::All`].
+//! The explicit enum distinguishes granting all models from denying all with
+//! `Only(vec![])`; an absent tenant policy remains a separate state.
 
 use std::collections::HashMap;
 use std::sync::Arc;

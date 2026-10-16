@@ -1,12 +1,9 @@
 //! The gRPC channel to the ADS control plane.
 //!
-//! The channel is built from the ADS cluster's own `transport_socket`, the
-//! same `UpstreamTlsContext` IR any other cluster uses, and TLS is
-//! originated by the same [`UpstreamTlsFactory`]. The control plane delivers
-//! provider credentials in cluster headers, so a plaintext channel to a
-//! remote control plane would expose them (architecture.md section 11, H7).
-//! Loading refuses that case unless the operator opts in; see
-//! `envoy-divergences.md` row 33.
+//! The channel is built from the ADS cluster's own `transport_socket` (an `UpstreamTlsContext`), and TLS is originated
+//! by the same [`UpstreamTlsFactory`]. Provider credentials travel in cluster headers, so a plaintext channel to a
+//! remote control plane would expose them (architecture.md section 11, H7). Loading refuses that unless the operator
+//! opts in (`envoy-divergences.md` row 33).
 
 use std::future::Future;
 use std::io;
@@ -25,9 +22,8 @@ use crate::tls::UpstreamTlsFactory;
 /// How the channel reaches the control plane, for the startup log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdsTransport {
-    /// TLS from the cluster's `transport_socket`. `server_verified` is false
-    /// when no `validation_context` is configured: Envoy then accepts any
-    /// server certificate, and so does this channel.
+    /// TLS from the cluster's `transport_socket`. `server_verified` is false with no `validation_context`. Envoy then
+    /// accepts any server certificate, and so does this channel.
     Tls { server_verified: bool },
     /// No `transport_socket`, and every endpoint is on this machine.
     PlaintextLoopback,
@@ -59,14 +55,11 @@ pub enum AdsChannelError {
     PlaintextRefused { cluster: String, target: String },
 }
 
-/// Builds the channel to the first endpoint of `cluster`, connected lazily
-/// so that a control plane that is down at boot does not stop the proxy
-/// (the ADS client reconnects with backoff). The cluster's
-/// `connect_timeout` bounds each dial, as it does for Envoy's gRPC client.
+/// Builds the channel to the first endpoint of `cluster`, connected lazily so a control plane that is down at boot
+/// does not stop the proxy (the ADS client reconnects with backoff). `connect_timeout` bounds each dial.
 ///
-/// Loading already refuses a plaintext channel to a remote control plane
-/// unless `ads.allow_plaintext` is set; this re-checks it so that a gap in
-/// that check fails closed instead of dialling.
+/// Loading already refuses a plaintext channel unless `ads.allow_plaintext` is set. This re-checks it, so a gap in
+/// that check fails closed instead of dialing.
 pub fn ads_channel(
     cluster: &ClusterConfig,
     ads: &AdsConfig,
@@ -140,9 +133,8 @@ pub fn ads_channel(
 
 /// Dials the ADS endpoint and originates TLS on it.
 ///
-/// Rust note: tonic accepts any `tower::Service<Uri>` that yields a
-/// `hyper::rt::Read + Write` stream as a connector; `TokioIo` adapts tokio's
-/// `AsyncRead`/`AsyncWrite` to hyper's traits.
+/// Rust note: tonic accepts any `tower::Service<Uri>` yielding a `hyper::rt::Read + Write` stream. `TokioIo` adapts
+/// tokio's `AsyncRead` and `AsyncWrite` to hyper's traits.
 #[derive(Clone)]
 struct TlsConnector {
     factory: Arc<UpstreamTlsFactory>,
@@ -170,10 +162,8 @@ impl Service<Uri> for TlsConnector {
             match this.factory.wrap(tcp, &this.host).await {
                 Ok(tls) => Ok(TokioIo::new(tls)),
                 Err(error) => {
-                    // tonic reports a failed connect as a bare "transport
-                    // error", so name the TLS cause here; an operator with a
-                    // wrong CA would otherwise see only reconnects. The ADS
-                    // client's reconnect backoff bounds how often this logs.
+                    // tonic reports a failed connect as a bare "transport error", so name the TLS cause here. An operator
+                    // with a wrong CA would otherwise see only reconnects. The reconnect backoff bounds how often this logs.
                     tracing::warn!(
                         cluster = %this.cluster,
                         target = %format!("{}:{}", this.host, this.port),

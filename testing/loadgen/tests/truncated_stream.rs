@@ -1,14 +1,5 @@
-//! A truncated SSE stream (body ends without the dialect's terminal frame)
-//! must be counted as a distinct failure, not a success -- see the crate's
-//! task brief. This is a regression test for a real measurement defect:
-//! `driver::execute` used to discard `FrameKind::Terminal` entirely
-//! (`FrameKind::Terminal | FrameKind::Other => {}`), so a stream cut short by
-//! the proxy reported a 0% error rate.
-//!
-//! Kept hermetic and independent of `testing/diffrig` (same reasoning as
-//! `smoke.rs`): a bare hyper server serving a fixed, known-length SSE body is
-//! all that's needed to prove the terminal-frame check works, for both the
-//! OpenAI (`[DONE]`) and Anthropic (`message_stop`) dialects.
+//! A truncated SSE stream must count as a failure. A local Hyper server tests
+//! terminal-frame handling for OpenAI and Anthropic without external services.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -42,10 +33,7 @@ const OPENAI_COMPLETE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-/// Anthropic `/v1/messages` content deltas with no trailing `message_stop` --
-/// this dialect's terminal frame is not `[DONE]`, so this proves the
-/// terminal-frame check in `driver.rs` is genuinely generic rather than
-/// hardcoded to the OpenAI shape.
+/// Anthropic content deltas without the required `message_stop` terminal frame.
 const ANTHROPIC_TRUNCATED: &str = concat!(
     "event: message_start\ndata: {}\n\n",
     "event: content_block_start\ndata: {}\n\n",

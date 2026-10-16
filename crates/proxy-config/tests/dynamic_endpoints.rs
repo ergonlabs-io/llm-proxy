@@ -1,18 +1,9 @@
 //! Acceptance tests: lowering ONE xDS-delivered
 //! `ClusterLoadAssignment` (an EDS resource) into endpoint IR.
 //!
-//! This is the config half of EDS only -- nothing here subscribes to EDS or
-//! feeds a cluster manager. Mirrors
-//! `dynamic_lower.rs`'s fixture idiom: build the proto by hand, encode it
-//! into an `Any` (the shape an ADS `DiscoveryResponse.resources` entry
-//! carries on the wire), and lower it directly -- there is no bootstrap file
-//! on this path.
-//!
-//! **The strict-mode test is the point of this file, not a nice-to-have.**
-//! `lower_dynamic_endpoints` runs the same `check_supported_surface` pass
-//! `build_snapshot` runs over a whole file-loaded bootstrap; a `Cluster`
-//! LoadAssignment delivered over EDS gets none of AGENTS.md invariant 1's
-//! protection unless this function puts it there too.
+//! Tests config lowering for EDS endpoint resources without subscribing or
+//! updating a cluster manager. Direct `Any` construction matches the ADS input
+//! path, and strict surface checks apply to delivered resources too.
 
 use prost::Message;
 use proxy_api::envoy::config::core::v3 as core_v3;
@@ -203,14 +194,8 @@ fn a_listener_typed_any_passed_to_lower_dynamic_endpoints_is_refused_naming_both
 
 // ------------------------------------------------------------- empty case --
 
-/// An assignment with no localities at all is a legitimate "this cluster has
-/// no endpoints right now" answer (Envoy sends exactly this while a cluster
-/// is draining, or before any host has registered) -- it must lower to an
-/// empty `Vec`, not error. This is NOT the same shape as the aggregate/EDS
-/// cross-check `convert_cluster` runs on a *bootstrap-declared* cluster's own
-/// `load_assignment` (see `lower.rs`'s doc on that check): there is no
-/// competing endpoint source here to have gone stale, this function IS the
-/// EDS-delivered source.
+/// An empty assignment is valid while a cluster is draining or has no hosts;
+/// it lowers to an empty vector.
 #[test]
 fn an_assignment_with_no_localities_lowers_to_an_empty_endpoint_list_rather_than_an_error() {
     let la = assignment("payments-primary", vec![]);
@@ -226,12 +211,8 @@ fn an_assignment_with_no_localities_lowers_to_an_empty_endpoint_list_rather_than
 
 // --------------------------------------------------------- hostnames vs IPs --
 
-/// An EDS-delivered endpoint must carry a literal IP, the same as a STATIC
-/// cluster's own endpoints, but for a different reason: `accept_eds_update`
-/// installs these through `discovery::static_hosts`, which does no name
-/// resolution. Envoy's EDS wire format does permit a hostname -- we cannot
-/// currently use one, and refusing at lowering keeps that a config-time error
-/// with a dotted path instead of a per-push runtime `io::Error`.
+/// EDS endpoints require literal IPs because `static_hosts` does no name
+/// resolution; rejecting hostnames here keeps errors at config time.
 #[test]
 fn an_eds_endpoint_with_a_hostname_instead_of_a_literal_ip_is_refused() {
     let la = assignment(

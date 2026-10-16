@@ -20,9 +20,7 @@ fn parse(text: &str) -> Result<proxy_simple_config::SimpleConfig, ConfigError> {
     parse_simple_config_with_env(text, &test_env)
 }
 
-/// The shipped example config — embedded as `SAMPLE_CONFIG` — parses,
-/// lowers, and passes the FULL Envoy-mode pipeline, including PGV validation
-/// and IR conversion.
+/// The shipped example parses and passes the full Envoy-mode pipeline.
 #[test]
 fn example_config_lowers_end_to_end() {
     let config = parse(proxy_simple_config::SAMPLE_CONFIG).expect("example must parse");
@@ -47,11 +45,7 @@ fn example_config_lowers_end_to_end() {
         ]
     );
 
-    // The aggregate really is one, and its members are in failover order --
-    // primary first. Asserting the kind (not just the name) is what proves
-    // the dialect emitted something our own strict loader accepted as an
-    // aggregate rather than a cluster that merely happens to be called
-    // `fallback:...`.
+    // Check the cluster kind as well as its name and member order.
     let aggregate = snapshot
         .clusters
         .get("fallback:route-0")
@@ -94,11 +88,7 @@ fn example_config_lowers_end_to_end() {
         .collect::<Vec<_>>()
         .join(",");
     assert!(!all.contains("limits"), "warnings: {all}");
-    // `fallbacks` must NOT warn any more: fallback lowering implements it,
-    // and this route's chain really does lower to the `fallback:route-0`
-    // aggregate asserted above. A warning here would mean the feature had
-    // silently regressed to being parsed-and-dropped, which is the state fallback
-    // lowering removed.
+    // Implemented fallbacks must not produce a warning.
     assert!(
         !all.contains("fallbacks"),
         "fallbacks are implemented and must not warn; warnings: {all}"
@@ -224,13 +214,7 @@ routes:
     }
 }
 
-/// `protocol: http2` on a provider must reach the IR as
-/// `UpstreamProtocol::Http2` on that provider's cluster -- asserted on the
-/// IR, not the intermediate JSON, since the JSON being right but the IR
-/// being wrong (a drift between this dialect's `HTTP_PROTOCOL_OPTIONS_KEY`
-/// and `proxy_config::lower`'s reader) is exactly the failure this test
-/// exists to catch. This is the on-ramp to `proxy-http::upstream_pool`'s h2
-/// upstream connection cache.
+/// HTTP/2 protocol options survive lowering into the provider cluster IR.
 #[test]
 fn provider_protocol_http2_reaches_the_ir() {
     let config = parse(

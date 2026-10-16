@@ -1,7 +1,4 @@
-//! Per-endpoint wire shapes: request bodies and SSE frame classification for
-//! the three dialects the driver speaks. Kept deliberately independent of
-//! `testing/diffrig`'s mock types (see module doc in `lib.rs`) -- this code
-//! only assumes the wire shapes those mocks (and real providers) emit.
+//! Request bodies, headers, and SSE classification for the driver's endpoint dialects.
 
 use serde_json::{json, Value};
 
@@ -86,10 +83,7 @@ impl Endpoint {
     }
 }
 
-/// What one SSE frame means to the driver: does it carry a piece of the
-/// generated text (a "token" for our purposes -- one delta chunk, not a
-/// tokenizer token), does it end the stream, or is it bookkeeping we don't
-/// care about (role deltas, `content_block_start`, etc.)?
+/// Whether a frame carries text, ends the stream, or is bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameKind {
     ContentDelta(String),

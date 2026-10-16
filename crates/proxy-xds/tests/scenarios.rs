@@ -6,9 +6,9 @@
 //!
 //! # Where each of the five lives
 //!
-//! Three of the five already had full socket-level coverage in
-//! `tests/client.rs` before this file existed; this file adds only what an
-//! audit found genuinely missing (plus one recovery leg that was unit-only).
+//! Three of the five already had socket-level coverage in `tests/client.rs`.
+//! This file adds the cases that were missing, plus one recovery leg that was
+//! covered only at the unit level.
 //!
 //! | Scenario              | Socket-level test                                                              | Unit-level test (`tests/subscription.rs`)                       |
 //! |------------------------|--------------------------------------------------------------------------------|-------------------------------------------------------------------|
@@ -18,10 +18,9 @@
 //! | spurious-nonce         | [`an_unrequested_second_response_is_still_answered_with_its_own_nonce`] (added here -- nothing before this file drove it over a socket) | `the_nonce_advances_on_a_nack_as_well_as_an_ack` (only proves the nonce field advances, not that the client answers a second response at all) |
 //! | out-of-order-response  | [`an_lds_response_before_cds_is_still_acked_independently_of_arrival_order`] (added here) | `types_keep_independent_version_and_nonce_state` (proves independent state, not ordering over a wire) |
 //!
-//! Rust note: every test bounds its wait with `tokio::time::timeout` or the
-//! shared `wait_for_log_len` poll helper (AGENTS.md "Build And Test", Hangs -- a hang must fail loudly,
-//! not stall) and runs on a `multi_thread` runtime, and every ephemeral
-//! socket comes from `Harness::spawn` binding `127.0.0.1:0` (AGENTS.md "Running The Product").
+//! Rust note: every test runs on a `multi_thread` runtime and bounds its waits
+//! with `tokio::time::timeout`, so a hang fails loudly (AGENTS.md "Build And
+//! Test", Hangs). Sockets are ephemeral (AGENTS.md "Running The Product").
 
 use std::time::{Duration, Instant};
 
@@ -153,31 +152,13 @@ async fn a_nack_is_followed_by_a_normal_accept_of_the_next_good_response() {
 // spurious-nonce
 // ---------------------------------------------------------------------------
 
-/// The `spurious-nonce` acceptance scenario. S8: "Requests must echo
-/// latest nonce; responses with stale nonce ignored (server-side concern;
-/// client behavior = respond to every response)."
+/// S8: the client answers every response, even one carrying a nonce it did
+/// not most recently send. Stale-nonce filtering is the server's job.
 ///
-/// `ScriptedAds` doesn't wait for a fresh client request per `Step::Send` --
-/// it waits for the next request of the matching `type_url`, whatever it is
-/// -- so scripting two `Send` steps back to back for the same type serves
-/// the second response the moment the client's ACK of the first lands,
-/// without the client ever asking for it. That models a control plane racing
-/// ahead of the client's own request cadence: by the time the client's ACK
-/// of `n1` arrives, the control plane already has `n2` to hand it. A client
-/// that tried to filter incoming responses by some notion of "the nonce I
-/// most recently sent" would drop this one; the correct behavior named
-/// above is to answer it anyway. A client that silently dropped it would
-/// make `wait_for_log_len` below time out rather than merely assert wrong.
-///
-/// **What this harness cannot script, and therefore what this test does NOT
-/// prove:** a response arriving *before* the client's prior ACK.
-/// `Step::Send` consumes a request before it sends, so the earliest a
-/// scripted response can land is immediately after the ACK it waited on.
-/// Truly overlapping delivery would need a `Step` that sends without
-/// consuming anything. Not added here because S8 assigns stale-nonce
-/// filtering to the server ("client behavior = respond to every response"),
-/// so the client has no ordering rule left to violate -- but if that
-/// annotation is ever revisited, this is the gap to close first.
+/// Two scripted sends back to back serve the second response as soon as the
+/// first ACK lands. A client that filtered it would time out here. This test
+/// does not cover a response arriving before the prior ACK, because the
+/// harness cannot script that.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unrequested_second_response_is_still_answered_with_its_own_nonce() {
     let harness = Harness::spawn(vec![

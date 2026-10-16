@@ -128,10 +128,9 @@ pub(super) fn build_cert_set(
     Ok(set)
 }
 
-/// `ResolvesServerCert` backed by an `ArcSwap<CertSet>` -- the hot-reload seam.
-/// Rust note: `ArcSwap` gives lock-free reads on the hot path (every accepted
-/// connection resolves a cert) and a cheap atomic pointer swap on update; it's
-/// the same pattern `WorkerConfigHandle` uses for whole config snapshots.
+/// `ResolvesServerCert` backed by an `ArcSwap<CertSet>`, the hot-reload seam.
+/// Rust note: `ArcSwap` gives lock-free reads on the hot path (every accepted connection resolves a cert) and a cheap
+/// atomic swap on update. It is the same pattern `WorkerConfigHandle` uses.
 #[derive(Debug)]
 pub(super) struct SwapCertResolver(ArcSwap<CertSet>);
 
@@ -145,10 +144,8 @@ impl SwapCertResolver {
     }
 }
 
-/// Signature schemes whose name starts with `ECDSA_` -- used to decide
-/// whether a ClientHello can accept an ECDSA certificate. `SignatureScheme`
-/// doesn't expose its `SignatureAlgorithm` publicly, so this matches on the
-/// concrete schemes rustls defines (see `rustls::enums::SignatureScheme`).
+/// Signature schemes whose name starts with `ECDSA_`, used to decide whether a ClientHello can accept an ECDSA
+/// certificate. `SignatureScheme` does not expose its algorithm, so this matches the concrete schemes rustls defines.
 fn is_ecdsa_scheme(scheme: SignatureScheme) -> bool {
     matches!(
         scheme,

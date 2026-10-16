@@ -1,10 +1,7 @@
-//! Compiled TLS transport sockets: builds `rustls`
-//! `ServerConfig`/`ClientConfig` straight from the IR
-//! (`DownstreamTlsSpec`/`UpstreamTlsSpec`), one factory per filter chain /
-//! cluster. This module never sees Envoy protos -- AGENTS.md invariant 2 -- and
-//! never silently drops a configured field -- AGENTS.md invariant 1: every
-//! `ValidationContextIR` field (`ca`, `san_matchers`,
-//! `allow_expired_certificate`) is honored by the verifiers in [`verify`].
+//! Compiled TLS transport sockets: builds `rustls` `ServerConfig` and `ClientConfig` straight from the IR, one
+//! factory per filter chain or cluster. No Envoy protos reach this module (AGENTS.md invariant 2). Every
+//! `ValidationContextIR` field (`ca`, `san_matchers`, `allow_expired_certificate`) is honored by the verifiers in
+//! [`verify`] (invariant 1).
 //!
 //! Split into:
 //! - this file: crypto-provider construction (versions/suites/curves) and
@@ -45,9 +42,8 @@ use verify::{
     HostnameBypassServerCertVerifier, PendingSdsClientCertVerifier,
 };
 
-/// Error building a TLS factory from IR. `context` is caller-supplied (e.g.
-/// `listener 'x' filter_chains[0]`) -- AGENTS.md invariant 1's "where" for the parts
-/// of config-loading that happen after IR conversion, at socket build time.
+/// Error building a TLS factory from IR. `context` is caller-supplied (for example `listener 'x' filter_chains[0]`),
+/// so the error says where, per AGENTS.md invariant 1.
 #[derive(Debug, thiserror::Error)]
 #[error("TLS config error in {context}: {reason}")]
 pub struct TlsBuildError {
@@ -66,17 +62,14 @@ impl TlsBuildError {
 
 // --------------------------------------------------------- crypto provider --
 
-// Rust note: these need to be named `static`s (not inline `&[...]` literals in
-// the `match` arms below) so the compiler can see they live for `'static` --
-// an array of `&'static` references isn't automatically promoted when it's
-// built as a temporary inside a function body.
+// Rust note: these must be named `static`s, not inline `&[...]` literals in the `match` arms. An array of `&'static`
+// references is not promoted to `'static` when built as a temporary inside a function body.
 static VERSIONS_V12: &[&rustls::SupportedProtocolVersion] = &[&version::TLS12];
 static VERSIONS_V13: &[&rustls::SupportedProtocolVersion] = &[&version::TLS13];
 static VERSIONS_BOTH: &[&rustls::SupportedProtocolVersion] = &[&version::TLS13, &version::TLS12];
 
-/// `&[&SupportedProtocolVersion]` for `min_version..=max_version`. Rust note:
-/// rustls builders take a slice of *enabled* versions, not a min/max pair, so
-/// this expands the IR's inclusive range into that list.
+/// The enabled versions for `min_version..=max_version`. rustls takes a list of enabled versions, not a min and max
+/// pair, so this expands the IR's inclusive range.
 fn protocol_versions(
     params: &TlsParametersIR,
 ) -> &'static [&'static rustls::SupportedProtocolVersion] {
@@ -119,10 +112,8 @@ fn map_ecdh_curve(curve: TlsEcdhCurve) -> &'static dyn rustls::crypto::Supported
     }
 }
 
-/// Build the `CryptoProvider` a `TlsParametersIR` implies. Empty
-/// `cipher_suites`/`ecdh_curves` mean "ring's defaults"; non-empty means a
-/// preference-ordered custom list -- see the module doc on TLS 1.3 suites
-/// never being filtered.
+/// Builds the `CryptoProvider` a `TlsParametersIR` implies. Empty `cipher_suites` or `ecdh_curves` mean ring's
+/// defaults. A non-empty list is a preference-ordered custom list (see the module doc on TLS 1.3 suites).
 fn build_crypto_provider(params: &TlsParametersIR) -> CryptoProvider {
     let default = rustls::crypto::ring::default_provider();
 
@@ -179,12 +170,9 @@ fn build_root_store(ca: &CaSource, context: &str) -> Result<RootCertStore, TlsBu
                     "trusted_ca PEM bundle contained no valid certificates",
                 ));
             }
-            // Envoy/BoringSSL fail on malformed entries in an explicit CA
-            // bundle; silently dropping some of a configured trust anchor set
-            // is exactly the degradation AGENTS.md invariant 1 forbids. (System
-            // roots below are different: platform stores routinely contain
-            // entries webpki can't parse, and skipping those matches how
-            // every TLS stack consumes them.)
+            // Envoy and BoringSSL fail on malformed entries in an explicit CA bundle. Silently dropping part of a
+            // configured trust-anchor set is the degradation AGENTS.md invariant 1 forbids. System roots differ:
+            // platform stores contain entries webpki cannot parse, and every TLS stack skips those.
             if ignored > 0 {
                 return Err(TlsBuildError::new(
                     context,
@@ -219,15 +207,12 @@ fn build_root_store(ca: &CaSource, context: &str) -> Result<RootCertStore, TlsBu
 
 /// Downstream (server-side) TLS termination for one filter chain.
 pub struct DownstreamTlsFactory {
-    // Unlike certificates (whose resolver is already hot-swappable), a
-    // trust-anchor rotation changes rustls's client verifier. Keep the whole
-    // immutable ServerConfig behind ArcSwap so a completed SDS update becomes
-    // visible to new handshakes atomically while established connections keep
-    // their config alive.
+    // A trust-anchor rotation changes rustls's client verifier, unlike a certificate (already hot-swappable). The
+    // whole immutable `ServerConfig` sits behind `ArcSwap`, so a completed SDS update takes effect atomically for new
+    // handshakes while established connections keep their config.
     server_config: ArcSwap<ServerConfig>,
-    // Rust note: kept as the concrete resolver type (not `Arc<dyn
-    // ResolvesServerCert>`) purely so `update_certificates` can call
-    // `SwapCertResolver::store` directly without downcasting.
+    // Rust note: kept as the concrete resolver type, not `Arc<dyn ResolvesServerCert>`, so `update_certificates` can
+    // call `SwapCertResolver::store` without a downcast.
     cert_resolver: Arc<SwapCertResolver>,
     provider: Arc<CryptoProvider>,
     params: TlsParametersIR,
@@ -239,18 +224,11 @@ pub struct DownstreamTlsFactory {
 impl DownstreamTlsFactory {
     pub fn build(spec: &DownstreamTlsSpec, context: &str) -> Result<Self, TlsBuildError> {
         let provider = Arc::new(build_crypto_provider(&spec.params));
-        // An SDS-named chain binds with an EMPTY cert set
-        // rather than refusing to build. `SwapCertResolver::resolve` answers
-        // `None` for that set, so the listener accepts TCP and fails every TLS
-        // handshake until the control plane delivers -- never serving in the
-        // clear. Both-empty still errors, from `build_cert_set` itself: the
-        // lowering invariant on `DownstreamTlsSpec::certificates` says exactly
-        // one of the two is set, and a hand-built spec that breaks it must not
-        // get a silently-unserving listener.
-        //
-        // Rule 17 shape: this is a control that has not engaged yet, so it is
-        // loud. Fires per accept-loop worker on bind and on every snapshot
-        // rebuild -- not per connection.
+        // An SDS-named chain binds with an EMPTY cert set. `SwapCertResolver::resolve` answers `None`, so the listener
+        // accepts TCP and fails every handshake until the control plane delivers. It never serves in the clear. A
+        // spec with neither certificates nor SDS names still errors in `build_cert_set`, since that breaks the lowering
+        // invariant. This is a control that has not engaged yet, so it is loud. It fires per accept-loop worker on bind
+        // and on each snapshot rebuild, not per connection.
         let cert_set = if spec.certificates.is_empty() && !spec.certificate_sds_names.is_empty() {
             tracing::warn!(
                 context,
@@ -356,10 +334,8 @@ impl DownstreamTlsFactory {
         certs: &[TlsCertificateIR],
         context: &str,
     ) -> Result<(), TlsBuildError> {
-        // Rust note: re-derive the provider from the already-built config so
-        // the new certs are validated against the same algorithm set as the
-        // ones `build` loaded -- `ServerConfig` doesn't expose its provider
-        // directly, but `crypto_provider()` returns it.
+        // Rust note: re-derive the provider from the built config, so new certs are validated against the same
+        // algorithm set. `ServerConfig` exposes its provider through `crypto_provider()`.
         let set = resolver::build_cert_set(certs, &self.provider, context)?;
         self.cert_resolver.store(set);
         Ok(())
@@ -371,9 +347,8 @@ impl DownstreamTlsFactory {
         self.cert_resolver.store(resolver::CertSet::default());
     }
 
-    /// Atomically replace downstream client-auth trust anchors after an SDS
-    /// validation-context delivery. Construction happens before the swap, so
-    /// invalid PEM or an unusable CA bundle leaves the prior config serving.
+    /// Atomically replaces the downstream client-auth trust anchors after an SDS validation-context delivery.
+    /// Construction happens before the swap, so bad PEM leaves the prior config serving.
     pub fn update_validation_context(
         &self,
         validation: &ValidationContextIR,
@@ -394,9 +369,8 @@ impl DownstreamTlsFactory {
         Ok(())
     }
 
-    /// Return this factory to its pre-delivery SDS validation state. The
-    /// pending verifier rejects every client certificate until a later SDS
-    /// delivery installs fresh trust anchors.
+    /// Returns this factory to its pre-delivery SDS validation state. The pending verifier rejects every client
+    /// certificate until a later delivery installs trust anchors.
     pub fn remove_validation_context(&self, context: &str) -> Result<(), TlsBuildError> {
         let config = Self::build_server_config(
             &self.provider,
@@ -429,13 +403,9 @@ impl UpstreamTlsFactory {
         Self::build_with_alpn(spec, None, context)
     }
 
-    /// Like [`Self::build`], but `alpn_override`, when `Some`, replaces
-    /// `spec.alpn_protocols` for the `ClientConfig`'s ALPN offer. Used by
-    /// [`transport_socket_builder`] to derive ALPN from the cluster's
-    /// `upstream_protocol` when the spec doesn't configure one explicitly --
-    /// see that function's doc comment for why. Doesn't mutate `spec` itself,
-    /// so callers that only have a borrowed IR (never `proxy-cluster`'s
-    /// concern to own) don't need to clone it.
+    /// Like [`Self::build`], but `alpn_override`, when `Some`, replaces `spec.alpn_protocols` for the client's ALPN
+    /// offer. [`transport_socket_builder`] uses it to derive ALPN from the cluster's `upstream_protocol`. It does not
+    /// mutate `spec`.
     pub fn build_with_alpn(
         spec: &UpstreamTlsSpec,
         alpn_override: Option<&[String]>,
@@ -498,11 +468,9 @@ impl UpstreamTlsFactory {
         })
     }
 
-    /// TLS-originate to an upstream. `endpoint_host` is the cluster
-    /// endpoint's host (DNS name or IP); used as the rustls `ServerName` when
-    /// no explicit `sni` was configured (rustls never sends SNI for IP
-    /// literals regardless, and with `enable_sni = false` the name only feeds
-    /// the, possibly bypassed, verifier).
+    /// TLS-originates to an upstream. `endpoint_host` is the endpoint's DNS name or IP. It is the `ServerName` when no
+    /// explicit `sni` is set, and rustls never sends SNI for IP literals. With `enable_sni = false` it only feeds the
+    /// verifier, which may be bypassed.
     pub async fn wrap<IO: AsyncRead + AsyncWrite + Unpin>(
         &self,
         io: IO,
@@ -515,22 +483,16 @@ impl UpstreamTlsFactory {
     }
 }
 
-/// Shared by [`UpstreamTlsFactory::wrap`] and its
-/// [`UpstreamTransportSocket`] impl below: the explicit `sni` override wins,
-/// otherwise fall back to the endpoint host.
+/// Shared by [`UpstreamTlsFactory::wrap`] and its [`UpstreamTransportSocket`] impl: the explicit `sni` wins,
+/// otherwise the endpoint host.
 fn server_name_for(sni: &Option<String>, endpoint_host: &str) -> io::Result<ServerName<'static>> {
     let name = sni.as_deref().unwrap_or(endpoint_host).to_string();
     ServerName::try_from(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
-// Rust note: `wrap`'s signature is fixed by the `UpstreamTransportSocket`
-// trait (`proxy-cluster`, see that module's doc comment on why the trait
-// lives there and the impl lives here) -- it takes a concrete `TcpStream` and
-// returns a `'static` boxed future, unlike the inherent `wrap` above which is
-// generic over `IO` and returns the concrete `TlsStream<IO>`. Cloning
-// `client_config` (an `Arc`) and `sni` out of `&self` up front is what makes
-// the future `'static`: it can't borrow `self`, because a pool may move it
-// onto a spawned task that outlives this call.
+// Rust note: `wrap`'s signature is fixed by the `UpstreamTransportSocket` trait, which takes a concrete `TcpStream`
+// and returns a `'static` boxed future. The inherent `wrap` above is generic over `IO`. Cloning `client_config` (an
+// `Arc`) and `sni` out of `&self` makes the future `'static`, since a pool may move it onto a task that outlives this call.
 impl UpstreamTransportSocket for UpstreamTlsFactory {
     fn wrap(
         &self,
@@ -548,23 +510,17 @@ impl UpstreamTransportSocket for UpstreamTlsFactory {
     }
 }
 
-/// Builds the real [`proxy_cluster::transport::TransportSocketBuilder`]:
-/// plaintext for clusters with no `transport_socket`, upstream TLS
-/// (rustls, via [`UpstreamTlsFactory`]) for clusters that configure one.
+/// Builds the [`proxy_cluster::transport::TransportSocketBuilder`]: plaintext for a cluster with no
+/// `transport_socket`, upstream TLS (rustls, via [`UpstreamTlsFactory`]) otherwise.
 ///
 /// # ALPN derivation
 ///
-/// If `spec.alpn_protocols` is empty, this offers exactly one protocol
-/// derived from the cluster's `upstream_protocol`: `Http2` -> `["h2"]`,
-/// `Http1` -> `["http/1.1"]`. A non-empty `alpn_protocols` is used verbatim
-/// (explicit config wins).
+/// With empty `spec.alpn_protocols`, the offer is the one protocol implied by the cluster's `upstream_protocol`:
+/// `Http2` gives `["h2"]`, and `Http1` gives `["http/1.1"]`. A non-empty list is used verbatim.
 ///
-/// Our upstream codec is chosen from `upstream_protocol` at config time, not
-/// negotiated -- so offering the *matching* ALPN makes a misconfigured server
-/// (one that doesn't support the protocol we're about to speak) fail loudly
-/// at the TLS handshake instead of us silently speaking the wrong protocol
-/// over an already-established connection. Envoy derives its ALPN offer from
-/// the cluster's protocol options the same way.
+/// The upstream codec is chosen from `upstream_protocol` at config time, not negotiated. Offering the matching ALPN
+/// makes a server that does not speak that protocol fail at the handshake, rather than silently speaking the wrong
+/// protocol on an open connection. Envoy derives its offer the same way.
 pub fn transport_socket_builder() -> proxy_cluster::transport::TransportSocketBuilder {
     Arc::new(|config: &ClusterConfig| {
         let Some(spec) = &config.transport_socket else {

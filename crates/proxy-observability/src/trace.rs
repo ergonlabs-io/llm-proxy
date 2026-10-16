@@ -1,19 +1,11 @@
-//! Our own span model, plus W3C
-//! `traceparent` parsing/serialization. Pure library code — nothing here is
-//! wired into the request path yet, and nothing here is an OTLP wire type.
-//! A later change maps [`FinishedSpan`] to `opentelemetry.proto.trace`
-//! (vendored in `proxy-api`); AGENTS.md invariant 2 keeps that
-//! proto on the far side of the exporter, never handled by the data plane.
+//! Our own span model, plus W3C `traceparent` parsing and serialization. No
+//! OTLP wire types live here. The exporter maps [`FinishedSpan`] to the OTLP
+//! proto on the far side, per AGENTS.md invariant 2.
 //!
-//! # Two independent pieces
-//!
-//! - [`TraceContext`]: the 16-byte trace id / 8-byte span id / sampled flag
-//!   that identifies where a span sits in a distributed trace, plus parsing
-//!   and serializing the W3C `traceparent` header (<https://www.w3.org/TR/trace-context/>)
-//!   so this proxy can participate in a trace it did not start.
-//! - [`FinishedSpan`] / [`SpanSink`]: the record a completed span becomes,
-//!   and the best-effort, non-blocking channel a worker uses to hand one to
-//!   the control side. Neither performs I/O — exporting is a later step.
+//! - [`TraceContext`]: trace id, span id and sampled flag, plus the W3C
+//!   `traceparent` header (<https://www.w3.org/TR/trace-context/>).
+//! - [`FinishedSpan`] and [`SpanSink`]: a completed span, and the non-blocking
+//!   channel a worker uses to hand it to the control side. Neither does I/O.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -40,30 +32,16 @@ impl TraceContext {
     /// `<version>-<trace-id>-<parent-id>-<trace-flags>`, e.g.
     /// `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`.
     ///
-    /// Returns `None` on any malformation — the caller starts a fresh root
-    /// span in that case ([`Self::new_root`]), so this never panics and
-    /// never needs to distinguish *why* a header was rejected.
+    /// Returns `None` on any malformation, so the caller starts a fresh root
+    /// span ([`Self::new_root`]). Rejected:
+    /// - a wrong number of `-`-separated fields;
+    /// - a version other than `00`. This is deliberately strict, since a `00`
+    ///   proxy cannot know what a later version's extra fields mean;
+    /// - a field with the wrong hex length or non-hex digits;
+    /// - an all-zero trace id or span id, which the spec calls invalid.
     ///
-    /// Rejected, all with `None`:
-    /// - wrong number of `-`-separated fields;
-    /// - a version other than `00` (the only version this proxy speaks; the
-    ///   spec reserves `ff` and allows future versions to add fields after
-    ///   the ones defined here, but a `00`-shaped proxy has no way to know
-    ///   what a later version's extra fields mean, so treating anything but
-    ///   `00` as invalid is deliberately strict rather than partially
-    ///   forward-compatible);
-    /// - any field with the wrong hex length, or non-hex digits;
-    /// - a trace id or span id that is all zero (the spec calls both
-    ///   invalid — an all-zero trace id in particular is the sentinel for
-    ///   "no trace context", not a real one).
-    ///
-    /// Rust note: this decodes over bytes, never `&str` indexing/slicing.
-    /// `traceparent[i..j]` on a non-ASCII header can panic mid-way through a
-    /// multi-byte UTF-8 character (`decode_hex_payload` in
-    /// `proxy-config/src/lower.rs` documents the exact hazard) — checking
-    /// `is_ascii()` up front, then working on `&[u8]`, rules that out
-    /// entirely instead of trusting every call site to get the byte offsets
-    /// right.
+    /// Rust note: this decodes over bytes, never `&str` slices. Slicing a
+    /// non-ASCII header can panic mid-character, so `is_ascii()` is checked first.
     pub fn parse_traceparent(header: &str) -> Option<Self> {
         if !header.is_ascii() {
             return None;
@@ -104,12 +82,8 @@ impl TraceContext {
 
     /// A fresh root span: random trace id and span id, no parent.
     ///
-    /// Rust note: `rand::thread_rng()` is a thread-local CSPRNG handle, so
-    /// this is cheap to call per request and needs no state threaded
-    /// through (unlike `proxy-http::headers::splitmix64`, which is seeded
-    /// explicitly so worker threads don't collide -- trace/span ids have no
-    /// equivalent cross-worker uniqueness requirement, they only need to be
-    /// unlikely to collide with any other span in the trace).
+    /// Rust note: `thread_rng()` is a cheap thread-local handle, so no state is
+    /// threaded through. IDs only need to be unlikely to collide.
     pub fn new_root(sampled: bool) -> Self {
         TraceContext {
             trace_id: random_nonzero_array::<16>(),
@@ -199,11 +173,8 @@ fn random_nonzero_array<const N: usize>() -> [u8; N] {
     }
 }
 
-/// Where a span sits in a client/server call: which side of the wire it
-/// represents. Matches OTLP's `SpanKind` naming for the two kinds this
-/// proxy produces; a proxy request is always both -- the inbound leg is a
-/// `Server` span, the outbound leg to the upstream cluster is a `Client`
-/// span.
+/// Which side of the wire a span represents. A proxy request yields a `Server`
+/// span for the inbound leg and a `Client` span for the upstream leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpanKind {
     Server,
@@ -221,13 +192,9 @@ pub enum SpanStatus {
 
 /// A completed span, ready to hand to [`SpanSink::emit`].
 ///
-/// Rust note: `start`/`end` are [`std::time::SystemTime`] (wall clock), not
-/// [`std::time::Instant`] (monotonic). OTLP span timestamps are absolute
-/// unix-nanos on the wire, and an `Instant` has no defined relationship to
-/// the epoch -- it cannot be converted to one at all, only diffed against
-/// another `Instant` from the same process. The exporter (a later step)
-/// converts `SystemTime` to `u64` nanos since the epoch with
-/// `duration_since(UNIX_EPOCH)`.
+/// Rust note: `start` and `end` are [`std::time::SystemTime`], not `Instant`.
+/// OTLP needs absolute epoch timestamps, and an `Instant` cannot be converted
+/// to one.
 #[derive(Debug, Clone)]
 pub struct FinishedSpan {
     pub context: TraceContext,
@@ -241,19 +208,11 @@ pub struct FinishedSpan {
 
 /// The worker-held handle for emitting finished spans to the control side.
 ///
-/// Best-effort and non-blocking, per ADR-0005's "writes documented as
-/// best-effort" requirement: a request must never wait on, or fail because
-/// of, telemetry bookkeeping. [`Self::emit`] uses `try_send` and drops the
-/// span (counting it) rather than applying backpressure to the caller.
+/// Best-effort and non-blocking (ADR-0005). [`Self::emit`] uses `try_send` and
+/// counts a dropped span rather than applying backpressure to a request.
 ///
-/// Rust note: the data plane is `!Send` per ADR-0003, but that bounds
-/// worker-local *runtime state* (connections, filter state) -- it says
-/// nothing about a value merely being held inside a `!Send` future.
-/// `tokio::sync::mpsc::Sender` is `Send + Clone` on its own, so cloning one
-/// into worker-local code and sending across to a receiver the control
-/// runtime owns is exactly the intended crossing point, the same shape
-/// `StatsControl`/`Registry` and the access-log sink already use to move
-/// data from worker to control.
+/// Rust note: the data plane is `!Send` (ADR-0003), but a `Sender` is `Send` and
+/// `Clone` on its own, so it can cross from worker to control.
 #[derive(Clone)]
 pub struct SpanSink {
     tx: tokio::sync::mpsc::Sender<FinishedSpan>,
@@ -294,19 +253,10 @@ impl SpanSink {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// A handle onto the same cumulative drop counter [`Self::dropped_count`]
-    /// reads, for a caller that is not itself a sink -- specifically the OTLP
-    /// metric exporter, which republishes this figure as
-    /// [`crate::stats::instruments::OTEL_SPANS_DROPPED`] on its own interval.
-    ///
-    /// This is a separate type rather than a handed-out
-    /// `Arc<AtomicU64>` because the exporter wants a *read*, not the ability to
-    /// `fetch_add` or reset a counter owned by the trace path. The drop count is
-    /// otherwise invisible to operators: the spans it describes were never
-    /// exported, so the trace backend holds no record of them at all, and
-    /// `docs/telemetry-design.md` §5.5 makes aggregate drop counters the
-    /// dependable loss signal precisely because a per-request loss event
-    /// cannot itself be delivered when the pipeline is what broke.
+    /// A read-only handle onto the same drop counter, for the OTLP exporter to
+    /// republish as [`crate::stats::instruments::OTEL_SPANS_DROPPED`]. Dropped
+    /// spans never reach the backend, so this aggregate is the only loss signal
+    /// (`docs/telemetry-design.md` §5.5).
     pub fn drop_counter(&self) -> SpanDropCounter {
         SpanDropCounter(Arc::clone(&self.dropped))
     }

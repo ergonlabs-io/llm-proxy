@@ -1,46 +1,19 @@
 //! A CI guard against "IR field lowered but never read".
 //!
-//! Motivation (read before touching the allowlist): `RouteEntry.request_headers_to_add`
-//! was lowered correctly by both config front-ends and read by no runtime code at
-//! all — it's how the config dialect injects provider API keys, so every request
-//! reached its provider with no credentials. Strict mode (AGENTS.md invariant 1) could not
-//! catch this: it only proves a config field maps *into* the IR, not that the IR
-//! field is then *consumed*. This test closes that gap on the other side of the
-//! seam by grepping the runtime crates for a read of every `pub` IR field.
+//! Strict config loading proves fields reach the IR, not that runtime code reads
+//! them. This source scan checks that every public IR field has a runtime reader,
+//! guarding against accepted configuration that has no effect.
 //!
-//! Rust note: this is a source-scanning test, not real type reflection — it parses
-//! `ir.rs` as text (looking for `pub struct` blocks and `pub <field>:` lines) and
-//! greps the runtime crates' `src/` trees for `.field_name`. That's a weaker
-//! guarantee than a proc-macro derive would give (it can't tell a read from a
-//! write, and can be fooled by an unrelated field of the same name elsewhere), but
-//! it is enough to catch exactly the class of bug above, and it runs in
-//! milliseconds with no extra dependencies.
+//! Rust note: the scan parses `ir.rs` and searches runtime source for `.field`;
+//! it is intentionally lightweight and can confuse unrelated fields with the same name.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Runtime crates that consume the IR. `proxy-config` itself is deliberately
-/// excluded — AGENTS.md invariant 2 says the data plane consumes the IR, and a field
-/// read only inside `proxy-config` (e.g. by `RouteTable::new`'s precomputed
-/// index) does not prove anything runs on it at request time.
-///
-/// **`proxy-admin` is excluded for the same reason, and the reason is worth
-/// stating because it was NOT excluded originally.** It was listed here while
-/// it was an empty stub, where the choice cost nothing. Once `proxy-admin` gained
-/// `/config_dump`, that stopped being true: the dump renders IR fields for
-/// display, so every field it touches acquires a `.field` reference and would
-/// silently satisfy this guard. `HttpConnectionManagerConfig.stat_prefix` is
-/// what caught it — the dump rendered it and the staleness check immediately
-/// declared its allowlist entry obsolete, even though nothing yet *acts* on
-/// the field (that is still outstanding).
-///
-/// Displaying a field is not acting on it. This guard exists to catch the
-/// `request_headers_to_add` class of bug — lowered, validated, and then read
-/// by nothing, so every provider request went out unauthenticated. A
-/// `/config_dump` that grows to render the whole IR would defeat it one field
-/// at a time, quietly, with no test ever failing. That is precisely the
-/// failure mode this file was written to make impossible.
+/// Runtime crates that consume the IR. Config inspection and rendering do not
+/// count as runtime readers: a field must affect request behavior to pass this guard.
+/// `proxy-config` and `proxy-admin` are excluded for that reason.
 const RUNTIME_CRATES: &[&str] = &[
     "proxy-http",
     "proxy-core",
@@ -56,47 +29,22 @@ const RUNTIME_CRATES: &[&str] = &[
 /// test needs to distinguish them, not just carry a free-text reason.
 #[derive(PartialEq)]
 enum EntryKind {
-    /// The field is read, but only inside `proxy-config` itself, via a method
-    /// the runtime crates call (e.g. `RouteTable::find_virtual_host` reading
-    /// `virtual_hosts`). It will *never* show up as directly read by the
-    /// runtime-crates scan, by construction — that's not staleness, it's the
-    /// whole reason for the entry.
+    /// Read inside `proxy-config` through a method called by runtime code; the
+    /// source scan cannot see that indirect read.
     ConsumedInternally,
-    /// The field is genuinely inert today (no reader anywhere), tracked
-    /// against a work package that will wire it up. Once it does, this entry
-    /// becomes stale and must be deleted.
+    /// The field has no reader yet; delete this exemption once one is added.
     KnownInert,
-    /// The field HAS a real reader and is acted on in production -- the
-    /// reader just lives outside [`RUNTIME_CRATES`], on the control side
-    /// (`proxy`, `proxy-admin`, `proxy-observability`). Nothing here is
-    /// pending: this is the text-based scan's blind spot, not a gap in the
-    /// data plane, and the entry stays for as long as the reader lives where
-    /// it does. Added 2026-09-08, because filing these as `KnownInert` said
-    /// something false -- `ConfigSnapshot.admin`'s reason claimed
-    /// `proxy-admin` was a stub long after it had grown to 1917 lines and
-    /// `main.rs` was binding the address this field carries.
-    ///
-    /// The staleness recheck still applies: a reader appearing inside
-    /// `RUNTIME_CRATES` means the field no longer needs an exemption at all.
-    /// The reason string must name the reader, by path, so it can be
-    /// re-verified by hand.
+    /// Read in production outside [`RUNTIME_CRATES`], on the control side.
+    /// The reason must name the reader; remove the exemption if a runtime
+    /// crate starts reading the field.
     ReadOutsideRuntimeCrates,
-    /// Same as `KnownInert`, but the field's *name* collides with an
-    /// unrelated field of the same name on a different struct that genuinely
-    /// is read — the text-based `.field_name` scan this test uses can't tell
-    /// them apart (a real limitation of a source-scanning check rather than a
-    /// type-aware one; see the module doc comment). The staleness recheck is
-    /// skipped for these; the reason string must name the colliding struct so
-    /// a human can re-verify by hand when touching this entry.
+    /// Inert, but the source scan finds an unrelated same-named field. The
+    /// reason must identify that collision for manual rechecking.
     KnownInertNameCollision,
 }
 
-/// One allowlist entry: a field that is a known, reasoned exception to "every
-/// field must have a runtime reader". Every entry must carry a reason; an
-/// entry that no longer matches reality (a `KnownInert` field now has a real
-/// reader, or the field/struct no longer exists at all) is a test failure —
-/// see `allowlist_has_no_stale_entries` below. That's what keeps this list
-/// from quietly growing forever instead of shrinking as work lands.
+/// A documented exception to the runtime-reader requirement. Stale entries
+/// fail `allowlist_has_no_stale_entries`.
 struct AllowlistEntry {
     struct_name: &'static str,
     field_name: &'static str,
@@ -105,14 +53,7 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
-    // --- The ADS config surface, lowered but not yet consumed. One of the
-    //     original five has left: `AdsConfig.node` now reaches the wire, and
-    //     the change that noticed found this entry's own reason had been
-    //     wrong for a while. That is worth
-    //     remembering, because this file could not have caught it: an unset
-    //     field is inert either way, so the list stayed green while every
-    //     DiscoveryRequest went out anonymous. The four below are genuinely
-    //     still inert; each says what will read it.
+    // --- ADS fields whose readers are outside the runtime scan.
     AllowlistEntry {
         struct_name: "AdsConfig",
         field_name: "initial_fetch_timeout",

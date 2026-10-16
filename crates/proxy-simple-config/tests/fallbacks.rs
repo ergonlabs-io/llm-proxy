@@ -172,10 +172,8 @@ fn every_provider_cluster_carries_its_own_host_header() {
     expect_host_header("provider:fb1", "fb1.internal");
 }
 
-/// Cross-dialect fallback (`openai` primary -> `anthropic` fallback) is a
-/// hard error naming `routes[0].fallbacks[0]` -- an OpenAI-shaped request
-/// body is not valid for Anthropic, and the response would be parsed for
-/// tokens by the wrong dialect's parser.
+/// Cross-dialect fallback is rejected because request and usage parsing would
+/// use incompatible provider dialects.
 #[test]
 fn cross_dialect_fallback_is_rejected() {
     let config = parse(CROSS_DIALECT_CONFIG).expect("must parse");
@@ -200,10 +198,7 @@ fn same_dialect_fallback_across_providers_is_accepted() {
     lower(&config).expect("same-dialect fallback across providers must lower");
 }
 
-/// `attempted_clusters` makes each retry against an aggregate pick the NEXT
-/// member, so a three-member chain (`openai` -> `fb1` -> `fb2`) needs at
-/// least 2 retries to ever reach the last one. `retries.attempts: 1` alone
-/// is not enough, so `num_retries` must be raised to 2.
+/// A three-member chain needs at least two retries to reach its last member.
 #[test]
 fn num_retries_is_raised_to_reach_every_member() {
     let config = parse(THREE_MEMBER_CONFIG).expect("must parse");
@@ -239,16 +234,8 @@ fn fallback_config_lowers_through_the_real_loader_to_an_aggregate() {
     }
 }
 
-/// AGENTS.md invariant 6 regression guard: `protocol: http2` on the PRIMARY and the
-/// FALLBACK provider must still lower cleanly through the real loader even
-/// though the route itself targets an `envoy.clusters.aggregate` cluster --
-/// `typed_extension_protocol_options` belongs on each MEMBER provider
-/// cluster (which is what actually gets dialled), never on the aggregate
-/// (a hard load error there; see
-/// `crates/proxy-config/tests/aggregate_cluster.rs`'s
-/// `typed_extension_protocol_options_on_an_aggregate_is_rejected`). Both
-/// members must independently end up `Http2` in the IR, and the aggregate
-/// itself must have none of this option at all.
+/// HTTP/2 options belong on each provider member, which is dialled during
+/// failover; aggregate clusters reject those options (AGENTS.md invariant 6).
 #[test]
 fn fallback_members_with_protocol_http2_still_load() {
     let config = parse(

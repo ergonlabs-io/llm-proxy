@@ -261,11 +261,8 @@ pub struct NodeIdentity {
 
 // ---------------------------------------------------------------- tracing --
 
-/// OTLP trace-export configuration -- config surface
-/// only. Nothing in the data plane consumes this yet; a later increment
-/// wires an actual exporter and starts minting/propagating spans. See
-/// `crates/proxy-config/tests/ir_readership.rs` for the allowlist entries
-/// that must be deleted when that lands.
+/// OTLP trace-export configuration, including the sampling contract consumed
+/// by the runtime. The outbound exporter is independent of inbound trace context.
 ///
 /// # The sampling contract
 ///
@@ -1014,7 +1011,7 @@ pub struct OutlierDetectionIR {
     /// How often the success-rate and failure-percentage detectors re-run
     /// over the whole host set. S6 default: 10s.
     pub interval: Duration,
-    /// First ejection's duration; later ejections grow by this amount per
+    /// First ejection's duration; each later ejection grows by this amount per
     /// consecutive ejection. S6 default: 30s.
     pub base_ejection_time: Duration,
     /// Ceiling on ejection duration regardless of growth. Envoy documents

@@ -1,20 +1,9 @@
 //! Named response profiles: per-profile distributions for TTFT, inter-token
 //! delay, and streamed length, selected by the request's `model` string.
 //!
-//! A scale test needs a mix of fast/short and slow/long streams coexisting,
-//! not every stream advancing
-//! on the same clock. A [`Profile`] is three independent [`Dist`]s; sampling
-//! one draws a `Duration`/count with `rand`, never blocks, and never
-//! allocates beyond the small `Vec` of per-token delays the caller builds
-//! from it (see `frames.rs`).
-//!
-//! # Distribution shape
-//!
-//! Deliberately just uniform-on-`[min, max]` (inclusive) for all three axes
-//! -- the scale-test plan explicitly allows this ("do not over-engineer").
-//! `min == max` degrades to "always this value", which is how the CLI's
-//! legacy `--ttft-ms`/`--inter-token-ms`/`--tokens` flags become the
-//! `default` profile's distributions unchanged (see [`ProfileSet::from_cli`]).
+//! Profiles let fast and slow streams progress independently. Each samples
+//! uniform inclusive distributions for TTFT, inter-token delay, and length;
+//! equal bounds preserve fixed values from the legacy CLI flags.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -79,10 +68,7 @@ impl Profile {
         self.inter_token_ms.sample_duration_ms(rng)
     }
 
-    /// Number of content chunks to stream this request, drawn fresh. Capped
-    /// at `u32::MAX` implicitly by `Dist`'s `u64` sample being narrowed --
-    /// no profile here configures anything near that, so `as u32` never
-    /// truncates in practice.
+    /// Number of content chunks drawn for this request.
     pub fn sample_length(&self, rng: &mut impl Rng) -> u32 {
         self.length.sample(rng) as u32
     }
@@ -155,10 +141,7 @@ impl ProfileSet {
         }
     }
 
-    /// Look up the profile a request's `model` selects. An unmatched model
-    /// is load-testing input, not a validation failure -- it falls back to
-    /// [`DEFAULT_PROFILE`], which always exists (installed by
-    /// [`Self::with_builtins`] and never removable, only replaceable).
+    /// Selects the model's profile, falling back to [`DEFAULT_PROFILE`] for unknown names.
     pub fn resolve(&self, model: &str) -> &Profile {
         self.profiles
             .get(model)

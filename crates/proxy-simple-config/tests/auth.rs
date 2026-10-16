@@ -1,15 +1,6 @@
-//! Acceptance tests: the dialect's `auth:` block
-//! lowers to a real `llmproxy.auth` `http_filters` entry that
-//! `proxy_filters::auth_filter::parse_config` actually accepts, with strict
-//! validation -- done entirely in this crate, naming DIALECT paths
-//! (`auth.keys[0].digest`) rather than that function's proto paths
-//! (`typed_config.virtual_keys[0].digest_hex`), which the operator's
-//! document has no `typed_config` to point into.
-//!
-//! Follows `tests/fallbacks.rs`'s shape: fixtures are real YAML, lowered
-//! through the real pipeline, asserted on the resulting bootstrap JSON (or,
-//! for the end-to-end case, on the real IR + the real filter factory) rather
-//! than on any intermediate representation.
+//! The dialect's `auth:` block must lower to config accepted by the real auth
+//! filter. Errors should use dialect paths such as `auth.keys[0].digest`.
+//! Fixtures run through the real loader and, where needed, the filter factory.
 
 use proxy_config::ConfigError;
 use proxy_filters::auth_filter::AuthFilterFactory;
@@ -112,11 +103,8 @@ fn auth_filter_type_url_matches_the_filter() {
 
 // --- 2: lowers through the real Envoy loader, and the REAL filter accepts it --
 
-/// This is what actually proves the dialect's emitted config satisfies
-/// `auth_filter::parse_config`, not merely that it looks plausible as JSON:
-/// strict-parse + PGV + IR (via `lower_to_loaded` + `build_snapshot`, same as
-/// `fallbacks.rs`'s equivalent), then the REAL `AuthFilterFactory::create`
-/// against the REAL `DynamicMessage` the IR carries.
+/// The lowered config passes strict parsing, PGV, IR construction, and the real
+/// `AuthFilterFactory::create` using the IR's `DynamicMessage`.
 #[test]
 fn auth_config_lowers_through_the_real_loader_and_the_real_filter_accepts_it() {
     let secret = "test-operator-secret";

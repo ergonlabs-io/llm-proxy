@@ -1,13 +1,7 @@
 //! The IR surface for EDS clusters, and nothing else.
 //!
-//! **Config surface only.** Nothing here subscribes to EDS or applies an
-//! endpoint update -- that is a later step (see
-//! `crates/proxy-config/tests/ir_readership.rs`'s allowlist entry for
-//! `ClusterConfig.eds`). This file's job is the same shape
-//! `dynamic_resources.rs` covers: an EDS cluster now *lowers* instead of
-//! being refused by name, and every part of the surface we do
-//! not implement is refused by its own full dotted path (AGENTS.md invariant 1)
-//! rather than silently ignored.
+//! These tests cover config lowering only: EDS clusters lower to IR, while
+//! unsupported fields fail with their dotted paths (AGENTS.md invariant 1).
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -83,11 +77,7 @@ fn a_valid_eds_cluster_with_explicit_service_name_lowers() {
     );
 }
 
-/// Envoy defaults `service_name` to the cluster's own name when the field is
-/// unset -- this is a real Envoy behavior (`EdsClusterConfig.service_name`'s
-/// own doc: "Optional alternative to cluster name"), not a convenience of
-/// ours, and it's worth its own test rather than trusting the empty-string
-/// case implicitly.
+/// Envoy defaults an unset `service_name` to the cluster name.
 #[test]
 fn eds_cluster_config_with_unset_service_name_defaults_to_the_cluster_name() {
     let yaml = yaml_with_eds_cluster(EDS_CONFIG_NO_SERVICE_NAME);

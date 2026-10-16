@@ -1,15 +1,5 @@
-//! Acceptance tests: the ADS config surface, and nothing
-//! else. No client, no gRPC, no networking -- this only teaches the
-//! loader to accept a bootstrap that points at a control plane, and to refuse
-//! every part of that surface it does not implement with a full dotted path.
-//!
-//! **The refusals are the substance of this file, not an afterthought.** Before
-//! this increment, `dynamic_resources` was a strict-mode hard error by name,
-//! because `Bootstrap`'s allowed-field list contained only
-//! `node`/`admin`/`static_resources` -- AGENTS.md invariant 1 working correctly. The
-//! risk in widening that list is trading one honest refusal for several silent
-//! drops, so every unimplemented member below has its own test asserting the
-//! exact path an operator will see.
+//! Tests the ADS bootstrap config surface without starting a client or network
+//! connection. Supported fields lower; unsupported fields fail with dotted paths.
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -168,8 +158,7 @@ fn cds_initial_fetch_timeout_lowers_to_ads_config() {
     );
 }
 
-/// The back-compat case, and the one that matters most: every config shipped
-/// through v0.2.0 has no `dynamic_resources` and must be completely unaffected.
+/// Configs without `dynamic_resources` remain unaffected.
 #[test]
 fn a_bootstrap_without_dynamic_resources_lowers_to_ads_none() {
     let yaml = format!("static_resources:\n  listeners: []{XDS_CLUSTER}");
@@ -454,14 +443,8 @@ dynamic_resources:
     );
 }
 
-/// Reached before our own check: the PGV validation engine already
-/// enforces `min_len: 1` on this field from the proto's own constraints, so it
-/// fires first and with a different `ConfigError` variant. Asserted on the
-/// rendered message rather than the variant, because which layer refuses is an
-/// implementation detail -- what an operator needs is the dotted path. The
-/// explicit empty-name arm in `convert_ads_grpc_service` is therefore
-/// defensive, not load-bearing; it matters only if that field is ever reached
-/// from a non-PGV path.
+/// PGV rejects the empty name before typed lowering; assert the operator-facing
+/// dotted path independent of which validation layer reports it.
 #[test]
 fn an_empty_ads_cluster_name_is_refused() {
     let yaml = with_ads(

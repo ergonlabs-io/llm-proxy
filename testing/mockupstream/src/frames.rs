@@ -1,37 +1,10 @@
 //! Pre-rendered response fragments for both dialects, streaming and
 //! non-streaming.
 //!
-//! # Why the content chunk is rendered once, never per token
-//!
-//! WP scale-test extension: response length and inter-token timing now vary
-//! per request (drawn from a [`crate::profiles::Profile`]), so the number of
-//! content-delta chunks and their pacing are no longer startup constants.
-//! What *hasn't* changed is the content chunk's bytes -- every position in
-//! every stream this process ever serves emits the exact same
-//! `CONTENT_CHUNK_TEXT` fragment (see the pre-scale-test doc below, which
-//! this inherits). So [`OpenAiFrames::new`]/[`AnthropicFrames::new`] still
-//! render that one fragment exactly once, as `Bytes`, at startup; a request
-//! wanting `k` content chunks clones it `k` times (a refcount bump each,
-//! never a JSON serialization) rather than re-rendering anything. This is
-//! the "pre-render at the profile's max length" idea taken to its logical
-//! end: since every position is byte-identical, there is no upper bound to
-//! pre-render *to* -- one fragment already covers any `k`.
-//!
-//! The per-request terminal frame (the usage/`message_delta` chunk) is
-//! rebuilt fresh every request because its `completion_tokens`/
-//! `output_tokens` field must equal the `k` actually drawn -- exactly the
-//! same one-JSON-render-per-request cost the non-streaming bodies below
-//! already pay, and nothing like the `k`-times-per-request cost the content
-//! chunk avoids.
-//!
-//! The one thing that varies per request besides length/timing is the
-//! client-supplied `model` string (see `crate::request::parse_request_meta`).
-//! It is echoed exactly once per stream, in the leading role-delta /
-//! `message_start` frame (and in the non-streaming body, built fresh per
-//! request regardless) -- real providers repeat `model` on every chunk, but
-//! nothing that reads these frames (`crates/proxy-filters/src/usage.rs`,
-//! `testing/loadgen`'s SSE classifier) looks at it there, so the fidelity
-//! gap costs nothing.
+//! Content chunks are rendered once as `Bytes` and cloned for each streamed
+//! token. The terminal usage frame is rebuilt per request so its token count
+//! matches the sampled length. The requested model appears in the leading
+//! frame; consumers do not inspect it on later chunks.
 
 use std::convert::Infallible;
 use std::time::Duration;

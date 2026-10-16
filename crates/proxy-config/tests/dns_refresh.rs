@@ -301,9 +301,7 @@ fn dns_failure_max_interval_below_the_base_is_rejected_with_its_path() {
 
 // --------------------------------------------------------- respect_dns_ttl --
 
-/// The resolver is getaddrinfo, which reports no TTLs. Accepting the flag and
-/// refreshing on the fixed rate would silently run something other than what
-/// the operator asked for.
+/// `getaddrinfo` reports no TTLs, so `respect_dns_ttl` cannot be honored.
 #[test]
 fn respect_dns_ttl_true_is_rejected_with_the_reason() {
     for ty in DNS_TYPES {
@@ -398,9 +396,7 @@ static_resources:
     }
 }
 
-/// Envoy ignores all four settings on a cluster that is not STRICT_DNS or
-/// LOGICAL_DNS. We reject them with the field's own path, so a config whose
-/// type was changed away from DNS cannot keep a setting that now does nothing.
+/// These settings apply only to STRICT_DNS and LOGICAL_DNS clusters.
 #[test]
 fn dns_settings_on_a_cluster_that_never_re_resolves_are_rejected_with_their_paths() {
     let settings = [

@@ -1,37 +1,20 @@
-//! The ADS gRPC request/response pump, and the reconnect loop that keeps
-//! re-establishing it.
+//! The ADS gRPC request/response pump, and the reconnect loop around it.
 //!
-//! This module owns exactly one thing: driving a single
-//! `StreamAggregatedResources` bidi stream so that
+//! This module drives one `StreamAggregatedResources` bidi stream, so that
 //! [`crate::subscription::SubscriptionState`] sees every response and its
-//! returned [`crate::subscription::Request`] reaches the wire. Everything
-//! else is deliberately out of scope:
+//! `Request` reaches the wire.
 //!
-//! - **Deciding a response's verdict, and applying it, is injected -- not
-//!   implemented here.** [`ResponseHandler`] is the seam a caller supplies;
-//!   [`FnHandler`] adapts a plain synchronous [`Validator`] closure to it for
-//!   callers (mostly this crate's own tests) with nothing to await. Real
-//!   validation and applying (field-path errors against the IR, in
-//!   `apply.rs`'s `ResourceApplier`) is that implementor's job; pulling
-//!   `proxy-config` in HERE would make every transport test a config test.
-//! - **The response's `resources` field is never read by this module** --
-//!   only `type_url`, `version_info` and `nonce`, which is all
-//!   [`SubscriptionState::on_response`] needs. Whatever `handler.handle`
-//!   returns is the only thing that ever looks at `resources`.
+//! - **Verdicts and applying are injected.** [`ResponseHandler`] is the seam.
+//!   Applying a response does real I/O, so it can finish before the ACK goes
+//!   out. Apply-then-ACK, never ACK-then-apply (S8). Keeping `proxy-config` out
+//!   of this module keeps transport tests free of config.
+//! - **`resources` is never read here.** Only `type_url`, `version_info` and
+//!   `nonce` are used.
 //!
-//! The layer above the pump: [`AdsClient::run`] reconnects
-//! forever with a jittered backoff, calling
-//! [`SubscriptionState::reset_stream`] before each new stream so S8's
-//! "versions persist across streams, nonces do not" holds on the wire.
-//! [`AdsClient::run_once`] still drives exactly ONE stream and still resets
-//! nothing -- everything about reconnecting lives in `run`.
-//!
-//! The handler seam is async: [`ResponseHandler::handle`]
-//! returns a future, so applying a response -- which does real I/O, e.g.
-//! `crates/proxy/src/main.rs::reload`'s
-//! `ClusterManager::update_from_snapshot` resolving DNS per cluster -- can
-//! finish before the ACK for that response goes out. Apply-then-ACK, never
-//! ACK-then-apply, per S8.
+//! [`AdsClient::run`] reconnects forever with jittered backoff, resetting
+//! per-stream state before each stream (S8: versions persist across streams,
+//! nonces do not). [`AdsClient::run_once`] drives exactly one stream and resets
+//! nothing.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -62,46 +45,31 @@ pub type Validator = Box<dyn FnMut(&DiscoveryResponse) -> Verdict + Send>;
 
 /// Decides the verdict for one `DiscoveryResponse`, and applies it.
 ///
-/// Rust note: written as return-position `impl Trait` in a trait (RPITIT,
-/// stable since 1.75) rather than a bare `async fn` in the trait. A bare
-/// `async fn handle(...)` here would still compile, but the trait could not
-/// name a bound on the future it desugars to -- only a concrete `impl` could
-/// choose to make its future `Send`, and the trait itself would have no way
-/// to require it. `AdsClient::run` gets `tokio::spawn`ed by its callers,
-/// which needs the whole future it returns -- and therefore every future it
-/// awaits, including whatever `handle` returns -- to be `Send`. Spelling the
-/// return type out lets `+ Send` sit on the trait method itself, so a
-/// non-`Send` implementation fails to compile right here instead of at some
-/// `tokio::spawn` call site several files away.
+/// Rust note: this is written as return-position `impl Trait` rather than a
+/// bare `async fn`, so `+ Send` sits on the trait method. A non-`Send`
+/// implementation then fails here, not at a distant `tokio::spawn`.
 pub trait ResponseHandler: Send {
     fn handle(
         &mut self,
         resp: &DiscoveryResponse,
     ) -> impl std::future::Future<Output = Verdict> + Send;
 
-    /// The resource names this handler currently wants subscribed for
-    /// `type_url`, if it derives one at all. `None` means "this handler has
-    /// no opinion for this type". This exists for EDS: `ResourceApplier` computes its EDS name set from whatever
-    /// clusters it currently holds (see its own `eds_resource_names`), and
-    /// `run_once` below is what turns a change in that set into a follow-up
-    /// `DiscoveryRequest` on the wire.
+    /// The resource names this handler wants subscribed for `type_url`. `None`
+    /// means no opinion. `run_once` turns a change in this set into a follow-up
+    /// request on the wire.
     ///
-    /// Rust note: a defaulted trait method, so `FnHandler` and every existing
-    /// test `ResponseHandler` impl keep compiling unchanged -- only
-    /// `ResourceApplier` overrides it.
+    /// Rust note: a defaulted trait method, so existing impls keep compiling.
+    /// Only `ResourceApplier` overrides it.
     fn desired_names(&self, _type_url: &str) -> Option<BTreeSet<String>> {
         None
     }
 }
 
-/// Adapts a plain [`Validator`] closure to [`ResponseHandler`], so a caller
-/// with nothing to await -- mostly this crate's own tests -- can still write
-/// its intent as a one-line synchronous closure instead of a hand-written
-/// handler type.
+/// Adapts a plain [`Validator`] closure to [`ResponseHandler`], for callers
+/// with nothing to await, mostly tests.
 ///
-/// Rust note: `std::future::ready` is the whole body of the trait impl below
-/// -- it wraps an already-computed value in a `Future` that resolves the
-/// first time it is polled, which is exactly "no awaiting happened here".
+/// Rust note: `std::future::ready` wraps a value in a future that is already
+/// complete, meaning no awaiting happens.
 pub struct FnHandler(pub Validator);
 
 impl ResponseHandler for FnHandler {
@@ -110,19 +78,16 @@ impl ResponseHandler for FnHandler {
     }
 }
 
-/// Errors from pumping ONE ADS stream. [`AdsClient::run_once`] never retries;
-/// [`AdsClient::run`] treats every one of these as "that stream ended", logs
-/// it, and reconnects after a backoff (`internal-docs/architecture.md` §12.2 rule 5:
-/// keep serving last-good config, never shed state).
+/// Errors from pumping ONE ADS stream. [`AdsClient::run`] treats each one as
+/// "that stream ended", then reconnects. The process keeps serving last-good
+/// config (`internal-docs/architecture.md` §12.2).
 #[derive(Debug, thiserror::Error)]
 pub enum AdsError {
     /// The stream itself failed (transport error, or the server closed it
     /// with a non-OK status).
     ///
-    /// Rust note: boxed because `tonic::Status` is 176 bytes — without the
-    /// box this enum would be that large too, and every function returning
-    /// `Result<_, AdsError>` would carry it by value on all paths. The
-    /// `From<tonic::Status>` impl below keeps `?` working unchanged.
+    /// Rust note: boxed because `tonic::Status` is large, and the box keeps
+    /// every `Result<_, AdsError>` small.
     #[error("ADS stream error: {0}")]
     Stream(Box<tonic::Status>),
 
@@ -144,14 +109,12 @@ impl From<tonic::Status> for AdsError {
     }
 }
 
-/// Wraps an `mpsc::Receiver<DiscoveryRequest>` as the `Stream` tonic's
-/// generated client wants for the outbound half of the bidi stream.
+/// Wraps an `mpsc::Receiver<DiscoveryRequest>` as the `Stream` tonic wants for
+/// the outbound half of the bidi stream.
 ///
-/// Rust note: same shape as `testing/controlplane`'s own private
-/// `OutboundStream` (see its `tests/ads_selftest.rs`), duplicated rather than
-/// shared -- neither crate depends on the other, and the type is a few
-/// lines. `poll_next` delegates straight to `Receiver::poll_recv`, which
-/// already does the real work of registering the waker.
+/// Rust note: same shape as `testing/controlplane`'s private `OutboundStream`,
+/// duplicated because neither crate depends on the other. `poll_next`
+/// delegates to `Receiver::poll_recv`, which registers the waker.
 struct OutboundStream(mpsc::Receiver<DiscoveryRequest>);
 
 impl futures::Stream for OutboundStream {
@@ -193,11 +156,9 @@ fn to_proto(req: &Request, node: Option<&NodeIdentity>) -> DiscoveryRequest {
     }
 }
 
-/// How [`AdsClient::run`] waits between streams. Both the randomness and the
-/// sleeping are injected rather than reached for, which is the whole reason
-/// the reconnect tests below take milliseconds instead of minutes: a test
-/// supplies a constant draw and a sleep that records its argument and returns
-/// immediately, then asserts the exact `Duration` the loop asked for.
+/// How [`AdsClient::run`] waits between streams. Randomness and sleeping are
+/// injected, so the reconnect tests run in milliseconds and can assert the
+/// exact delay requested.
 pub struct Reconnect {
     pub policy: BackoffPolicy,
     /// Draws the jitter, in `[0.0, 1.0]`. Same shape as
@@ -209,12 +170,8 @@ pub struct Reconnect {
 
 /// The sleeping half of [`Reconnect`].
 ///
-/// Rust note: an `FnMut` returning a boxed future, rather than an `async fn`
-/// in a trait -- the closure has to be stored in a struct and called from a
-/// loop that already holds `&mut self`, and `Pin<Box<dyn Future>>` is the
-/// ordinary way to name "some future I will not spell out". `'static` on the
-/// future (not borrowing the closure) keeps the call site free to hold other
-/// `&mut` borrows across the await.
+/// Rust note: a boxed `FnMut` returning a boxed future, because the closure
+/// is stored in a struct and called from a loop holding `&mut self`.
 pub type Sleep = Box<dyn FnMut(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 impl Reconnect {
@@ -233,20 +190,13 @@ impl Reconnect {
 /// re-established across streams by [`AdsClient::run`].
 pub struct AdsClient {
     states: Vec<SubscriptionState>,
-    /// Consecutive stream failures since the last stream that received a
-    /// response, i.e. the attempt number [`backoff::delay`] is asked about.
-    ///
-    /// Reset the instant a response arrives, NOT when a stream opens: a
-    /// control plane that accepts the connection and then immediately drops
-    /// it would otherwise pin the backoff at its floor forever and become a
-    /// reconnect storm. This is Envoy's own placement (`GrpcStream`resets its
-    /// backoff strategy in `onReceiveMessage`).
+    /// Consecutive stream failures since the last response, i.e. the attempt
+    /// number [`backoff::delay`] takes. It resets when a response arrives, not
+    /// when a stream opens. Otherwise a server that accepts and then drops
+    /// every connection would cause a reconnect storm (as in Envoy's `GrpcStream`).
     attempt: u32,
-    /// The xDS `Node` identity (S8) this client announces itself with, from
-    /// bootstrap `dynamic_resources`. `None` means no node reaches the wire at
-    /// all -- legal, but a control plane that routes by `node.id` (as
-    /// go-control-plane's snapshot cache does) will not find a snapshot for
-    /// this client.
+    /// The xDS `Node` identity this client announces. `None` sends no node, so
+    /// a control plane that routes by `node.id` will not find a snapshot.
     node: Option<NodeIdentity>,
 }
 
@@ -283,20 +233,13 @@ impl AdsClient {
         self.attempt
     }
 
-    /// Reconnects forever: reset per-stream state, pump one stream, log why
-    /// it ended, wait a jittered backoff, repeat. Never returns -- there is
-    /// no stream-ending condition treated as fatal, because giving up on
-    /// xDS means never picking up config again while the process keeps
-    /// serving the last-good one.
+    /// Reconnects forever: reset per-stream state, pump one stream, wait a
+    /// jittered backoff, repeat. No stream error is fatal, because giving up
+    /// would stop config updates while the last-good config keeps serving.
     ///
-    /// The `client`'s `Channel` is reused across streams on purpose: tonic
-    /// re-establishes the underlying connection per RPC, so a control plane
-    /// that goes away and comes back needs no new `Channel` here -- the next
-    /// `stream_aggregated_resources` call dials it again.
+    /// The `Channel` is reused across streams. Tonic redials on each RPC.
     ///
-    /// Rust note: the `-> !` ("never") return type is how Rust spells "this
-    /// diverges". Callers `tokio::spawn` it and drop the handle, or select
-    /// against it; there is no `Ok` case to handle.
+    /// Rust note: `-> !` is how Rust says "this diverges". There is no `Ok` to handle.
     pub async fn run<H: ResponseHandler>(
         &mut self,
         client: &mut AggregatedDiscoveryServiceClient<Channel>,
@@ -304,10 +247,8 @@ impl AdsClient {
         mut reconnect: Reconnect,
     ) -> ! {
         loop {
-            // S8 rule 4, and the reason this is at the TOP of the loop rather
-            // than after a failure: the nonce belongs to the stream that
-            // issued it, so it must be gone BEFORE `run_once` builds the new
-            // stream's initial requests. The acked version deliberately
+            // S8: nonces die with their stream, so clear them before the next
+            // `run_once` builds its requests. The acked version deliberately
             // survives -- "versions persist across streams for same server".
             for state in &mut self.states {
                 state.reset_stream();
@@ -327,54 +268,30 @@ impl AdsClient {
         }
     }
 
-    /// Opens `StreamAggregatedResources` on `client`, sends the initial
-    /// request for every subscription for which
-    /// [`SubscriptionState::has_nothing_to_request`] is false, then pumps:
-    /// for each `DiscoveryResponse`, hands `(version_info, nonce, Verdict)`
-    /// to the matching `SubscriptionState` and sends back the `Request` it
-    /// returns. Returns `Ok(())` once the server ends the stream cleanly.
-    ///
-    /// Reconnecting is NOT this function's job, and neither is resetting
-    /// per-stream state: [`AdsClient::run`] owns both.
+    /// Opens one `StreamAggregatedResources`, sends the initial request for
+    /// each subscription that has something to request, then pumps responses.
+    /// Returns `Ok(())` once the server ends the stream cleanly. Reconnecting
+    /// and resetting per-stream state are left to [`AdsClient::run`].
     pub async fn run_once<H: ResponseHandler>(
         &mut self,
         client: &mut AggregatedDiscoveryServiceClient<Channel>,
         handler: &mut H,
     ) -> Result<(), AdsError> {
-        // Rust note: bounded so a client that never reads applies
-        // backpressure rather than growing memory unboundedly. The bound must
-        // also be big enough to hold every initial request, because they are
-        // queued BEFORE anything drains the channel -- see below.
+        // Rust note: bounded, so a client that never reads applies backpressure.
+        // The bound must fit every initial request, which is queued before
+        // anything drains the channel.
         let (tx, rx) = mpsc::channel::<DiscoveryRequest>(self.states.len().max(16));
 
-        // S8 / Envoy's own `GrpcMuxImpl`: the node identity goes on the FIRST
-        // request of a stream and is omitted from every request after it, so
-        // this is per STREAM, not per request and not per resource type --
-        // whichever type happens to be requested first carries it. A
-        // reconnect opens a new stream and therefore sends it again, which is
-        // what makes a control plane that lost its state able to identify us.
+        // S8: the node identity goes on the FIRST request of each stream and is
+        // omitted after that. A reconnect opens a new stream, so it is sent again.
         let mut node_pending = self.node.clone();
 
-        // **These are queued BEFORE the stream is opened, and that ordering is
-        // load-bearing rather than stylistic.** `stream_aggregated_resources`
-        // does not resolve until the server sends response HEADERS, and
-        // grpc-go -- so every go-control-plane-based management server, which
-        // is most of them -- does not send headers until its handler's first
-        // outgoing message, which it does not produce until it has received a
-        // request. Awaiting the stream first and sending after therefore
-        // deadlocks both sides: we wait for headers, the server waits for a
-        // request, forever.
-        //
-        // Found 2026-09-06 by `make xds-conformance`, the first run of this
-        // client against the reference implementation. Our own puppet server
-        // in `testing/controlplane` cannot catch it, because tonic sends
-        // headers eagerly from `Response::new(stream)` -- exactly the
-        // "us agreeing with ourselves about the protocol and both being
-        // wrong" failure that target's own message says it exists to find.
-        //
-        // Queuing into a buffered channel does not block (the bound above is
-        // sized for it), so the requests are simply sitting in the outbound
-        // stream ready for tonic to send the moment the connection is live.
+        // These are queued BEFORE the stream opens, and the order is required.
+        // `stream_aggregated_resources` resolves only once the server sends
+        // response headers. grpc-go servers send headers only after receiving a
+        // request. Awaiting the stream first would deadlock both sides. Queuing
+        // into the buffered channel does not block, since the bound above fits
+        // every initial request.
         for state in &self.states {
             if state.has_nothing_to_request() {
                 // S8 / this crate's own doc: an empty name subscription
@@ -399,10 +316,7 @@ impl AdsClient {
                 return Ok(());
             };
 
-            // The control plane is talking to us, so this stream counts as
-            // established: the next failure starts its backoff from the floor
-            // again. See the field's own note for why arrival, not connect,
-            // is the right moment.
+            // The control plane answered, so reset the backoff. See `attempt`.
             self.attempt = 0;
 
             let state = self
@@ -421,11 +335,9 @@ impl AdsClient {
             // rather than an initial request.
             node_pending = None;
 
-            // This response may have changed what a
-            // name-based subscription (EDS today) wants. The ACK/NACK above
-            // MUST go out first -- it answers the response that just
-            // arrived, on THIS response's nonce, and must not be reordered
-            // behind a request that has nothing to do with it. Only after
+            // This response may change what a name-based subscription (EDS)
+            // wants. The ACK/NACK above goes out first, since it answers this
+            // response's nonce. Only after
             // that does the pump ask every state what it wants now; a CDS
             // response naming a new EDS cluster is what makes
             // `ResourceApplier::desired_names` return a wider EDS set here,

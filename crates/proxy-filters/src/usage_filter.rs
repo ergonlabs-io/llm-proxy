@@ -1,26 +1,8 @@
-//! Wires the [`crate::usage`] extractor into the real HTTP
-//! encode path.
-//!
-//! This is the filter that actually watches response bytes go by: it picks a
-//! parsing strategy off `content-type`, feeds bytes to the right extractor as
-//! they arrive, and writes the result (plus TTFT/inter-chunk timing) into
-//! [`StreamInfo::llm`] once the response ends.
-//!
-//! # The one rule that matters more than any other
-//!
-//! This filter must **never** buffer the response. The whole product bet
-//! is that a client streaming tokens from an LLM sees them as they're
-//! generated, not after the proxy has assembled the full response. See the
-//! `// Rust note:` on [`UsageFilterInstance::encode_data`] for the mechanical
-//! guarantee.
-//!
-//! # Config: owned `llmproxy.filters.v0.Usage`
-//!
-//! The filter owns its dialect field and its opaque pricing JSON carrier.
-//! Pricing remains JSON because its strict schema is shared with the dialect
-//! price-list surface and is validated by this filter at listener creation.
-//! The old `DataSource` shape remains accepted for one release through
-//! [`LegacyUsageFilterFactory`].
+//! Streams response bytes through the usage extractor and publishes token
+//! usage and timing when the response ends. It never buffers the response so
+//! generated tokens reach the client immediately. Pricing JSON shares the
+//! dialect's strict schema; legacy `DataSource` config remains accepted for
+//! one release.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};

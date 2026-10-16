@@ -1,11 +1,9 @@
-//! `tcp_proxy` network filter runtime: the first terminal L4 filter.
-//! Given a matched downstream connection and its `TcpProxyConfig`, resolves
-//! an upstream endpoint, connects, and pumps bytes bidirectionally until
-//! either side closes, the connection idles out, or a drain shutdown fires.
+//! `tcp_proxy` network filter runtime, the first terminal L4 filter. It resolves an upstream endpoint for a matched
+//! connection, connects, and pumps bytes both ways until either side closes, the connection idles out, or a drain
+//! shutdown fires.
 //!
-//! Cluster/endpoint resolution here is deliberately minimal (v1): "first
-//! `priority == 0` endpoint" is a placeholder for the real load-balancing and
-//! cluster-manager machinery in `proxy-cluster`.
+//! Endpoint selection is minimal: the first `priority == 0` endpoint. The cluster-manager machinery in `proxy-cluster`
+//! is not used here yet.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -31,14 +29,10 @@ pub struct TcpProxyParams {
     pub buffer_limit: u32,
 }
 
-/// Resolve an upstream target address for `cluster` from `snapshot`.
+/// Resolves an upstream target address for `cluster` from `snapshot`: the first `priority == 0` endpoint in
+/// declaration order. `None` (cluster missing, or no priority-0 endpoint) fails the connection.
 ///
-/// v1 endpoint selection: the first `priority == 0` endpoint, in declaration
-/// order. `None` covers both "cluster missing" and "no priority-0 endpoints"
-/// -- both are treated the same way by the caller (fail the connection).
-///
-/// TODO: real load balancing (round robin / least request / ring hash
-/// / random / maglev per `LbPolicy`); this always picks the same endpoint.
+/// TODO: real load balancing per `LbPolicy`. This always picks the same endpoint.
 fn resolve_target(snapshot: &ConfigSnapshot, cluster: &str) -> Option<(String, u16, Duration)> {
     let cluster_ir = snapshot.clusters.get(cluster)?;
     let endpoint = cluster_ir.endpoints.iter().find(|e| e.priority == 0)?;
@@ -49,15 +43,11 @@ fn resolve_target(snapshot: &ConfigSnapshot, cluster: &str) -> Option<(String, u
     ))
 }
 
-/// Attempt to connect to `(host, port)` up to `max_attempts` times, each
-/// bounded by `connect_timeout`. No backoff between attempts for v1 (Envoy's
-/// `backoff_options` isn't represented in our IR yet).
+/// Connects to `(host, port)` up to `max_attempts` times, each bounded by `connect_timeout`. There is no backoff
+/// between attempts, since Envoy's `backoff_options` is not in the IR yet.
 ///
-/// Rust note: `(host, port)` implements `tokio::net::ToSocketAddrs`, which
-/// resolves both IP literals (STATIC clusters) and DNS names
-/// (STRICT_DNS/LOGICAL_DNS) through the system resolver -- so this connects
-/// to DNS-named endpoints too, even though the full StrictDns
-/// expansion/re-resolution semantics belong to `proxy-cluster`, not this function.
+/// Rust note: `(host, port)` resolves both IP literals and DNS names through the system resolver. DNS endpoints
+/// connect here, but full StrictDns re-resolution belongs to `proxy-cluster`.
 async fn connect_upstream(
     host: &str,
     port: u16,
@@ -83,20 +73,13 @@ async fn connect_upstream(
     None
 }
 
-/// Copy one direction of the proxy: read from `r`, write to `w`, until `r`
-/// hits EOF/error, then send FIN on `w` (`shutdown`). Bumps `last_activity`
-/// on every read so the idle timer in [`pump`] sees traffic in either
-/// direction.
+/// Copies one direction: reads from `r`, writes to `w`, until `r` hits EOF or an error, then sends FIN on `w`.
+/// Every read bumps `last_activity`, so the idle timer in [`pump`] sees traffic in either direction.
 ///
-/// Rust note: this is deliberately its *own* future (one per direction) rather
-/// than two arms of a single `select!`. Two concurrently-polled halves are
-/// what make the pump deadlock-free under bidirectional backpressure: if one
-/// half is parked on a slow `write_all` (the peer isn't draining), the other
-/// half still gets polled and keeps draining its own read side -- which is
-/// often exactly what unblocks the stalled write. A single `select!` that
-/// reads *and* writes inside one arm can't do that: selecting one arm parks
-/// the whole task on that arm's write, starving the other direction (classic
-/// proxy deadlock once both socket buffers fill).
+/// Rust note: each direction is its own future, not two arms of one `select!`. Two concurrently polled halves keep the
+/// pump deadlock-free under backpressure: if one half parks on a slow `write_all`, the other still drains its read side,
+/// which often unblocks the stalled write. A single `select!` that reads and writes in one arm would park the whole task
+/// on one write and starve the other direction.
 async fn half_copy<R, W>(mut r: R, mut w: W, last_activity: Rc<Cell<Instant>>, buffer_limit: u32)
 where
     R: AsyncRead + Unpin,
@@ -105,9 +88,7 @@ where
     let mut buf = vec![0u8; buffer_limit.max(1) as usize];
     loop {
         match r.read(&mut buf).await {
-            // EOF or read error: half-close -- send FIN on the write side so
-            // the peer learns this direction is done, but let the *other*
-            // direction (a separate `half_copy`) keep flowing.
+            // EOF or read error: half-close by sending FIN on the write side. The other direction keeps flowing.
             Ok(0) | Err(_) => {
                 let _ = w.shutdown().await;
                 return;
@@ -124,12 +105,9 @@ where
     }
 }
 
-/// Bidirectional pump with half-close (FIN propagation) and an optional idle
-/// timeout. Runs the two directions as concurrently-polled `half_copy` futures
-/// (see its Rust note for why concurrency, not a single `select!`, is what
-/// keeps this deadlock-free). The whole connection ends when *both* directions
-/// have hit EOF, or -- if `idle_timeout` is set -- when no bytes have flowed in
-/// either direction for that long.
+/// Bidirectional pump with half-close (FIN propagation) and an optional idle timeout. The two directions are
+/// concurrently polled `half_copy` futures (see its Rust note). The connection ends when both directions hit EOF, or,
+/// with `idle_timeout` set, when no bytes flow in either direction for that long.
 async fn pump<A, B>(downstream: A, upstream: B, idle_timeout: Option<Duration>, buffer_limit: u32)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -138,9 +116,7 @@ where
     let (down_r, down_w) = tokio::io::split(downstream);
     let (up_r, up_w) = tokio::io::split(upstream);
 
-    // Rust note: `Rc<Cell<Instant>>` (not an atomic) because this whole task
-    // is single-threaded (`!Send` per ADR-0003); each direction owns a clone
-    // and bumps it on read, the idle branch below reads it.
+    // Rust note: `Rc<Cell<Instant>>`, not an atomic, because this task is single-threaded (`!Send`, ADR-0003).
     let last_activity = Rc::new(Cell::new(Instant::now()));
 
     let both = async {

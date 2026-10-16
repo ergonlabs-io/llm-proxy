@@ -1,37 +1,15 @@
 //! Envoy response flags (`%RESPONSE_FLAGS%`). Short codes must match Envoy's
-//! access-log vocabulary exactly — the differential rig compares them (S9).
+//! access-log vocabulary exactly, since the differential rig compares them (S9).
+//! Deliberate departures are in `internal-docs/envoy-divergences.md`.
 //!
-//! # Acceptance audit (2026-08-22)
-//!
-//! "Every variant must be reachable by at least one differential test" was
-//! re-audited flag by flag against what this codebase actually builds, not
-//! against the enum's names. Two buckets, exactly one per flag:
-//!
-//! - **Reachable and tested**: the condition can occur, is wired to
-//!   `StreamInfo::set_response_flag`, and at least one test drives the real
-//!   condition and asserts on the RENDERED `%RESPONSE_FLAGS%` line (never on
-//!   the enum directly — see `render_flags`'s callers). See each variant's
-//!   doc below for its test.
-//! - **Unreachable**: the condition cannot occur in what's built today. Each
-//!   such variant's doc says why, so the next audit doesn't start from
-//!   scratch. `internal-docs/envoy-divergences.md` carries the same table with the
-//!   fuller narrative.
-//!
-//! That audit found two flags declared, apparently wired, and yet **dead
-//! code**: `UpstreamRemoteReset` and `DownstreamConnectionTermination`. Both
-//! matched on an error variant nothing ever constructed. Both have since
-//! been fixed — the h2 refused-stream decode gave `UR` a producer, and
-//! `collect_request` stopped discarding its body error, giving `DC` one.
-//!
-//! Keep the lesson even though the instances are closed: a `grep` for
-//! `set_response_flag` is not a reachability proof, and neither is a passing
-//! test. Both of those flags had one. A flag is reachable when something can
-//! construct the *condition*, so a test that fabricates the error proves the
-//! mapping and nothing else.
+//! Each variant is either reachable, with a test that drives the real condition
+//! and asserts on the rendered line, or documented as unreachable with the
+//! reason. A `grep` for `set_response_flag` does not prove reachability, and
+//! neither does a test that fabricates the error. The test must reach the
+//! condition through the real path.
 
-/// Why a request ended the way it did. See the module doc's audit for
-/// which variants are reachable (and where their test lives) versus
-/// documented-unreachable.
+/// Why a request ended the way it did. Each variant notes whether it is
+/// reachable (and where its test lives) or unreachable, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResponseFlag {
     /// UH: no healthy upstream host in the cluster. Reachable: a cluster
@@ -54,39 +32,20 @@ pub enum ResponseFlag {
     /// configured route. See `proxy_http`'s
     /// `response_flags::no_route_matched_records_and_renders_the_nr_flag`.
     NoRouteFound,
-    /// URX: upstream retry limit exceeded. Reachable via the S3 retry
-    /// engine, but was NOT wired until this audit found the gap (this is
-    /// the "found a real defect" instance of the four flags this pass
-    /// discovered are neither trivially reachable-and-tested nor a plain
-    /// missing feature) -- see `RetryState::retry_limit_exceeded`'s doc in
-    /// `proxy_http::retry` for the exact condition (the trigger table would
-    /// have retried, but the S3.1 attempt budget was already spent) and
-    /// `router.rs`'s `record_retry_limit_exceeded_if_applicable`, its one
-    /// call site pattern. Tested by `proxy_http`'s
-    /// `router_retry::retry_limit_exceeded_renders_the_urx_response_flag`
-    /// (and the negative case,
-    /// `router_retry::a_successful_retry_never_renders_urx`).
+    /// URX: upstream retry limit exceeded. Set by the S3 retry engine when the
+    /// trigger table would retry but the S3.1 attempt budget is spent. See
+    /// `RetryState::retry_limit_exceeded` in `proxy_http::retry`. Tested by
+    /// `proxy_http`'s `router_retry::retry_limit_exceeded_renders_the_urx_response_flag`,
+    /// with the negative case `router_retry::a_successful_retry_never_renders_urx`.
     UpstreamRetryLimitExceeded,
     /// NC: matched route's cluster not found. Reachable: a route forwarding
     /// to a cluster name absent from the cluster manager's snapshot. See
     /// `proxy_http`'s `router_access_log::unknown_cluster_records_and_renders_the_nc_flag`.
     NoClusterFound,
-    /// DC: downstream connection terminated -- the client's own request body
-    /// read failed mid-stream. **Reachable and tested**; it was not always.
-    /// `filter_manager.rs`'s `collect_request` used to flatten its body error
-    /// to `()` before any `StreamInfo` existed to flag, so the resulting 400
-    /// carried nothing; it now propagates the real `BodyError` and flags a
-    /// `Downstream` one here.
-    /// `response_flags::a_client_that_dies_mid_upload_records_and_renders_the_dc_flag`
-    /// drives the genuine condition (announce `Content-Length: 100`, send 10
-    /// bytes, close the write half) through the real downstream codec.
-    ///
-    /// Worth remembering how this hid: `access_logging.rs`'s
-    /// `LoggingBody::classify` mapped the variant and had a passing unit
-    /// test the whole time -- but that test hand-constructs the error, and
-    /// the response-body pipeline it wraps only ever carries
-    /// `BodyError::Upstream`. A test that fabricates its condition proves the
-    /// mapping, never the reachability.
+    /// DC: downstream connection terminated, meaning the client's request body
+    /// failed mid-stream. Tested by
+    /// `response_flags::a_client_that_dies_mid_upload_records_and_renders_the_dc_flag`,
+    /// which sends a short body through the real codec.
     DownstreamConnectionTermination,
     /// LH: local service failed health check (maintenance mode). Unreachable:
     /// there is no downstream health-check filter or admin/maintenance-mode
@@ -106,20 +65,12 @@ pub enum ResponseFlag {
     /// `UF`/`UC`/`UR`) -- Envoy's own uses of `LR` (e.g. an internal error
     /// aborting a stream) have no analog here.
     LocalReset,
-    /// UR: upstream remote reset -- the peer deliberately reset the stream
-    /// between connect and the first response byte. **Reachable and tested**
-    /// since the h2 codec learned to decode RST_STREAM reasons: an
-    /// `UpstreamCodecError::RefusedStream` (h2 `REFUSED_STREAM`) is a remote
-    /// reset, and `router.rs` flags it `UR` rather than `UC`.
+    /// UR: upstream remote reset. The peer reset the stream between connect and
+    /// the first response byte. Set for an h2 `REFUSED_STREAM`. Tested by
     /// `response_flags::a_refused_h2_stream_records_and_renders_the_ur_flag`.
     ///
-    /// The *other* route to this flag is still dead:
-    /// `PoolError::ResetBeforeHeaders` is constructed by neither
-    /// `ConnectPool::new_stream` (h1) nor the h2 connection cache, so a
-    /// post-connect TCP reset is still indistinguishable from a connect
-    /// failure and reports as `UF`. Distinguishing it (matching `ECONNRESET`
-    /// specifically after a successful connect) remains a classification
-    /// decision -- see `internal-docs/envoy-divergences.md`.
+    /// A post-connect TCP reset is not yet classified as `UR`. It reports as
+    /// `UF` (see `internal-docs/envoy-divergences.md`).
     UpstreamRemoteReset,
     /// UC: upstream connection termination. Reachable: a hyper-level
     /// failure sending the request or reading the response that is neither
@@ -128,14 +79,10 @@ pub enum ResponseFlag {
     /// Envoy does. See `proxy_http`'s
     /// `response_flags::an_upstream_that_closes_before_headers_records_503_and_the_uc_flag`.
     UpstreamConnectionTermination,
-    /// RL: rate limited locally. Reachable: `proxy_filters::token_limit_filter`
-    /// denies a request once its budget is exhausted (an audit found this was
-    /// wired nowhere -- zero occurrences of `ResponseFlag` in that file --
-    /// despite being that filter's entire reason to exist). Fixed; see its
-    /// `tests::a_denied_request_renders_the_rl_response_flag`. Deliberately
-    /// NOT set on that filter's fail-open paths (a store error, or
-    /// unreadable usage) -- those admit the request, and `RL` would claim a
-    /// refusal that never happened.
+    /// RL: rate limited locally. Set by `proxy_filters::token_limit_filter` when
+    /// its budget is exhausted. It is not set on that filter's fail-open paths,
+    /// since those admit the request and `RL` would claim a refusal that never
+    /// happened. Tested by `tests::a_denied_request_renders_the_rl_response_flag`.
     RateLimited,
     /// UAEX: external authorization denial, fail-closed service error, or
     /// invalid mutation. Explicit fail-open admission does not set this flag.
@@ -155,12 +102,9 @@ pub enum ResponseFlag {
     /// See `proxy_http`'s
     /// `response_flags::an_idle_response_body_records_and_renders_the_si_flag`.
     StreamIdleTimeout,
-    /// DPE: downstream protocol error. Unreachable in the current
-    /// architecture: a malformed downstream request is a CONNECTION-level
-    /// failure inside `codec.rs`'s `serve_http1`/`serve_http2`
-    /// (`CodecError`), returned before any per-request `HttpRequestParts`/
-    /// `StreamInfo` is ever constructed -- there is no stream to attach a
-    /// flag to at the point this failure occurs.
+    /// DPE: downstream protocol error. Unreachable: a malformed downstream
+    /// request fails at connection level in `codec.rs`, before any `StreamInfo`
+    /// exists to carry the flag.
     DownstreamProtocolError,
     /// UPE: upstream protocol error. Reachable: hyper could not parse the
     /// upstream response (`hyper::Error::is_parse`: a malformed status line,

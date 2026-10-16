@@ -1,9 +1,7 @@
 //! Acceptance tests: proto -> IR conversion.
 //!
-//! Covers: the Phase-1 example config, S1 domain-precedence pre-computation,
-//! route defaults (15s timeout, case-sensitive), weighted-cluster cumulative
-//! arrays, retry policy parsing, and — critically — that every proto field
-//! outside the supported surface errors with its full path (AGENTS.md invariant 1).
+//! Covers route and cluster lowering, S1 domain precedence, defaults, retries,
+//! and strict rejection of fields outside the supported surface.
 
 use std::time::Duration;
 
@@ -135,7 +133,7 @@ static_resources:
     assert_eq!(hcm.rds_route_config_name.as_deref(), Some("ingress-routes"));
 }
 
-/// The Phase-1 example config lowers end to end.
+/// The example config lowers end to end.
 #[test]
 fn example_tcp_proxy_config_lowers() {
     let yaml = std::fs::read_to_string(concat!(
@@ -436,13 +434,8 @@ fn retry_back_off_explicit_base_derives_default_max() {
     assert_eq!(rp.retry_back_off.max_interval, Duration::from_millis(1000));
 }
 
-/// AGENTS.md invariant 1, guarding a gap that actually bit us: route-level
-/// `request_headers_to_add` IS lowered (and applied by the
-/// router), but Envoy also allows the same field on `VirtualHost` and
-/// `RouteConfiguration`, where we model nothing. Those levels must be
-/// REJECTED with their field path rather than parsed and dropped — the
-/// route-level version spent months lowering into an IR field no runtime code
-/// read, which is exactly the failure mode this asserts against.
+/// Reject `request_headers_to_add` on virtual-host and route-configuration
+/// levels, where the IR has no reader (AGENTS.md invariant 1).
 #[test]
 fn virtual_host_level_request_headers_to_add_is_rejected() {
     let err = hcm_snapshot_err(
@@ -665,13 +658,8 @@ static_resources:
     assert_eq!(field_path, "static_resources.listeners[0].transparent");
 }
 
-/// We deliberately ship without RING_HASH/MAGLEV (they need bit-exact
-/// parity with Envoy's hashing, or session affinity breaks across a mixed
-/// fleet). That has to fail at *config* time: `proxy-cluster` also refuses to
-/// build such a cluster, but that happens after startup and merely leaves the
-/// cluster absent — every request to it would get a bare 503 with nothing
-/// explaining why. Failing here is what makes `make validate` and startup
-/// report the real reason.
+/// Ring hash and Maglev require bit-exact Envoy parity for session affinity;
+/// reject them at config time with an actionable error.
 #[test]
 fn unimplemented_lb_policy_errors_at_config_time() {
     for policy in ["RING_HASH", "MAGLEV"] {

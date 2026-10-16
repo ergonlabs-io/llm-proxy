@@ -377,7 +377,7 @@ fn gated_mock(release: Arc<AtomicBool>, arrived: Arc<std::sync::atomic::AtomicUs
     }
 }
 
-/// The spool is experimental (review M7): a proxy that delivers to the agent
+/// The spool is experimental: a proxy that delivers to the agent
 /// says so at startup, in the log the operator reads.
 #[test]
 fn capture_to_the_agent_spool_warns_that_it_is_experimental() {

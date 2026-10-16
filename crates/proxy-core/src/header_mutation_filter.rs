@@ -1,18 +1,11 @@
-//! A minimal built-in HTTP filter that adds one configured header to every
-//! response. It exists to exercise the `FilterRegistry` -> `FilterChainHandler`
-//! wiring in `listener.rs` end to end -- see `hcm_filter_chain_mutates_headers_over_the_real_socket`
-//! in that module's tests, which fails without a real registry + factory
-//! behind the HCM terminal filter.
+//! A minimal built-in HTTP filter that adds one configured header to every response. It exists to exercise the
+//! `FilterRegistry` to `FilterChainHandler` wiring in `listener.rs` end to end (see
+//! `hcm_filter_chain_mutates_headers_over_the_real_socket`).
 //!
-//! Rust note on the type URL: rather than vendoring a brand-new Envoy-style
-//! proto in `proxy-api` just for this one built-in, `typed_config` reuses the
-//! shape of the already-compiled `envoy.config.core.v3.HeaderValueOption`
-//! message (`header.key` / `header.value`) -- an Any's type URL is just an
-//! opaque `prefix/full.type.name` string, and only the suffix has to resolve
-//! against the descriptor pool (see `proxy-config::lower::decode_http_filter_config`),
-//! so pointing our `type.llmproxy.dev` prefix at that existing message name is
-//! legal, if a little unusual. A real `llmproxy.*` filter would get its own vendored
-//! proto; this one is deliberately the smallest thing that proves the path.
+//! Rust note on the type URL: `typed_config` reuses the shape of the compiled `envoy.config.core.v3.HeaderValueOption`
+//! (`header.key` and `header.value`). Only the type URL suffix must resolve against the descriptor pool (see
+//! `proxy-config::lower::decode_http_filter_config`), so pointing the `type.llmproxy.dev` prefix at that message is
+//! legal, if unusual. A real `llmproxy.*` filter would get its own vendored proto.
 
 use std::sync::Arc;
 

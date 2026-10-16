@@ -118,9 +118,8 @@ static_resources:
     assert_eq!(cluster.lb_policy, LbPolicy::RoundRobin);
 }
 
-/// An aggregate cluster that omits `lb_policy` gets the proto's ROUND_ROBIN
-/// default, which is not CLUSTER_PROVIDED -- Envoy requires it be set
-/// explicitly, so this must fail naming `lb_policy`.
+/// Aggregates must explicitly set `CLUSTER_PROVIDED`; the proto default is
+/// `ROUND_ROBIN`.
 #[test]
 fn aggregate_without_cluster_provided_lb_policy_is_rejected() {
     let body = r#"
@@ -260,12 +259,8 @@ fn typed_extension_protocol_options_on_an_aggregate_is_rejected() {
     );
 }
 
-/// The converse of the four rejections above, and a deliberate decision worth
-/// pinning: `circuit_breakers` on an aggregate is NOT inert, so it must keep
-/// lowering. The router applies the breaker to the *routed* cluster before the
-/// host pick (matching Envoy), so an aggregate's own thresholds do real work
-/// even though it owns no hosts. Rejecting it alongside the others would look
-/// tidy and be wrong.
+/// Aggregate circuit breakers apply to the routed cluster before host selection,
+/// matching Envoy even though aggregates own no hosts.
 #[test]
 fn circuit_breakers_on_an_aggregate_still_lower() {
     let body = format!(
@@ -360,19 +355,9 @@ fn unsupported_custom_cluster_type_name_is_rejected() {
     );
 }
 
-/// An unknown field inside the aggregate `typed_config` is rejected by strict
-/// mode, which proves the `Any` is decoded as a *typed message* whose type URL
-/// resolves in the descriptor pool -- i.e. that
-/// `envoy/extensions/clusters/aggregate/v3/cluster.proto` really is a
-/// `proxy-api/build.rs` root. Without it the type URL would not resolve at all.
-///
-/// It does **not** prove the surface walk's allowlist does anything here, and
-/// an earlier version of this test claimed that it did. Verified by mutation
-/// (2026-08-07): adding `"bogus"` to the aggregate's `allowed_fields` entry
-/// leaves this test green, because a field absent from the descriptor is
-/// rejected by the proto3 JSON deserializer (`loader.rs:169`) long before
-/// `check_supported_surface` ever runs. See that entry's comment for why it is
-/// nonetheless correct to keep.
+/// An unknown field is rejected while decoding the typed `Any`. This verifies
+/// the aggregate descriptor is present; it does not exercise the surface
+/// allowlist because proto3 JSON decoding rejects fields absent from the descriptor.
 #[test]
 fn unknown_field_inside_aggregate_typed_config_is_rejected() {
     let body = r#"

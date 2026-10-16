@@ -1,17 +1,11 @@
-//! The per-cluster host-set snapshot.
+//! The per-cluster host-set snapshot: the immutable membership view the cluster manager publishes.
 //!
-//! `HostSet` is the immutable membership view the cluster manager publishes.
-//! It's built on the control runtime by [`crate::discovery`] and shared with
-//! workers as `Arc<HostSet>` -- the same "control computes, workers swap"
-//! model `ConfigSnapshot` uses (ADR-0003): discovery/DNS refresh recompute a
-//! whole new snapshot, and readers only ever `load` the latest one, never
-//! mutate in place.
+//! Built on the control runtime by [`crate::discovery`] and shared with workers as `Arc<HostSet>`, the same
+//! "control computes, workers swap" model as `ConfigSnapshot` (ADR-0003). Readers only `load` the latest snapshot.
 //!
-//! Envoy itself publishes incremental host-set *deltas* to workers rather
-//! than whole-set swaps. This implementation always rebuilds the snapshot wholesale
-//! (see `ManagedCluster::resolve_and_publish` in `manager.rs`) but still exposes the
-//! added/removed/unchanged classification via [`diff_host_sets`], both for
-//! observability and so tests can assert on it.
+//! Envoy publishes incremental host-set deltas. This implementation rebuilds the snapshot wholesale (see
+//! `ManagedCluster::resolve_and_publish`), but still classifies added, removed, and unchanged addresses via
+//! [`diff_host_sets`], for observability and tests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -55,11 +49,8 @@ impl HostSet {
             .unwrap_or(&[])
     }
 
-    /// Priorities present in this snapshot, ascending -- failover order
-    /// (S5/S7). Used by [`crate::load_balancer`]'s priority-spillover pass.
-    ///
-    /// Rust note: `BTreeMap::keys()` already yields ascending order, so this
-    /// is just naming that guarantee for callers rather than doing any work.
+    /// Priorities present in this snapshot, ascending: the failover order (S5/S7). Used by the priority-spillover pass.
+    /// `BTreeMap::keys()` already yields ascending order.
     pub fn priorities(&self) -> impl Iterator<Item = u32> + '_ {
         self.by_priority.keys().copied()
     }
@@ -93,12 +84,8 @@ pub struct HostSetDiff {
     pub unchanged: Vec<SocketAddr>,
 }
 
-/// Diff two host sets by address. Each list is sorted for deterministic
-/// comparison in tests/logs.
-///
-/// v1 tracks membership only: a host whose weight/priority changed but whose
-/// address didn't is reported as `unchanged` (attribute churn is out of
-/// scope here).
+/// Diffs two host sets by address. Each list is sorted for deterministic comparison. Membership only: a host whose
+/// weight or priority changed, but whose address did not, counts as `unchanged`.
 pub fn diff_host_sets(old: &HostSet, new: &HostSet) -> HostSetDiff {
     let old_addrs: HashSet<SocketAddr> = old.all_hosts().iter().map(|h| h.address).collect();
     let new_addrs: HashSet<SocketAddr> = new.all_hosts().iter().map(|h| h.address).collect();
@@ -122,30 +109,20 @@ pub fn diff_host_sets(old: &HostSet, new: &HostSet) -> HostSetDiff {
     diff
 }
 
-/// Carry `health_flags` over from `old` to `new` for every address `diff`
-/// calls `unchanged`.
+/// Carries `health_flags` from `old` to `new` for every address `diff` calls `unchanged`.
 ///
-/// `discovery::resolve` builds every `Host` fresh, with `HealthFlags::default()`
-/// -- it has no notion of "this address was already known", so a plain
-/// `managed.host_set.store(new)` on every DNS/EDS refresh would silently
-/// mark a host healthy again on a timer, erasing the active health checker's
-/// (and outlier detector's) entire output with nothing logged. Only
-/// `unchanged` addresses are touched: `added` addresses are genuinely new
-/// (nothing to carry from), and `removed` addresses don't exist in `new` to
-/// carry anything onto.
+/// `discovery::resolve` builds every `Host` fresh with `HealthFlags::default()`. A plain store on every refresh would
+/// silently mark a host healthy again on a timer, erasing the active health checker's and outlier detector's output.
+/// Only `unchanged` addresses are carried: `added` addresses are new, and `removed` ones are absent from `new`.
 ///
-/// Rust note: rebuilds the `Vec<Arc<Host>>` and re-buckets via
-/// `HostSet::from_hosts` rather than mutating in place -- `Host` has no
-/// interior mutability for `health_flags` (see `health_check`'s own
-/// `apply_health_transition`, which rebuilds for the same reason), so a new
-/// `Arc<Host>` is the only way to change it.
+/// Rust note: rebuilds the `Vec<Arc<Host>>` through `HostSet::from_hosts`. `Host` has no interior mutability for
+/// `health_flags`, so a new `Arc<Host>` is the only way to change them.
 pub fn carry_over_health_flags(old: &HostSet, new: HostSet, diff: &HostSetDiff) -> HostSet {
     if diff.unchanged.is_empty() {
         return new;
     }
-    // Flags and the in-flight counter both come from the host the traffic is
-    // already running against: a fresh discovery `Host` has a zeroed counter,
-    // and guards held by in-flight requests decrement the old one.
+    // Flags and the in-flight counter both come from the host the traffic is already running against. A fresh
+    // discovery `Host` has a zeroed counter, and in-flight guards decrement the old one.
     let old_state: HashMap<SocketAddr, (HealthFlags, Arc<AtomicU64>)> = old
         .all_hosts()
         .iter()

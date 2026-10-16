@@ -1,13 +1,8 @@
-//! Acceptance tests: driving [`ResourceApplier`] with
-//! hand-built `DiscoveryResponse`s directly -- no socket, no `controlplane`
-//! harness. This is the apply layer, not the transport; `client.rs`'s own
-//! tests already cover pumping a real stream.
+//! Acceptance tests that drive [`ResourceApplier`] with hand-built
+//! `DiscoveryResponse`s. No socket: transport is covered in `client.rs`.
 //!
-//! Fixture idiom matches `crates/proxy-config/tests/dynamic_lower.rs`, the
-//! sibling file that just landed: build the proto types directly and
-//! `prost::Message::encode`e them into an `Any`, rather than going through
-//! YAML -- there is no bootstrap file on this path, only resources the ADS
-//! client already decoded off the wire.
+//! Fixtures build the proto types directly and encode them into an `Any`, as
+//! `dynamic_lower.rs` does. There is no bootstrap file on this path.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -621,12 +616,9 @@ async fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_p
     assert_eq!(applier.current().version.0, 0);
 }
 
-/// A CDS response that lowers cleanly but whose publish is refused (the
-/// cluster manager could not build one of its clusters) is NACKed with the
-/// refusal as `error_detail`, and every effect of it is discarded (S8). The
-/// negative half is the next, unrelated LDS response: if the refused cluster
-/// set survived in the applier, that LDS publish would carry it and be
-/// refused too, NACKing a valid listener for a CDS fault.
+/// A CDS response whose publish is refused is NACKed, and all of its effects
+/// are discarded (S8). The next unrelated LDS response must not inherit the
+/// refused clusters.
 #[tokio::test]
 async fn a_refused_publish_is_rejected_and_does_not_leak_into_the_next_response() {
     let published: Arc<Mutex<Vec<Arc<ConfigSnapshot>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -710,16 +702,10 @@ async fn resending_an_identical_cluster_set_publishes_nothing_and_does_not_bump_
     );
 }
 
-/// The mirror of the no-op test above, and the one that pins `Entry`'s
-/// hand-written `PartialEq`. Same cluster NAME, different bytes (a different
-/// endpoint port) must publish a new snapshot carrying the new definition.
-///
-/// Without this, an `Entry::eq` that always answered `true` -- the exact
-/// shape a careless edit to that hand-written impl produces -- would classify
-/// every re-delivery as `unchanged`, and a control plane moving a cluster to
-/// a new endpoint would be **silently ignored**. That is AGENTS.md invariant 1's
-/// failure mode arriving over the wire instead of from a file, and every
-/// other test in this file passes while it happens.
+/// Pins `Entry`'s hand-written `PartialEq`. Same cluster name with different
+/// bytes must publish the new definition. An `Entry::eq` that always returned
+/// `true` would silently ignore every change a control plane made. That is
+/// AGENTS.md invariant 1's failure mode arriving over the wire.
 #[tokio::test]
 async fn a_cluster_whose_bytes_changed_under_the_same_name_is_republished() {
     let (publish, published) = recording_publisher();
@@ -1038,9 +1024,7 @@ async fn a_cds_full_state_response_does_not_remove_a_previously_published_listen
 
 /// `ResourceApplier` no longer needs an `into_validator`
 /// adapter to reach the ADS client -- it IS a [`ResponseHandler`] directly.
-/// This is the replacement for the old `into_validator` test: the same claim
-/// ("the seam gives back exactly what `on_response` would"), now through
-/// `ResponseHandler::handle` instead of a consumed `Validator` closure.
+/// The `ResponseHandler` seam returns the same verdict as `on_response`.
 #[tokio::test]
 async fn resource_applier_is_a_response_handler_returning_the_same_verdict_as_on_response() {
     let resp = cds_response("v1", &[minimal_cluster("a", 8080)]);
@@ -1084,15 +1068,9 @@ async fn a_valid_eds_response_reaches_the_sink_with_the_right_name_and_endpoints
     assert_eq!(calls[0].1[0].port, 9090);
 }
 
-/// THE PART 1 REGRESSION TEST. The EDS resource's own name
-/// (`ClusterLoadAssignment.cluster_name`) differs from the `Cluster.name` that
-/// subscribes to it via `eds_cluster_config.service_name` -- Envoy allows
-/// this. The sink must be called with the CLUSTER's name, never the resource
-/// name passed straight through. Against a version that called the sink with
-/// the assignment's own `cluster_name`, this fails: the sink is never called at all, because nothing in
-/// `empty_base()` is named `eds-resource-name`, or -- had the bug instead
-/// been "call the sink with the resource name regardless of any cluster" --
-/// it would have called the sink under the wrong name.
+/// Regression test. The EDS resource name (`ClusterLoadAssignment.cluster_name`)
+/// differs from the cluster that subscribes to it. Envoy allows this, and the
+/// sink must receive the cluster's name, not the resource name.
 #[tokio::test]
 async fn an_eds_resource_whose_name_differs_from_the_cluster_name_reaches_the_sink_under_the_cluster_name(
 ) {
@@ -1236,14 +1214,9 @@ async fn an_eds_response_with_a_resource_that_fails_to_lower_is_rejected_without
     );
 }
 
-/// The store-consistency fix from `apply.rs`'s own doc on `on_eds_response`:
-/// a sink that fails once and then succeeds, given the same resource bytes
-/// twice, must reach the sink the SECOND time too. Without the fix
-/// (`SotwSet::forget` on a failed name), `apply` already recorded the first
-/// attempt, the second identical response would compare `unchanged`, and the
-/// sink would never be called again -- a resource stuck permanently
-/// uninstalled while the store reports it fine. This is the regression the
-/// mismatched-name rule exists to prevent.
+/// A sink that fails once, then succeeds on the same bytes, must be reached a
+/// second time. Without `SotwSet::forget` on the failed name, the retry would
+/// read `unchanged` and the resource would stay uninstalled.
 #[tokio::test]
 async fn a_sink_that_fails_once_is_retried_on_the_next_identical_response() {
     let base = base_with_static_eds_cluster("my-cluster", "my-cluster");
@@ -1394,9 +1367,8 @@ fn listener_with_sds_validation_context(
     listener
 }
 
-/// An applied LDS listener whose chain names SDS secrets makes those names the
-/// SDS subscription: `desired_names` answers a real set, (it once answered
-/// `None` for SDS unconditionally).
+/// An applied LDS listener's SDS-named chains make those names the SDS
+/// subscription, so `desired_names` returns a real set.
 #[tokio::test]
 async fn sds_desired_names_come_from_the_applied_listeners() {
     let (publish, _published) = recording_publisher();
@@ -1455,16 +1427,9 @@ async fn a_listener_without_sds_certs_names_no_secrets() {
 }
 
 // -------------------------------------------------------------------------
-// A `validation_context` secret reaches a sink shaped like the real one,
-// rather than being ACKed and discarded.
-//
-// `crates/proxy-xds/src/apply.rs`'s own unit tests already prove
-// `a_well_formed_validation_context_secret_lowers_and_reaches_the_sink`:
-// that is `on_sds_response`'s sink-agnostic plumbing. These tests exercise
-// both secret kinds end to end through `ResourceApplier` with the same sink
-// logic `crates/proxy/src/main.rs`'s `start_ads` wires (mirrored here since
-// the sink itself is a closure private to `main`, not something this crate
-// exports).
+// Both secret kinds reach a sink shaped like the real one, rather than being
+// ACKed and discarded. The sink mirrors `start_ads` in `crates/proxy/src/main.rs`,
+// since that closure is private to `main`.
 
 fn tls_cert_secret(name: &str, chain: &[u8], key: &[u8]) -> tls_v3::Secret {
     tls_v3::Secret {

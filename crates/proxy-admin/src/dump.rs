@@ -1,11 +1,6 @@
-//! Redacted JSON views of a [`ConfigSnapshot`] for `/config_dump` and
-//! `/clusters`.
-//!
-//! See the crate-level "Redaction policy" doc for the rule these types
-//! enforce. In short: every struct here is a hand-picked allowlist of IR
-//! fields, never a `#[derive(Serialize)]` on the IR types themselves --
-//! that would re-expose everything on the day a new IR field is added,
-//! silently.
+//! Redacted JSON views of a [`ConfigSnapshot`] for `/config_dump` and `/clusters`. Every struct here is a
+//! hand-picked allowlist of IR fields. None derives `Serialize` on an IR type, which would re-expose every new IR
+//! field silently (see the crate's "Redaction policy").
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -31,13 +26,9 @@ pub struct ConfigDump {
     pub admin: Option<String>,
     pub listeners: Vec<ListenerDump>,
     pub clusters: Vec<ClusterDump>,
-    /// RDS-delivered route tables; tables inlined in an HTTP
-    /// connection manager are nested under that listener's filter chain
-    /// instead (`ConfigSnapshot.routes` doc, `ir.rs`).
+    /// RDS-delivered route tables. Tables inlined in an HTTP connection manager sit under its filter chain instead.
     pub routes: Vec<RouteTableDump>,
-    /// Secret **names** only -- never key material (`TlsSecret` today only
-    /// carries a name, but this stays an explicit allowlist rather than a
-    /// derive so that stays true if the type grows fields later).
+    /// Secret **names** only. This stays an explicit allowlist, not a derive, so it stays true if `TlsSecret` grows fields.
     pub secrets: Vec<String>,
 }
 
@@ -133,9 +124,8 @@ pub enum NetworkFilterDump {
         generate_request_id: bool,
         use_remote_address: bool,
         xff_num_trusted_hops: u32,
-        /// Filter names/type URLs only. `HttpFilterSpec.config` is an
-        /// opaque `DynamicMessage` this crate has not vetted per filter, so
-        /// it is never rendered -- default-deny, per module doc.
+        /// Filter names and type URLs only. `HttpFilterSpec.config` is an opaque message this crate has not vetted, so
+        /// it is never rendered.
         http_filters: Vec<HttpFilterDump>,
         route_table: RouteTableDump,
     },
@@ -221,11 +211,9 @@ pub struct RouteDump {
     pub path: PathMatchDump,
     pub case_sensitive: bool,
     pub action: RouteActionDump,
-    /// Header **names** the router adds/appends on match -- this is exactly
-    /// how provider API keys reach the upstream.
-    /// Every value renders as `"[redacted]"` unconditionally, regardless of
-    /// header name: this list is credential-shaped by construction, not by
-    /// name-matching, so there is no name pattern to keep in sync.
+    /// Header **names** the router adds on match, which is how provider API keys reach the upstream. Every value
+    /// renders as `"[redacted]"`, regardless of name. The list is credential-shaped by construction, so no name
+    /// pattern needs to stay in sync.
     pub request_headers_to_add: Vec<HeaderMutationDump>,
 }
 
@@ -294,10 +282,8 @@ pub enum RouteActionDump {
     },
     DirectResponse {
         status: u16,
-        /// Presence only. Not rendering the body is the conservative
-        /// default-deny call: this crate has not vetted `DataSourceIR` as
-        /// safe-to-show (a `File` variant is a path, but nothing stops a
-        /// future direct-response body from carrying something sensitive).
+        /// Presence only. The body is not rendered: `DataSourceIR` is not vetted as safe to show, and a future
+        /// direct-response body could carry something sensitive.
         has_body: bool,
     },
 }
@@ -326,10 +312,8 @@ impl RouteActionDump {
     }
 }
 
-// Rust note: adjacently tagged (`tag`+`content`), not internally tagged
-// (`tag` alone) -- internal tagging needs each variant's payload to
-// serialize as a map, which a bare `String`/`Vec` can't; this is the same
-// shape `PathMatchDump` above uses for the same reason.
+// Rust note: adjacently tagged (`tag` plus `content`), not internally tagged. Internal tagging needs each variant's
+// payload to serialize as a map, which a bare `String` or `Vec` cannot. `PathMatchDump` uses the same shape.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "value")]
 pub enum ForwardTargetDump {
@@ -362,9 +346,8 @@ pub struct ClusterDump {
     /// key material -- see module doc.
     pub tls: bool,
     pub endpoints: Vec<EndpointDump>,
-    /// Present only on `/clusters` when its live-state provider is wired.
-    /// `/config_dump` remains a configuration dump and intentionally omits
-    /// this runtime-only value.
+    /// Present only on `/clusters`, when its live-state provider is wired. `/config_dump` is configuration only and
+    /// omits this runtime value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initialized: Option<bool>,
     pub circuit_breakers: CircuitBreakersDump,
@@ -400,11 +383,9 @@ impl ClusterDump {
         }
     }
 
-    /// Build the `/clusters` view from safe configuration fields plus the
-    /// manager's live host-set snapshot. If the manager cannot prove that it
-    /// owns the same configuration (a reload is between manager install and
-    /// config publication), `live` is `None`: report no endpoints rather
-    /// than leaking a future configuration's members into this snapshot.
+    /// Builds the `/clusters` view from safe configuration plus the manager's live host set. If the manager cannot
+    /// prove it owns this configuration (a reload is between install and publish), `live` is `None` and the cluster
+    /// reports no endpoints, rather than leaking a future configuration's members.
     pub(crate) fn from_ir_and_live(c: &ClusterConfig, live: Option<&LiveCluster>) -> Self {
         let mut dump = Self::from_ir(c);
         dump.endpoints = live
@@ -454,9 +435,8 @@ impl EndpointDump {
     }
 }
 
-/// Runtime host-set input to `/clusters`. It intentionally uses only plain
-/// owned values: `proxy-admin` remains independent of the data-plane cluster
-/// crate and, in particular, generated proto types.
+/// Runtime host-set input to `/clusters`. Plain owned values only, so `proxy-admin` stays independent of the
+/// data-plane cluster crate and of generated proto types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveCluster {
     pub name: String,
@@ -475,10 +455,8 @@ pub struct LiveEndpoint {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// Render every configured cluster against the corresponding live host set.
-/// Names absent from `live` deliberately render an empty endpoint list: that
-/// means the provider could not prove it describes this config snapshot, and
-/// showing configured/stale endpoints would be less honest than empty.
+/// Renders every configured cluster against its live host set. A name absent from `live` renders an empty endpoint
+/// list: the provider could not prove it describes this snapshot, and stale endpoints would be less honest.
 pub(crate) fn clusters_from_snapshot_and_live(
     snapshot: &ConfigSnapshot,
     live: &[LiveCluster],
@@ -541,10 +519,8 @@ fn lb_policy_str(p: LbPolicy) -> &'static str {
         LbPolicy::RingHash => "RING_HASH",
         LbPolicy::Random => "RANDOM",
         LbPolicy::Maglev => "MAGLEV",
-        // `/config_dump` must round-trip what the config actually said;
-        // mapping this to "ROUND_ROBIN" would misreport an aggregate
-        // cluster's lb_policy in the one surface people use to check what
-        // the proxy loaded.
+        // `/config_dump` must round-trip what the config said. Mapping this to "ROUND_ROBIN" would misreport an
+        // aggregate's `lb_policy` in the surface operators use to check what loaded.
         LbPolicy::ClusterProvided => "CLUSTER_PROVIDED",
     }
 }
@@ -568,21 +544,15 @@ pub struct ModelInventory {
     pub models: Vec<ModelDump>,
 }
 
-/// One model pattern, as `GET /models` renders it. Same allowlist rule as
-/// every other type in this module: hand-picked fields, never a
-/// `#[derive(Serialize)]` on an IR type.
+/// One model pattern, as `GET /models` renders it. Hand-picked fields, like every type in this module.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ModelDump {
-    /// The pattern as an operator would write it -- an exact name, or a glob
-    /// reconstructed from the route's prefix/suffix matcher (see
-    /// [`Self::from_header_match`]).
+    /// The pattern as an operator would write it: an exact name, or a glob rebuilt from the route's prefix or suffix
+    /// matcher (see [`Self::from_header_match`]).
     pub model: String,
-    /// How the route matches that pattern: `exact`, `prefix`, `suffix`,
-    /// `regex`, `present`, or `absent`.
+    /// How the route matches that pattern: `exact`, `prefix`, `suffix`, `regex`, `present`, or `absent`.
     ///
-    /// Rust note: `r#match` is a RAW IDENTIFIER -- `match` is a Rust keyword
-    /// so it cannot be a plain field name, but `serde` still serializes the
-    /// field as plain `match`, which is the wire name a reader expects.
+    /// Rust note: `r#match` is a raw identifier, since `match` is a keyword. Serde still emits the plain name `match`.
     pub r#match: &'static str,
     /// The route's configured `name`, when it has one -- provenance, so the
     /// entry can be found again in `/config_dump`.
@@ -593,15 +563,9 @@ pub struct ModelDump {
 }
 
 impl ModelDump {
-    /// Renders one `x-llmproxy-model` header matcher as a model pattern.
-    ///
-    /// Prefix/suffix matchers are shown back as GLOBS (`gpt-4` -> `gpt-4*`,
-    /// `gpt-4o` suffix -> `*gpt-4o`) because that is exactly the string an
-    /// operator wrote and Envoy's prefix matcher means precisely that set of
-    /// models -- showing the bare prefix would read like a truncated name.
-    /// A regex cannot be reconstructed as a glob without guessing, so its
-    /// source is shown verbatim and labelled `regex` rather than flattened
-    /// into something that might not mean the same thing.
+    /// Renders one `x-llmproxy-model` header matcher as a model pattern. Prefix and suffix matchers show as globs
+    /// (`gpt-4` becomes `gpt-4*`), since that is what the operator wrote and what Envoy's prefix matcher means. A regex
+    /// cannot become a glob without guessing, so its source is shown verbatim and labelled `regex`.
     fn from_header_match(
         header: &HeaderMatch,
         route_name: &Option<String>,
@@ -612,10 +576,8 @@ impl ModelDump {
             HeaderMatchKind::Prefix { value, .. } => (format!("{value}*"), "prefix"),
             HeaderMatchKind::Suffix { value, .. } => (format!("*{value}"), "suffix"),
             HeaderMatchKind::Regex(re) => (re.as_str().to_string(), "regex"),
-            // A presence matcher keys on the header EXISTING, not on any
-            // particular model. `*` is the honest rendering (it spans every
-            // model, or every model-less request); the kind is what tells the
-            // two directions apart.
+            // A presence matcher keys on the header existing, not on a model. `*` is the honest rendering: it spans every
+            // model, and the kind tells the two apart.
             HeaderMatchKind::Present(true) => ("*".to_string(), "present"),
             HeaderMatchKind::Present(false) => ("*".to_string(), "absent"),
         };
@@ -628,27 +590,15 @@ impl ModelDump {
     }
 }
 
-/// Builds `GET /models`'s body: every route in the snapshot that matches on
-/// [`MODEL_HEADER_NAME`].
+/// Builds `GET /models`'s body: every route that matches on [`MODEL_HEADER_NAME`]. That header is the model
+/// dimension: `proxy_filters::body_rewrite_filter` publishes the request's `model` onto it, and `proxy_simple_config`
+/// lowers each `routes[].model` pattern into a matcher on it.
 ///
-/// That header IS the model dimension in this proxy:
-/// `proxy_filters::body_rewrite_filter` publishes the request's `model` onto
-/// it (removing any client-supplied value first), and `proxy_simple_config`
-/// lowers every `routes[].model` pattern and every `models.<name>` catalogue
-/// entry into a matcher on it.
+/// Routes that do not match on that header are deliberately absent. A plain `/v1/chat/completions` prefix route
+/// serves every model and names none, so inventing an entry would report a model the config never mentioned.
 ///
-/// **Routes that do not match on that header are deliberately absent.** A
-/// plain `/v1/chat/completions` prefix route serves every model and names
-/// none; inventing an entry for it would report a model the config never
-/// mentioned. This endpoint reports what routing actually keys on, not what
-/// a reader might wish it keyed on -- the same honesty rule as `/stats`
-/// answering 404 rather than a fake empty `200` when unwired.
-///
-/// Both route sources are walked: RDS-delivered tables
-/// (`ConfigSnapshot::routes`) and the tables inlined in an HCM (the
-/// simple-config lowering inlines; see `ConfigSnapshot::routes`'s doc).
-/// Identical entries from two tables are de-duplicated, and the result is
-/// sorted, so the response is stable across calls for the same config.
+/// Both route sources are walked: RDS tables (`ConfigSnapshot::routes`) and tables inlined in an HCM. Identical
+/// entries are de-duplicated, and the result is sorted, so the response is stable for a given config.
 pub fn models_from_snapshot(snapshot: &ConfigSnapshot) -> ModelInventory {
     let mut models: Vec<ModelDump> = Vec::new();
     for table in snapshot.routes.values() {

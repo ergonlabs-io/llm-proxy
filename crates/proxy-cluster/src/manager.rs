@@ -1,18 +1,11 @@
-//! Cluster manager: owns per-cluster discovery state and
-//! publishes [`HostSet`] snapshots. Built/updated on the control runtime; the
-//! router only ever talks to it through [`ClusterManager::cluster`]'s
-//! `Arc<dyn ClusterEntry>` handle, never touching discovery internals.
+//! Cluster manager: owns per-cluster discovery state and publishes [`HostSet`] snapshots. It is built
+//! and updated on the control runtime; the router reaches it only through [`ClusterManager::cluster`]'s
+//! `Arc<dyn ClusterEntry>` handle.
 //!
-//! Warming ("is this cluster ready to serve") tracking lives here --
-//! [`ClusterManager::is_initialized`] flips once a cluster's first
-//! resolution lands, or, for a cluster that never resolves in time,
-//! [`ClusterManager::force_initialize`] mimics Envoy's
-//! `initial_fetch_timeout` "proceed empty" behavior.
-//! [`ClusterManager::warming_clusters`] is what a
-//! readiness probe reads; this crate has no opinion on what a caller does
-//! with a non-empty result -- see `proxy-admin`'s `ReadinessProbe` and
-//! `proxy/src/main.rs` for the production wiring, and note this only gates
-//! `/ready`, not request routing.
+//! Warming: [`ClusterManager::is_initialized`] flips once a cluster's first resolution lands. A cluster
+//! that never resolves in time is marked by [`ClusterManager::force_initialize`], which mimics Envoy's
+//! `initial_fetch_timeout` "proceed empty" behavior. [`ClusterManager::warming_clusters`] feeds `/ready`
+//! only; it does not gate request routing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -41,11 +34,8 @@ use crate::{
     RoutingPriority, SelectedMember, UpstreamProtocol,
 };
 
-/// Failure to build a cluster: either its `lb_policy` isn't implemented
-/// ([`LbError`]) or its `transport_socket` couldn't be built
-/// ([`TransportSocketError`]). Kept as one enum (rather than two separate
-/// `Vec`s of rejections) because both are "this cluster didn't make it into
-/// the cluster set" outcomes the same callers need to report the same way.
+/// Failure to build a cluster: an unimplemented `lb_policy` ([`LbError`]) or a `transport_socket` that
+/// will not build ([`TransportSocketError`]). One enum, because callers report both the same way.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterBuildError {
     #[error(transparent)]
@@ -54,10 +44,8 @@ pub enum ClusterBuildError {
     TransportSocket(#[from] TransportSocketError),
 }
 
-/// A copyable, control-plane-facing snapshot of one cluster's active host
-/// set. This deliberately contains only runtime values and standard-library
-/// types: consumers such as the admin server need no generated-proto
-/// dependency (and never receive a `ManagedCluster` internals handle).
+/// A copyable, control-plane-facing snapshot of one cluster's active host set. It holds only runtime
+/// and std types, so the admin server needs no generated-proto dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveCluster {
     pub name: ClusterName,
@@ -69,151 +57,92 @@ pub struct LiveCluster {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveEndpoint {
     pub address: SocketAddr,
-    /// The DNS origin, when discovery resolved a DNS endpoint. `address` is
-    /// always the actual address traffic dials; this is supplementary SNI /
-    /// operator context, never a replacement for it.
+    /// The DNS origin, when discovery resolved one. `address` is always what traffic dials; this is for
+    /// SNI and operator context only.
     pub hostname: Option<String>,
     pub weight: u32,
     pub priority: u32,
     pub health_flags: String,
-    /// The explicitly accepted endpoint-label namespace. Values are copied
-    /// into the immutable host set on discovery/EDS ingest, so this follows
-    /// live membership rather than the configured endpoint shape.
+    /// Endpoint labels. Copied into the immutable host set on ingest, so they follow live membership.
     pub metadata: BTreeMap<String, String>,
 }
 
-/// One cluster's live state: where its membership comes from, its current
-/// host-set snapshot, and its warming status.
+/// One cluster's live state: its membership source, current host-set snapshot, and warming status.
 ///
-/// Rust note: `ArcSwap<HostSet>` is the same "control computes, workers
-/// swap" pattern `proxy_core::WorkerConfigHandle` uses for `ConfigSnapshot`
-/// (ADR-0003) -- discovery recomputes whole host sets on the control
-/// runtime; readers (`select_host`) only ever `load`.
+/// Rust note: `ArcSwap<HostSet>` is the "control computes, workers swap" pattern from `WorkerConfigHandle`
+/// (ADR-0003). Discovery recomputes whole host sets on the control runtime; readers only `load`.
 ///
-/// For an aggregate cluster (`ClusterConfig::kind` is `Aggregate`),
-/// `host_set`/`host_picker`/`transport`/`upstream_protocol` below are all
-/// inert placeholders -- see [`ManagedCluster::from_config`]'s aggregate arm.
+/// For an aggregate cluster, `host_set`, `host_picker`, `transport`, and `upstream_protocol` are inert
+/// placeholders (see the aggregate arm of [`ManagedCluster::from_config`]).
 struct ManagedCluster {
-    /// The config this cluster was built from; discovery follows its
-    /// `DiscoveryType` (STATIC/STRICT_DNS/LOGICAL_DNS -- see
-    /// [`crate::discovery`]), except `EDS`, whose membership arrives through
-    /// [`ClusterManager::accept_eds_update`] instead.
+    /// The config this cluster was built from. Discovery follows its `DiscoveryType` (see [`crate::discovery`]),
+    /// except `EDS`, whose membership arrives via [`ClusterManager::accept_eds_update`].
     config: Arc<ClusterConfig>,
-    /// Rust note: `Arc<ArcSwap<..>>` (not a bare `ArcSwap<..>`) so
-    /// [`health_check::HealthCheckEngine::spawn_for_host`] -- which needs an
-    /// owned handle to publish transitions onto, since its check loop
-    /// outlives any single call into this manager -- can hold a clone of the
-    /// exact swap cell every reader of this cluster shares, rather than a
-    /// borrow tied to `&self`. `.load()`/`.store()`/`.rcu()` still work
-    /// unchanged through `Arc`'s `Deref`.
-    ///
+    /// Rust note: `Arc<ArcSwap<..>>` lets [`health_check::HealthCheckEngine::spawn_for_host`] hold a clone of
+    /// the swap cell. Its check loop outlives any single call, so a borrow tied to `&self` will not do.
+    /// `.load()`, `.store()`, and `.rcu()` work unchanged through `Deref`.
     /// [`health_check::HealthCheckEngine::spawn_for_host`]: crate::health_check::HealthCheckEngine::spawn_for_host
     host_set: Arc<ArcSwap<HostSet>>,
-    /// Flips to `true` once the cluster's first resolution (or, for EDS, its
-    /// first externally-supplied set) has landed. Also `true` from
-    /// construction for an aggregate, which has nothing of its own to
-    /// resolve (see `from_config`'s aggregate arm).
+    /// Set once the first resolution (or, for EDS, the first externally supplied set) lands. Always true
+    /// for an aggregate, which has nothing to resolve.
     initialized: AtomicBool,
-    /// S7 host selection: the configured `lb_policy`'s [`LoadBalancer`],
-    /// plus the priority-spillover / healthy-panic-threshold logic shared by
-    /// every policy. Built once at cluster construction -- see
-    /// [`load_balancer::build`] for why `RING_HASH`/`MAGLEV` fail here
-    /// instead of falling back to something else.
+    /// S7 host selection: the configured `lb_policy`'s [`LoadBalancer`], plus the priority-spillover and
+    /// healthy-panic logic shared by all policies. Built once at construction; see [`load_balancer::build`]
+    /// for why `RING_HASH`/`MAGLEV` fail here rather than falling back.
     ///
     /// [`LoadBalancer`]: crate::load_balancer::LoadBalancer
     host_picker: HostPicker,
-    /// S5 circuit-breaker budgets for this cluster, one bucket per routing
-    /// priority; these are the buckets `ClusterEntry::circuit_breaker` hands
-    /// back. An aggregate's members therefore share the aggregate's own
-    /// budget today -- see `router.rs`'s `apply_forward` for where that's
-    /// acquired.
+    /// S5 circuit-breaker budgets, one bucket per routing priority, as `ClusterEntry::circuit_breaker`
+    /// returns them. An aggregate's members share the aggregate's budget today (see `router.rs`'s
+    /// `apply_forward`).
     default_cb: CircuitBreakerState,
     high_cb: CircuitBreakerState,
-    /// Which HTTP protocol the router speaks to this cluster's upstreams.
-    /// Captured from the config at build time (Envoy default HTTP/1.1); EDS
-    /// clusters, which have no `ClusterConfig`, default to HTTP/1.1.
+    /// The HTTP protocol the router speaks to this cluster's upstreams. EDS clusters, which have no
+    /// `ClusterConfig`, default to HTTP/1.1.
     upstream_protocol: UpstreamProtocol,
-    /// What [`crate::pool::ConnectPool`] wraps a freshly-dialed TCP
-    /// connection in: plaintext, or a TLS originator built from
-    /// `config.transport_socket`. Built once at cluster construction via the
-    /// manager's [`TransportSocketBuilder`]; EDS clusters, which have no
-    /// `ClusterConfig`, always get plaintext.
+    /// The wrapper for a freshly dialed TCP connection: plaintext, or TLS built from
+    /// `config.transport_socket`. EDS clusters always get plaintext.
     transport: Arc<dyn UpstreamTransportSocket>,
-    /// `ClusterConfig::connect_timeout` (Envoy default 5s), handed to every
-    /// [`crate::pool::ConnectPool`] built for this cluster. EDS clusters and
-    /// aggregates, which have no `ClusterConfig` of their own to read (the
-    /// aggregate arm's own pool is never actually dialed -- see
-    /// `ClusterHandle::http_pool`), fall back to the same Envoy default.
+    /// `ClusterConfig::connect_timeout` (Envoy default 5s). EDS clusters and aggregates use the same
+    /// default; an aggregate's own pool is never dialed.
     connect_timeout: std::time::Duration,
-    /// S6 active health checking: built once from
-    /// `config.health_check` at construction, same as `host_picker`/
-    /// `transport` above. `None` when the config configures no health check
-    /// (Envoy's own default, every host healthy), and always `None` for an
-    /// aggregate (no hosts of its own to probe -- see the aggregate arm) or
-    /// an EDS cluster (no `ClusterConfig` to read one from -- see [`Self::eds`]).
+    /// S6 active health checks, built once from `config.health_check`. `None` when none is configured
+    /// (Envoy's default: every host healthy), and always `None` for aggregates and EDS clusters.
     health_engine: Option<Arc<HealthCheckEngine>>,
-    /// Live probe tasks, one per currently-probed host address. Reconciled
-    /// against membership on every resolve/`accept_eds_update`
-    /// call by [`Self::reconcile_probes`]. Kept here (not on the engine
-    /// itself) because it's per-*cluster* membership, and a `ManagedCluster`
-    /// is what actually gets discarded wholesale on a config reload -- see
-    /// this type's `Drop` impl for why that discard must abort every handle
-    /// here rather than just letting them go.
+    /// Live probe tasks, one per probed host address, reconciled on every resolve or EDS update by
+    /// [`Self::reconcile_probes`]. They live here, not on the engine, because a `ManagedCluster` is what
+    /// gets discarded on reload. The `Drop` impl aborts them all.
     ///
-    /// Rust note: `std::sync::Mutex`, not `tokio::sync::Mutex` -- every
-    /// critical section here is a plain, non-async `HashMap` insert/remove/
-    /// drain, so there's no `.await` under the lock to require the async
-    /// variant (same reasoning as `resolver::FakeResolver::records`).
+    /// Rust note: `std::sync::Mutex`, not `tokio::sync::Mutex`. Every critical section is a plain
+    /// `HashMap` edit with no `.await`.
     probes: Mutex<HashMap<SocketAddr, JoinHandle<()>>>,
-    /// S6 passive outlier detection, or `None` when the config
-    /// configures none. Fed one [`RequestResult`] per upstream attempt by the
-    /// router (via [`ClusterEntry::report_outlier_result`]); it ejects a host
-    /// by setting `failed_outlier_check` on it in this same cluster's
-    /// `host_set`, so ejections and active-health-check failures share one
-    /// snapshot (see `HealthFlags`). Holds an `Arc<ArcSwap<HostSet>>` clone of
-    /// `host_set` below, so it always ejects into the current membership even
-    /// across a DNS re-resolution.
+    /// S6 passive outlier detection, or `None` when unconfigured. The router feeds it one
+    /// [`RequestResult`] per upstream attempt. It ejects by setting `failed_outlier_check` in this
+    /// cluster's `host_set`, so ejections and active-check failures share one snapshot (see `HealthFlags`).
+    /// It holds a clone of `host_set`, so it ejects into current membership across DNS re-resolution.
     outlier_detector: Option<Arc<OutlierDetector>>,
-    /// The detector's periodic success-rate / failure-percentage sweep task
-    /// ([`OutlierDetector::spawn`]). Aborted on `Drop` for the identical
-    /// reason as `probes` -- a dropped `JoinHandle` detaches rather than
-    /// stops, so without this a config reload leaks one sweep loop per
-    /// cluster, forever.
+    /// Periodic outlier sweep task ([`OutlierDetector::spawn`]). Aborted on `Drop`: a dropped `JoinHandle`
+    /// detaches rather than stops, so a reload would leak one sweep loop per cluster.
     outlier_sweep: Mutex<Option<JoinHandle<()>>>,
-    /// The timer that re-resolves a `STRICT_DNS`/`LOGICAL_DNS` cluster
-    /// ([`run_dns_refresh`]); `None` for every other cluster. Set once, by
-    /// [`ClusterManager::start_dns_refresh`], after the cluster is behind its
-    /// `Arc` -- the task holds only a `Weak` to the cluster, so this field
-    /// cannot be filled at construction. Aborted on `Drop` for the same
-    /// reason as `probes`; the task also ends by itself when its `Weak` stops
-    /// upgrading, which covers the instant between the last `Arc` dropping
-    /// and the abort taking effect.
+    /// Timer that re-resolves a `STRICT_DNS`/`LOGICAL_DNS` cluster ([`run_dns_refresh`]); `None` for others.
+    /// Set by [`ClusterManager::start_dns_refresh`] once the cluster is behind its `Arc`, since the task
+    /// holds only a `Weak`. Aborted on `Drop`; the task also ends once its `Weak` stops upgrading.
     dns_refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for ManagedCluster {
-    /// A dropped `JoinHandle` does **not** abort its task -- it only detaches
-    /// from it, and the check loop keeps running with nobody left to stop it.
-    /// `ClusterManager::update_from_snapshot` rebuilds a config-sourced
-    /// cluster whenever its config actually changed
-    /// (unless it is carried forward unchanged, see that method's own doc),
-    /// so without this, every rebuild -- and this proxy reloads on SIGHUP in
-    /// production -- would leak one permanently-running probe loop per host,
-    /// forever.
+    /// Aborts every background task on drop. A dropped `JoinHandle` detaches rather than stops, and a
+    /// check loop with no owner runs forever. Config reloads rebuild clusters, so without this each
+    /// reload would leak one probe loop per host.
     fn drop(&mut self) {
-        // Rust note: `Mutex::lock`'s `Err` case is poisoning (a prior holder
-        // panicked mid-critical-section) -- `if let Ok` rather than
-        // `.unwrap()` here so a poisoned lock still aborts whatever handles
-        // it can reach instead of panicking again inside a `Drop` (a
-        // double-panic during unwind aborts the whole process).
+        // Rust note: `Mutex::lock` errs only on poisoning. `if let Ok` still aborts reachable handles, where
+        // `.unwrap()` would panic inside `Drop` during unwind and abort the process.
         if let Ok(mut probes) = self.probes.lock() {
             for (_, handle) in probes.drain() {
                 handle.abort();
             }
         }
-        // Same reasoning for the outlier-detection sweep: a dropped handle
-        // detaches, so without this a config reload leaks one sweep loop per
-        // cluster that configures outlier detection.
+        // Same for the outlier sweep, so a reload does not leak it.
         if let Ok(mut sweep) = self.outlier_sweep.lock() {
             if let Some(handle) = sweep.take() {
                 handle.abort();
@@ -223,10 +152,8 @@ impl Drop for ManagedCluster {
         if let Some(detector) = &self.outlier_detector {
             detector.shutdown();
         }
-        // And the DNS refresh timer. Its `Weak` would stop upgrading anyway,
-        // so it would never resolve for a dead cluster again, but it would
-        // sit asleep until its next tick to find that out: a refresh interval
-        // per replaced cluster, and operators can set that to hours.
+        // The DNS refresh timer. Its `Weak` stops upgrading, but the task would sleep until its next tick
+        // to find that out, so abort it now.
         if let Ok(mut task) = self.dns_refresh_task.lock() {
             if let Some(handle) = task.take() {
                 handle.abort();
@@ -236,14 +163,10 @@ impl Drop for ManagedCluster {
 }
 
 impl ManagedCluster {
-    /// Builds a config-sourced cluster's state. Branches on `config.kind`:
-    /// an `Endpoints` cluster gets a real load balancer and transport socket
-    /// (failing if `config.lb_policy` isn't implemented yet -- `RING_HASH`/
-    /// `MAGLEV`, see [`load_balancer::build`] -- or if `config.transport_socket`
-    /// doesn't build; AGENTS.md invariant 1 forbids silently substituting another
-    /// policy or downgrading to plaintext); an `Aggregate` cluster has no
-    /// hosts, load balancer, or transport socket of its own to build at all
-    /// (see the aggregate arm below).
+    /// Builds a config-sourced cluster's state, branching on `config.kind`. An `Endpoints` cluster gets a
+    /// real load balancer and transport socket. Either failing fails the build: AGENTS.md invariant 1
+    /// forbids silently substituting a policy or downgrading to plaintext. An `Aggregate` cluster has no
+    /// hosts, load balancer, or transport socket (see the aggregate arm below).
     fn from_config(
         config: Arc<ClusterConfig>,
         transport_builder: &TransportSocketBuilder,
@@ -254,21 +177,15 @@ impl ManagedCluster {
             ClusterKind::Endpoints => {
                 let policy = load_balancer::build(config.lb_policy)?;
                 let transport = transport_builder(&config)?;
-                // Read + map (IR → runtime enum) before `config` is moved
-                // into `source` below.
+                // Read and map the IR enum before `config` moves into `source`.
                 let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
                 let connect_timeout = config.connect_timeout;
-                // Build the engine now, from the lowered config, same as
-                // `policy`/`transport` above --
-                // `None` means the config configures no health check at all
-                // (Envoy's own default), not that this cluster is exempt.
+                // Build the engine from the lowered config, like `policy` and `transport`. `None` means no
+                // health check is configured, not that this cluster is exempt.
                 let health_engine = config.health_check.as_ref().map(HealthCheckEngine::from_ir);
-                // The detector must eject into the SAME
-                // `host_set` the router picks from, so build the `Arc` here
-                // and hand the detector a clone. It ejects by publishing a new
-                // snapshot with `failed_outlier_check` set, which the picker
-                // then skips -- see `OutlierDetector`. Its periodic sweep is
-                // spawned now and its handle stashed for `Drop` to abort.
+                // The detector must eject into the same `host_set` the router picks from, so build the `Arc`
+                // here and give the detector a clone. Its periodic sweep is spawned now; the handle is stashed
+                // for `Drop` to abort.
                 let host_set = Arc::new(ArcSwap::from_pointee(HostSet::default()));
                 let (outlier_detector, outlier_sweep) = match &config.outlier_detection {
                     Some(od) => {
@@ -301,25 +218,13 @@ impl ManagedCluster {
                 })
             }
             ClusterKind::Aggregate { .. } => {
-                // `select_host` never reads this
-                // cluster's own `host_set`/`host_picker`/`transport`/
-                // `upstream_protocol`/`connect_timeout` for an aggregate --
-                // it resolves straight through to whichever member actually
-                // served the host (see `ClusterHandle::select_aggregate_member`)
-                // -- so `RoundRobin`/`RawTransportSocket`/`Http1` here are
-                // inert placeholders, never real answers. `initialized` starts
-                // `true`: there is nothing here to resolve, and leaving it `false`
-                // would make warming wait forever on a cluster that never runs
-                // discovery -- and, since the router refuses an un-initialized
-                // cluster before host selection, would 503 every request routed at
-                // an aggregate.
-                // `connect_timeout` is read from the real config anyway (it
-                // costs nothing and stays correct if this arm's pool is ever
-                // actually dialed). `health_engine`
-                // stays `None` for the same reason as the rest of this arm:
-                // an aggregate has no hosts of its own to probe -- probing
-                // happens on the member cluster, which has its own real
-                // `ManagedCluster` and its own `health_engine`.
+                // Inert placeholders: `select_host` never reads this cluster's own `host_set`, `host_picker`,
+                // `transport`, or `upstream_protocol`. It resolves straight to the member that served the host
+                // (see `ClusterHandle::select_aggregate_member`), so `RoundRobin`, `RawTransportSocket`, and
+                // `Http1` here are never real answers. `initialized` starts `true` because there is nothing to
+                // resolve; `false` would make warming wait forever and the router would 503 every request.
+                // `connect_timeout` is read from the config anyway, so it stays correct if the pool is ever
+                // dialed. `health_engine` stays `None`: probing happens on the member cluster.
                 let connect_timeout = config.connect_timeout;
                 Ok(Self {
                     config,
@@ -336,8 +241,7 @@ impl ManagedCluster {
                     connect_timeout,
                     health_engine: None,
                     probes: Mutex::new(HashMap::new()),
-                    // An aggregate has no hosts of its own to eject -- outlier
-                    // detection runs on the member cluster, same as probing.
+                    // Outlier detection runs on the member cluster, not on an aggregate.
                     outlier_detector: None,
                     outlier_sweep: Mutex::new(None),
                     // An aggregate resolves nothing itself; its members
@@ -348,17 +252,9 @@ impl ManagedCluster {
         }
     }
 
-    /// Reconcile this cluster's active-health-check probes against a
-    /// membership diff: stop the probe for every
-    /// `removed` address (aborting its task, not just dropping the handle --
-    /// see this type's `Drop` impl for why a drop alone isn't enough), and
-    /// start one for every `added` address. `unchanged` addresses are left
-    /// alone -- their probe, if any, is already running against this same
-    /// `host_set`, and re-spawning would just be a second task racing the
-    /// first over the same host.
-    ///
-    /// A no-op when this cluster has no health check configured
-    /// (`health_engine` is `None`).
+    /// Reconciles this cluster's active-health-check probes against a membership diff: aborts the probe for
+    /// each `removed` address (see the `Drop` impl) and starts one for each `added`. `unchanged` addresses keep
+    /// their running probe, since it already targets this `host_set`. A no-op without a health check.
     fn reconcile_probes(&self, diff: &HostSetDiff) {
         let Some(engine) = &self.health_engine else {
             return;
@@ -370,11 +266,8 @@ impl ManagedCluster {
             }
         }
         for &addr in &diff.added {
-            // Hand the probe a clone of this cluster's own
-            // detector (if any) so a recovery here also clears an outlier
-            // ejection -- see `HealthCheckEngine::spawn_for_host`'s doc for
-            // why this is one-way (active HC recovery -> un-eject, never the
-            // reverse).
+            // Hand the probe a clone of the cluster's detector, so a recovery also clears an outlier ejection.
+            // The reverse does not happen (see `HealthCheckEngine::spawn_for_host`).
             let handle = engine.spawn_for_host(
                 addr,
                 Arc::clone(&self.host_set),
@@ -384,30 +277,16 @@ impl ManagedCluster {
         }
     }
 
-    /// Run discovery and publish the result into this cluster's own
-    /// `host_set`, returning the diff against whatever it held before. This is
-    /// the one resolve path: the initial resolution in
-    /// [`ClusterManager::update_from_snapshot`] and the refresh timer
-    /// ([`run_dns_refresh`]) both end up here.
+    /// Runs discovery and publishes the result to this cluster's `host_set`, returning the diff from the
+    /// previous set. The initial resolution and the DNS refresh timer both go through here.
     ///
-    /// Two shapes have nothing to resolve, and both return an explicit no-op
-    /// rather than a resolve of zero endpoints.
+    /// An aggregate and an EDS cluster return an explicit no-op rather than resolving zero endpoints. For
+    /// EDS, `discovery::resolve` returns an empty set, so falling through would wipe the membership
+    /// delivered by [`ClusterManager::accept_eds_update`] on the next refresh.
     ///
-    /// An aggregate has no endpoints or discovery of its own.
-    ///
-    /// An EDS cluster's membership arrives through
-    /// [`ClusterManager::accept_eds_update`], and short-circuiting matters
-    /// here. A DNS refresh re-runs this; `discovery::resolve` returns an
-    /// EMPTY host set for `DiscoveryType::Eds`, so falling through would
-    /// diff the EDS-delivered membership against nothing and wipe it on the
-    /// next refresh.
-    ///
-    /// A changed host set is published; an unchanged one is not. DNS can only
-    /// change a host's address (its weight, priority and labels come from the
-    /// immutable config), so "unchanged" is exact here, and skipping the
-    /// publish keeps the live `Host`s -- their health flags, in-flight
-    /// counters and identity -- instead of replacing them every few seconds
-    /// with equal fresh ones.
+    /// A changed set is published; an unchanged one is not. DNS can only change a host's address, so
+    /// "unchanged" is exact. Skipping the publish keeps the live `Host`s and their health flags, in-flight
+    /// counters, and identity.
     async fn resolve_and_publish(&self, resolver: &dyn HostResolver) -> io::Result<HostSetDiff> {
         let config = &self.config;
         if matches!(config.kind, ClusterKind::Aggregate { .. })
@@ -480,7 +359,7 @@ fn not_found(name: &str) -> io::Error {
 /// with) and retries after the schedule's failure backoff. The first failure
 /// of a streak logs at `warn`, then only every power of two (see
 /// [`discovery::should_warn`]); the lookup that ends a streak logs the
-/// recovery once. The streak counter behind that is a field of this task's own
+/// recovery once. The streak counter behind that is a field of the task's own
 /// `schedule`, so none of the suppression state is shared and none of it is
 /// on a request path.
 async fn run_dns_refresh(
@@ -523,9 +402,7 @@ async fn run_dns_refresh(
                 let (streak, next_wait) = schedule.lookup_failed();
                 wait = next_wait;
                 let hosts = managed.host_set.load().all_hosts().len();
-                // Rust note: `tracing` levels are fixed at each call site, so
-                // choosing `warn` versus `debug` at run time takes two macro
-                // calls carrying the same fields.
+                // Rust note: `tracing` levels are fixed per call site, so choosing `warn` or `debug` at run time takes two macro calls.
                 if !discovery::should_warn(streak) {
                     tracing::debug!(
                         cluster = %name,
@@ -558,33 +435,20 @@ async fn run_dns_refresh(
     }
 }
 
-/// Owns every cluster's discovery state. `&self`-based throughout (the
-/// per-cluster map lives behind an `ArcSwap`, like `HostSet` itself) so a
-/// single manager can be shared (`Arc<ClusterManager>`) between whatever
-/// drives config reloads and whatever drives DNS refresh timers.
+/// Owns every cluster's discovery state. `&self`-based, so one manager can be shared as
+/// `Arc<ClusterManager>` between config reloads and DNS refresh timers.
 pub struct ClusterManager {
-    // Rust note: wrapped in an extra `Arc` around the `ArcSwap` (not just
-    // `ArcSwap<..>` directly) so a [`ClusterHandle`] can hold a *clone of
-    // this exact registry* rather than a snapshot of what it pointed to when
-    // the handle was built. That's what makes aggregate member resolution
-    // late-bound: `Arc::clone` here is just a refcount bump (the `ArcSwap`
-    // itself, and the `HashMap` it wraps, are never copied), and every clone
-    // still `.load()`s whatever `update_from_snapshot` most recently
-    // published. Late binding matters because `update_from_snapshot`
-    // rebuilds a config-sourced cluster whenever its own config changed
-    // (unless it is carried forward unchanged, see that
-    // method's own doc) -- a member resolved *eagerly*, at the aggregate's
-    // own construction time, would keep pointing at a specific
-    // `Arc<ManagedCluster>` that a later reload replaces, silently freezing
-    // that member's discovery even though the config for it kept updating.
+    // Rust note: the registry sits behind an extra `Arc`, so a [`ClusterHandle`] holds a clone of this exact
+    // registry rather than a snapshot. Aggregate member resolution is late-bound: a member resolved at the
+    // aggregate's construction would keep pointing at a `ManagedCluster` that a later reload replaces,
+    // silently freezing its discovery.
     clusters: Arc<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
     resolver: Arc<dyn HostResolver>,
     transport_builder: TransportSocketBuilder,
 }
 
-/// A cluster set built by [`ClusterManager::stage`] and not yet installed.
-/// Dropping it discards the built clusters (their `Drop` aborts any task they
-/// started).
+/// A cluster set built by [`ClusterManager::stage`] and not yet installed. Dropping it discards the built
+/// clusters and aborts their tasks.
 pub struct StagedClusters {
     next: HashMap<ClusterName, Arc<ManagedCluster>>,
     freshly_built: Vec<ClusterName>,
@@ -610,16 +474,12 @@ pub struct PendingRemoval {
     names: Vec<ClusterName>,
 }
 
-/// Immutable view of the cluster registry captured for one listener/HCM
-/// configuration generation. Existing downstream connections retain their
-/// generation's view while a newly published configuration serves new
-/// connections from the replacement registry.
+/// Immutable view of the registry for one listener/HCM configuration generation. Existing connections keep
+/// their generation's view, while a new configuration serves new connections from its replacement.
 #[derive(Clone)]
 pub struct ClusterRegistrySnapshot {
-    // This is intentionally a distinct, never-updated `ArcSwap`, seeded with
-    // one published registry. `ClusterHandle` still uses an `ArcSwap` for
-    // aggregate member resolution, but its members must resolve within this
-    // generation rather than against a later reload's registry.
+    // A distinct, never-updated `ArcSwap`, seeded with one published registry. Aggregate members must resolve
+    // within this generation, not against a later reload's registry.
     clusters: Arc<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
 }
 
@@ -632,102 +492,53 @@ impl ClusterManager {
         }
     }
 
-    /// Convenience constructor for callers that don't (yet) wire real
-    /// upstream TLS: installs [`transport::reject_tls_builder`], so
-    /// plaintext clusters work and a `transport_socket`-configured one fails
-    /// loudly instead of silently downgrading. Used throughout this crate's
-    /// own tests.
+    /// Convenience constructor for callers without real upstream TLS. It installs
+    /// [`transport::reject_tls_builder`], so a `transport_socket` cluster fails loudly rather than
+    /// downgrading to plaintext. Used by this crate's tests.
     pub fn with_default_transport(resolver: Arc<dyn HostResolver>) -> Self {
         Self::new(resolver, transport::reject_tls_builder())
     }
 
-    /// Capture the registry currently published by this manager for a
-    /// connection-facing configuration generation. Unlike [`Self::cluster`],
-    /// handles obtained through this view never observe a later replacement
-    /// registry; this keeps in-flight requests routed by an older HCM from
-    /// losing their selected clusters during a listener rename/reload.
+    /// Captures the currently published registry for a connection-facing configuration generation. Handles
+    /// from this view never see a later replacement, so requests routed by an older HCM keep their clusters
+    /// through a reload.
     pub fn routing_snapshot(&self) -> ClusterRegistrySnapshot {
         ClusterRegistrySnapshot {
             clusters: Arc::new(ArcSwap::from(self.clusters.load_full())),
         }
     }
 
-    /// Reconcile against a config snapshot's cluster map and kick off each
-    /// current cluster's initial resolution.
+    /// Reconciles against a config snapshot's cluster map and starts each current cluster's initial resolution.
     ///
-    /// A cluster whose config is unchanged from the
-    /// currently-published one is carried forward as the exact same
-    /// `Arc<ManagedCluster>` -- host set, health-check engine, outlier
-    /// detector, DNS refresh timer and their running task handles all survive
-    /// untouched -- rather
-    /// than being rebuilt and re-resolved. "Unchanged" is `Arc::ptr_eq` OR
-    /// `ClusterConfig`'s derived `PartialEq` (see that type's doc for why the
-    /// derive, not a hand-written `eq`, is load-bearing here). Both halves
-    /// earn their place:
-    /// - `Arc::ptr_eq` is the free short-circuit that covers the ADS path.
-    ///   `SotwSet::apply` (`proxy-xds/src/store.rs`) keeps the *old* resource
-    ///   entry when a CDS push compares a resource `unchanged`, and
-    ///   `ResourceApplier::assemble_snapshot` (`proxy-xds/src/apply.rs`)
-    ///   `Arc::clone`s it into the next snapshot -- so a CDS push that only
-    ///   changes cluster B hands this method the pointer-identical
-    ///   `Arc<ClusterConfig>` for cluster A. Statically-declared clusters are
-    ///   likewise never re-lowered across a call. This is the motivating
-    ///   scenario: a control-plane heartbeat silently
-    ///   clearing ejection state proxy-wide.
-    /// - Content equality is what additionally covers a SIGHUP file reload,
-    ///   where every `Arc` is freshly lowered from scratch and no pointer
-    ///   from the previous generation survives at all.
-    ///   Pointer equality alone is conservative in the safe direction (two
-    ///   pointer-equal `Arc`s are trivially content-equal too, since these
-    ///   `ClusterConfig`s are never mutated in place) -- content equality is
-    ///   what makes the carry-forward complete rather than just cheap.
+    /// A cluster whose config is unchanged is carried forward as the same `Arc<ManagedCluster>`: its host set,
+    /// health engine, outlier detector, refresh timer, and task handles all survive, and it is not re-resolved.
+    /// "Unchanged" means `Arc::ptr_eq` or equal `ClusterConfig` (derived `PartialEq`). Both are needed:
+    /// - `Arc::ptr_eq` covers the ADS path. When a CDS push changes only cluster B, `ResourceApplier` keeps
+    ///   cluster A's `Arc<ClusterConfig>` pointer-identical. Without carry-forward, a control-plane heartbeat
+    ///   would clear ejection state proxy-wide.
+    /// - Content equality covers a SIGHUP reload, where every `Arc` is freshly lowered and no pointer
+    ///   survives. Pointer equality alone is conservative; content equality makes carry-forward complete.
     ///
-    /// A cluster whose config DID change still goes through the full
-    /// rebuild-then-resolve path below, in `next`'s own resolve loop -- only
-    /// freshly-built clusters ever reach it now.
+    /// A changed cluster takes the full rebuild-then-resolve path in `next`'s resolve loop. A freshly built
+    /// `STRICT_DNS`/`LOGICAL_DNS` cluster starts its refresh timer right after its initial lookup (see
+    /// `start_dns_refresh`). The replaced cluster keeps its timer until its last reference drops, so a
+    /// connection that predates the reload stays fresh while it routes through the old cluster.
     ///
-    /// A freshly-built `STRICT_DNS`/`LOGICAL_DNS` cluster also gets its
-    /// refresh timer started there, right after its initial lookup (see
-    /// `start_dns_refresh`). The cluster it replaces keeps its own
-    /// timer until the last reference to it is dropped: a connection that
-    /// predates the reload can still route through the old cluster, and its
-    /// addresses should stay fresh for as long as it can.
+    /// Every freshly built cluster is resolved before the map is published. Publishing empty placeholders
+    /// first would reject traffic for every cluster, including static ones, for as long as a slow DNS lookup
+    /// took. Resolving into `next` first lets the old map serve until the new one swaps in atomically.
     ///
-    /// Every freshly-built cluster is
-    /// resolved *before* the map is published (`self.clusters.store` below),
-    /// not after. The previous ordering stored every cluster with an empty
-    /// `HostSet` first and resolved them one at a time afterward -- for the
-    /// whole span of that serial loop, EVERY cluster (including ones like
-    /// `STATIC` that need no I/O at all) was empty and rejecting traffic, and
-    /// a slow `STRICT_DNS` cluster in the same reload stretched that window
-    /// for everyone else too. Resolving into `next` first means the
-    /// previously-published map keeps serving, untouched, until the
-    /// fully-resolved replacement is ready to swap in atomically.
+    /// EDS-delivered membership on a config-sourced EDS cluster survives an unrelated reload through the same
+    /// carry-forward, since its config does not change. Its `host_set` (installed by
+    /// [`Self::accept_eds_update`]) rides along on the same `Arc`.
     ///
-    /// **EDS-delivered membership on a config-sourced EDS cluster now
-    /// survives an unrelated reload, via the same carry-forward.** Previously
-    /// this was the sharpest consequence of the missing carry-forward: a
-    /// cluster declared `discovery: eds` is an ordinary config-sourced
-    /// cluster like any other, so every reload
-    /// rebuilt it from scratch with an empty `HostSet`, and `resolve_cluster`
-    /// deliberately does not resolve an EDS-typed config cluster (there is
-    /// nothing to resolve) -- so a SIGHUP reload emptied it until the control
-    /// plane next pushed that resource. Since that config never changes on
-    /// an unrelated reload, it now takes the carry-forward branch below like
-    /// any other cluster, and its externally-delivered `host_set` (installed
-    /// by [`Self::accept_eds_update`]) rides along on the same `Arc`.
+    /// A cluster whose `lb_policy` is unimplemented (`RING_HASH`/`MAGLEV`) is rejected, not substituted
+    /// (AGENTS.md invariant 1). It is left out of the set, and its name and error are returned so the caller
+    /// can surface them as a config error.
     ///
-    /// A cluster whose `lb_policy` isn't implemented (`RING_HASH`/`MAGLEV`)
-    /// is rejected rather than silently substituted with another
-    /// policy (AGENTS.md invariant 1): it's left out of the resulting cluster set
-    /// entirely and its name+error is returned here so the caller can
-    /// surface it (e.g. as a config error) instead of it disappearing
-    /// silently.
-    ///
-    /// This builds, installs, and retires dropped clusters in one step, for
-    /// callers with no workers to publish to in between (boot, tests). A live
-    /// apply uses [`Self::stage`], [`Self::install`], and [`Self::retire`] so
-    /// that removal is two-phase.
+    /// This builds, installs, and retires in one step, for callers with no workers to publish to (boot,
+    /// tests). A live apply uses [`Self::stage`], [`Self::install`], and [`Self::retire`] so removal is
+    /// two-phase.
     pub async fn update_from_snapshot(
         &self,
         clusters: &HashMap<ClusterName, Arc<ClusterConfig>>,
@@ -737,19 +548,16 @@ impl ClusterManager {
         rejected
     }
 
-    /// Builds every cluster in `clusters` whose config differs from the live
-    /// one, without installing anything; unchanged clusters are carried
-    /// forward (see [`Self::update_from_snapshot`]). A caller that must apply
-    /// all-or-nothing (an xDS response, S8) checks
-    /// [`StagedClusters::rejected`] and drops the result to discard it: the
-    /// live registry is untouched until [`Self::install`].
+    /// Builds every cluster in `clusters` whose config differs from the live one, without installing anything.
+    /// Unchanged clusters are carried forward (see [`Self::update_from_snapshot`]). An all-or-nothing caller (an
+    /// xDS response, S8) checks [`StagedClusters::rejected`] and drops the result to discard it; the live
+    /// registry is untouched until [`Self::install`].
     pub fn stage(&self, clusters: &HashMap<ClusterName, Arc<ClusterConfig>>) -> StagedClusters {
         let previous = self.clusters.load_full();
         let mut next: HashMap<ClusterName, Arc<ManagedCluster>> =
             HashMap::with_capacity(clusters.len());
         let mut rejected = Vec::new();
-        // Freshly-built clusters only -- these are the only ones that need
-        // `resolve_cluster` in `install`. A carried-forward cluster's
+        // Only freshly built clusters need `resolve_cluster` in `install`. A carried-forward cluster's
         // `host_set` is already live and must not be touched.
         let mut freshly_built: Vec<ClusterName> = Vec::new();
         for (name, config) in clusters {
@@ -786,18 +594,13 @@ impl ClusterManager {
         }
     }
 
-    /// Resolves the staged clusters and installs them, keeping every live
-    /// cluster the new set dropped. Returns those dropped names as a
-    /// [`PendingRemoval`] for [`Self::retire`], plus the clusters `stage`
-    /// rejected (left out of the set).
+    /// Resolves the staged clusters and installs them, keeping live clusters the new set dropped. Dropped
+    /// names come back as a [`PendingRemoval`] for [`Self::retire`], along with the clusters `stage` rejected.
     ///
-    /// Removal waits because a worker builds a connection's router against
-    /// the registry as it is when that worker first serves a snapshot
-    /// version. A worker still on the previous snapshot, whose routes name a
-    /// dropped cluster, would otherwise build against a registry that lacks
-    /// it and answer 503 "unknown cluster" for the life of that connection.
-    /// New and changed clusters must be present before workers see the new
-    /// snapshot; dropped ones must stay until they have it.
+    /// Removal waits because a worker builds a connection's router against the registry as it stands when
+    /// that worker first serves a snapshot. A worker still on the previous snapshot may route to a dropped
+    /// cluster and would answer 503 "unknown cluster" for that connection's lifetime. So new and changed
+    /// clusters must be present before workers see the new snapshot, and dropped ones must stay until then.
     pub async fn install(
         &self,
         staged: StagedClusters,
@@ -807,26 +610,17 @@ impl ClusterManager {
             freshly_built,
             rejected,
         } = staged;
-        // Resolve each freshly-built cluster's own discovery into ITS OWN
-        // `host_set` -- nothing here is reachable through `self.clusters` yet
-        // (the `store` below hasn't happened), so nothing else can observe
-        // these half-resolved `ManagedCluster`s mid-loop. `resolve_cluster`
-        // runs the same `resolve_and_publish` the refresh timer does, so an
-        // EDS-typed cluster still isn't resolved here either (it would return empty, and there
-        // is no membership to carry over at construction time).
+        // Resolve each freshly built cluster into its own `host_set`. Nothing here is reachable through
+        // `self.clusters` yet, so no one can observe a half-resolved cluster. `resolve_cluster` runs the same
+        // path as the refresh timer, so an EDS-typed cluster still resolves to nothing here: there is no
+        // membership to carry over at construction.
         for name in &freshly_built {
             let managed = &next[name];
             let resolved = self.resolve_cluster(managed).await;
             if let Err(err) = &resolved {
-                // Rust note: a discovery failure doesn't take the cluster
-                // manager down -- Envoy keeps serving the last-known-good
-                // (here: empty, since this is the first resolution) host set
-                // and logs. A DNS cluster keeps retrying on its refresh
-                // timer, started just below, so the cluster fills in on the
-                // first lookup that succeeds. Crucially, this is scoped
-                // to the ONE cluster that failed -- every other entry in
-                // `next` already resolved (or failed) independently above,
-                // so one bad DNS answer never blocks or fails the reload.
+                // Rust note: a discovery failure does not take the manager down. Envoy keeps serving the
+                // last-known-good set (here, empty, since this is the first resolution) and logs. A DNS cluster
+                // retries on its refresh timer, and the failure is scoped to this one cluster.
                 tracing::warn!(
                     cluster = %name,
                     error = %err,
@@ -839,9 +633,8 @@ impl ClusterManager {
         let previous = self.clusters.load_full();
         let mut dropped = Vec::new();
         for (name, managed) in previous.iter() {
-            // A live cluster whose new definition was rejected is retired the
-            // same way: it is not part of the new set, but workers on the
-            // previous snapshot still route to it.
+            // A live cluster whose new definition was rejected is retired the same way: it is not in the new
+            // set, but workers on the previous snapshot still route to it.
             if !next.contains_key(name) {
                 next.insert(name.clone(), Arc::clone(managed));
                 dropped.push(name.clone());
@@ -851,10 +644,9 @@ impl ClusterManager {
         (PendingRemoval { names: dropped }, rejected)
     }
 
-    /// Removes the clusters an earlier [`Self::install`] kept for workers on
-    /// the previous snapshot. Call only after the new snapshot is published.
-    /// Connections built before this keep their own registry view, so a
-    /// retired cluster lives on until they close.
+    /// Removes the clusters an earlier [`Self::install`] kept for workers on the previous snapshot. Call only
+    /// after the new snapshot is published. Connections built earlier keep their own registry view, so a
+    /// retired cluster lives until they close.
     pub fn retire(&self, pending: PendingRemoval) {
         if pending.names.is_empty() {
             return;
@@ -866,22 +658,14 @@ impl ClusterManager {
         self.clusters.store(Arc::new(next));
     }
 
-    /// Start the timer that re-resolves `managed`'s hostnames, if it has any:
-    /// a `STRICT_DNS` or `LOGICAL_DNS` cluster gets one, every other kind
-    /// (STATIC, EDS, aggregate) none. Without it a DNS cluster would keep the
-    /// addresses from its first lookup for the life of the process, and one
-    /// whose first lookup failed would stay empty.
+    /// Starts the timer that re-resolves `managed`'s hostnames. Only `STRICT_DNS` and `LOGICAL_DNS` clusters get
+    /// one. Without it, a DNS cluster would keep its first lookup's addresses forever, and one whose first
+    /// lookup failed would stay empty.
     ///
-    /// `initial_lookup_succeeded` is how the lookup that just ran in
-    /// [`Self::update_from_snapshot`] went; it decides the first wait (the
-    /// refresh rate, or the first failure backoff).
+    /// `initial_lookup_succeeded` decides the first wait: the refresh rate, or the first failure backoff.
     ///
-    /// The task is spawned on the runtime this runs on, which is the control
-    /// runtime: `update_from_snapshot` is called only by control-side code
-    /// (boot, the SIGHUP reload, the ADS apply path in `proxy/src/main.rs`),
-    /// never from a worker. Like the health-check probes and the outlier
-    /// sweep, a cluster with a refresh timer can only be built inside a
-    /// Tokio runtime.
+    /// The task runs on the control runtime, since `update_from_snapshot` is only called from control-side
+    /// code, never from a worker. Like the probes and the outlier sweep, it needs a Tokio runtime.
     fn start_dns_refresh(&self, managed: &Arc<ManagedCluster>, initial_lookup_succeeded: bool) {
         let Some(refresh) = managed.config.discovery.dns_refresh() else {
             return;
@@ -892,11 +676,8 @@ impl ClusterManager {
         } else {
             schedule.lookup_failed().1
         };
-        // Rust note: the task gets a `Weak`, not a clone of the `Arc`. The
-        // `ManagedCluster` owns this task's `JoinHandle`, so a task that also
-        // owned the cluster would be a reference cycle: the cluster's
-        // refcount could never reach zero, `Drop` would never run, and the
-        // timer would outlive every reload that replaced its cluster.
+        // Rust note: the task holds a `Weak`, not an `Arc`. The cluster owns this task's `JoinHandle`, so a
+        // strong reference would form a cycle: `Drop` would never run and the timer would outlive every reload.
         let task = tokio::spawn(run_dns_refresh(
             Arc::downgrade(managed),
             Arc::clone(&self.resolver),
@@ -908,8 +689,8 @@ impl ClusterManager {
         }
     }
 
-    /// Apply an externally-supplied endpoint set to an EDS-registered
-    /// cluster, publishing a new host set and marking it initialized.
+    /// Applies an externally supplied endpoint set to an EDS cluster, publishing a new host set and marking it
+    /// initialized.
     pub fn accept_eds_update(
         &self,
         name: &str,
@@ -921,16 +702,13 @@ impl ClusterManager {
             .get(name)
             .cloned()
             .ok_or_else(|| not_found(name))?;
-        // Rust note: `static_hosts` just turns literal-IP `EndpointIR`s into
-        // `Host`s -- no I/O either way, whether they came from a STATIC
-        // cluster's config or an externally-pushed EDS response.
+        // Rust note: `static_hosts` turns literal-IP `EndpointIR`s into `Host`s. It does no I/O, whatever the source.
         let hosts = discovery::static_hosts(endpoints)?;
         let new_set = HostSet::from_hosts(hosts);
         let old_set = managed.host_set.load();
         let diff = diff_host_sets(&old_set, &new_set);
-        // Carry `health_flags` over for every address
-        // still present, or an active-check flip would be silently erased
-        // by the next EDS push -- see `host_set::carry_over_health_flags`.
+        // Carry `health_flags` over for every address still present. Otherwise the next EDS push would erase an
+        // active-check result. See `host_set::carry_over_health_flags`.
         let new_set = carry_over_health_flags(&old_set, new_set, &diff);
         drop(old_set);
         managed.host_set.store(Arc::new(new_set));
@@ -939,34 +717,27 @@ impl ClusterManager {
         Ok(diff)
     }
 
-    /// Run discovery for `managed` with this manager's resolver and publish
-    /// the result into ITS OWN `host_set`, returning the diff against
-    /// whatever it held before. Does not touch `self.clusters` at all: it
-    /// serves [`Self::update_from_snapshot`], which resolves a cluster that
-    /// hasn't been published yet.
+    /// Runs discovery for `managed` and publishes into its own `host_set`, returning the diff. Does not touch
+    /// `self.clusters`: it serves [`Self::update_from_snapshot`], which resolves clusters not yet published.
     async fn resolve_cluster(&self, managed: &ManagedCluster) -> io::Result<HostSetDiff> {
         managed.resolve_and_publish(self.resolver.as_ref()).await
     }
 
-    /// The router-facing handle for a cluster, or `None` if no cluster with
-    /// that name is currently known.
+    /// The router-facing handle for a cluster, or `None` if no cluster with that name is known.
     pub fn cluster(&self, name: &str) -> Option<Arc<dyn ClusterEntry>> {
         self.clusters.load().get(name).cloned().map(|managed| {
             Arc::new(ClusterHandle {
                 managed,
-                // Rust note: cloning the `Arc<ArcSwap<..>>` itself (not the
-                // map it currently points at) -- see `ClusterManager::clusters`'s
-                // doc for why this is what makes aggregate member lookups
-                // late-bound.
+                // Rust note: clone the `Arc<ArcSwap<..>>` itself, not the map it points at. That keeps aggregate
+                // member lookups late-bound (see `ClusterManager::clusters`).
                 registry: Arc::clone(&self.clusters),
             }) as Arc<dyn ClusterEntry>
         })
     }
 
-    /// Whether the currently published cluster `name` has a host at `addr`.
-    /// `false` for an unknown cluster. Reads the live registry, not a
-    /// generation snapshot, so the upstream pool sees DNS and EDS membership
-    /// changes and drains connections to removed endpoints as Envoy does.
+    /// Whether the currently published cluster `name` has a host at `addr`. `false` for an unknown cluster.
+    /// Reads the live registry, not a generation snapshot, so the upstream pool sees membership changes and
+    /// drains removed endpoints.
     pub fn has_host(&self, name: &str, addr: SocketAddr) -> bool {
         self.clusters
             .load()
@@ -974,9 +745,8 @@ impl ClusterManager {
             .is_some_and(|managed| managed.host_set.load().contains_address(addr))
     }
 
-    /// Whether a cluster's first resolution/EDS update has landed (or it was
-    /// force-initialized, see [`Self::force_initialize`]). `false` for an
-    /// unknown cluster name.
+    /// Whether a cluster's first resolution or EDS update has landed, or it was force-initialized. `false`
+    /// for an unknown name.
     pub fn is_initialized(&self, name: &str) -> bool {
         self.clusters
             .load()
@@ -985,21 +755,16 @@ impl ClusterManager {
             .unwrap_or(false)
     }
 
-    /// Envoy's `initial_fetch_timeout` "proceed empty" escape hatch: mark a
-    /// cluster initialized even though it never resolved, so downstream
-    /// warming doesn't wait on it forever. A no-op for an unknown
-    /// cluster name.
+    /// Envoy's `initial_fetch_timeout` "proceed empty" escape hatch: marks a cluster initialized even though it
+    /// never resolved, so warming does not wait on it forever. No-op for an unknown name.
     pub fn force_initialize(&self, name: &str) {
         if let Some(managed) = self.clusters.load().get(name) {
             managed.initialized.store(true, Ordering::Release);
         }
     }
 
-    /// The names of every currently-registered cluster still waiting on its
-    /// first resolution/EDS update -- built on [`Self::is_initialized`], not
-    /// a second copy of its logic. This is what gives
-    /// `is_initialized` a production caller -- `/ready` gates on whether this
-    /// is empty (see `proxy-admin`'s `ReadinessProbe` and `proxy/src/main.rs`).
+    /// Names of every registered cluster still waiting on its first resolution or EDS update, built on
+    /// [`Self::is_initialized`]. `/ready` gates on whether this is empty (see `proxy-admin`'s `ReadinessProbe`).
     pub fn warming_clusters(&self) -> Vec<ClusterName> {
         self.clusters
             .load()
@@ -1009,13 +774,10 @@ impl ClusterManager {
             .collect()
     }
 
-    /// Snapshot the runtime host sets whose cluster configuration matches the
-    /// supplied config snapshot. A reload installs a replacement manager map
-    /// before it publishes the matching `ConfigSnapshot`; filtering by the
-    /// exact/equal config prevents an admin reader holding the old snapshot
-    /// from accidentally reporting endpoints from that next, unpublished
-    /// configuration. The returned endpoint lists are copies, so callers
-    /// cannot retain a `ManagedCluster` or mutate a live host set.
+    /// Snapshots the runtime host sets whose cluster config matches `config`. A reload installs its
+    /// replacement map before publishing the matching `ConfigSnapshot`. Filtering on an exact config match
+    /// keeps an admin reader on the old snapshot from reporting endpoints from that unpublished configuration.
+    /// The returned lists are copies.
     pub fn live_clusters_for(
         &self,
         configs: &HashMap<ClusterName, Arc<ClusterConfig>>,
@@ -1147,10 +909,8 @@ impl ClusterHandle {
                 );
                 continue;
             }
-            // Tenant mode (ADR-0007): a member is eligible only when it
-            // carries a tenant credential slot for a provider the tenant
-            // holds. Checked before the host pick so an ineligible member is
-            // never dialled and the next member is tried instead.
+            // Tenant mode (ADR-0007): a member is eligible only if it holds a tenant credential slot for a
+            // provider the tenant has. Checked before the host pick, so an ineligible member is never dialled.
             if let Some(providers) = &ctx.credential_providers {
                 let eligible = member
                     .config
@@ -1195,25 +955,16 @@ impl ClusterEntry for ClusterHandle {
     }
 
     fn http_pool(&self, host: &Arc<Host>, _proto: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
-        // v1 is connect-per-stream: `ConnectPool` just opens a fresh TCP
-        // connection per request and hands it to the cluster's transport
-        // socket (plaintext passthrough, or a TLS handshake). The resulting
-        // byte stream is protocol-agnostic -- the router applies h1 or h2c on
-        // top by picking the upstream codec -- so `_proto` doesn't change the
-        // pool today. Real h2 multiplexing pools are a follow-up.
+        // Connect-per-stream: `ConnectPool` opens a fresh TCP connection per request and hands it to the
+        // cluster's transport socket. The byte stream is protocol-agnostic (the router picks h1 or h2c on top),
+        // so `_proto` does not change the pool today. Real h2 multiplexing pools are a follow-up.
         let server_name = host
             .hostname
             .clone()
             .unwrap_or_else(|| host.address.ip().to_string());
-        // Rust note: this slice enforces the DEFAULT-priority connection
-        // budget only. `RoutingPriority::High` is a rare path and the router
-        // doesn't thread priority into `http_pool` today, so a HIGH-priority
-        // route's dials are still counted against `default_cb` here; wiring
-        // per-priority connection budgets through is a follow-up, not this
-        // slice. `.clone()` shares the same gauge (`CircuitBreakerState`'s
-        // `Arc`-backed handles) across every per-call `ConnectPool` this
-        // method builds for the cluster, so the count stays global per
-        // cluster as intended.
+        // Rust note: this slice enforces only the DEFAULT-priority connection budget. The router does not thread
+        // priority into `http_pool`, so HIGH-priority dials count against `default_cb`. `.clone()` shares the same
+        // gauge (its handles are `Arc`-backed) across every per-call `ConnectPool`, so the count stays global per cluster.
         Arc::new(crate::pool::ConnectPool::new(
             host.address,
             Arc::clone(&self.managed.transport),
@@ -1235,11 +986,9 @@ impl ClusterEntry for ClusterHandle {
     }
 
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation] {
-        // An aggregate's own `request_headers_to_add` is never read here: the
-        // router calls this on the *member's* entry
-        // (`HostSelection::member`), not the aggregate's. AGENTS.md invariant 6 --
-        // anything per-provider belongs on the cluster that is actually
-        // dialled -- is the reason that matters.
+        // An aggregate's own `request_headers_to_add` is never read: the router calls this on the member's entry
+        // (`HostSelection::member`). AGENTS.md invariant 6 is why: anything per-provider belongs on the cluster
+        // actually dialled.
         &self.managed.config.request_headers_to_add
     }
 
@@ -1256,11 +1005,8 @@ impl ClusterEntry for ClusterHandle {
     }
 
     fn report_outlier_result(&self, addr: SocketAddr, result: RequestResult) {
-        // No-op unless this cluster configures outlier detection. For an
-        // aggregate the router calls this on the *member's* entry (the one
-        // that owns the dialed host), never the aggregate's own, so this
-        // reaches the member's detector -- the same routing `request_headers_to_add`
-        // above relies on.
+        // No-op unless this cluster configures outlier detection. For an aggregate, the router calls this on the
+        // member's entry (the one owning the dialled host), which is why it reaches the member's detector.
         if let Some(detector) = &self.managed.outlier_detector {
             detector.report_result(addr, result);
         }
@@ -1305,19 +1051,15 @@ mod tests {
         })
     }
 
-    /// Re-resolve the published cluster `name` through the production path
-    /// (`ManagedCluster::resolve_and_publish`, which the refresh timer also
-    /// uses), without waiting for the timer.
+    /// Re-resolves the published cluster `name` through the production path
+    /// (`ManagedCluster::resolve_and_publish`, which the refresh timer also uses), without waiting for the timer.
     async fn resolve_now(manager: &ClusterManager, name: &str) -> io::Result<HostSetDiff> {
         let managed = manager.clusters.load().get(name).cloned().unwrap();
         managed.resolve_and_publish(manager.resolver.as_ref()).await
     }
 
-    /// Same shape as `cluster_config`, plus a caller-supplied
-    /// `connect_timeout`. Tests use this to build a
-    /// second config that's a genuine, if inconsequential, content change
-    /// from the first (`ClusterConfig` has no `Clone`, only `PartialEq`, so
-    /// this is a second constructor rather than a `..base` update).
+    /// Like `cluster_config`, plus a `connect_timeout`. A real but inconsequential content change, for reload
+    /// tests. `ClusterConfig` has no `Clone`, so this is a second constructor.
     fn cluster_config_with_connect_timeout(
         name: &str,
         discovery: DiscoveryType,
@@ -1345,10 +1087,8 @@ mod tests {
         })
     }
 
-    /// A config-sourced EDS cluster (`discovery: eds`): membership arrives
-    /// via [`ClusterManager::accept_eds_update`], never
-    /// `endpoints`/`discovery` resolution. Tests the paragraph in
-    /// `update_from_snapshot`'s own doc about this shape surviving a reload.
+    /// A config-sourced EDS cluster (`discovery: eds`): membership arrives via
+    /// [`ClusterManager::accept_eds_update`]. Tests the EDS carry-forward described in `update_from_snapshot`.
     fn cluster_config_eds(name: &str) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
             eds: Some(proxy_config::ir::EdsClusterConfig {
@@ -1373,10 +1113,9 @@ mod tests {
         })
     }
 
-    /// A STATIC cluster carrying an outlier-detection config that ejects on
-    /// `consecutive_5xx` consecutive 5xx, enforced 100%, with a 100% ejection
-    /// cap so a single-host cluster can eject its only host (the default 10%
-    /// rounds down to zero for one host).
+    /// A STATIC cluster whose outlier detection ejects after `consecutive_5xx` 5xx responses. Enforcement is
+    /// 100% and the ejection cap is 100%, so a single-host cluster can eject its only host (the default 10%
+    /// rounds to zero for one host).
     fn cluster_config_with_outlier(
         name: &str,
         endpoints: Vec<EndpointIR>,
@@ -1410,10 +1149,8 @@ mod tests {
         })
     }
 
-    /// An aggregate cluster over `members`, in the given order.
-    /// `endpoints`/`discovery` are unused for an
-    /// aggregate (see `ClusterKind::Aggregate`'s doc) but still need
-    /// *something* syntactically valid to satisfy `ClusterConfig`'s shape.
+    /// An aggregate cluster over `members`, in the given order. `endpoints` and `discovery` are unused for an
+    /// aggregate (see `ClusterKind::Aggregate`), but `ClusterConfig` still needs valid values.
     fn aggregate_config(name: &str, members: &[&str]) -> Arc<ClusterConfig> {
         Arc::new(ClusterConfig {
             // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
@@ -1451,10 +1188,8 @@ mod tests {
 
     // --------------------------------------------- active health checks --
 
-    /// Same shape as `cluster_config` above, plus a `health_check` -- kept
-    /// separate rather than adding a parameter to `cluster_config` so the
-    /// many call sites above that don't care about health checking stay
-    /// untouched.
+    /// Like `cluster_config`, plus a `health_check`. Kept separate so the call sites that ignore health checks
+    /// stay untouched.
     fn cluster_config_with_health_check(
         name: &str,
         discovery: DiscoveryType,
@@ -1483,11 +1218,9 @@ mod tests {
         })
     }
 
-    /// A bare-TCP-connect health check (empty `send`/`expect`, see
-    /// `HealthCheckKindIR::Tcp`'s own doc) with the given thresholds/interval
-    /// and a generous fixed timeout -- these tests care about threshold and
-    /// scheduling behavior, not timeout edge cases (`health_check.rs`'s own
-    /// test module already covers those).
+    /// A bare TCP-connect health check (empty `send`/`expect`; see `HealthCheckKindIR::Tcp`) with the given
+    /// thresholds and interval, plus a generous timeout. These tests care about threshold and scheduling, not
+    /// timeout edges.
     fn tcp_health_check(
         unhealthy_threshold: u32,
         healthy_threshold: u32,
@@ -1507,12 +1240,8 @@ mod tests {
         }
     }
 
-    /// A cluster carrying BOTH a health check and outlier detection:
-    /// `uneject_on_healthy_active_hc` is the
-    /// one field the two tests below vary. `consecutive_5xx: 2`,
-    /// `enforcing_consecutive_5xx: 100`, `max_ejection_percent: 100` mirror
-    /// `cluster_config_with_outlier` -- enforced deterministically, and able
-    /// to eject a single-host cluster's only host.
+    /// A cluster with both a health check and outlier detection. `uneject_on_healthy_active_hc` is the one
+    /// field the tests vary. The outlier settings mirror `cluster_config_with_outlier`.
     fn cluster_config_with_health_check_and_outlier(
         name: &str,
         endpoints: Vec<EndpointIR>,
@@ -1548,10 +1277,8 @@ mod tests {
         })
     }
 
-    /// Spawns a task that accepts connections forever and counts each one --
-    /// the observable signal these tests use to prove a probe loop is (or
-    /// isn't) still running, since a `JoinHandle` living or dying isn't
-    /// otherwise visible from outside `manager.rs`.
+    /// Accepts connections forever and counts them. This is the observable signal that a probe loop is still
+    /// running, since a `JoinHandle`'s fate is not visible from outside `manager.rs`.
     fn spawn_counting_acceptor(listener: TcpListener, hits: Arc<AtomicUsize>) {
         tokio::spawn(async move {
             loop {
@@ -1562,10 +1289,8 @@ mod tests {
         });
     }
 
-    /// Poll `cond` on real wall-clock time until it's true or `deadline`
-    /// elapses -- same rationale as `health_check`'s own `wait_until`: these
-    /// tests assert on genuine TCP connect/accept timing, which races
-    /// unpredictably against a paused clock's auto-advance.
+    /// Polls `cond` on real wall-clock time until it holds or `deadline` elapses. These tests assert on real TCP
+    /// timing, which races a paused clock's auto-advance.
     async fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) {
         let start = std::time::Instant::now();
         while !cond() {
@@ -1615,11 +1340,9 @@ mod tests {
         assert!(manager.cluster("svc").is_none());
     }
 
-    /// Two-phase removal (make-before-break, review M5). Between `install`
-    /// and `retire` a worker still serving the previous snapshot builds its
-    /// router from `routing_snapshot`; the cluster the new set dropped must
-    /// still be there, or that connection answers 503 "unknown cluster" for
-    /// its whole life. The new cluster must already be there too.
+    /// Two-phase removal (make-before-break). Between `install` and `retire`, a worker on the previous snapshot
+    /// builds its router from `routing_snapshot`, so the dropped cluster must still be there, or that
+    /// connection answers 503 for its whole life. The new cluster must be there too.
     #[tokio::test]
     async fn a_dropped_cluster_stays_routable_until_it_is_retired() {
         let resolver = Arc::new(FakeResolver::new());
@@ -1865,9 +1588,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..4 {
             let sel = entry.select_host(&ctx).unwrap();
-            // A non-aggregate cluster's pick never carries a `member` --
-            // the entry the caller already holds is the owner, so there's
-            // nothing further to resolve.
+            // A non-aggregate pick never carries a `member`: the caller's entry is the owner.
             assert!(sel.member.is_none());
             seen.insert(sel.host.address);
         }
@@ -1959,8 +1680,7 @@ mod tests {
         endpoints: Vec<EndpointIR>,
         provider: Option<&str>,
     ) -> Arc<ClusterConfig> {
-        // Rust note: `ClusterConfig` is not `Clone`, but this `Arc` is the only
-        // owner, so `try_unwrap` hands back the value to mutate.
+        // Rust note: `ClusterConfig` is not `Clone`, but this `Arc` has one owner, so `try_unwrap` returns the value to mutate.
         let mut config = Arc::try_unwrap(cluster_config(name, DiscoveryType::Static, endpoints))
             .unwrap_or_else(|_| unreachable!("fresh Arc has one owner"));
         config.provider_runtime =
@@ -2045,9 +1765,8 @@ mod tests {
         );
         manager.update_from_snapshot(&snapshot).await;
 
-        // The SAME `entry`, obtained before the reload, must still see the
-        // new address -- proving member resolution isn't pinned to whatever
-        // `ManagedCluster` existed when the aggregate's handle was built.
+        // The SAME `entry`, obtained before the reload, must see the new address: member resolution is not
+        // pinned to the `ManagedCluster` that existed when the handle was built.
         let ctx = LoadBalancerContext::default();
         let sel = entry.select_host(&ctx).expect("aggregate should serve b");
         assert_eq!(
@@ -2107,10 +1826,9 @@ mod tests {
 
     // --------------------------------------------- active health checks --
 
-    /// An active health check must actually run: two static hosts -- one a live
-    /// listener, one a bound-then-dropped port so nothing answers -- with `unhealthy_threshold: 1`
-    /// and a short interval; `all_healthy_hosts()` must converge to exactly
-    /// the live host.
+    /// An active health check must actually run. Two static hosts: one a live listener, one a bound-then-dropped
+    /// port. With `unhealthy_threshold: 1` and a short interval, `all_healthy_hosts()` must converge to the live
+    /// host alone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn health_check_converges_to_only_the_live_host() {
         let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2157,13 +1875,9 @@ mod tests {
         .await;
     }
 
-    /// `discovery::resolve` builds
-    /// every `Host` fresh with `HealthFlags::default()`, so a naive
-    /// `host_set.store(new_set)` on refresh would silently re-mark an
-    /// already-unhealthy host healthy on every DNS cycle. Flip a host
-    /// unhealthy directly (simulating an active-check failure that already
-    /// landed), re-run discovery against an unchanged DNS record set, and
-    /// confirm the flag survives.
+    /// `discovery::resolve` builds every `Host` fresh with `HealthFlags::default()`, so a naive `host_set.store`
+    /// on refresh would re-mark an unhealthy host healthy every DNS cycle. Flip a host unhealthy directly,
+    /// re-run discovery on an unchanged record set, and confirm the flag survives.
     #[tokio::test]
     async fn resolve_carries_over_health_flags_for_unchanged_hosts() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2215,11 +1929,9 @@ mod tests {
         );
     }
 
-    /// A removed host's probe must stop: flip `host-doomed`'s DNS record to
-    /// empty and re-resolve the *same* cluster (the same `ManagedCluster`, not a
-    /// config reload) -- `reconcile_probes`'s `removed` path must abort its
-    /// task, not just drop the map entry (a bare drop doesn't abort the
-    /// underlying tokio task -- see `ManagedCluster`'s `Drop` impl doc).
+    /// A removed host's probe must stop. Empty `host-doomed`'s DNS record and re-resolve the same
+    /// `ManagedCluster`. `reconcile_probes`'s `removed` path must abort the task, not just drop the map entry
+    /// (see `ManagedCluster`'s `Drop` impl).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_removed_hosts_probe_stops() {
         let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2272,16 +1984,11 @@ mod tests {
         .await;
     }
 
-    /// A config reload must not leak the previous generation's probes.
-    /// `update_from_snapshot` rebuilds a config-sourced `ManagedCluster`
-    /// whenever its config actually changed -- reload a single-host config
-    /// several times, each with a genuinely different `interval`. Reloading the SAME config
-    /// would now hit the carry-forward, which skips the rebuild entirely and no probe is ever
-    /// aborted -- it would pass without exercising the `Drop` path it exists
-    /// to prove), and confirm the hit rate against that host's listener stays
-    /// at roughly one generation's worth, rather than scaling with the number
-    /// of reloads (which is exactly what a dropped-but-not-aborted
-    /// `JoinHandle` per reload would produce).
+    /// A config reload must not leak the previous generation's probes. `update_from_snapshot` rebuilds a
+    /// config-sourced cluster only when its config changes, so reload a single-host config several times, each
+    /// with a different `interval` (a same-config reload hits carry-forward and aborts nothing). The hit rate
+    /// against that host's listener must stay near one generation's worth, not scale with reloads, which is
+    /// what a dropped-but-not-aborted `JoinHandle` per reload would produce.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_config_reload_does_not_leak_the_previous_generations_probes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2311,9 +2018,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let baseline = hits.load(Ordering::SeqCst) - baseline_start;
 
-        // Each reload's `interval` differs from the last, so
-        // `ClusterConfig`'s content equality never carry-forwards this
-        // cluster -- every one of these four calls really rebuilds it.
+        // Each reload's `interval` differs, so content equality never carry-forwards this cluster.
         for i in 0..4u64 {
             manager.update_from_snapshot(&reload_config(15 + i)).await;
         }
@@ -2453,23 +2158,14 @@ mod tests {
 
     // ---------------------------- active-HC clears outlier --
 
-    /// Active-HC recovery must clear an outlier ejection: a host outlier-ejected via
-    /// `report_outlier_result` must be un-ejected once a REAL active health
-    /// check against it passes -- not just have `failed_active_hc` flip, but
-    /// the whole host must rejoin `all_healthy_hosts()`.
+    /// Active-HC recovery must clear an outlier ejection. A host ejected via `report_outlier_result` must rejoin
+    /// `all_healthy_hosts()` once a real active health check passes, not just flip `failed_active_hc`.
     ///
-    /// The address starts with nothing listening (bind, then drop -- the
-    /// same "dead, then stood up later" shape `health_check.rs`'s own
-    /// `a_transition_publishes_a_host_set_the_picker_then_observes` uses),
-    /// so the probe's first check fails and its `ConsecutiveTracker` (see
-    /// `health_check.rs`) actually crosses into `Unhealthy` -- that edge is
-    /// what makes the *later* recovery a real `Some(Healthy)` transition,
-    /// which is the only thing `HealthCheckEngine::run_host_loop` calls
-    /// `on_active_health_check_pass` on. `report_outlier_result` then ejects
-    /// the same host independently through the outlier path, so it carries
-    /// both flags (`failed_active_hc` from the real failing probe,
-    /// `failed_outlier_check` from the manual report) before a real listener
-    /// stands up and both must clear.
+    /// The address starts with nothing listening, so the probe's first check fails and its `ConsecutiveTracker`
+    /// reaches `Unhealthy`. That edge makes the later recovery a real `Some(Healthy)` transition, the only one
+    /// `HealthCheckEngine::run_host_loop` reports to `on_active_health_check_pass`. The host then carries both
+    /// flags, `failed_active_hc` from the real probe and `failed_outlier_check` from the manual report, and both
+    /// must clear once a listener stands up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn active_health_check_recovery_also_clears_an_outlier_ejection() {
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2506,9 +2202,7 @@ mod tests {
                 .health_flags
         };
 
-        // The real probe crosses `unhealthy_threshold: 1` against the dead
-        // address -- confirms the edge this test depends on actually fires
-        // before layering the outlier ejection on top.
+        // The probe crosses `unhealthy_threshold: 1` against the dead address before the outlier ejection is layered on.
         wait_until(Duration::from_secs(5), || flags().failed_active_hc).await;
 
         // Eject via the outlier path too, independent of the active check.
@@ -2543,11 +2237,8 @@ mod tests {
         .await;
     }
 
-    /// The negative half of the same acceptance test: with
-    /// `uneject_on_healthy_active_hc: false`, the identical recovery must
-    /// flip `failed_active_hc` back to `false` (the active-HC engine itself
-    /// doesn't know or care about outlier state) but must NOT touch
-    /// `failed_outlier_check` -- the host stays out of `all_healthy_hosts()`.
+    /// The negative half: with `uneject_on_healthy_active_hc: false`, the same recovery flips `failed_active_hc`
+    /// back but must NOT clear `failed_outlier_check`. The host stays out of `all_healthy_hosts()`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn uneject_on_healthy_active_hc_false_leaves_the_outlier_ejection_in_place() {
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2601,10 +2292,8 @@ mod tests {
         // config -- the two subsystems are independent.
         wait_until(Duration::from_secs(5), || !flags().failed_active_hc).await;
 
-        // But the outlier ejection must survive: give the (now-passing)
-        // probe several more ticks so a wiring bug that ignores the config
-        // flag has ample opportunity to un-eject anyway, then assert it
-        // didn't.
+        // Give the now-passing probe several more ticks, so a wiring bug that ignores the flag has room to
+        // un-eject, then assert it did not.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             flags().failed_outlier_check,
@@ -2627,15 +2316,11 @@ mod tests {
 
     // -------------------------------------------- reload ordering --------
 
-    /// The bug: the old `update_from_snapshot` stored every rebuilt cluster
-    /// with an EMPTY `HostSet` first and resolved them one at a time
-    /// afterward, serially. A `STRICT_DNS` cluster slow to resolve therefore
-    /// left every OTHER cluster in the same reload -- including a `STATIC`
-    /// one that needs no I/O at all -- serving empty for the whole span of
-    /// that loop. `#[tokio::test(flavor = "multi_thread")]` is required, not
-    /// `current_thread`: a single-threaded runtime can't run the spawned
-    /// reload and this test's sampling loop concurrently, so it would never
-    /// actually observe the mid-resolution window (AGENTS.md "Build And Test").
+    /// Regression test for reload ordering. The old `update_from_snapshot` stored every rebuilt cluster with an
+    /// EMPTY `HostSet` and resolved them serially afterward. A slow `STRICT_DNS` cluster then left every other
+    /// cluster in the reload, even a `STATIC` one, empty for the whole loop. This needs `multi_thread`: a
+    /// `current_thread` runtime cannot run the reload and the sampling loop concurrently, so it would never see
+    /// the mid-resolution window (AGENTS.md "Build And Test").
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_slow_dns_cluster_does_not_empty_other_clusters_mid_reload() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2672,24 +2357,15 @@ mod tests {
         // reload open for the whole sampling window below.
         resolver.set_delay("svc.internal", Duration::from_millis(300));
 
-        // Reloading the identical `snapshot` map (as this
-        // test used to) now carries BOTH clusters forward by content
-        // equality, so `dns-svc` is never rebuilt or resolved and the
-        // reload returns near-instantly -- defeating the whole point of this
-        // test. Give `dns-svc` a real, if inconsequential, config change (a
-        // different `connect_timeout`) so it still takes the rebuild path
-        // and its slow resolution genuinely holds the reload open;
-        // `static-svc`'s `Arc<ClusterConfig>` is untouched, so it is exactly
-        // the carried-forward cluster this sampling loop is asserting stays
-        // populated throughout.
+        // Reloading the identical map would carry BOTH clusters forward by content equality, so `dns-svc` would
+        // never resolve and the reload would return at once. Give `dns-svc` a real but inconsequential change (a
+        // different `connect_timeout`) so its slow resolution holds the reload open. `static-svc`'s
+        // `Arc<ClusterConfig>` is untouched, so it is the carried-forward cluster this loop asserts on.
         let mut snapshot_for_reload = snapshot.clone();
         snapshot_for_reload.insert(
             "dns-svc".to_string(),
             Arc::new(ClusterConfig {
-                // Same shape as `cluster_config`'s literal, but a genuinely
-                // different `connect_timeout` -- `ClusterConfig` has no
-                // `Clone` (only `PartialEq`), so this is
-                // written out rather than `..base.clone()`.
+                // Same shape as `cluster_config`, with a different `connect_timeout`. `ClusterConfig` has no `Clone`.
                 eds: None,
                 name: "dns-svc".to_string(),
                 discovery: DiscoveryType::StrictDns(DnsRefresh::ENVOY_DEFAULT),
@@ -2717,10 +2393,8 @@ mod tests {
                 .await;
         });
 
-        // Sample static-svc's host set repeatedly while the reload is still
-        // in flight. On the buggy sequencing this window goes empty the
-        // instant `update_from_snapshot` stores its freshly-built (all-empty)
-        // map, well before the slow DNS cluster finishes resolving.
+        // Sample static-svc's host set while the reload is in flight. The buggy ordering empties it as soon as the
+        // all-empty map is stored, well before the slow DNS lookup finishes.
         let ctx = LoadBalancerContext::default();
         let mut samples = 0;
         while !reload.is_finished() {
@@ -2745,14 +2419,10 @@ mod tests {
 
     // -------------------------------------------- carry-forward --------
 
-    /// The ADS path: `SotwSet::apply` (`proxy-xds/src/store.rs`) keeps the
-    /// OLD resource `Arc` for anything a CDS push compares `unchanged`, and
-    /// `ResourceApplier::assemble_snapshot` (`proxy-xds/src/apply.rs`)
-    /// `Arc::clone`s it into the next snapshot -- so this method sees the
-    /// exact same `Arc<ClusterConfig>` pointer again for a cluster nothing
-    /// changed. Proves the cheap `Arc::ptr_eq` half of the carry-forward
-    /// condition: reload with the SAME `Arc`, and the published
-    /// `Arc<ManagedCluster>` must be the same one too.
+    /// The ADS path: `SotwSet::apply` (`proxy-xds/src/store.rs`) keeps the old resource `Arc` for an unchanged CDS
+    /// entry, and `ResourceApplier::assemble_snapshot` (`proxy-xds/src/apply.rs`) clones it into the next snapshot.
+    /// So this method sees the same `Arc<ClusterConfig>` pointer. Covers the cheap `Arc::ptr_eq` half of the
+    /// carry-forward condition.
     #[tokio::test]
     async fn pointer_equal_config_is_carried_forward() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2778,12 +2448,8 @@ mod tests {
         );
     }
 
-    /// The SIGHUP path: every `Arc<ClusterConfig>` is freshly lowered from
-    /// bytes on disk, so no pointer from the previous generation survives at
-    /// all -- content equality is the only signal available. Built via the
-    /// same `cluster_config` helper twice, deliberately, to prove this is
-    /// content equality doing the work, not `Arc::ptr_eq` (test above) by
-    /// accident.
+    /// The SIGHUP path: every `Arc<ClusterConfig>` is freshly lowered, so only content equality can match. Built
+    /// twice via `cluster_config`, on purpose, so this exercises content equality and not `Arc::ptr_eq`.
     #[tokio::test]
     async fn content_equal_config_is_carried_forward() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2853,12 +2519,9 @@ mod tests {
         );
     }
 
-    /// Acceptance test and motivating scenario for carry-forward: a
-    /// control-plane heartbeat that only changes cluster B must not silently
-    /// clear an ejection on unrelated cluster A. Eject A's only host, push a
-    /// snapshot where only B's config changed, and confirm both that A's
-    /// `ManagedCluster` is the exact same `Arc` (not just behaviorally
-    /// equivalent) and that its ejection survived.
+    /// Acceptance test for carry-forward. A control-plane push that changes only cluster B must not clear an
+    /// ejection on cluster A. Eject A's only host, push a snapshot where only B's config changed, and confirm A's
+    /// `ManagedCluster` is the same `Arc` and its ejection survived.
     #[tokio::test]
     async fn an_unrelated_clusters_change_leaves_an_ejection_in_place() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2898,9 +2561,7 @@ mod tests {
 
         let managed_a_before = manager.clusters.load().get("a").unwrap().clone();
 
-        // Reload with ONLY b's config changed -- a's config is byte-for-byte
-        // the same (a fresh, content-equal Arc, same shape as a real SIGHUP
-        // reload's lowering).
+        // Reload with ONLY b's config changed. a's config is content-equal (a fresh `Arc`, as a SIGHUP lowering produces).
         let mut snapshot2 = HashMap::new();
         snapshot2.insert(
             "a".to_string(),
@@ -2924,11 +2585,9 @@ mod tests {
         );
     }
 
-    /// The paragraph `update_from_snapshot`'s own doc now makes about EDS
-    /// membership surviving a reload: a config-sourced EDS cluster
-    /// (`discovery: eds` -- see [`cluster_config_eds`]) fed via
-    /// [`ClusterManager::accept_eds_update`], then a reload that changes an
-    /// unrelated cluster's config, must not empty it.
+    /// EDS membership survives an unrelated reload (see `update_from_snapshot`). A config-sourced EDS cluster
+    /// (see [`cluster_config_eds`]) fed by [`ClusterManager::accept_eds_update`] must not be emptied by a reload
+    /// that changes another cluster's config.
     #[tokio::test]
     async fn eds_membership_survives_an_unrelated_config_reload() {
         let resolver = Arc::new(FakeResolver::new());
@@ -2975,10 +2634,8 @@ mod tests {
         );
     }
 
-    /// Mirrors `resolve_carries_over_health_flags_for_unchanged_hosts`,
-    /// but across `update_from_snapshot` rather than a re-resolve: an
-    /// active-health-check failure flag flipped directly on a host must
-    /// survive an unrelated cluster's config change in the same snapshot.
+    /// An active-health-check failure flag set on a host must survive an unrelated cluster's config change in the
+    /// same snapshot, as in `resolve_carries_over_health_flags_for_unchanged_hosts`.
     #[tokio::test]
     async fn active_health_check_flags_survive_an_unrelated_config_reload() {
         let resolver = Arc::new(FakeResolver::new());
@@ -3053,20 +2710,14 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------- DNS refresh timer --
-    //
-    // These run on tokio's paused clock (`start_paused`): sleeping in the test
-    // advances virtual time to the next timer, so a 5s refresh interval costs
-    // no wall time, and the resolver's recorded lookup times are the waits the
-    // timer really chose. Tests sleep to just past an interval (5.1s, say),
-    // never to its exact edge, where the test's own timer and the refresh
-    // timer would fire in the same tick in no guaranteed order.
+    // DNS refresh tests run on tokio's paused clock (`start_paused`). Sleeping advances virtual time to the next
+    // timer, so a 5s interval costs no wall time. Tests sleep to just past an interval (5.1s), never to its exact
+    // edge, where the test's timer and the refresh timer race.
 
     use futures::future::BoxFuture;
 
-    /// A resolver whose answer per host the test scripts, which records every
-    /// lookup (host and tokio-clock time). `FakeResolver` cannot do either: it
-    /// has no way to make a host fail again once seeded, and keeps no record.
+    /// A resolver that scripts each host's answer and records every lookup with its tokio-clock time.
+    /// `FakeResolver` can do neither.
     #[derive(Default)]
     struct ScriptedResolver {
         /// `None` is a failing lookup.
@@ -3226,9 +2877,8 @@ mod tests {
         );
     }
 
-    /// The timer must not republish an unchanged answer: that would replace
-    /// every live `Host` -- health flags, in-flight counters -- with an equal
-    /// fresh one every few seconds, forever.
+    /// The timer must not republish an unchanged answer: that would replace every live `Host` (health flags,
+    /// in-flight counters) with an equal fresh one every few seconds.
     #[tokio::test(start_paused = true)]
     async fn a_refresh_that_changes_nothing_leaves_the_published_host_set_alone() {
         let resolver = Arc::new(ScriptedResolver::default());
@@ -3280,9 +2930,8 @@ mod tests {
         assert!(manager.warming_clusters().is_empty());
     }
 
-    /// A lookup that succeeds with no records changes nothing, so the
-    /// "unchanged, don't republish" shortcut applies -- but the cluster has
-    /// still been resolved and must stop warming.
+    /// A successful lookup with no records changes nothing, so the no-republish shortcut applies. The cluster
+    /// is still resolved and must stop warming.
     #[tokio::test(start_paused = true)]
     async fn an_empty_answer_still_marks_the_cluster_initialized() {
         let resolver = Arc::new(ScriptedResolver::default());
@@ -3475,12 +3124,10 @@ mod tests {
         );
     }
 
-    /// The timer task is cancelled when its cluster is dropped, not left to
-    /// notice at its next tick. With a refresh rate of an hour the tick is far
-    /// away, so a task still alive right after the drop is a leak per reload.
-    ///
-    /// Observed through the resolver: the task owns a clone of the manager's
-    /// `Arc<dyn HostResolver>`, which goes away only when the task is dropped.
+    /// The timer task is cancelled when its cluster is dropped, not left to notice at its next tick. With a
+    /// refresh rate of an hour the tick is far away, so a task still alive after the drop is a leak per reload.
+    /// Observed through the resolver: the task holds the manager's `Arc<dyn HostResolver>`, released only when
+    /// the task is dropped.
     #[tokio::test(start_paused = true)]
     async fn dropping_a_dns_cluster_cancels_its_timer_task_at_once() {
         let resolver = Arc::new(ScriptedResolver::default());
@@ -3503,9 +3150,8 @@ mod tests {
         assert_eq!(Arc::strong_count(&resolver), 2, "the timer task is gone");
     }
 
-    /// A reload that changes a DNS cluster rebuilds it. Its predecessor's timer
-    /// must stop, or two timers would resolve (and a stale one would republish
-    /// into a cluster nobody routes to).
+    /// A reload that changes a DNS cluster rebuilds it. Its predecessor's timer must stop, or a stale timer
+    /// would republish into a cluster nobody routes to.
     #[tokio::test(start_paused = true)]
     async fn replacing_a_dns_cluster_on_reload_stops_the_old_timer() {
         let resolver = Arc::new(ScriptedResolver::default());
@@ -3550,9 +3196,8 @@ mod tests {
         }
     }
 
-    /// A connection that predates a reload keeps routing through the cluster
-    /// it was built against (`routing_snapshot`), so that cluster keeps its
-    /// addresses fresh until the last reference to it is dropped.
+    /// A connection that predates a reload keeps routing through the cluster it was built against
+    /// (`routing_snapshot`), so that cluster keeps its addresses fresh until its last reference drops.
     #[tokio::test(start_paused = true)]
     async fn a_replaced_cluster_keeps_refreshing_until_its_last_reference_is_dropped() {
         let resolver = Arc::new(ScriptedResolver::default());
@@ -3635,9 +3280,8 @@ mod tests {
         }
     }
 
-    /// Only DNS clusters resolve on a timer, and a refresh must never reach an
-    /// EDS cluster: resolving it yields an empty set that would wipe the
-    /// membership its stream delivered.
+    /// Only DNS clusters resolve on a timer. A refresh must never reach an EDS cluster: resolving it yields an
+    /// empty set that would wipe the membership its stream delivered.
     #[tokio::test(start_paused = true)]
     async fn only_dns_clusters_get_a_refresh_timer() {
         let resolver = Arc::new(ScriptedResolver::default());
@@ -3689,9 +3333,8 @@ mod tests {
         assert_eq!(live(&manager, &snapshot, "eds-svc"), ["10.0.0.5:80"]);
     }
 
-    /// A health check can mark a host while a lookup is in flight. The publish
-    /// must build on the set as it is when the lookup returns, or the mark is
-    /// silently undone -- and a health check only publishes on an edge, so
+    /// A health check can mark a host while a lookup is in flight. The publish must build on the set as it is
+    /// when the lookup returns, or the mark is silently undone. A health check publishes only on an edge, so
     /// nothing would set it again.
     #[tokio::test(start_paused = true)]
     async fn a_health_flag_set_during_the_lookup_survives_the_publish() {
@@ -3760,9 +3403,8 @@ mod tests {
         );
     }
 
-    /// Fails the first `failures` lookups, then answers through the platform
-    /// resolver. Production never gets the injected failures (a real outage
-    /// cannot be summoned on demand); everything after them is the real thing.
+    /// Fails the first `failures` lookups, then answers through the platform resolver. Production never gets
+    /// injected failures; everything after them is the real thing.
     struct FailsThenResolves {
         failures_left: Mutex<usize>,
         real: crate::resolver::TokioResolver,
@@ -3783,13 +3425,10 @@ mod tests {
         }
     }
 
-    /// The timer on a real multi-thread runtime, the real clock and the real
-    /// `TokioResolver` (`getaddrinfo` on the blocking pool), not a scripted
-    /// resolver on a paused clock: after the first lookups fail, the cluster
-    /// fills in by itself. The hostname is a numeric address, which
-    /// `getaddrinfo` answers without touching the network, so the test needs no
-    /// DNS; the 20ms intervals only make it quick, and it waits for the
-    /// outcome rather than asserting how long it took.
+    /// The timer on a real multi-thread runtime, with the real clock and the real `TokioResolver`, not a
+    /// scripted resolver on a paused clock: after the first lookups fail, the cluster fills in by itself. The
+    /// hostname is a numeric address, which `getaddrinfo` answers without touching the network. The test waits
+    /// for the outcome rather than asserting how long it took.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cluster_heals_through_the_platform_resolver_on_a_real_runtime() {
         let resolver = Arc::new(FailsThenResolves {
@@ -3883,20 +3522,14 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
-    /// The one capture for this test process, installed as the GLOBAL default
-    /// subscriber the first time a logging test asks for it. Each logging test
-    /// uses a cluster name of its own and reads back only events naming it, so
-    /// the other tests logging into the same capture do not matter.
+    /// The one capture for this test process, installed as the GLOBAL default subscriber the first time a
+    /// logging test asks for it. Each logging test uses its own cluster name and reads back only events naming
+    /// it.
     ///
-    /// Rust note: not `tracing::subscriber::set_default`, which would scope the
-    /// capture to one thread. `cargo test` runs tests as parallel threads of
-    /// one process, and `tracing` caches whether each log call site is enabled
-    /// process-wide: a call site first reached by a thread with no subscriber
-    /// is cached as disabled, and the scoped capture then never sees it when
-    /// the logging test reaches it (the "recovered" line and one warning went
-    /// missing exactly that way). A global default is every thread's fallback,
-    /// so no call site can be cached as disabled. `cargo nextest`, which `make
-    /// tq` uses, runs one test per process and would not have hit this.
+    /// Rust note: not `tracing::subscriber::set_default`, which scopes the capture to one thread. `tracing`
+    /// caches whether each call site is enabled process-wide, so a call site first reached on a thread with no
+    /// subscriber is cached as disabled and the scoped capture never sees it. A global default is every
+    /// thread's fallback, so no call site is cached as disabled.
     fn capture() -> Arc<EventCapture> {
         static CAPTURE: std::sync::OnceLock<Arc<EventCapture>> = std::sync::OnceLock::new();
         Arc::clone(CAPTURE.get_or_init(|| {
@@ -3907,9 +3540,8 @@ mod tests {
         }))
     }
 
-    /// 40 failed lookups in a row log six warnings -- the first, then the 2nd,
-    /// 4th, 8th, 16th and 32nd -- not forty; recovery logs once; and nothing
-    /// logs after that.
+    /// 40 failed lookups in a row log six warnings (the 1st, 2nd, 4th, 8th, 16th and 32nd), not forty. Recovery
+    /// logs once, and nothing logs after that.
     #[tokio::test(start_paused = true)]
     async fn a_dns_outage_warns_loudly_then_rarely_and_recovery_is_logged_once() {
         use tracing::Level;

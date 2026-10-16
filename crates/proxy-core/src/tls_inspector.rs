@@ -1,9 +1,6 @@
-//! `tls_inspector` listener filter: peeks the TLS
-//! ClientHello off an accepted connection *without consuming it* and extracts
-//! SNI + ALPN so filter-chain matching (`crate::filter_chain`) can key on
-//! `server_names`/`application_protocols`/`transport_protocol`. Does not
-//! terminate TLS -- the real handshake (or the terminal filter)
-//! still sees every byte, undisturbed.
+//! `tls_inspector` listener filter. It peeks the TLS ClientHello without consuming it, and extracts SNI and ALPN so
+//! filter-chain matching (`crate::filter_chain`) can key on them. It does not terminate TLS: the handshake or the
+//! terminal filter still sees every byte.
 
 use std::time::Duration;
 
@@ -44,17 +41,13 @@ pub struct InspectedTls {
     pub application_protocols: Vec<String>,
 }
 
-/// Peek (without consuming) the ClientHello on `stream` and extract SNI+ALPN.
+/// Peeks the ClientHello on `stream` without consuming it, and extracts SNI and ALPN.
 ///
-/// Returns `Ok(None)` when the connection is NOT TLS (first byte isn't a TLS
-/// handshake record) or the ClientHello can't be parsed within limits (either
-/// `max_client_hello_size` or the internal wall-clock timeout) -- the caller
-/// then treats it as plaintext, matching Envoy's default
-/// `close_connection_on_client_hello_parsing_errors=false` behavior (the
-/// `true` variant is rejected at config load, so `false` is the only
-/// behavior this function needs to implement).
+/// Returns `Ok(None)` when the connection is not TLS, or the ClientHello does not parse within limits
+/// (`max_client_hello_size` or the wall-clock timeout). The caller treats it as plaintext, matching Envoy's default
+/// `close_connection_on_client_hello_parsing_errors=false`. The `true` variant is rejected at config load.
 ///
-/// `Err` is reserved for real socket errors (not parse failures).
+/// `Err` is reserved for real socket errors.
 pub async fn inspect_client_hello(
     stream: &TcpStream,
     max_client_hello_size: u32,
@@ -86,12 +79,8 @@ async fn peek_client_hello(
     let mut last_incomplete_n: Option<usize> = None;
 
     loop {
-        // Rust note: `TcpStream::peek` reads from the front of the kernel
-        // receive buffer *without* draining it, so whatever we read here is
-        // still there for the real TLS handshake (or the stub handler) to
-        // read again later. It's also already `async`: on a socket with zero
-        // bytes buffered it registers interest and waits for the first byte,
-        // same as `read().await` would.
+        // Rust note: `TcpStream::peek` reads the front of the kernel buffer without draining it, so the real handshake
+        // still reads those bytes later. On an empty socket it waits for the first byte, as `read().await` would.
         let n = stream.peek(&mut buf).await?;
         if n == 0 {
             // Peer closed before sending anything.
@@ -118,16 +107,9 @@ async fn peek_client_hello(
                     buf.resize(new_len, 0);
                     last_incomplete_n = None;
                 } else if last_incomplete_n == Some(n) {
-                    // Rust note: because `peek` never drains the socket, a
-                    // second `.await` on it can return *instantly* with the
-                    // exact same bytes as before if the kernel still reports
-                    // the fd readable -- readiness here is level-triggered on
-                    // "there is unread data", not edge-triggered on "new data
-                    // arrived". Without this check we'd hot-loop calling
-                    // `peek` as fast as the executor can schedule us, pinning
-                    // a CPU while genuinely waiting on the peer. Back off
-                    // briefly instead; the outer `INSPECT_TIMEOUT` bounds how
-                    // long this can go on for.
+                    // Rust note: `peek` never drains the socket, so a second peek can return instantly with the same bytes.
+                    // Readiness is level-triggered on "unread data", not on "new data arrived". Without this backoff the loop
+                    // would spin a CPU while waiting on the peer. The outer `INSPECT_TIMEOUT` bounds the wait.
                     tokio::time::sleep(STALL_BACKOFF).await;
                 } else {
                     last_incomplete_n = Some(n);

@@ -1,11 +1,7 @@
 //! The `llm-proxy` binary.
 //!
-//! Implemented: Envoy bootstrap loading (`-c`), PGV validation, IR building,
-//! the simple dialect (`--config`), `--mode validate` / `--mode translate`,
-//! `--mode keygen` (see `keygen`), `init`, serve mode's control runtime, worker
-//! pool, SIGTERM/SIGINT drain sequence, and the per-worker listener manager
-//! that binds sockets and accepts connections. The L4 network filter chain
-//! (`tcp_proxy` etc.) lives in `proxy_core` (`tcp_proxy`, `net_filter`).
+//! Loads Envoy and simple-dialect configuration, then runs the proxy binary
+//! modes and serves HTTP and L4 traffic through `proxy_core`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -42,12 +38,9 @@ mod keygen;
 
 #[derive(Parser)]
 #[command(name = "llm-proxy", version, about = "Proxy for LLM inference APIs")]
-// Rust note: no `.required(true)` here any more -- `--mode keygen` needs
-// neither `-c`/`--config-path` nor `--config`, so "at least one" can no
-// longer be a blanket clap-level rule. The group still enforces "not both"
-// (its `multiple` flag defaults to `false`); "at least one, unless keygen"
-// is checked by hand in `main()`, right where `--mode translate`'s own extra
-// requirement already is.
+// Rust note: no `.required(true)`, because `--mode keygen` takes neither
+// input. The group still rejects "both"; "at least one, unless keygen" is
+// checked by hand in `main()`.
 #[command(group(clap::ArgGroup::new("input").args(["config_path", "config"])))]
 #[command(group(clap::ArgGroup::new("capture_destination").args(["request_records_file", "request_records_agent"])))]
 struct Args {
@@ -415,7 +408,7 @@ fn load(args: &Args) -> Result<(String, LoadedBootstrap), (String, String)> {
         .map_err(|e| (display.clone(), e.to_string()))?;
 
     if args.mode == Mode::Translate {
-        // Secrets are redacted unless asked for (review M9).
+        // Secrets are redacted unless asked for.
         let translated = if args.reveal_secrets {
             proxy_simple_config::to_envoy_yaml_with_secrets(&config)
         } else {
@@ -439,19 +432,9 @@ fn load(args: &Args) -> Result<(String, LoadedBootstrap), (String, String)> {
     Ok((display, loaded))
 }
 
-/// Which config front-end (`-c`/`--config-path` Envoy bootstrap, or
-/// `--config` dialect) and file `serve` was started with -- captured once,
-/// right after argument parsing, and threaded down into the SIGHUP reload
-/// path (see [`reload`]) instead of a reload re-deriving it from `Args`
-/// itself.
-///
-/// This is what makes "a reload goes through the SAME front-end it booted
-/// with" true by construction rather than by care: a `Bootstrap`-sourced
-/// process can only ever call `load_bootstrap_file` again on SIGHUP, and a
-/// `Dialect`-sourced one can only ever call `load_simple_config_file` again
-/// -- there is no code path that lets one call into the other's loader,
-/// unlike re-inspecting `Args` on every reload, which would silently start
-/// working from whatever `Args` happens to hold this time.
+/// The config front-end and file that `serve` started with. It is captured
+/// once after argument parsing and passed to the SIGHUP reload path. A reload
+/// therefore always uses the same loader the process booted with.
 #[derive(Debug)]
 enum ConfigSource {
     /// `-c`/`--config-path`: an Envoy bootstrap file, loaded with `strict`
@@ -486,14 +469,9 @@ impl ConfigSource {
         }
     }
 
-    /// Re-parses and re-lowers this source's file from scratch: the exact
-    /// same library calls `load`/`build_snapshot` make at boot, minus
-    /// `load`'s two CLI-only conveniences (the cross-mode hint text and
-    /// `--mode translate`'s stdout side effect) -- a SIGHUP reload has
-    /// neither a terminal to hint at nor a reason to print an Envoy YAML
-    /// translation. Warnings are logged via `tracing` rather than
-    /// `eprintln!`, since this runs from the serve-mode signal loop, not the
-    /// startup path.
+    /// Re-parses this source's file from scratch with the same library calls
+    /// as boot. It omits the CLI-only output (hints and translate printing).
+    /// Warnings go through `tracing`, because this runs from the signal loop.
     fn load(&self) -> Result<ConfigSnapshot, String> {
         let loaded = match self {
             ConfigSource::Bootstrap { path, strict } => {
@@ -949,7 +927,7 @@ async fn run_serve(
             }
         }
     };
-    // Delivery to the capture agent's spool is experimental (review M7): the
+    // Delivery to the capture agent's spool is experimental: the
     // agent has no reader, acknowledgement, retention or replay dedup, and
     // stops when its disk limit is reached. Say so where the operator will
     // see it; the JSONL file sink is the supported destination.
@@ -1052,27 +1030,12 @@ async fn run_serve(
                 }
             });
 
-    // Metric export, spawned INDEPENDENTLY of the trace
-    // exporter above. `snapshot.metrics` is a separate IR field precisely so
-    // this block is reachable with `snapshot.tracing` set to `None` -- before
-    // the split, a config with no `tracing` block exported no OTLP metrics at
-    // all, even though the registry they are read from is always populated
-    // (`docs/telemetry-design.md` §5.3). Separate task, separate ticker,
-    // separate deadline, separate `Endpoint`: a slow or failing trace export
-    // cannot delay a metric snapshot.
-    //
-    // Built and then conditionally MOVED into a task -- not built inside the
-    // `if`. Resolving the failure series unconditionally is what makes
-    // `llmproxy_otel_export_failures{signal="metrics"}` visible on
-    // `/stats/prometheus` from the very first scrape of a process with no
-    // metric export at all: a dashboard that only grows a series once something
-    // has gone wrong cannot tell "zero failures" from "not instrumented", and
-    // the design doc's failure matrix leans on these counters being dependable.
-    // Span drops are deliberately NOT resolved here -- they are trace-path
-    // facts owned by the trace exporter (see `ExportCounters`' doc), and
-    // resolving them from this side is exactly the cross-domain coupling the
-    // review rejected: a Prometheus-only deployment would otherwise have
-    // reported zero span drops forever.
+    // Metric export runs as its own task, separate from the trace exporter, so
+    // a slow trace export cannot delay a metric snapshot. It is reachable even
+    // when `snapshot.tracing` is `None`. The failure series is resolved
+    // unconditionally, so `llmproxy_otel_export_failures{signal="metrics"}`
+    // reads zero from the first scrape rather than being absent. Span drops are
+    // not resolved here. They belong to the trace exporter's `ExportCounters`.
     let metric_health = proxy_observability::otlp::MetricExportHealth::resolve(&stats_control);
     if let Some(cfg) = snapshot.metrics.as_ref() {
         tracing::info!(
@@ -1625,27 +1588,13 @@ async fn run_serve(
             }
         }
 
-        // Ask the metric exporter for one last snapshot and WAIT
-        // for it, AFTER the drain has finished -- so the final
-        // cumulative figures include everything the drain period itself served, and
-        // so a slow collector's deadline can never delay the drain. An earlier
-        // revision fired this before the drain and was corrected in review on both
-        // counts: drain-period traffic was missing from the "final" snapshot, and
-        // the pre-drain await added up to one export deadline of latency to every
-        // shutdown for no benefit.
+        // Ask the metric exporter for one last snapshot, AFTER the drain, so the
+        // final cumulative figures include drain-period traffic. The wait is
+        // bounded by the exporter's deadline, so an unreachable collector cannot
+        // hang exit. This proves delivery at the collector's ACK level only.
         //
-        // Design doc §13's other half still holds: this proves delivery of the
-        // last snapshot at the collector's ACK level and nothing more, and the
-        // wait is bounded (the exporter's deadline plus slack, captured at spawn)
-        // so an unreachable collector cannot hang exit -- the process was already
-        // done serving when this starts, so the only cost here is exit latency,
-        // and it is one bounded RPC, not a reconnect loop.
-        //
-        // Each `send`/`await` result is deliberately ignored rather than unwrapped:
-        // a closed channel or a panicked task means the exporter was already gone
-        // (or never started), and there is no useful recovery for either at this
-        // point in shutdown. The proxy is exiting; a missing final metric snapshot
-        // must not change its exit behavior.
+        // Each `send`/`await` result is ignored on purpose. A closed channel means
+        // the exporter is already gone, and nothing can be done about it at exit.
         if fast_exit {
             // Dropping the sender and handle without waiting: see the fast-exit
             // comment above.
@@ -1722,29 +1671,19 @@ fn begin_drain(
 /// republishes a fresh snapshot -- on failure, logs and leaves every piece of
 /// running state untouched.
 ///
-/// Order of operations on success, and why: [`proxy_http::stat_handles::StatHandles::resolve_missing`]
-/// runs first so a cluster this table has never seen has a handle resolved
-/// *before* traffic can possibly reach it; [`proxy_cluster::manager::ClusterManager::update_from_snapshot`]
-/// runs next, exactly the call `run_serve` makes at boot, so the shared
-/// cluster manager every worker's router reads through picks up added,
-/// removed, or changed clusters; [`ConfigPublisher::publish`] runs last, so
-/// listeners (via each worker's `config_ping` -> `reconcile`, already
-/// covered by `proxy-core`'s own tests) never start routing to a cluster the
-/// manager doesn't know about yet.
+/// Order of operations on success: stat handles are resolved first, so a new
+/// cluster has a handle before traffic can reach it. Then
+/// `update_from_snapshot` runs, the same call `run_serve` makes at boot. Then
+/// [`ConfigPublisher::publish`] runs last, so no listener routes to a cluster
+/// the manager does not know yet.
 ///
-/// A cluster `update_from_snapshot` rejects (unimplemented `lb_policy`, a
-/// bad `transport_socket`, ...) is logged at `error` and left out of the
-/// live cluster set -- unlike at boot, where the same rejection is fatal,
-/// here it cannot be: requirement 1 is that a reload never takes the process
-/// down, and that has to hold even for a failure `build_snapshot` itself
-/// has no way to catch.
+/// A cluster the manager rejects is logged at `error` and left out of the live
+/// set. Unlike at boot it is not fatal, because a reload must never take the
+/// process down.
 ///
-/// The three boot-resolved stat-handle tables [`reload`] must extend when a
-/// SIGHUP introduces a listener or cluster the boot snapshot never named.
-/// Bundled purely to keep `reload`'s own argument count under clippy's
-/// `too_many_arguments` threshold -- the same motivation, one layer up, that
-/// [`proxy_core::listener::StatsRecorders`] documents for bundling the three
-/// *recorders* these tables feed.
+/// The boot-resolved stat-handle tables that `reload` extends when a SIGHUP
+/// introduces a new listener or cluster. They are bundled to keep `reload`'s
+/// argument count down.
 struct StatHandleTables {
     router: Arc<proxy_http::stat_handles::StatHandles>,
     downstream: Arc<proxy_http::stat_handles::DownstreamStatHandles>,
@@ -1754,16 +1693,13 @@ struct StatHandleTables {
 /// Proof that a snapshot's clusters are already installed in the shared
 /// [`proxy_cluster::manager::ClusterManager`].
 ///
-/// Rust note: a zero-sized "receipt" (or witness) type. It carries no data --
-/// its whole job is that [`install_clusters`] is the only thing that can
-/// produce one and [`publish_to_workers`] demands one by value, so the
-/// dangerous order (publish first, install second) is not expressible. This
-/// is the cheapest way to turn "a comment says do these in order" into "the
-/// compiler says so", and it exists because two separate attempts to catch
-/// the wrong order with a test both failed -- see [`apply_snapshot`]'s doc.
+/// Rust note: a "receipt" type. [`install_clusters`] is the only code that can
+/// produce one, and [`publish_to_workers`] takes it by value. That makes
+/// publish-before-install inexpressible, so the order is checked by the
+/// compiler rather than a comment. See [`apply_snapshot`]'s doc.
 ///
-/// It carries the clusters the new snapshot dropped, which stay installed
-/// until [`retire_clusters`] runs (review M5: removal is two-phase).
+/// It carries the clusters the new snapshot dropped. They stay installed until
+/// [`retire_clusters`] runs.
 #[must_use = "publishing without installing clusters first is the bug this type exists to prevent"]
 struct ClustersInstalled(proxy_cluster::manager::PendingRemoval);
 
@@ -1854,77 +1790,36 @@ fn live_scope_for(snapshot: &ConfigSnapshot) -> proxy_observability::stats::Live
     }
 }
 
-/// Applies an already-built [`ConfigSnapshot`] to every piece of running
-/// state, in the one order that is safe. This is the shared apply path:
-/// `reload` below (the SIGHUP producer) is the first
-/// caller, and the ADS client -- the *second* producer of `Arc<ConfigSnapshot>`,
-/// landing next -- calls this SAME function rather than reaching around it to
-/// publish on its own.
-///
-/// Order of operations, and why -- unchanged from what used to be inline in
-/// `reload`, just no longer duplicated for a second caller.
+/// Applies an already-built [`ConfigSnapshot`] to all running state, in the
+/// one safe order. This is the shared apply path for the SIGHUP `reload` and
+/// the ADS client. Both call this function rather than publishing on their own.
 ///
 /// Before any step, [`proxy_cluster::manager::ClusterManager::stage`] builds
-/// the snapshot's new and changed clusters without installing them. A
-/// cluster it rejects (unimplemented `lb_policy`, a bad `transport_socket`,
-/// ...) is handled per `on_rejection`: [`OnClusterRejection::RefuseSnapshot`]
-/// returns `Err` with nothing touched (the ADS caller NACKs, review H1);
-/// [`OnClusterRejection::LeaveOut`] applies the rest (`reload` logs).
+/// new and changed clusters without installing them. A rejected cluster is
+/// handled per `on_rejection`: [`OnClusterRejection::RefuseSnapshot`] returns
+/// `Err` with nothing touched (the ADS caller NACKs), and
+/// [`OnClusterRejection::LeaveOut`] applies the rest.
 ///
-/// 0.[`proxy_observability::stats::StatsControl::set_live_scope`] with the
-///    snapshot's cluster and listener names, so series of removed ones stop
-///    being emitted and stop counting against their caps, and series absent
-///    from this snapshot and the previous one are drained for reuse. The
-///    grace period is one published snapshot, not a span of time: the xDS
-///    applier publishes only when the listener, cluster or route set changed
-///    (`proxy_xds::apply::same_published_resources`), so heartbeats, EDS
-///    updates and re-sent identical resources never count toward it.
-/// 1. [`proxy_http::stat_handles::StatHandles::resolve_missing`] over the
-///    cluster keys, so a cluster this table has never seen has a handle
-///    resolved *before* traffic can possibly reach it, and an entry step 0
-///    drained is dropped or re-resolved. Steps 2 and 3 do the same.
-/// 2. [`proxy_http::stat_handles::DownstreamStatHandles::resolve_missing`]
-///    over the listener keys, so a listener this snapshot introduces has a
-///    `downstream_cx_total` handle resolved before its accept loop can
-///    possibly see a connection.
-/// 3. [`proxy_http::stat_handles::TokenUsageStatHandles::resolve_missing`]
-///    over the cluster keys, so a cluster this snapshot introduces has its
-///    four `llm.client.token.usage` handles resolved before it can dial its
-///    first request.
-/// 4. [`proxy_cluster::manager::ClusterManager::install`] so the shared
-///    cluster manager every worker's router reads through picks up added and
-///    changed clusters. Clusters the snapshot dropped stay installed.
-/// 5. [`proxy_core::runtime::ConfigPublisher::publish`]: this is what
-///    makes the snapshot visible to workers (via each worker's `config_ping`
-///    -> `reconcile`, already covered by `proxy-core`'s own tests), so it must
-///    not run until step 4 has already taught the cluster manager about every
-///    cluster the new snapshot's routes can reach -- otherwise a worker could
-///    start routing to a cluster the manager doesn't know about yet.
-/// 6. [`proxy_cluster::manager::ClusterManager::retire`], LAST: removes the
-///    dropped clusters only once workers have the snapshot whose routes no
-///    longer reach them (make-before-break, review M5).
+/// 0. [`proxy_observability::stats::StatsControl::set_live_scope`] drains the
+///    series of removed clusters and listeners. The grace period is one
+///    published snapshot. Heartbeats and identical re-sends never count.
+/// 1. Stat handles are resolved for new cluster keys before traffic can reach
+///    them. Steps 2 and 3 do the same for listeners and token usage.
+/// 4. [`proxy_cluster::manager::ClusterManager::install`] makes added and
+///    changed clusters visible to every worker's router.
+/// 5. [`proxy_core::runtime::ConfigPublisher::publish`] makes the snapshot
+///    visible to workers. It must not run before step 4, or a worker could
+///    route to a cluster the manager does not know yet.
+/// 6. [`proxy_cluster::manager::ClusterManager::retire`] runs last, removing
+///    dropped clusters only after workers have the snapshot that no longer
+///    routes to them (make-before-break).
 ///
-/// **The ordering of steps 4, 5 and 6 is enforced by the TYPE SYSTEM, not by
-/// a test, and that is a deliberate choice made after two measured failures.**
-///
-/// First (2026-09-06) a plain mutation showed no unit test caught a
-/// reordering. Then an end-to-end test was written for exactly this -- boot
-/// the binary, have a control plane introduce a cluster, drive real traffic --
-/// and a mutation showed *it did not catch the reordering either*
-/// (`tests/ads_e2e.rs`, see its module doc). The reason is structural: the
-/// damage window is the microseconds between `publish` storing the snapshot
-/// and `update_from_snapshot` storing the cluster map, which it does
-/// synchronously before it resolves each new cluster's discovery. No
-/// black-box observer can reliably land inside it, and AGENTS.md "Build And Test"'s
-/// lesson is that an instrument which lies is worse than none.
-///
-/// So the order is a compile-time property instead: [`install_clusters`]
-/// returns a [`ClustersInstalled`] receipt that [`publish_to_workers`]
-/// requires by value, and [`publish_to_workers`] returns the
-/// [`SnapshotPublished`] receipt [`retire_clusters`] requires. Reordering the
-/// statements below does not typecheck -- a receipt would be used before it
-/// exists. That is a stronger guarantee than the test that could not be
-/// written.
+/// The order of steps 4 to 6 is enforced by the type system, not by a test.
+/// The damage window is microseconds, and no black-box test lands inside it.
+/// [`install_clusters`] returns a [`ClustersInstalled`] receipt that
+/// [`publish_to_workers`] takes by value. [`publish_to_workers`] returns a
+/// [`SnapshotPublished`] receipt that [`retire_clusters`] takes. Reordering
+/// the statements below does not compile.
 async fn apply_snapshot(
     snapshot: ConfigSnapshot,
     on_rejection: OnClusterRejection,
@@ -2282,8 +2177,7 @@ fn effective_node(
 ///
 /// Returns `None` -- and starts nothing -- in three cases, none of them
 /// fatal to `run_serve` (architecture.md §12.2 rule 5: keep serving last-good/static config):
-/// - `snapshot.ads` is `None`: no `dynamic_resources` in bootstrap, today's
-///   behavior for every release through v0.2.0, untouched by this wiring.
+/// - `snapshot.ads` is `None`: no `dynamic_resources` in the bootstrap.
 /// - none of `lds`, `cds`, or a statically-declared EDS cluster asks for
 ///   anything: nothing to subscribe to, logged at `info!`. EDS has no
 ///   bootstrap flag of its own -- Envoy expresses it per cluster, via
@@ -2595,42 +2489,22 @@ fn start_ads(
             // `AdsClient::run_once` does not send this response's ACK until
             // THIS future resolves.
             //
-            // **NOTHING CATCHES THE LOSS OF THIS `.await`, and an
-            // end-to-end attempt to fix that FAILED -- measured twice.**
-            // Deleting it leaves this crate's unit tests green (2026-09-06),
-            // and it also leaves all three of `tests/ads_e2e.rs`'s
-            // real-binary-against-a-real-control-plane tests green. The
-            // reason is in that file's module doc: observing the ACK costs a
-            // network round trip, orders of magnitude longer than the window
-            // this bug opens, so the racing apply always wins.
-            //
-            // The seam itself IS pinned, one layer down, by `proxy-xds`'s
-            // `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`
-            // -- what is unpinned is that THIS closure uses it. The sibling
-            // step-4/step-5 ordering was in the same position and got solved
-            // structurally instead (see `apply_snapshot`'s `ClustersInstalled`
-            // receipt); the same trick does not reach across this channel,
-            // because the reply arrives at runtime rather than as a value the
-            // compiler can require. Left open deliberately, and the harm is
-            // bounded: a control plane believes config is live fractionally
-            // early, which is an S8 conformance point, not a serving defect.
+            // Nothing in the tests catches the loss of this `.await`. Observing
+            // the ACK costs a round trip, so the racing apply nearly always
+            // wins (see `tests/ads_e2e.rs`). The seam is pinned one layer down
+            // by `proxy-xds`'s
+            // `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`.
+            // This closure's use of it is not pinned. The harm is bounded: the
+            // control plane believes config is live slightly early, which is an
+            // S8 conformance point, not a serving defect.
             await_apply_reply(reply_rx).await
         })
     });
 
-    // An accepted EDS endpoint update goes straight
-    // to `ClusterManager::accept_eds_update` -- an `arc_swap` store on the
-    // cluster's own `HostSet`, nothing more -- rather than through the
-    // `apply_tx`/`Publish` channel above. That channel exists because a
-    // CDS/LDS response runs the WHOLE `apply_snapshot` sequence (install
-    // clusters into `cluster_manager`, THEN publish to every worker), and
-    // `Publish`'s own doc comment is what explains why that sequencing needs
-    // a round trip through this function's control loop. Installing
-    // endpoints into a cluster that already exists needs none of that -- the
-    // cluster is already live, and there is no worker-visible snapshot to
-    // publish -- so this sink calls `accept_eds_update` directly on the
-    // `Arc<ClusterManager>` this closure closes over, instead of inventing a
-    // second channel back to the same loop.
+    // An accepted EDS endpoint update calls `ClusterManager::accept_eds_update`
+    // directly. It skips the `apply_tx` channel, which exists for CDS/LDS
+    // sequencing. The cluster is already live and no worker-visible snapshot
+    // needs publishing.
     let cluster_manager = Arc::clone(cluster_manager);
     let endpoint_sink: PublishEndpoints = Box::new(move |name, endpoints| {
         let cluster_manager = Arc::clone(&cluster_manager);
@@ -2642,17 +2516,10 @@ fn start_ads(
         })
     });
 
-    // An accepted SDS secret goes straight to
-    // `SdsSecretRegistry::publish` -- same "no round trip through this
-    // function's control loop" shape as `endpoint_sink` just above, and for
-    // the same reason: the registry is already live shared state (an
-    // `Arc<SdsSecretRegistry>`, not a worker-visible `ConfigSnapshot`), so
-    // there is nothing for `apply_snapshot`'s sequencing to add.
-    //
-    // Certificate and validation-context secrets use distinct live TLS
-    // seams. The latter rebuilds then atomically swaps ServerConfig because
-    // rustls bakes the client verifier (trust anchors) into it; an invalid CA
-    // is returned here as an SDS NACK while the prior config keeps serving.
+    // An accepted SDS secret goes straight to `SdsSecretRegistry`, for the
+    // same reason as `endpoint_sink`. Validation contexts rebuild and swap the
+    // ServerConfig, because rustls bakes the trust anchors into it. An invalid
+    // CA is NACKed while the prior config keeps serving.
     let secret_registry = Arc::clone(secret_registry);
     let secret_sink: PublishSecrets = Box::new(move |update| {
         let secret_registry = Arc::clone(&secret_registry);
@@ -2946,43 +2813,17 @@ fn build_readiness_probe(
     })
 }
 
-/// Starts the read-only admin server (`proxy-admin`) when
-/// `admin` names a bind address; binds nothing and returns `Ok(None)`
-/// otherwise -- the admin surface is opt-in, never automatic.
+/// Starts the read-only admin server when `admin` names a bind address. It
+/// binds nothing and returns `Ok(None)` otherwise. The admin surface is opt-in.
 ///
-/// The admin server's [`WorkerConfigHandle`](proxy_core::WorkerConfigHandle) is obtained from
-/// `snapshot_handles` -- the SAME [`SnapshotHandles`] registry
-/// [`WorkerPool::spawn`] enrolls every worker's handle into, further down in
-/// `run_serve`. That is what makes `/config_dump` and `/clusters` track a
-/// SIGHUP reload: `reload`'s call to `ConfigPublisher::publish` walks the
-/// registry, not a hand-picked list of workers, so the admin handle gets the
-/// new snapshot in the same store as everyone else's. (Before this, the admin
-/// server built its own private `WorkerConfigHandle` here, outside that
-/// registry entirely -- `publish` had no way to reach it, so `/config_dump`
-/// kept serving the boot snapshot forever.)
+/// The admin handle comes from the same [`SnapshotHandles`] registry that
+/// `ConfigPublisher::publish` walks. That is what makes `/config_dump` and
+/// `/clusters` follow a SIGHUP reload. A private handle outside the registry
+/// would keep serving the boot snapshot.
 ///
-/// `registry` is the same [`proxy_observability::stats::Registry`]
-/// `run_serve` hands to every worker's [`RouterStats`](proxy_http::stat_handles::RouterStats)
-/// -- built once, from a single [`StatsControl`](proxy_observability::stats::StatsControl),
-/// in `run_serve` itself, because the workers need the exact same registry,
-/// not a second, disconnected one. `/stats` reports real `upstream_rq`/`upstream_rq_time`
-/// traffic for every cluster the boot snapshot named, and `reload`'s call to
-/// `StatHandles::resolve_missing` keeps that true for a cluster a later
-/// config reload introduces too -- see `proxy_http::stat_handles`'s module
-/// doc for the two instruments' call sites.
-///
-/// A bind failure is returned as an `Err`, not swallowed: `run_serve` turns
-/// it into a startup failure, holding the admin port to the same standard
-/// `initial_bind` holds every listener port to.
-///
-/// `factory_state` is `run_serve`'s ONE per-serve [`proxy_http::filter::SharedFactoryState`]
-/// -- the admin write API resolves its `ControlPlane` out of it per request
-/// (see `proxy_admin::server`'s module doc for why that resolution can't
-/// happen here or at `serve()` time: this function runs before the worker
-/// pool spawns, so nothing has registered into the slot yet). This function
-/// also reads [`ADMIN_TOKEN_ENV_VAR`] once and passes the result to
-/// `proxy_admin::serve` as a plain parameter, per that function's own doc on
-/// why it never reads the environment itself.
+/// A bind failure is returned as `Err`, so `run_serve` treats it as a startup
+/// failure. `ADMIN_TOKEN_ENV_VAR` is read once here and passed to
+/// `proxy_admin::serve` as a plain parameter.
 struct AdminStartRuntime<'a> {
     snapshot: Arc<ConfigSnapshot>,
     registry: Arc<proxy_observability::stats::Registry>,

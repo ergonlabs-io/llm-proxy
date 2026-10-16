@@ -1,11 +1,10 @@
 //! The real `llm-proxy` binary reaching a TLS-terminating control plane
 //! (`testing/controlplane`'s `Harness::spawn_tls`) over the ADS cluster's
-//! `UpstreamTlsContext` (architecture.md section 11, H7).
+//! `UpstreamTlsContext` (architecture.md section 11).
 //!
-//! Each test checks the wire: the harness either records the proxy's
-//! discovery requests (TLS worked) or counts a refused handshake (the proxy
-//! dialled and TLS failed), so a proxy that never dialled cannot pass the
-//! negative case. Every port is ephemeral and every wait is bounded.
+//! Each test checks the wire. The harness either records discovery requests
+//! (TLS worked) or counts a refused handshake, so a proxy that never dialled
+//! cannot pass the negative case.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;

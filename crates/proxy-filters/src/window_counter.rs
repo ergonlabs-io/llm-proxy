@@ -1,60 +1,14 @@
-//! Rate-limit counters for `llmproxy.token_limit`: tier-3 window counters and
-//! tier-4 concurrent-stream gauges (ADR-0006, amendment and addendum of
-//! 2026-10-15).
+//! Tier-3 window counters and tier-4 concurrent-stream gauges for
+//! `llmproxy.token_limit` (ADR-0006). Admission uses local `base + pending`
+//! under a short lock and never calls the store; a control-side thread
+//! reconciles additive deltas. Windows are epoch-aligned and keyed by subject,
+//! dimension, and window, so changing a limit preserves current usage.
 //!
-//! # Window counters: accumulate locally, reconcile through the store
-//!
-//! Tokens per window and requests per window use spend's shape
-//! ([`crate::spend::SpendAccumulator`]). A worker admits against
-//! `base + pending` and records into `pending` under one short lock; it never
-//! touches the store (addendum §1: admission never reads the store, in any
-//! mode). A control-side flusher thread sends `pending` as additive deltas,
-//! deduplicated by `(node_id, seq)`, and adopts each total the store returns
-//! as the new `base`. `base` is therefore the fleet total the store last
-//! confirmed, and `pending` is this replica's share not yet delivered.
-//!
-//! The backend is whatever `auth.store` selects, through
-//! [`ControlPlaneStore`]'s window rows. With the in-memory store the
-//! accumulator is exact; with a shared store every replica converges on the
-//! fleet total one reconcile interval behind (amendment G).
-//!
-//! Windows are wall-clock keys aligned to the epoch ([`WindowKey`],
-//! amendment B), so every replica names the same minute the same way. A
-//! caller's first window can therefore be shorter than the configured length.
-//! Counters are keyed by subject, dimension and window, never by the limit
-//! (amendment C): the limit is compared at admission, so changing it keeps
-//! the current counts.
-//!
-//! A replica learns another replica's usage only for subjects it has a
-//! bucket for: a subject it has never served reads as zero until its first
-//! request creates a bucket and the next reconcile fills `base`. That is the
-//! accepted cost of keeping the store off the admission path.
-//!
-//! # Small limits: early flush
-//!
-//! When a bucket's pending count passes a quarter of its remaining allowance,
-//! the worker wakes the flusher (addendum §2). The worker only signals; the
-//! flush itself runs on the flusher thread. This bounds a multi-replica burst
-//! by the allowance rather than by the reconcile interval.
-//!
-//! # Store outage: fail open, loudly
-//!
-//! A failed reconcile keeps enforcing against the last confirmed base plus
-//! local activity (ADR-0006 §5). Past the reconciliation bound the
-//! accumulator counts each admission it makes while unreconciled and warns,
-//! at most once per [`STALE_WARN_INTERVAL`] (AGENTS.md "Fail-open controls").
-//!
-//! # Concurrent streams: a local gauge and a lease store
-//!
-//! Concurrency is a gauge, not a counter. [`LeaseGauge`] admits when
-//! `local_in_flight + others_last_known < limit` and hands back a
-//! [`StreamLease`] that frees the slot when dropped. A publisher thread
-//! writes this replica's in-flight count per subject to a [`LeaseStore`] with
-//! a TTL and keeps `fleet_sum - own_published` as `others_last_known`
-//! (amendment E). Each publish returns the fleet sums of every subject in the
-//! scope, so a replica that has never served a subject still counts the
-//! streams other replicas hold for it. With [`InMemoryLeaseStore`] there are
-//! no other replicas, so the gauge is exact.
+//! On store failure, enforcement uses the last confirmed base plus local
+//! activity and warns after the reconciliation bound (ADR-0006 §5; AGENTS.md
+//! "Fail-open controls"). Stream leases publish per-replica counts with a TTL;
+//! each publish returns fleet totals for the whole scope, including unseen
+//! subjects (ADR-0006 amendment E).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

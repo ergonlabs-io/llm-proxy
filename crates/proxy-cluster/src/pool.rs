@@ -1,13 +1,10 @@
-//! v1 upstream connection pool: connect-per-stream, no
-//! reuse. [`ConnectPool::new_stream`] dials a fresh TCP connection for every
-//! call, hands it to the cluster's transport socket (plaintext passthrough or
-//! a TLS handshake), and returns the resulting byte stream as an
-//! [`UpstreamStream`] -- the router runs the h1/h2 codec over it.
+//! v1 upstream connection pool: connect-per-stream, with no reuse. [`ConnectPool::new_stream`] dials a fresh
+//! TCP connection per call, wraps it in the cluster's transport socket (plaintext or TLS), and returns an
+//! [`UpstreamStream`] for the router's h1 or h2 codec.
 //!
-//! There is no keep-alive reuse, no h2 multiplexing, and no connection-level
-//! circuit breaking yet; all of that is follow-up work (see the `TODO`
-//! on [`UpstreamStream`]). The pool is protocol-agnostic: it produces bytes,
-//! and the router picks the codec from the cluster's `upstream_protocol`.
+//! There is no keep-alive reuse, no h2 multiplexing, and no connection-level circuit breaking yet (see the
+//! `TODO` on [`UpstreamStream`]). The pool is protocol-agnostic: it produces bytes, and the router picks the
+//! codec from `upstream_protocol`.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -21,38 +18,26 @@ use futures::future::BoxFuture;
 use crate::transport::UpstreamTransportSocket;
 use crate::{CircuitBreakerState, HttpConnPool, PoolError, UpstreamStream};
 
-/// Identifies one *build* of a cluster, so a worker's connection caches can
-/// tell a connection dialed under the cluster as it is now from one dialed
-/// under a build the control plane has since replaced.
+/// Identifies one *build* of a cluster, so a worker's connection caches can tell a connection dialed under the
+/// current build from one dialed under a build the control plane has since replaced.
 ///
-/// A cluster whose config changes is rebuilt from scratch
-/// (`ClusterManager::update_from_snapshot`): new transport socket, so new TLS
-/// trust roots and client certificates, and new circuit-breaker gauges. Its
-/// name and endpoint addresses are usually unchanged, so a cache keyed on
-/// those alone would hand the new build a connection that was negotiated under
-/// the old settings. This id is the part of the cache key that changes when the
-/// build does.
+/// A changed cluster is rebuilt from scratch (`ClusterManager::update_from_snapshot`) with a new transport socket
+/// (new TLS trust roots and client certificates) and new circuit-breaker gauges. Its name and addresses are often
+/// unchanged, so a cache keyed on those alone would reuse a connection negotiated under the old settings. This id
+/// is the part of the key that changes when the build does.
 ///
-/// It is the identity of the build's `max_connections` gauge, which is the one
-/// per-build object a caller can reach through the public `ClusterEntry`
-/// surface (`circuit_breaker`), and the object a pooled connection is accounted
-/// against for its whole life. Every `ConnectPool` built for a cluster clones
-/// that gauge, so all of them share one id, and a carried-forward cluster
-/// keeps it across unrelated reloads.
+/// It is the identity of the build's `max_connections` gauge, the one per-build object reachable through
+/// `ClusterEntry::circuit_breaker`. Every `ConnectPool` for a cluster clones that gauge, so they share one id, and a
+/// carried-forward cluster keeps it across unrelated reloads.
 ///
-/// Rust note: equality is `Arc::ptr_eq`, not a comparison of the counter's
-/// value, and the id holds a strong clone of the `Arc`. Holding it is what
-/// rules out an address being freed and reused by a later build while an id
-/// for the old one still sits in a map: the allocation cannot be freed while
-/// any clone is alive, so two live ids with the same address are always the
-/// same build.
+/// Rust note: equality is `Arc::ptr_eq`, and the id holds a strong `Arc` clone. That stops an address from being
+/// freed and reused by a later build while the old id is still in a map.
 #[derive(Clone)]
 pub struct ClusterBuildId(Arc<AtomicU32>);
 
 impl ClusterBuildId {
-    /// The id of the build that owns `breaker`. Pass the budget the cluster's
-    /// pools charge for dials (`ClusterEntry::circuit_breaker` with the
-    /// priority `http_pool` uses), or two builds can collide on one id.
+    /// The id of the build that owns `breaker`. Pass the budget the cluster's pools charge dials to, or two builds
+    /// can collide on one id.
     pub fn of(breaker: &CircuitBreakerState) -> Self {
         Self(breaker.connections_counter())
     }
@@ -87,32 +72,15 @@ impl fmt::Debug for ClusterBuildId {
 pub struct ConnectPool {
     addr: SocketAddr,
     transport: Arc<dyn UpstreamTransportSocket>,
-    /// The name handed to the transport socket for SNI / certificate
-    /// verification: the endpoint's configured DNS name where there is one,
-    /// otherwise the IP literal. See [`crate::Host::hostname`].
+    /// The name for SNI and certificate verification: the configured DNS name if there is one, else the IP
+    /// literal. See [`crate::Host::hostname`].
     server_name: String,
-    /// `ClusterConfig::connect_timeout` (Envoy default 5s). Bounds the
-    /// *whole* job of getting a usable upstream connection: the TCP connect
-    /// AND the transport socket's `wrap` (TLS handshake), as one shared
-    /// budget rather than one timeout per phase.
-    ///
-    /// Envoy's own `connect_timeout` is documented as the time allowed to
-    /// establish a connection, and Envoy's transport-socket handshake runs
-    /// inside that same connecting window (`ConnectionImpl` doesn't start a
-    /// second timer for the TLS handshake) -- so a single budget spanning
-    /// both phases here matches Envoy's semantics, not just the easiest
-    /// implementation. A slow-loris TLS peer that completes the TCP SYN/ACK
-    /// instantly but never finishes the handshake would sail past a
-    /// TCP-only timeout; wrapping both phases in the same deadline closes
-    /// that gap.
+    /// `ClusterConfig::connect_timeout` (Envoy default 5s). One budget covers the TCP connect and the transport
+    /// `wrap` (TLS handshake) together, as in Envoy's connecting window. A TCP-only timeout would let a peer that
+    /// accepts the SYN and then stalls the handshake hold the connection forever.
     connect_timeout: Duration,
-    /// The cluster's S5 `max_connections` AND `max_pending_requests` budgets.
-    /// A whole [`CircuitBreakerState`] clone, not a borrow -- it
-    /// shares the same underlying gauge (`CircuitBreakerState` is
-    /// `Clone`-and-shared, see its own doc), so every per-call `ConnectPool`
-    /// built for a cluster (`ClusterHandle::http_pool` makes a fresh one per
-    /// call) still enforces one global count. `new_stream` uses both: a
-    /// caller that can't get a connection slot right away parks, holding a
+    /// The cluster's S5 `max_connections` and `max_pending_requests` budgets. A clone of the shared state, so every
+    /// per-call pool counts against one global limit. `new_stream` parks a caller that cannot get a slot, holding a
     /// pending slot, until one frees or `connect_timeout` elapses.
     connections: CircuitBreakerState,
 }
@@ -135,27 +103,13 @@ impl ConnectPool {
     }
 }
 
-/// Project a failed `TcpStream::connect` onto the right [`PoolError`].
+/// Projects a failed `TcpStream::connect` onto a [`PoolError`]. Most failures are `ConnectFailure` (Envoy `UF`).
+/// `ConnectionReset` and `ConnectionAborted` mean the peer accepted and then reset the connection, which is Envoy's
+/// `UR`, so they map to `ResetBeforeHeaders`. The distinction changes retry behavior: a reset is retriable under
+/// S3.2's `reset` policy, and a connect failure under `connect-failure`.
 ///
-/// Almost every connect failure is a genuine "never got a connection" and
-/// maps to [`PoolError::ConnectFailure`] -> Envoy `UF` (connection refused,
-/// host unreachable, timeout surfaced as an error, ...). Two kinds are
-/// different: `ConnectionReset` (`ECONNRESET`) and `ConnectionAborted`
-/// (`ECONNABORTED`) mean the peer accepted or half-accepted the connection
-/// and then *reset* it, rather than never answering -- which is Envoy's `UR`
-/// (upstream remote reset), not `UF`. Splitting them out is what finally
-/// *constructs* [`PoolError::ResetBeforeHeaders`]: the variant, its
-/// `from_pool_error` -> `ResetBeforeHeaders` mapping, and the router arm that
-/// turns it into `UR` all already existed, but nothing produced it, so a
-/// connect-time reset reported `UF`. A reset before any response headers is
-/// retriable under S3.2's `reset`, whereas a plain connect failure is
-/// retriable under `connect-failure` -- so the distinction changes retry
-/// behaviour, not only the logged flag.
-///
-/// Rust note: `io::Error` is matched on its `ErrorKind` (a `Copy` enum) via
-/// `.kind()`, leaving the original error owned to move into the
-/// `ConnectFailure` arm unchanged -- so the `{0}` in `PoolError`'s `#[error]`
-/// still carries the OS message.
+/// Rust note: `.kind()` matches on the `Copy` `ErrorKind`, leaving the `io::Error` owned for the `ConnectFailure`
+/// arm, so its OS message survives.
 fn classify_connect_error(err: std::io::Error) -> PoolError {
     match err.kind() {
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
@@ -167,64 +121,37 @@ fn classify_connect_error(err: std::io::Error) -> PoolError {
 
 impl HttpConnPool for ConnectPool {
     fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>> {
-        // Rust note: the returned future is `'static` (it may outlive this
-        // call, e.g. spawned onto a task), so it can't borrow `self`. Copy
-        // `addr`/`connect_timeout` out (both `Copy`) and clone the
-        // `Arc`/`String` into the `async move` block instead.
+        // Rust note: the returned future is `'static` and may outlive this call, so it cannot borrow `self`. Copy the
+        // `Copy` fields out and clone the `Arc`s and `String`s into the `async move` block.
         let addr = self.addr;
         let transport = Arc::clone(&self.transport);
         let server_name = self.server_name.clone();
         let connect_timeout = self.connect_timeout;
         let connections = self.connections.clone();
         Box::pin(async move {
-            // S5's `max_connections` and `max_pending_requests`: a
-            // connection slot is claimed before the dial so an over-budget
-            // cluster never opens the socket, but a caller that loses that
-            // race no longer overflows immediately -- it parks, holding a
-            // pending-queue slot, until either a slot frees or the deadline
-            // below elapses. `CbGuard` is `Send + 'static`, so it's fine to
-            // hold across the `.await`s here; if anything after acquiring it
-            // returns early via `?` (connect/handshake failure, timeout),
-            // the guard drops right there and releases the slot -- exactly
-            // the "failed dial doesn't leak budget" behaviour this exists
-            // for.
+            // S5's `max_connections` and `max_pending_requests`: claim a connection slot before dialing, so an
+            // over-budget cluster never opens a socket. A caller that loses the race parks in the pending queue until
+            // a slot frees or the deadline passes. The guard releases the slot on any early `?` return, so a failed
+            // dial does not leak budget.
             //
-            // Rust note: the whole "acquire-or-park, then dial" job runs
-            // inside one `tokio::time::timeout`, so a park that never gets a
-            // slot fails through the exact same path as a dial that never
-            // connects -- `PoolError::ConnectTimeout`, not a new variant.
-            // This is a deliberate MVP simplification: Envoy bounds a
-            // pending request by the *request* timeout, not the connect
-            // timeout, so a request configured with a long request timeout
-            // but a short `connect_timeout` will shed load here sooner than
-            // Envoy would. Flagged for later work, not a gap anyone
-            // is meant to rely on.
+            // Rust note: acquire-or-park and dial share one `tokio::time::timeout`, so a park that never gets a slot
+            // fails the same way as a dial that never connects. Envoy bounds a pending request by the request timeout,
+            // not the connect timeout. This is an MVP simplification: a long request timeout with a short
+            // `connect_timeout` sheds load here sooner than Envoy would.
             let (guard, connected) = tokio::time::timeout(connect_timeout, async {
                 let guard = match connections.try_acquire_connection() {
                     Some(guard) => guard,
                     None => {
-                        // Saturated: try to park instead of shedding
-                        // immediately. This acquire has its own bound
-                        // (`max_pending_requests`), so a cluster that's both
-                        // fully connected AND fully queued still overflows
-                        // right here rather than growing an unbounded
-                        // waiter list.
+                        // Saturated: park in the pending queue, which has its own bound (`max_pending_requests`), so
+                        // a cluster that is fully connected and fully queued still overflows here.
                         let pending_guard = connections
                             .try_acquire_pending()
                             .ok_or(PoolError::Overflow)?;
                         let notify = connections.connections_notify();
                         let guard = loop {
-                            // Rust note: `notify.notified()` must be created
-                            // (armed) BEFORE re-checking
-                            // `try_acquire_connection`, not after. If we
-                            // checked first and only then armed `notified`,
-                            // a slot released in between the two would call
-                            // `notify_one()` while nobody was listening yet
-                            // -- that wakeup is simply lost, and we'd wait
-                            // for a release that already happened.
-                            // Registering the waiter first means any release
-                            // from this point onward is guaranteed to
-                            // resolve `notified`.
+                            // Rust note: arm `notified()` BEFORE re-checking `try_acquire_connection`. A slot released
+                            // between the check and the arm would call `notify_one()` with no waiter, and that wakeup
+                            // would be lost.
                             let notified = notify.notified();
                             tokio::pin!(notified);
                             if let Some(guard) = connections.try_acquire_connection() {
@@ -265,17 +192,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// A generous timeout for tests that expect to succeed quickly -- large
-    /// enough that it never fires under normal test-machine load, so it
-    /// can't be the reason a non-timeout test flakes.
+    /// Large enough that it never fires under normal test load, so it cannot cause a flake.
     const AMPLE_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
     fn classify_connect_error_splits_reset_from_plain_failure() {
-        // A peer that reset the (half-)connection -> `ResetBeforeHeaders`
-        // (Envoy `UR`), NOT `ConnectFailure`. This is the one behaviour that
-        // makes `PoolError::ResetBeforeHeaders` reachable at all from the
-        // connect path -- see `classify_connect_error`'s own doc.
+        // A reset (half-)connection maps to `ResetBeforeHeaders` (Envoy `UR`), not `ConnectFailure`. This is the one
+        // path that makes `PoolError::ResetBeforeHeaders` reachable from connect; see `classify_connect_error`.
         for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted] {
             match classify_connect_error(std::io::Error::from(kind)) {
                 PoolError::ResetBeforeHeaders => {}
@@ -326,9 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_stream_surfaces_connect_failure() {
-        // Bind a listener, learn its address, then drop it so nothing is
-        // listening there -- reliably refused on loopback rather than
-        // relying on a "probably unused" fixed port.
+        // Bind, learn the port, then drop the listener. Nothing listens there, so the connect is refused on loopback.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -345,9 +266,8 @@ mod tests {
 
     #[tokio::test]
     async fn transport_socket_handshake_failure_is_reported_separately() {
-        // A transport socket that always fails stands in for a TLS handshake
-        // that can't complete: the TCP connect succeeded, so the error must
-        // come back as `TlsHandshake`, not `ConnectFailure`.
+        // The transport fails on purpose. The TCP connect succeeds, so the error must come back as `TlsHandshake`,
+        // not `ConnectFailure`.
         struct FailingTransport;
         impl UpstreamTransportSocket for FailingTransport {
             fn wrap(
@@ -410,25 +330,12 @@ mod tests {
         );
     }
 
-    /// TEST-NET-1 (RFC 5737, `192.0.2.0/24`) is reserved for documentation:
-    /// nothing routes it, so a SYN sent there is silently dropped rather than
-    /// answered with an RST -- the "blackhole" a connect-timeout test needs,
-    /// as opposed to a refused connect (which returns immediately and proves
-    /// nothing about the timeout path). This is deliberately NOT the same
-    /// trick `new_stream_surfaces_connect_failure` uses (bind-then-drop),
-    /// which resolves fast because something *did* answer, just with a
-    /// refusal.
+    /// TEST-NET-1 (RFC 5737, `192.0.2.0/24`) is reserved for documentation and nothing routes it. A SYN there is
+    /// dropped rather than refused, which gives a real blackhole for the timeout path. This differs from the
+    /// bind-then-drop trick in `new_stream_surfaces_connect_failure`, where something answers with a refusal.
     ///
-    /// Hermeticity: this makes no real network trip -- `192.0.2.0/24` is
-    /// non-forwarded per RFC 5737 and the kernel routes the SYN out but
-    /// nothing on the link ever responds, so there's no DNS lookup and no
-    /// dependency on an external host being reachable. The residual
-    /// assumption is that the test host's own network stack doesn't
-    /// immediately reject the destination as unreachable (e.g. "no route to
-    /// host") before the timeout fires; that has held on both macOS and
-    /// Linux CI in this repo's experience, but it is a property of the local
-    /// routing table, not a guarantee, so this is "hermetic in practice",
-    /// not "hermetic by protocol".
+    /// Hermetic in practice, not by protocol: no DNS, no external host. It assumes the local routing table does not
+    /// reject the destination before the timeout fires, which holds on macOS and Linux CI.
     const BLACKHOLE_ADDR: &str = "192.0.2.1:80";
 
     #[tokio::test]
@@ -446,9 +353,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         match pool.new_stream().await {
             Err(PoolError::ConnectTimeout) => {
-                // Loose, one-sided bound: "took at least the configured
-                // timeout", never a tight window -- this repo has already
-                // lost a session to a test misdiagnosed as timing-flaky.
+                // Loose, one-sided bound: "took at least the configured timeout". Never a tight window.
                 assert!(
                     started.elapsed() >= short_timeout,
                     "timeout fired before the configured duration elapsed"
@@ -461,10 +366,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_stream_times_out_a_handshake_that_never_completes() {
-        // A transport socket whose `wrap` never resolves stands in for a TLS
-        // peer that completes the TCP handshake but stalls the handshake
-        // itself (slow-loris) -- proving the timeout budget covers `wrap`,
-        // not just `TcpStream::connect`.
+        // The transport's `wrap` never resolves, standing in for a TLS peer that completes TCP but stalls the
+        // handshake. This proves the timeout covers `wrap`, not only the connect.
         struct HangingTransport;
         impl UpstreamTransportSocket for HangingTransport {
             fn wrap(
@@ -512,16 +415,8 @@ mod tests {
 
     #[tokio::test]
     async fn max_connections_is_enforced_at_dial_and_released_on_drop() {
-        // S5's `max_connections`: a cluster with a budget of 1 must
-        // reject a second concurrent dial with `PoolError::Overflow`, and
-        // must accept a new dial again once the first connection is dropped
-        // -- acquire, reject-at-limit, and release-on-drop, in one test.
-        //
-        // `max_pending_requests: 0` here is deliberate: this test is about
-        // `max_connections` specifically, not the parking queue (that's
-        // `second_request_parks_...` and friends, below), so it closes the
-        // pending queue to keep the old "saturated connections overflow
-        // immediately" behaviour rather than parking.
+        // Acquire, reject at the limit, and release on drop, in one test. `max_pending_requests: 0` closes the parking
+        // queue, so this tests `max_connections` alone and saturated connections overflow at once.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let one_connection = proxy_config::ir::CircuitBreakerThresholds {
@@ -573,10 +468,8 @@ mod tests {
 
     #[tokio::test]
     async fn second_request_parks_then_completes_when_a_connection_slot_frees() {
-        // With the connection budget saturated but a pending slot
-        // free, a second concurrent request must PARK rather than overflow
-        // immediately, and must complete once the first connection's
-        // `CbGuard` drops and wakes it.
+        // With connections saturated and a pending slot free, a second request must PARK and then complete once the
+        // first connection's guard drops.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let pool = one_connection_one_pending(addr, AMPLE_TIMEOUT);
@@ -584,29 +477,19 @@ mod tests {
         let first = pool.new_stream().await.expect("first dial is under budget");
         let (_accepted1, _client_addr1) = listener.accept().await.unwrap();
 
-        // Spawn so the main task can keep running while the second request
-        // parks -- `new_stream()`'s returned future is already `'static`
-        // and boxed, so it can be handed to `tokio::spawn` directly without
-        // moving `pool` itself.
+        // Spawned so the main task can keep running while the second request parks.
         let second_handle = tokio::spawn(pool.new_stream());
 
-        // Give it a moment to actually reach the parked state, then confirm
-        // it's still pending -- proving this exercises the park path rather
-        // than a lucky race where it happened to finish first.
+        // Give it time to reach the parked state, so this exercises the park path and not a race that finished early.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !second_handle.is_finished(),
             "second request should still be parked while the only connection slot is held"
         );
 
-        // Freeing the held connection's `CbGuard` must wake the parked
-        // waiter -- bound the join with an outer timeout so a broken wakeup
-        // fails the test instead of hanging it. Unwrap all the way down to
-        // the `UpstreamStream` BEFORE touching `listener` again: if the
-        // parked dial never actually happened (e.g. it failed instead of
-        // succeeding), there's nothing incoming for `accept()` to receive,
-        // and calling it first would trade a clear assertion failure for a
-        // second, unrelated hang.
+        // Freeing the first connection must wake the parked waiter. The outer timeout turns a broken wakeup into a
+        // failure, not a hang. Unwrap down to the `UpstreamStream` before touching `listener`: if the parked dial
+        // failed, nothing is incoming, and `accept()` would add a second hang.
         drop(first);
         let second = tokio::time::timeout(AMPLE_TIMEOUT, second_handle)
             .await
@@ -619,9 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn third_concurrent_request_overflows_once_pending_queue_is_also_full() {
-        // Connections AND pending both saturated (1 held, 1 parked)
-        // must shed a third concurrent request immediately with
-        // `PoolError::Overflow`, not grow the waiter list further.
+        // With connections and pending both saturated, a third request sheds at once with `Overflow`.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let pool = one_connection_one_pending(addr, AMPLE_TIMEOUT);
@@ -642,10 +523,8 @@ mod tests {
             Ok(_) => panic!("third request must be shed once the pending queue is also full"),
         }
 
-        // Clean up: free the connection so the parked second request (and
-        // its background task) don't outlive the test. Unwrap fully before
-        // touching `listener` again -- see the sibling test's comment on
-        // why that ordering matters.
+        // Free the connection so the parked request and its task do not outlive the test. Unwrap before touching
+        // `listener`, as above.
         drop(first);
         let second = tokio::time::timeout(AMPLE_TIMEOUT, second_handle)
             .await
@@ -658,10 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn parked_request_times_out_if_a_connection_slot_never_frees() {
-        // A parked request is bounded by `connect_timeout`, not left to
-        // wait forever -- see `new_stream`'s doc for why `connect_timeout`
-        // rather than a request timeout is the (deliberately stricter) MVP
-        // bound.
+        // A parked request is bounded by `connect_timeout`, not left to wait forever.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let short_timeout = Duration::from_millis(200);
@@ -673,10 +549,7 @@ mod tests {
         let (_accepted1, _client_addr1) = listener.accept().await.unwrap();
 
         let started = tokio::time::Instant::now();
-        // Outer bound is defensive only: if the implementation regresses
-        // back to an unbounded park, fail the test instead of hanging the
-        // suite (nextest's `terminate-after` would otherwise be what
-        // catches this, minutes later).
+        // The outer bound makes a regression to an unbounded park fail the test instead of hanging the suite.
         match tokio::time::timeout(Duration::from_secs(5), pool.new_stream()).await {
             Ok(Err(PoolError::ConnectTimeout)) => {
                 assert!(

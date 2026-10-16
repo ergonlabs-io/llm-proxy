@@ -1,42 +1,16 @@
 //! `llmproxy.model_resolver`: resolves the reserved model name `auto` to a
 //! configured model alias.
 //!
-//! # Where it sits
+//! It reads tenant identity from auth and the requested model from
+//! `body_rewrite`; config validation enforces that order and places
+//! `model_authz` afterward. For `auto`, it publishes the resolved alias and
+//! updates the routing header, while the router rewrites the body after the
+//! upstream cluster is selected. Authorization checks the alias, and usage
+//! retains the original request model (AGENTS.md "Policy Domains").
 //!
-//! The filter needs the tenant `llmproxy.auth` writes
-//! (`StreamInfo::auth.tenant`) and the model `llmproxy.body_rewrite`
-//! extracts (`StreamInfo::requested_model`), and `llmproxy.model_authz` must
-//! check what it resolved. `proxy_config::lower::check_lane_h_filter_order`
-//! enforces auth, body_rewrite, model_resolver, model_authz at config load.
-//!
-//! # What resolving does
-//!
-//! A request whose model is not `auto` passes through untouched. For `auto`,
-//! the filter writes the chosen alias to `StreamInfo::resolved_model`,
-//! rewrites the `x-llmproxy-model` routing header to it, and clears the route
-//! cache, so the alias's route and fallback chain select the provider. The
-//! request body still says `auto`: the router replaces the body's `model`
-//! once the upstream cluster is known (`router::rewrite_cluster_provider_model`),
-//! and `requested_model` keeps `auto` so usage records show both.
-//!
-//! The resolver picks a model alias, never a provider (AGENTS.md "Policy
-//! Domains": tenants never select providers). It also never widens access:
-//! `llmproxy.model_authz` authorizes the resolved alias, not `auto`.
-//!
-//! # No rule means refused
-//!
-//! A tenant with no rule, when no `default_model` is configured, gets a 400.
-//! Unset never routes to a guessed model. A request with no authenticated
-//! tenant is treated like a tenant with no rule: it gets the default when one
-//! exists. That bypasses nothing, since the same caller could name the default
-//! model directly, and `llmproxy.model_authz` still applies.
-//!
-//! # Decided in the data phase
-//!
-//! `body_rewrite` publishes the model from its `decode_data`, so a header-phase
-//! read would always see `None`; see `model_authz_filter`'s module doc for the
-//! same constraint. The decision runs at end of stream, or from
-//! `decode_trailers` for a trailered request, exactly once per stream.
+//! Resolution runs after request data is available, at end-of-stream or
+//! trailers. Missing rules without a default are refused; a configured default
+//! still passes through model authorization.
 
 use std::collections::HashMap;
 use std::sync::Arc;

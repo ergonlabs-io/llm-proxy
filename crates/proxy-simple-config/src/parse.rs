@@ -1,9 +1,6 @@
-//! Dialect parsing: `${VAR}` env interpolation -> strict YAML parse ->
-//! semantic validation (checks the schema cannot express, like route ->
-//! provider references).
-//!
-//! Same error-quality bar as Envoy mode: every failure names a field path or
-//! the offending value; unknown fields are always errors.
+//! Interpolate environment variables, parse strict YAML, then validate
+//! semantic constraints such as route-to-provider references. Errors retain
+//! field paths and unknown fields are always rejected.
 
 use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
@@ -278,18 +275,10 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         }
     }
 
-    // `routes:` references, checked only now that the `models:` loop above has
-    // validated every entry -- `dialect_from_models` reads those entries, and
-    // a models-surface error deserves its own more specific message first.
-    //
-    // A `ProviderModelRef` is `{ provider, model }` and nothing else: only
-    // `models:`'s object form carries `dialect`. So for a dialect-ambiguous
-    // type the wire format has to come from a `models:` entry, and when none
-    // pins it the old behaviour was to answer `openai` silently. That sends an
-    // Anthropic-shaped response to the OpenAI usage parser, which reads no
-    // usage at all, which lets the token limiter fail open (it warns now, but
-    // it still admits the request uncharged) -- a quota bypass produced by a
-    // config the loader accepted. AGENTS.md invariant 1: name the path and refuse.
+    // Validate model entries first so dialect lookup cannot mask a more
+    // specific models error. Ambiguous provider types require an explicit
+    // dialect: guessing can make usage parsing fail and bypass token charging
+    // (AGENTS.md "Architecture Invariants", 1).
     for (i, route) in config.routes.iter().enumerate() {
         check_route_ref_dialect(config, &route.provider, &format!("routes[{i}].provider"))?;
         for (j, fallback) in route.fallbacks.iter().enumerate() {
@@ -349,13 +338,8 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// `models.<name>.max_output_tokens` checks. A cap of 0 would make every
-/// request unservable, so it is refused rather than read as "no cap".
-///
-/// The cap also cannot be combined with `auto:`. It is read from the route the
-/// requested model selects, which for `auto` is not the route of the model the
-/// resolver then picks, so the cap of the resolved model would silently not
-/// apply. Refusing the combination keeps the cap from failing open.
+/// A zero cap blocks every request. `auto:` cannot use this cap because it is
+/// read from the requested model's route, not the resolved model's route.
 fn validate_output_caps(config: &SimpleConfig) -> Result<(), ConfigError> {
     for (name, model) in &config.models {
         let Some(cap) = model.max_output_tokens else {
@@ -384,10 +368,8 @@ fn validate_output_caps(config: &SimpleConfig) -> Result<(), ConfigError> {
 /// The reserved model name `auto:` resolves.
 const AUTO_MODEL: &str = "auto";
 
-/// `auto:` checks. Every target must be a concrete model a route or `models`
-/// entry serves, so a resolved request never falls through to a 404. While
-/// `auto:` is set, `auto` itself is reserved: a route or model named exactly
-/// `auto` could never be reached.
+/// Every target must be served by a route or `models` entry. When `auto:` is
+/// configured, the name `auto` is reserved because it could not be reached.
 fn validate_auto(config: &SimpleConfig) -> Result<(), ConfigError> {
     let Some(auto) = &config.auto else {
         return Ok(());
@@ -748,10 +730,8 @@ fn check_provider_ref(
     Ok(())
 }
 
-/// A `routes:` provider reference must end up with a wire format that was
-/// *stated*, not guessed. For unambiguous types the type states it; for
-/// Vertex/Bedrock only a `models:` entry can, since the route surface has no
-/// `dialect` field -- see the call site for what guessing costs.
+/// Route references need an explicit dialect when provider type alone is
+/// ambiguous; routes have no `dialect` field, so Vertex/Bedrock use `models:`.
 fn check_route_ref_dialect(
     config: &SimpleConfig,
     reference: &ProviderModelRef,

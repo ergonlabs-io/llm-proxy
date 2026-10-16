@@ -1,29 +1,7 @@
-//! Acceptance: real traffic through the real
-//! `llm-proxy` binary produces real distributed-trace spans, propagates a
-//! W3C `traceparent` to the upstream leg, and exports the finished spans
-//! over a real OTLP/gRPC connection to a collector -- a mock one, but a real
-//! `tonic` server implementing the generated `TraceServiceServer`, not a
-//! stand-in for the wire protocol.
-//!
-//! Same rationale and shape as `tests/stats_e2e.rs` (see its module doc):
-//! only driving the compiled binary exercises `main.rs`'s real
-//! `run_serve`/`worker_main` wiring (the `SpanSink` construction and
-//! `otlp::run_exporter` task this WP actually adds), and asserting against
-//! `FinishedSpan`/`otlp::map_span` directly (already unit-tested, no
-//! network, in `proxy-observability`) would not prove any of it reaches a
-//! real collector in the real OTLP wire shape.
-//!
-//! `#[tokio::test(flavor = "multi_thread")]`, not the default
-//! `current_thread`: the mock collector's `tonic` server task and this
-//! test's own blocking waits (`wait_for_connectable`, `TcpStream` I/O) both
-//! need to make progress concurrently -- see AGENTS.md "Build And Test"'s account of
-//! exactly this hazard sinking `diffrig::mock_e2e` under a single-threaded
-//! runtime.
-//!
-//! AGENTS.md "Running The Product": every spawned process is a [`ChildGuard`] (killed on
-//! `Drop`, so a failing assertion partway through still leaves nothing
-//! running), ports are all ephemeral (`free_port`), and nothing here runs
-//! the binary in the foreground or skips a timeout.
+//! Drives the compiled proxy through real trace propagation and OTLP/gRPC export.
+//! The collector uses the generated `TraceServiceServer` to verify the wire path.
+//! A multi-thread runtime lets the server and blocking test waits progress together
+//! (AGENTS.md "Build And Test"); `ChildGuard` reaps spawned processes.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -52,18 +30,13 @@ use proxy_api::opentelemetry::proto::trace::v1::Span;
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 
-/// Same technique as `tests/stats_e2e.rs`'s `free_port` / `tests/cli.rs`'s
-/// own copy -- each `tests/*.rs` file is its own compiled crate, so this
-/// isn't shared, just duplicated.
+/// Reserves an ephemeral port. Each integration-test file is a separate crate.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
     listener.local_addr().expect("no local addr").port()
 }
 
-/// A reserved-then-immediately-dropped port: nothing is listening on it, so
-/// a connect attempt gets a real, near-instant ECONNREFUSED -- what the
-/// `primary` cluster below needs to force a genuine connect-failure attempt
-/// (not a slow timeout) on every run.
+/// Returns an unused loopback address for an immediate connection failure.
 fn dead_addr() -> SocketAddr {
     format!("127.0.0.1:{}", free_port()).parse().unwrap()
 }
@@ -112,9 +85,7 @@ fn drain_available_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
     lines
 }
 
-/// Kills and reaps a child process on drop -- see `tests/stats_e2e.rs`'s
-/// identical type for why (AGENTS.md "Running The Product": a hand-run process that
-/// outlives its test is a leak, not just a red test).
+/// Kills and reaps the child process on drop (AGENTS.md "Running The Product").
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
@@ -124,15 +95,7 @@ impl Drop for ChildGuard {
     }
 }
 
-/// The `fallback` cluster's mock upstream: answers every request `200 OK`,
-/// AND captures the `traceparent` header value it actually received --
-/// this is what proves propagation (`RouterHandler`'s `attempt_head.headers.insert`),
-/// not merely that a client span with the right parent got minted. If that
-/// injection were dropped, this would instead capture the DOWNSTREAM
-/// caller's own inbound `traceparent` (unmodified, since `attempt_head`
-/// starts as a clone of it) -- a different value from the child span's, so
-/// the mismatch is exactly the propagation mutation this
-/// file's task brief calls out.
+/// Answers `200 OK` and captures the propagated `traceparent`.
 fn spawn_capturing_mock_upstream() -> (SocketAddr, Arc<Mutex<Option<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
     let addr = listener.local_addr().expect("no local addr");
@@ -163,14 +126,7 @@ fn spawn_capturing_mock_upstream() -> (SocketAddr, Arc<Mutex<Option<String>>>) {
     (addr, captured)
 }
 
-/// A mock upstream that sleeps `delay` before answering every request --
-/// everything else identical to [`spawn_capturing_mock_upstream`].
-///
-/// This exists so a request can be made IN FLIGHT across SIGTERM: the drain
-/// sequence waits for connections that are already open (Gradual's close
-/// probability ramps over the whole window, and an in-flight request is given
-/// its full window), so the request completes after the signal but before the
-/// drain finishes -- and its counters must land in the final snapshot.
+/// Sleeps before answering so a request remains in flight across SIGTERM.
 fn spawn_slow_mock_upstream(delay: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
     let addr = listener.local_addr().expect("no local addr");
@@ -190,11 +146,7 @@ fn spawn_slow_mock_upstream(delay: Duration) -> SocketAddr {
     addr
 }
 
-/// Sends `GET <path>` with no `traceparent` at all. Same shape as
-/// `get_with_traceparent` minus the header -- used by the exporter independence tests,
-/// where a `traceparent` would make a failure ambiguous between "the trace
-/// export is wrongly on" and "the traceparent join is broken", and the two
-/// need to be distinguishable.
+/// Sends a request without `traceparent` to keep exporter and join failures distinct.
 fn get(addr: SocketAddr, path: &str, host: &str) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
@@ -236,12 +188,7 @@ fn get_with_traceparent(addr: SocketAddr, path: &str, host: &str, traceparent: &
     String::from_utf8_lossy(&response).to_string()
 }
 
-/// The mock OTLP collector: a real `TraceServiceServer` recording every span
-/// it receives into a shared `Vec`, flattened out of
-/// `resource_spans[].scope_spans[].spans` -- this proxy only ever sends one
-/// `ResourceSpans`/`ScopeSpans` per batch (see `otlp::flush`), but a real
-/// collector has to handle the general (possibly-multiple) shape, so this
-/// does too rather than assuming index `[0]`.
+/// Records spans from every `ResourceSpans` and `ScopeSpans` entry.
 #[derive(Clone, Default)]
 struct MockCollector {
     spans: Arc<Mutex<Vec<Span>>>,
@@ -282,20 +229,7 @@ impl MetricsService for MockCollector {
     }
 }
 
-/// Binds an ephemeral port synchronously (so the caller can embed it in the
-/// proxy's config before the collector itself finishes starting -- same
-/// "reserve, then let the real server rebind" pattern `free_port` documents
-/// elsewhere in this file), then spawns the mock collector on the current
-/// (multi-thread) tokio runtime. Returns the collector's shared span buffer,
-/// its shared `ResourceMetrics` buffer, and its
-/// address. Both `TraceService` and `MetricsService` are registered on the
-/// SAME `tonic` router/port -- exactly what a real OTLP/gRPC collector
-/// exposes (one endpoint, multiple services multiplexed by gRPC method
-/// path), and what `otlp::run_exporter` connects to: one `Channel`, two
-/// clients built from it.
-/// Named purely to keep [`spawn_mock_collector`]'s signature readable --
-/// clippy's `type_complexity` lint flagged the inline three-tuple form, same
-/// reasoning as `stats.rs`'s own `ResolveKey` alias.
+/// Serves trace and metric requests on one port and returns their buffers and address.
 type MockCollectorHandles = (
     Arc<Mutex<Vec<Span>>>,
     Arc<Mutex<Vec<ResourceMetrics>>>,
@@ -318,20 +252,7 @@ fn spawn_mock_collector() -> MockCollectorHandles {
     (spans, metrics, addr)
 }
 
-/// Polls `metrics` for a `Sum`-typed `Metric` named `name` whose data points'
-/// `AsInt` values total at least `min_total`, or until `deadline` (wall-clock)
-/// passes. Returns that `Metric`, cloned, once found.
-///
-/// Every export the mock collector receives is a FULL, CUMULATIVE snapshot of
-/// the registry at that tick, not a delta (`otlp::map_metrics` reads
-/// `Registry::counters` fresh on every call) -- and
-/// `tokio::time::interval`'s first tick fires immediately (`otlp.rs`'s own
-/// doc on `run_exporter`), so the collector's FIRST captured export can
-/// easily predate the request this test just sent. Matching on "a `Metric`
-/// with this name exists" (as a naive first-found search would) is therefore
-/// a race: it can return that too-early, all-zero snapshot. Scanning from the
-/// MOST RECENT export backward and requiring the total to clear `min_total`
-/// waits out that race instead of merely tolerating it.
+/// Polls cumulative exports newest-first until the named `Sum` reaches `min_total`.
 async fn wait_for_metric_totaling(
     metrics: &Arc<Mutex<Vec<ResourceMetrics>>>,
     name: &str,
@@ -372,17 +293,7 @@ async fn wait_for_metric_totaling(
     }
 }
 
-/// A healthy collector whose `Export` calls sleep `delay` before recording.
-///
-/// This exists for exactly one test (`a_clean_shutdown_...`), and the delay is
-/// what makes that test discriminating. A collector that answers instantly
-/// cannot distinguish "the shutdown path awaited its final export" from "the
-/// shutdown path signalled and then raced the runtime teardown", because an
-/// instant loopback RPC usually wins that race even when nothing is waiting for
-/// it. Verified: mutating `main.rs` to signal without awaiting the task left a
-/// delay-free version of the test green. With the final export deliberately
-/// slower than process exit, only actually waiting for it delivers the
-/// snapshot.
+/// Delays each export so shutdown tests can distinguish awaiting it from racing teardown.
 type DelayedCollectorHandles = (
     Arc<Mutex<Vec<Span>>>,
     Arc<Mutex<Vec<ResourceMetrics>>>,
@@ -396,15 +307,8 @@ fn spawn_delayed_collector(delay: Duration) -> DelayedCollectorHandles {
     (spans, metrics, addr)
 }
 
-/// Wall-clock arrival time of each `ResourceMetrics` the delayed collector has
-/// received, in receive order. Exposed so the drain-ordering test can compare
-/// "when the final snapshot landed" against "when the in-flight request
-/// finished" -- the only reliable discriminator for export-after-drain, since
-/// this proxy's counters are dispatch-time (`upstream_rq`) or
-/// attempt-except-killed (`upstream_rq_time`; see the test's comment).
-/// Handles returned by [`spawn_delayed_collector_with_arrivals`]: span buffer,
-/// metric buffer, metric ARRIVAL timestamps (see that function's doc), and the
-/// bound address.
+/// Buffers and address returned by the delayed collector, including metric
+/// arrival times used to verify export ordering after drain.
 type DelayedWithArrivalsHandles = (
     Arc<Mutex<Vec<Span>>>,
     Arc<Mutex<Vec<ResourceMetrics>>>,
@@ -476,20 +380,8 @@ impl MetricsService for DelayedCollector {
     }
 }
 
-/// A collector that completes the gRPC transport and then never answers an
-/// `Export` call -- the "accepted the connection, went silent" case that
-/// `export_deadline` exists for.
-///
-/// A real `tonic` server (so the HTTP/2 handshake genuinely completes and the
-/// proxy's `connect_lazy` genuinely succeeds -- a `dead_addr` would only prove
-/// the connect-error path), whose `export` implementations park on
-/// `std::future::pending()` forever. Returns the bound address.
-///
-/// This is the one mock here that deliberately leaks a parked task: it is
-/// dropped when the test's runtime tears down at the end of the test, and there
-/// is no clean way to cancel a `pending()` from outside. It holds no proxy state
-/// and no port the next test could collide on (the port is freed by the OS on
-/// process exit, and the test binary exits after its own tests).
+/// Completes the gRPC handshake but never answers `Export`, exercising the
+/// deadline path separately from a connection error.
 fn spawn_hanging_collector() -> SocketAddr {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -527,10 +419,7 @@ impl MetricsService for HangingCollector {
     }
 }
 
-/// Polls `spans` until it holds at least `min_count` entries or `deadline`
-/// (wall-clock) passes -- the exporter batches on a 5s interval
-/// (`otlp::BATCH_INTERVAL`), so this test's spans arrive in one lump well
-/// after the request that produced them completes, not immediately.
+/// Polls for spans; the exporter delivers them on its 5s batch interval.
 async fn wait_for_spans(spans: &Arc<Mutex<Vec<Span>>>, min_count: usize, deadline: Duration) {
     let start = std::time::Instant::now();
     loop {
@@ -544,12 +433,8 @@ async fn wait_for_spans(spans: &Arc<Mutex<Vec<Span>>>, min_count: usize, deadlin
     }
 }
 
-/// The two OTLP surfaces under test, as the two INDEPENDENT
-/// `node.metadata` namespace keys the `llmproxy` dialect's carriers use
-/// (`convert_tracing_metadata` and `convert_metrics_metadata` in
-/// `proxy-config`). They are separate arguments rather than one endpoint for
-/// both because the whole point of the split is that they can differ --
-/// see the module doc's "The two exporters are independent" section.
+/// Independent trace and metric endpoints, matching the separate
+/// `node.metadata` keys consumed by `proxy-config`.
 #[derive(Debug, Clone, Default)]
 struct OtlpEndpoints {
     /// `io.llmproxy.tracing`'s endpoint, deadline, and sampling ratio.
@@ -558,13 +443,7 @@ struct OtlpEndpoints {
     metrics: Option<MetricsBlock>,
 }
 
-/// One `io.llmproxy.tracing` block's worth of configuration.
-///
-/// The deadline is per-instance for the same reason `MetricsBlock`'s are: the
-/// hung-export test needs to choose it so the relationship to the batch
-/// interval is visible at the call site. `1.0s` default keeps every existing
-/// test's behavior unchanged (the collector answers instantly there) while
-/// bounding any hung attempt to a fraction of the fixed 5s batch interval.
+/// Tracing configuration with a per-instance deadline for hung-export tests.
 #[derive(Debug, Clone)]
 struct TraceBlock {
     endpoint: String,
@@ -589,12 +468,7 @@ impl From<String> for TraceBlock {
     }
 }
 
-/// One `io.llmproxy.metrics` block's worth of configuration.
-///
-/// The interval and deadline are per-instance rather than constants on
-/// `OtlpEndpoints` because the deadline test needs to choose both itself (1s
-/// interval, 200ms deadline) while every other test wants the fast default pair.
-/// Defaulted here so the common case can be written `endpoint.into()`.
+/// Metrics configuration; per-instance timing lets tests exercise deadline cases.
 #[derive(Debug, Clone)]
 struct MetricsBlock {
     endpoint: String,
@@ -603,21 +477,7 @@ struct MetricsBlock {
 }
 
 impl MetricsBlock {
-    /// The fast pairing most tests use: 1s interval, 250ms deadline.
-    ///
-    /// The interval is at the 1s floor `convert_metrics_metadata` enforces
-    /// (`METRICS_EXPORT_INTERVAL_MIN`), not below it -- a sub-second interval is
-    /// a config error, so a test cannot use one. That floor is itself a real
-    /// constraint on the tests here rather than an inconvenience: a
-    /// full cumulative registry snapshot ten times a second is bandwidth an
-    /// operator should have to opt into explicitly, and the proxy refusing to be
-    /// configured that way is the same check these tests exercise
-    /// incidentally.
-    ///
-    /// 1s is still well below the 15s production default, so it keeps every
-    /// assertion in this file to one or two ticks instead of fifteen. The
-    /// deadline is 250ms -- under the interval as required, and short enough
-    /// that the hung-collector test sees several expiries quickly.
+    /// Uses the minimum allowed 1s interval and a 250ms deadline for fast tests.
     fn fast(endpoint: String) -> Self {
         MetricsBlock {
             endpoint,
@@ -665,18 +525,8 @@ impl OtlpEndpoints {
     }
 }
 
-/// Writes a bootstrap config: one listener routing to an aggregate cluster
-/// `agg` (`primary` then `fallback`, the failover order) with a retry
-/// policy that retries a connect failure, plus whichever of the two
-/// `node.metadata` OTLP blocks `endpoints` names.
-///
-/// The `export_interval`/`export_deadline` here are short on purpose. The
-/// production defaults (15s/10s) would make every metric assertion in this file
-/// either a 15-second wait or a race against a snapshot taken before the
-/// request under test; 500ms/250ms keeps the tests fast while still exercising
-/// the real ticker, the real deadline, and the real cumulative-snapshot
-/// semantics. The bounds are validated by `crates/proxy-config`'s own tests,
-/// not here.
+/// Writes a bootstrap with aggregate fallback and the requested OTLP metadata.
+/// Test export timings are shorter than production defaults.
 fn write_config(
     listener_port: u16,
     admin_port: u16,
@@ -684,11 +534,7 @@ fn write_config(
     fallback_addr: SocketAddr,
     endpoints: OtlpEndpoints,
 ) -> std::path::PathBuf {
-    // Built as a list of already-indented metadata block bodies and joined,
-    // rather than string-concatenated with its own `node:` header per block, so
-    // a config with BOTH blocks ends up with exactly one `node:` carrying two
-    // metadata keys -- which is what `proxy-simple-config`'s merge-then-emit
-    // lowering produces, so a bug there and a bug here would look the same.
+    // Keep both metadata keys under one `node:`, matching simple-config output.
     let mut metadata = Vec::new();
     if let Some(traces) = endpoints.traces {
         metadata.push(format!(
@@ -782,16 +628,7 @@ static_resources:
     write_temp_config(listener_port, config_yaml)
 }
 
-/// Assemble the `node:` YAML from already-indented metadata block bodies, or
-/// the empty string when there are none.
-///
-/// Centralized rather than inlined in `write_config` so the "no `node:` key at
-/// all when nothing is configured" case has exactly one implementation. That
-/// case is load-bearing: a config that emits an empty `node: {metadata: {}}` is
-/// still a valid config, but it stops being a faithful stand-in for the
-/// overwhelmingly common no-OTLP deployment, and
-/// `crates/proxy-simple-config/tests/dialect.rs` asserts the empty case lowers
-/// to *no* node key.
+/// Builds `node:` metadata, omitting the block when no metadata is configured.
 fn build_node_block(metadata_blocks: &[String]) -> String {
     if metadata_blocks.is_empty() {
         return String::new();
@@ -823,11 +660,8 @@ fn spawn_proxy(config_path: &std::path::Path) -> (ChildGuard, mpsc::Receiver<Str
     (ChildGuard(child), rx)
 }
 
-/// Sends SIGTERM WITHOUT waiting for the process to exit -- unlike
-/// [`terminate`], which signals and then blocks on exit. Needed by the
-/// drain-ordering test, which must measure "when the in-flight request
-/// finished" independently of "when the process exited": `terminate` would
-/// conflate the two and make the arrival-time assertion vacuous.
+/// Sends SIGTERM without waiting, so drain ordering can be measured independently
+/// of process exit.
 fn signal_term(child: &mut ChildGuard) {
     let pid = child.0.id().to_string();
     let _ = Command::new("kill").arg("-TERM").arg(&pid).status();
@@ -865,17 +699,8 @@ fn terminate(child: &mut ChildGuard) {
     }
 }
 
-/// The load-bearing test: a real request through a real aggregate
-/// fallback, with a synthetic inbound `traceparent`, produces --
-/// - exactly one SERVER span whose trace_id equals the INBOUND trace_id
-///   (the JOIN: preserved, not replaced by a fresh root);
-/// - exactly two CLIENT spans (`primary`'s connect-failure, `fallback`'s
-///   response), both parented to that one SERVER span's span_id and sharing
-///   its trace_id (the fallback attempt is a child under the SAME server
-///   span, never a new trace);
-/// - the `fallback` upstream actually receiving a `traceparent` header equal
-///   to the fallback CLIENT span's own context, not the downstream client's
-///   original header unchanged (the propagation half, not just emission).
+/// Verifies inbound trace joining, child spans for both fallback attempts, and
+/// propagation of the fallback client span's context to the upstream.
 #[tokio::test(flavor = "multi_thread")]
 async fn traceparent_join_and_fallback_produce_the_right_span_tree() {
     let (fallback_addr, captured_traceparent) = spawn_capturing_mock_upstream();
@@ -958,9 +783,7 @@ async fn traceparent_join_and_fallback_produce_the_right_span_tree() {
     );
 
     let server_span = server_spans[0];
-    // The JOIN: the server span's trace_id is the INBOUND one, not a fresh
-    // root -- this is exactly what breaks if `FilterChainHandler::handle`'s
-    // join used `TraceContext::new_root` instead of `inbound_ctx.child()`.
+    // The server span must preserve the inbound trace ID.
     assert_eq!(
         server_span.trace_id, INBOUND_TRACE_ID,
         "server span's trace_id must equal the inbound traceparent's trace_id (joined, not \
@@ -998,11 +821,7 @@ async fn traceparent_join_and_fallback_produce_the_right_span_tree() {
          (fallback's 200), got {collected:#?}"
     );
 
-    // The propagation half: what `fallback` actually saw on the wire must
-    // be the FALLBACK CLIENT SPAN's own traceparent, not the caller's
-    // original header passed through unmodified. Find the Ok (fallback)
-    // client span and check its own `to_traceparent()`-equivalent bytes
-    // against what the mock upstream captured.
+    // The upstream must receive the fallback attempt's context, not the caller's.
     let fallback_span = client_spans
         .iter()
         .find(|s| s.status.as_ref().map(|st| st.code) == Some(OtlpStatusCode::Ok as i32))
@@ -1040,18 +859,7 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Tracing-OFF configuration (no `node.metadata["io.llmproxy.tracing"]` and
-/// no `io.llmproxy.metrics` block at all) must mean the collector receives
-/// nothing on either signal -- no `SpanSink` is ever built, no exporter task
-/// ever runs, so there is nothing to connect with in the first place.
-///
-/// The metrics half of that assertion is the
-/// stricter one: before the split, "no collector traffic" was trivially true
-/// because metrics rode inside the trace exporter, so this test could not have
-/// distinguished "metrics off" from "metrics configured but broken". Now the
-/// two are independent, and this pins that a config naming NEITHER leaves both
-/// silent -- while `metrics_export_with_tracing_disabled_exports_metrics` pins
-/// that naming one leaves the other running.
+/// Neither signal should be exported when both OTLP blocks are absent.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_otlp_surfaces_configured_sends_nothing_to_the_collector() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
@@ -1117,21 +925,7 @@ async fn no_otlp_surfaces_configured_sends_nothing_to_the_collector() {
     terminate(&mut child);
 }
 
-/// Acceptance restated for exporter independence: the same real
-/// proxy, driven by the same real traffic as
-/// `traceparent_join_and_fallback_produce_the_right_span_tree` above, also
-/// exports OTLP **metrics** to the collector. `upstream_rq`
-/// (`RouterStats::record_attempt`) is the counter the served request actually
-/// increments: one attempt against `primary` (connect-failure) and one against
-/// `fallback` (the 200), so its per-cluster data points should sum to 2 --
-/// proving both the wiring (`main.rs`'s `registry.clone()` reaching the metric
-/// exporter) and the grouping (`otlp::map_metrics` collapsing the two `cluster`
-/// attribute sets into one `Metric`).
-///
-/// This used to assert that both signals shared ONE `Channel`. They no longer
-/// do -- `otlp::metrics_client` builds its own `Endpoint` -- so the mock
-/// collector still serves both on one port (a real collector's shape) while
-/// the proxy now holds two independent connections to it.
+/// Confirms both fallback attempts reach OTLP metrics in one clustered metric.
 #[tokio::test(flavor = "multi_thread")]
 async fn served_traffic_exports_upstream_rq_metric_to_the_collector() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
@@ -1253,20 +1047,7 @@ async fn served_traffic_exports_upstream_rq_metric_to_the_collector() {
 
 // ------------------------------- Exporter independence --
 
-/// The headline acceptance criterion, stated as a test: **metrics export works
-/// with tracing entirely off.** A config naming only `io.llmproxy.metrics`
-/// must still export OTLP metrics for real served traffic, and must produce NO
-/// spans.
-///
-/// Before the split this configuration was inexpressible: the only OTLP config
-/// in the IR was `tracing`, and the `MetricsServiceClient` was constructed
-/// inside the task spawned for it. The regression this pins is therefore not
-/// subtle -- it is "someone re-merged the two config fields, or re-gated the
-/// metric spawn on `snapshot.tracing`".
-///
-/// The span half of the assertion matters as much as the metric half: a change
-/// that made metrics work by, say, constructing a `SpanSink` unconditionally
-/// and exporting its (empty) contents would pass a metrics-only test.
+/// Metrics configured alone must export served traffic without producing spans.
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_export_with_tracing_disabled_exports_metrics_and_no_spans() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
@@ -1347,14 +1128,7 @@ async fn metrics_export_with_tracing_disabled_exports_metrics_and_no_spans() {
     terminate(&mut child);
 }
 
-/// The mirror image, and the half of the independence claim that is easy to
-/// regress by accident: **traces must not imply metrics.** A config naming only
-/// `io.llmproxy.tracing` exports spans and NO metrics.
-///
-/// This is what stops a future "helpfully default metrics on whenever the
-/// exporter is running" change from quietly making an operator who wanted
-/// traces only start paying for a full cumulative registry snapshot on every
-/// interval. The interval is 500ms here, so the 2s wait covers four of them.
+/// Tracing configured alone must export spans without metric snapshots.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracing_without_metrics_exports_spans_and_no_metrics() {
     let (fallback_addr, captured_traceparent) = spawn_capturing_mock_upstream();
@@ -1421,21 +1195,8 @@ async fn tracing_without_metrics_exports_spans_and_no_metrics() {
     terminate(&mut child);
 }
 
-/// A **failing** metric export must be counted, not swallowed, and must NOT
-/// stop the proxy from forwarding traffic or from serving `/stats`.
-///
-/// This is the observability-half of the design doc's failure matrix row
-/// "Operational collector unavailable -> Forwarding: Continues; Operational
-/// outcome: bounded export failures/drops". The failure is provoked by pointing
-/// the metrics block at a port nothing is listening on (`dead_addr()`), which
-/// is a connect error rather than a hang -- the deadline case is covered
-/// separately below.
-///
-/// The assertion is made against the ADMIN server's `/stats/prometheus` rather
-/// than against the collector, because the point is that the failure count is
-/// visible *somewhere* when the collector is by definition unreachable. That
-/// also proves the two paths are independent: scrape keeps working while OTLP
-/// export does not.
+/// A failed metric export must be counted while forwarding and `/stats` continue.
+/// The unreachable collector makes `/stats/prometheus` the place to observe it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_metric_export_is_counted_and_forwarding_continues() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
@@ -1539,21 +1300,9 @@ async fn a_failing_metric_export_is_counted_and_forwarding_continues() {
     terminate(&mut child);
 }
 
-/// A **hung** collector -- one that accepts the TCP connection and then never
-/// answers -- must be bounded by `export_deadline`, counted, and must not wedge
-/// the proxy or prevent later ticks.
-///
-/// The mock collector below is the important piece: it completes the HTTP/2
-/// handshake by running a real `tonic` server, then simply never calls `export`
-/// (it parks instead of answering). Without the `export_deadline`
-/// `tokio::time::timeout` in `flush_metrics`, the first export's `.await` would
-/// never return and every subsequent tick would queue behind it forever --
-/// which is precisely the failure mode the design doc's §5.3 "separate metric
-/// and span scheduling/deadlines" exists to prevent, and the reason the
-/// deadline is a config field rather than a constant.
-///
-/// Asserted through the same admin `/stats/prometheus` path as above, since the
-/// collector never answers by construction.
+/// A collector that accepts gRPC but never answers must hit the configured
+/// deadline, be counted, and allow later export ticks. The failure is observed
+/// through `/stats/prometheus` because the collector never replies.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_collector_is_bounded_by_the_export_deadline() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
@@ -1654,16 +1403,8 @@ async fn a_hung_collector_is_bounded_by_the_export_deadline() {
     terminate(&mut child);
 }
 
-/// `/stats/prometheus` must work with NO OTLP configuration of any kind --
-/// neither `tracing` nor `metrics`. Design doc §5.3: "Prometheus scrape remains
-/// available without OTLP or tracing."
-///
-/// This is partly a regression guard on the split itself: the metric exporter's
-/// self-instruments (`llmproxy_otel_export_failures`, `llmproxy_otel_spans_
-/// dropped`) are resolved at boot **unconditionally**, so this test also proves
-/// those series exist in scrape output on a process that has never exported
-/// anything. That is deliberate (`MetricExportHealth::resolve`'s doc): a
-/// dashboard should not have a series appear mid-incident.
+/// Prometheus remains available without OTLP config, with exporter health series
+/// present from the first scrape.
 #[tokio::test(flavor = "multi_thread")]
 async fn prometheus_scrape_works_with_no_otlp_configured() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
@@ -1909,12 +1650,7 @@ fn collector_saw_upstream_rq_at_least(
     })
 }
 
-/// A trace collector whose FIRST export hangs forever and whose later exports
-/// answer instantly -- the exact shape the trace exporter's deadline exists
-/// for.
-///
-/// The `AtomicU32` counts completed exports, so a test can distinguish "hung"
-/// from "answered". Everything else mirrors `MockCollector`.
+/// Hangs on the first trace export and answers later ones; `done` counts completions.
 #[derive(Clone)]
 struct HangFirstTraceCollector {
     done: Arc<AtomicU32>,
@@ -2341,10 +2077,7 @@ fn total_of(metric: &proxy_api::opentelemetry::proto::metrics::v1::Metric) -> i6
     }
 }
 
-/// Both surfaces can point at DIFFERENT collectors in the same config, and each
-/// must reach its own. This is the deployment shape the separate `Endpoint`
-/// per exporter exists for, and it is only expressible because the two config
-/// fields are separate.
+/// Trace and metric exporters can target separate collectors.
 #[tokio::test(flavor = "multi_thread")]
 async fn traces_and_metrics_can_target_different_collectors() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();

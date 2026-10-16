@@ -1,43 +1,25 @@
-//! **Third-party smoke test**: the real `llm-proxy` binary against a real,
-//! locally-running OpenAI-compatible server (Ollama), over real HTTP.
+//! Smoke test: the real `llm-proxy` binary against a locally running
+//! OpenAI-compatible server (Ollama), over real HTTP.
 //!
-//! ## Why this exists, and what it is NOT
+//! This sits between two tiers. `mock_e2e.rs` uses our own mocks, which share
+//! our reading of the wire format, so a wrong assumption can pass in both
+//! places. `live_smoke.rs` uses the real providers but costs money. Ollama is
+//! a third-party implementation, so a disagreement with our extractor is a
+//! real signal.
 //!
-//! This sits in the gap between two tiers we already have:
+//! Ollama serves both the OpenAI and Anthropic surfaces. Both dialects are
+//! covered, streaming and not, plus a real upstream-TLS hop.
 //!
-//! - `mock_e2e.rs` drives the proxy against **our own** in-process mocks.
-//!   Those mocks encode our understanding of the provider wire format, so
-//!   they agree with the proxy by construction: any assumption baked into
-//!   the proxy is baked into the mock too, and the pair can be wrong
-//!   together without a single test going red.
-//! - `live_smoke.rs` drives it against **api.openai.com / api.anthropic.com**
-//!   with real keys. That is the v0.0.1 ship gate.
-//!
-//! This file drives it against a **third-party implementation nobody here
-//! wrote**, for free, with no network egress. That kills the shared-blind-spot
-//! problem above -- Ollama's endpoints were written by people who read the
-//! providers' specs independently of us, so a disagreement between them and
-//! our extractor is a genuine signal.
-//!
-//! Ollama serves **both** compatibility surfaces -- OpenAI at
-//! `/v1/chat/completions` and Anthropic at `/v1/messages` -- so both dialects
-//! are covered here, streaming and not, plus a real upstream-TLS hop and the
-//! per-route dialect selection that acceptance criterion 7 is about.
-//!
-//! **It does not close the v0.0.1 ship gate and must never be described as
-//! doing so.** The gate names *real provider endpoints*; what remains unseen
-//! here is public-root certificate trust, real DNS, h2 upstream (both
-//! providers serve HTTP/2, Ollama is h1), and production error/rate-limit
-//! shapes. `live_smoke.rs` remains the only test that closes the gate.
+//! It does not cover public-root certificate trust, real DNS, HTTP/2
+//! upstreams, or production error shapes. `live_smoke.rs` is still needed for
+//! those.
 //!
 //! ## The load-bearing assertion
 //!
-//! Token counts. Ollama emits a genuine `usage` block -- in the JSON body
-//! when non-streaming, and (given `stream_options.include_usage`) in the
-//! final SSE frame when streaming. So this exercises the usage filter
-//! end to end against numbers **we did not choose**: the proxy's access log
-//! must agree with what the upstream independently reported. A mock proves
-//! the extractor can read a body we wrote; this proves it can read one we
+//! Token counts. Ollama emits a genuine `usage` block, so the usage filter is
+//! checked against numbers we did not choose. The access log must agree with
+//! what the upstream reported. A mock proves the extractor can read a body we
+//! wrote. This proves it can read one we did not write.
 //! didn't.
 //!
 //! ## How to run
@@ -103,20 +85,13 @@ fn dialect_config(
     // for the provider host, so the leaf must actually be issued for the name
     // in `base_url`. A cert for the wrong name fails even under our own CA --
     // which is the point, and was one of the two upstream-verification holes
-    // fixed on 2026-07-25.
     let ca_line = ca_file
         .map(|path| format!("\n    ca_file: \"{path}\""))
         .unwrap_or_default();
-    // BOTH providers point at the same Ollama, which serves an
-    // OpenAI-compatible API at /v1/chat/completions AND an
-    // Anthropic-compatible one at /v1/messages. That makes this a real
-    // per-route-dialect test (acceptance criterion 7) against a third-party server:
-    // one proxy, one config, two response shapes, and the token counts have to
-    // come out right for both.
-    //
-    // Route order matters (S1: first match wins). `claude-*` is listed before
-    // the catch-all, so the OpenAI tests -- which send the bare model name --
-    // keep falling through to `openai` exactly as before.
+    // Both providers point at the same Ollama, which serves OpenAI and
+    // Anthropic surfaces. This is a per-route dialect test against a
+    // third-party server. Route order matters (S1: first match wins). The
+    // `claude-*` route is listed before the catch-all.
     format!(
         r#"
 version: 0
@@ -251,15 +226,9 @@ fn read_access_log_lines(path: &std::path::Path, want: usize) -> Vec<serde_json:
     }
 }
 
-/// Pull the JSON payload out of one SSE frame.
-///
-/// A frame here is the whole `\n\n`-delimited block, and Anthropic puts an
-/// `event: <name>` line *before* the `data:` line. So a bare
-/// `trim_start_matches("data: ")` leaves `event: message_delta\ndata: {...}`,
-/// which fails to parse and makes the frame silently vanish from any
-/// `find` — which is exactly how the first version of the Anthropic
-/// streaming test failed. Scan for the `data:` line instead of assuming the
-/// frame starts with it.
+/// Pull the JSON payload out of one SSE frame. Anthropic puts an `event:` line
+/// before the `data:` line, so the frame must be scanned for `data:` rather
+/// than assuming it comes first.
 fn sse_json(event: &TimedEvent) -> Option<serde_json::Value> {
     let data = event.data.lines().find_map(|l| l.strip_prefix("data:"))?;
     serde_json::from_str(data.trim()).ok()
@@ -396,19 +365,10 @@ async fn streaming_delivers_incremental_frames_and_extracts_usage_from_the_strea
         "expected the stream to terminate with `data: [DONE]`"
     );
 
-    // Real streaming, not a buffered response replayed as SSE at the end.
-    //
-    // `live_smoke.rs` tests this as "first frame lands before 80% of total",
-    // which works against a hosted model where generation dominates. It is
-    // the WRONG test here and produced a false failure on the first run: a
-    // 270M model answers so fast that model load and prompt eval dominate,
-    // so the first frame legitimately arrives at ~81% of a ~250ms stream.
-    // High TTFT with a short tail is still streaming.
-    //
-    // What buffering actually looks like is every frame landing in the same
-    // instant at the end, so assert on SPREAD instead: distinct arrival
-    // times across frames. That discriminates the thing we care about
-    // without assuming anything about where TTFT sits.
+    // Real streaming means frames arrive at distinct times. A buffered
+    // response lands every frame at once at the end. Asserting on the spread
+    // of arrival times does not depend on where TTFT sits, which matters for a
+    // small local model where model load dominates.
     let first_at = events[0].at;
     let total = events.last().expect("at least one event").at;
     let distinct_arrivals = events
@@ -451,7 +411,7 @@ async fn streaming_delivers_incremental_frames_and_extracts_usage_from_the_strea
     );
 
     // TTFT is only meaningful on a streamed response, and it is the metric
-    // v0.1.0's gate names -- assert it is populated and sane rather than "-".
+    // It is the TTFT metric, so assert it is populated and sane rather than "-".
     let ttft = numeric_field(&line, "llm_ttft_ms")
         .unwrap_or_else(|| panic!("llm_ttft_ms must be populated for a stream (line: {line})"));
     assert!(
@@ -463,21 +423,11 @@ async fn streaming_delivers_incremental_frames_and_extracts_usage_from_the_strea
     drop(scratch);
 }
 
-/// Proves: the same third-party round trip **over real upstream TLS** —
-/// handshake, SNI, chain verification against a CA the proxy was configured
-/// with, and the dialect's DNS-exact SAN check against the provider host.
-///
-/// This is the tier that was missing. `tls_e2e.rs` proves the proxy's TLS
-/// path against *our* mocks; the plaintext tests above prove the wire format
-/// against a server we didn't write. Neither proves the combination, and the
-/// combination is what a real provider is. Here the proxy dials
-/// `https://<name>:<port>`, completes a genuine handshake, and the plaintext
-/// on the far side reaches Ollama byte for byte.
-///
-/// The TLS front is a `copy_bidirectional` pump, deliberately not an HTTP
-/// reverse proxy: parsing and re-emitting the request would put our own
-/// framing back in the path and undo the point of testing against foreign
-/// framing.
+/// The same third-party round trip over real upstream TLS. This covers the
+/// handshake, SNI, chain verification against a configured CA, and the
+/// DNS-exact SAN check. The TLS front is a plain `copy_bidirectional` pump, not
+/// an HTTP reverse proxy. Re-framing the request would reintroduce our own
+/// framing into a test meant to use foreign framing.
 #[tokio::test]
 #[ignore = "needs a local Ollama server; run with --ignored"]
 async fn tls_round_trip_to_a_third_party_upstream_extracts_token_counts() {

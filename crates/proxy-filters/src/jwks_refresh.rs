@@ -1,48 +1,8 @@
-//! OIDC discovery + background JWKS refresh.
-//!
-//! [`crate::jwt_auth::JwtAuthenticator`] verifies against a cached key set;
-//! this module is what keeps that cache fresh without ever touching the
-//! request path. Shape (OIDC fits the static-JWKS design without reshaping it):
-//!
-//! ```text
-//! refresher thread (one per discovery-configured provider)
-//!   GET discovery_url -> { jwks_uri } -> GET jwks_uri -> JwtKeySet
-//!   -> ArcSwap::store (atomic publish; workers see the new set on next load)
-//! ```
-//!
-//! # What runs where
-//!
-//! - [`parse_discovery_doc`] / [`parse_jwks_doc`] / [`parse_ca_pem`] are pure
-//!   functions over bytes: no I/O, unit-tested directly.
-//! - [`refresh_once`] composes them with one injected `fetch`: the production
-//!   thread passes [`fetch_bytes`] (real HTTPS via hyper + rustls), tests
-//!   pass a stub or a localhost server.
-//! - [`start_jwks_refresher`] spawns a named `std::thread` (mirroring
-//!   [`crate::control::ControlPlane::start_policy_poller`'s] `Weak` design:
-//!   the thread holds a `Weak` to the snapshot and exits once the last
-//!   filter is dropped, so SIGHUP reloads retire old threads) with its own
-//!   single-threaded tokio runtime -- no ambient runtime is assumed at
-//!   filter-build time.
-//!
-//! # Failure semantics (fail closed, bounded staleness)
-//!
-//! A failed refresh keeps serving the last-good snapshot and logs at WARN;
-//! it never clears the set (an empty fetch that replaced good keys would be
-//! a self-inflicted outage). A snapshot older than
-//! [`STALE_AFTER_MISSED`] consecutive missed intervals is refused outright
-//! ([`crate::auth::AuthError::JwtJwksStale`]) -- the same bounded-staleness
-//! rule that applies to credential snapshots: serving
-//! indefinitely old keys turns a rotation into silent acceptance.
-//!
-//! # TLS
-//!
-//! `https` only, enforced at config parse AND re-checked in [`fetch_bytes`].
-//! HTTP JWKS fetch would be an auth bypass (a MITM swaps the key set, then
-//! forges tokens with its own key), so there is no plaintext exception, not
-//! even for loopback. Trust roots are the system roots unless the provider
-//! configures `trusted_ca` (a TLS-intercepting enterprise proxy, or a test
-//! CA). Only TLS 1.2 is available: the workspace pins rustls without the
-//! `tls13` feature, and Entra negotiates 1.2.
+//! Refreshes OIDC discovery and JWKS data off the request path, then
+//! atomically publishes the key set. Failed refreshes keep the last good set
+//! and warn; snapshots older than the missed-interval bound are refused.
+//! Fetches require HTTPS and recheck the URL at the network boundary; this
+//! prevents a substituted key set from enabling forged tokens.
 
 use std::fmt;
 use std::sync::{Arc, Weak};

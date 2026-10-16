@@ -1,40 +1,7 @@
-//! End-to-end acceptance test: proves the downstream
-//! authentication filter (`crates/proxy-filters/src/auth_filter.rs`) works
-//! inside the REAL filter manager, driving a REAL `llm-proxy` process, over a
-//! real socket -- not just against the `TestCallbacks` double its unit tests
-//! use.
-//!
-//! Structural sibling of `failover_e2e.rs`: same harness, same `spawn_suite`
-//! shape, same timeout discipline (every request wrapped in
-//! `tokio::time::timeout` -- see that file's module doc for why a hang here
-//! once turned a 79s workspace run into 656-863s). Read `failover_e2e.rs`
-//! first if this one is unfamiliar.
-//!
-//! # Envoy mode (`-c`), not the dialect (`--config`)
-//!
-//! `llmproxy.auth` has no dialect (`llmproxy.yaml`) surface yet -- see
-//! `ProxyProcess::spawn_envoy`'s doc comment. This suite hands the proxy a
-//! hand-written Envoy bootstrap document instead, built from a
-//! verified-working base (`llm-proxy --config <dialect> --mode translate`
-//! against a simple OpenAI-provider dialect config) with `llmproxy.auth`
-//! inserted as the FIRST `http_filters` entry.
-//!
-//! # Why the digests are computed, never hardcoded
-//!
-//! [`digest_hex`] recomputes `hex(HMAC-SHA256(secret, plaintext_key))` at
-//! test-run time, the same way `auth_filter::VirtualKeyAuthenticator`
-//! verifies a presented key. A hardcoded digest would silently stop matching
-//! the day anything about the derivation changed, and this suite would still
-//! "pass" -- by 401ing every request, including the ones meant to succeed.
-//!
-//! # The token math Test 7 depends on
-//!
-//! Every chat request in this file sends the single-word message `"hi"`
-//! (1 token) and the mock upstream always replies with the single-word
-//! completion `"ok"` (1 token, per `OpenAiConfig::response_text`), so every
-//! successful exchange costs exactly 2 tokens against
-//! `LimitOn::Total` (`crates/proxy-filters/src/token_limit.rs`). Test 7's
-//! budget of 2 is chosen to be exhausted by exactly one exchange.
+//! Exercises authentication through the real filter manager, proxy process, and socket.
+//! The suite uses an Envoy bootstrap because `llmproxy.auth` has no dialect surface.
+//! Digests are computed with the same HMAC derivation as the authenticator. Each
+//! successful exchange costs two tokens: one input and one output.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -86,21 +53,10 @@ fn digest_hex(secret: &str, plaintext_key: &str) -> String {
     digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Render the Envoy-mode bootstrap this suite loads with `-c`: one cluster
-/// (`provider:p1`, carrying the PROVIDER credential via
-/// `io.llmproxy.provider_auth` metadata) and one listener whose
-/// `http_filters` puts `llmproxy.auth` FIRST -- before `llmproxy.body_rewrite`
-/// (so an unauthenticated request is refused before the body-peek filter
-/// ever buffers its body) and before `llmproxy.token_limit`
-/// (`proxy_config::lower::check_lane_h_filter_order` ENFORCES this second
-/// ordering at load time: reversed, the limiter would silently fall back to
-/// bucketing on the client-supplied `authorization` header instead of the
-/// tenant this filter resolves).
-///
-/// Parameterised on the listener/upstream ports and the token-limit budget
-/// (Test 7 needs its own tiny one; every other test gets [`AMPLE_MAX_TOKENS`]
-/// / [`AMPLE_FILL_RATE`]). The three virtual-key digests are always computed
-/// fresh via [`digest_hex`].
+/// Renders the Envoy bootstrap with cluster credentials and auth before body
+/// rewriting and token limiting. The latter order is required so the limiter
+/// uses the authenticated tenant rather than the client header. Digests are
+/// computed at runtime; the token budget is parameterized for Test 7.
 fn envoy_config(listener_port: u16, upstream_port: u16, max_tokens: u32, fill_rate: f64) -> String {
     let key_live_digest = digest_hex(HMAC_SECRET, KEY_LIVE);
     let key_revoked_digest = digest_hex(HMAC_SECRET, KEY_REVOKED);
@@ -625,16 +581,8 @@ async fn all_three_failure_modes_are_byte_identical_on_the_wire() {
     drop(scratch);
 }
 
-/// 7. Two different virtual keys on the same tenant share ONE token budget.
-///
-/// **This is the v0.1.0 ship-gate clause "a token-based rate limit is
-/// enforced", proven end to end.** The limiter is keyed on
-/// `StreamInfo::auth.tenant`, an identity the CALLER cannot choose, so two
-/// keys belonging to the same tenant draw from the same bucket. Keying on the
-/// client's raw `authorization` header (`hash_credential(...)`) would make the
-/// limit advisory by construction: a second, distinct header value would get a
-/// fresh budget. This test is the only place in the suite that would catch a
-/// regression back to keying on the raw header.
+/// 7. Distinct keys for one tenant share a token bucket keyed by the authenticated
+/// tenant, so changing the caller-controlled authorization header cannot reset it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_virtual_keys_on_the_same_tenant_share_one_token_budget() {
     // A budget of 2 is exhausted by exactly one exchange -- see this file's

@@ -48,11 +48,7 @@ pub enum AttemptOutcome {
     /// `hyper::Error`'s source chain; `UpstreamCodecError::RefusedStream` is
     /// the carrier.
     RefusedStream,
-    /// The per-try timeout (S4.2) fired before a response arrived. Produced
-    /// by `router.rs`'s attempt loop, which wraps each attempt in
-    /// `tokio::time::timeout(per_try_timeout, ..)`. (This doc previously said
-    /// "not yet produced anywhere" long after that landed -- status prose
-    /// decays toward overstating what is missing; check the call sites.)
+    /// The per-try timeout (S4.2) fired before a response arrived.
     PerTryTimeout,
     /// Circuit-breaker / pending-queue overflow (S5): [`PoolError::Overflow`].
     PoolOverflow,

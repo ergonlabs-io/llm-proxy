@@ -1,71 +1,14 @@
-//! The router terminal filter. Since ADR-0004 step 3
-//! this is an ordinary [`crate::filter::HttpFilter`] that also implements
-//! [`crate::filter::TerminalHttpFilter`] -- `proxy-core`'s HTTP connection
-//! manager wiring plugs a [`RouterFilterFactory`] in as the LAST entry of the
-//! filter chain (mirroring Envoy's `envoy.filters.http.router`, which is
-//! simply the terminal `StreamDecoderFilter`) -- matches a route (`crate::route`), picks a cluster + host through
-//! `proxy_cluster::manager::ClusterManager`, dials/reuses an upstream
-//! connection, and proxies the request over it -- HTTP/1.1 via
-//! `crate::upstream_pool::H1ConnCache` (which sends over
-//! [`crate::codec::send_upstream_http1`]'s split "dial"/"send" halves),
-//! HTTP/2 via `crate::upstream_pool::UpstreamConnCache`.
+//! Terminal HTTP filter that matches routes, selects a cluster and host, and
+//! proxies requests over reusable HTTP/1.1 or HTTP/2 upstream connections.
+//! Route transforms, timeouts, retries, hedges, and circuit breakers are
+//! applied during forwarding. HCM stream timeouts wrap this filter in
+//! `filter_manager`; route idle timeout takes precedence for response body
+//! gaps (envoy-divergences.md row 29).
 //!
-//! ## v1 scope
-//!
-//! In scope: `Forward` routing to a `Cluster`/`ClusterHeader`/`Weighted`
-//! target, both HTTP/1.1 and HTTP/2 upstreams. HTTP/1.1 reuses one IDLE
-//! keep-alive connection at a time per (cluster, address) via
-//! `crate::upstream_pool::H1ConnCache` (see that type's doc
-//! for the conservative reuse-vs-discard rule); HTTP/2 reuses a small bounded
-//! *set* of connections per (cluster, address), multiplexed across
-//! concurrent/sequential requests, via `crate::upstream_pool::UpstreamConnCache`
-//! (see that module's doc). `DirectResponse` for inline
-//! bodies, the
-//! upstream request transforms `prefix_rewrite`/`host_rewrite_literal`/
-//! `x-envoy-expected-rq-timeout-ms`, the S4 route timeout
-//! (`ForwardAction::timeout`, bounding time-to-response-headers only), and
-//! the S4 route `idle_timeout` (`ForwardAction::idle_timeout`), applied to
-//! the **response** (server->client) body only -- once headers arrive, a
-//! gap of more than `idle_timeout` between response body frames resets the
-//! stream (`router::idle::IdleTimeoutBody`) rather than hanging forever, the
-//! LLM-relevant direction for a stalled token stream. See `apply_forward`
-//! below for how the two timeouts compose.
-//!
-//! Also in scope: the S5 `max_requests` circuit breaker
-//! (`ClusterEntry::circuit_breaker(RoutingPriority::Default)`), acquired
-//! before dialing and held for the whole response stream via
-//! `router::guarded::GuardedBody` -- exceeding it sheds load as `UO` + 503 +
-//! `x-envoy-overloaded` rather than piling onto a struggling upstream. The
-//! `max_connections`/`max_pending_requests` are enforced by the pool, and
-//! retries plus safe hedges acquire the same fixed `max_retries` or dynamic
-//! `retry_budget` guard before dispatch.
-//!
-//! Deferred (known feature gap, not a silent drop -- AGENTS.md invariant 1):
-//! request-direction body idle (bounding gaps in the *downstream* request
-//! body). HCM `request_timeout` bounds request-body collection instead.
-//!
-//! The S9 request-header transforms are not done here. XFF and
-//! `x-request-id` are applied on decode by `crate::filter_manager` (through
-//! `crate::headers`), and the `:authority` rewrite is the route's
-//! `host_rewrite_literal`, applied by this router.
-//!
-//! HCM `stream_idle_timeout` and `max_stream_duration` are enforced one level
-//! up, in `crate::filter_manager`, around this router: it bounds the wait for
-//! response headers and wraps the body this router returns. A route
-//! `idle_timeout` set here wins over the HCM idle for body gaps (divergences
-//! row 29).
-//!
-//! The retry and hedging engine (S3) lives in `crate::retry` and is driven
-//! from the attempt loop in this file.
-//!
-//! Response flags are recorded onto a per-request
-//! [`StreamInfo`] (not just `tracing::debug!`'d) at every site below --
-//! `%BYTES_RECEIVED%`, upstream host/cluster/protocol, response flags. This
-//! router no longer renders access-log lines itself: that moved up to
-//! [`crate::filter_manager::FilterChainHandler`] (see its module doc and
-//! [`crate::access_logging`]'s doc for why -- in short, this router sits
-//! INSIDE the encode filter chain, so logging from here can never observe
-//! what an encode filter does at end-of-stream).
+//! Request header transforms run during decode. Response flags and upstream
+//! details are recorded in [`StreamInfo`]. Access logging wraps the completed
+//! encode chain in [`crate::filter_manager::FilterChainHandler`] so it sees
+//! end-of-stream mutations from encoder filters.
 
 use std::collections::HashMap;
 use std::rc::Rc;

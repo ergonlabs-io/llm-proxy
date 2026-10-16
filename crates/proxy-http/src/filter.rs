@@ -1,9 +1,5 @@
-//! The HTTP filter API — a Rust mirror of Envoy's `envoy/http/filter.h`, with the
-//! exact iteration semantics specified in internal-docs/envoy-semantics.md S2.
-//!
-//! This is a frozen shared surface (AGENTS.md invariant 8): the filter manager,
-//! the router, the other HTTP filters, and the LLM filters all
-//! code against these types. Changing a signature here requires cross-crate review.
+//! HTTP filter API matching Envoy iteration semantics (S2). This shared surface
+//! is frozen by AGENTS.md invariant 8.
 //!
 //! Rust note: we model Envoy's C++ virtual-method filter classes as *traits*
 //! (Rust's interfaces). A filter instance is held as `Box<dyn HttpFilter>` — a
@@ -104,27 +100,12 @@ pub struct BufferedBody(pub BytesMut);
 /// cross threads. Used to let `send_local_reply` callers mutate response headers.
 pub type HeaderMutationFn = Box<dyn FnOnce(&mut HeaderMap) + Send>;
 
-/// A cloneable handle that resumes a decode-direction `StopAll*` hold from
-/// OUTSIDE callback context (S2.2's "out-of-band continue"
-/// case, the one thing [`DecoderCallbacks::continue_decoding`] can't do,
-/// since that method only exists on the callbacks borrow, which does not
-/// outlive the callback that received it). A filter that stops all
-/// iteration to wait on work that resolves independently of
-/// [`HttpFilter::poll_pending`] (a webhook callback, a timer, some other
-/// out-of-band event) stashes this handle during the callback and calls
-/// [`Self::continue_decoding`] on it whenever that work finishes — possibly
-/// long after the callback that produced it has returned.
+/// Cloneable handle for resuming a decode `StopAll*` hold outside callback
+/// context, when work completes independently of `poll_pending`.
 ///
-/// Rust note: `Rc<tokio::sync::Notify>`, not `Arc` — the filter manager is
-/// per-worker and single-threaded (`ChainCtx` holds `Rc<RefCell<StreamInfo>>`
-/// for the identical reason, ADR-0003), so this handle is `!Send` by design
-/// and never needs to cross a thread. `Notify` specifically (not a plain
-/// `bool` flag) because it **stores a permit**: a `notify_one()` that lands
-/// before the driver ever awaits `notified()` is not lost — the very next
-/// `.await` on it resolves immediately instead of parking. That is exactly
-/// the race this handle has to be safe against: a resume that arrives while
-/// the driver is still between callbacks (not yet parked) must not
-/// deadlock the stream by dropping the wakeup on the floor.
+/// Rust note: worker-local `Rc` keeps this handle `!Send` (ADR-0003).
+/// `Notify` stores an early permit, so resuming before the driver parks cannot
+/// lose the wakeup.
 #[derive(Clone)]
 pub struct DecodeContinueHandle {
     resume: Rc<Notify>,

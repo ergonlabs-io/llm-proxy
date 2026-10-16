@@ -44,13 +44,9 @@ impl HostResolver for TokioResolver {
 #[derive(Debug, Default)]
 pub struct FakeResolver {
     records: Mutex<HashMap<String, Vec<IpAddr>>>,
-    /// Per-host artificial resolution latency, set via [`FakeResolver::set_delay`].
-    /// Empty by default, so every existing caller that never calls it sees no
-    /// behavior change (`resolve` skips the `.await` sleep entirely). Exists
-    /// to let a test hold `update_from_snapshot` mid-resolution long enough
-    /// to observe what a *different* cluster's host set looks like while a
-    /// slow `STRICT_DNS` cluster is still resolving -- see
-    /// `manager.rs`'s `a_slow_dns_cluster_does_not_empty_other_clusters_mid_reload`.
+    /// Per-host artificial resolution latency, set via [`FakeResolver::set_delay`]. Empty by default, so callers that
+    /// never set it see no change. Lets a test hold a reload mid-resolution and observe another cluster's host set
+    /// meanwhile (see `manager.rs`'s `a_slow_dns_cluster_does_not_empty_other_clusters_mid_reload`).
     delays: Mutex<HashMap<String, Duration>>,
 }
 

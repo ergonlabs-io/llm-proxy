@@ -1,31 +1,23 @@
 //! Decoding an SDS-delivered
 //! `envoy.extensions.transport_sockets.tls.v3.Secret` resource.
 //!
-//! [`DynamicSecret`] is shared configuration IR in `proxy-config`, not xDS
-//! client state: this module decodes the wire protobuf into it, while the TLS
-//! serving layer consumes it. That separation keeps `proxy-core` independent
-//! from the discovery transport.
+//! [`DynamicSecret`] is shared IR in `proxy-config`. This module decodes the
+//! wire protobuf into it, and the TLS layer consumes it.
 //!
-//! # Strict mode (AGENTS.md invariant 1), applied to `Secret`
+//! # Strict mode (AGENTS.md invariant 1)
 //!
-//! Every field this message (and the messages it nests) can carry either
-//! lowers into [`DynamicSecret`] or is refused with its full dotted path --
-//! never silently dropped. Concretely, this module supports exactly:
-//! - `tls_certificate.certificate_chain` / `.private_key`, each an
-//!   `inline_bytes` or `inline_string` [`DataSource`] -- nothing else in
-//!   `TlsCertificate` (`pkcs12`, `watched_directory`, `private_key_provider`,
-//!   `password`, `ocsp_staple`, `signed_certificate_timestamp`) is
-//!   implemented;
-//! - `validation_context.trusted_ca`, same `DataSource` restriction --
-//!   nothing else in `CertificateValidationContext` is implemented;
-//! - `session_ticket_keys` and `generic_secret` are real `Secret.type` cases
-//!   this proxy simply does not act on yet, refused by name;
-//! - an unset `type` oneof is refused, not treated as a no-op.
+//! Every field either lowers into [`DynamicSecret`] or is refused with its
+//! dotted path. Supported:
+//! - `tls_certificate.certificate_chain` and `.private_key`, as `inline_bytes`
+//!   or `inline_string` only. Other `TlsCertificate` fields are refused.
+//! - `validation_context.trusted_ca`, with the same restriction. Other
+//!   `CertificateValidationContext` fields are refused.
+//! - `session_ticket_keys` and `generic_secret` are refused by name.
+//! - An unset `type` is refused.
 //!
-//! A `filename`/`environment_variable` `DataSource` is refused rather than
-//! read, deliberately: a control plane handing this proxy a *path* to read
-//! (or an env var name to look up) is a materially different trust model
-//! from handing it bytes directly, and is not this feature.
+//! `filename` and `environment_variable` sources are refused, not read. A
+//! control plane that hands over a path is a different trust model from one
+//! that hands over bytes.
 
 use prost::Message;
 use proxy_api::envoy::config::core::v3::data_source::Specifier;
@@ -37,11 +29,9 @@ use proxy_api::envoy::extensions::transport_sockets::tls::v3::{
 use proxy_config::ir::{DynamicSecret, SecretKind};
 use proxy_config::ConfigError;
 
-/// Build a [`ConfigError::UnsupportedField`] -- the same variant
-/// `proxy-config`'s own `lower.rs` raises for a field outside its allowlist,
-/// reused here rather than inventing a parallel error shape for the same
-/// idea (AGENTS.md invariant 1's dotted-path requirement applies identically to a
-/// dynamically-delivered resource).
+/// Build a [`ConfigError::UnsupportedField`], the same variant `proxy-config`'s
+/// `lower.rs` raises. Dotted paths apply to dynamic resources too (AGENTS.md
+/// invariant 1).
 fn unsupported(path: impl Into<String>, reason: impl Into<String>) -> ConfigError {
     ConfigError::UnsupportedField {
         field_path: path.into(),

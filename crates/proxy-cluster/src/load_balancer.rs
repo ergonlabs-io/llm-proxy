@@ -1,14 +1,10 @@
-//! Load balancing (S7): `ROUND_ROBIN` (smooth weighted),
-//! `LEAST_REQUEST` (power-of-two-choices), `RANDOM`, plus the
-//! priority-spillover / healthy-panic-threshold behavior every policy shares.
+//! Load balancing (S7): `ROUND_ROBIN` (smooth weighted), `LEAST_REQUEST` (power of two choices), `RANDOM`, plus
+//! the priority-spillover and healthy-panic-threshold behavior every policy shares.
 //!
-//! `RING_HASH`/`MAGLEV` are **not** implemented here -- both need bit-exact
-//! parity with Envoy's hash function and endpoint-key format to avoid
-//! silently breaking session affinity across a mixed fleet, and we don't yet
-//! have the differential harness to prove that parity (see [`build`]). That
-//! is a deliberate scope cut, not an oversight -- AGENTS.md invariant 1 forbids
-//! silently substituting a different policy, so we reject the config
-//! instead.
+//! `RING_HASH` and `MAGLEV` are not implemented. Both need bit-exact parity with Envoy's hash function and endpoint
+//! key format to avoid silently breaking session affinity across a mixed fleet, and there is no differential
+//! harness yet to prove that parity (see [`build`]). AGENTS.md invariant 1 forbids silently substituting another
+//! policy, so the config is rejected instead.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,16 +18,13 @@ use proxy_config::ir::LbPolicy;
 use crate::host_set::HostSet;
 use crate::{Host, LoadBalancerContext};
 
-/// Envoy's overprovisioning factor (S7), expressed as a percent multiplier
-/// (140 == 1.4x) so priority-load math stays integer. See
-/// [`priority_loads`] for the worked example.
+/// Envoy's overprovisioning factor (S7), as a percent multiplier (140 == 1.4x) so the priority math stays integer.
+/// See [`HostPicker::choose_priority`] for the worked example.
 const OVERPROVISIONING_FACTOR_PERCENT: u64 = 140;
 
-/// Envoy's healthy-panic threshold (S7): if the healthy fraction *within the
-/// selected priority* is strictly below this percentage, load balancing
-/// widens to every host at that priority (healthy and unhealthy) instead of
-/// just the healthy ones. Exactly 50% healthy does **not** panic -- Envoy's
-/// check is `healthy_percent < panic_threshold`, not `<=`.
+/// Envoy's healthy-panic threshold (S7). If the healthy fraction within the selected priority is strictly below
+/// this percentage, selection widens to every host at that priority. Exactly 50% healthy does not panic: Envoy's
+/// check is `<`, not `<=`.
 const PANIC_THRESHOLD_PERCENT: u64 = 50;
 
 /// A configured `lb_policy` unsupported by this build. Cluster construction
@@ -48,12 +41,9 @@ pub enum LbError {
     UnsupportedPolicy(LbPolicy),
 }
 
-/// One policy's choice among an already-narrowed candidate list (the
-/// priority + panic-threshold pool, see [`HostPicker::pick`]). Implementors
-/// do not need to handle `ctx.host_override` themselves -- that's resolved
-/// once, in [`HostPicker::pick`], so it can't drift between policies.
-/// `ctx.hash` is likewise unused here; it only matters for `RING_HASH`/
-/// `MAGLEV`, which aren't implemented (see [`build`]).
+/// One policy's choice among an already-narrowed candidate list (the priority and panic-threshold pool, see
+/// [`HostPicker::pick`]). Implementors do not handle `ctx.host_override`, which [`HostPicker::pick`] resolves once.
+/// `ctx.hash` is unused here; it matters only for `RING_HASH`/`MAGLEV`, which are not implemented (see [`build`]).
 pub trait LoadBalancer: Send + Sync {
     fn pick(&self, hosts: &[Arc<Host>], ctx: &LoadBalancerContext) -> Option<Arc<Host>>;
 }
@@ -66,15 +56,9 @@ pub fn build(policy: LbPolicy) -> Result<Box<dyn LoadBalancer>, LbError> {
         LbPolicy::Random => Ok(Box::new(RandomLb::new())),
         LbPolicy::LeastRequest => Ok(Box::new(LeastRequestLb::new())),
         LbPolicy::RingHash | LbPolicy::Maglev => Err(LbError::UnsupportedPolicy(policy)),
-        // `CLUSTER_PROVIDED` gets its own arm rather than joining the one
-        // above: RING_HASH/MAGLEV mean "not implemented yet"; this means
-        // "there is no host-picking `LoadBalancer` to build here, by
-        // design" -- an aggregate cluster (the only user of this policy,
-        // see `LbPolicy::ClusterProvided`'s doc) has no hosts of its own,
-        // only members. This arm is defensive: `ManagedCluster::from_config`'s
-        // aggregate arm of `ManagedCluster::from_config` never
-        // calls `build` at all, so reaching this in practice would mean a
-        // bug elsewhere, not a missing feature here.
+        // `CLUSTER_PROVIDED` is not `RING_HASH`/`MAGLEV`'s "not implemented yet". It means there is no host-picking
+        // `LoadBalancer` by design: an aggregate has members, not hosts (see `LbPolicy::ClusterProvided`). Defensive
+        // only: `ManagedCluster::from_config`'s aggregate arm never calls `build`.
         LbPolicy::ClusterProvided => Err(LbError::UnsupportedPolicy(policy)),
     }
 }
@@ -89,23 +73,15 @@ struct SwrrEntry {
     current: i64,
 }
 
-/// `ROUND_ROBIN` (S7): a plain rotating cursor when every candidate has the
-/// same weight (the common case, and indistinguishable from anything
-/// fancier), otherwise smooth weighted round robin so weight 5-vs-1 comes
-/// out interleaved (`A A A B A A`) instead of batched (`A A A A A B`) --
-/// Envoy uses an EDF scheduler for this; the nginx-style SWRR algorithm
-/// below produces the same "spread the low-weight host out" property with
-/// plain integers instead of floating-point deadlines.
+/// `ROUND_ROBIN` (S7): a plain rotating cursor when every candidate has the same weight. Otherwise smooth weighted
+/// round robin, so a 5:1 weight comes out interleaved (`A A A B A A`) rather than batched (`A A A A A B`). Envoy
+/// uses an EDF scheduler; this nginx-style SWRR gives the same spread with plain integers.
 pub struct RoundRobinLb {
     cursor: AtomicUsize,
-    // Rust note: SWRR is a stateful scheduler -- each pick both reads and
-    // rewrites every entry's `current` weight so it "remembers" where it
-    // left off -- but `LoadBalancer::pick` takes `&self` because one
-    // `Arc<dyn LoadBalancer>` is shared across worker threads. `Mutex` is
-    // the interior-mutability seam that lets a `&self` method still mutate.
-    // TODO: a per-pick lock here is a known contention point
-    // under load; a per-worker LB instance (no cross-thread sharing) would
-    // remove it, but that's a bigger structural change than this one.
+    // Rust note: SWRR is stateful, since each pick rewrites every entry's `current` weight. `pick` takes `&self`
+    // because one `Arc<dyn LoadBalancer>` is shared across workers, so the `Mutex` is the interior-mutability seam.
+    // TODO: a per-pick lock is a known contention point under load. A per-worker instance would remove it, but that
+    // is a larger structural change.
     swrr: Mutex<Vec<SwrrEntry>>,
 }
 
@@ -117,23 +93,16 @@ impl RoundRobinLb {
         }
     }
 
-    /// Smooth weighted round robin (nginx's algorithm): bump every
-    /// candidate's `current` by its own weight, pick whichever now has the
-    /// highest `current`, then discount that one by the total weight.
+    /// Smooth weighted round robin (nginx's algorithm): add each candidate's weight to its `current`, pick the
+    /// highest `current`, then subtract the total weight from that one.
     ///
-    /// Rust note: the loop invariant is what makes this "smooth" -- over any
-    /// `total_weight` consecutive picks, every host is chosen exactly
-    /// `weight` times, and because a host's `current` resets below zero
-    /// right after it's picked, it can't win again until enough other picks
-    /// have accumulated weight past it. Worked example, weights 5 and 1
-    /// (total 6): the sequence this produces is `A A A B A A` (repeating) --
-    /// B never has to wait through five A's in a row.
+    /// Rust note: over any `total_weight` consecutive picks, every host is chosen exactly `weight` times. The
+    /// chosen host's `current` drops below zero, so it cannot win again until other picks accumulate enough weight.
+    /// Weights 5 and 1 (total 6) give `A A A B A A`, repeating: `B` never waits through five `A`s.
     fn smooth_weighted_pick(&self, hosts: &[Arc<Host>]) -> Option<Arc<Host>> {
         let mut state = self.swrr.lock().unwrap();
-        // Reconcile against the current candidate set: hosts that were
-        // already tracked keep their `current` (that's the "memory" across
-        // picks); anything new starts at 0; anything that disappeared is
-        // simply dropped.
+        // Reconcile with the current candidate set. Tracked hosts keep their `current` (the memory across picks), new
+        // hosts start at 0, and departed hosts are dropped.
         let mut next: Vec<SwrrEntry> = Vec::with_capacity(hosts.len());
         for h in hosts {
             let current = state
@@ -233,12 +202,10 @@ impl LoadBalancer for RandomLb {
 /// Envoy's default `choice_count` for power-of-two-choices (S7).
 const DEFAULT_CHOICE_COUNT: usize = 2;
 
-/// `LEAST_REQUEST` (S7): pick `choice_count` candidates uniformly at random
-/// and take whichever has fewer active requests ("power of two choices" when
-/// `choice_count` is 2, Envoy's default). The router holds a
-/// `Host::begin_request` guard for each attempt's whole life, so
-/// `Host::active_requests` is the live in-flight count; with all hosts idle
-/// this is uniform random.
+/// `LEAST_REQUEST` (S7): pick `choice_count` candidates uniformly at random and take the one with fewer active
+/// requests. With `choice_count` 2 (Envoy's default) this is power of two choices. The router holds a
+/// `Host::begin_request` guard per attempt, so `Host::active_requests` is the live in-flight count. With all hosts
+/// idle this is uniform random.
 pub struct LeastRequestLb {
     choice_count: usize,
     rng: Mutex<StdRng>,
@@ -273,14 +240,9 @@ impl LoadBalancer for LeastRequestLb {
         }
         let mut rng = self.rng.lock().unwrap();
         let k = self.choice_count.min(hosts.len());
-        // Rust note: partial Fisher-Yates -- shuffle only the first `k`
-        // slots of an index array instead of the whole thing, since P2C
-        // only needs `k` *distinct* candidates, not a full random ordering.
-        // Sampling without replacement matters here: sampling *with*
-        // replacement could draw the same host twice and never actually
-        // compare it against anything, which defeats the "power of two
-        // choices" property (and made this fail non-deterministically with
-        // only 2 hosts in early testing).
+        // Rust note: partial Fisher-Yates shuffles only the first `k` slots, since P2C needs `k` distinct candidates.
+        // Sampling without replacement matters: sampling with replacement could draw the same host twice and never
+        // compare it against anything. That made this fail non-deterministically in early testing with 2 hosts.
         let mut indices: Vec<usize> = (0..hosts.len()).collect();
         for i in 0..k {
             let j = rng.gen_range(i..indices.len());
@@ -290,9 +252,7 @@ impl LoadBalancer for LeastRequestLb {
         let mut best_load = hosts[best_idx].active_request_count();
         for &idx in &indices[1..k] {
             let load = hosts[idx].active_request_count();
-            // Strict `<` (not `<=`): the first candidate drawn wins a tie --
-            // deterministic, and there's nothing here that could panic on a
-            // tie either way.
+            // Strict `<`: the first candidate drawn wins a tie, which is deterministic.
             if load < best_load {
                 best_load = load;
                 best_idx = idx;
@@ -304,16 +264,13 @@ impl LoadBalancer for LeastRequestLb {
 
 // ------------------------------------------------- priority + panic threshold --
 
-/// Combines a policy-specific [`LoadBalancer`] with the priority-spillover /
-/// healthy-panic-threshold behavior that's identical across every policy
-/// (S7). This is the single path a non-aggregate cluster's
-/// `ClusterEntry::select_host` (and, per-member, an aggregate's) calls into,
-/// so that shared behavior can't drift between policies.
+/// Combines a policy's [`LoadBalancer`] with the priority-spillover and healthy-panic-threshold behavior that every
+/// policy shares (S7). It is the single path for `ClusterEntry::select_host`, so that behavior cannot drift between
+/// policies.
 pub struct HostPicker {
     policy: Box<dyn LoadBalancer>,
-    // Rust note: which priority a given request lands on is itself a
-    // weighted random draw (see `choose_priority`), so this needs the same
-    // `&self`-but-mutates seam as the policies above.
+    // Rust note: the priority a request lands on is a weighted random draw (see `choose_priority`), which needs the
+    // same `&self`-but-mutates seam as the policies.
     priority_rng: Mutex<StdRng>,
 }
 
@@ -329,17 +286,12 @@ impl HostPicker {
         }
     }
 
-    /// Full S7 host pick: `ctx.host_override` short-circuit, then priority
-    /// spillover, then the healthy-panic-threshold widening, then the
-    /// configured policy's choice among the resulting pool. When the route
-    /// installs Envoy's `previous_hosts` retry predicate, a rejected pick is
-    /// re-run up to `host_selection_retry_max_attempts` times; the final pick
-    /// is used even if it repeats, exactly as Envoy specifies when no unused
-    /// host can be found.
+    /// Full S7 host pick: the `host_override` short-circuit, then priority spillover, then healthy-panic widening,
+    /// then the policy's choice among the resulting pool. With Envoy's `previous_hosts` predicate, a rejected pick is
+    /// re-run up to `host_selection_retry_max_attempts` times. The final pick is used even if it repeats, as Envoy
+    /// specifies when no unused host is found.
     pub fn pick(&self, host_set: &HostSet, ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
-        // Endpoint-picker hook: honor an explicit override when it's
-        // actually present in the set; otherwise fall through to normal
-        // selection rather than erroring (the override is a *hint*).
+        // The override is a hint. Honor it only when the address is in the set; otherwise select normally.
         if let Some(addr) = ctx.host_override {
             if let Some(host) = host_set.all_hosts().iter().find(|h| h.address == addr) {
                 if !ctx.avoid_previous_hosts || !ctx.attempted_hosts.contains(&addr) {
@@ -386,21 +338,15 @@ impl HostPicker {
         unreachable!("the inclusive selection loop always returns")
     }
 
-    /// Picks which priority level this request routes to, per S7's
-    /// overprovisioning-factor spillover.
+    /// Picks the priority for this request, per S7's overprovisioning-factor spillover.
     ///
-    /// Formula (Envoy's, ⚠️ overprovisioning factor 1.4 == 140%): walk
-    /// priorities ascending; each gets `min(100, healthy_ratio * 140,
-    /// remaining_load)` percent, except the *last* priority present, which
-    /// always absorbs whatever load is left over (there's nowhere else for
-    /// it to go). Percentages are integers 0..=100 that sum to exactly 100.
+    /// Envoy's formula (overprovisioning factor 1.4 == 140%): walk priorities ascending. Each gets
+    /// `min(100, healthy_ratio * 140, remaining_load)` percent, except the last priority present, which absorbs
+    /// whatever load is left. Percentages are integers 0..=100 that sum to 100.
     ///
-    /// Worked example, P0 50% healthy, P1 fully healthy: P0 gets
-    /// `min(100, 50 * 140 / 100) = 70`; the remaining 30 goes to P1 (the
-    /// last priority) regardless of P1's own ratio. All-healthy P0 (alone or
-    /// with other priorities) gets `min(100, 100*140/100) = 100`, so nothing
-    /// spills. P0 fully unhealthy gets `min(100, 0) = 0`, so P1 (as the last
-    /// priority) absorbs all 100.
+    /// Example: P0 50% healthy, P1 fully healthy. P0 gets `min(100, 50 * 140 / 100) = 70`, and the remaining 30
+    /// goes to P1 (the last priority) regardless of its ratio. A fully healthy P0 gets 100, so nothing spills. A
+    /// fully unhealthy P0 gets 0, so P1 absorbs all 100.
     fn choose_priority(&self, host_set: &HostSet) -> Option<u32> {
         let priorities: Vec<u32> = host_set.priorities().collect();
         if priorities.is_empty() {
@@ -435,9 +381,8 @@ impl HostPicker {
                 return Some(*priority);
             }
         }
-        // Rounding safety net: integer math should always sum to exactly
-        // 100, but if it somehow doesn't, fall back to the last priority
-        // rather than returning `None` for a non-empty host set.
+        // Integer math should always sum to exactly 100. If it does not, fall back to the last priority rather than
+        // return `None` for a non-empty host set.
         Some(last)
     }
 }
@@ -453,13 +398,9 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)), 80)
     }
 
-    // Rust note: these tests predate `HealthFlags` and were written
-    // against the old two-state `HealthStatus` enum; rather than touch every
-    // one of the dozens of call sites below, `host()` keeps the old
-    // `HealthStatus` parameter and maps it onto the new `failed_active_hc`
-    // bit -- `Unhealthy` here means "failing active HC", which is exactly
-    // what these tests are exercising (S7 panic threshold / spillover), not
-    // outlier ejection.
+    // Rust note: these tests predate `HealthFlags`. Rather than touch every call site, `host()` maps the old
+    // `HealthStatus` onto `failed_active_hc`. `Unhealthy` here means failing active HC, which is what the S7 panic
+    // and spillover tests exercise, not outlier ejection.
     fn host(last: u8, weight: u32, priority: u32, health: HealthStatus) -> Arc<Host> {
         Arc::new(Host {
             address: addr(last),
@@ -532,16 +473,9 @@ mod tests {
 
     #[test]
     fn weighted_round_robin_is_smooth_not_batched() {
-        // Weights 5:1 -- a naive "emit weight copies in a row, in host-list
-        // order" scheme is periodic with period 6 and *always* puts the
-        // light host at the very end of each period: A,A,A,A,A,B repeated.
-        // Note the ratio itself (5:1) forces a run of 5 A's to appear
-        // *somewhere* in any periodic schedule (there's only one gap per
-        // period to place) -- so the meaningful distinguishing property
-        // isn't "no run of 5 ever", it's *where* the interruption falls.
-        // Smooth (nginx-style SWRR, standing in for Envoy's EDF) does not
-        // front-load all of host 1's picks before ever visiting host 2: the
-        // first interruption happens well before the naive scheme's would.
+        // Weights 5:1. A naive "emit weight copies in a row" scheme is periodic with period 6 and always puts the
+        // light host last: A,A,A,A,A,B. A run of five A's must appear somewhere, since there is one gap per period.
+        // What matters is where the interruption falls. Smooth weighting visits host 2 well before the naive scheme does.
         let lb = RoundRobinLb::new();
         let hosts = vec![healthy_host(1, 5), healthy_host(2, 1)];
         let ctx = LoadBalancerContext::default();
@@ -568,10 +502,8 @@ mod tests {
             "smooth weighting should not match the naive batched sequence"
         );
 
-        // The distinguishing assertion: the naive scheme's first
-        // interruption is at index 5 (0-based) -- the light host never
-        // appears before all 5 copies of the heavy host have run. Smooth
-        // weighting interleaves it in well before that.
+        // The naive scheme's first interruption is at index 5 (0-based). Smooth weighting interleaves the light host
+        // well before that.
         let first_light = picks.iter().position(|&h| h == 2).unwrap();
         assert!(
             first_light < 5,
@@ -756,9 +688,8 @@ mod tests {
 
     #[test]
     fn previous_hosts_predicate_reuses_last_pick_when_all_hosts_were_tried() {
-        // Envoy does not turn a retriable request into UH merely because the
-        // predicate cannot find a new host: after its configured re-picks it
-        // uses the final selection, which can be a previous host.
+        // Envoy does not turn a retriable request into UH just because the predicate finds no new host. After its
+        // configured re-picks it uses the final selection, which may be a previous host.
         let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
         let set = host_set_from(vec![healthy_host(1, 1)]);
         let ctx = LoadBalancerContext {
@@ -772,9 +703,8 @@ mod tests {
 
     #[test]
     fn all_unhealthy_everywhere_still_returns_a_host_via_panic() {
-        // A single priority, fully unhealthy: still gets 100% of the load
-        // (it's the only/last priority), and the panic threshold widens
-        // selection to the unhealthy hosts since there are no healthy ones.
+        // A single fully unhealthy priority still gets 100% of the load, since it is the last priority. The panic
+        // threshold widens selection to the unhealthy hosts.
         let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
         let set = host_set_from(vec![
             host(1, 1, 0, HealthStatus::Unhealthy),
@@ -863,9 +793,8 @@ mod tests {
 
     #[test]
     fn half_healthy_priority_zero_spills_thirty_percent_to_priority_one() {
-        // P0: 1 of 2 healthy = 50% -> min(100, 50*140/100) = 70% to P0.
-        // Remaining 30% goes to P1 (the last priority), per the worked
-        // example in `choose_priority`'s doc comment.
+        // P0: 1 of 2 healthy = 50%, so min(100, 50*140/100) = 70% to P0. The remaining 30% goes to P1, the last
+        // priority (see `choose_priority`'s doc).
         let picker = HostPicker::with_seed(Box::new(RoundRobinLb::new()), 1);
         let set = host_set_from(vec![
             host(1, 1, 0, HealthStatus::Healthy),

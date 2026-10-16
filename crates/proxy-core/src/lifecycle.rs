@@ -10,10 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 
-// Rust note: every flag below is an independent boolean read and written on
-// its own, with no other memory that must be observed in a matching order, so
-// `Relaxed` is enough. The one cross-task handoff (waking the signal loop)
-// goes through `Notify`, which does its own synchronization.
+// Rust note: each flag is an independent boolean with no memory that must be observed in a matching order, so
+// `Relaxed` is enough. The one cross-task handoff (waking the signal loop) goes through `Notify`, which synchronizes itself.
 #[derive(Debug, Default)]
 pub struct LifecycleState {
     health_check_failed: AtomicBool,

@@ -1,10 +1,5 @@
-//! `openai`: an OpenAI-chat-completions-compatible mock upstream for the LLM
-//! feature lanes (streaming metrics, token metering, model
-//! routing). Unlike `echo`/`slow` it understands the request body
-//! (`/v1/chat/completions`) well enough to fabricate a plausible completion —
-//! non-streaming JSON or a paced SSE stream — and it records the parsed
-//! request bodies (not just method/path/headers) so scenarios can assert on
-//! what the proxy forwarded upstream.
+//! OpenAI-compatible mock upstream for `/v1/chat/completions`. It returns JSON
+//! or paced SSE and records parsed request bodies for forwarding assertions.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

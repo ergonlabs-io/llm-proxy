@@ -1,4 +1,4 @@
-//! Rate limit on failed admin bearer tokens, per peer IP (review M9).
+//! Rate limit on failed admin bearer tokens, per peer IP.
 //!
 //! The admin token gates key minting, revocation, tenant policy and tenant
 //! provider credentials. Without a limit a peer can try tokens as fast as it

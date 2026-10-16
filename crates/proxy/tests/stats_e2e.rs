@@ -1,38 +1,7 @@
-//! Acceptance: real traffic through the real
-//! `llm-proxy` binary shows up in `/stats`/`/stats/prometheus`. This is the
-//! load-bearing test -- an assertion against
-//! `Registry::value` (or anything short of the actual admin-endpoint HTTP
-//! response) would pass even if the renderer never saw what the recording
-//! side wrote. See `crates/proxy-http/src/stat_handles.rs` and
-//! `crates/proxy-http/src/router.rs`/`crates/proxy-core/src/listener.rs` for
-//! the recording side; this file only drives the compiled binary and reads
-//! its admin surface.
-//!
-//! Rust note: same shape as `tests/cli.rs` (a separate compiled crate per
-//! `tests/*.rs` file, so nothing here is shared with it beyond convention) --
-//! `env!("CARGO_BIN_EXE_llm-proxy")`, ephemeral ports via `free_port()`, and
-//! `Command::new(BIN).spawn()` rather than any in-process harness, because
-//! `crates/proxy` has no `[lib]` target for an integration test to link
-//! against: the only way to exercise `main.rs`'s real wiring (the
-//! `StatsControl`/`StatHandles`/`RouterStats` construction in `run_serve`/
-//! `worker_main`) is to run the actual binary.
-//!
-//! # `downstream_cx_total`/`llm.client.token.usage`: `/stats/prometheus`, not `/stats`
-//!
-//! `llm.client.token.usage` is asserted against `/stats/prometheus` only:
-//! `proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE`'s own
-//! doc says it "has no Envoy equivalent" and renders to nothing in the
-//! Envoy-text format by design, so asserting it on `/stats` would be
-//! asserting a bug.
-//!
-//! `downstream_cx_total` is asserted on BOTH, and the `/stats` half is the
-//! more interesting one. It was originally `/stats/prometheus`-only for the
-//! same reason -- but that reason was wrong: this stat DOES have an Envoy
-//! equivalent, and `envoy_render::envoy_counter_name` simply had no case for
-//! it, so the Envoy-text endpoint silently under-reported while Prometheus
-//! looked fine. Two renderers over one registry can disagree, and only
-//! checking both catches it. Note the key is the listener NAME, a deliberate
-//! divergence from Envoy's address-keyed default (internal-docs/envoy-divergences.md).
+//! Drives the binary and verifies recorded traffic through the real admin
+//! renderers. `llm.client.token.usage` is Prometheus-only because it has no Envoy
+//! text equivalent. `downstream_cx_total` is checked in both formats; its label
+//! uses the listener name (internal-docs/envoy-divergences.md).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -45,10 +14,7 @@ use proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT;
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 
-/// Reserves a free ephemeral port and hands back its number -- same
-/// "bind to port 0, read it back, drop it" technique as `tests/cli.rs`'s own
-/// `free_port`; each `tests/*.rs` file is its own compiled crate, so this
-/// isn't shared, just duplicated.
+/// Reserves and returns an ephemeral port.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
     listener.local_addr().expect("no local addr").port()
@@ -174,11 +140,7 @@ fn post(addr: SocketAddr, path: &str, host: &str, body: &str) -> String {
     String::from_utf8_lossy(&response).to_string()
 }
 
-/// Kills and reaps a child process on drop -- used for the two child
-/// processes the `llm.client.token.usage` test below spawns
-/// (`mock-upstream` and `llm-proxy`), so an assertion failure partway through
-/// the test still leaves nothing running (AGENTS.md "Running The Product"'s corollary: a
-/// hand-run process that outlives its test is a leak, not just a red test).
+/// Kills and reaps the child process on drop (AGENTS.md "Running The Product").
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {

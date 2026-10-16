@@ -1,36 +1,22 @@
-//! The admin HTTP server: binds a socket (control runtime, ADR-0003) and
-//! answers the read-only endpoints, plus a
-//! bearer-gated write API for the control plane, over real hyper
-//! connections.
+//! The admin HTTP server: binds a socket on the control runtime (ADR-0003) and answers the read-only
+//! endpoints, plus a bearer-gated write API for the control plane, over real hyper connections.
 //!
-//! # The write API's `ControlPlane` is resolved PER REQUEST, never cached
+//! # The write API's `ControlPlane` is resolved per request
 //!
-//! `run_serve` (`crates/proxy/src/main.rs`) calls [`serve`] *before* the
-//! worker pool spawns -- so at the moment this module's socket binds, no
-//! worker has run its `AuthFilterFactory::create` yet, and therefore no
-//! [`proxy_filters::control::ControlPlane`] has been registered into the
-//! shared [`proxy_http::filter::SharedFactoryState`] slot. Caching a
-//! `ControlPlane` (or `None`) at `serve()` time would freeze that boot race
-//! into a permanent 503, or panic the first mint request. Every write
-//! request instead calls [`resolve_control_plane`] fresh -- see that
-//! function's doc for what a miss means, and for the SEPARATE case where more
-//! than one filter chain configures `llmproxy.auth`: this server has no chain
-//! scope of its own (it isn't part of any filter chain), so it cannot pick
-//! one of several `ControlPlane`s without guessing -- that case is a loud,
-//! explicit error, never a silent pick.
+//! `run_serve` (`crates/proxy/src/main.rs`) calls [`serve`] before the worker pool spawns, so no worker has
+//! run `AuthFilterFactory::create` when this socket binds. Caching a `ControlPlane` (or `None`) at `serve()`
+//! time would freeze that boot race into a permanent 503. Each write request therefore calls
+//! [`resolve_control_plane`] fresh. See that function for what a miss means, and for the case where more than
+//! one filter chain configures `llmproxy.auth`: this server has no chain scope, so it errors loudly rather
+//! than guess.
 //!
-//! # The admin bearer token: a `serve()` parameter, never read from the
-//! environment here
+//! # The admin bearer token is a `serve()` parameter
 //!
-//! The owner's convention (mirroring `keygen`'s `LLMPROXY_AUTH_SECRET`) is
-//! an env var, `LLMPROXY_ADMIN_TOKEN` -- but `std::env::var` is
-//! process-global and racy across parallel tests, so this module never reads
-//! it. `crates/proxy/src/main.rs`'s `start_admin` reads the env var once and
-//! passes the result in; every test in `server/tests.rs` passes a literal.
-//! [`serve`] normalizes `None`/empty/whitespace-only to `None` in exactly one
-//! place ([`normalize_admin_token`]) so both callers get identical
-//! fail-closed behavior -- **unset never means open**, see the gate inside
-//! [`handle`] for the rest of the semantics.
+//! The convention mirrors `keygen`'s `LLMPROXY_AUTH_SECRET` with an env var, `LLMPROXY_ADMIN_TOKEN`. But
+//! `std::env::var` is process-global and racy across parallel tests, so this module never reads it.
+//! `start_admin` in `crates/proxy/src/main.rs` reads it once and passes it in. [`serve`] normalizes `None`,
+//! empty, and whitespace-only to `None` in one place ([`normalize_admin_token`]), so both callers fail closed
+//! the same way. **Unset never means open**; see the gate inside [`handle`].
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -72,11 +58,8 @@ use crate::dump::{
     clusters_from_snapshot_and_live, models_from_snapshot, ClusterDump, ConfigDump, LiveCluster,
 };
 
-/// The endpoints this crate serves, used both to route requests and to list
-/// "available endpoints" in a 404 body. `{id}` segments are literal in this
-/// list (documentation only) -- routing itself is done by
-/// [`match_write_route`] for the write API, not by matching against these
-/// strings.
+/// The endpoints this crate serves, used to route requests and to list them in a 404 body. `{id}` segments
+/// are documentation only; routing is done by [`match_write_route`].
 const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/ready",
     // Gated lifecycle writes (POST); see `handle_lifecycle`.
@@ -128,96 +111,57 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/capture/spool/records?after=<sequence>&limit=<1..=100> (bearer-gated page of stored records)",
 ];
 
-/// Hard cap on a write request's body. An admin write endpoint has no
-/// legitimate reason to receive a multi-megabyte body (the largest real
-/// payload, a `PUT .../policy`, is a handful of glob strings); without a
-/// cap, reading `Incoming` to completion would buffer an attacker-controlled
-/// body of unbounded size in memory -- a trivial DoS against a port that is,
-/// deliberately, reachable without a config file naming an operator's IP
-/// allowlist.
+/// Hard cap on a write request's body. No legitimate admin write is large (the biggest, a `PUT .../policy`,
+/// is a handful of glob strings). Without a cap, reading `Incoming` would buffer an unbounded body. The port
+/// is deliberately reachable without an IP allowlist, so this matters.
 pub(super) const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
 
-/// Body cap for `PUT /pricing` alone. A rate card is machine-generated and
-/// large: the shipped OpenRouter card (438 entries) is 142 KB as compact JSON,
-/// 268 KB with its source catalog, and 401 KB pretty-printed, which is what the
-/// admin UI's upload box and a hand-edited file send. The generic cap above
-/// rejected all of them. 4 MiB leaves about ten times the largest of those, so
-/// a catalog several times today's size still fits.
-///
-/// The cap stays finite for the reason the generic one exists: the bearer
-/// gate has already passed by the time the body is read, so only a token
-/// holder can make the server buffer this much, and the buffer is released
-/// when the request ends. Every other route keeps [`MAX_ADMIN_BODY_BYTES`].
+/// Body cap for `PUT /pricing` alone. A rate card is machine-generated and large: the shipped OpenRouter card
+/// is 401 KB pretty-printed. 4 MiB leaves about ten times that. The cap stays finite because only a token
+/// holder reaches this read, and the buffer is released when the request ends. Every other route keeps
+/// [`MAX_ADMIN_BODY_BYTES`].
 pub(super) const MAX_PRICING_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-/// What `/ready` should report, as decided by whoever injects the
-/// [`ReadinessProbe`] -- this crate never asks a `ClusterManager` itself
-/// (AGENTS.md invariant 2: generated protos and their consuming crates stay out
-/// of `proxy-admin`; the analogous discipline here is "no data-plane crate
-/// dependency", matching `proxy-xds::apply::Publish`'s seam).
+/// What `/ready` reports, as decided by whoever injects the [`ReadinessProbe`]. This crate never asks a
+/// `ClusterManager` itself, so it takes no data-plane or generated-proto dependency (AGENTS.md invariant 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Readiness {
     /// Serve traffic: `/ready` returns `200 "LIVE"`.
     Live,
-    /// At least one cluster has not resolved yet and the caller's warming
-    /// deadline (if any) has not passed: `/ready` returns `503
-    /// "INITIALIZING"`. `warming` names the still-unresolved clusters, for
-    /// logging by whoever built the probe -- this module does not log it
-    /// itself (`/ready` is polled on a tight loop
-    /// by orchestrators, so logging on every call would become the
-    /// incident; the one-shot "deadline expired" warning belongs to the
-    /// probe's owner, `crates/proxy/src/main.rs`, which knows when the
-    /// deadline fires and can suppress repeats).
+    /// At least one cluster is still unresolved and the caller's warming deadline has not passed: `/ready`
+    /// returns `503 "INITIALIZING"`. `warming` lists the unresolved clusters for the probe's owner to log. This
+    /// module does not log: `/ready` is polled tightly, so a log per call would become the incident.
     Initializing { warming: Vec<String> },
-    /// The process is out of rotation, either because `/healthcheck/fail`
-    /// was called or because a drain started (SIGTERM or
-    /// `POST /drain_listeners`): `/ready` returns `503 "DRAINING"`, Envoy's
-    /// server-state text for the same condition.
+    /// The process is out of rotation: `/healthcheck/fail` was called, or a drain started (SIGTERM or
+    /// `POST /drain_listeners`). `/ready` returns `503 "DRAINING"`, Envoy's server-state text.
     Draining,
 }
 
-/// Where `/ready` gets its answer. A plain synchronous closure (not `async`,
-/// unlike [`proxy_xds::apply::Publish`]) because the real implementation
-/// (`crates/proxy/src/main.rs`) only reads atomics off a `ClusterManager` --
-/// no I/O, nothing to await. `Arc<dyn Fn...>` rather than a `Box` because it
-/// is cloned into every accepted connection's task alongside `config` and
-/// `registry` (see [`serve`]'s accept loop) -- an `Arc` clone is a refcount
-/// bump; a `Box` would need to be reconstructed or the closure would need to
-/// be `Clone` itself, which a `dyn Fn` cannot be.
-///
-/// This crate never depends on `proxy-cluster` to build one -- see this
-/// module's doc and [`Readiness`]'s doc for why. When `serve` is called with
-/// `None` (no probe wired), `/ready` keeps its default behavior, `200
-/// "LIVE"` unconditionally, rather than inventing a new failure mode for
-/// callers (mostly tests) that never had a `ClusterManager` to ask.
+/// Where `/ready` gets its answer. A plain synchronous closure, since the real one only reads atomics.
+/// `Arc<dyn Fn..>` because every accepted connection's task clones it, and a `dyn Fn` cannot be `Clone`.
+/// With `None` (no probe wired, mostly tests), `/ready` returns `200 "LIVE"` unconditionally.
 pub type ReadinessProbe = Arc<dyn Fn() -> Readiness + Send + Sync>;
 
-/// Supplies a runtime host-set snapshot for one config snapshot. Keeping this
-/// as an injected closure preserves the admin crate's control-plane-only
-/// dependency direction: the binary can adapt `ClusterManager` state without
-/// making this crate depend on the data plane or on generated protos.
+/// Supplies a runtime host-set snapshot for one config snapshot. Injecting it keeps this crate free of
+/// data-plane and generated-proto dependencies.
 pub type ClusterStateProvider =
     Arc<dyn Fn(&proxy_config::ir::ConfigSnapshot) -> Vec<LiveCluster> + Send + Sync>;
 
-/// Supplies the capture agent endpoint as of this request, `None` when no
-/// agent is configured. A closure rather than a value because a declarative
-/// config reload can move the endpoint; the admin crate stays free of the
-/// binary's config plumbing, like [`ClusterStateProvider`].
+/// Supplies the capture agent endpoint as of this request, `None` when no agent is configured. A closure,
+/// because a config reload can move the endpoint.
 pub type CaptureAgentProvider = Arc<dyn Fn() -> Option<AgentTransportConfig> + Send + Sync>;
 
 /// Bound on one inspection round trip to the capture agent. The agent reads
 /// and decrypts a page under this budget; a slower answer reads as down.
 const CAPTURE_QUERY_DEADLINE: Duration = Duration::from_secs(2);
 
-/// How long `/capture/spool/stats` serves its last agent answer. The endpoint
-/// is ungated, so without this any admin-port caller could make the agent walk
-/// its spool directory once per request.
+/// How long `/capture/spool/stats` serves its last agent answer. The endpoint is ungated, so without this any
+/// admin caller could make the agent walk its spool once per request.
 pub(crate) const CAPTURE_STATS_TTL: Duration = Duration::from_secs(5);
 
-/// Single-flight cache for the stats query: the async mutex is held across the
-/// agent round trip, so concurrent callers queue behind one query and then read
-/// its result. A flood costs the agent at most one query per TTL. Errors are
-/// cached too, so a down agent is not hammered either. Records stay uncached.
+/// Single-flight cache for the stats query. The async mutex is held across the agent round trip, so
+/// concurrent callers queue and share one result. Errors are cached too, so a down agent is not hammered.
+/// Records stay uncached.
 struct CaptureStatsCache {
     ttl: Duration,
     // Rust note: `tokio::sync::Mutex` (unlike `std::sync::Mutex`) may be held
@@ -244,18 +188,14 @@ pub enum AdminError {
     },
 }
 
-/// A running admin server. Dropping this does not stop the server -- see
-/// [`AdminServer::abort`] -- so callers that care about shutdown (none do
-/// yet) must call it explicitly.
+/// A running admin server. Dropping it does not stop the server; call [`AdminServer::abort`].
 pub struct AdminServer {
     local_addr: SocketAddr,
     accept_task: JoinHandle<()>,
 }
 
-/// Dependencies shared by every connection accepted by one admin server.
-///
-/// This is one server-level capability bundle, not a request payload: cloning
-/// it only clones `Arc` handles and optional closures for the next task.
+/// Dependencies shared by every connection one admin server accepts. Cloning it clones only `Arc` handles and
+/// optional closures.
 #[derive(Clone)]
 pub struct AdminRuntime {
     pub config: Arc<WorkerConfigHandle>,
@@ -359,9 +299,8 @@ impl UiAssets {
         Ok(Self { files })
     }
 
-    /// Resolves a `/ui/` remainder to a file. Unknown remainders fall back
-    /// to `index.html` (a single-page app owns its own sub-routes; a 404
-    /// here would break a refresh on any client-side route).
+    /// Resolves a `/ui/` remainder to a file. Unknown remainders fall back to `index.html`, so client-side
+    /// routes survive a refresh.
     fn lookup(&self, remainder: &str) -> Option<&UiFile> {
         let key = remainder.trim_start_matches('/');
         if key.is_empty() {
@@ -371,11 +310,8 @@ impl UiAssets {
     }
 }
 
-/// Content type by file extension for `/ui/` assets. Unknown extensions get
-/// `application/octet-stream` rather than a guessed text type -- serving an
-/// attacker-influenced byte stream as scriptable HTML/JS is exactly how a
-/// stored-XSS rides a static file server, and these bytes come from a build
-/// directory, not a vetted allowlist.
+/// Content type by extension for `/ui/` assets. Unknown extensions get `application/octet-stream`, never a
+/// guessed text type: serving attacker-influenced bytes as HTML or JS is how stored XSS rides a static server.
 fn ui_content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
@@ -392,26 +328,19 @@ fn ui_content_type(path: &str) -> &'static str {
 }
 
 impl AdminServer {
-    /// The address actually bound -- callers pass port 0 in tests and read
-    /// the OS-assigned port back from here.
+    /// The address actually bound. Tests pass port 0 and read the OS-assigned port back from here.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    /// Stops accepting new connections. In-flight requests on already
-    /// accepted connections may still complete (each runs on its own
-    /// spawned task, independent of this handle).
+    /// Stops accepting new connections. In-flight requests on accepted connections may still complete.
     pub fn abort(&self) {
         self.accept_task.abort();
     }
 }
 
-/// Collapses `None` and an empty/whitespace-only token to `None` -- see the
-/// module doc's "admin bearer token" section for why this lives here rather
-/// than at either caller. An operator who sets `LLMPROXY_ADMIN_TOKEN=""` (or
-/// leaves it exported-but-empty in a script) gets the same fail-closed 403
-/// as an operator who never set it at all, rather than a token that is
-/// trivially "guessed" by presenting an empty bearer value.
+/// Collapses `None` and an empty or whitespace-only token to `None`, so an empty `LLMPROXY_ADMIN_TOKEN` fails
+/// closed (403) like an unset one, instead of accepting an empty bearer value.
 fn normalize_admin_token(token: Option<String>) -> Option<String> {
     match token {
         Some(value) if !value.trim().is_empty() => Some(value),
@@ -421,35 +350,23 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
 
 /// Binds `addr` and starts answering admin requests on the control runtime.
 ///
-/// `config` is read (never owned) per request via `load()` -- an `Arc`
-/// clone of whatever the control side last published, per ADR-0005's
-/// "control computes, workers read" split applied to this reader too.
-/// `registry` is the stats registry, `Some` once a caller has one to
-/// offer -- see `/stats`'s route in [`handle`] for what happens when it
-/// doesn't. `started_at` backs `/server_info`'s uptime. `factory_state` is
-/// the per-serve [`SharedFactoryState`] a worker's `AuthFilterFactory`
-/// registers its `ControlPlane` singleton into -- see the module doc's
-/// "resolved PER REQUEST" section for why `serve` itself never reads out of
-/// it at startup. `admin_token` gates every WRITE endpoint (`/keys`,
-/// `/tenants`, ...); see [`normalize_admin_token`] and [`handle`]'s gate for
-/// the fail-closed semantics -- READ endpoints are unaffected by it.
-/// `readiness` answers `/ready`; see [`ReadinessProbe`]'s
-/// doc for why it is an injected closure and what `None` means.
-/// `cluster_state` supplies the current host sets for `/clusters`.
-/// Passing `None` preserves the standalone config-only view used by older
-/// embedders and tests; the shipped binary always passes the real provider.
+/// `config` is read per request via `load()`, an `Arc` clone of the last published snapshot (ADR-0005's
+/// "control computes, workers read"). `registry` backs `/stats`, which returns 404 when `None` rather than an
+/// empty `200`, since an empty `/stats` reads as no traffic. `started_at` backs `/server_info`'s uptime.
+/// `factory_state` is the per-serve [`SharedFactoryState`] that `ControlPlane`s register into; `serve` never
+/// reads it at startup (see the module doc). `admin_token` gates every WRITE endpoint (see
+/// [`normalize_admin_token`]); READ endpoints are not gated by it. `readiness` answers `/ready`, and `None`
+/// keeps the unconditional `200 "LIVE"`. `cluster_state` supplies `/clusters`, and `None` gives the
+/// config-only view that older embedders and tests use.
 ///
-/// Rust note: `TcpListener::accept` runs in a loop inside a `tokio::spawn`led
-/// task; each accepted connection gets its own further-spawned task running
-/// one `hyper::server::conn::http1` connection, the standard hyper-on-tokio
-/// shape. Nothing here needs `!Send`/`Rc` -- this is ordinary control-plane
-/// code, never the worker-local data plane (ADR-0003).
+/// Rust note: each accepted connection gets its own spawned task running one `hyper` `http1` connection.
+/// Nothing here is `!Send`: this is ordinary control-plane code, not the worker-local data plane (ADR-0003).
 pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServer, AdminError> {
     serve_with_stats_ttl(addr, runtime, CAPTURE_STATS_TTL).await
 }
 
-/// [`serve`] with the `/capture/spool/stats` cache lifetime as a parameter, so
-/// tests can expire it without sleeping the production 5 s.
+/// [`serve`] with the `/capture/spool/stats` cache lifetime as a parameter, so tests can expire it without
+/// sleeping 5 s.
 pub(crate) async fn serve_with_stats_ttl(
     addr: SocketAddr,
     runtime: AdminRuntime,
@@ -526,10 +443,8 @@ async fn handle(
     let admin_token = runtime.admin_token.as_deref();
     let readiness = runtime.readiness.as_ref();
     let cluster_state = runtime.cluster_state.as_ref();
-    // ---- Single-page admin UI (optional, in-memory, same-origin so no CORS
-    // is ever needed): `GET /ui`, `GET /ui/`, and `GET /ui/<asset>`. Unknown
-    // sub-paths fall back to index.html -- the SPA owns its own routes.
-    // Exact-prefix matching only (`/ui` + `/` or end): `/uix` must not match.
+    // ---- Single-page admin UI (optional, in-memory, same-origin, so no CORS is needed): `GET /ui`, `GET /ui/`,
+    // `GET /ui/<asset>`. Unknown sub-paths fall back to index.html. Matching is exact-prefix: `/uix` must not match.
     let path_str = req.uri().path();
     let ui_remainder = if path_str == "/ui" {
         Some("")
@@ -565,15 +480,9 @@ async fn handle(
             return handle_get_pricing(factory_state, stat_prefix);
         }
     }
-    // ---- Read endpoints: unchanged by the write API,
-    // no gate, matched on path alone (as before -- these never distinguished
-    // method). ----
+    // ---- Read endpoints. No gate; matched on path alone. ----
     match req.uri().path() {
-        // No probe wired keeps the pre-existing
-        // unconditional `200 "LIVE"` -- see `ReadinessProbe`'s doc for why
-        // that is a deliberate "no new failure mode" default rather than an
-        // invented one for callers (mostly tests) with no `ClusterManager`
-        // to ask.
+        // With no probe wired, `200 "LIVE"` stays unconditional. See `ReadinessProbe`.
         "/ready" => {
             return match readiness.map(|probe| probe()) {
                 None | Some(Readiness::Live) => text(StatusCode::OK, "LIVE"),
@@ -603,12 +512,9 @@ async fn handle(
             };
             return json(StatusCode::OK, &clusters);
         }
-        // Model inventory: every route this snapshot matches on the model
-        // header (`x-llmproxy-model`), rendered as the patterns an operator
-        // configured. Ungated like every other read in this block -- it is
-        // config shape, exactly like `/config_dump` above, and carries no
-        // identity and no spend. See `dump::models_from_snapshot` for what
-        // counts as a model and what is deliberately left out.
+        // Model inventory: every route this snapshot matches on the model header, rendered as the operator
+        // configured it. Ungated like `/config_dump`, since it is config shape with no identity or spend. See
+        // `dump::models_from_snapshot`.
         "/models" => {
             let snapshot = config.load();
             return json(StatusCode::OK, &models_from_snapshot(&snapshot));
@@ -623,14 +529,8 @@ async fn handle(
                 },
             );
         }
-        // Rendering is `envoy_render::render`, which only
-        // reads atomics already resolved/incremented elsewhere and formats
-        // a string -- no I/O, no blocking, safe on this request path (see
-        // `envoy_render::render`'s own doc). When no registry has been
-        // wired for this server instance (e.g. a test standing up `serve`
-        // without one), this deliberately keeps the pre-existing honest
-        // 404 rather than fabricating an empty `200` -- an operator who
-        // trusts an empty `/stats` believes there is no traffic.
+        // Rendering only formats atomics already updated elsewhere, so it is safe on this path. With no registry
+        // wired, keep the honest 404 rather than an empty `200`.
         "/stats" => {
             return match registry {
                 Some(registry) => text(StatusCode::OK, &envoy_render::render(registry)),
@@ -658,27 +558,17 @@ async fn handle(
         _ => {}
     }
 
-    // ---- Write endpoints, PLUS two gated reads: `.../spend`, and
-    // `GET .../keys` (the key listing). All are
-    // resolved per request through the SAME three gates. A GET on either
-    // renders data an unauthenticated caller has no business reading --
-    // per-tenant spend, or the tenant/key inventory -- unlike every endpoint
-    // matched by literal path above (`/config_dump`, `/clusters`, `/models`,
-    // `/stats`, ...), which is why they are routed here instead of there.
-    // See `lib.rs`'s module doc for the one-line rule and `WriteRoute`'s doc
-    // for how a GET fits a type named for writes. ----
-    // The gated records read has its own handler, but passes the same gate.
+    // ---- Write endpoints, plus two gated reads: `.../spend` and `GET .../keys`. All go through the SAME three
+    // gates. A GET on either renders per-tenant spend or the key inventory, which an unauthenticated caller must
+    // not read. The other literal-path reads above are ungated. ----
     if req.uri().path() == "/capture/spool/records" {
         return handle_capture_records(&req, runtime, peer).await;
     }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // Rust note: leading `/` stripped, then split on `/` WITHOUT filtering
-    // empty segments -- a trailing slash (`/keys/`) must produce a distinct,
-    // empty final segment (`["keys", ""]`) rather than silently collapsing
-    // to `["keys"]`, or `DELETE /keys/` would be routed as the no-id `/keys`
-    // shape (which only accepts `POST`) instead of hitting the empty-id
-    // validation `match_write_route`'s doc describes.
+    // Rust note: split on `/` WITHOUT dropping empty segments. A trailing slash (`/keys/`) must yield a distinct
+    // empty final segment, or `DELETE /keys/` would route as `/keys` (POST only) instead of hitting the empty-id
+    // validation in `match_write_route`.
     let trimmed = path.strip_prefix('/').unwrap_or(path.as_str());
     let segments: Vec<&str> = trimmed.split('/').collect();
 
@@ -704,10 +594,9 @@ async fn handle(
         return handle_lifecycle(action, runtime.lifecycle.as_deref(), req.uri().query());
     }
 
-    // `PUT /pricing` needs the chain's rate card registry, not a control
-    // plane: without `llmproxy.auth` it still works, for this process only,
-    // and says so. It also has its own body cap, so it leaves before the
-    // control-plane gate and the generic body read below.
+    // `PUT /pricing` needs the chain's rate card registry, not a control plane. It works without `llmproxy.auth`
+    // (for this process only, and it says so). It has its own body cap, so it leaves before the control-plane
+    // gate and the generic body read.
     if matches!(route, WriteRoute::Pricing | WriteRoute::ScopedPricing(_)) {
         let body = match read_limited_body(req.into_body(), MAX_PRICING_BODY_BYTES).await {
             Ok(bytes) => bytes,
@@ -716,23 +605,14 @@ async fn handle(
         return handle_set_pricing(factory_state, route.stat_prefix(), &body);
     }
 
-    // Gate 3: does the control plane exist, and is it unambiguous which one
-    // this write means?
+    // Gate 3: does the control plane exist, and is it unambiguous which one this write means?
     //
-    // A SCOPED route (`route.stat_prefix()` is `Some`) names
-    // exactly which chain it means, so it resolves through
-    // `SharedFactoryState::get_by_name` -- no ambiguity is possible there
-    // (the lowering check rejects a duplicate `stat_prefix` among
-    // `llmproxy.auth`-configuring chains before this server ever runs), and
-    // an unknown name is a 404, not a 503: it names an operator error
-    // (typo'd or never-configured `stat_prefix`), not a boot race.
+    // A SCOPED route names its chain and resolves through `SharedFactoryState::get_by_name`. Ambiguity is
+    // impossible there (lowering rejects duplicate `stat_prefix`es), and an unknown name is a 404: an operator
+    // typo, not a boot race.
     //
-    // An UNSCOPED route falls back to `resolve_control_plane`
-    // (`get_across_scopes`) exactly as it did before scoped routes existed -- kept
-    // as a convenience for the single-chain case; see that function's doc
-    // for the two 503 situations it does not need to tell apart, and for the
-    // third case below (more than one `llmproxy.auth`-configured chain) that
-    // it does.
+    // An UNSCOPED route falls back to `resolve_control_plane` (`get_across_scopes`), a single-chain convenience.
+    // See that function for its 503 cases and for the multi-chain case it refuses.
     let stat_prefix_opt = route.stat_prefix();
     let control_plane = if let Some(stat_prefix) = stat_prefix_opt {
         match resolve_control_plane_by_name(factory_state, stat_prefix) {
@@ -760,9 +640,8 @@ async fn handle(
                 );
             }
             Err(scopes) => {
-                // Loud, not a guess (AGENTS.md "Fail-open controls"'s shape applied here
-                // too): picking one of several ControlPlanes at random would
-                // risk writing a key into the wrong tenant's control plane.
+                // Loud, not a guess (AGENTS.md "Fail-open controls"). Picking one of several ControlPlanes could
+                // write a key into the wrong tenant's control plane.
                 tracing::error!(
                     endpoint = %path,
                     scopes = ?scopes,
@@ -790,8 +669,7 @@ async fn handle(
     };
 
     match route {
-        // `GET /keys` / `GET /chains/{p}/keys` -- the gated LIST read, same
-        // three gates as every write below (see `WriteRoute::KeyList`'s doc).
+        // `GET /keys` and `GET /chains/{p}/keys`: the gated list read, through the same three gates as the writes.
         WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => handle_list_keys(&control_plane),
         WriteRoute::Keys | WriteRoute::ScopedKeys(_) => handle_mint_key(&control_plane, &body),
         WriteRoute::KeyById(id) | WriteRoute::ScopedKeyById(_, id) => {
@@ -830,13 +708,10 @@ async fn handle(
         WriteRoute::TenantCredentials(id) | WriteRoute::ScopedTenantCredentials(_, id) => {
             handle_list_tenant_credentials(&control_plane, id)
         }
-        // `body` moves into the handler (unlike every arm above, which
-        // borrows it) so the handler can wipe the buffer holding the
-        // plaintext key. Only one arm runs, so the move is fine.
+        // `body` moves into the handler (unlike the arms above, which borrow it) so the handler can wipe the buffer
+        // holding the plaintext key. Only one arm runs, so the move is fine.
         //
-        // Rust note: `Option<Arc<dyn Trait>>::as_deref()` borrows the trait
-        // object out of the `Arc` without cloning it, giving the handler an
-        // `Option<&dyn Trait>` it can call through.
+        // Rust note: `Option<Arc<dyn Trait>>::as_deref()` borrows the trait object out of the `Arc` without cloning it.
         WriteRoute::TenantCredentialPut(id, provider)
         | WriteRoute::ScopedTenantCredentialPut(_, id, provider) => {
             handle_put_tenant_credential(
@@ -871,14 +746,11 @@ enum LifecycleAction {
     DrainListeners,
 }
 
-/// `POST /healthcheck/fail`, `/healthcheck/ok`, `/drain_listeners`. Callers
-/// have already passed the token gate.
+/// `POST /healthcheck/fail`, `/healthcheck/ok`, `/drain_listeners`. Callers have already passed the token gate.
 ///
-/// `/drain_listeners` accepts the Envoy flags `graceful` and `inboundonly`
-/// (istio sends `?inboundonly&graceful`); both are accepted with no extra
-/// effect because the drain is always the full graceful one. Any other query
-/// parameter is a 400 naming it, so a typo'd flag is never silently dropped.
-/// Logs carry no credentials: only the action and whether it changed state.
+/// `/drain_listeners` accepts the Envoy flags `graceful` and `inboundonly` (istio sends `?inboundonly&graceful`)
+/// with no extra effect, since the drain is always graceful. Any other query parameter is a 400 that names it,
+/// so a typo is never silently dropped. Logs carry only the action and whether state changed, never credentials.
 fn handle_lifecycle(
     action: LifecycleAction,
     lifecycle: Option<&LifecycleState>,
@@ -919,30 +791,17 @@ fn handle_lifecycle(
     text(StatusCode::OK, "OK")
 }
 
-/// One of the write-capable paths this server recognizes, with the path
-/// parameter(s) (if any) borrowed straight out of the request's path
-/// segments. Kept separate from method matching
-/// ([`WriteRoute::expected_method`]) so "known path, wrong method" can
-/// answer 405 rather than falling through to the generic 404 an unrecognized
-/// path gets.
+/// One write-capable path this server recognizes, with its path parameters borrowed from the request. It is
+/// separate from method matching ([`WriteRoute::expected_method`]), so a known path with the wrong method gets
+/// a 405, not the generic 404.
 ///
-/// The `Scoped*` variants (`/chains/{stat_prefix}/...`) sit alongside the
-/// original unscoped ones rather than replacing them --
-/// [`Self::stat_prefix`] is the single place that tells the two families
-/// apart for [`handle`]'s control-plane resolution gate.
+/// The `Scoped*` variants (`/chains/{stat_prefix}/...`) sit beside the unscoped ones. [`Self::stat_prefix`]
+/// tells the two families apart for [`handle`]'s control-plane gate.
 ///
-/// `TenantSpend`/`ScopedTenantSpend` are a GET, despite the
-/// type's name. It shares this type (rather than getting a parallel
-/// `ReadRoute` enum) precisely because it needs the exact same gate and the
-/// exact same scoped/unscoped `ControlPlane` resolution every other variant
-/// here already has; see [`handle`]'s doc for why it is gated at all.
-///
-/// `KeyList`/`ScopedKeyList` are the same story for a second reason worth
-/// stating separately: a key inventory is IDENTITY data -- which key ids
-/// exist, which tenant owns each, whether it was revoked, what ceiling it
-/// runs against. Nothing about it should be answerable to an unauthenticated
-/// caller just because the verb is `GET`, exactly as the spend read's doc
-/// says for money.
+/// The `TenantSpend` and `KeyList` families (and their `Scoped` forms) are GETs, despite the name. They share
+/// this type because they need the same gate and control-plane resolution as the writes. A key inventory is
+/// identity data (which keys exist, which tenant owns them, what ceiling they run against), and spend is money.
+/// Neither is answerable to an unauthenticated caller just because the verb is GET.
 enum WriteRoute<'a> {
     /// `GET /keys` -- the gated list read. Distinct from [`Self::Keys`]
     /// (POST, mint) so a GET is never answered with a 405 and a POST never
@@ -1087,33 +946,20 @@ impl<'a> WriteRoute<'a> {
     }
 }
 
-/// Matches `segments` (the request path, leading slash stripped, split on
-/// `/` -- empty segments kept, see the call site) against the known
-/// write-endpoint shapes.
+/// Matches `segments` (the request path with the leading slash stripped, split on `/`, empty segments kept)
+/// against the write-endpoint shapes.
 ///
-/// Percent-decoding is deliberately NOT performed: an id containing a
-/// literal `/` simply cannot be addressed through this API -- it splits
-/// into extra segments and matches no shape below, landing on the generic
-/// 404. No caller has a reason to mint a `key_id`/tenant containing a
-/// slash, so this is a documented limitation, not a bug.
+/// Percent-decoding is deliberately not performed. An id containing a literal `/` cannot be addressed through
+/// this API: it splits into extra segments, matches nothing, and gets the generic 404. No caller mints such an
+/// id, so this is a known limitation.
 ///
-/// An id segment that is present but EMPTY (`/keys/`, a trailing slash)
-/// still matches its shape here -- the per-route handlers in [`handle`]
-/// reject an empty id with 400, the same way an empty `tenant`/`key_id` in a
-/// JSON body is rejected, rather than this function silently treating an
-/// empty-id path as "not a route" (404) for what is really a validation
-/// failure, not a routing one.
+/// An empty id segment (`/keys/`) still matches its shape. The handlers in [`handle`] reject it with 400, a
+/// validation failure rather than a routing one.
 ///
-/// `method` participates for exactly TWO shapes: the key collection paths
-/// (`/keys` and `/chains/{stat_prefix}/keys`), where `GET` is the gated
-/// listing and every other verb is the mint (POST). Every other shape here
-/// is decided by the path alone, with [`WriteRoute::expected_method`]
-/// answering a wrong verb with 405 -- but on a collection path the path
-/// cannot decide, because two legitimate endpoints (mint and list) share it
-/// and are told apart only by the verb. Reading `method` here rather than
-/// after the gate keeps both from landing on 405: routing happens before
-/// authorization, as it must (a caller with the wrong verb on the right path
-/// should learn the path exists, not that it was forbidden).
+/// `method` matters for one kind of shape: the key collection paths (`/keys` and `/chains/{stat_prefix}/keys`),
+/// where `GET` is the gated listing and every other verb is the mint. Elsewhere the path decides, and
+/// [`WriteRoute::expected_method`] answers a wrong verb with 405. Reading `method` here, before the gate, means
+/// a wrong verb on a real path gets 405 rather than a forbidden response, since routing precedes authorization.
 fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteRoute<'a>> {
     match segments {
         ["keys"] if *method == Method::GET => Some(WriteRoute::KeyList),
@@ -1198,38 +1044,17 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
     }
 }
 
-/// Resolves the live [`ControlPlane`] a worker's `AuthFilterFactory`
-/// registered into `factory_state`, keyed on that filter's own
-/// `auth_filter::TYPE_URL` ACROSS EVERY CHAIN'S SCOPE -- the admin server has
-/// no chain of its own to scope by (it isn't part of any filter chain), so
-/// this reads [`SharedFactoryState::get_across_scopes`] rather than the
-/// scoped `get` a filter factory uses; see that method's doc for the
-/// singleton-slot mechanism and why a `type_url`-only read is unsafe in
-/// general.
+/// Resolves the live [`ControlPlane`] that a worker's `AuthFilterFactory` registered, keyed on the filter's
+/// `TYPE_URL` across every chain's scope. The admin server belongs to no chain, so it reads
+/// [`SharedFactoryState::get_across_scopes`] rather than a scoped `get`.
 ///
-/// `Ok(None)` covers two situations this function cannot (and need not)
-/// distinguish, both mapped to the same 503 by the caller:
-/// - **A genuine boot race.** `serve()` is called before the worker pool
-///   spawns (see the module doc), so a request that lands before any
-///   worker's `create()` has run finds nothing here yet. This resolves
-///   itself within the time it takes the first worker to build its filter
-///   chain -- a 503 (retryable, "come back shortly") is the correct
-///   response, not a 500 ("something is broken").
-/// - **No `llmproxy.auth` filter in this config at all.** A deployment with
-///   no virtual-key auth configured has no `ControlPlane` to mint keys
-///   into, ever -- also a 503, since from the caller's perspective "not
-///   ready yet" and "will never exist" are both "the write cannot be served
-///   right now," and inventing a third status code here would not give the
-///   caller anything actionable to do differently.
+/// `Ok(None)` covers two cases, both mapped to 503 by the caller: a boot race (`serve()` runs before the
+/// workers build their chains, so an early request finds nothing yet), and a config with no `llmproxy.auth` at
+/// all. Both mean "the write cannot be served right now".
 ///
-/// `Err(scopes)` is a THIRD, genuinely different situation: more than one
-/// filter chain in this serve configures `llmproxy.auth` (e.g. two listeners,
-/// each with its own keys). The write API is one endpoint (`/keys`), not one
-/// per chain, so there is no scope to route this write to -- and guessing
-/// (e.g. "the first one registered") would silently write a key into the
-/// wrong tenant's control plane, exactly the class of bug this whole task
-/// exists to close. The honest answer, and what the caller does with it: an
-/// explicit error naming every ambiguous scope, never a guess.
+/// `Err(scopes)` is a different case: more than one chain configures `llmproxy.auth`. No single scope is what
+/// this endpoint means, and guessing (for example "the first registered") could write a key into the wrong
+/// tenant's control plane. The caller therefore gets an explicit error naming every scope.
 fn resolve_control_plane(
     factory_state: &SharedFactoryState,
 ) -> Result<Option<Arc<ControlPlane>>, Vec<String>> {
@@ -1237,17 +1062,10 @@ fn resolve_control_plane(
     Ok(singleton.and_then(|s| s.downcast::<ControlPlane>().ok()))
 }
 
-/// Resolves the [`ControlPlane`] registered under the chain named
-/// `stat_prefix` -- the scoped (`/chains/{stat_prefix}/...`) counterpart of
-/// [`resolve_control_plane`]. `None` means no chain
-/// by that name has registered an `llmproxy.auth` control plane, which
-/// [`handle`] reports as 404: unlike the unscoped path, there is no
-/// ambiguity to report here (`get_by_name` cannot find two chains at once,
-/// since `proxy-config`'s lowering rejects a duplicate `stat_prefix`
-/// among `llmproxy.auth`-configuring chains before this server ever starts),
-/// so a caller-facing 404 naming the unknown `stat_prefix` is honest: either
-/// it was typo'd, or that chain's worker has not finished building its
-/// filter chain yet.
+/// Resolves the [`ControlPlane`] registered under the chain named `stat_prefix`, the scoped counterpart of
+/// [`resolve_control_plane`]. `None` means no chain with that name has registered one. [`handle`] reports that
+/// as 404: there is no ambiguity to report, and the name is either a typo or its worker has not finished
+/// building the chain yet.
 fn resolve_control_plane_by_name(
     factory_state: &SharedFactoryState,
     stat_prefix: &str,
@@ -1340,31 +1158,17 @@ fn handle_get_pricing(
     }
 }
 
-/// Resolves the [`SpendAccumulator`] singleton `llmproxy.spend_limit`
-/// registers, ACROSS EVERY CHAIN'S SCOPE -- the counterpart of
-/// [`resolve_control_plane`], for the unscoped `GET /tenants/{id}/spend`
-/// alias.
+/// Resolves the [`SpendAccumulator`] singleton that `llmproxy.spend_limit` registers, across every chain's
+/// scope. The counterpart of [`resolve_control_plane`], for the unscoped `GET /tenants/{id}/spend` alias.
 ///
-/// **What is registered under [`proxy_filters::spend_limit_filter::TYPE_URL`]
-/// is [`SharedSpendLimitState`], a WRAPPER -- never a bare
-/// `Arc<SpendAccumulator>`.** `SpendLimitFilterFactory::create` bundles the
-/// accumulator together with its usage-missing warner behind one singleton
-/// slot (see that type's own doc for why); downcasting straight to
-/// `SpendAccumulator` here would silently fail on every real chain, which is
-/// exactly the trap this function's doc exists to name before a future
-/// caller re-adds it.
+/// What is registered under [`proxy_filters::spend_limit_filter::TYPE_URL`] is a [`SharedSpendLimitState`]
+/// wrapper, never a bare `Arc<SpendAccumulator>`. The factory bundles the accumulator with its usage-missing
+/// warner behind one slot (see that type's doc). Downcasting straight to `SpendAccumulator` would fail on every
+/// real chain.
 ///
-/// `Ok(None)`/`Err(scopes)` mirror [`resolve_control_plane`]'s exact
-/// semantics, restated for this singleton: `Ok(None)` covers both a boot
-/// race and "no chain configures `llmproxy.spend_limit` at all" (both a 503
-/// to the caller -- "not configured" and "not ready yet" are equally
-/// unactionable to distinguish); `Err(scopes)` is more than one chain
-/// registering the singleton, which cannot actually happen for an unscoped
-/// caller that already resolved a SINGLE, unambiguous `ControlPlane` above
-/// (`llmproxy.spend_limit` requires `llmproxy.auth` earlier in the SAME
-/// chain, so two spend-configured chains would already have failed the
-/// control-plane gate) -- kept here defensively, mirroring
-/// `resolve_control_plane`'s shape, rather than assumed.
+/// `Ok(None)` covers a boot race and "no chain configures `llmproxy.spend_limit`"; both map to 503. `Err(scopes)`
+/// cannot happen in practice: `llmproxy.spend_limit` requires `llmproxy.auth` in the same chain, and the
+/// control-plane gate has already refused ambiguity. It is kept for parity with [`resolve_control_plane`].
 fn resolve_spend_state(
     factory_state: &SharedFactoryState,
 ) -> Result<Option<Arc<SpendAccumulator>>, Vec<String>> {
@@ -1406,20 +1210,13 @@ fn resolve_spend_state_by_name(
         .map(|shared| Arc::clone(shared.accumulator()))
 }
 
-/// Reads `body` up to `cap` bytes ([`MAX_ADMIN_BODY_BYTES`] for every route
-/// but pricing), returning the collected bytes or a ready-to-send 413.
+/// Reads `body` up to `cap` bytes ([`MAX_ADMIN_BODY_BYTES`] for every route but pricing), returning the bytes
+/// or a ready-to-send 413.
 ///
-/// Rust note: `http_body_util::Limited` wraps any `Body` and turns "read
-/// past the cap" into an error rather than continuing to buffer -- the
-/// standard way to bound an otherwise-unbounded `Incoming::collect()`. Its
-/// error type is a boxed `dyn Error`; `downcast_ref::<LengthLimitError>`
-/// tells "the cap was hit" apart from "the connection died mid-body" so the
-/// former reports 413 and the latter reports 400 instead of one masquerading
-/// as the other.
-// This admin write path runs a handful of times per operator action, never
-// per data-plane request -- the `Response<Full<Bytes>>` `Err` variant clippy
-// flags as "large" (a ready-to-send error response, by design) costs nothing
-// worth boxing for on a path this cold.
+/// Rust note: `http_body_util::Limited` turns "read past the cap" into an error, instead of unbounded
+/// buffering. `downcast_ref::<LengthLimitError>` tells "cap hit" (413) apart from "connection died mid-body"
+/// (400).
+// Cold admin path: the large `Err` variant is a ready-to-send response, so boxing it buys nothing.
 #[allow(clippy::result_large_err)]
 async fn read_limited_body(body: Incoming, cap: usize) -> Result<Bytes, Response<Full<Bytes>>> {
     match Limited::new(body, cap).collect().await {
@@ -1443,17 +1240,14 @@ async fn read_limited_body(body: Incoming, cap: usize) -> Result<Bytes, Response
     }
 }
 
-/// The shared admin gate, for every write and every sensitive read. `Some`
-/// is the refusal to return; `None` means the caller may proceed.
+/// The shared admin gate, for every write and every sensitive read. `Some` is the refusal; `None` means proceed.
 ///
-/// Gate 1: is the API enabled at all? Unset (or empty/whitespace)
-/// `LLMPROXY_ADMIN_TOKEN` means "not configured", never "open" -- see
-/// AGENTS.md "Fail-open controls". This is the fail-CLOSED default, and it
-/// must never be reachable by falling through any other branch.
+/// Gate 1: is the API enabled? An unset, empty, or whitespace-only `LLMPROXY_ADMIN_TOKEN` means "not
+/// configured", never "open" (AGENTS.md "Fail-open controls"). This fail-closed default must not be reachable
+/// from any other branch.
 ///
-/// Gate 2: does the caller present the configured token? RFC 7235 requires a
-/// `www-authenticate` challenge on a 401 -- `auth_filter.rs`'s
-/// `AuthFilterInstance::deny` does the same thing for the same reason.
+/// Gate 2: does the caller present the configured token? A 401 carries a `www-authenticate` challenge
+/// (RFC 7235), as `auth_filter.rs`'s `AuthFilterInstance::deny` does on the data plane.
 fn admin_gate(
     path: &str,
     admin_token: Option<&str>,
@@ -1472,7 +1266,7 @@ fn admin_gate(
         ));
     };
     // Gate 2a: a peer past its failed-token budget is refused before its
-    // token is even compared (review M9; see `auth_limit`'s module doc).
+    // token is even compared (see `auth_limit`'s module doc).
     let now = Instant::now();
     if let Verdict::Limited { retry_after, first } = peer.limiter.check(peer.ip, now) {
         if first {
@@ -1669,31 +1463,16 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     value.strip_prefix("Bearer ").map(str::to_string)
 }
 
-/// Constant-time equality for two secrets, by the double-HMAC compare.
+/// Constant-time equality for two secrets, via a double-HMAC compare.
 ///
-/// **Not `==`**, which short-circuits on the first differing byte and leaks
-/// a matching prefix's length through timing -- the whole point of this
-/// function. It is also **not**
-/// `ring::constant_time::verify_slices_are_equal`, even though that reads
-/// like the obvious primitive: in the `ring` version this workspace pins
-/// (0.17.14) it is deprecated with the note "Internal function not intended
-/// for external use with **no promises regarding side channels**", i.e.
-/// `ring` no longer documents it as constant-time for callers outside the
-/// crate -- which is the entire property being bought here.
-/// `proxy_filters::auth`'s module doc records that same finding and the same
-/// decision for the data plane's key check; this is the control plane
-/// reaching the same conclusion, so both sides of the product use the one
-/// primitive `ring` still documents as constant-time.
+/// **Not `==`**, which short-circuits on the first differing byte and leaks the length of a matching prefix
+/// through timing. Also not `ring::constant_time::verify_slices_are_equal`: `ring` 0.17 deprecates it with the
+/// note that it makes no side-channel promises. `proxy_filters::auth` reached the same conclusion for the
+/// data-plane key check.
 ///
-/// `ring::hmac::verify` DOES apply to a plain secret-vs-secret comparison,
-/// contrary to how it first reads: HMAC both values under one key and the
-/// digests are equal exactly when the inputs are (collision resistance), and
-/// `hmac::verify` performs that digest comparison in constant time. The key
-/// is freshly random per call and never leaves this function -- it is not a
-/// secret being authenticated with, it is a blinding value, and generating a
-/// new one each time additionally randomizes what an attacker can observe
-/// across attempts. Cost is one 32-byte RNG read and two SHA-256s of a short
-/// string, on a path that runs at operator rate, not per data-plane request.
+/// `ring::hmac::verify` does apply to a plain comparison. HMAC both values under one random key, and the
+/// digests match exactly when the inputs do, and `hmac::verify` compares digests in constant time. The key is a
+/// blinding value, freshly random per call, so attempts cannot be correlated.
 ///
 /// Fails CLOSED if the RNG fails: no random key, no comparison, no match.
 fn secrets_match(presented: &[u8], configured: &[u8]) -> bool {
@@ -1776,16 +1555,10 @@ fn unknown_endpoint(path: &str) -> Response<Full<Bytes>> {
     )
 }
 
-/// Parses a JSON request body into `T`, rejecting any unknown field (every
-/// request struct in this module carries `#[serde(deny_unknown_fields)]` --
-/// see AGENTS.md invariant 1: a silently ignored field in a security-write API is
-/// the same class of bug as a silently ignored config field) and mapping
-/// any parse failure to 400. The error `Display` from `serde_json` names
-/// only the JSON shape problem (missing/wrong-typed field, unknown field,
-/// malformed syntax) -- these request bodies never carry a token or a
-/// plaintext key (the one plaintext key this API ever produces is a
-/// RESPONSE, from `POST /keys`, never a request field), so there is nothing
-/// sensitive to leak by including it in the message.
+/// Parses a JSON request body into `T`, rejecting unknown fields (`#[serde(deny_unknown_fields)]` on every
+/// request struct; AGENTS.md invariant 1 applies to security writes too), and maps any parse failure to 400.
+/// The `serde_json` message names only the shape problem, never a token or key: none of these bodies carries a
+/// plaintext key, since `POST /keys` only returns one.
 // See `read_limited_body`'s identical `#[allow]` -- same cold admin-write
 // path, same "large" `Err` variant by design.
 #[allow(clippy::result_large_err)]
@@ -1796,11 +1569,9 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(
         .map_err(|err| bad_request(&format!("malformed request body: {err}")))
 }
 
-/// Maps a [`StoreError`] to a response. `NotFound` (e.g. revoking a `key_id`
-/// the store has never seen) is a 404; anything else is a 500 carrying the
-/// error's `Display` -- safe to expose because [`StoreError`]'s own doc
-/// states it carries only a store-failure reason (redb/I/O error text) or
-/// "not found", never key material.
+/// Maps a [`StoreError`] to a response. `NotFound` (for example, revoking an unknown `key_id`) is a 404.
+/// Anything else is a 500 with the error's `Display`, which [`StoreError`] documents as store-failure text,
+/// never key material.
 fn store_error_response(endpoint: &str, err: StoreError) -> Response<Full<Bytes>> {
     match err {
         StoreError::NotFound => text(StatusCode::NOT_FOUND, "not found"),
@@ -1937,10 +1708,8 @@ fn parse_limits(body: &[u8]) -> Result<Option<LimitPolicy>, Response<Full<Bytes>
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BudgetSpec {
-    /// A decimal-string ceiling, e.g. `"500.00"` -- parsed by
-    /// [`parse_micro_usd`], the SAME parser a configured price uses (see
-    /// that function's doc), so an operator cannot express a budget more
-    /// precisely than a price.
+    /// A decimal-string ceiling, e.g. `"500.00"`, parsed by [`parse_micro_usd`] (the same parser a price uses), so
+    /// a budget cannot be more precise than a price.
     max_usd: String,
     period: PeriodSpec,
     /// `"platform"` or `"tenant"`; absent means `"platform"`. Kept a plain
@@ -1950,14 +1719,8 @@ struct BudgetSpec {
     credential_source: Option<String>,
 }
 
-/// External representation of [`Period`] over the wire -- `"daily"` or
-/// `"monthly"`, matching the proto/config convention this admin API already
-/// uses elsewhere (lowercase, snake_case wire names for a Rust enum).
-///
-/// Serializable as well as deserializable, so the SAME wire spelling is used
-/// in both directions: a `PUT .../budget` accepts `"daily"` and
-/// `GET /keys` reports `"daily"`, rather than two spellings an operator has
-/// to remember belong together.
+/// Wire form of [`Period`]: `"daily"` or `"monthly"`. The same spelling is used for requests and responses, so
+/// a `PUT` and a `GET` agree.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PeriodSpec {
@@ -1983,10 +1746,7 @@ impl From<Period> for PeriodSpec {
     }
 }
 
-/// External representation of [`ModelAccess`] over the wire: `"all"` (a bare
-/// string) or `{"only": [...]}` -- the default externally-tagged shape
-/// `#[derive(Deserialize)]` produces for an enum, which is exactly the two
-/// shapes the task's request examples use.
+/// Wire form of [`ModelAccess`]: `"all"`, or `{"only": [...]}` (the default externally tagged enum shape).
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AccessSpec {
@@ -1994,21 +1754,12 @@ enum AccessSpec {
     Only(Vec<String>),
 }
 
-/// `GET /keys` and `GET /chains/{stat_prefix}/keys`: the key inventory --
-/// key id, owning tenant, revocation state, and configured ceiling, sorted
-/// by `(tenant, key_id)` (the sort is `ControlPlane::list_keys`'s, so the
-/// same state always answers the same bytes).
+/// `GET /keys` and `GET /chains/{stat_prefix}/keys`: the key inventory (key id, owning tenant, revocation state,
+/// configured ceiling), sorted by `(tenant, key_id)`.
 ///
-/// Routed through the write API's three gates despite being a GET, for the
-/// same reason `.../spend` is (see [`handle`]): this is IDENTITY data -- it
-/// answers which keys exist, which tenant owns each, and what each may spend
-/// -- and nothing about that should be enumerable by an unauthenticated
-/// caller just because the verb is `GET`.
-///
-/// It returns nothing a credential could be derived from: no digest, and no
-/// plaintext. The plaintext exists only in `POST /keys`'s own response body,
-/// exactly once (see `lib.rs`'s redaction section) -- `list_keys` reads the
-/// published snapshot, which never held it in the first place.
+/// Gated like `.../spend` despite being a GET: it is identity data, and nothing about it should be enumerable
+/// by an unauthenticated caller. It carries no digest and no plaintext. The plaintext appears only in the
+/// `POST /keys` response, once (see `lib.rs`'s redaction section).
 fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
     let keys = control_plane.list_keys();
     let rendered: Vec<serde_json::Value> = keys
@@ -2019,12 +1770,8 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                 "tenant": listing.tenant.as_str(),
                 "revoked": listing.revoked,
                 "policy": listing.model_access.as_ref().map(render_model_access),
-                // `null` means "no ceiling configured" (unlimited); an
-                // explicitly configured zero ceiling serializes as its own
-                // real number -- see `proxy_filters::spend::TenantBudget`'s
-                // doc for why those two must not collapse into one value.
-                // Both integer micro-dollars (exact) and a rendered decimal
-                // string (readable) are reported, mirroring the spend read.
+                // `null` means no ceiling configured. An explicit zero serializes as a real number, so the two never
+                // collapse. Both integer micro-dollars and a rendered decimal string are reported, as in the spend read.
                 "budget": listing.budget.map(|budget| serde_json::json!({
                     "max_micro_usd": budget.max_micros.as_micros(),
                     "max_usd": render_micro_usd(budget.max_micros.as_micros()),
@@ -2083,8 +1830,7 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
     if key_id.trim().is_empty() {
         return bad_request("key_id must not be empty");
     }
-    // Checked here for a 400 that names the field, and again inside
-    // `ControlPlane::mint_key` so no other caller can bypass it.
+    // Checked here for a 400 that names the field, and again in `ControlPlane::mint_key` for every other caller.
     if let Err(reason) = proxy_filters::auth::check_principal_id("tenant", &tenant)
         .and_then(|()| proxy_filters::auth::check_principal_id("key_id", &key_id))
     {
@@ -2099,10 +1845,8 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
                 tenant = minted.tenant.as_str(),
                 "admin: minted a virtual key"
             );
-            // `minted.plaintext` is handed back here EXACTLY ONCE -- the
-            // store persists only its digest (see `MintedKey`'s doc), so
-            // this response body is the only place this value will ever
-            // exist again after this call returns.
+            // `minted.plaintext` is returned here exactly once. The store keeps only its digest (see `MintedKey`), so
+            // this body is the only place the value will ever exist.
             json(
                 StatusCode::CREATED,
                 &serde_json::json!({
@@ -2172,18 +1916,15 @@ fn handle_delete_tenant(control_plane: &ControlPlane, tenant: &str) -> Response<
     }
 }
 
-/// Longest API key `PUT .../provider_credentials/{provider}` accepts. Real
-/// provider keys are well under 300 bytes; the cap bounds what a header value
-/// the router later builds can be.
+/// Longest API key `PUT .../provider_credentials/{provider}` accepts. Real keys are well under 300 bytes; the cap
+/// bounds the header value the router later builds.
 const MAX_TENANT_API_KEY_BYTES: usize = 4096;
 
 /// The only `schema_version` this endpoint speaks.
 const TENANT_CREDENTIALS_API_VERSION: u32 = 1;
 
-/// JSON error in the shape the router's own local replies use
-/// (`{"error":{"message":..,"type":..}}`), so a client has one error shape to
-/// parse. Callers pass a fixed message: never format request-body content into
-/// it.
+/// JSON error in the router's own reply shape (`{"error":{"message":..,"type":..}}`). Callers pass a fixed
+/// message and never format request-body content into it.
 fn error_json(status: StatusCode, error_type: &str, message: &str) -> Response<Full<Bytes>> {
     json(
         status,
@@ -2191,9 +1932,8 @@ fn error_json(status: StatusCode, error_type: &str, message: &str) -> Response<F
     )
 }
 
-/// [`error_json`] plus `upstream_status` inside the `error` object, for the
-/// save-time probe's failures where the provider did answer. The status is a
-/// bare code, so it carries nothing from the request or the response body.
+/// [`error_json`] plus `upstream_status`, for save-time probe failures where the provider did answer. The status
+/// is a bare code, so it carries nothing from the request or response body.
 fn error_json_with_upstream(
     status: StatusCode,
     error_type: &str,
@@ -2212,19 +1952,17 @@ fn error_json_with_upstream(
     )
 }
 
-/// Deserializes straight into a [`TenantSecret`] so the parsed plaintext
-/// lives in a zeroize-on-drop buffer from its first owned form onward.
+/// Deserializes straight into a [`TenantSecret`], so the plaintext lives in a zeroize-on-drop buffer from its
+/// first owned form onward.
 ///
-/// Rust note: `deserialize_with` points serde at a function instead of the
-/// field type's own `Deserialize` impl; `TenantSecret` deliberately has none.
+/// Rust note: `deserialize_with` points serde at this function, since `TenantSecret` has no `Deserialize` impl.
 fn deserialize_tenant_secret<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<TenantSecret, D::Error> {
     <String as serde::Deserialize>::deserialize(de).map(TenantSecret::new)
 }
 
-/// `verify` defaults to `true`: a key is checked against the provider unless
-/// the caller opts out (ADR-0007 decision 10).
+/// `verify` defaults to `true`: a key is checked against the provider unless the caller opts out (ADR-0007).
 fn default_verify() -> bool {
     true
 }
@@ -2239,10 +1977,8 @@ struct PutTenantCredentialRequest {
     verify: bool,
 }
 
-/// Whether `tenant` exists: created through the store, or implied by a
-/// bootstrap/minted key or a stored policy. Reads the store, not only the
-/// snapshot, because a created tenant with no key or policy yet appears only
-/// there.
+/// Whether `tenant` exists: created through the store, or implied by a bootstrap or minted key or a stored
+/// policy. Reads the store, since a tenant with no key or policy yet appears only there.
 fn tenant_exists(control_plane: &ControlPlane, tenant: &TenantId) -> Result<bool, StoreError> {
     {
         let snapshot = control_plane.handle().load();
@@ -2259,9 +1995,8 @@ fn tenant_not_found() -> Response<Full<Bytes>> {
     error_json(StatusCode::NOT_FOUND, "tenant_not_found", "unknown tenant")
 }
 
-/// Wipes `body` when this handle is the only reference to its buffer.
-/// Best effort: if hyper still shares the buffer, `try_into_mut` fails and the
-/// bytes live until the allocator reuses them.
+/// Wipes `body` when this handle is the only reference. Best effort: if hyper still shares the buffer, the bytes
+/// live until the allocator reuses them.
 fn wipe_body(body: Bytes) {
     if let Ok(mut unique) = body.try_into_mut() {
         zeroize::Zeroize::zeroize(&mut unique[..]);
@@ -2270,12 +2005,10 @@ fn wipe_body(body: Bytes) {
 
 /// `PUT /tenants/{id}/provider_credentials/{provider}`.
 ///
-/// Check order: body shape (400), tenant (404), provider enabled on some
-/// cluster (422), then, when `verify` is true, the save-time probe (422 or 502,
-/// nothing stored on failure), then the store (503 when `tenant_credentials` is
-/// not configured). The request body is never logged, echoed, or formatted into
-/// an error message: serde's own errors can quote input, so this handler maps
-/// them to fixed text by [`serde_json::Error::classify`].
+/// Check order: body shape (400), tenant (404), provider enabled on some cluster (422), then, when `verify` is
+/// true, the save-time probe (422 or 502, nothing stored on failure), then the store (503 when
+/// `tenant_credentials` is not configured). The body is never logged or echoed. serde errors can quote input,
+/// so this handler maps them to fixed text by [`serde_json::Error::classify`].
 async fn handle_put_tenant_credential(
     control_plane: &ControlPlane,
     config: &WorkerConfigHandle,
@@ -2351,9 +2084,8 @@ async fn put_tenant_credential_inner(
             "api_key exceeds 4096 bytes",
         );
     }
-    // The key is later written into an upstream header. `HeaderValue::from_str`
-    // refuses CR/LF and other control bytes but allows obs-text (0x80..=0xFF),
-    // which no provider key uses, so `is_ascii` closes that gap.
+    // `HeaderValue::from_str` refuses CR/LF and other control bytes but allows obs-text (0x80..=0xFF), which no
+    // provider key uses, so `is_ascii` closes that gap.
     if !key.is_ascii() || hyper::header::HeaderValue::from_str(key).is_err() {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -2369,9 +2101,8 @@ async fn put_tenant_credential_inner(
         Err(err) => return store_error_response("/tenants/{id}/provider_credentials", err),
     }
 
-    // A credential no cluster slot would ever use is a typo the operator wants
-    // to hear about now, not an inert row. The snapshot guard is dropped before
-    // any `.await` below.
+    // A credential no cluster slot would use is a typo the operator should hear about now, not an inert row.
+    // The snapshot guard is dropped before any `.await`.
     let verify_target = {
         let snapshot = config.load();
         let enabled = snapshot.clusters.values().any(|cluster| {
@@ -2388,9 +2119,8 @@ async fn put_tenant_credential_inner(
                 "no configured cluster accepts tenant credentials for this provider",
             );
         }
-        // The probe goes to the first slot cluster, by name, that has a
-        // `verify_path`. `min_by` over the names keeps that choice independent
-        // of the map's iteration order.
+        // The probe goes to the first slot cluster, by name, that has a `verify_path`. `min_by` over names keeps the
+        // choice independent of map iteration order.
         snapshot
             .clusters
             .iter()
@@ -2406,11 +2136,9 @@ async fn put_tenant_credential_inner(
             .min_by(|a, b| a.0.cmp(&b.0))
     };
 
-    // ADR-0007 decision 10: a key is stored as verified only after a probe
-    // got a 2xx from the provider. Every failure path returns before the store.
+    // ADR-0007: a key is stored as verified only after the provider answers 2xx. Every failure returns before the store.
     let verified = if request.verify {
-        // Without key-encryption keys the store refuses the key below, so do
-        // not send it to the provider first.
+        // Without key-encryption keys the store refuses the key, so do not send it to the provider first.
         if !control_plane.tenant_credentials_configured() {
             return tenant_credentials_not_configured();
         }
@@ -2421,9 +2149,8 @@ async fn put_tenant_credential_inner(
                 "no provider cluster has a verify_path for this provider, or the credential probe is not wired; pass \"verify\": false to store the key unverified",
             );
         };
-        // The probe owns its secret, and the store still needs the key, so
-        // this is the one extra plaintext copy the save path makes. Both
-        // copies are zeroize-on-drop.
+        // The probe owns its secret and the store still needs the key, so this is the one extra plaintext copy.
+        // Both copies are zeroize-on-drop.
         let probe_request = CredentialProbeRequest {
             cluster: cluster.clone(),
             slot,
@@ -2465,8 +2192,7 @@ async fn put_tenant_credential_inner(
                 );
             }
             CredentialProbeOutcome::Unreachable(reason) => {
-                // The reason names the failure only (see the probe trait's
-                // doc), so it is safe for the log but not for the reply.
+                // The reason names the failure only, so it is safe for the log but not for the reply.
                 tracing::warn!(
                     endpoint = "/tenants/{id}/provider_credentials/{provider}",
                     tenant,
@@ -2584,8 +2310,8 @@ fn handle_set_policy(
         Ok(access) => access,
         Err(response) => return response,
     };
-    // A policy no filter reads is a silent hole: the write succeeds and the
-    // operator believes the tenant is restricted. Refuse it, naming why.
+    // A policy no filter reads is a silent hole: the write succeeds and the operator believes the tenant is
+    // restricted. Refuse it, naming why.
     if !model_authz_enforced(factory_state, stat_prefix) {
         return not_enforced(
             "no listener chain runs llmproxy.model_authz; tenant policies would not be enforced",
@@ -2611,13 +2337,8 @@ fn parse_model_policy(body: &[u8]) -> Result<ModelAccess, Response<Full<Bytes>>>
     let request: SetPolicyRequest = parse_json_body(body)?;
     let allow = match request.access {
         AccessSpec::All => ModelAccess::All,
-        // An empty `only: []` is a legitimate, deliberate policy -- "deny
-        // every model for this tenant" -- and MUST stay `Only(vec![])`
-        // rather than collapsing to `All`. Doing so would be a silent
-        // privilege escalation: an operator meaning to lock a tenant out of
-        // every model until patterns are added would instead grant it
-        // access to everything. See `ModelAccess`'s own doc for the same
-        // point made from the type's side.
+        // An empty `only: []` is a deliberate "deny every model" and MUST stay `Only(vec![])`. Collapsing it to
+        // `All` would silently grant access to everything.
         AccessSpec::Only(patterns) => {
             for (index, pattern) in patterns.iter().enumerate() {
                 if !ModelPattern::is_valid(pattern) {
@@ -2671,17 +2392,14 @@ fn handle_set_key_policy(
     }
 }
 
-/// Turns a request's [`BudgetSpec`] into the stored [`TenantBudget`]. Both
-/// budget writes use it, so their validation cannot drift apart.
-// See `parse_json_body`'s identical `#[allow]` -- same cold admin-write path,
-// same "large" `Err` variant by design.
+/// Turns a request's [`BudgetSpec`] into the stored [`TenantBudget`]. Both budget writes use it, so their
+/// validation cannot drift apart.
 #[allow(clippy::result_large_err)]
 fn budget_from_spec(spec: BudgetSpec) -> Result<TenantBudget, Response<Full<Bytes>>> {
     let max_micros = parse_micro_usd(&spec.max_usd)
         .map_err(|err| bad_request(&format!("invalid `max_usd`: {err}")))?;
     let credential_source = match spec.credential_source.as_deref() {
-        // Absent means platform so existing budgets keep their meaning
-        // (ADR-0007 decision 8).
+        // Absent means platform, so existing budgets keep their meaning (ADR-0007).
         None | Some("platform") => CredentialSource::Platform,
         Some("tenant") => CredentialSource::Tenant,
         Some(_) => {
@@ -2697,11 +2415,8 @@ fn budget_from_spec(spec: BudgetSpec) -> Result<TenantBudget, Response<Full<Byte
     })
 }
 
-/// `PUT /tenants/{id}/budget`. `{"budget": null}`
-/// clears the tenant's ceiling (reverts to unlimited); `{"budget": {...}}`
-/// sets it, parsing `max_usd` with [`parse_micro_usd`] -- the SAME parser a
-/// configured price uses -- so a malformed decimal string is a 400 naming
-/// the problem, not a silently-truncated ceiling.
+/// `PUT /tenants/{id}/budget`. `{"budget": null}` clears the ceiling; `{"budget": {...}}` sets it. `max_usd`
+/// goes through [`parse_micro_usd`], the same parser a configured price uses, so a malformed decimal is a 400.
 fn handle_set_budget(
     factory_state: &SharedFactoryState,
     stat_prefix: Option<&str>,
@@ -2725,17 +2440,10 @@ fn handle_set_budget(
         },
     };
 
-    // The start-up check in `llmproxy.spend_limit` treats any tenant budget in
-    // the store as a legacy one and refuses to start without the cutover. A
-    // budget written here would pass now and stop the next restart, and a
-    // rolling restart would crash-loop every replica, so refuse it at write
-    // time, where the operator is looking. Clearing a budget is always fine,
-    // and rows already in the store behave as they did.
-    //
-    // A budget no spend filter reads is the same silent hole as an unread
-    // policy, so setting one is refused when the chain has no
-    // `llmproxy.spend_limit`. Clearing stays allowed so an operator can tidy up
-    // after turning enforcement off.
+    // The start-up check in `llmproxy.spend_limit` refuses to start on any tenant budget in the store that
+    // predates the cutover. A budget written here would pass now and crash-loop every replica on the next
+    // rolling restart, so refuse it at write time. Clearing is always fine. A budget no spend filter reads is
+    // the same silent hole as an unread policy, so setting one is refused without `llmproxy.spend_limit`.
     if budget.is_some() {
         let Some(shared) = resolve_spend_shared(factory_state, stat_prefix) else {
             return not_enforced(
@@ -2768,9 +2476,8 @@ fn handle_set_budget(
     }
 }
 
-/// `PUT /keys/{id}/budget`. A budget belongs to the logical key identity,
-/// never its secret, so rotating a secret leaves this row and its spend
-/// ledger in place.
+/// `PUT /keys/{id}/budget`. A budget belongs to the logical key identity, not its secret, so rotating the
+/// secret leaves this row and its spend ledger in place.
 fn handle_set_key_budget(
     control_plane: &ControlPlane,
     key_id: &str,
@@ -2849,13 +2556,9 @@ fn handle_set_key_limits(
     }
 }
 
-/// Resolves the spend accumulator (scoped or unscoped, matching
-/// `stat_prefix`'s presence exactly the way [`handle`]'s own `ControlPlane`
-/// gate already did just above this call) and dispatches to
-/// [`handle_get_spend`]. Split out of [`handle`]'s final `match` so that
-/// match's other arms stay one-liners; this one needs its own resolution
-/// step because a tenant's spend read needs a SECOND singleton beyond the
-/// `ControlPlane` every other write/read here already resolved.
+/// Resolves the spend accumulator (scoped or unscoped, matching `stat_prefix`'s presence as [`handle`]'s
+/// control-plane gate already did) and dispatches to [`handle_get_spend`]. A tenant's spend read needs a
+/// second singleton beyond the `ControlPlane`, so it gets its own resolution step.
 fn handle_get_spend_route(
     factory_state: &SharedFactoryState,
     stat_prefix: Option<&str>,
@@ -2868,10 +2571,7 @@ fn handle_get_spend_route(
         None => match resolve_spend_state(factory_state) {
             Ok(accumulator) => accumulator,
             Err(scopes) => {
-                // See `resolve_spend_state`'s doc: defensive, mirrors
-                // `resolve_control_plane`'s ambiguity handling, but cannot
-                // actually be reached given the control-plane gate that
-                // already ran above this call.
+                // See `resolve_spend_state`'s doc. Defensive: the control-plane gate has already refused ambiguity.
                 tracing::error!(
                     endpoint = %path,
                     scopes = ?scopes,
@@ -2927,27 +2627,17 @@ fn handle_get_key_spend_route(
 
 /// `GET /tenants/{id}/spend` (and its scoped form).
 ///
-/// Reads TWO singletons, both of which can legitimately be missing on a
-/// live, otherwise-healthy chain:
-/// - the tenant's [`TenantBudget`] (period + ceiling), read off the
-///   ALREADY-RESOLVED `control_plane`'s published snapshot -- a tenant with
-///   no configured budget is not an error (see `TenantBudget`'s own doc);
-///   `budget_micro_usd`/`remaining_micro_usd` render `null` for one;
-/// - the spend accumulator itself, resolved by the caller
-///   ([`handle_get_spend_route`]) and handed in as `None` when
-///   `llmproxy.spend_limit` is not configured on this chain at all -- THAT
-///   is the one genuinely missing-singleton case this function answers with
-///   a 503, matching the shape of the missing-`ControlPlane` 503 elsewhere
-///   in this file (never a fourth status code for "half configured").
+/// Reads two singletons, either of which can legitimately be missing on a live chain:
+/// - the tenant's [`TenantBudget`] (period and ceiling), from the already-resolved `control_plane`'s snapshot.
+///   A tenant with no budget is not an error; `budget_micro_usd` and `remaining_micro_usd` render `null`.
+/// - the spend accumulator, resolved by the caller and passed as `None` when `llmproxy.spend_limit` is not
+///   configured on this chain. That is the one missing-singleton case answered with 503.
 ///
-/// **Which period?** The tenant's own `TenantBudget::period` if one is
-/// configured, else [`SpendAccumulator::default_period`] -- exactly
-/// `spend_limit_filter`'s own `decode_headers` resolution, restated here so
-/// the read reports the SAME period the enforcement filter would check.
+/// **Which period?** The tenant's own `TenantBudget::period` if set, else [`SpendAccumulator::default_period`].
+/// This matches `spend_limit_filter`'s `decode_headers`, so the read reports the period enforcement checks.
 ///
-/// `spend_usd` is rendered from the integer `total_micros` by
-/// [`render_micro_usd`] -- never through an `f64`; see `proxy_filters::spend`'s
-/// module doc for why introducing one anywhere in the money path is a bug.
+/// `spend_usd` comes from the integer `total_micros` via [`render_micro_usd`], never an `f64`. See
+/// `proxy_filters::spend`'s module doc.
 fn handle_get_spend(
     control_plane: &ControlPlane,
     accumulator: Option<Arc<SpendAccumulator>>,
@@ -2965,9 +2655,8 @@ fn handle_get_spend(
     };
 
     let tenant_id = TenantId::new(tenant);
-    // Rust note: `TenantPolicyMap` is keyed on the tenant's plain `&str`
-    // name, not `TenantId` -- same lookup `spend_limit_filter`'s own
-    // `decode_headers` performs against this exact snapshot.
+    // Rust note: `TenantPolicyMap` is keyed on the tenant's plain `&str` name, not `TenantId`, matching
+    // `spend_limit_filter`'s own lookup.
     let budget = control_plane
         .handle()
         .load()
@@ -2988,12 +2677,8 @@ fn handle_get_spend(
     let (budget_micros, remaining_micros) = match budget {
         Some(b) => {
             let limit = b.max_micros.as_micros();
-            // Saturating, never wrapping: `total_micros` can exceed `limit`
-            // (the check/record split means the request that crosses a
-            // ceiling is always admitted -- see `spend_limit_filter`'s own
-            // module doc), and an operator reading a wrapped-around
-            // `remaining` as a huge positive number instead of `0` would be
-            // told the opposite of the truth.
+            // Saturating, never wrapping. `total_micros` can exceed `limit`, since the check and record are split and
+            // the request that crosses a ceiling is admitted. A wrapped `remaining` would read as a huge positive.
             (Some(limit), Some(limit.saturating_sub(report.total_micros)))
         }
         None => (None, None),
@@ -3017,15 +2702,10 @@ fn handle_get_spend(
             "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
             "journal_pending_micro_usd": report.journal_pending_micro_usd,
             "journal_pending_rows": report.journal_pending_rows,
-            // ADR-0006 §5. `last_flush_at` alone answers "when",
-            // which forces every reader to do the subtraction and to know
-            // what bound this deployment configured; these three answer
-            // "is this replica's number trustworthy right now", which is
-            // what an operator reading a spend figure during an incident
-            // actually needs. A replica that has NEVER flushed reports its
-            // age since start here rather than `null`, so "never reached the
-            // store" cannot be misread as "fine" -- see
-            // `SpendAccumulator::reconciliation_age`.
+            // ADR-0006 §5. `last_flush_at` answers "when", which forces every reader to subtract and to know the
+            // configured bound. These three answer "is this replica's number trustworthy right now". A replica that
+            // has never flushed reports its age since start, not `null`, so "never reached the store" cannot read as
+            // "fine". See `SpendAccumulator::reconciliation_age`.
             "reconciliation_age_seconds": report.reconciliation_age_seconds,
             "reconciliation_expired": report.reconciliation_expired,
             "unreconciled_admissions": report.unreconciled_admissions,
@@ -3099,11 +2779,9 @@ fn handle_get_key_spend(
     )
 }
 
-/// Renders integer micro-dollars as a decimal-string dollar amount, e.g.
-/// `1_234` -> `"0.001234"`, `500_000_000` -> `"500.000000"`. Never goes
-/// through `f64` -- `proxy_filters::spend`'s entire module is integer-only by
-/// design (see its module doc's "Money is integer, never `f64`" section),
-/// and this admin read must not be the first place that property breaks.
+/// Renders integer micro-dollars as a decimal string, e.g. `1_234` -> `"0.001234"`. Never goes through `f64`:
+/// `proxy_filters::spend` is integer-only by design (see its module doc), and this read must not be the first
+/// place that breaks.
 fn render_micro_usd(micros: u64) -> String {
     format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
 }

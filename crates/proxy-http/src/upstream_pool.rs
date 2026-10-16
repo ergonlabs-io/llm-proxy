@@ -1,88 +1,15 @@
-//! Per-worker HTTP/2 upstream connection cache: keeps a small, bounded *set* of live hyper h2 [`SendRequest`]s
-//! per (cluster, address, protocol) instead of exactly one, and hands out
-//! clones from whichever member of that set has room, instead of dialing a
-//! fresh TCP connection (and TLS handshake, where configured) for every
-//! request. hyper's h2 `SendRequest` multiplexes concurrent requests over
-//! one connection internally and is cheap to `.clone()`, so the win is still
-//! N concurrent requests to one provider costing far fewer than N TCP
-//! connections -- just not always exactly 1 any more.
+//! Per-worker upstream connection caches. h2 connections are multiplexed and
+//! bounded per key; h1 connections are reused only after a clean response end.
+//! The caches stay in `proxy-http` because their hyper senders are `!Send`.
 //!
-//! ## Why "exactly one connection" wasn't enough
+//! h2 clients expose no way to observe the peer's available stream capacity.
+//! The cache uses a conservative in-flight count to spread work across a
+//! bounded connection set; hyper's per-connection queue handles excess sends.
 //!
-//! A capacity sweep plateaued at exactly 202 concurrent streams no matter
-//! how much load was offered, because the peer (any real h2 server,
-//! including hyper's own, whose server default is
-//! `max_concurrent_streams: 200`, `hyper-1.11.0/src/proto/h2/server.rs:69`)
-//! caps how many streams *one* connection may carry at once, and the original
-//! design cached exactly one connection per key. h1 hit no such ceiling (its own
-//! pool dials a fresh connection per stream), so h2 pooling was costing up
-//! to 5x peak concurrency versus h1 for the identical workload.
-//!
-//! The fix is a bounded *set* of connections (see `MAX_CONNECTIONS_PER_KEY`)
-//! plus our own accounting of how many streams are in flight on each one
-//! (see `SOFT_STREAMS_PER_CONNECTION`, `StreamGuard`) -- **not** hyper's
-//! `SendRequest::poll_ready`/`is_ready`/`is_closed`. Read those three
-//! methods in `hyper-1.11.0/src/client/conn/http2.rs` before reaching for
-//! them here: for the h2 client they only ever report whether the
-//! connection is *closed*, never whether it currently has spare stream
-//! capacity (that real backpressure exists, but it lives entirely inside
-//! the spawned connection-driving task -- `proto::h2::client::ClientTask`
-//! polls the underlying `h2::client::SendRequest::poll_ready` itself, and
-//! only pulls the next queued request off its internal channel once a real
-//! slot frees). Excess sends past the peer's true limit don't fail; they
-//! queue invisibly inside that task -- which is exactly the fixed-slot-queue
-//! symptom the sweep measured (TTFT jumping to one full stream duration).
-//! So this module tracks its own conservative "how busy does *this* pool
-//! think this connection is" counter to decide when to prefer a different
-//! (or new) connection; hyper's real per-connection queue is still what
-//! ultimately keeps everything safe if that guess runs a little high.
-//!
-//! h1 was untouched by the h2 set: h1 has no multiplexing (one request in
-//! flight per connection, ever), so none of the stream-accounting machinery
-//! above applies to it. Keep-alive reuse for h1 is [`H1ConnCache`]
-//! (below) -- a much smaller cache in shape (one IDLE connection
-//! leased to one request at a time, never shared concurrently) but with its
-//! own hazard the h2 cache never has to think about: an h1 connection is
-//! only safe to hand to the NEXT request after its CURRENT response body has
-//! reached a clean end of stream. See that type's doc for the full rule.
-//!
-//! This cache lives here, in `proxy-http`, and not in `proxy-cluster`
-//! alongside [`proxy_cluster::HttpConnPool`], because hyper's h2
-//! `SendRequest<StreamBody>` is deliberately `!Send` (`StreamBody` is,
-//! ADR-0003 -- see `codec.rs`'s use of `spawn_local`/`LocalExec`), while
-//! `HttpConnPool`/`ClusterEntry` are `Send + Sync` and shared across every
-//! worker OS thread. A pooled sender can't live in that shared pool; it has
-//! to live per worker, where the h1/h2 codec already runs.
-//! [`proxy_cluster::pool::ConnectPool`] keeps doing exactly what it does
-//! today (dial raw bytes); this cache sits on top of it, worker-side.
-//!
-//! ## Connection lifetime
-//!
-//! Both caches keep a connection until something ends it, so three separate
-//! mechanisms keep a stale entry from costing anything:
-//!
-//! - **The `max_connections` slot belongs to the socket, not to the cache
-//!   entry** ([`SlotIo`]). A pooled connection holds one of the cluster's S5
-//!   connection slots, and the gauge behind it is shared by every worker and
-//!   every host in the cluster. If the slot were released when the *entry*
-//!   was evicted, an idle connection whose peer had hung up would keep its
-//!   slot until something happened to look that key up again -- which, once a
-//!   cluster's endpoint addresses change at runtime, may be never. The slot
-//!   rides inside the byte stream instead, so it is returned the moment the
-//!   connection is dropped by whoever owns it: the peer closing it, an error,
-//!   or us letting go. An h2 connection that is evicted while streams are
-//!   still running on it keeps its slot until those streams end, because the
-//!   socket is still open.
-//! - **A periodic sweep** ([`SWEEP_INTERVAL`]) drops closed connections,
-//!   connections that have been idle for [`UPSTREAM_IDLE_TIMEOUT`], and keys
-//!   with nothing left under them. It runs in a task of its own, never inside
-//!   a request, so no request pays for the size of the cache. Lookups still
-//!   check `is_closed()` themselves: the sweep is periodic and a peer can
-//!   hang up between two sweeps.
-//! - **The cluster build is part of the key** ([`ConnKey::build`]), so a
-//!   cluster that was rebuilt with different TLS or protocol settings never
-//!   reuses a connection negotiated under the old ones. The old build's
-//!   entries are unreachable from then on and age out through the sweep.
+//! Connection slots live inside the byte stream, so eviction does not release
+//! a slot while an h2 stream still owns the socket. Periodic sweeps remove
+//! closed, idle, and removed-endpoint connections. Cluster build IDs in keys
+//! prevent reuse across changes to TLS, protocol, or connection budgets.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -110,32 +37,9 @@ use crate::codec::{
 use crate::filter::{RequestHeaders, ResponseHeaders};
 use crate::handler::{local_boxed, BodyError, HttpRequestParts, HttpResponseParts, StreamBody};
 
-/// The cache key -- and a security boundary, not just a lookup convenience.
-///
-/// The cluster name MUST stay part of this key even though `addr` alone can
-/// look like it already disambiguates two upstreams. Two *different*
-/// clusters can be configured to point at the very same address with
-/// different `transport_socket`s (different TLS trust roots, client certs,
-/// SNI) and different per-provider credentials
-/// (`ClusterConfig::request_headers_to_add`). Dropping `cluster` from
-/// this key would let a request routed to cluster B reuse cluster A's
-/// already-established h2 connection -- shipping A's TLS identity, and every
-/// request sent over that connection afterward, to a destination the config
-/// never authorized for it. This is the same class of bug AGENTS.md invariant 6
-/// already names twice (provider credentials and `host_rewrite_literal`
-/// following the routing decision instead of the connection); a future
-/// reader who notices `addr` alone "looks like enough" and removes `cluster`
-/// to shrink the key would reopen it a third time.
-///
-/// `build` is the same kind of boundary across *time* rather than across
-/// clusters. A cluster that is reloaded with different settings keeps its name
-/// and its addresses, but it gets a new transport socket (TLS roots, client
-/// certificate, SNI) and a new connection budget. Without `build`, the new
-/// cluster would reuse a connection the old one negotiated, and the connection
-/// would be counted against a `max_connections` gauge the new cluster no longer
-/// reads. The old build's entries stay in the map under their own key, for the
-/// requests of the configuration generation that still routes to that build,
-/// until the sweep retires them.
+/// Cache identity and security boundary: cluster names prevent sharing
+/// connections between providers at the same address, while build IDs prevent
+/// reuse across configuration changes to TLS or connection budgets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnKey {
     pub cluster: String,
@@ -183,20 +87,13 @@ impl Hash for ConnKey {
 /// configure and nothing to inherit; this is the value Envoy would apply.
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// How often each worker sweeps its connection caches. The idle timeout is an
-/// hour, so a minute of granularity means a connection is closed between an
-/// hour and an hour and a minute after it went idle, which is the precision
-/// an operator can see anyway. Short enough that entries for an endpoint that
-/// has gone away do not linger, long enough that a worker with nothing to
-/// reclaim does almost no work.
+/// Sweep interval; stale endpoints are reclaimed promptly without frequent
+/// work on otherwise idle workers.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Answers "is `addr` still a host of `cluster`?" for the sweep. Supplied by
-/// whoever owns cluster membership (see [`UpstreamConnCache::set_membership`]).
-/// It runs inside the sweep, under the cache map's borrow, so it must be cheap
-/// and must not call back into the cache; loading the cluster's host set and
-/// looking the address up is the intended shape. A cluster the oracle does not
-/// know answers `false`: its connections are drained too.
+/// Answers whether an address still belongs to a cluster. It runs during the
+/// sweep under the map borrow, so it must be cheap and must not call the cache;
+/// unknown clusters are treated as removed.
 ///
 /// Rust note: `Rc<dyn Fn(..)>` is a shared, type-erased closure. `dyn` hides the
 /// closure's concrete type so the cache need not be generic over it, and `Rc`
@@ -207,11 +104,8 @@ pub type MembershipOracle = Rc<dyn Fn(&str, SocketAddr) -> bool>;
 /// set, and the sweep then only reclaims closed and idle-expired connections.
 type Membership = Rc<RefCell<Option<MembershipOracle>>>;
 
-/// Has the oracle (if any) said `key`'s endpoint left its cluster? Envoy drains
-/// a host's connection pools when the host is removed; without this, an idle
-/// socket to a replaced endpoint would hold a slot of the cluster-wide
-/// `max_connections` budget for up to [`UPSTREAM_IDLE_TIMEOUT`] and could
-/// starve dials to its replacement.
+/// Whether the endpoint was removed. Draining removed hosts prevents stale
+/// sockets from holding cluster-wide connection slots (Envoy S4).
 fn endpoint_removed(membership: &Membership, key: &ConnKey) -> bool {
     membership
         .borrow()
@@ -219,9 +113,7 @@ fn endpoint_removed(membership: &Membership, key: &ConnKey) -> bool {
         .is_some_and(|is_member| !is_member(&key.cluster, key.addr))
 }
 
-/// What one sweep took out of a cache. The periodic task logs it when it is
-/// not empty, and the tests read it, so an operator and a test see the same
-/// account of what was reclaimed.
+/// Counts reclaimed connections and empty keys.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SweepReport {
     /// Connections dropped: closed by the peer, or idle past
@@ -231,8 +123,7 @@ struct SweepReport {
     keys: usize,
 }
 
-/// Run `sweep` over a cache's entries every [`SWEEP_INTERVAL`], for as long as
-/// the cache lives.
+/// Run periodic sweeps while the cache is alive.
 ///
 /// Rust note: the task holds a `Weak`, not an `Rc`. A strong handle in a task
 /// that never ends would keep the cache alive for the life of the runtime;
@@ -273,18 +164,9 @@ fn spawn_sweeper<S: 'static>(
     });
 }
 
-/// An upstream byte stream that owns the S5 `max_connections` slot its
-/// connection was dialed under.
-///
-/// The codecs take ownership of the stream and drop it when the connection is
-/// over, however that happens: the peer closes it, an I/O error ends it, the
-/// driver task is aborted, or the cache lets go of the last handle. Putting the
-/// slot inside the stream makes "the slot is released when the connection
-/// closes" true by construction, for both protocols. It is also the only
-/// place that is right for h2: hyper runs an h2 connection in a task of its
-/// own, started through the executor, that outlives the `SendRequest` the
-/// cache holds -- dropping the cache entry does not close the socket while
-/// streams are still running on it, and the slot must not be released then.
+/// Upstream stream that owns its S5 connection slot. For h2, the driver can
+/// outlive the cached sender, so eviction must not release the slot while a
+/// stream still owns the socket.
 ///
 /// Rust note: fields drop in declaration order, so `io` is dropped (the socket
 /// closes) before `_slot` hands the budget back. A waiter that is woken by the
@@ -397,14 +279,8 @@ const SOFT_STREAMS_PER_CONNECTION: usize = 100;
 /// cluster; a fixed conservative default is used.
 const MAX_CONNECTIONS_PER_KEY: usize = 4;
 
-/// One connection this cache is holding open for a [`ConnKey`], plus our own
-/// best guess at how many streams are currently in flight on it -- see
-/// [`StreamGuard`] for how that counter is kept honest across the whole
-/// request/response lifetime, not just until headers arrive.
-///
-/// The connection's `max_connections` slot is not a field here: it travels
-/// inside the socket (see [`SlotIo`]), so evicting this entry gives the slot
-/// back only if that also ends the connection.
+/// Cached connection and its in-flight count. Its connection slot stays in
+/// the socket (see [`SlotIo`]) until the connection ends.
 struct PooledConn {
     sender: SendRequest<StreamBody>,
     activity: Rc<ConnActivity>,
@@ -443,20 +319,11 @@ impl ConnActivity {
     }
 }
 
-/// One cache slot: the bounded set of connections currently held for a
-/// single [`ConnKey`]. Empty means nobody has successfully dialed this key
-/// yet (or every prior occupant died and was swept).
-/// `Rc<tokio::sync::Mutex<_>>`, not a plain `RefCell` -- see
-/// [`UpstreamConnCache::get_or_connect`]'s doc for why a real (queueing)
-/// lock is required here even though this whole cache never leaves one
-/// worker thread.
+/// Bounded connection set for one key. The async mutex serializes dials
+/// across awaits; see [`UpstreamConnCache::get_or_connect`].
 type Slot = Rc<tokio::sync::Mutex<Vec<PooledConn>>>;
 
-/// A leased h2 sender plus the `StreamGuard` that must ride along with
-/// whatever response body this stream produces -- see [`Self::send`].
-/// Returned by [`UpstreamConnCache::get_or_connect`] instead of a bare
-/// `SendRequest` (what the original single-connection design returned) so the router can't accidentally
-/// send a request without also carrying its stream-accounting guard.
+/// Leased h2 sender paired with the guard that tracks its response body.
 #[derive(Debug)]
 pub struct PooledSendRequest {
     sender: SendRequest<StreamBody>,
@@ -487,14 +354,8 @@ impl PooledSendRequest {
     }
 }
 
-/// RAII stream-accounting handle. Created by
-/// [`UpstreamConnCache::get_or_connect`] (via `lease`, incrementing
-/// [`ConnActivity::in_flight`] there and then), and decremented on `Drop`
-/// -- whichever way that happens: the response body read to completion, an
-/// early `?` before one was ever produced, or the body simply being dropped
-/// because the downstream client went away mid-stream. Every one of those is
-/// "this stream is no longer in flight" for this cache's purposes, and
-/// `Drop` fires on all of them uniformly.
+/// RAII handle that decrements the in-flight count when the response body is
+/// completed or dropped, including when the downstream disconnects.
 ///
 /// Rust note: `Cell<usize>`, not an atomic or a `Mutex` -- this whole cache
 /// never leaves its worker's OS thread (ADR-0003, the same reasoning
@@ -785,22 +646,8 @@ impl UpstreamConnCache {
         self.slots.borrow_mut().remove(key);
     }
 
-    /// Drop every cached connection.
-    ///
-    /// Nothing calls this in the shipped binary today. The natural trigger
-    /// would be "this worker just learned about a new config snapshot", but
-    /// there is no such live seam yet: `ConfigPublisher::publish` exists and
-    /// `run_listener_manager` does reconcile on it, but in
-    /// `crates/proxy/src/main.rs` the publisher is only ever used for
-    /// `shutdown()`/`join()` -- there is no SIGHUP handler, admin reload
-    /// endpoint, or file watcher that calls `publish()` after boot. The only
-    /// callers of `publish` anywhere in the tree are unit tests. Wiring a
-    /// real post-boot reload trigger is separate, already-scheduled work.
-    /// This is not a silently-unhandled config-swap gap (AGENTS.md invariant 1):
-    /// there is no reload path yet for a stale entry to survive, so there is
-    /// nothing to get wrong. This method (and [`Self::invalidate`]) exist so
-    /// that whoever wires the reload trigger has a correct, already-tested
-    /// seam to call into.
+    /// Drop every cached connection. Active streams retain their sockets and
+    /// connection slots until they finish.
     pub fn clear(&self) {
         self.slots.borrow_mut().clear();
     }
@@ -998,34 +845,10 @@ fn sweep_h1(
     report
 }
 
-/// Per-worker cache of IDLE, reusable HTTP/1.1 upstream connections, keyed by
-/// [`ConnKey`]. Reached via [`worker_h1_conn_cache`]; see [`UpstreamConnCache`]'s
-/// doc for why this lives in `proxy-http` (not `proxy-cluster`) and why a
-/// `thread_local!`, not a `RouterFilterFactory` field.
-///
-/// h1 has no multiplexing: one connection carries exactly one request at a
-/// time, ever. So unlike [`UpstreamConnCache`] (which hands out CLONES of a
-/// live `SendRequest` to run concurrently), this cache only ever holds
-/// connections that are between requests, and a lease removes an entry from
-/// here entirely rather than incrementing an in-flight counter -- there's
-/// nothing to share while a lease is out. That also means there's no
-/// thundering-herd hazard to guard against the way [`UpstreamConnCache::get_or_connect`]'s
-/// per-key `tokio::sync::Mutex` does: two requests racing for the same key
-/// with an empty idle set just both dial their own connection, which is
-/// correct h1 behavior (one connection can't serve two requests at once
-/// anyway), not a bug -- so a plain `RefCell` is enough here.
-///
-/// The hazard this cache DOES have to guard, that the h2 cache doesn't: an
-/// h1 connection is only safe to reuse once its CURRENT response body has
-/// reached a clean end of stream. Handing out a connection whose response is
-/// still mid-flight (or that ended in an error, or that the caller gave up
-/// reading before EOF) would let the next request's bytes land while the
-/// peer is still mid-write of the previous response -- a real
-/// response/request desync, not just a wasted connection. See `H1ReuseBody`
-/// for where that decision is made, and why it's made in `Drop`.
-///
-/// The map is behind an `Rc` for the same reason as [`UpstreamConnCache`]'s:
-/// the periodic sweep reaches it through a `Weak` from a task of its own.
+/// Per-worker cache of idle HTTP/1.1 connections. A connection is reusable
+/// only after its response body ends cleanly; otherwise the next request could
+/// be confused with the remainder of the previous response. The sweep reaches
+/// the worker-local map through a `Weak` handle.
 pub struct H1ConnCache {
     slots: Rc<RefCell<HashMap<ConnKey, VecDeque<IdleH1Conn>>>>,
     /// Whether this cache's sweep task has been started -- see
@@ -1247,20 +1070,9 @@ fn response_has_connection_close<B>(response: &http::Response<B>) -> bool {
         .any(|token| token.trim().eq_ignore_ascii_case("close"))
 }
 
-/// The response body wrapper that makes h1 reuse safe: it delegates every
-/// poll to `inner`, tracking along the way whether the stream reached a
-/// CLEAN end (`completed`) or an error (`errored`) -- and defers the actual
-/// "is this connection safe to hand to the next request?" decision to
-/// [`Drop`], which is the only place that can see the FINAL state of both
-/// flags together with how the body was actually consumed (fully drained,
-/// vs. dropped early by a caller that stopped reading).
-///
-/// Every field this type needs to move out of itself on drop (`sender`,
-/// `conn_task`) is wrapped in `Option` for exactly that reason -- see
-/// `Drop`'s own doc below for why, and contrast with [`IdleH1Conn::discard`]'s
-/// note, which solves the same underlying conflict (Rust forbids moving a
-/// field out of a `Drop` type) the opposite way, because a consuming method
-/// had the freedom to take `self` by value and this `Drop` impl doesn't.
+/// Tracks whether the response body ended cleanly and returns the h1
+/// connection to the cache only from `Drop`, when its final state is known.
+/// `Option` fields allow `Drop` to take ownership of the sender and task.
 struct H1ReuseBody {
     inner: StreamBody,
     sender: Option<Http1SendRequest<StreamBody>>,

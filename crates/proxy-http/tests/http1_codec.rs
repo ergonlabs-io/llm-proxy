@@ -1,9 +1,5 @@
-//! Standalone tests for the downstream HTTP/1.1 codec
-//! (`proxy_http::codec::serve_http1`) and the `StreamHandler` seam, driven
-//! over an in-memory `tokio::io::duplex` pipe with a hyper low-level client
-//! on the other end (mirroring the technique `tests/hyper_spike.rs`
-//! established). The codec is `!Send` (ADR-0003), so every test runs on a
-//! `LocalSet` via `#[tokio::test(flavor = "current_thread")]` + `run_local`.
+//! Tests the HTTP/1.1 codec and `StreamHandler` over an in-memory duplex pipe.
+//! The codec is `!Send` (ADR-0003), so tests run on a current-thread `LocalSet`.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -27,9 +23,7 @@ use tokio::io::duplex;
 use tokio::task::LocalSet;
 use tokio::time::Instant;
 
-/// Run `fut` to completion on a fresh current-thread runtime + `LocalSet` --
-/// the codec (and `Rc<dyn StreamHandler>`) is `!Send`, so it can't run on the
-/// default multi-threaded test runtime.
+/// Runs a future on a fresh current-thread runtime because the codec is `!Send`.
 fn run_local<F: Future<Output = ()>>(fut: F) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -39,8 +33,7 @@ fn run_local<F: Future<Output = ()>>(fut: F) {
     local.block_on(&rt, fut);
 }
 
-/// A no-op shutdown future that never resolves -- for tests that don't
-/// exercise drain.
+/// A shutdown future that stays pending for tests that do not exercise drain.
 fn never_shutdown() -> impl Future<Output = ()> {
     std::future::pending()
 }
@@ -136,9 +129,7 @@ fn post_body_is_echoed_back() {
             let _ = conn.await;
         });
 
-        // Multi-chunk payload: `Full` sends it as one frame at the hyper
-        // client-body level, but the assertion is on the *reassembled*
-        // bytes, which is what matters for "the echo round-trips correctly".
+        // Assert on reassembled bytes; `Full` emits one client-body frame.
         let payload = Bytes::from(
             vec![b'a'; 1024]
                 .into_iter()
@@ -163,10 +154,7 @@ fn post_body_is_echoed_back() {
     });
 }
 
-/// A handler whose response body yields one chunk immediately, sleeps, then
-/// yields a second chunk and ends -- the SSE-shaped early-flush fixture,
-/// mirroring `hyper_spike.rs` test (a) but through the full seam (codec +
-/// `StreamHandler`) instead of hyper's raw API.
+/// Emits two response chunks with a delay to exercise early flushing.
 struct SlowChunkedHandler {
     pause: Duration,
 }
@@ -397,8 +385,7 @@ fn keep_alive_false_closes_connection_after_one_response() {
     });
 }
 
-/// A handler that holds the response open briefly (simulating an in-flight
-/// request still being served when drain fires), then completes.
+/// Holds a response open briefly so drain can be tested in flight.
 struct SlowHandler {
     delay: Duration,
 }
@@ -426,9 +413,7 @@ impl StreamHandler for SlowHandler {
     }
 }
 
-/// A handler that records whether the `HttpRequestParts` it received carried
-/// an extracted `on_upgrade` handle, then returns a fixed 200 -- S10 is plumbing + detection only, so this stub doesn't touch the
-/// handle itself, just proves `serve_one` threaded it through correctly.
+/// Records whether `serve_one` passed the extracted `on_upgrade` handle (S10).
 struct UpgradeRecordingHandler {
     // Rust note: `Rc<Cell<..>>` rather than a plain field -- `handle` takes
     // `&self` (see `StreamHandler`'s doc), and the codec calls `handler`
@@ -495,10 +480,7 @@ fn upgrade_shaped_request_hands_handler_a_some_on_upgrade() {
             let _ = conn.await;
         });
 
-        // 2a is detection-only -- the stub handler above answers a plain 200
-        // rather than actually switching protocols, so this deliberately
-        // doesn't assert on the response status; it only proves the
-        // `OnUpgrade` handle reached the handler.
+        // Detection only: the stub returns 200 without switching protocols.
         let req = Request::builder()
             .method("GET")
             .uri("/")
@@ -608,8 +590,7 @@ fn drain_completes_in_flight_request_then_closes() {
             .unwrap();
         let send = tokio::task::spawn_local(async move { sender.send_request(req).await });
 
-        // Give the request time to reach the server and start being handled,
-        // then fire shutdown mid-flight.
+        // Start handling the request before firing shutdown.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = shutdown_tx.send(());
 
@@ -629,11 +610,9 @@ fn drain_completes_in_flight_request_then_closes() {
 
 // --- HCM `request_headers_timeout` (`Http1Options::header_read_timeout`) ----
 //
-// Driven on tokio's paused clock: the runtime auto-advances virtual time
-// whenever every task is idle, so a 30-second default or a 5-second deadline
-// resolves instantly and the assertions are on outcomes, not wall-clock.
+// Paused time makes header deadlines testable without wall-clock waits.
 
-/// Like `run_local` but with tokio's clock paused.
+/// Runs on a current-thread runtime with tokio time paused.
 fn run_local_paused<F: Future<Output = ()>>(fut: F) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -674,8 +653,7 @@ fn unset_header_timeout_does_not_inherit_hypers_30s_default() {
         let (mut client, server_io) = duplex(64 * 1024);
         let _server = spawn_fixed_server(server_io, None);
 
-        // Two virtual minutes of silence: with hyper's default 30s header
-        // timeout active, the connection would be gone by now.
+        // Stay idle past hyper's 30-second default before sending the request.
         tokio::time::sleep(Duration::from_secs(120)).await;
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
@@ -699,7 +677,7 @@ fn header_timeout_closes_a_connection_whose_request_head_stalls() {
         let server = spawn_fixed_server(server_io, Some(Duration::from_secs(5)));
 
         client.write_all(b"GET / HT").await.unwrap();
-        // EOF with no bytes: hyper drops the connection without a 408.
+        // Hyper closes on timeout without sending a 408.
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert!(

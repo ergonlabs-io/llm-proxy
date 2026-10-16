@@ -153,8 +153,7 @@ MOCK_PID=$!
 # The mock prints its bound address as its first stdout line and flushes
 # before it starts serving, so waiting for that line is a real readiness
 # fence -- not a sleep, and not a connect() that would succeed against
-# whatever else happened to hold the port (the false-negative generator
-# internal-docs/MILESTONES.md records under the sigterm-drain bullet).
+# whatever else happened to hold the port (a false-negative generator).
 MOCK_ADDR=""
 for _ in $(seq 1 100); do
     MOCK_ADDR="$(sed -n 's/^mock-upstream listening on \([^ ]*\).*/\1/p' "$MOCK_LOG" | head -1)"

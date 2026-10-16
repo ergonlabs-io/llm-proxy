@@ -1,5 +1,5 @@
-//! Hermetic end-to-end proof (the MVP north-star's P3 milestone):
-//! the real `llm-proxy` binary, booted from a dialect (`llmproxy.yaml`)
+//! Hermetic end-to-end proof: the real `llm-proxy` binary, booted from a
+//! dialect (`llmproxy.yaml`)
 //! config, proxies real HTTP/1.1 requests over a real TLS connection
 //! (self-signed cert, genuine SNI + certificate verification) to the
 //! in-process OpenAI/Anthropic mocks in `diffrig::upstreams` -- including

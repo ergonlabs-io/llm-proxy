@@ -1,130 +1,17 @@
-//! Wires [`crate::spend`]'s price table,
-//! tenant/key spend accumulator and budgets into a real decode/encode
-//! `HttpFilter`: `llmproxy.spend_limit`.
+//! Enforces spend budgets through decode admission and records completed
+//! request costs on encode. Costs arrive only at response end, so admitted
+//! in-flight requests can exceed a ceiling; there are no reservations.
 //!
-//! # The check/record split is inherent, not a shortcut -- restated from
-//! `token_limit_filter`, for money
+//! Configure auth before this filter (decode order) and usage after it
+//! (reverse encode order, S2.1). Budgets apply only to matching credential
+//! sources (ADR-0007 decision 8). Missing identity is denied only when a
+//! budget is configured; absent budgets mean unlimited while spend remains
+//! reportable. A configured zero ceiling denies immediately.
 //!
-//! A request's cost is unknown until its response finishes (usage arrives at
-//! the END of the stream, never before), so this filter -- exactly like
-//! [`crate::token_limit_filter`] -- checks on the **decode** path (before a
-//! request is sent upstream, against whatever each scope's live spend
-//! already is) and records on the **encode** path, at response end. The
-//! cost of every request admitted before prior responses finish can exceed
-//! the ceiling. There are no spend reservations: overspend includes all admitted
-//! in-flight costs plus remote charges not yet reconciled. Without separate
-//! concurrency and request-cost limits there is no finite strict overspend bound.
-//! Sequential traffic can exceed the ceiling by one request's cost.
-//!
-//! # Filter position: mirrors `token_limit_filter`'s two ordering rules
-//! exactly, restated for key + usage instead of tenant + usage
-//!
-//! - **`llmproxy.auth` BEFORE `llmproxy.spend_limit`** (decode-side): this
-//!   filter's decode check reads `StreamInfo::auth.key_id`, which the auth
-//!   filter writes. Decoder callbacks run in config order (S2.1), so this
-//!   is the same direction as `token_limit`'s own auth-ordering rule.
-//! - **`llmproxy.spend_limit` BEFORE `llmproxy.usage`** (encode-side): this
-//!   filter's encode-side `record` reads the [`proxy_http::LlmTokenUsage`]
-//!   the usage filter writes at response end. Encoder callbacks run in
-//!   REVERSE config order, so "the usage filter has already run" means "the
-//!   usage filter is LATER in config order" -- exactly `token_limit`'s own
-//!   usage-ordering rule, for the identical reason. Get it backwards and
-//!   `StreamInfo::llm.usage` reads `None` forever; see "Loud on unreadable
-//!   usage" below for why that is no longer silent.
-//!
-//! `proxy_config::lower::check_lane_h_filter_order` enforces both at config
-//! load; this comment states the reasoning, not the guard.
-//!
-//! Each completed priced or unpriced request is attributed to both tenant and
-//! key. Each scope uses its own configured period, or the reporting default.
-//! Either configured ceiling can refuse admission; both ledgers remain separate.
-//!
-//! # Each budget is scoped to one credential source (ADR-0007 decision 8)
-//!
-//! Every [`crate::spend::TenantBudget`] carries the credential source it is
-//! scoped to. On decode, only budgets whose scope matches this request's mode
-//! are enforced: tenant mode is "the auth filter handed the tenant a
-//! credential set" (ADR-0007 decision 5), platform mode is everything else. A
-//! non-matching budget is treated as ABSENT for that request -- no denial, no
-//! warning, no admission count -- rather than as a zero ceiling. On encode, a
-//! subject (key or tenant) that HAS a configured budget is charged only when
-//! the attempt's `StreamInfo::credential_source` -- set by the router at the
-//! credential step (ADR-0007 decision 7) -- matches the budget's scope, so one
-//! mode's spend never inflates the other mode's ceiling. A subject with no
-//! budget at all still records every request: those counters double as spend
-//! reporting.
-//!
-//! # Missing identity is denied when a spend budget is configured
-//!
-//! Two DIFFERENT "nothing to enforce" cases, both admitting, for different
-//! reasons:
-//!
-//! - **`StreamInfo::auth.key_id` is `None`.** This filter is not an
-//!   authenticator, and duplicating `llmproxy.auth`'s own fail-closed 401
-//!   here would only produce a second, confusingly different refusal reason
-//!   for the same underlying fact ("this request was never authenticated").
-//!   With configured tenant or key budgets this returns 403, preventing a JWT or
-//!   missing key identity from bypassing policy. With no budgets, it admits without
-//!   recording unattributable spend.
-//! - **Neither the authenticated key nor its tenant has a configured
-//!   [`crate::spend::TenantBudget`].** Mirrors
-//!   [`crate::model_authz_filter`]'s and
-//!   [`crate::spend::TenantBudget`]'s own "`None` means unlimited, and that
-//!   is the deliberate default" reasoning: a budget is an opt-in ceiling, not
-//!   a default-deny, so enabling this filter must not silently deny every
-//!   key's very first request the moment an operator adds it to a chain.
-//!   Spend IS still recorded for this key (under
-//!   [`crate::spend::SpendAccumulator::default_period`]) so its history
-//!   accrues somewhere reportable even with no ceiling to check it against.
-//!
-//! # A configured ceiling of exactly zero denies immediately
-//!
-//! `Some(TenantBudget { max_micros: MicroUsd::from_micros(0), .. })` is a
-//! real, deliberate policy -- deny every priced request this period -- not a
-//! degenerate case to special-case away. The comparison below is
-//! `current_micros >= limit_micros`, which is `0 >= 0` on a fresh period:
-//! true, so the very first request a zero-budget key makes is refused.
-//! See [`crate::spend::TenantBudget`]'s doc for why `None` and `Some(0)` are
-//! kept distinguishable end to end rather than collapsed.
-//!
-//! # Enforcement reads the LIVE accumulator, never the last flush
-//!
-//! Exactly [`crate::spend::SpendAccumulator::current_total`]'s documented
-//! property: a slow or dead flusher thread can only make the STORED total
-//! staler, never loosen what this filter's decode check sees. This filter
-//! never reads anything the flusher wrote; it reads live memory, every time.
-//!
-//! # Spend flushes into the OPERATOR'S store, not a private one
-//!
-//! [`crate::spend::SpendAccumulator`] needs a
-//! [`crate::control::ControlPlaneStore`] to flush to and resume from, and it
-//! gets the SAME one the `llmproxy.auth`-resolved
-//! [`crate::control::ControlPlane`] persists budgets and policies into, via
-//! [`crate::control::ControlPlane::store`]. That matters concretely: with
-//! `store: persistent` configured on `llmproxy.auth`, a key's accrued
-//! spend survives a restart along with its budget, and only the unflushed
-//! window (bounded by the flush interval) is lost -- the crash-refund.
-//!
-//! A private store here would have been the quiet failure. Budgets would
-//! persist while SPEND reset to zero on every restart, so a monthly ceiling
-//! would be escapable by bouncing the proxy, and the entire
-//! spend persistence path (`add_spend`/`load_spend` on redb, additive writes,
-//! restart-resume) would be wired to nothing while still passing its own
-//! tests.
-//! # Loud on unreadable usage, but never fail-closed -- restated from
-//! `token_limit_filter`, per AGENTS.md "Fail-open controls"
-//!
-//! A request a budget actually applies to (this stream had a key AND that
-//! key had a configured budget) whose usage reads `None` at encode time is
-//! metered as zero spend and never shown anywhere an operator would look --
-//! unless something says so. [`UsageMissingWarner::warn_if_due`] closes
-//! exactly that gap, `warn!`, never a denial (the request itself succeeded
-//! and behaved as designed): see [`crate::token_limit_filter`]'s identical
-//! section for the full reasoning, including why this must warn ONLY when a
-//! budget actually applies (an unbudgeted key's missing usage is not a
-//! bypass of anything) and why the suppression is once-per-key-per-minute
-//! rather than once-per-process. Key ids identify a logical credential and
-//! are never rendered in metrics labels or response bodies.
+//! Admission reads the live accumulator, never the last flush. It shares the
+//! auth control-plane store so persisted budgets and spend survive restarts;
+//! unreadable applicable usage warns and records zero rather than denying a
+//! completed request (AGENTS.md "Fail-open controls").
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

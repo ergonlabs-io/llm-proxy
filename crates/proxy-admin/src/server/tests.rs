@@ -1534,7 +1534,7 @@ async fn write_with_correct_token_but_no_control_plane_registered_is_503() {
 /// disambiguate by, so this must be a loud, explicit error naming the
 /// ambiguity, never a silent pick of one of the two -- see
 /// `resolve_control_plane`'s doc for why guessing here is exactly the class
-/// of bug this task exists to close.
+/// of bug this design rules out.
 #[tokio::test]
 async fn write_with_two_registered_control_planes_is_an_explicit_error_not_a_guess() {
     let factory_state = Arc::new(SharedFactoryState::default());
@@ -2888,8 +2888,8 @@ async fn oversized_body_is_413() {
 /// A wrong method on a recognized write path answers 405, not the generic
 /// 404 an unknown path gets.
 ///
-/// `GET /keys` used to be the assertion here; it is now the gated LIST
-/// endpoint, so the wrong-method probe is `DELETE /keys` (no id -- the mint
+/// `GET /keys` is the gated LIST endpoint, so the wrong-method probe is
+/// `DELETE /keys` (no id -- the mint
 /// shape only accepts POST) instead. The listing's own behavior is covered
 /// by the `get_keys_*` tests below.
 #[tokio::test]

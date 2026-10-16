@@ -1,23 +1,9 @@
 //! The simple LLM-native config dialect.
 //!
-//! **Normative schema: `schema/llmproxy-v0.schema.json`** — the single source
-//! of truth for the dialect. User docs, editor autocomplete, and the validator
-//! are all generated from that file; this crate implements it, never extends it.
-//!
-//! Architecture: this is a FRONT-END, not a parallel config system. The
-//! dialect lowers to standard Envoy resources (providers -> clusters + TLS
-//! contexts, routes -> a route table on one listener/HCM), which then flow
-//! through the identical `proxy-config` strict-parse -> PGV-validate -> IR
-//! pipeline as Envoy bootstrap mode. `llm-proxy --mode translate` prints the
-//! lowered Envoy bootstrap. Dialect rule: a capability must exist in the
-//! Envoy-mode surface before the dialect may expose it.
-//!
-//! LLM-tuned defaults live here (no total timeout, idle-based guards,
-//! never-retry-after-first-byte); Envoy bootstrap mode keeps Envoy's defaults
-//! for parity.
-//!
-//! `SAMPLE_CONFIG` / `sample_config()` expose the shipped example for docs
-//! and tests.
+//! The dialect follows the normative schema and lowers to standard Envoy
+//! resources, then uses the same strict parse, PGV, and IR pipeline as Envoy
+//! bootstrap mode. A capability must already exist in Envoy mode before the
+//! dialect exposes it. LLM-tuned timeout and retry defaults are applied here.
 
 pub mod lower;
 pub mod model;
@@ -33,10 +19,7 @@ pub use parse::{
     parse_simple_config, parse_simple_config_with_env,
 };
 
-/// The annotated sample config shipped as `examples/llmproxy.yaml` — the
-/// "2-minute experience" file users copy from. Embedded here so docs,
-/// doctests, and tests all exercise the exact file users see, instead of a
-/// second copy that can drift out of sync.
+/// The shipped example embedded so docs, doctests, and tests share one copy.
 // Rust note: `include_str!` reads the file's contents at *compile* time and
 // inlines them as a `&'static str`; the path is resolved relative to this
 // source file, not the crate root or the working directory.
@@ -46,9 +29,6 @@ pub const SAMPLE_CONFIG: &str = include_str!("../../../examples/llmproxy.yaml");
 /// deterministic placeholder (`sk-sample-<name>`) so the sample never
 /// requires real environment variables.
 ///
-/// This cannot panic in practice: the dialect test suite parses and lowers
-/// `SAMPLE_CONFIG` end to end, so any change that would break parsing fails
-/// CI before it reaches this helper.
 ///
 /// ```
 /// let config = proxy_simple_config::sample_config();

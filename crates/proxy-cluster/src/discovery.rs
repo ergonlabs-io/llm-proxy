@@ -1,15 +1,9 @@
-//! Discovery: turns a [`ClusterConfig`]'s configured endpoints into a
-//! [`HostSet`], and paces the re-resolution of the DNS ones.
+//! Discovery: turns a [`ClusterConfig`]'s endpoints into a [`HostSet`], and paces re-resolution of DNS endpoints.
 //!
-//! `STATIC` needs no I/O -- its endpoints are already literal IPs (enforced
-//! at config lowering, see `proxy-config/src/lower.rs`). `STRICT_DNS` and
-//! `LOGICAL_DNS` resolve through a [`HostResolver`] and are the only variants
-//! that re-resolve on a timer: [`RefreshSchedule`] decides how long to wait
-//! after each lookup, and `ClusterManager` runs the timer (see
-//! `manager.rs`'s `run_dns_refresh`). `EDS` clusters have no self-driven
-//! discovery here at all; their membership is fed in externally, handled at
-//! the [`crate::manager::ClusterManager`] level (see
-//! `ClusterManager::accept_eds_update`).
+//! `STATIC` needs no I/O: its endpoints are literal IPs, enforced at lowering. `STRICT_DNS` and `LOGICAL_DNS` resolve
+//! through a [`HostResolver`] and are the only variants that re-resolve on a timer. [`RefreshSchedule`] sets the wait
+//! after each lookup, and `ClusterManager` runs the timer (`manager.rs`'s `run_dns_refresh`). `EDS` membership is fed
+//! in externally through `ClusterManager::accept_eds_update`.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -22,16 +16,13 @@ use crate::host_set::HostSet;
 use crate::resolver::HostResolver;
 use crate::{HealthFlags, Host};
 
-/// Envoy's default `initial_fetch_timeout`: how long cluster warming
-/// waits for a cluster's first resolution/EDS response before proceeding
-/// with an empty host set. The caller (`proxy/src/main.rs`) applies it; the
-/// manual "mark initialized anyway" escape hatch is
+/// Envoy's default `initial_fetch_timeout`: how long warming waits for a cluster's first resolution or EDS response
+/// before proceeding with an empty host set. The caller applies it. The manual escape hatch is
 /// [`crate::manager::ClusterManager::force_initialize`].
 pub const DEFAULT_INITIAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Resolve `config`'s endpoints into a host set. `previous` is the host set
-/// currently published for this cluster (empty on the first resolution); only
-/// `LOGICAL_DNS` reads it, to keep a host's address steady across refreshes.
+/// Resolves `config`'s endpoints into a host set. `previous` is the currently published set (empty on first
+/// resolution). Only `LOGICAL_DNS` reads it, to keep a host's address steady across refreshes.
 pub async fn resolve(
     config: &ClusterConfig,
     resolver: &dyn HostResolver,
@@ -43,27 +34,16 @@ pub async fn resolve(
         DiscoveryType::LogicalDns(_) => {
             logical_dns_hosts(&config.endpoints, resolver, previous).await?
         }
-        // An EDS cluster owns no endpoints to resolve -- its membership
-        // arrives through
-        // [`crate::manager::ClusterManager::accept_eds_update`]. Empty, not
-        // an error: a cluster whose EDS response has not landed yet is the
-        // ordinary startup state, and warming is what stops traffic
-        // reaching it meanwhile.
-        //
-        // **Callers must not reach here for an EDS cluster in the steady
-        // state**, and `ManagedCluster::resolve_and_publish` has an explicit
-        // arm to make sure they do not: resolving to empty on a DNS-cadence
-        // refresh would WIPE the host set EDS had already delivered. This arm
-        // is the defensive floor for a caller that gets that wrong, not the
-        // intended path.
+        // An EDS cluster owns no endpoints to resolve, so it is empty rather than an error. Warming holds traffic off
+        // until the first EDS response lands. Callers must not reach here for an EDS cluster in steady state:
+        // `ManagedCluster::resolve_and_publish` has an explicit arm for that. Resolving to empty on a DNS-cadence
+        // refresh would wipe the membership EDS delivered. This arm is only the defensive floor.
         DiscoveryType::Eds => Vec::new(),
     };
     Ok(HostSet::from_hosts(hosts))
 }
 
-/// Literal-IP endpoints -> hosts, no I/O. Also used by
-/// [`crate::manager::ClusterManager::accept_eds_update`], since externally
-/// supplied EDS endpoints are just more `EndpointIR`s.
+/// Literal-IP endpoints to hosts, with no I/O. Also used for externally supplied EDS endpoints, which are `EndpointIR`s too.
 pub(crate) fn static_hosts(endpoints: &[EndpointIR]) -> io::Result<Vec<Arc<Host>>> {
     endpoints
         .iter()
@@ -111,18 +91,12 @@ async fn strict_dns_hosts(
     Ok(hosts)
 }
 
-/// `LOGICAL_DNS`: one logical host per configured endpoint, holding one
-/// address from the latest resolution.
+/// `LOGICAL_DNS`: one logical host per configured endpoint, holding one address from the latest resolution.
 ///
-/// The address stays where it is while the answer still contains it, and
-/// moves to the answer's first address only when it is gone. Round-robin DNS
-/// reorders its answers on every query, so always taking the first address
-/// would swap the host every refresh -- and every swap makes the next
-/// requests dial a new address and pay a new TCP and TLS handshake for no
-/// reason. Envoy gets the same stability differently: its one logical host
-/// keeps its pooled connections when the address behind it changes; this
-/// proxy's hosts are immutable snapshots, so stability comes from not
-/// changing the address unless it has to (see
+/// The address stays while the answer still contains it, and moves only when it is gone. Round-robin DNS reorders
+/// its answers on every query, so taking the first address each time would swap the host every refresh. Each swap
+/// would then pay a new TCP and TLS handshake. Envoy keeps pooled connections on its logical host instead. This
+/// proxy's hosts are immutable snapshots, so stability comes from not changing the address unless it must (see
 /// `internal-docs/envoy-divergences.md`).
 async fn logical_dns_hosts(
     endpoints: &[EndpointIR],
@@ -150,9 +124,8 @@ async fn logical_dns_hosts(
     Ok(hosts)
 }
 
-/// The address `previous` already holds for `endpoint`'s logical host. A
-/// logical host is identified by what it was resolved from -- hostname, port
-/// and priority -- because the address is the part that changes.
+/// The address `previous` holds for `endpoint`'s logical host. The host is identified by hostname, port, and
+/// priority, since the address is the part that changes.
 fn current_address(previous: &HostSet, endpoint: &EndpointIR) -> Option<IpAddr> {
     previous
         .hosts_for_priority(endpoint.priority)
@@ -166,36 +139,28 @@ fn current_address(previous: &HostSet, endpoint: &EndpointIR) -> Option<IpAddr> 
 
 // ------------------------------------------------------- refresh pacing --
 
-/// The wait before the next lookup after one that succeeded: the refresh rate
-/// plus a share of the jitter bound. Envoy's `dns_jitter` is the exclusive
-/// upper bound of a uniform random delay added to every refresh.
+/// The wait before the next lookup after a success: the refresh rate plus a share of the jitter bound. Envoy's
+/// `dns_jitter` is the exclusive upper bound of a uniform random delay added to each refresh.
 ///
-/// `unit` is the random draw, in `[0, 1)`. It is an argument rather than drawn
-/// here so the arithmetic is exactly testable.
+/// `unit` is the random draw in `[0, 1)`, passed in so the arithmetic is testable.
 fn success_wait(refresh: &DnsRefresh, unit: f64) -> Duration {
     refresh
         .refresh_rate
         .saturating_add(refresh.jitter.mul_f64(unit))
 }
 
-/// The wait before retrying after `consecutive_failures` failed lookups in a
-/// row (1 = the first failure): exponential from `failure_base_interval`,
-/// doubling per failure and capped at `failure_max_interval`, with jitter.
+/// The wait before retrying after `consecutive_failures` failures in a row (1 is the first). It is exponential from
+/// `failure_base_interval`, doubling per failure and capped at `failure_max_interval`, with jitter. The jitter keeps
+/// the wait uniform in `(step / 2, step]`: replicas that lost DNS together do not retry in lockstep, and a down
+/// resolver is not hammered. When base and maximum are equal (Envoy's default, failures retry at the refresh rate),
+/// the interval is fixed and has no jitter.
 ///
-/// The jitter keeps the wait uniform in `(step / 2, step]`, so a fleet of
-/// replicas that lost DNS together does not retry in lockstep, a retry never
-/// comes sooner than half of the exponential step (a down resolver is not
-/// hammered), and the wait never exceeds the configured maximum. When the
-/// base and maximum are equal -- Envoy's default, where failures retry at the
-/// refresh rate -- the interval is fixed and gets no jitter.
-///
-/// `unit` is the random draw, in `[0, 1)`; see [`success_wait`].
+/// `unit` is the random draw in `[0, 1)`; see [`success_wait`].
 fn failure_wait(refresh: &DnsRefresh, consecutive_failures: u32, unit: f64) -> Duration {
     let base = refresh.failure_base_interval;
     let max = refresh.failure_max_interval;
-    // base * 2^(failures - 1), found by doubling until the cap: unlike a
-    // `1 << n` shift this cannot overflow however long the outage lasts, and
-    // it stops after a handful of steps instead of walking the whole streak.
+    // `base * 2^(failures - 1)`, found by doubling until the cap. Unlike a `1 << n` shift, this cannot overflow however
+    // long the outage lasts.
     let mut step = base;
     for _ in 1..consecutive_failures {
         if step >= max {
@@ -210,10 +175,8 @@ fn failure_wait(refresh: &DnsRefresh, consecutive_failures: u32, unit: f64) -> D
     step.mul_f64(1.0 - 0.5 * unit)
 }
 
-/// Whether the `consecutive_failures`-th failure of a streak is logged at
-/// `warn`: the first, then every power of two (2nd, 4th, 8th, ...). An outage
-/// is loud when it starts and stays visible while it lasts, without a line
-/// per retry; the failures in between log at `debug`.
+/// Whether the `consecutive_failures`-th failure of a streak logs at `warn`: the first, then each power of two. An
+/// outage is loud when it starts and stays visible while it lasts, without a line per retry.
 pub(crate) fn should_warn(consecutive_failures: u32) -> bool {
     consecutive_failures.is_power_of_two()
 }
@@ -487,11 +450,9 @@ mod tests {
         }
     }
 
-    /// Streaks 1..=6 against base 1s: the exponential step doubles until it
-    /// reaches the max and stays there, and the jittered wait lies in
-    /// (step/2, step]. Two maxima: 8s, a power-of-two multiple of the base, and
-    /// 5s, where plain doubling would overshoot (1, 2, 4, 8) and the cap has to
-    /// pull the step back down.
+    /// Streaks 1..=6 with base 1s: the step doubles until it reaches the max and stays there, and the jittered wait lies
+    /// in (step/2, step]. Two maxima: 8s, a power-of-two multiple of the base, and 5s, where doubling would overshoot
+    /// (1, 2, 4, 8) and the cap must pull the step back down.
     #[test]
     fn failure_wait_doubles_from_the_base_and_stops_at_the_max() {
         for (max_ms, steps) in [(8000, [1, 2, 4, 8, 8, 8]), (5000, [1, 2, 4, 5, 5, 5])] {

@@ -1,111 +1,33 @@
-//! The HTTP filter manager — drives the S2 iteration state machine over
-//! the frozen [`crate::filter`] API and bridges it to the codec's
-//! [`StreamHandler`] seam.
+//! Drives the HTTP filter iteration state machine and bridges the frozen
+//! [`crate::filter`] API to the codec's [`StreamHandler`] seam.
 //!
-//! # Scope so far
+//! Request decoding is fully buffered; response encoding is incremental so
+//! downstream clients can receive frames before the upstream body completes.
+//! Decode runs in config order and encode in reverse order. Filters remain
+//! alive until the response stream ends, when [`Drop`] triggers teardown.
 //!
-//! The **decode** (request) direction stays fully buffered: it collects the
-//! whole request body, then runs the decoder chain (config order). LLM request
-//! bodies are small JSON, so there's no time-to-first-byte pressure there.
+//! Local replies pass through the same encoder chain as upstream responses so
+//! filters observe both. Buffer overflow produces 413 during decode and 500
+//! during encode while headers are held; after headers are sent, encode errors
+//! terminate the stream because a new status can no longer be sent.
 //!
-//! The **encode** (response) direction is now **streaming** (chunk 3): the
-//! manager no longer collects the upstream response before encoding it. It
-//! runs the encode *header* phase (async — a header hold may need to consume
-//! upstream frames to resolve, S2.2), then returns a response whose body is a
-//! [`StreamingEncoder`] — a hand-rolled [`hyper::body::Body`] that pulls
-//! frames from the upstream body on demand, running the encoder chain
-//! (**reverse** config order, S2.1) over each one as it arrives. This is what
-//! makes time-to-first-token possible: bytes flow to the downstream
-//! connection as soon as a filter lets them through, without waiting for the
-//! upstream response to finish.
-//!
-//! S2 mechanics covered:
-//!
-//! - S2.1 ordering (decode forward, encode reverse) and per-stream teardown
-//!   (`on_destroy`, reverse creation order) — now driven by [`Drop`], since a
-//!   streaming response means filters live until the stream actually ends, not
-//!   until `run()` returns;
-//! - S2.2/S2.3 `Continue`, `StopIteration`/stop-all header-hold + resume (via
-//!   `continue_*()` or a `Continue` from the same filter's data callback), and
-//!   the buffering statuses, now genuinely incremental on the encode side (a
-//!   held filter keeps seeing new frames, not a single fully-buffered chunk);
-//! - S2.4 trailers, including "queue behind buffered data" on encode;
-//! - `add_*_data` / `*coding_buffer` / `modify_*_buffer` buffer APIs (S2.7);
-//! - buffer-limit overflow → **413** (decode) / **500** (encode, only while
-//!   headers are still held) / mid-stream truncation with an error (encode,
-//!   once headers have already been forwarded — a 500 can no longer be sent).
-//!
-//! `send_local_reply` (S2.5) now lands too: before response headers have been
-//! forwarded downstream, it synthesizes a response and drives it through the
-//! encoder chain via the exact same [`encode_headers_phase`] +
-//! [`StreamingEncoder`] machinery a normal response uses — an encoder filter
-//! (token metering, access logging, ...) can't tell a local reply from an
-//! ordinary one. The manager's own failure paths (decode buffer overflow →
-//! 413, a request body read error → 400, an encode-header-phase buffer
-//! overflow → 500) are routed through the same [`respond_with_local_reply`]
-//! helper, for the same reason: no response should bypass the chain filters
-//! were installed to observe.
-//!
-//! Chunk 4 adds the decode-side **StopAll stall / out-of-band resume** model
-//! (an unresumed `StopAllIterationAndBuffer`/`Watermark` hold now genuinely
-//! stalls the stream instead of falling through to the terminal — see
-//! [`drive_decode`]'s watermark/StopAll branch and [`wait_for_decode_resume`]'s
-//! doc for the hazard that buys) and **decode watermark buffering** (a
-//! recorded signal on a fully-buffered path — see the paragraph below).
-//! `StopIterationAndWatermark`/`StopAllIterationAndWatermark` overflow now
-//! records [`ChainCtx::decode_high_watermark`] and keeps buffering instead of
-//! 413ing; genuine backpressure (readDisable / HTTP/2 flow control) still
-//! isn't expressible, because that needs a decode *read* to disable, and
-//! decode stays fully buffered (module doc above) — there's nothing to
-//! disable, only a signal to have recorded once decode streams (a later
-//! chunk). The still-open decode-side S2.2 gotcha — `StopAll*` does not yet
-//! skip *its own* filter's data/trailers callbacks the way the encode-side
-//! `StreamingEncoder` does (see [`StopKind::StopAll`]'s doc) — is unchanged
-//! by this chunk; it's a separate, still-tracked gap.
-//!
-//! Deferred to later chunks:
-//! 1xx (S2.6); resetting the downstream stream when a filter stalls forever
-//! past end-of-stream, or when an encode header-hold is never resolved
-//! before the upstream response ends (both noted at their call sites); an
-//! out-of-callback `continue_encoding()` that could wake a *pending*
-//! `poll_frame` (today it only matters if observed synchronously inside a
-//! callback — there's no waker registered for a filter that decides to
-//! continue later, e.g. after async work — [`DecodeContinueHandle`] is the
-//! decode-side fix for the equivalent decode gap, chunk 4; encode's own
-//! version is still open); a genuine stream **reset** for `send_local_reply`
-//! called after response headers have already been forwarded — we have no
-//! reset primitive through the body seam yet, so that case terminates the
-//! body with a [`BodyError`] instead (noted at
-//! [`DecoderCallbacksAdapter::send_local_reply`]). The ~60-case S2
-//! conformance suite (chunk 2, already landed for decode) is what will keep
-//! pinning every corner as the remaining items land.
+//! Decode watermarking records [`ChainCtx::decode_high_watermark`] and keeps
+//! buffering; it does not provide read backpressure. Decode stop-all holds
+//! still invoke their own data and trailer callbacks; see [`StopKind::StopAll`].
 //!
 //! # The encode per-position state machine
 //!
-//! Every frame — real or the synthetic end-of-stream flush — walks the encode
-//! chain starting at position **0**, always (never resuming mid-chain from
-//! wherever some other position happens to be stopped: that was a real bug,
-//! see the `PositionState` doc comment). A frame flows forward until it hits a
-//! position that is currently stopped; that's where it accumulates. Because
-//! frames now genuinely walk from the front every time, more than one
-//! position can be stopped simultaneously (an early filter buffering while a
-//! later one is also buffering), so each position gets its **own** buffer
-//! (`ctx.encode.positions: Vec<PositionState>`, indexed by position, not by
-//! filter index — see [`StreamingEncoder`]'s doc comment for what "position"
-//! means) instead of one buffer shared by the whole direction.
+//! Every frame, including the synthetic end-of-stream flush, starts at
+//! position 0 and stops at the first held position. Multiple positions can be
+//! held simultaneously, so each has its own buffer in
+//! `ctx.encode.positions: Vec<PositionState>`.
 //!
 //! # The borrow problem (and why this compiles without `unsafe`)
 //!
-//! A filter callback receives `&mut dyn DecoderCallbacks` — the manager — while
-//! the manager is also holding `&mut filters[i]` to make the call. Envoy uses
-//! raw back-pointers here. We instead **split storage**: the filter `Vec` and
-//! the mutable [`ChainCtx`] (buffers, stream info, continuation flags) are
-//! distinct fields, and the message head is passed as its own `&mut`. So one
-//! call site borrows three *disjoint* things — `&mut filters[i]`, `&mut head`,
-//! and a callbacks adapter that borrows only `&mut ctx` — which the borrow
-//! checker accepts. It's sound because the callbacks only ever *record* state in
-//! `ctx` (continue flags, appended buffer bytes) that the driver acts on **after
-//! the callback returns**; a callback never re-enters another filter.
+//! A callback needs mutable access to both its filter and the manager. Storage
+//! is split so the call borrows the filter, message head, and [`ChainCtx`]
+//! independently. The adapter only records callback state; the driver applies
+//! it after the callback returns, so callbacks never re-enter another filter.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -151,13 +73,8 @@ use proxy_observability::ResponseFlag;
 /// that requested buffering yields 413 on decode / 500 on encode.
 pub const DEFAULT_BUFFER_LIMIT: usize = 1 << 20;
 
-/// One `http_filters` chain entry, as building a [`FilterChainHandler`] with
-/// `typed_per_filter_config` resolution (ADR-0004) needs
-/// it: the Envoy filter name (`typed_per_filter_config`'s map key), the
-/// per-stream instance factory (unchanged — what `factories` alone used to
-/// carry), and the REGISTERED [`HttpFilterFactory`] itself, needed once at
-/// construction to resolve any `typed_per_filter_config` entry naming this
-/// filter through `HttpFilterFactory::parse_per_route`.
+/// One `http_filters` entry, including the registered factory needed to
+/// resolve its `typed_per_filter_config` at construction (ADR-0004).
 ///
 /// Rust note: not retained after construction — [`FilterChainHandler::new_with_filters`]
 /// consumes a `Vec` of these and keeps only the already-resolved
@@ -207,12 +124,9 @@ impl std::fmt::Debug for PerRouteTable {
 }
 
 impl PerRouteTable {
-    /// Look up the most specific override for `filter_index` given the
-    /// stream's resolved `route` — route > virtual host > route
-    /// configuration (Envoy's `mostSpecificPerFilterConfig`). `.get(..)`
-    /// throughout (never direct indexing): an empty [`PerRouteTable::default`]
-    /// (built by [`FilterChainHandler::new`], which has no filter NAMES to
-    /// resolve against) must behave as "no override anywhere", not panic.
+    /// Look up the most specific override: route, virtual host, then route
+    /// configuration (Envoy's `mostSpecificPerFilterConfig`). An empty table
+    /// means no override, so lookups use `.get(..)` rather than indexing.
     fn lookup(&self, route: &RouteEntry, filter_index: usize) -> Option<Arc<dyn PerRouteConfig>> {
         let vhost = self.route_to_vhost.get(route.route_index).copied();
         let levels = [
@@ -1514,8 +1428,7 @@ impl FilterManager {
                 );
                 return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
             }
-            // A downstream body read error is a client problem: 400. (Streaming
-            // will surface this mid-flight instead; chunk 1 sees it up front.)
+            // A downstream body read error is a client problem: 400.
             // S2.5: routed through the encoder chain like any other response —
             // no filters have run yet, but the still-fresh `filters`/`ctx` are
             // exactly what `respond_with_local_reply` needs.
@@ -1765,8 +1678,8 @@ impl FilterManager {
         // new response (S2.5); see `ctx.reset_after_headers`.
         ctx.response_headers_forwarded = true;
 
-        // --- the rest of the response streams through the encoder chain on
-        // demand (chunk 3): filters/ctx move into the body so callbacks keep
+        // --- The response streams through the encoder chain on demand:
+        // filters/ctx move into the body so callbacks keep
         // working exactly as before, just driven by `poll_frame` instead of a
         // single synchronous pass. `on_destroy` now runs in `Drop` (below),
         // since the stream — and therefore the filters' lifetime — doesn't
@@ -1945,9 +1858,8 @@ enum StopKind {
     /// end-of-stream). Without re-invoking, a buffering filter could never
     /// unstall before the stream ends.
     ///
-    /// Watermark backpressure itself (applying downstream flow control
-    /// instead of just accumulating) is chunk 4; here it collapses to the
-    /// same "buffer and wait" behavior as the plain buffering statuses.
+    /// Watermark overflow currently has the same "buffer and wait" behavior
+    /// as the plain buffering statuses; it does not apply flow control.
     Buffering,
     /// `StopIterationNoBuffer`: bytes are discarded, not replayed. The filter
     /// is NOT re-invoked (unlike `Buffering`) — only an explicit
@@ -1970,14 +1882,9 @@ enum StopKind {
 ///
 /// # Why per-position, not one shared buffer
 ///
-/// The chunk-3 encoder used a single `ctx.encode.buffer` plus a single
-/// `stopped_at: Option<usize>` for the whole direction. That's wrong the
-/// moment two positions are stopped at once (an early filter buffering while
-/// a later one also buffers): the flat buffer can't tell whose bytes are
-/// whose, and releasing one position would re-deliver bytes the other
-/// position already saw. Fixing the "a frame must always walk from position
-/// 0" bug (see the module doc) makes that double-stop reachable in practice,
-/// so it has to be fixed in the same change.
+/// Each position needs its own buffer because multiple filters can stop at
+/// once. A shared buffer cannot distinguish their bytes, and releasing one
+/// position could re-deliver data the other already saw.
 ///
 /// # Invariant
 ///
@@ -2825,8 +2732,8 @@ async fn wait_for_decode_resume(ctx: &ChainCtx) {
 }
 
 /// Drive the decoder chain over a fully-buffered request. Returns `Err(status)`
-/// if a filter's buffering overflowed `buffer_limit` (→ 413) — the only failure
-/// this chunk raises. `body` may be mutated in place by `decode_data`.
+/// if a filter's buffering overflowed `buffer_limit` (→ 413). `body` may be
+/// mutated in place by `decode_data`.
 ///
 /// The pointer machine (S2.2/S2.3): walk filters forward delivering headers;
 /// when a filter holds (`StopIteration`/buffer/stop-all), deliver the buffered
@@ -2840,12 +2747,9 @@ async fn wait_for_decode_resume(ctx: &ChainCtx) {
 /// once**: a filter that took its data early (to resolve a header-hold) is
 /// skipped by the trailing data phase.
 ///
-/// Chunk-1 simplification (documented; the streaming chunk fixes it): a
-/// held filter takes its data slightly before earlier filters in wall-clock
-/// order. Since the body is a single buffered chunk, the observable
-/// per-filter effect — each `decode_data` called once, in config order — is
-/// preserved. A hold that never resolves synchronously (async buffering /
-/// local reply) is chunk 3; here it simply stops progression past that filter.
+/// A held filter may receive data before earlier filters in wall-clock order.
+/// Because the body is a single buffered chunk, each `decode_data` still runs
+/// once per filter in config order. An unresolved hold stops progression.
 ///
 /// ADR-0004 step 2: `async fn`, so a `StopIteration*` from `decode_headers` or
 /// `decode_data` can now also mean "ask the filter if it has async work"

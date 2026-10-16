@@ -1,20 +1,6 @@
-//! Acceptance tests: lowering ONE xDS-delivered resource
-//! (a `google.protobuf.Any`) into the IR.
-//!
-//! **The strict-mode test is the point of this file, not a nice-to-have.**
-//! `build_snapshot` enforces AGENTS.md invariant 1 by running `check_supported_surface`
-//! over the whole bootstrap before converting anything; a resource delivered
-//! over ADS instead of from a file gets none of that unless `lower_dynamic_*`
-//! puts it there too. If an xDS-delivered `Cluster` could carry a field the
-//! `allowed_fields` allowlist does not permit and still be accepted, xDS would
-//! be a hole straight through the project's most important invariant (AGENTS.md invariant 1).
-//!
-//! Built by constructing the proto types directly and
-//! `prost::Message::encode`ing them into an `Any`, rather than going through
-//! YAML -- there is no bootstrap file on this path, only a resource the ADS
-//! client already decoded off the wire (mirroring
-//! `proxy-api/tests/descriptor_pool.rs`'s `generated_types_are_usable`, the
-//! sibling for this "build a proto by hand" idiom in this workspace).
+//! Acceptance tests for lowering individual xDS `Any` resources into IR.
+//! Dynamic resources must pass the same strict surface checks as file config.
+//! Tests construct messages directly because this path receives protobufs, not YAML.
 
 use prost::Message;
 use proxy_api::envoy::config::cluster::v3 as cluster_v3;
@@ -151,12 +137,8 @@ fn a_dynamic_listener_with_zero_buffer_limit_is_rejected() {
 
 // ---------------------------------------------------- strict mode over xDS --
 
-/// THE IMPORTANT ONE. `close_connections_on_host_health_failure` is a real
-/// `Cluster` field (cluster.proto field 31) that `allowed_fields
-/// ("envoy.config.cluster.v3.Cluster")` in `lower.rs` does not list -- picked
-/// by reading that allowlist, not guessed. An xDS-delivered cluster setting it
-/// must be refused exactly as a file-loaded one would be, with the caller's
-/// path as the root.
+/// An unsupported real `Cluster` field must be refused on xDS with the caller's
+/// path, just as it is for file-loaded config.
 #[test]
 fn a_dynamic_cluster_setting_a_field_outside_the_allowlist_is_refused_with_the_callers_path_root() {
     let mut c = minimal_cluster("payments-primary");
@@ -257,11 +239,8 @@ fn undecodable_bytes_under_a_correct_type_url_are_refused_rather_than_panicking(
 
 // --------------------------------------------------- path rooted at caller --
 
-/// An error raised deep inside `convert_cluster` (an unimplemented
-/// `lb_policy`, the same refusal `tests/ir.rs`'s
-/// `unimplemented_lb_policy_errors_at_config_time` exercises for a
-/// file-loaded cluster) must carry the CALLER's `path` as its root, not a
-/// hardcoded `static_resources...` prefix.
+/// Errors from typed lowering retain the caller's path rather than a
+/// hardcoded `static_resources` prefix.
 #[test]
 fn an_error_from_deep_inside_convert_cluster_is_rooted_at_the_callers_path() {
     let mut c = minimal_cluster("payments-primary");

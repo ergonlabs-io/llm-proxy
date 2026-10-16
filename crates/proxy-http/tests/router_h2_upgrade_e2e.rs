@@ -1,28 +1,6 @@
-//! S10.2 acceptance tests: h2<->h2 WebSocket tunneling
-//! via RFC 8441 extended CONNECT -- TRANSPARENT, same-protocol only. Sibling
-//! of `router_upgrade_e2e.rs` (the h1<->h1 tunnel); see that file's own doc
-//! for the general shape these tests follow.
-//!
-//! `h2_websocket_tunnel_echoes_bytes_end_to_end` is the core proof and is the
-//! one test in this file that must fail if `codec::bridge_upgrade` (the
-//! `tokio::io::copy_bidirectional` spawn in `codec::serve_one`), the h2
-//! extended-CONNECT detection in `serve_one`, or `serve_http2`'s
-//! `.enable_connect_protocol()` were removed -- it drives a REAL downstream
-//! h2 client (extended CONNECT) through the REAL `proxy_http::serve_http2`
-//! codec against a mock h2 upstream that answers `200` and echoes bytes over
-//! the upgraded stream, mirroring `tests/hyper_spike.rs` finding (g)'s
-//! server/client shapes but run behind the real router+codec stack instead
-//! of a bare `service_fn`/hand-rolled client.
-//!
-//! The other two tests prove S10.2's cross-protocol REJECTION (transparent,
-//! same-protocol only -- cross bridging is deliberately out of scope):
-//! an h2 downstream CONNECT routed to an h1-upstream cluster,
-//! and the symmetric h1 downstream Upgrade routed to an h2-upstream cluster,
-//! both `502` with no tunnel and, like `router_upgrade_e2e.rs`'s 403 test,
-//! no dial at all -- proving the rejection happens before `pool.new_stream()`
-//! runs, not as a failed dial. These call `FilterChainHandler::handle`
-//! directly (no real codec needed -- there is no tunnel to bridge either
-//! way), same convention `router_upgrade_e2e.rs`'s own gate tests use.
+//! S10.2 tests for same-protocol h2 extended CONNECT tunneling and rejection
+//! of cross-protocol upgrades. The end-to-end case exercises the real codec,
+//! router, and mock upstream; rejection cases assert no upstream dial occurs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;

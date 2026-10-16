@@ -1,20 +1,5 @@
-//! `anthropic`: an Anthropic-Messages-compatible mock upstream (`POST
-//! /v1/messages`), the Anthropic-dialect sibling of `openai`'s chat
-//! completions mock. It exists for the same LLM feature lanes (streaming
-//! metrics, token metering, model routing) and mirrors
-//! `openai.rs`'s structure closely, but gets several wire details
-//! deliberately different to match the real API:
-//!
-//! - Auth is `x-api-key: <key>` (not `authorization: Bearer <key>`).
-//! - The non-streaming response envelope is `{"type":"message", ...}`, not
-//!   `{"object":"chat.completion", ...}`.
-//! - Errors are `{"type":"error","error":{"type":..,"message":..}}`.
-//! - Streaming is a sequence of *named* SSE events (`event:` + `data:` per
-//!   frame), not the data-only frames OpenAI chat completions uses, and usage
-//!   is split across two event types (`message_start` for input tokens,
-//!   `message_delta` for a *cumulative* output token count) — see
-//!   `crates/proxy-filters/src/usage.rs`'s `Dialect::Anthropic` handling,
-//!   which this mock is built to match exactly.
+//! Anthropic Messages mock (`POST /v1/messages`) matching its named SSE events,
+//! `x-api-key` authentication, response envelopes, and split usage fields.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,9 +1,5 @@
-//! Shared, in-process test upstreams used by differential scenarios and the
-//! rig's own self-tests: an `echo` server that reflects what it received, a
-//! `flaky` server driven by a scripted fail sequence, and a `slow` server
-//! that delays before responding. All bind an ephemeral port
-//! (`127.0.0.1:0`) and hand back their bound address plus a request log the
-//! test harness can query.
+//! In-process echo, flaky, and delayed upstreams for differential tests. Each
+//! binds an ephemeral loopback port and exposes a request log.
 
 mod anthropic;
 mod echo;
@@ -91,14 +87,8 @@ impl ServerHandle {
     }
 }
 
-/// Response body type every upstream in this module hands back to `serve`.
-///
-/// Rust note: `BoxBody` (from `http_body_util::combinators`) type-erases the
-/// concrete `Body` implementation behind a `Box<dyn Body>`-like wrapper, so
-/// `echo`/`slow` (a single, already-buffered `Full<Bytes>`) and `openai`
-/// (a paced `StreamBody` fed from a `futures::stream::unfold`) can share one
-/// `serve` function despite having unrelated concrete body types — each just
-/// calls `.boxed()` before returning.
+/// Response body shared by these upstreams. Rust note: `BoxBody` erases their
+/// different concrete body types so they can use one `serve` function.
 pub(crate) type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
 
 /// Spawn a hyper HTTP/1.1 server bound to an ephemeral loopback port, calling

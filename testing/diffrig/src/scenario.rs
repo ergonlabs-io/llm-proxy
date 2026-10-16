@@ -1,11 +1,6 @@
-//! Scenario file model for the differential rig: a scenario names a
-//! bootstrap config, an ordered request script to replay against the proxy
-//! under test, and an upstream script describing which scriptable upstream
-//! backs it. This module only parses and validates the shape; actually
-//! spinning up proxies/upstreams and comparing captures is left for later.
-//!
-//! Strict-mode mindset: unknown fields are always errors, same standard as
-//! the rest of the repo's config surfaces.
+//! Parses and validates differential-rig scenarios, which describe a proxy
+//! bootstrap, ordered requests, and the scripted upstream serving them.
+//! Unknown fields are errors, matching the repository's strict config mode.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,8 +20,8 @@ pub struct Scenario {
 }
 
 /// The bootstrap config under test: either a path to a file on disk or an
-/// inline YAML document. Kept as data here — the rig (a later chunk)
-/// decides how to hand it to a proxy process.
+/// inline YAML document. Kept as data here. The rig decides how to hand it to
+/// a proxy process.
 ///
 /// Rust note: `#[serde(untagged)]` tries each variant in order and picks the
 /// first that matches the input shape; each variant is itself a

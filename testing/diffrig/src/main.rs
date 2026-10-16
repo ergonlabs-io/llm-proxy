@@ -1,22 +1,9 @@
 //! Differential test rig: compares llm-proxy against the pinned real
 //! Envoy image.
 //!
-//! **Landed:** `config-validate-diff` — the config-loading
-//! differential: runs a curated set of Envoy bootstrap configs
-//! (`testing/diffrig/configs/`) through both the real Envoy validator (in a
-//! throwaway docker container, `envoyproxy/envoy:v1.38.0` — see
-//! `config_diff::ENVOY_IMAGE`) and llm-proxy's own `--mode validate`, and
-//! reports where they agree/diverge (`config_diff` module).
-//!
-//! **Landed:** `tests/swap_under_load.rs` is a hermetic real-proxy traffic
-//! topology for paced LLM SSE/non-streaming traffic across SIGHUP reload; it
-//! asserts terminal SSE frames rather than cosmetic request counters.
-//!
-//! **Deferred:** the full side-by-side HTTP traffic-replay topology (docker-compose,
-//! scriptable upstreams driving both proxies side by side, response/access-log
-//! diffing — the scenario format already parsed by `scenario.rs`) waits on
-//! an explicit capture schema and an llm-proxy Docker image to run it
-//! alongside pinned Envoy.
+//! The rig compares config validation and HTTP behavior against pinned Envoy.
+//! Config validation runs both validators on curated bootstrap files; reload
+//! coverage exercises streamed and non-streamed traffic under SIGHUP.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

@@ -1,33 +1,10 @@
-//! Turns the parsed `AccessLogIR`/`FormatString`
-//! (`proxy_observability::access_log`/`sink`) into real per-request log
-//! lines. Originally lived under `router::logging` and was invoked from
-//! `RouterHandler::handle_and_log` -- moved up to be a peer of
-//! [`crate::filter_manager`] because the router sits INSIDE the encode
-//! filter chain (`filter_manager::StreamingEncoder` wraps the router's
-//! response body, not the other way around). Wrapping the response here,
-//! from *inside* the router, meant [`LoggingBody`] rendered its line the
-//! moment the router's own body hit end-of-stream -- which is BEFORE the
-//! encode filter chain has had a chance to run its own end-of-stream
-//! callback. An encode filter that records something at stream end (the
-//! usage filter, notably) was therefore invisible to access logs.
+//! Resolves access log configuration and writes one line per completed
+//! response. `LoggingBody` wraps the outermost encoded response so logs include
+//! mutations made by encoder filters during end-of-stream callbacks.
 //!
-//! `FilterChainHandler::handle` now wraps the OUTERMOST response body --
-//! i.e. `LoggingBody(StreamingEncoder(router's response))`, not
-//! `StreamingEncoder(LoggingBody(router's response))` -- so a line is only
-//! ever rendered once every encode filter (and the encode chain's own
-//! end-of-stream flush) has already run. See `FilterChainHandler::handle`'s
-//! own doc for exactly where that wrap happens and why it's the single
-//! outermost exit point.
-//!
-//! Two pieces, unchanged from the original module:
-//! - [`AccessLoggerRuntime`]: the resolved, per-HCM-bind runtime form of one
-//!   `AccessLogIR` entry -- its sink already opened (or shared, via
-//!   `SinkRegistry`, with any other logger in the same HCM pointed at the
-//!   same file), so the hot per-request path here only ever renders +
-//!   writes, no I/O setup.
-//! - [`LoggingBody`]: the body combinator that actually calls those loggers,
-//!   once, when a response is fully observed -- see its doc for why that has
-//!   to be at *stream end*, not at header-flush time.
+//! [`AccessLoggerRuntime`] holds sinks opened at HCM bind time; the request
+//! path only renders and writes. [`LoggingBody`] invokes the loggers once the
+//! response stream ends.
 
 use std::cell::RefCell;
 use std::io;

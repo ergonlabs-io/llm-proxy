@@ -26,11 +26,8 @@ pub struct FormatString(pub Vec<FormatOp>);
 /// One `%OPERATOR%` (or a literal run of text between operators) from a
 /// parsed format string.
 ///
-/// Rust note: this is a classic "parse, don't validate" enum — every variant
-/// that reached here is already known-good (right arity, right operator
-/// name), so [`render`] can never fail; it only has to handle *absent data*
-/// (render `-`), not *malformed format strings* (rejected in
-/// [`parse_format`]).
+/// Rust note: "parse, don't validate." Every variant here is already valid, so
+/// [`render`] only handles absent data (`-`), never a malformed format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatOp {
     /// Text copied through unchanged.
@@ -60,56 +57,11 @@ pub enum FormatOp {
     UpstreamHost,
     UpstreamCluster,
     DownstreamRemoteAddress,
-    // OTel-GenAI-semconv-aligned aliases for these nine operators (e.g.
-    // `%GEN_AI_USAGE_INPUT_TOKENS%` next to `%LLM_INPUT_TOKENS%`) were
-    // investigated 2026-08-21 and deliberately NOT added -- decision recorded
-    // here so the next attempt starts from the
-    // analysis instead of redoing it and landing the bug this avoided.
-    // (Re-scoped 2026-08-24: the same disjoint-vs-inclusive mismatch is why
-    // the `llm.client.token.usage` metric in `proxy-observability::stats`
-    // was renamed off the semconv name `gen_ai.client.token.usage` instead
-    // of being fixed by adding aliases here.)
-    //
-    // The mismatch is not one field, it's the family relationship. Our
-    // `TokenUsage` (`proxy-filters/src/usage.rs:45`) models disjoint buckets
-    // that sum to a total: `input_tokens` deliberately EXCLUDES the cached
-    // portion. OTel's registry says of `gen_ai.usage.cache_read.input_tokens`
-    // and `gen_ai.usage.cache_creation.input_tokens`: "The value SHOULD be
-    // included in `gen_ai.usage.input_tokens`" -- i.e. semconv's
-    // `input_tokens` is INCLUSIVE of both cache buckets. A plain alias from
-    // `%LLM_INPUT_TOKENS%` to a `%GEN_AI_USAGE_INPUT_TOKENS%` operator would
-    // therefore emit a standard name carrying non-standard arithmetic --
-    // under-counting billed input by exactly the cached portion, silently,
-    // under a name that looks standard. That is AGENTS.md invariant 1's hazard
-    // wearing a naming disguise.
-    //
-    // A subset (`output_tokens`, the two cache buckets individually) COULD
-    // be mapped one at a time with correct semantics. Rejected anyway: a
-    // surface that is standard-named for some fields and proprietary for
-    // others, with the standard names not composing the way the standard
-    // says they should (`input_tokens` here still excludes cache even where
-    // the cache fields themselves are correctly aliased), is harder to
-    // reason about than a wholly proprietary one -- a reader can't tell
-    // which names mean what they say without reading this comment anyway.
-    //
-    // If this is revisited, the registry attributes that exist today and
-    // would be the mapping targets: `gen_ai.usage.input_tokens` (inclusive
-    // semantics, see above -- NOT a plain alias of `LLM_INPUT_TOKENS`),
-    // `gen_ai.usage.output_tokens` (a plain alias IS correct here -- output
-    // isn't split into sub-buckets), `gen_ai.usage.cache_read.input_tokens`
-    // (`LLM_CACHED_TOKENS`), `gen_ai.usage.cache_creation.input_tokens`
-    // (`LLM_CACHE_CREATION_TOKENS`), and `gen_ai.response.time_to_first_chunk`
-    // (`LLM_TTFT` -- note the unit mismatch too: ours renders milliseconds,
-    // the registry attribute is a `double` in SECONDS, so an alias would need
-    // a unit conversion at the render site, not just a name change).
-    // `gen_ai.usage.reasoning.output_tokens` also exists in the registry;
-    // we don't extract reasoning tokens today (`TokenUsage` has no such
-    // field), so there is nothing to alias yet -- worth remembering when
-    // reasoning-token support lands. There is no per-output-token timing
-    // attribute in the registry at all, so `LLM_TPOT` has no counterpart
-    // regardless of how this decision goes; nor do `LLM_TOTAL_TOKENS`,
-    // `LLM_MAX_STALL`, or `LLM_RESPONSE_CHUNKS`, which are proprietary to
-    // this proxy.
+    // No OTel GenAI semconv aliases for these operators. Semconv's
+    // `gen_ai.usage.input_tokens` includes the cache buckets, while our
+    // `input_tokens` excludes them. A plain alias would under-count billed
+    // input under a standard-looking name, which is AGENTS.md invariant 1's
+    // hazard in a naming disguise. A partial alias set would be worse.
     //
     /// `%LLM_INPUT_TOKENS%`.
     LlmInputTokens,
@@ -503,12 +455,9 @@ fn build_op(
 /// `%.3f` instead of the abseil-specific `%E3S`).
 const DEFAULT_START_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
-/// Provider-reported token usage, in the four billing buckets --
-/// mirrors `proxy_http::LlmTokenUsage` field-for-field, but this crate can't
-/// name that type (`proxy-observability` is a *dependency* of `proxy-http`,
-/// not the other way around -- AGENTS.md invariant 2's direction applies to crate
-/// layering here too), so the caller (`proxy-http::router::logging`) converts
-/// at the boundary.
+/// Provider-reported token usage in the four billing buckets. It mirrors
+/// `proxy_http::LlmTokenUsage` because `proxy-http` depends on this crate, not
+/// the reverse (AGENTS.md invariant 2). The caller converts at the boundary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LlmTokens {
     pub input: u64,
@@ -528,13 +477,11 @@ impl LlmTokens {
     }
 }
 
-/// Everything a request/stream lifecycle knows by the time it's logged.
-/// Built by the caller (the router / filter manager) and handed to
-/// [`render`]; this type has no knowledge of how those fields were computed.
+/// Everything a request or stream knows when it is logged. The caller builds it
+/// and passes it to [`render`].
 ///
-/// Rust note: `'a` ties every borrowed field to the caller's stack frame —
-/// `LogContext` never owns data, it's a read-only view assembled just before
-/// rendering, so building one doesn't allocate.
+/// Rust note: `'a` ties the borrowed fields to the caller's frame. The context
+/// owns nothing, so building one does not allocate.
 pub struct LogContext<'a> {
     pub start_time: std::time::SystemTime,
     pub request_headers: &'a http::HeaderMap,
@@ -605,9 +552,7 @@ pub struct LogContext<'a> {
 }
 
 /// Render a parsed format string against a request's context. Allocation is
-/// limited to the single output `String` (grown in place) plus one
-/// `String` per truncated header value; no per-operator heap churn beyond
-/// that render path.
+/// limited to the output `String` and any truncated header values.
 pub fn render(fmt: &FormatString, ctx: &LogContext<'_>) -> String {
     let mut out = String::new();
     for op in &fmt.0 {
@@ -698,17 +643,10 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
             }
             None => out.push('-'),
         },
-        // Mean time per output token, in milliseconds --
-        // `(duration - ttft) / output_tokens`. Every guard here renders `-`
-        // rather than a garbage number or a panic:
-        //   - no usage reported, or output_tokens == 0 (division by zero)
-        //   - no TTFT recorded
-        //   - no duration recorded
-        //   - duration < ttft (clock/measurement skew) -- `checked_sub`
-        //     catches this instead of `Duration`'s subtraction, which
-        //     PANICS on underflow.
-        // Rust note: `checked_sub` on `Duration` returns `None` on
-        // underflow instead of panicking, unlike the `-` operator.
+        // Mean time per output token: `(duration - ttft) / output_tokens`. Renders
+        // `-` when usage, TTFT or duration is missing, when there are no output
+        // tokens, or when duration < ttft (clock skew).
+        // Rust note: `checked_sub` returns `None` on underflow, where `-` panics.
         FormatOp::LlmTpot => {
             let tpot = (|| {
                 let output_tokens = ctx.llm_tokens?.output;
@@ -718,20 +656,11 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
                 let ttft = ctx.llm_ttft?;
                 let duration = ctx.duration?;
                 let numerator = duration.checked_sub(ttft)?;
-                // Divide in MICROseconds, render as fractional milliseconds.
+                // Divide in microseconds. Millisecond division would render 0 for
+                // fast providers (1000+ tok/s), which reads as a broken stream.
                 //
-                // Integer-millisecond division renders 0 for any stream faster
-                // than one output token per millisecond -- and fast inference
-                // providers (Groq, Cerebras) run 1000-2000 tok/s routinely, so
-                // TPOT would read 0 exactly when performance is BEST, which
-                // looks like a broken stream rather than a fast one. Microsecond
-                // division keeps three significant decimals at millisecond
-                // scale.
-                //
-                // Rust note: integer arithmetic throughout (no `f64`), so the
-                // rendered value is bit-for-bit reproducible -- access-log lines
-                // get diffed and asserted on. Truncating rather than rounding,
-                // consistent with `as_millis()` elsewhere in this file.
+                // Rust note: integer arithmetic, not `f64`, so output is
+                // reproducible and can be diffed in tests.
                 Some(numerator.as_micros() / u128::from(output_tokens))
             })();
             match tpot {
@@ -774,20 +703,12 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
     }
 }
 
-/// The shared core of `%REQ%`/`%RESP%`/`%TRAILER%` rendering: resolve
-/// `spec.primary`, fall back to `spec.fallback` if the primary didn't
-/// resolve, then apply `:Z` truncation -- or `-` if neither resolved. The one
-/// thing that differs between REQ/RESP/TRAILER is *how a single name
-/// resolves to a value* (plain header lookup vs. also checking Envoy
-/// pseudo-headers), so that's the only part `resolve` has to supply; this
-/// function never itself knows what a pseudo-header is.
+/// Shared core of `%REQ%`/`%RESP%`/`%TRAILER%`: resolve the primary name, then
+/// the fallback, then apply `:Z` truncation, or render `-`. Each caller supplies
+/// `resolve`, the only part that differs between them.
 ///
-/// Rust note: `resolve` returns `Cow` rather than `&str` because RESP's
-/// `:status` resolver has to *format* `response_code` into an owned
-/// `String` (there's no borrowed `&str` to hand back), while a plain header
-/// lookup can hand back a borrow straight out of the `HeaderMap` -- `Cow`
-/// lets one function serve both without forcing every header lookup to
-/// allocate.
+/// Rust note: `resolve` returns `Cow` so a header lookup can borrow from the
+/// `HeaderMap` while `:status` returns an owned, formatted `String`.
 fn render_named<'a, F>(spec: &HeaderSpec, mut resolve: F, out: &mut String)
 where
     F: FnMut(&str) -> Option<std::borrow::Cow<'a, str>>,
@@ -815,14 +736,11 @@ fn render_header(map: &http::HeaderMap, spec: &HeaderSpec, out: &mut String) {
     );
 }
 
-/// `%REQ(X)%`/`%REQ(X?Y)%`: a name starting with `:` is one of Envoy's four
-/// request pseudo-headers (matched case-insensitively) and resolves against
-/// the typed [`LogContext`] fields; any other pseudo-name (e.g. `:bogus`)
-/// resolves to `None` rather than panicking (AGENTS.md invariant 1 doesn't apply
-/// here -- the format string was already validated at parse time, this is
-/// just "no data" like any other absent header). Anything not starting with
-/// `:` falls through to a plain [`header_lookup`] against
-/// `ctx.request_headers`.
+/// `%REQ(X)%`/`%REQ(X?Y)%`. A `:`-prefixed name is one of Envoy's four request
+/// pseudo-headers and resolves against the typed [`LogContext`] fields. Any
+/// other pseudo-name resolves to `None`. AGENTS.md invariant 1 does not apply
+/// here, since the format was validated at parse time and this is just absent
+/// data. Other names use [`header_lookup`].
 fn render_req(ctx: &LogContext<'_>, spec: &HeaderSpec, out: &mut String) {
     render_named(
         spec,
@@ -852,14 +770,9 @@ fn resolve_req_pseudo<'a>(ctx: &LogContext<'a>, name: &str) -> Option<&'a str> {
 /// presence, never its value.
 const REDACTED: &str = "[REDACTED]";
 
-/// Request headers that carry a credential: the client's `llmp_` virtual key
-/// or JWT (`authorization`), a provider key a client sends itself, a proxy
-/// credential, or a session cookie. `llmproxy.auth` strips the key only from a
-/// request it admits; a refused request keeps it (an unknown key may be a typo
-/// of a real one), and a client-sent provider key is never stripped. Without
-/// this, a format naming `%REQ(authorization)%` would write those to the log
-/// (review M9).
-/// Envoy renders these headers verbatim; this departure is recorded in
+/// Request headers that carry a credential. These render as presence only, so a
+/// format naming `%REQ(authorization)%` cannot write a key to the log. Envoy
+/// renders them verbatim. This departure is in
 /// `internal-docs/envoy-divergences.md`.
 const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",
@@ -897,14 +810,9 @@ fn resolve_resp_pseudo<'a>(ctx: &LogContext<'a>, name: &str) -> Option<std::borr
     header_lookup(ctx.response_headers, name).map(std::borrow::Cow::Borrowed)
 }
 
-/// Header lookup by name. Handles the common case (a real HTTP field name)
-/// via `http::HeaderName`; Envoy pseudo-header names like `:method`/
-/// `:authority` are NOT valid `http::HeaderName` tokens (a colon isn't
-/// allowed in an HTTP field-name), so they never reach this function at all
-/// for `%REQ%`/`%RESP%` -- [`render_req`]/[`render_resp`] intercept and
-/// resolve those against [`LogContext`]'s typed pseudo-header fields before
-/// falling through to this plain lookup. This never panics on a malformed
-/// operator argument.
+/// Header lookup by name. Pseudo-headers such as `:method` are not valid
+/// `http::HeaderName`s, so [`render_req`] and [`render_resp`] resolve them
+/// first. A malformed name returns `None` rather than panicking.
 fn header_lookup<'a>(map: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
     let header_name = http::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()).ok()?;
     map.get(header_name)?.to_str().ok()
@@ -1425,11 +1333,8 @@ mod tests {
 
     const LLM_TPOT_FMT: &str = "%LLM_TPOT% %LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%";
 
-    /// Deliberately chosen so `duration`, `ttft`, `output_tokens`, the
-    /// correct TPOT answer, and `max_inter_chunk` are all distinct numbers --
-    /// a formula that accidentally read the wrong field (or rendered
-    /// `max_inter_chunk` under the TPOT label, the exact mistake this test
-    /// exists to prevent) cannot slip through by coincidence.
+    /// Every input is a distinct number, so a formula that reads the wrong field
+    /// cannot pass by coincidence.
     #[test]
     fn llm_tpot_renders_mean_time_per_output_token() {
         let empty = http::HeaderMap::new();
@@ -1451,14 +1356,8 @@ mod tests {
         assert_eq!(render(&fs, &c), "20.000 150 7");
     }
 
-    /// The reason TPOT divides in microseconds rather than milliseconds.
-    ///
-    /// A fast inference provider (Groq, Cerebras) streams 1000-2000 tokens/sec
-    /// routinely. Under integer-millisecond division every one of those renders
-    /// TPOT as `0` -- the metric reads zero exactly when performance is BEST,
-    /// which an operator reads as a broken stream rather than a fast one. This
-    /// pins the sub-millisecond case so nobody "simplifies" the arithmetic back
-    /// to `as_millis()`.
+    /// Pins the sub-millisecond case. Dividing in milliseconds would render 0
+    /// for fast providers, so nobody should "simplify" back to `as_millis()`.
     #[test]
     fn llm_tpot_keeps_sub_millisecond_precision_for_fast_streams() {
         let empty = http::HeaderMap::new();

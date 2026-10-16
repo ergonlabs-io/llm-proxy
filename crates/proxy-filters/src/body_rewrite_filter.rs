@@ -1,84 +1,10 @@
-//! Wires the [`crate::body_rewrite`]
-//! scanner/splice engine into a real decode-path `HttpFilter`, for BOTH
-//! consumers of the one scan (one scan, one held prefix, two consumers —
-//! never a second scanner):
-//!
-//! - **Consumer A** — force `stream_options.include_usage = true` onto
-//!   OpenAI-dialect streaming requests that didn't already opt in, so
-//!   the usage filter has something to find. Gated on `cfg.enabled &&
-//!   cfg.dialect == OpenAi`, exactly as before.
-//! - **Consumer B** — publish the scanned `model` onto the
-//!   [`MODEL_HEADER_NAME`] request header (overwriting any client-supplied
-//!   value; removing it outright when no model was found — a security
-//!   property, not a tidiness one; see "Header trust" below) and call
-//!   `clear_route_cache()` so S2.8 re-resolves the route against it.
-//!   Dialect-agnostic and unconditional: it runs for every dialect and
-//!   regardless of `cfg.enabled` (model extraction has
-//!   nothing to do with the usage-reporting kill switch).
-//!
-//! The `llmproxy` dialect / JSON schema surface that configures this filter
-//! from `--config` lives in `proxy-simple-config`'s `lower.rs`.
-//!
-//! # State machine
-//!
-//! Per stream: `Scanning { .. } -> PassThrough`. `decode_headers` decides up
-//! front whether this request even has a body worth scanning (has a body,
-//! JSON content type) — dialect and `enabled` no longer gate entry, since
-//! consumer B needs every dialect. A request with no scannable body still
-//! gets its model header cleared right there (see
-//! [`BodyRewriteFilterInstance::decode_headers`]) since absence there means
-//! the same thing "Header trust" means everywhere else: no proven model, no
-//! trusted header. Once in `PassThrough` (either from the start, or once a
-//! decision has been made), every subsequent `decode_data` call is a
-//! straight-through no-op: `Continue`, `data` untouched, no buffer touched.
-//! See [`BodyRewriteFilterInstance::decode_data`] for the `Scanning` side.
-//!
-//! # Memory bound: `O(prefix cap + one chunk)`, not strictly `O(cap)`
-//!
-//! [`crate::body_rewrite::BodyPrefixScanner`] itself stops *holding* bytes
-//! the instant it has `cap` of them. But this filter must still forward
-//! whatever's left of the chunk that crossed that boundary — it can't hand
-//! the downstream router half a chunk — so this filter's own `pending`
-//! buffer is bounded by `cap` plus the size of one inbound chunk, not
-//! strictly `cap`. Chunks themselves are bounded by the codec's read buffer,
-//! so this is still nowhere near `O(body)`: a 40MB multimodal request never
-//! costs more than `cap + one chunk`, and the moment a decision is made
-//! (`Decided`, or `end_stream`), `pending` is handed off and the state drops
-//! back to `PassThrough`, discarding it. The bound is often loosely described as `O(cap)`; this doc is
-//! the precise version, written down so nobody "fixes" the extra chunk of
-//! slack later under a misunderstanding.
-//!
-//! This bound is the central requirement of the filter. A multimodal request
-//! (several MB of inline base64 image data, with `model`/`stream` in their
-//! normal leading position) must be spliced into correctly, forwarded
-//! byte-identical after the splice point, and metered with real token counts,
-//! while peak memory stays independent of body size. The acceptance test for
-//! that case is what fails if someone "simplifies" the scanner back into a
-//! full-body buffer, which is the most likely way this filter gets built
-//! wrong.
-//!
-//! # Header trust
-//!
-//! [`MODEL_HEADER_NAME`] is derived from the body, never trusted from the
-//! client. A client-supplied value is overwritten when the body has a model
-//! and removed when it does not (including a non-JSON or bodyless request).
-//! A body whose `model` falls past the prefix cap (`CapExceeded`) is treated
-//! exactly like "no model found": absence is not proven, so the header is
-//! cleared and routing falls through to the `*` backstop.
-//!
-//! # Never fails a request
-//!
-//! Non-JSON bodies, truncated JSON, and bodies whose interesting keys never
-//! show up inside the window all fall out of [`crate::body_rewrite`] as
-//! "no injection" facts, never an error — this filter forwards them
-//! untouched, exactly per that module's "pass through, never fail" rule.
-//!
-//! # Config identity: owned `llmproxy.filters.v0.BodyRewrite`
-//!
-//! The filter owns its enable switch and dialect. The old
-//! `RuntimeFeatureFlag` carrier remains accepted for one release through
-//! [`LegacyBodyRewriteFilterFactory`], so existing bootstraps keep loading
-//! while new configs use the versioned message.
+//! One bounded scan serves two consumers: OpenAI streaming usage injection
+//! (when enabled) and model extraction for route selection (all dialects).
+//! The filter retains at most the prefix cap plus one codec chunk, then passes
+//! data through. It derives the routing header from the body, clearing any
+//! client value when no model is proven; scan failures pass through unchanged.
+//! The versioned filter config retains one-release support for the legacy
+//! `RuntimeFeatureFlag` carrier.
 
 use bytes::{Bytes, BytesMut};
 use http::header::CONTENT_LENGTH;
@@ -103,24 +29,9 @@ pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite";
 /// Borrowed type URL accepted for one release after the move to an owned, versioned message.
 pub const LEGACY_TYPE_URL: &str = "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 
-/// The request header consumer B publishes the scanned `model` onto. Must
-/// equal `proxy_simple_config::lower::MODEL_HEADER`, which the dialect's
-/// route table matches against — duplicated as a literal rather than
-/// imported, for the same cross-crate reason `lower.rs` gives for its own
-/// `USAGE_FILTER_TYPE_URL`/`BODY_REWRITE_FILTER_TYPE_URL` (`proxy-filters`
-/// cannot depend on `proxy-simple-config`: that would drag the whole data
-/// plane into a crate that only ever emits JSON, and `proxy-simple-config`
-/// already depends on `proxy-filters` as a dev-dependency to pin the type
-/// URLs the other direction). This is
-/// the exact shape that produced the `io.llmproxy.provider_auth` seam gap
-/// found 2026-08-03: two crates agreeing on a string by convention, each
-/// crate's tests pinning its own literal, nothing testing the join. The pin
-/// here is `proxy-simple-config/tests/dialect.rs`'s
-/// `body_based_model_routing_reaches_the_right_provider`, which drives a
-/// real request through a dialect-lowered config and asserts on which
-/// CLUSTER was reached — not on this string, since a string-equality
-/// assertion is exactly the check that would have passed right through the
-/// 2026-08-03 gap.
+/// Must match `proxy_simple_config::lower::MODEL_HEADER`, which dialect
+/// routing uses. Kept as a literal to avoid a dependency cycle; the integration
+/// test verifies the joined behavior by checking the reached cluster.
 pub const MODEL_HEADER_NAME: &str = "x-llmproxy-model";
 
 /// Write `model` onto [`MODEL_HEADER_NAME`], or remove the header outright

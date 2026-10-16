@@ -21,21 +21,14 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use proxy_config::ConfigSnapshot;
 
-/// How each worker sees configuration. The control runtime builds immutable
-/// snapshots and `store`s them; workers `load` on connection accept (and react to
-/// a `watch` ping for listener socket add/remove).
+/// How each worker sees configuration. The control runtime builds immutable snapshots and `store`s them. Workers
+/// `load` on connection accept, and react to a `watch` ping for listener socket add and remove. In-flight connections
+/// keep their `Arc<ConfigSnapshot>`, which gives Envoy-style drain: old config lives as long as the connections made
+/// under it.
 ///
-/// In-flight connections keep their `Arc<ConfigSnapshot>` clone, which is what
-/// gives Envoy-style drain semantics: old config lives exactly as long as the
-/// connections created under it.
-///
-/// The only way to obtain one from outside this crate is
-/// [`runtime::SnapshotHandles::register`], which enrolls it so
-/// [`runtime::ConfigPublisher::publish`] can find it again -- a handle built
-/// any other way would silently stop seeing config reloads (this is exactly
-/// how the admin server's `/config_dump` went stale after a SIGHUP reload).
-/// `WorkerConfigHandle::new` is `pub(crate)`, so this isn't just documented,
-/// it doesn't compile:
+/// The only way to obtain one from outside this crate is [`runtime::SnapshotHandles::register`], which enrolls it so
+/// [`runtime::ConfigPublisher::publish`] can find it. A handle built any other way would silently stop seeing reloads.
+/// `WorkerConfigHandle::new` is `pub(crate)`, so this is enforced by the compiler:
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
@@ -48,14 +41,9 @@ use proxy_config::ConfigSnapshot;
 pub struct WorkerConfigHandle(ArcSwap<ConfigSnapshot>);
 
 impl WorkerConfigHandle {
-    // Rust note: `pub(crate)` rather than `pub` on purpose. A handle that
-    // isn't enrolled in `runtime::SnapshotHandles` is exactly the bug this
-    // type exists to prevent -- it silently stops seeing `publish()`s (the
-    // admin server's `/config_dump` did precisely this after a SIGHUP
-    // reload). Keeping `new` crate-visible means `SnapshotHandles::register`
-    // (the only place that both builds a handle and enrolls it) is the only
-    // way anything outside `proxy-core` can obtain one; the compiler refuses
-    // the shortcut instead of a doc comment merely discouraging it.
+    // Rust note: `pub(crate)` on purpose. A handle not enrolled in `runtime::SnapshotHandles` silently stops seeing
+    // `publish()`. `SnapshotHandles::register` is the only place that both builds and enrolls, and the compiler refuses
+    // the shortcut.
     pub(crate) fn new(initial: Arc<ConfigSnapshot>) -> Self {
         Self(ArcSwap::new(initial))
     }

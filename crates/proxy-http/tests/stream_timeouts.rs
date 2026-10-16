@@ -1,13 +1,5 @@
-//! HCM `stream_idle_timeout` and `max_stream_duration` against a real handler
-//! and a scripted socket upstream.
-//!
-//! What matters for LLM traffic: a provider that accepts and never answers
-//! must be cut and must give its breaker permit back; a stream that keeps
-//! producing tokens must survive far longer than the idle timeout; one that
-//! goes quiet mid-stream must be cut; and `max_stream_duration` must cut even
-//! a stream that is still producing. The cut cases stall forever, so they do
-//! not depend on timing margins, and the survive case keeps a 30x gap between
-//! chunk spacing and the idle timeout.
+//! Exercises HCM stream timeouts against a handler and scripted socket
+//! upstream, including stalled and continuously producing responses.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -39,17 +31,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
-/// Every await on the handler is bounded so a regression fails instead of
-/// hanging the suite.
+/// Bounds handler waits so regressions fail instead of hanging the suite.
 const BOUND: Duration = Duration::from_secs(10);
 
 /// What the scripted upstream does once it has read a request head.
 #[derive(Clone, Copy)]
 enum Script {
-    /// Accept, read the request, never answer.
+    /// Accept and read the request without answering.
     Hang,
-    /// Send chunked headers, then `chunks` chunks `gap` apart. With
-    /// `stall`, go quiet after the last chunk instead of ending the body.
+    /// Send `chunks` with `gap` between them; optionally stall before ending.
     Stream {
         chunks: u32,
         gap: Duration,
@@ -110,8 +100,7 @@ struct Limits {
 }
 
 fn temp_path() -> PathBuf {
-    // A counter, not just the clock: macOS timestamps tick in microseconds,
-    // so two tests started together can read the same one and share a file.
+    // Add a counter because concurrent tests can share a timestamp.
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let mut p = std::env::temp_dir();
     p.push(format!(
@@ -135,8 +124,7 @@ fn read_flags(path: &Path) -> Vec<String> {
     s.lines().map(str::to_owned).collect()
 }
 
-/// A handler routing everything to one cluster `up` whose breaker allows a
-/// single concurrent request, so a leaked permit shows as `503 UO`.
+/// Uses a single-request breaker so leaked permits surface as `503 UO`.
 async fn build_handler(addr: SocketAddr, limits: Limits) -> (FilterChainHandler, PathBuf) {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: std::collections::HashMap<ClusterName, Arc<ClusterConfig>> =
@@ -254,8 +242,7 @@ fn request() -> HttpRequestParts {
     }
 }
 
-/// Drives one request to the end and returns the status plus whether the body
-/// finished cleanly.
+/// Returns the status and whether the response body finished cleanly.
 async fn drive(handler: &FilterChainHandler) -> (StatusCode, bool) {
     tokio::time::timeout(BOUND, async {
         let resp = handler.handle(request()).await;
@@ -271,10 +258,7 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
-/// The hung-provider half of the card: the provider accepts and never
-/// answers, the stream is cut at `stream_idle_timeout` with `408` and `SI`,
-/// and the cluster's single `max_requests` permit comes back, so a second
-/// request is cut the same way instead of being shed as `503 UO`.
+/// A hung provider is cut with `408`/`SI`, and its breaker permit is released.
 #[tokio::test(flavor = "current_thread")]
 async fn a_provider_that_never_answers_is_cut_and_its_permit_released() {
     LocalSet::new()
@@ -299,9 +283,7 @@ async fn a_provider_that_never_answers_is_cut_and_its_permit_released() {
         .await;
 }
 
-/// A stream that keeps producing is not cut by the idle timeout even when it
-/// outlives it: 50 chunks 30 ms apart (about 1.5 s)
-/// under a 1 s idle timeout, with 30x headroom between chunks.
+/// A continuously producing stream outlives the idle timeout without being cut.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stream_that_keeps_producing_outlives_the_idle_timeout() {
     LocalSet::new()
@@ -362,9 +344,7 @@ async fn a_stream_that_goes_quiet_mid_body_is_cut() {
         .await;
 }
 
-/// A route `idle_timeout` governs response body gaps instead of the HCM value:
-/// a 300 ms stall passes under a 5 s route idle even though the HCM idle is
-/// 100 ms.
+/// Route `idle_timeout` overrides the HCM value for response body gaps.
 #[tokio::test(flavor = "current_thread")]
 async fn a_route_idle_timeout_overrides_the_hcm_value_for_the_body() {
     LocalSet::new()
@@ -392,8 +372,7 @@ async fn a_route_idle_timeout_overrides_the_hcm_value_for_the_body() {
         .await;
 }
 
-/// `max_stream_duration` cuts a stream that is still producing: chunks every
-/// 20 ms for up to 400 chunks, cut at 300 ms with `UMSDR`.
+/// `max_stream_duration` cuts an active stream with `UMSDR`.
 #[tokio::test(flavor = "current_thread")]
 async fn max_stream_duration_cuts_a_stream_that_is_still_producing() {
     LocalSet::new()

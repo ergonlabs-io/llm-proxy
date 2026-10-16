@@ -1,54 +1,21 @@
-//! The v0.2.0 ship-gate clause this closes: "a config swap under live
-//! traffic with zero dropped streams." `internal-docs/MILESTONES.md` names the
-//! differential rig's traffic-replay topology as a prerequisite -- it is not one. Three pieces
-//! that already exist compose into exactly this scenario:
+//! A config swap under live traffic must drop no streams. The test reuses
+//! `diffrig::upstreams::OpenAiUpstream` (paced SSE mock) for both providers,
+//! `diffrig::harness` binary and scratch helpers, and `loadgen`'s open-loop
+//! driver for the non-streaming half of the traffic.
 //!
-//! - `diffrig::upstreams::OpenAiUpstream` -- a mock upstream with real SSE
-//!   pacing (`ttft` + `inter_token_delay`), reused directly here for both the
-//!   pre-swap and post-swap providers.
-//! - `diffrig::harness::{resolve_llm_proxy_bin, free_port, ScratchDir}` --
-//!   binary resolution and scratch-file plumbing, reused directly.
-//! - `loadgen::driver::run_open_loop` -- the open-loop, coordinated-omission
-//!   -aware driver, reused for the *non-streaming* half of the traffic mix
-//!   (see "what is NOT reused, and why" below for the streaming half).
-//! - `crates/proxy/tests/reload.rs`'s pattern (spawn with piped stderr, poll
-//!   for a log line, `kill -HUP`) -- not literally shared code (it lives in
-//!   a different crate, and `diffrig::harness::ProxyProcess` redirects
-//!   stdout/stderr to a *file*, not something pollable line-by-line, and has
-//!   no signal-sending API), but reproduced here at the same small scope
-//!   `harness.rs`'s own module doc says every `tests/*.rs` file already pays
-//!   ("each file under `testing/diffrig/tests/` is its own separate
-//!   compilation unit"). Adding a `sighup()`/pid-exposing method to the
-//!   shared `ProxyProcess` for one test file felt like scope creep, so this
-//!   is a third, independent instance of that small amount of glue rather
-//!   than a change to shared harness code.
-//!
-//! ## What is NOT reused, and why
-//!
-//! The long-lived SSE streams are driven by hand-rolled code in this file,
-//! not `loadgen::driver::run_open_loop`, despite the brief calling that
-//! driver out as reusable. `loadgen::driver::execute` classifies a stream as
-//! `Outcome::Success` once its HTTP body ends without a transport-level
-//! error -- it never inspects the *content* of the last SSE frame, so a
-//! stream truncated by a clean-looking connection close (the proxy or an
-//! upstream ending the response early but still terminating the chunked
-//! encoding properly) would read as a success. That is exactly the failure
-//! mode this task's brief calls "the assertion that actually matters," so it
-//! cannot be answered by layering onto a driver that cannot see it. The
-//! non-streaming background traffic has no such gap -- a non-streaming
-//! request either comes back 2xx with a full body or it doesn't, which is
-//! precisely what `RunSummary` already reports -- so that half *is* driven
-//! through `run_open_loop` unmodified.
+//! The SSE streams use hand-rolled code, not `loadgen::driver`. The driver
+//! counts a stream as a success once the body ends without a transport
+//! error, and it never checks the last SSE frame. A stream cut short by a
+//! clean-looking close would pass, and that is the failure this test exists
+//! to catch.
 //!
 //! ## The scenario
 //!
-//! Config A points a single `STATIC` cluster ("backend") at mock upstream 1.
-//! While a pool of long-lived SSE streams and a stream of short
-//! non-streaming requests are continuously in flight, config B (same
-//! listener address, same cluster name, different endpoint -- pointed at
-//! mock upstream 2) is written and delivered via `SIGHUP`. Traffic keeps
-//! running for a while after the reload succeeds, then everything is
-//! drained and every outcome is checked.
+//! Config A points a `STATIC` cluster ("backend") at mock upstream 1. While
+//! SSE streams and non-streaming requests are in flight, config B (same
+//! listener and cluster name, pointed at mock upstream 2) is delivered via
+//! `SIGHUP`. Traffic keeps running after the reload, then drains, and every
+//! outcome is checked.
 
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -74,9 +41,8 @@ use loadgen::driver::{run_open_loop, RunConfig, Target};
 
 // --------------------------------------------------------------- tuning ----
 //
-// Every timing constant below is a liveness backstop or a "definitely still
-// running" margin, never a tight race -- see the module doc on the honesty
-// requirement against timing flakiness.
+// Every timing constant is a liveness backstop or a "still running" margin,
+// never a tight race.
 
 /// Per-stream SSE pacing: `TTFT + INTER_TOKEN_DELAY * (tokens - 1)` is the
 /// wall-clock length of one stream. With 16 tokens this is ~30ms + 15*90ms =
@@ -97,14 +63,11 @@ const STREAM_CONCURRENCY: usize = 6;
 /// stream's ~1.38s length, so every streaming worker's first iteration is
 /// still in flight when it's sampled.
 const PRE_SWAP_WARMUP: Duration = Duration::from_millis(700);
-/// How long to keep traffic running after the reload succeeds, so both
-/// "already in flight when the swap happened" and "started fresh after it"
-/// streams get exercised.
+/// How long to keep traffic running after the reload succeeds, so streams
+/// that started before the swap and after it both get exercised.
 const POST_SWAP_HOLD: Duration = Duration::from_millis(1800);
-/// Total span the background non-streaming (`loadgen`) traffic runs for --
-/// comfortably longer than `PRE_SWAP_WARMUP` + a generous reload allowance +
-/// `POST_SWAP_HOLD`, so it is still running (or has just finished) by the
-/// time the streaming half is torn down.
+/// Span of the background non-streaming traffic. It must outlast the
+/// streaming half so that half is still running when the swap happens.
 const NONSTREAM_RUN: Duration = Duration::from_secs(5);
 const NONSTREAM_RATE_HZ: f64 = 10.0;
 
@@ -127,11 +90,8 @@ fn upstream_config(label: &str) -> OpenAiConfig {
 
 // ----------------------------------------------------------------- config --
 
-/// One `STATIC` cluster ("backend") behind an `http_connection_manager` +
-/// router, matching prefix "/" -- so no dialect-specific routing header is
-/// needed and `loadgen`'s plain client headers are enough. Same shape as
-/// `crates/proxy/tests/stats_e2e.rs`'s config, generalized to take the
-/// upstream address as a parameter so config A/B differ only in that.
+/// One `STATIC` cluster ("backend") behind a prefix-"/" router. Config A and B
+/// differ only in the upstream address.
 fn envoy_config(listener_port: u16, upstream: SocketAddr) -> String {
     format!(
         r#"
@@ -181,8 +141,8 @@ static_resources:
 
 // ------------------------------------------------- process + SIGHUP glue ---
 //
-// A third, small instance of `crates/proxy/tests/reload.rs`'s pattern -- see
-// the module doc for why this isn't a change to `diffrig::harness`.
+// Same spawn and SIGHUP pattern as `crates/proxy/tests/reload.rs`. Kept local
+// so `diffrig::harness` does not gain a signal API for one test file.
 
 fn wait_for_connectable(addr: SocketAddr, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -347,11 +307,8 @@ impl ProxyHandle {
 
 // --------------------------------------------------- streaming SSE client --
 //
-// Hand-rolled (see module doc for why this isn't `loadgen::driver`):
-// fallible (a transport error becomes an `Err`, not a panic, so one bad
-// stream doesn't take down every other concurrently running task) and
-// content-aware (it looks at the *last* SSE frame, not just whether the
-// body ended cleanly).
+// Hand-rolled so it can check the last SSE frame. A transport error is an
+// `Err`, not a panic, so one bad stream does not take down the others.
 
 #[derive(Debug)]
 enum StreamOutcome {
@@ -370,11 +327,10 @@ enum StreamOutcome {
     HttpError { status: u16 },
 }
 
-/// One result plus the two phase observations needed to prove the reload did
-/// not merely happen *near* some successful streams.  A stream overlaps the
-/// reload only when it began before the swap gate opened and completed after
-/// it opened; validating only the aggregate outcome list would let a broken
-/// reload that aborted every old stream hide behind streams started later.
+/// One result plus the phase observations. A stream counts as overlapping the
+/// reload only if it began before the swap and finished after it. Checking the
+/// aggregate alone would let a reload that aborted every old stream hide behind
+/// newer ones.
 #[derive(Debug)]
 struct StreamObservation {
     outcome: Result<StreamOutcome, String>,
@@ -482,10 +438,8 @@ async fn stream_worker(
 
 // -------------------------------------------------------------------- test --
 
-/// The v0.2.0 ship-gate acceptance test: see the module doc for the full
-/// scenario. Not `#[ignore]`d -- total wall time is ~6-8s (dominated by
-/// `NONSTREAM_RUN`'s fixed 5s span), in the same range as this crate's other
-/// e2e suites, and it needs no network beyond loopback.
+/// Config swap under live traffic, end to end. Not `#[ignore]`d: it takes about
+/// 6-8s and needs only loopback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn config_swap_under_live_traffic_drops_no_streams() {
     let upstream_1 = OpenAiUpstream::spawn(upstream_config("upstream-1"))

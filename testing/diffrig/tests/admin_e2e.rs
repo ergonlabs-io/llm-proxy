@@ -1,74 +1,13 @@
-//! End-to-end acceptance drill for the admin WRITE API -- closes the coverage
-//! gap that the admin API had never run against the real binary (nothing
-//! outside unit tests set `LLMPROXY_ADMIN_TOKEN`). Four of the five defects
-//! found when it was first wired (`SharedFactoryState` keyed on `type_url` alone, a
-//! per-worker token-limit store, and two more) were wiring bugs a unit test
-//! against a `TestCallbacks`/in-process double could not see, because they
-//! only exist once a real binary boots real workers around a real socket.
-//! This file is that drill: it spawns the REAL `llm-proxy` process with
-//! `LLMPROXY_ADMIN_TOKEN` set in ITS environment (never this test process's
-//! own -- see [`diffrig::harness::ProxyProcess::spawn_envoy_with_env`]),
-//! points it at a mock upstream, and drives both the admin HTTP surface and
-//! the data plane over real sockets.
+//! Exercises the admin API and data plane through a real proxy process and sockets.
+//! The admin token is set only in the child environment. Requests are bounded and
+//! tests use ephemeral ports because worktrees share machine ports (AGENTS.md "Build And Test").
 //!
-//! # NOT `local_openai_smoke.rs`, deliberately
+//! The filter chain follows `check_lane_h_filter_order`. Each exchange costs
+//! $1.00: the mock receives one input token and returns one output token, each
+//! priced at 500,000 micro-dollars.
 //!
-//! That file is `#[ignore]`d behind a local Ollama -- and AGENTS.md "Coverage"
-//! records, from the last time this happened, that an `#[ignore]`d file is
-//! exactly how an entire observability surface stayed untested while 1141
-//! other tests stayed green. This drill needs no live provider (the mock
-//! upstream in `diffrig::upstreams` is enough for every case below), so it
-//! runs in the default `make tq` suite, same as `auth_e2e.rs`.
-//!
-//! # Structural sibling of `auth_e2e.rs` -- read that file first if unfamiliar
-//!
-//! Same harness, same `spawn_suite` shape, same timeout discipline (every
-//! request wrapped in `tokio::time::timeout`), same reason
-//! (`ProxyProcess::wait_until_ready` blocks the calling thread, so every test
-//! needs `#[tokio::test(flavor = "multi_thread", ...)]` or the mock upstream
-//! spawned onto the same runtime freezes -- see that function's doc for the
-//! 656-863s incident this guards against).
-//!
-//! # Ephemeral ports, always
-//!
-//! Every port here (listener, admin, upstream) comes from
-//! [`diffrig::harness::free_port`] at test-run time, never a hardcoded value
-//! from `examples/*.yaml` -- AGENTS.md "Build And Test" records a fixed-port test as a
-//! real cross-suite collision, and rule 15 records that a git worktree does
-//! NOT isolate ports from a concurrently running agent on the same machine.
-//!
-//! # Filter order, restated for this chain
-//!
-//! `proxy_config::lower::check_lane_h_filter_order` requires `llmproxy.auth`
-//! before `llmproxy.model_authz` and before `llmproxy.spend_limit` (both
-//! decode-side), `llmproxy.body_rewrite` before `llmproxy.model_authz` (the
-//! model comes from the request body), and `llmproxy.spend_limit` before
-//! `llmproxy.usage` (spend's `record` is encode-side, which runs in REVERSE
-//! config order). [`single_chain_config`] orders them
-//! auth -> body_rewrite -> model_authz -> spend_limit -> usage -> router,
-//! satisfying every rule at once.
-//!
-//! # Pricing, and the token math every priced test depends on
-//!
-//! Every chat request here sends the single-word message `"hi"` (1 token)
-//! and the mock upstream always replies with the single-word completion
-//! `"ok"` (1 token) -- see `auth_e2e.rs`'s module doc for why this is exactly
-//! reproducible. [`single_chain_config`] prices [`MODEL_ALLOWED`] and
-//! [`MODEL_DENIED`] on cluster `provider:p1` at `"500000.00"` per million
-//! input AND output tokens (cached/cache-creation at `"0.00"`), so one
-//! admitted exchange costs exactly `500_000 + 500_000 = 1_000_000`
-//! micro-dollars ($1.00) -- the number [`a_budget_write_is_enforced_live_and_reported_via_admin_spend`]
-//! is built around.
-//!
-//! # One test in this file is RED on purpose
-//!
-//! [`a_tenant_policy_write_changes_model_authorization_live`] documents a
-//! real, previously-unknown defect this drill found (`llmproxy.model_authz`
-//! denies every request in a real filter chain, unconditionally -- see that
-//! function's doc for the full analysis) rather than silently working
-//! around it. Per this task's own instructions, a test that demonstrates a
-//! real bug precisely is the correct outcome, not a regression to chase out
-//! of this file.
+//! `a_tenant_policy_write_changes_model_authorization_live` also records a known
+//! defect: model authorization currently denies requests in a real filter chain.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -82,20 +21,14 @@ use serde_json::{json, Value};
 
 // ------------------------------------------------------------------ config --
 
-/// How long a single client request (data-plane or admin) waits before
-/// failing the test outright instead of hanging the whole suite -- see
-/// `auth_e2e.rs`'s identical constant for the incident this guards against.
+/// Bounds each data-plane or admin request.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long [`admin_request_retrying`] will retry a `503` "not initialized
 /// yet" boot-race response before giving up -- see that function's doc.
 const BOOT_RACE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The operator secret naming every `Authentication` filter's HMAC key in
-/// this file. Real only for the lifetime of one test process -- never a
-/// value any of these tests read back out to verify (the whole point of the
-/// admin API is that a client sees only the plaintext keys IT mints, never
-/// this secret).
+/// Test-only HMAC secret; tests verify minted plaintext keys, not this value.
 const HMAC_SECRET: &str = "wp-50-admin-e2e-hmac-secret-never-reused-elsewhere";
 
 /// `LLMPROXY_ADMIN_TOKEN`'s configured value for tests that need the write
@@ -105,9 +38,7 @@ const ADMIN_TOKEN: &str = "wp-50-admin-e2e-bearer-token-never-reused-elsewhere";
 /// (`admin/src/server.rs`'s `handle`) without ever matching [`ADMIN_TOKEN`].
 const WRONG_ADMIN_TOKEN: &str = "wp-50-admin-e2e-WRONG-bearer-token";
 
-/// The credential the CLUSTER injects via `io.llmproxy.provider_auth`
-/// metadata (AGENTS.md invariant 6: per-provider credentials belong on the cluster,
-/// never the route) -- restated from `auth_e2e.rs`.
+/// Provider credential injected by cluster metadata (AGENTS.md invariant 6).
 const PROVIDER_KEY: &str = "sk-real-provider-credential-admin-e2e";
 
 /// A model priced (see the module doc) and, in
@@ -140,31 +71,10 @@ fn chat_request_body(model: &str) -> Value {
     })
 }
 
-/// Renders a single-listener Envoy bootstrap: one `admin` surface, one
-/// cluster (`provider:p1`), one listener whose `http_filters` chain is
-/// `llmproxy.auth -> llmproxy.body_rewrite -> llmproxy.model_authz ->
-/// llmproxy.spend_limit -> llmproxy.usage -> envoy.filters.http.router` --
-/// see the module doc for why this order is the only one
-/// `check_lane_h_filter_order` accepts.
-///
-/// `virtual_keys` is deliberately EMPTY: every credential exercised against
-/// this config is minted through the admin API at test run time, not
-/// pre-configured -- this is the whole point of the drill (see the top-level
-/// module doc).
-///
-/// `with_model_authz` gates whether `llmproxy.model_authz` is in the chain
-/// at all. It defaults OFF for every test but
-/// [`a_tenant_policy_write_changes_model_authorization_live`] -- see that
-/// function's own doc for a KNOWN, REAL defect this drill found:
-/// `llmproxy.model_authz`'s decode-time check runs in the SAME header phase
-/// as `llmproxy.body_rewrite`'s `decode_headers`, which never holds the
-/// request -- the model it publishes onto `StreamInfo::requested_model` is
-/// only written later, in the trailing DATA phase, which
-/// `crates/proxy-http/src/filter_manager.rs::drive_decode` runs strictly
-/// after every filter's header phase has already completed.
-/// `llmproxy.model_authz` therefore denies every request it ever sees in a
-/// real chain, unconditionally, regardless of policy -- see that test for
-/// the full analysis and the demonstration.
+/// Renders the test bootstrap. The filter order satisfies
+/// `check_lane_h_filter_order`; virtual keys are minted through the admin API.
+/// `with_model_authz` enables the filter for the policy test, which documents
+/// its current decode-phase defect.
 fn single_chain_config(
     listener_port: u16,
     admin_port: u16,
@@ -293,18 +203,8 @@ static_resources:
     )
 }
 
-/// Renders a bootstrap with TWO independent listeners, each its own HCM
-/// (`stat_prefix` `chain-a`/`chain-b`), each configuring its OWN
-/// `llmproxy.auth` -- for
-/// [`the_admin_api_requires_a_scope_when_multiple_auth_chains_exist`]. No
-/// `llmproxy.model_authz`/`llmproxy.spend_limit`/`llmproxy.body_rewrite`/
-/// `llmproxy.usage` on either chain: that test only exercises auth
-/// resolution and scoped/unscoped addressing, so the minimal chain that
-/// satisfies `check_lane_h_filter_order` (which only fires when BOTH halves
-/// of a rule are present) is `llmproxy.auth -> envoy.filters.http.router`.
-/// Both listeners route to the SAME cluster/mock upstream -- nothing about
-/// this test needs two upstreams, only two independently-scoped
-/// `ControlPlane`s.
+/// Renders two auth chains with separate scopes for scoped/unscoped API checks.
+/// Both listeners share one cluster and mock upstream.
 fn two_chain_config(
     listener_a_port: u16,
     listener_b_port: u16,
@@ -414,14 +314,8 @@ static_resources:
 
 // ----------------------------------------------------------------- helpers --
 
-/// Spawns the mock upstream plus the real proxy against
-/// [`single_chain_config`], with `LLMPROXY_ADMIN_TOKEN` set to `admin_token`
-/// in the CHILD's environment only when `Some` (see
-/// `ProxyProcess::spawn_envoy_with_env`'s doc for why never
-/// `std::env::set_var` here). Returns the data-plane and admin addresses
-/// alongside the guards the caller must hold (and drop, in order) for the
-/// rest of the test. `with_model_authz` is forwarded to
-/// [`single_chain_config`] -- see that function's doc.
+/// Starts the proxy and mock upstream, setting the admin token only in the child
+/// environment. Returns addresses and resource guards.
 async fn spawn_suite(
     label: &str,
     admin_token: Option<&str>,
@@ -457,10 +351,7 @@ async fn spawn_suite(
         &scratch.path().join("proxy.log"),
         &envs,
     );
-    // The admin server binds BEFORE the worker pool spawns (`main.rs`'s
-    // `run_serve`, see `start_admin`'s doc), so waiting on it first can only
-    // make this call return sooner, never later, than waiting on the
-    // data-plane listener.
+    // The admin listener binds before workers, so it is ready first.
     proxy.wait_until_ready(admin_addr, READY_TIMEOUT);
     proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
 
@@ -541,11 +432,7 @@ async fn send_chat_request(addr: SocketAddr, headers: &[(&str, &str)], model: &s
     )
 }
 
-/// Send one request against the ADMIN surface, bounded by [`CLIENT_TIMEOUT`].
-/// `token`, when `Some`, is sent as `Authorization: Bearer <token>`; `None`
-/// sends no `Authorization` header at all (the Gate-1 "unset token" case
-/// tests this on the SERVER side; this is the client sending nothing, which
-/// is the normal shape of that case).
+/// Sends an admin request with an optional bearer token, bounded by the timeout.
 async fn admin_request(
     addr: SocketAddr,
     method: &str,
@@ -566,16 +453,7 @@ async fn admin_request(
     .expect("admin request timed out -- an admin write hung instead of completing")
 }
 
-/// [`admin_request`], but retried while the response is exactly the
-/// documented boot-race `503` (`proxy_admin::server`'s `resolve_control_plane`
-/// doc: "a request that lands before any worker's `create()` has run finds
-/// nothing here yet"). `start_admin` binds the admin port before the worker
-/// pool spawns (see `main.rs`), so in practice this never loops more than
-/// once by the time `wait_until_ready` has already proven the DATA-PLANE
-/// listener is up -- built anyway so a slow CI box cannot turn a real,
-/// self-resolving race into a flaky failure. A response that ISN'T that
-/// specific 503 (including every other status this file asserts on) is
-/// returned immediately, unretried.
+/// Retries only the boot-race 503 until the control plane is available.
 async fn admin_request_retrying(
     addr: SocketAddr,
     method: &str,
@@ -837,56 +715,12 @@ async fn revoking_a_key_takes_effect_on_the_very_next_request() {
     drop(scratch);
 }
 
-/// 4. `PUT /tenants/{id}/policy` changes model authorization for the VERY
-/// NEXT request, with no reload. Sends the same (denied) model twice --
-/// once before the policy write (permitted, the default-open
-/// baseline) and once after (refused) -- then confirms the allowed model
-/// still passes under the new, restrictive policy.
-///
-/// # KNOWN DEFECT, found by this test, NOT fixed here -- see the task report
-///
-/// This test is RED, and stays red: the very first assertion (the
-/// default-open baseline, before any policy write) already fails --
-/// `llmproxy.model_authz` denies EVERY authenticated request with a real
-/// model, unconditionally, in a real filter chain. Reported precisely rather
-/// than silently patched (see this crate's task scope). In short:
-///
-/// `ModelAuthzFilterInstance::decode_headers`
-/// (`crates/proxy-filters/src/model_authz_filter.rs`) reads
-/// `StreamInfo::requested_model`, which only `BodyRewriteFilterInstance::decode_data`
-/// (`crates/proxy-filters/src/body_rewrite_filter.rs`) ever writes.
-/// `BodyRewriteFilterInstance::decode_headers` always returns
-/// `FilterHeadersStatus::Continue` (never holds the request), so per
-/// `drive_decode`'s two-phase design
-/// (`crates/proxy-http/src/filter_manager.rs`): first EVERY filter's
-/// `decode_headers` runs, in order, all the way to the terminal; only
-/// afterward does a SECOND, trailing pass deliver `decode_data` to filters
-/// that still owe it, again in order. `llmproxy.model_authz` has no
-/// `decode_data` of its own -- its ONLY check is in `decode_headers` -- so
-/// it always runs, and always denies (`requested_model: None`), during the
-/// FIRST pass, strictly before `llmproxy.body_rewrite`'s `decode_data` (the
-/// second pass) has ever set the field it depends on. No filter ORDERING
-/// fixes this: any position after `llmproxy.body_rewrite` still puts
-/// `model_authz`'s header-phase read before body_rewrite's data-phase write,
-/// because the two phases are global (across every filter), not per-filter.
-///
-/// `crates/proxy-config/src/lower.rs`'s `check_lane_h_filter_order` (and its
-/// module doc) states the opposite -- "decode callbacks run in config
-/// order" -- treating `decode_headers` and `decode_data` as one combined,
-/// per-filter sequence. That is true for a filter whose OWN
-/// `decode_headers` holds the request (`llmproxy.auth`/`llmproxy.token_limit`
-/// both do, effectively, by resolving everything they need directly from
-/// headers with no data dependency), but not for two filters split across
-/// the header/data boundary the way `body_rewrite`/`model_authz` are.
-///
-/// This also explains why no test caught it before now:
-/// `model_authz_filter.rs`'s own unit tests use a hand-rolled
-/// `TestCallbacks` whose `set_requested_model` writes the field directly,
-/// bypassing `drive_decode` entirely -- so they encode "if the model were
-/// already known, would the policy check be right", never "does a real
-/// chain make the model known in time". This file is the first place
-/// `llmproxy.model_authz` has ever run inside the real `filter_manager.rs`
-/// pointer machine.
+/// 4. A policy write should affect the next request without reload. This test
+/// currently exposes a decode-phase defect: `model_authz` reads
+/// `requested_model` during `decode_headers`, before `body_rewrite` writes it
+/// during `decode_data`. Filter phases run globally, so changing filter order
+/// cannot resolve this dependency. Unit tests miss it because their callbacks
+/// set the model directly instead of driving the real filter manager.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tenant_policy_write_changes_model_authorization_live() {
     let (listener_addr, admin_addr, upstream, scratch, proxy) =
@@ -921,7 +755,7 @@ async fn a_tenant_policy_write_changes_model_authorization_live() {
     let header_pairs: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
 
     // No policy stored yet: the tenant is refused (a tenant without a model
-    // policy is denied by default, review H4).
+    // policy is denied by default).
     let unconfigured = send_chat_request(listener_addr, &header_pairs, MODEL_DENIED).await;
     assert_eq!(
         unconfigured.status, 403,
@@ -1097,16 +931,8 @@ async fn a_key_policy_narrows_its_tenant_grant_and_never_widens_it() {
     drop(scratch);
 }
 
-/// 5. `PUT /keys/{id}/budget` is enforced live against real priced
-/// traffic, and `GET /keys/{id}/spend` (admin-gated despite being a GET
-/// -- financial data) reports spend consistent with what was actually sent.
-///
-/// Per the module doc's token math, one admitted exchange against
-/// [`MODEL_ALLOWED`] costs exactly 1,000,000 micro-dollars ($1.00). A budget
-/// of `"1.50"` (1,500,000 micro-dollars) therefore admits exactly two
-/// exchanges and refuses the third with `429` + `x-ratelimit-*` headers IN
-/// MICRO-DOLLARS (`spend_limit_filter`'s convention, not a token/request
-/// count).
+/// 5. A $1.50 budget admits two $1 exchanges, then refuses the third; spend
+/// reporting and rate-limit headers use micro-dollars.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tenant_budget_aggregates_multiple_keys_and_enforces_both_scopes() {
     let (listener, admin, upstream, scratch, proxy) =
@@ -1356,15 +1182,8 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
          {spend_json}"
     );
 
-    // The financial-data gate applies here too, despite this being a GET --
-    // see `handle_get_spend`'s doc for why. Confirmed directly rather than
-    // assumed from the write-endpoint tests above. `LLMPROXY_ADMIN_TOKEN` IS
-    // configured for this process (unlike
-    // `admin_write_endpoints_are_forbidden_when_the_token_env_var_is_unset`'s
-    // 403), so presenting no bearer at all lands on Gate 2 ("enabled, no
-    // credential presented"), which is a 401, not a 403 -- the SAME
-    // distinction that test's own doc draws between "disabled" and
-    // "enabled, wrong/missing credential".
+    // Spend data is gated even on GET; with the gate enabled, missing credentials
+    // produce 401 rather than the disabled-gate 403.
     let unauthenticated_spend_read = admin_request(
         admin_addr,
         "GET",
@@ -1384,14 +1203,8 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
     drop(scratch);
 }
 
-/// 6. Scoped vs. unscoped addressing. With TWO `llmproxy.auth`-configured
-/// filter chains live, the UNSCOPED admin API cannot tell which
-/// `ControlPlane` a write means and refuses explicitly (never guesses,
-/// AGENTS.md "Fail-open controls"'s shape); the SCOPED `/chains/{stat_prefix}/...` form
-/// is always correct, addresses each chain independently, and a key minted
-/// on one chain does NOT authenticate against the other -- proving the
-/// `df0ae8c` fix (`SharedFactoryState` keyed on `(chain scope, type_url)`,
-/// not `type_url` alone) stays fixed end to end.
+/// 6. With multiple auth chains, unscoped writes are ambiguous; scoped writes
+/// address each chain independently, and keys do not cross-authenticate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_admin_api_requires_a_scope_when_multiple_auth_chains_exist() {
     let (listener_a_addr, listener_b_addr, admin_addr, upstream, scratch, proxy) =
@@ -1411,13 +1224,7 @@ async fn the_admin_api_requires_a_scope_when_multiple_auth_chains_exist() {
          configures llmproxy.auth -- got {}: {}",
         ambiguous.status, ambiguous.body
     );
-    // The refusal names each ambiguous filter chain by its internal `scope`
-    // (listener name + filter_chains index -- `SharedFactoryState`'s doc:
-    // `scope` is positional/internal, distinct from the operator-chosen
-    // `stat_prefix` this test's OWN chains are named with), not by
-    // `stat_prefix` -- the unscoped resolver has no name to give, only the
-    // fact that more than one chain collided. `resolve_control_plane`'s doc
-    // in `crates/proxy-admin/src/server.rs` is normative for this.
+    // Ambiguity reports internal chain scopes; scoped routes use `stat_prefix`.
     assert!(
         ambiguous.body.contains("chain_a_listener") && ambiguous.body.contains("chain_b_listener"),
         "the refusal must name every ambiguous chain, got: {}",

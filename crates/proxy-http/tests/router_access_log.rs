@@ -1,26 +1,10 @@
-//! Proves access logs actually emit -- rendered lines land in
-//! the configured sink, honoring `AccessLogIR.filter`, and (the mistake this
-//! file exists to catch) a streamed response's line carries the *final*
-//! byte count and a duration covering the whole stream, not just the time to
-//! response headers.
+//! Verify that access-log lines reach the configured sink, honor filters, and
+//! include final byte counts and duration for streamed responses. Logging is
+//! attached to `FilterChainHandler`, outside the router, so it observes the
+//! encode chain through end-of-stream.
 //!
-//! Relocated (see `proxy_http::access_logging`'s and
-//! `proxy_http::filter_manager`'s module docs): access logging now lives on
-//! `FilterChainHandler`, one level above the router, not on `RouterHandler`
-//! itself -- the router sits INSIDE the encode filter chain, so logging from
-//! there could never observe what an encode filter does at end-of-stream.
-//! These tests build a `FilterChainHandler` with no configured HTTP filters
-//! (nothing here exercises the filter chain itself) wrapping a real
-//! `RouterHandler` terminal, and drive requests through the *handler*, not
-//! the bare router.
-//!
-//! Standalone (not `router.rs`'s own `#[cfg(test)]` module), same reasoning
-//! as `router_retry.rs`/`router_header_mutations.rs`: a fresh, focused set
-//! of upstream/file-reading helpers.
-//!
-//! Rust note: same shape as `router.rs`'s own tests -- `send_upstream_http1`
-//! spawns a non-`Send` connection driver task via `tokio::task::spawn_local`,
-//! so every test needs a `LocalSet` on a `current_thread` runtime.
+//! Rust note: `send_upstream_http1` uses `spawn_local`, so tests need a
+//! `LocalSet` on a current-thread runtime.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -51,8 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::LocalSet;
 
-/// A unique path under the OS temp dir, cleaned up by each test itself --
-/// same technique as `proxy_observability::sink`'s own tests.
+/// Return a unique temporary path that the test removes afterward.
 fn temp_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!(
@@ -68,8 +51,7 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 fn read_to_string(path: &Path) -> String {
-    // Access-log writes are asynchronous (background writer thread); wait
-    // for everything queued so far instead of sleeping.
+    // Flush queued writes instead of sleeping for the background writer.
     assert!(proxy_observability::sink::flush_all_queued(
         Duration::from_secs(5)
     ));
@@ -107,23 +89,15 @@ fn forward_to(cluster: &str) -> ForwardAction {
     }
 }
 
-/// A fresh, single-worker [`RouterStats`] resolved for
-/// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
-/// mirroring how `crates/proxy/src/main.rs` builds the real one from the
-/// boot config snapshot's cluster names.
+/// Resolve one worker's router stats for the supplied cluster names.
 fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
     let control = StatsControl::new(1);
     let handles = Arc::new(StatHandles::build(&control, cluster_names.iter().copied()));
     Arc::new(RouterStats::new(control.registry(), handles, WorkerId(0)))
 }
 
-/// Build a one-route `FilterChainHandler` (no configured HTTP filters, a
-/// real `RouterHandler` terminal) forwarding `/v1/` to a cluster named `"up"`
-/// at `addr` (when `addr` is `Some`; `None` leaves `"up"` entirely
-/// unregistered, for the unknown-cluster/`NC` test), with `access_logs`
-/// wired through `FilterChainHandler::new_with_access_logs` -- mirrors
-/// `router_retry.rs`'s own `build_router` helper plus the field this file
-/// exists to exercise.
+/// Build a one-route handler forwarding `/v1/` to `up`. With `addr: None`,
+/// the cluster is unregistered for the unknown-cluster test.
 async fn build_router(
     addr: Option<SocketAddr>,
     access_logs: Vec<AccessLogIR>,
@@ -223,8 +197,7 @@ fn request_with_method(method: Method, path: &'static str) -> HttpRequestParts {
     }
 }
 
-/// A one-shot upstream that answers `200 OK` with a small fixed body,
-/// immediately.
+/// Answer once with `200 OK` and a fixed body.
 async fn spawn_upstream_ok(body: &'static [u8]) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -242,10 +215,7 @@ async fn spawn_upstream_ok(body: &'static [u8]) -> SocketAddr {
     addr
 }
 
-/// An upstream that streams `frame_count` chunked body frames, each preceded
-/// by `gap`, then closes normally -- long enough in total that a log line
-/// written at header-flush time (rather than stream-end) would report a
-/// duration and byte count from long before the stream actually finished.
+/// Stream chunked frames with a delay before each, then close normally.
 async fn spawn_upstream_streaming_slowly(frame_count: usize, gap: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -294,10 +264,8 @@ async fn successful_proxied_request_writes_one_line_with_status_and_path() {
         .await;
 }
 
-/// The bug this test exists to catch: `%REQ(:METHOD)%` (part of Envoy's OWN
-/// default access-log format) used to always render `-` -- no pseudo-header
-/// could ever match a real `http::HeaderName`-based lookup -- so every
-/// access log this proxy wrote was missing the request method.
+/// Verify `%REQ(:METHOD)%` renders the method despite `:method` being an
+/// HTTP pseudo-header rather than a regular `HeaderName`.
 #[tokio::test(flavor = "current_thread")]
 async fn req_method_pseudo_header_carries_the_real_method_not_a_dash() {
     LocalSet::new()
@@ -346,7 +314,7 @@ async fn streamed_response_logs_full_bytes_sent_and_a_duration_covering_the_whol
                 let resp = handler.handle(request("/v1/chat/completions")).await;
                 assert_eq!(resp.head.status, StatusCode::OK);
                 let collected = resp.body.collect().await.unwrap().to_bytes();
-                // Every frame ("hello", 5 bytes) made it through.
+                // Three `hello` frames contribute 15 response bytes.
                 assert_eq!(collected.len(), 5 * frame_count);
 
                 let logged = read_to_string(&path);
@@ -355,9 +323,7 @@ async fn streamed_response_logs_full_bytes_sent_and_a_duration_covering_the_whol
                 let bytes_sent: u64 = parts.next().unwrap().parse().unwrap();
                 let duration_ms: u64 = parts.next().unwrap().parse().unwrap();
 
-                // The bug this test exists to catch: logging at
-                // header-flush time would report 0 bytes and ~0ms, not the
-                // full stream.
+                // The log must reflect completion of the full stream.
                 assert_eq!(
                     bytes_sent,
                     (5 * frame_count) as u64,
@@ -398,11 +364,8 @@ async fn unknown_cluster_records_and_renders_the_nc_flag() {
             resp.body.collect().await.unwrap();
 
             let logged = read_to_string(&path);
-            // `cluster_not_found` -- a wholly unknown cluster name --
-            // is distinct from `cluster_not_warmed` (a registered cluster
-            // that's never completed its first resolution; see
-            // `response_flags.rs`'s never-warmed tests for that case), even though
-            // both render the same `NC` short code.
+            // An unknown cluster is distinct from a registered, unwarmed one;
+            // both render as `NC`.
             assert_eq!(logged, "503 NC cluster_not_found\n");
 
             std::fs::remove_file(&path).unwrap();
@@ -416,9 +379,7 @@ async fn a_request_excluded_by_the_access_log_filter_produces_no_line() {
         .run_until(async {
             let addr = spawn_upstream_ok(b"hi").await;
             let path = temp_path("filtered-out");
-            // An empty `ResponseFlag` filter list means "log only if *some*
-            // flag fired" (Envoy semantics) -- a plain successful request
-            // fires none, so this logger must produce nothing for it.
+            // An empty response-flag filter logs only when a flag fires.
             let handler = build_router(
                 Some(addr),
                 vec![text_logger(
@@ -433,8 +394,7 @@ async fn a_request_excluded_by_the_access_log_filter_produces_no_line() {
             assert_eq!(resp.head.status, StatusCode::OK);
             resp.body.collect().await.unwrap();
 
-            // The sink was still opened (the file exists, created on
-            // `FileSink::new`), but no line was ever written to it.
+            // The sink exists, but the filter prevented any line from being written.
             assert_eq!(read_to_string(&path), "");
 
             std::fs::remove_file(&path).unwrap();
@@ -448,10 +408,7 @@ async fn two_loggers_on_the_same_file_path_share_one_sink_and_interleave_whole_l
         .run_until(async {
             let addr = spawn_upstream_ok(b"hi").await;
             let path = temp_path("shared-sink");
-            // Two independently-configured loggers naming the same file,
-            // each with a distinct format -- proves they share one
-            // `FileSink` (one `BufWriter`/`Mutex`) rather than each opening
-            // their own handle and corrupting each other's writes.
+            // Both loggers share one sink while retaining distinct formats.
             let handler = build_router(
                 Some(addr),
                 vec![

@@ -1,96 +1,12 @@
-//! The spend-budget filter's price table, as a pure
-//! library.
+//! Pure request-cost calculations used by the spend filter.
 //!
-//! This module answers exactly one question: **what did this request cost?**
-//! It does not touch `HttpFilter`, proto decoding, `StreamInfo`, or any
-//! accumulation over time — those are [`crate::model_authz`]'s pattern
-//! repeated for money: [`PriceTable`] and [`PriceTable::cost_of`] are the
-//! pure core, and `spend_limit_filter` is the filter that reads
-//! `typed_config`, holds a shared accumulator, and enforces a ceiling.
-//!
-//! # Keyed on `(cluster, model)`, not `model` alone — AGENTS.md invariant 6
-//!
-//! This is another instance of AGENTS.md invariant 6's hazard: a per-provider
-//! value attached to the ROUTE (or, equivalently, resolved by model name
-//! alone with no notion of which member served it) follows the routing
-//! decision instead of the connection. The same model name can be served by
-//! two clusters at two different prices — `gpt-4o` direct versus through a
-//! discounted secondary — and a route only picks an *aggregate*; the cluster
-//! is the *member* that actually gets dialled. A price that ignored which
-//! cluster served the request would bill the primary's rate for a request a
-//! fallback actually served, which is silently wrong billing that only shows
-//! up on failover — the same shape as the credential and `host_rewrite_literal`
-//! bugs invariant 6 already names. [`PriceTable::cost_of`] therefore takes the
-//! cluster *actually dialled* (the filter resolves this from
-//! `StreamInfo::upstream_cluster`, never from the route) as a first-class,
-//! required-to-match input, not an afterthought.
-//!
-//! # Money is integer, never `f64`
-//!
-//! Every arithmetic operation in this module is on integers, in units of
-//! **micro-dollars** (1e-6 USD, [`MicroUsd`]). Config supplies prices as
-//! decimal strings (`"2.50"`) for operator readability; [`parse_micro_usd`]
-//! parses each one EXACTLY ONCE, at load, into a `u64`. Binary floating point
-//! does not round-trip decimal fractions — `0.1 + 0.2 != 0.3` in IEEE 754 —
-//! and a spend ceiling compared against a value that drifted through
-//! repeated `f64` addition over millions of requests is an unreproducible
-//! wrong answer, in the one subsystem whose entire job is to be right about
-//! money. `f64` does not appear anywhere in this module; if a future edit
-//! introduces one here, that is a bug.
-//!
-//! # Four buckets, priced independently
-//!
-//! Providers price standard input, cache-read input, cache-write input, and
-//! output tokens independently — see [`crate::usage::TokenUsage`]'s doc.
-//! [`PriceTable::cost_of`] charges each bucket at its own configured rate and
-//! sums the (independently rounded) results; collapsing cached tokens into
-//! the input rate would overcharge heavily on cache-heavy workloads, which is
-//! exactly the workload this proxy attracts.
-//!
-//! # An unpriced `(cluster, model)` costs ZERO — and that is not the same as
-//! a configured `"0.00"` rate
-//!
-//! Owner decision: a model or cluster with no
-//! configured price is admitted and charged nothing, and this is the DEFINED
-//! semantic, not a fallback from a failure — consistent with AGENTS.md "Fail-open controls"'s
-//! precedent that metering must not start refusing traffic. But "no price
-//! configured" and "price configured as zero" are different facts an operator
-//! may care to tell apart later (the accumulator reports an unpriced-request count and the distinct unpriced `(cluster,
-//! model)` pairs, so a config gap stays discoverable without reading logs).
-//! [`Charge`] keeps them distinguishable: [`Charge::Unpriced`] is the former,
-//! [`Charge::Priced`]`(MicroUsd(0))` is the latter. Collapsing them into one
-//! "zero" would make that later reporting structurally impossible.
-//!
-//! # Rounding: half-up, ONCE per request, not per bucket
-//!
-//! At these rates, a single request's cost is routinely a fraction of a
-//! micro-dollar (a $2.50-per-million-token rate charged against a 37-token
-//! request is 92.5 ten-thousandths of a micro-dollar), so *some* rounding
-//! decision is unavoidable once the result is forced into an integer.
-//! Truncating (always rounding down) systematically UNDER-bills over millions
-//! of requests — the same-direction error every time, compounding. `ceil`
-//! (always rounding up) is the mirror-image bug: it would systematically
-//! OVER-bill by the same mechanism, just in the other direction. Round-half-up
-//! (ties away from zero) is the one option whose per-request rounding error
-//! is not one-directional — over many requests, roughly as many round up as
-//! round down, and the error cancels rather than accumulates.
-//!
-//! It is applied ONCE, to the sum of all four buckets' exact numerators —
-//! never to each bucket separately. Rounding per bucket rounds up to four
-//! times for one request, and on the small requests that dominate real
-//! traffic that is a genuine overcharge rather than a rounding nicety: four
-//! buckets each costing 0.6 micro-dollars are 2.4 micro-dollars in total, so
-//! one rounding charges 2 and four roundings charge 4 — double. Each bucket
-//! still gets its own independent RATE (see above); it is only the rounding
-//! that is deferred. See [`bucket_numerator`] and [`round_once`].
-//!
-//! # `model` is an EXACT match here — no globs
-//!
-//! Deliberately unlike [`crate::model_authz`]'s `ModelPattern`, which allows
-//! one trailing `*`. A glob that matched two models priced differently would
-//! make the charged rate depend on iteration order over the configured price
-//! list — an unreproducible wrong answer in the one subsystem that must never
-//! produce one. So [`PriceTable`] is keyed on exact model strings, full stop.
+//! Prices are keyed by the dialled `(cluster, model)` because fallback
+//! clusters may charge differently (AGENTS.md invariant 6). Integer
+//! micro-dollars avoid floating-point drift; four token buckets are priced
+//! independently and rounded once per request. Missing prices remain
+//! distinguishable from configured zero rates so gaps can be reported while
+//! metering stays fail-open (AGENTS.md "Fail-open controls"). Model matching
+//! is exact to keep billing independent of config order.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -102,9 +18,7 @@ use crate::auth::{KeyId, TenantId};
 
 mod recovery;
 
-// UTC calendar-aligned period keys. `chrono` is
-// already a workspace dependency (`proxy-cluster`, `proxy-observability`
-// use it); this crate had no prior need for wall-clock rendering.
+// UTC calendar-aligned period keys.
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::control::{ControlPlaneStore, SpendDelta, StoreError};

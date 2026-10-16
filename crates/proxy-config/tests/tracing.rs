@@ -1,19 +1,8 @@
 //! Acceptance tests: config surface only.
 //!
-//! Two front doors, and this file tests both:
-//! - `Bootstrap.node.metadata["io.llmproxy.tracing"]` -> `ConfigSnapshot.tracing`
-//!   (the carrier the `llmproxy` dialect actually uses -- see
-//!   `convert_tracing_metadata` in `lower.rs` for why `Node.metadata`, a real
-//!   Envoy field, stands in for the real-but-unmapped
-//!   `HttpConnectionManager.tracing.provider`);
-//! - `HttpConnectionManager.tracing` itself, which Envoy mode rejects outright
-//!   with a dotted path rather than mapping (the tracer extension proto isn't
-//!   compiled into the descriptor pool -- see `convert_hcm`'s comment).
-//!
-//! Everything here is the strict-parse -> PGV -> IR pipeline a hand-written
-//! Envoy config goes through, so a config that never sets either surface must
-//! be completely unaffected. Every malformed shape is a hard error carrying
-//! its full dotted path (AGENTS.md invariant 1), never a silent skip.
+//! Tests trace configuration through `node.metadata` and rejection of the
+//! unmapped HCM tracing field. The strict parse, PGV, and IR path must preserve
+//! dotted errors and leave unset tracing disabled.
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
@@ -76,9 +65,7 @@ node:
     );
 }
 
-/// AGENTS.md invariant 1: a missing `otlp_endpoint` is a hard error naming the exact
-/// field, not a namespace silently treated as absent -- the operator wrote
-/// `io.llmproxy.tracing`, so something must have been meant by it.
+/// A present tracing namespace requires `otlp_endpoint` (AGENTS.md invariant 1).
 #[test]
 fn missing_otlp_endpoint_is_a_hard_error() {
     let yaml = r#"
@@ -146,10 +133,8 @@ node:
     );
 }
 
-/// An unknown key inside the namespace is a hard error too. The reflective
-/// surface walk cannot see into a `Struct`, so this is the only place AGENTS.md
-/// invariant 1 can be enforced for it -- a typo'd `endpoint:` must not load as
-/// "no otlp_endpoint configured".
+/// Unknown metadata keys are rejected because the surface walk cannot inspect
+/// inside a `Struct` (AGENTS.md invariant 1).
 #[test]
 fn unknown_key_under_the_tracing_namespace_is_a_hard_error() {
     let yaml = r#"

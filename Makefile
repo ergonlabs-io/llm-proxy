@@ -233,21 +233,13 @@ validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.ya
 
 # ------------------------------------------------- xDS conformance (docker) --
 
-# Owner decision 2026-09-04: the go-control-plane cross-implementation check is
-# an OPT-IN target, NOT part of `make ci`. `make ci` stays hermetic and needs no
-# docker.
+# The go-control-plane cross-implementation check is an OPT-IN target, NOT part
+# of `make ci`. `make ci` stays hermetic and needs no docker.
 #
-# THE RISK THIS CARRIES, stated because it has already cost this project once:
-# an opt-in target is exactly the shape of `local_openai_smoke.rs`, which AGENTS.md "Coverage"
-# records as having quietly stopped running for a whole work package
-# while the suite stayed green -- an entire observability surface went untested
-# behind an `#[ignore]`. A target nobody runs is worse than no target, because it
-# reads as coverage.
-#
-# So this has a stated cadence, not just an existence: run it before the v0.3.2
-# ship gate is declared closed.
-# `internal-docs/MILESTONES.md`'s v0.3.2 gate names it as the verification, which
-# is what keeps the cadence enforceable rather than aspirational.
+# The risk: an opt-in target has the same shape as `local_openai_smoke.rs`, which
+# AGENTS.md "Coverage" records as having quietly stopped running while the suite
+# stayed green. A target nobody runs reads as coverage, so run it on a stated
+# cadence, not only when someone remembers.
 
 DOCKER := $(shell command -v docker 2>/dev/null)
 

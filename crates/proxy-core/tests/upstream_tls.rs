@@ -1,15 +1,10 @@
-//! Acceptance test for upstream TLS (the "P0 blocker" milestone): a real
-//! HTTP request is routed, end to end through the real config path (YAML ->
-//! `parse_bootstrap`/`build_snapshot` -> IR -> `ClusterManager` ->
-//! `crate::tls::transport_socket_builder()`), to a real TLS HTTP/1.1
-//! upstream over loopback. Mirrors
-//! `crate::listener::tests::router_forwards_a_real_request_to_a_real_upstream_over_http1`
-//! (plaintext counterpart) for the listener/router harness, and
-//! `tests/tls.rs`'s `rcgen` cert-minting helpers for the TLS side.
+//! Acceptance tests for upstream TLS. A real HTTP request goes through the real config path (YAML, then
+//! `parse_bootstrap` and `build_snapshot`, then IR, then `ClusterManager`, then `transport_socket_builder()`) to a real
+//! TLS HTTP/1.1 upstream on loopback. The plaintext counterpart is
+//! `listener::tests::router_forwards_a_real_request_to_a_real_upstream_over_http1`.
 //!
-//! The negative cases matter more than the happy path here: every upstream
-//! TLS defect in this project's history has been on the verification path,
-//! not the handshake-succeeds path.
+//! The negative cases matter more than the happy path. Every upstream TLS defect in this project's history has been on
+//! the verification path, not the handshake-succeeds path.
 
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -85,9 +80,7 @@ fn default_params() -> TlsParametersIR {
 
 // --------------------------------------------------------- upstream fixture --
 
-/// Reserve an ephemeral port, then free it -- same technique as
-/// `listener.rs`'s test `free_port`, needed here so the bootstrap YAML can
-/// name the listener's port ahead of binding it.
+/// Reserves an ephemeral port, then frees it, so the bootstrap YAML can name the port before the listener binds it.
 async fn free_port() -> u16 {
     let l = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
@@ -95,10 +88,8 @@ async fn free_port() -> u16 {
     port
 }
 
-/// A real TLS HTTP/1.1 upstream on loopback: accept, TLS-terminate with
-/// `cert`/`key` (via the same `DownstreamTlsFactory` the downstream listener
-/// side uses -- there's no reason to hand-roll a second rustls setup here),
-/// then serve one fixed 200 response per connection.
+/// A real TLS HTTP/1.1 upstream on loopback. It terminates TLS with `cert` and `key` through the same
+/// `DownstreamTlsFactory` the listener side uses, then serves one fixed 200 per connection.
 async fn spawn_tls_http_upstream(
     cert: &rcgen::Certificate,
     key: &KeyPair,
@@ -114,9 +105,7 @@ async fn spawn_tls_http_upstream(
         require_client_certificate: false,
         disable_stateless_session_resumption: false,
     };
-    // Rust note: `Arc` so every accepted connection's spawned task can hold
-    // its own clone -- the factory (and the `ServerConfig` inside it) is
-    // immutable and cheap to share this way.
+    // Rust note: `Arc` so each accepted connection's task can hold a clone. The factory is immutable and cheap to share.
     let downstream = Arc::new(DownstreamTlsFactory::build(&spec, "test-tls-upstream").unwrap());
 
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -156,11 +145,9 @@ async fn spawn_tls_http_upstream(
 
 // --------------------------------------------------------------- bootstrap --
 
-/// A one-listener, one-cluster bootstrap: the listener forwards every
-/// request to cluster `up`, a STATIC cluster at `127.0.0.1:<upstream_port>`
-/// whose `transport_socket` is an `UpstreamTlsContext` carrying `sni` and a
-/// `trusted_ca` bundle -- the real config path from YAML down to
-/// `UpstreamTlsSpec`, not hand-built IR.
+/// A one-listener, one-cluster bootstrap. The listener forwards every request to cluster `up`, a STATIC cluster at
+/// `127.0.0.1:<upstream_port>` whose `transport_socket` is an `UpstreamTlsContext` with `sni` and a `trusted_ca`
+/// bundle. The config goes from YAML down to `UpstreamTlsSpec`, not hand-built IR.
 fn bootstrap_yaml(
     listener_port: u16,
     upstream_port: u16,
@@ -168,14 +155,9 @@ fn bootstrap_yaml(
     ca_pem: &str,
     san_matcher: Option<&str>,
 ) -> String {
-    // Rust note: escaping the PEM's newlines into a double-quoted YAML flow
-    // scalar (`"...\n...\n"`) sidesteps block-scalar indentation rules --
-    // much simpler than getting a `|`-block's indent to line up inside a
-    // `format!` template.
+    // Rust note: escaping the PEM newlines into a double-quoted YAML flow scalar sidesteps block-scalar indentation.
     let ca_pem_escaped = ca_pem.replace('\n', "\\n");
-    // `san_matcher` is a caller-supplied, already-indented
-    // `match_typed_subject_alt_names:` YAML block (or empty) so tests that
-    // don't need one don't have to duplicate the whole template.
+    // `san_matcher` is a caller-supplied, already indented `match_typed_subject_alt_names:` block, or empty.
     let san_matcher_yaml = san_matcher.unwrap_or("");
     format!(
         r#"
@@ -231,12 +213,9 @@ fn snapshot_from(yaml: &str) -> Arc<ConfigSnapshot> {
 // -------------------------------------------------------------- listener harness --
 
 struct Harness {
-    /// Held purely to keep the config-update channel open. `run_listener_manager`
-    /// selects on `config_rx.changed()`, which resolves with `Err` as soon as the
-    /// last sender drops -- it reads that as "control plane is gone" and returns,
-    /// dropping every bound listening socket with it. Letting this sender fall out
-    /// of scope at the end of `spawn_listener` therefore tears the proxy down
-    /// before the test can connect to it (symptom: `ConnectionRefused`).
+    /// Held only to keep the config-update channel open. `run_listener_manager` returns when the last sender drops,
+    /// reading that as "control plane is gone", and that drops every bound socket. Letting this fall out of scope
+    /// early tears the proxy down before the test connects (symptom: `ConnectionRefused`).
     _config_tx: watch::Sender<proxy_config::ir::SnapshotVersion>,
     shutdown_tx: watch::Sender<bool>,
     manager: tokio::task::JoinHandle<()>,
@@ -249,13 +228,10 @@ impl Harness {
     }
 }
 
-/// Boots the real listener manager against `snapshot`, with a `ClusterManager`
-/// wired to the real `transport_socket_builder()` -- the same call
-/// `crates/proxy`'s `serve()` makes, not a test-only stand-in.
+/// Boots the real listener manager against `snapshot`, with a `ClusterManager` wired to the real
+/// `transport_socket_builder()`, as `crates/proxy`'s `serve()` does.
 async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
-    // Same registration path production code uses -- see
-    // `runtime::SnapshotHandles` for why a bare `WorkerConfigHandle::new` is
-    // no longer reachable from outside `proxy-core`.
+    // Same registration path production uses. `SnapshotHandles` is the only way to get a handle from outside `proxy-core`.
     let config = SnapshotHandles::new().register(snapshot.clone());
     let (config_tx, config_rx) = watch::channel(snapshot.version);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -277,10 +253,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         cluster_manager.force_initialize(name);
     }
 
-    // `crates/proxy/src/main.rs` builds this once, at
-    // boot, from the real config snapshot's cluster names -- mirrored here
-    // rather than skipped, since `initial_bind` now requires it to build
-    // `RouterFilterFactory`.
+    // Mirrors the boot-time `router_stats`: `initial_bind` requires it to build `RouterFilterFactory`.
     let stats_control = StatsControl::new(1);
     let stat_handles = Arc::new(StatHandles::build(
         &stats_control,
@@ -292,9 +265,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         WorkerId(0),
     ));
 
-    // `DownstreamStats`/`GenAiTokenStats` counterparts to
-    // `router_stats` above -- `initial_bind` now requires both too, mirroring
-    // `crates/proxy/src/main.rs`'s `worker_main`.
+    // The `DownstreamStats` and `GenAiTokenStats` counterparts to `router_stats`, which `initial_bind` also requires.
     let downstream_handles = Arc::new(DownstreamStatHandles::build(
         &stats_control,
         snapshot.listeners.keys().map(String::as_str),
@@ -387,13 +358,11 @@ async fn get_response(addr: SocketAddr) -> String {
 
 // ----------------------------------------------------------------- tests ---
 
-/// The acceptance test: bytes cross a genuine TLS connection from the proxy
-/// to the upstream, driven purely through YAML config -- `sni: upstream.test`
-/// and a `trusted_ca` matching the upstream's minted CA.
+/// The acceptance test: bytes cross a real TLS connection from the proxy to the upstream, driven only through YAML
+/// (`sni: upstream.test` and a `trusted_ca` matching the upstream's minted CA).
 ///
-/// Mutation-tested (see task notes): reverting `transport_socket_builder` to
-/// always return `RawTransportSocket` makes the TLS-only upstream refuse the
-/// plaintext preface and this test fails.
+/// Mutation-tested: making `transport_socket_builder` always return `RawTransportSocket` makes the TLS-only upstream
+/// refuse the plaintext preface, and this test fails.
 #[test]
 fn router_forwards_a_real_request_to_a_real_tls_upstream_over_http1() {
     run_local(async {
@@ -431,10 +400,8 @@ fn router_forwards_a_real_request_to_a_real_tls_upstream_over_http1() {
     });
 }
 
-/// Verification actually verifies: the cluster's `trusted_ca` is a
-/// *different* CA than the one that signed the upstream's certificate.
-/// Silently succeeding here (accepting an untrusted cert) would be a
-/// security defect, not a test-writing choice to shrug at.
+/// Verification must actually verify: the cluster's `trusted_ca` is a DIFFERENT CA from the one that signed the
+/// upstream's certificate. Accepting that certificate would be a security defect.
 #[test]
 fn upstream_tls_verification_rejects_the_wrong_ca() {
     run_local(async {
@@ -476,15 +443,10 @@ fn upstream_tls_verification_rejects_the_wrong_ca() {
     });
 }
 
-/// A `validation_context` with only `trusted_ca` set validates chain trust
-/// alone -- Envoy does NOT perform RFC 6125 hostname verification from
-/// `trusted_ca` (or `system_root_certs`) by itself. Here the cluster's `sni`
-/// is `wrong.test` while the upstream's certificate is only valid for
-/// `upstream.test`, and the handshake still succeeds. This is genuine Envoy
-/// parity, not a bug in this proxy -- but it is a real footgun: `trusted_ca`
-/// alone is chain-of-trust-only, not identity checking. The real defense is
-/// `match_typed_subject_alt_names`, exercised by
-/// `upstream_tls_san_matcher_rejects_a_mismatched_certificate` below.
+/// A `validation_context` with only `trusted_ca` validates chain trust alone. Envoy does NOT do RFC 6125 hostname
+/// verification from `trusted_ca` by itself. Here `sni` is `wrong.test` while the upstream certificate is valid only for
+/// `upstream.test`, and the handshake still succeeds. That is genuine Envoy parity, and a real footgun: the defense is
+/// `match_typed_subject_alt_names`, exercised by `upstream_tls_san_matcher_rejects_a_mismatched_certificate`.
 #[test]
 fn upstream_tls_trusted_ca_alone_does_not_verify_the_hostname() {
     run_local(async {
@@ -523,12 +485,9 @@ fn upstream_tls_trusted_ca_alone_does_not_verify_the_hostname() {
     });
 }
 
-/// The real defense against the footgun above: `match_typed_subject_alt_names`
-/// performs the actual identity check. A DNS/exact matcher for `wrong.test`
-/// rejects a certificate whose only SAN is `upstream.test` (503); the same
-/// setup with a matcher for `upstream.test` (the positive control) succeeds,
-/// proving the 503 comes from the matcher itself and not something incidental
-/// like a malformed bootstrap.
+/// The real defense against that footgun: `match_typed_subject_alt_names` performs the identity check. A matcher for
+/// `wrong.test` rejects a certificate whose only SAN is `upstream.test` (503). The positive control, a matcher for
+/// `upstream.test`, succeeds. That shows the 503 comes from the matcher, not a malformed bootstrap.
 #[test]
 fn upstream_tls_san_matcher_rejects_a_mismatched_certificate() {
     run_local(async {
@@ -604,11 +563,8 @@ fn upstream_tls_san_matcher_rejects_a_mismatched_certificate() {
     });
 }
 
-/// Strict-mode guard: a `ClusterManager` built with
-/// `proxy_cluster::transport::reject_tls_builder()` (the default for anyone
-/// who hasn't installed the real TLS builder) must reject a cluster that
-/// configures a `transport_socket`, not silently serve it in plaintext.
-/// No sockets needed -- this is about `update_from_snapshot`'s return value.
+/// Strict-mode guard: a `ClusterManager` built with `reject_tls_builder()` (the default without a real TLS builder)
+/// must reject a cluster that configures a `transport_socket`, not serve it in plaintext. No sockets needed.
 #[tokio::test]
 async fn strict_mode_cluster_manager_rejects_a_tls_cluster_without_a_transport_socket_builder() {
     let manager = Arc::new(ClusterManager::new(

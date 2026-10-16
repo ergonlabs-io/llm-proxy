@@ -1,23 +1,15 @@
-//! Active health checking: periodically probes hosts and flips
-//! [`HealthStatus`] on consecutive pass/fail runs, publishing the transition
-//! as a fresh [`HostSet`] snapshot rather than mutating a `Host` in place --
-//! the same "control computes, workers swap" model discovery already uses
-//! (see [`crate::manager`]/ADR-0003). This module runs entirely on the
-//! control runtime; the only thing that crosses to workers is the `Arc<Host>`
-//! snapshot itself.
+//! Active health checking: probes each host on an interval and flips its health on consecutive pass or fail
+//! runs. Each transition publishes a fresh [`HostSet`] snapshot rather than mutating a `Host` in place, the same
+//! "control computes, workers swap" model discovery uses (see [`crate::manager`] and ADR-0003). This module runs
+//! entirely on the control runtime.
 //!
-//! **IR wiring landed.** `proxy_config::ir::ClusterConfig`
-//! carries `health_check: Option<HealthCheckIR>`; [`HealthCheckConfig`]/
-//! [`HealthCheckKind`] are still defined here rather than in the IR (ground
-//! rule #2 keeps proto/IR types from leaking past `proxy-config`), and
-//! [`HealthCheckEngine::from_ir`] is the one conversion site. `crate::manager`
-//! builds an engine per config-sourced `Endpoints` cluster and calls
-//! [`HealthCheckEngine::spawn_for_host`]/aborts its `JoinHandle` as
-//! `diff_host_sets` reports hosts added/removed on each refresh.
+//! The IR wiring is done: `ClusterConfig::health_check` carries a `HealthCheckIR`, and
+//! [`HealthCheckEngine::from_ir`] is the one conversion site. [`HealthCheckConfig`] and [`HealthCheckKind`] stay
+//! here rather than in the IR, so proto and IR types do not leak past `proxy-config` (AGENTS.md invariant 2).
+//! `crate::manager` builds one engine per config-sourced `Endpoints` cluster and aborts a host's probe when it
+//! leaves membership.
 //!
-//! gRPC health checks (`grpc.health.v1.Health/Check`) are **out of scope**
-//! here -- see [`HealthCheckKind`]'s doc comment for why silently reporting
-//! "healthy" would be worse than not supporting the mode at all.
+//! gRPC health checks (`grpc.health.v1.Health/Check`) are out of scope. See [`HealthCheckKind`] for why.
 
 use std::io;
 use std::net::SocketAddr;
@@ -38,38 +30,25 @@ use crate::{HealthFlags, HealthStatus, Host};
 /// with no explicit `expected_statuses`: 200 and nothing else.
 pub const DEFAULT_EXPECTED_HTTP_STATUS: u16 = 200;
 
-/// Envoy's default `no_traffic_interval`: the interval used for a host that
-/// hasn't received any traffic since its last check.
+/// Envoy's default `no_traffic_interval`: the interval for a host with no traffic since its last check. Not
+/// wired yet. `Host` carries no since-last-check traffic signal (`active_requests` is a live gauge), and guessing
+/// would be a silent approximation (AGENTS.md invariant 1). Every loop sleeps `interval` plus jitter for now.
 ///
-/// TODO: this constant exists so the config surface is
-/// complete, but nothing in this engine actually switches to it yet --
-/// "has this host received traffic recently" is a signal `Host` doesn't
-/// carry today (`active_requests` is a live gauge, not a
-/// since-last-check-count), and wiring it correctly is the router/pool's
-/// job, not this one. Every check loop here always sleeps
-/// `interval` (+ jitter). Getting `no_traffic_interval` right without a real
-/// traffic signal would mean guessing, which AGENTS.md invariant 1's spirit
-/// (no silent approximations) argues against -- better to leave it unwired
-/// and documented than to fake the behavior.
+/// TODO: wire this once the router or pool can report traffic per host.
 pub const DEFAULT_NO_TRAFFIC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What a health check sends and expects, per protocol.
 #[derive(Debug, Clone)]
 pub enum HealthCheckKind {
-    /// Envoy's `HttpHealthCheck`: a `GET` to `path`, `Connection: close`, with
-    /// an optional `Host` header override. `expected_statuses.is_empty()`
-    /// means "use [`DEFAULT_EXPECTED_HTTP_STATUS`]" (Envoy's own
-    /// zero-value-means-default convention for this field).
+    /// Envoy's `HttpHealthCheck`: a `GET` to `path` with `Connection: close` and an optional `Host` override.
+    /// Empty `expected_statuses` means [`DEFAULT_EXPECTED_HTTP_STATUS`], Envoy's zero-value convention.
     Http {
         path: String,
         expected_statuses: Vec<u16>,
         host: Option<String>,
     },
-    /// Envoy's `TcpHealthCheck`: after connecting, optionally write `send`,
-    /// then optionally read exactly `expect.len()` bytes and require an exact
-    /// match. An empty `send` skips the write; an empty `expect` makes a bare
-    /// TCP connect the whole check (Envoy allows this too -- it's the
-    /// "just prove something's listening" mode).
+    /// Envoy's `TcpHealthCheck`: connect, optionally write `send`, then optionally read `expect.len()` bytes and
+    /// require an exact match. An empty `expect` makes a bare connect the whole check.
     Tcp { send: Vec<u8>, expect: Vec<u8> },
     // TODO (out of scope here): `grpc.health.v1.Health/Check`.
     // Deliberately not a variant yet -- a stub that always reports healthy
@@ -101,11 +80,9 @@ pub struct HealthCheckConfig {
     pub interval_jitter: Duration,
 }
 
-/// A host's per-check consecutive-count state machine (Envoy's threshold
-/// semantics): thresholds are *consecutive* counts, not ratios, and any
-/// result of the opposite kind resets the run back to zero. This is a plain
-/// data type (no I/O, no async) so its transition logic is unit-testable in
-/// isolation from the network/timing code around it.
+/// A host's per-check consecutive-count state machine (Envoy's threshold semantics). Thresholds count consecutive
+/// results, not ratios, and a result of the opposite kind resets the run. It does no I/O, so its transitions are
+/// unit-testable on their own.
 struct ConsecutiveTracker {
     healthy_threshold: u32,
     unhealthy_threshold: u32,
@@ -127,10 +104,8 @@ impl ConsecutiveTracker {
         }
     }
 
-    /// Feed one check result. Returns `Some(new_status)` only when this
-    /// result actually caused a transition, so callers know to republish;
-    /// `None` covers both "still within threshold" and "already settled"
-    /// (e.g. a success while already `Healthy` just resets the failure run).
+    /// Feeds one result. Returns `Some(new_status)` only on a transition, so callers know to republish. `None`
+    /// means no change.
     fn record(&mut self, success: bool) -> Option<HealthStatus> {
         if success {
             self.consecutive_failures = 0;
@@ -155,13 +130,10 @@ impl ConsecutiveTracker {
     }
 }
 
-/// Runs one cluster's active health checks and publishes transitions onto a
-/// shared [`HostSet`] slot.
+/// Runs one cluster's active health checks and publishes transitions to a shared [`HostSet`] slot.
 ///
-/// Rust note: `Send + Sync` (not `!Send` -- see ADR-0003) is exactly right
-/// here: this type only ever runs on the control runtime, spawning one
-/// `tokio::spawn`ed loop per host, and hands the *results* to workers only
-/// via the `Arc<HostSet>` it stores into `host_set`.
+/// Rust note: `Send + Sync` is right here (ADR-0003). This type runs only on the control runtime, spawning one
+/// loop per host, and hands results to workers only through the `Arc<HostSet>` it stores.
 pub struct HealthCheckEngine {
     config: HealthCheckConfig,
     kind: HealthCheckKind,
@@ -172,12 +144,8 @@ impl HealthCheckEngine {
         Arc::new(Self { config, kind })
     }
 
-    /// Builds an engine from the lowered IR: the
-    /// module doc's wiring plan, now that `ClusterConfig::health_check`
-    /// exists. This is the one place `proxy_config::ir::HealthCheckIR`/
-    /// `HealthCheckKindIR` convert to this module's own
-    /// `HealthCheckConfig`/`HealthCheckKind` -- AGENTS.md invariant 2 keeps the IR
-    /// types from leaking any further than this call site.
+    /// Builds an engine from the lowered IR. This is the one place `HealthCheckIR` and `HealthCheckKindIR` convert
+    /// to this module's types (AGENTS.md invariant 2).
     pub fn from_ir(ir: &proxy_config::ir::HealthCheckIR) -> Arc<Self> {
         let config = HealthCheckConfig {
             interval: ir.interval,
@@ -205,28 +173,16 @@ impl HealthCheckEngine {
         Self::new(config, kind)
     }
 
-    /// Spawn a check loop for one host address on the current (control)
-    /// runtime. The first check fires immediately -- there is no initial
-    /// `interval` sleep before it -- matching Envoy's own "check as soon as a
-    /// host is added" behavior; every following check is spaced `interval`
-    /// (+ jitter) apart, timed from when the previous check *finished* (a
-    /// slow upstream doesn't get checked back-to-back).
+    /// Spawns a check loop for one host on the control runtime. The first check fires immediately, as in Envoy.
+    /// Each later check waits `interval` plus jitter after the previous one finishes, so a slow host is not
+    /// checked back to back.
     ///
-    /// The loop runs until `host_set`'s last strong reference is dropped
-    /// (aside from this task's own clone) or the returned handle is aborted.
-    /// `ManagedCluster::reconcile_probes` aborts the handle of a host that
-    /// leaves membership (see the module doc's IR-wiring note).
+    /// The loop runs until the handle is aborted (`ManagedCluster::reconcile_probes` does that when the host leaves
+    /// membership) or `host_set`'s last strong reference is gone.
     ///
-    /// `outlier_detector` links active HC (this module) and outlier detection,
-    /// which are otherwise independent, but a
-    /// host that recovers here should also clear an outlier ejection --
-    /// [`OutlierDetector::on_active_health_check_pass`] already implements
-    /// that (including its own `uneject_on_healthy_active_hc` check), it
-    /// just had nothing calling it. `None` when the cluster configures no
-    /// outlier detection at all, in which case this is a no-op. The
-    /// direction is one-way: an *unhealthy* active-check transition never
-    /// touches the detector, and outlier ejection never touches
-    /// `failed_active_hc`.
+    /// `outlier_detector` links the two otherwise independent subsystems one way: a host that recovers here also
+    /// clears an outlier ejection (see [`OutlierDetector::on_active_health_check_pass`]). `None` makes that a no-op.
+    /// An unhealthy transition never touches the detector.
     pub fn spawn_for_host(
         self: &Arc<Self>,
         addr: SocketAddr,
@@ -263,11 +219,10 @@ impl HealthCheckEngine {
         }
     }
 
-    /// `interval` plus a uniform-random draw in `[0, interval_jitter)`.
+    /// `interval` plus a uniform random draw in `[0, interval_jitter)`.
     ///
-    /// Rust note: a fresh `rand::thread_rng()` per call rather than a stored
-    /// `Mutex<StdRng>` (like the load balancers use) -- this runs on its own
-    /// task with no shared state to protect, so there's nothing to guard.
+    /// Rust note: a fresh `thread_rng()` per call. The loop has no shared state to lock, unlike the load balancers'
+    /// stored RNG.
     fn next_delay(&self) -> Duration {
         if self.config.interval_jitter.is_zero() {
             return self.config.interval;
@@ -281,9 +236,7 @@ impl HealthCheckEngine {
         self.config.interval + Duration::from_nanos(jitter)
     }
 
-    /// One check attempt, `timeout`-bounded: a timeout or any I/O failure
-    /// counts as a failure (Envoy makes no distinction there either -- both
-    /// just mean "the host didn't answer this probe in time").
+    /// One check, bounded by `timeout`. A timeout or any I/O failure counts as a failure, as in Envoy.
     async fn run_single_check(&self, addr: SocketAddr) -> bool {
         matches!(
             tokio::time::timeout(self.config.timeout, self.attempt_check(addr)).await,
@@ -303,37 +256,18 @@ impl HealthCheckEngine {
     }
 }
 
-/// Replace one host's `failed_active_hc` flag in `host_set` and publish the
-/// result, but only if the address is still present and that flag actually
-/// differs -- a no-op store would just be needless churn for every reader
-/// watching this `ArcSwap`. The outlier-detection flag
-/// (`failed_outlier_check`) is carried over untouched: active HC and
-/// outlier detection are independent axes (see [`crate::HealthFlags`]), so a
-/// health-check transition must never clobber an outlier ejection that's
-/// concurrently in effect.
+/// Replaces one host's `failed_active_hc` flag and publishes, but only if the address is still present and the
+/// flag actually changes. `failed_outlier_check` is carried over, since the two axes are independent (see
+/// [`crate::HealthFlags`]).
 ///
-/// Rust note: `Host` has no interior mutability for `health_flags` (unlike
-/// `active_requests`'s `AtomicU64`) precisely so this can't race with a
-/// reader mid-read -- a whole new `Arc<Host>` is built and the whole
-/// `HostSet` swapped, the same "control computes, workers swap" discipline
-/// [`crate::discovery`] already uses for DNS flaps.
+/// Rust note: `Host` has no interior mutability for `health_flags`. A whole new `Arc<Host>` is built and the
+/// `HostSet` swapped, the same discipline [`crate::discovery`] uses.
 fn apply_health_transition(host_set: &ArcSwap<HostSet>, addr: SocketAddr, status: HealthStatus) {
-    // Rust note: `rcu` (read-copy-update), NOT `load()` then `store()`.
-    //
-    // There is one of these tasks *per host*, all sharing this one `ArcSwap`,
-    // so a plain load/modify/store is a lost-update race: task A and task B
-    // both load snapshot S, A stores S+{a: Unhealthy}, then B stores
-    // S+{b: Unhealthy} -- computed from the stale S, so it silently reverts
-    // A's transition. And because `ConsecutiveTracker::record` only returns
-    // `Some` on the *edge*, A never re-publishes: the host stays wrongly
-    // Healthy until it happens to flap again. That is a permanent lost
-    // transition, and it is likeliest exactly when it matters most -- a
-    // provider outage flips many hosts at once.
-    //
-    // `rcu` re-runs the closure against the newest value whenever it loses
-    // the compare-and-swap, so concurrent transitions compose instead of
-    // clobbering. The closure must therefore be pure and cheap; rebuilding a
-    // `HostSet` is both.
+    // Rust note: `rcu` (read-copy-update), NOT `load()` then `store()`. One task runs per host, all on this one
+    // `ArcSwap`. A plain load, modify, and store is a lost-update race: two tasks load snapshot S, and the second
+    // store reverts the first's transition. `ConsecutiveTracker` reports only the edge, so the lost transition is
+    // never republished. `rcu` reruns the closure against the newest value on a lost compare-and-swap, so concurrent
+    // transitions compose. The closure must be pure and cheap.
     let failed_active_hc = status == HealthStatus::Unhealthy;
     host_set.rcu(|current| {
         let updated: Vec<Arc<Host>> = current
@@ -351,10 +285,8 @@ fn apply_health_transition(host_set: &ArcSwap<HostSet>, addr: SocketAddr, status
                             failed_active_hc,
                             failed_outlier_check: h.health_flags.failed_outlier_check,
                         },
-                        // Shared, not copied -- a health flip must not erase
-                        // in-flight accounting that `LeastRequestLb` reads,
-                        // and a guard holding the old snapshot must decrement
-                        // the counter the new snapshot reads.
+                        // Shared, not copied: a health flip must not erase in-flight accounting, and a guard on the old
+                        // snapshot must decrement the counter the new one reads.
                         active_requests: Arc::clone(&h.active_requests),
                     })
                 } else {
@@ -366,9 +298,8 @@ fn apply_health_transition(host_set: &ArcSwap<HostSet>, addr: SocketAddr, status
     });
 }
 
-/// A minimal HTTP/1.1 `GET`, hand-rolled rather than pulled in via `hyper` --
-/// a health check only needs to send one fixed request and read a status
-/// line back, and this crate has no HTTP client dependency to reuse today.
+/// A hand-rolled HTTP/1.1 `GET`. A health check needs one fixed request and the status line back, and this crate
+/// has no HTTP client to reuse.
 async fn http_check(
     addr: SocketAddr,
     path: &str,
@@ -382,9 +313,8 @@ async fn http_check(
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
 
-    // `Connection: close` means the server closes once it's done responding,
-    // so reading to EOF gets the whole response without needing to parse
-    // `Content-Length`/chunked framing -- we only need the status line.
+    // `Connection: close` means reading to EOF gets the whole response, so no `Content-Length` or chunked parsing
+    // is needed. Only the status line is used.
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
 
@@ -668,13 +598,8 @@ mod tests {
         )])));
         engine.spawn_for_host(addr, host_set, None);
 
-        // If the first check waited a full `interval` before firing, this
-        // would time out (the interval is an hour); it must resolve almost
-        // immediately. Real (unpaused) time here: mixing a paused clock with
-        // genuine socket I/O races the paused-clock auto-advance against the
-        // OS actually delivering the connect event, which is exactly the
-        // flakiness this bounded real-time wait avoids -- the bound itself
-        // (2s) is generous but the loopback connect resolves in microseconds.
+        // The first check must fire almost at once. Real time, not a paused clock, because paused time races the
+        // loopback connect. The 2s bound is generous, since the connect takes microseconds.
         tokio::time::timeout(Duration::from_secs(2), checked.notified())
             .await
             .expect("first health check must fire immediately on host add");
@@ -682,12 +607,8 @@ mod tests {
 
     // --------------------------- publishes a new HostSet HostPicker observes --
 
-    /// Poll `cond` on real wall-clock time until it's true or `deadline`
-    /// elapses. Used instead of a fixed sleep count so these tests aren't
-    /// tuned to a guessed number of check ticks -- see the module test
-    /// notes on why real time (not `tokio::time::pause`) is used here: these
-    /// tests assert on genuine TCP connect/refuse timing, which races
-    /// unpredictably against paused-clock auto-advance.
+    /// Polls `cond` on real wall-clock time until it holds or `deadline` elapses, instead of a fixed sleep. These
+    /// tests assert on real TCP timing, which races a paused clock's auto-advance.
     async fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) {
         let start = std::time::Instant::now();
         while !cond() {
@@ -699,14 +620,9 @@ mod tests {
         }
     }
 
-    /// Every host has its own check task writing to one shared `ArcSwap`, so
-    /// `apply_health_transition` must compose concurrent updates rather than
-    /// clobber them. With a `load()`/`store()` implementation this loses
-    /// transitions and the assertion below fails; with `rcu` it holds.
-    ///
-    /// The lost update is *permanent*, not transient, which is what makes it
-    /// worth a dedicated test: `ConsecutiveTracker` only reports the edge, so
-    /// a clobbered transition is never re-published.
+    /// Every host's check task writes one shared `ArcSwap`, so `apply_health_transition` must compose concurrent
+    /// updates. A `load`/`store` version loses transitions and fails this test. The loss is permanent, since a
+    /// clobbered edge is never republished.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_transitions_on_different_hosts_do_not_clobber_each_other() {
         const HOSTS: u16 = 64;
@@ -749,15 +665,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_transition_publishes_a_host_set_the_picker_then_observes() {
-        // Two hosts at the same priority: `flaky` starts with nothing
-        // listening (its checks fail), `steady` has a real listener and is
-        // never health-checked (so it's always `Healthy`, a stable baseline
-        // to assert the picker's behavior against). With 2 hosts and 1
-        // healthy (50%, not below the panic threshold, see
-        // `load_balancer::PANIC_THRESHOLD_PERCENT`), the picker should
-        // exclude `flaky` once it flips -- unlike a *single*-host set, where
-        // panic-widening would select it anyway (see
-        // `load_balancer::tests::all_unhealthy_everywhere_still_returns_a_host_via_panic`).
+        // `flaky` has nothing listening, so its checks fail. `steady` has a real listener and no checks, so it stays
+        // `Healthy`. With 1 of 2 healthy (50%, above the panic threshold; see `load_balancer::PANIC_THRESHOLD_PERCENT`),
+        // the picker should exclude `flaky` once it flips.
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let flaky_addr = probe.local_addr().unwrap();
         drop(probe); // nothing listens yet -> connect fails -> check fails
@@ -794,9 +704,7 @@ mod tests {
 
         engine.spawn_for_host(flaky_addr, Arc::clone(&host_set), None);
 
-        // Two consecutive failed connects (unhealthy_threshold=2) must flip
-        // `flaky`, and once it does, every pick over a wider sample should
-        // land only on `steady`.
+        // Two failed connects (`unhealthy_threshold=2`) flip `flaky`. After that, every pick should land on `steady`.
         wait_until(Duration::from_secs(2), || {
             (0..20).all(|_| picker.pick(&host_set.load(), &ctx).unwrap().address == steady_addr)
         })
@@ -823,11 +731,8 @@ mod tests {
 
     #[tokio::test]
     async fn enough_unhealthy_hosts_trip_the_panic_threshold() {
-        // Three hosts; two never accept a connection (fail forever), one is
-        // always healthy. unhealthy_threshold=1 so a single failed check
-        // flips a host. 2 of 3 unhealthy -> 33% healthy < 50% panic
-        // threshold -> HostPicker should widen to all three rather than
-        // starving on the one healthy host.
+        // Three hosts, two always failing (`unhealthy_threshold=1`). 33% healthy is below the 50% panic threshold, so
+        // the picker widens to all three rather than starve on the one healthy host.
         let bad1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bad1_addr = bad1.local_addr().unwrap();
         drop(bad1);

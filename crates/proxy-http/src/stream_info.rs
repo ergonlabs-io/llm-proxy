@@ -8,22 +8,10 @@ use std::time::{Duration, Instant, SystemTime};
 use proxy_observability::trace::TraceContext;
 use proxy_observability::ResponseFlag;
 
-/// Tokens billed for one LLM request, as reported by the provider.
-///
-/// Four buckets, not two, and they are mirrored one-for-one from
-/// `proxy_filters::usage::TokenUsage` — because the four are **priced
-/// differently**. Cache-read tokens bill at a steep discount and cache-write
-/// tokens at a premium, so a downstream consumer handed only
-/// `input`/`output` cannot compute a correct cost. Collapsing them here would
-/// make the token-budget limiter structurally unable to be right.
-///
-/// The buckets do not overlap — `input_tokens` is already net of the cached
-/// portion — so [`total`](Self::total) is a plain sum.
-///
-/// Deliberately a plain data struct rather than a re-export of
-/// `proxy_filters::usage::TokenUsage`: `proxy-filters` depends on
-/// `proxy-http`, so the dependency cannot point the other way. The usage
-/// filter converts at its boundary.
+/// Provider-reported token usage. The four buckets remain separate because
+/// cache reads and writes have different prices; input tokens exclude cached
+/// tokens, so [`total`](Self::total) sums the buckets. This type stays here
+/// because `proxy-filters` depends on `proxy-http`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LlmTokenUsage {
     /// Standard (non-cached) input tokens, at the base input rate.
@@ -79,13 +67,8 @@ impl GenAiSystem {
     }
 }
 
-/// The GenAI observations for one stream, filled in by the usage filter
-/// on the encode path.
-///
-/// `None` everywhere is the correct state for a non-LLM route, a request that
-/// never reached an upstream, or a provider response that reported no usage —
-/// *absent* usage must never be recorded as zero
-/// tokens, because this number feeds billing.
+/// GenAI observations filled by the usage filter. Missing usage remains
+/// `None`, never zero, because these values feed billing.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LlmStats {
     pub usage: Option<LlmTokenUsage>,
@@ -138,28 +121,9 @@ pub struct LlmStats {
     pub response_chunks: u64,
 }
 
-/// Who the downstream caller was authenticated as, written by the auth
-/// filter (`proxy-filters`) on the decode path.
-///
-/// # Why plain `String`s and not `proxy_filters::auth::Principal`
-///
-/// Same dependency direction as [`LlmTokenUsage`] above: `proxy-filters`
-/// depends on `proxy-http`, so the richer type cannot travel the other way.
-/// The auth filter converts at its boundary. What crosses is deliberately only
-/// the two *identifiers* — a `Principal` also carries an `Arc<TenantPolicy>`,
-/// and policy is not something a downstream consumer of `StreamInfo` (access
-/// logs, stats) has any business reading.
-///
-/// # `None` means "not authenticated", and every reader must treat it as such
-///
-/// A stream where the auth filter is not configured, or that was refused
-/// before authentication, leaves both fields `None`. **A consumer keying
-/// anything security-relevant off `tenant` must fail closed on `None` rather
-/// than substitute a default**, because the alternative — one shared implicit
-/// bucket for every unauthenticated caller — is exactly the identity confusion
-/// authentication exists to remove. See
-/// `proxy_filters::token_limit_filter`'s bucket-key selection for the one
-/// consumer that exists today and how it handles the absent case.
+/// Authenticated caller identifiers from the auth filter. Policy is not
+/// exposed through `StreamInfo`; consumers of security-sensitive identity
+/// must treat `None` as unauthenticated and fail closed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AuthInfo {
     /// The tenant (account/team) the credential resolved to.
@@ -217,15 +181,7 @@ impl AttemptInfo {
     }
 }
 
-/// Envoy's `StreamInfo`: populated throughout the request lifecycle, consumed by
-/// access logging and stats.
-///
-/// TODO: attempt count,
-/// dynamic metadata, filter state. Response flags, upstream host/cluster,
-/// protocol, and byte counts are wired -- see
-/// `router::apply_forward` (flags, upstream host/cluster, protocol, at the
-/// dial site) and `router::logging::LoggingBody` (`bytes_sent`, finalized at
-/// stream end, not at header-flush time).
+/// Per-request state consumed by access logging and stats.
 #[derive(Debug)]
 pub struct StreamInfo {
     pub downstream: Option<crate::handler::DownstreamInfo>,

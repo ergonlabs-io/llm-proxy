@@ -23,12 +23,8 @@ const LISTENER_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Li
 /// harness hung" into a fast, named failure instead of a stall.
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Rust note: same `mpsc::Receiver`-as-`Stream` shape as
-/// `controlplane::server`'s internal one, duplicated here because the real
-/// one is a private implementation detail of the server, not part of the
-/// harness's public API. It lets this test send requests interactively
-/// (react to a response, then send the next request) instead of handing the
-/// client a fixed `Vec` up front.
+/// Rust note: the receiver stream enables interactive request/response steps;
+/// the server's equivalent is private.
 struct OutboundStream(mpsc::Receiver<DiscoveryRequest>);
 
 impl Stream for OutboundStream {
@@ -384,15 +380,9 @@ async fn wait_for_nack_does_not_accept_an_ack_for_the_same_nonce() {
     harness.shutdown().await;
 }
 
-/// The reconnect-resync scenario named in the client acceptance criteria and that
-/// `Step::Send` alone could not express: `DropStream` ends stream 1, the
-/// client opens stream 2, and the script resumes at the step *after*
-/// `DropStream` rather than replaying from the top.
-///
-/// Rust note: `flavor = "multi_thread"` per AGENTS.md "Build And Test" -- this test
-/// drives two concurrent streams against the same in-process server, and a
-/// `current_thread` runtime is exactly the shape that has produced real
-/// hangs here before.
+/// Reconnects on a second stream and resumes the script after `DropStream`.
+/// Rust note: a multi-thread runtime lets both streams progress against the server
+/// (AGENTS.md "Build And Test").
 #[tokio::test(flavor = "multi_thread")]
 async fn drop_stream_resumes_script_on_reconnect() {
     let harness = Harness::spawn(vec![

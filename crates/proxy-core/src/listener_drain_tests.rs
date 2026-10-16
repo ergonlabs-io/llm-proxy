@@ -1,7 +1,6 @@
-//! Owner-boundary proof of what a worker does when a drain starts: the real
-//! `initial_bind` + `run_listener_manager` + accept loops + HTTP/1 codec over
-//! real sockets (`internal-docs/architecture.md` section 8, "Drain"). Every
-//! wait is bounded by `WAIT`; nothing asserts a wall-clock window.
+//! Owner-boundary proof of what a worker does when a drain starts: the real `initial_bind`, `run_listener_manager`,
+//! accept loops, and HTTP/1 codec over real sockets (`internal-docs/architecture.md` section 8, "Drain"). Every wait is
+//! bounded by `WAIT`.
 use super::*;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

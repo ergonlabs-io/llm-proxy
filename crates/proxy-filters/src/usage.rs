@@ -1,50 +1,16 @@
-//! Provider usage/token extraction.
-//!
-//! This module answers one question: **how many tokens did this response
-//! cost?** It is the input to token-based rate limiting (the budget store and
-//! the 429 enforcement path) and to the GenAI token counters.
-//!
-//! # Why this is a pure-function module
-//!
-//! Everything here operates on plain byte slices and owns no I/O, no async,
-//! and no filter-chain state. That is deliberate: it makes the tricky part
-//! (parsing) exhaustively unit-testable against scripted provider responses,
-//! and it keeps the streaming filter that eventually calls it trivial.
-//!
-//! # The hard requirement: streaming-safe, never buffer the stream
-//!
-//! The encode path guarantees flush-through — tokens reach the client
-//! as they arrive. So usage extraction may **not** accumulate the response
-//! body to parse it at the end. [`SseUsageScanner`] is fed whatever byte chunks
-//! happen to arrive and must retain only a bounded amount of state (at most one
-//! partial line).
-//!
-//! Chunk boundaries fall in arbitrary places — mid-line, mid-JSON, even mid
-//! UTF-8 character. A scanner that assumes each `push` is a whole line or a
-//! whole event is the single most likely bug in this module, which is why the
-//! tests hammer that case specifically.
-//!
-//! # Status
-//!
-//! Extraction is complete for all three dialects (OpenAI chat completions,
-//! OpenAI Responses, and Anthropic Messages), streaming and non-streaming, and
-//! the full acceptance suite below runs in the CI gate.
-//!
-//! This module is a pure extractor; [`crate::usage_filter`] wires it into the
-//! encode chain.
+//! Extracts provider token usage from response bytes. The scanner must remain
+//! streaming-safe: response chunks pass through immediately, so it retains
+//! only bounded state and handles boundaries inside lines, JSON, and UTF-8.
+//! [`crate::usage_filter`] wires it into the encode chain.
 
 /// Tokens consumed by one request/response exchange, split into the buckets
 /// that are **priced differently** so downstream cost accounting can apply a
 /// per-bucket rate.
 ///
-/// The buckets are deliberately **non-overlapping** — each token is counted in
-/// exactly one field — so [`total`](Self::total) is a true sum and each field
-/// can be multiplied by its own rate without double-counting. This means
-/// `input_tokens` is the *non-cached* input only: for OpenAI, whose
-/// `prompt_tokens` is inclusive of cached tokens, we subtract the cached
-/// portion out; for Anthropic, whose `input_tokens` already excludes cache, we
-/// take it as-is. (So `input_tokens` here will not always equal the provider's
-/// headline `prompt_tokens`.)
+/// Buckets do not overlap, so totals and per-bucket pricing avoid
+/// double-counting. `input_tokens` excludes cached tokens: OpenAI cached
+/// tokens are subtracted from `prompt_tokens`, while Anthropic input already
+/// excludes them.
 ///
 /// Rust note: `Copy` is derived because this is four `u64`s — small enough that
 /// copying is cheaper than referencing, so callers needn't think about borrows.
@@ -545,11 +511,8 @@ impl RawTokens {
 /// `None` for *any* JSON number that isn't a non-negative integer — including
 /// a perfectly ordinary `150.0`, which real providers do emit — and every
 /// caller here used to feed that straight into `.unwrap_or(0)` two calls
-/// downstream in [`usage_from_object`]. That silently turned "provider sent a
-/// float" into "provider sent zero", which is a confident wrong billing
-/// number with nothing logged and nothing erroring. This function is the
-/// single place that distinction gets made, so it only has to be gotten
-/// right once:
+/// downstream in [`usage_from_object`], silently turning a reported float
+/// into a wrong billing number. This function keeps that distinction explicit:
 /// - a non-negative JSON integer passes through unchanged;
 /// - a non-negative finite float is truncated toward zero (`150.0` means
 ///   150; a provider using a float for a count is a formatting difference,

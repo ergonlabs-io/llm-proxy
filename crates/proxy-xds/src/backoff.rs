@@ -4,28 +4,18 @@
 //! attempt number and one caller-supplied draw, which is what makes every
 //! claim below assertable without waiting for wall-clock time.
 //!
-//! The requirement is stream re-establishment with jittered backoff,
-//! 500ms to 30s. Those two numbers are Envoy's own
-//! `RetryInitialDelayMs`/`RetryMaxDelayMs` for the xDS mux, so they are the
-//! defaults here.
+//! Reconnects use jittered backoff from 500ms to 30s. Those are Envoy's xDS
+//! mux defaults (`RetryInitialDelayMs` and `RetryMaxDelayMs`).
 //!
-//! # This is NOT the same curve as S3.3
+//! This is NOT the HTTP retry curve. [`proxy_http::retry::backoff_delay`]
+//! draws from `[0, (2^n - 1) * base]` (S3.3). Envoy's xDS mux draws from
+//! `[0, base * 2^n]`, so the first reconnect waits up to `base`. Copying the
+//! retry curve would turn a control plane restart into a hot loop, which
+//! `internal-docs/architecture.md` §12.2 rule 5 forbids.
 //!
-//! Easy to get wrong, because the repo already contains a fully-jittered
-//! backoff: [`proxy_http::retry::backoff_delay`] draws from
-//! `[0, (2^n - 1) * base]` per **S3.3**, which is the HTTP retry policy's
-//! curve. Envoy's xDS mux uses `JitteredExponentialBackOffStrategy`, whose
-//! interval is `base * 2^n` -- so the first xDS reconnect waits up to
-//! `base` (500ms), not up to zero. Copying the retry curve here would make
-//! the first reconnect instantaneous and turn a control plane restart into a
-//! hot loop, which is precisely what `internal-docs/architecture.md` §12.2
-//! rule 5 ("never NACK-storm") forbids.
-//!
-//! One deliberate, harmless divergence: Envoy draws with an integer modulo,
-//! giving the half-open range `[0, cap)`. We take a float draw in `[0, 1]`
-//! and scale, giving the closed range `[0, cap]`. Nothing observes the
-//! difference; a closed range is what lets a test pin an exact delay with a
-//! constant draw of `1.0`.
+//! One deliberate divergence: the draw is a float in `[0, 1]`, giving a
+//! closed range, where Envoy's integer modulo gives a half-open one. A closed
+//! range lets a test pin an exact delay with a draw of `1.0`.
 
 use std::time::Duration;
 
@@ -54,12 +44,8 @@ impl Default for BackoffPolicy {
 /// first reconnect after a stream that had been working, and draws from
 /// `[0, base_interval]`).
 ///
-/// Rust note: randomness arrives as an `FnMut() -> f64` rather than this
-/// function reaching for a global RNG -- the same shape
-/// `proxy_http::retry::backoff_delay` uses, and for the same reason: a test
-/// supplies a constant and asserts an exact `Duration`. Values outside
-/// `[0.0, 1.0]` are clamped rather than trusted, since a bare closure
-/// carries no such guarantee in its type.
+/// Rust note: randomness is an injected `FnMut() -> f64`, so a test can supply
+/// a constant and assert an exact `Duration`. Out-of-range draws are clamped.
 pub fn delay(policy: &BackoffPolicy, attempt: u32, rng: &mut impl FnMut() -> f64) -> Duration {
     // `2^attempt` in u128 so a long outage cannot panic on overflow; it
     // saturates, and the `.min(max)` below makes saturation harmless.

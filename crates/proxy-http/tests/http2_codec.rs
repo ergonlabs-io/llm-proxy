@@ -1,14 +1,6 @@
-//! Standalone tests for the downstream HTTP/2 codec
-//! (`proxy_http::codec::serve_http2`), mirroring `tests/http1_codec.rs`'s
-//! shape and harness (in-memory `tokio::io::duplex` pipe, a hyper low-level
-//! client on the other end, `#[tokio::test]`-free `run_local` + `#[test]`
-//! since the codec is `!Send` per ADR-0003).
-//!
-//! The one thing this file exercises that `http1_codec.rs` structurally
-//! cannot: h2 multiplexes many concurrent streams over a single connection,
-//! where h1 serves one request at a time. `several_concurrent_streams_get_their_own_response_without_crosstalk`
-//! is the test written specifically to catch a shared/leaked per-stream
-//! state bug -- see its doc comment.
+//! Tests the downstream HTTP/2 codec with an in-memory client. The codec is
+//! `!Send` (ADR-0003), so tests use a local runtime. Multiplexing tests verify
+//! that concurrent streams do not share per-stream state.
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -33,10 +25,7 @@ use tokio::io::duplex;
 use tokio::task::LocalSet;
 use tokio::time::Instant;
 
-/// Run `fut` to completion on a fresh current-thread runtime + `LocalSet` --
-/// identical to `http1_codec.rs`'s helper of the same name (the codec, and
-/// `Rc<dyn StreamHandler>`, are `!Send`, so this can't run on the default
-/// multi-threaded test runtime).
+/// Run a future locally because the codec and handler are `!Send`.
 fn run_local<F: Future<Output = ()>>(fut: F) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -46,8 +35,7 @@ fn run_local<F: Future<Output = ()>>(fut: F) {
     local.block_on(&rt, fut);
 }
 
-/// A no-op shutdown future that never resolves -- for tests that don't
-/// exercise drain.
+/// A pending shutdown future for tests that do not exercise drain.
 fn never_shutdown() -> impl Future<Output = ()> {
     std::future::pending()
 }
@@ -136,8 +124,7 @@ fn post_body_is_echoed_back_over_h2() {
             let _ = conn.await;
         });
 
-        // Multi-chunk payload, same shape as `http1_codec.rs`'s equivalent
-        // test: the assertion is on the reassembled bytes.
+        // Verify that the codec reassembles the chunks without changing bytes.
         let payload = Bytes::from(
             vec![b'a'; 1024]
                 .into_iter()
@@ -161,10 +148,8 @@ fn post_body_is_echoed_back_over_h2() {
     });
 }
 
-/// A handler whose response body yields one chunk immediately, sleeps, then
-/// yields a second chunk and ends -- the same SSE-shaped early-flush fixture
-/// `http1_codec.rs` uses, proving the same "headers + first chunk flush
-/// before the body completes" property holds over h2, not just h1.
+/// Yield one response chunk immediately and another after a delay, verifying
+/// that HTTP/2 flushes headers and the first chunk before body completion.
 struct SlowChunkedHandler {
     pause: Duration,
 }
@@ -272,10 +257,7 @@ fn streamed_response_arrives_incrementally_over_h2_not_buffered() {
     });
 }
 
-/// Captures the exact `RequestHeaders` a request arrived with -- used by
-/// `request_and_response_headers_survive_intact_and_authority_reaches_routing`
-/// to check what the codec seam handed the handler, not just what came back
-/// over the wire.
+/// Capture the request headers received by the handler.
 struct CapturingHandler {
     captured: Rc<RefCell<Option<RequestHeaders>>>,
 }
@@ -309,13 +291,8 @@ impl StreamHandler for CapturingHandler {
     }
 }
 
-/// h2 has no `Host` header by default -- `:authority` is a typed
-/// pseudo-header the client sets from the request URI's authority, and
-/// `sync_route_head` (`filter_manager.rs`) prefers `head.uri.authority()`
-/// over a `Host` header for exactly this reason. This test proves that value
-/// reaches the handler (and so, transitively, routing) over h2 the same way
-/// an h1 `Host` header does, and that ordinary request/response headers
-/// round-trip intact alongside it.
+/// Verify that HTTP/2 `:authority` reaches the handler and ordinary headers
+/// round-trip intact. HTTP/2 carries authority as a pseudo-header, not `Host`.
 #[test]
 fn request_and_response_headers_survive_intact_and_authority_reaches_routing() {
     run_local(async {
@@ -346,10 +323,8 @@ fn request_and_response_headers_survive_intact_and_authority_reaches_routing() {
             let _ = conn.await;
         });
 
-        // Absolute-form URI: hyper's h2 client derives `:scheme`/`:authority`
-        // from it (same trick `send_upstream_http2` relies on) -- there is
-        // no `Host` header on this request at all, so if `:authority` didn't
-        // reach the handler this assertion would see an empty authority.
+        // Hyper derives `:authority` from the absolute URI; this request has
+        // no `Host` header.
         let req = Request::builder()
             .method("GET")
             .uri("http://example.com/authority-test")
@@ -384,11 +359,8 @@ fn request_and_response_headers_survive_intact_and_authority_reaches_routing() {
     });
 }
 
-/// A handler whose response is keyed off an `x-stream-id` request header and
-/// whose completion is deliberately delayed by an `x-delay-ms` request
-/// header -- the multiplexing test below sets these so responses complete in
-/// the REVERSE of request order, and asserts each response still carries
-/// exactly its own stream's id and body, never another concurrent stream's.
+/// Delay responses by `x-delay-ms` and echo each stream's `x-stream-id` and
+/// body, allowing the multiplexing test to detect cross-stream state leaks.
 struct StreamTaggedHandler;
 
 impl StreamHandler for StreamTaggedHandler {
@@ -412,12 +384,8 @@ impl StreamHandler for StreamTaggedHandler {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
 
-            // Read the request body BEFORE sleeping, and fold the sleep in
-            // afterwards -- if this handler's per-stream state were somehow
-            // shared across concurrent streams on the connection (the bug
-            // this test exists to catch), a concurrently-running stream
-            // could observe or clobber `stream_id`/`request_body` between
-            // this read and the response being built below.
+            // Keep the body and stream ID local across the delay; concurrent
+            // streams must not overwrite either value.
             let request_body = req.body.collect().await.expect("collect").to_bytes();
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
@@ -441,16 +409,8 @@ impl StreamHandler for StreamTaggedHandler {
     }
 }
 
-/// The single most important property this WP adds over h1: several streams
-/// concurrently in flight on ONE h2 connection, each getting exactly its own
-/// response, with no cross-talk -- and, to actually exercise interleaving
-/// rather than incidental ordering, completing in the REVERSE of the order
-/// they were sent (stream "c" is tagged with no delay and finishes first;
-/// stream "a" is tagged with the longest delay and finishes last). If
-/// `serve_http2`'s per-stream dispatch ever collapsed onto shared
-/// connection-level state (e.g. a single `StreamInfo`/handler invocation
-/// reused across streams instead of one per stream), this is the test that
-/// would see stream "a"'s response carry stream "b" or "c"'s body/id.
+/// Send concurrent streams on one connection and complete them in reverse
+/// order. Each response must retain its own stream ID and body.
 #[test]
 fn several_concurrent_streams_get_their_own_response_without_crosstalk() {
     run_local(async {
@@ -478,8 +438,7 @@ fn several_concurrent_streams_get_their_own_response_without_crosstalk() {
             let _ = conn.await;
         });
 
-        // (stream id, delay ms, request body) -- sent in this order, delays
-        // chosen so completion order is exactly reversed: c, then b, then a.
+        // (stream ID, delay, body), ordered so responses finish c, b, a.
         let streams = [
             ("a", 200u64, "payload-a"),
             ("b", 100, "payload-b"),
@@ -497,11 +456,8 @@ fn several_concurrent_streams_get_their_own_response_without_crosstalk() {
                 .header("x-delay-ms", delay_ms.to_string())
                 .body(Full::new(Bytes::from_static(payload.as_bytes())))
                 .unwrap();
-            // Rust note: each `send_request` is spawned as its own
-            // `spawn_local` task (not just `.await`ed in a loop) so all
-            // three requests are genuinely in flight on the connection
-            // concurrently, rather than one being sent only after the
-            // previous one's full response already arrived.
+            // Rust note: spawn each request so all three are in flight
+            // concurrently on the connection.
             sends.push((
                 id,
                 delay_ms,
@@ -530,9 +486,7 @@ fn several_concurrent_streams_get_their_own_response_without_crosstalk() {
             completions.push((id, delay_ms, completed_at));
         }
 
-        // Reversed-order assertion: "c" (0ms) must finish before "b"
-        // (100ms), which must finish before "a" (200ms) -- proving genuine
-        // interleaving, not request-order serialization.
+        // Completion order must be c, b, a to prove stream interleaving.
         completions.sort_by_key(|(_, delay_ms, _)| *delay_ms);
         for pair in completions.windows(2) {
             let (earlier_id, _, earlier_at) = pair[0];

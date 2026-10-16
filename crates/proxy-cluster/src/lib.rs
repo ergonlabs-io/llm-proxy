@@ -1,10 +1,8 @@
-//! Cluster subsystem: cluster manager & discovery, load balancers,
-//! active health checking, outlier detection, and upstream
-//! connection pools + circuit breakers.
+//! Cluster subsystem: cluster manager and discovery, load balancers, active health checking, outlier
+//! detection, and upstream connection pools with circuit breakers.
 //!
-//! [`ClusterEntry`] / [`HttpConnPool`] are THE seam between the HTTP router and
-//! the cluster subsystem — changes to these traits require review from both
-//! sides (AGENTS.md invariant 8).
+//! [`ClusterEntry`] and [`HttpConnPool`] are the seam between the HTTP router and this subsystem. Changes to
+//! these traits need review from both sides (AGENTS.md invariant 8).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -38,10 +36,8 @@ pub enum UpstreamProtocol {
     Http2,
 }
 
-// Rust note: the config IR carries its own `UpstreamProtocol` (protos stay in
-// `proxy-config`; the data plane consumes the IR). This `From` is the one place
-// that bridges the two, so cluster-build code maps config → runtime once and
-// stays decoupled from the IR enum's identity.
+// Rust note: the IR carries its own `UpstreamProtocol` (protos stay in `proxy-config`). This `From` is the one
+// bridge between the two, so cluster-build code maps config to runtime once.
 impl From<proxy_config::ir::UpstreamProtocol> for UpstreamProtocol {
     fn from(proto: proxy_config::ir::UpstreamProtocol) -> Self {
         match proto {
@@ -51,10 +47,8 @@ impl From<proxy_config::ir::UpstreamProtocol> for UpstreamProtocol {
     }
 }
 
-/// A simple two-state health view. [`health_check::HealthCheckEngine`]'s
-/// internal consecutive-count tracker uses it (it only ever cares "did active
-/// HC just flip me"). It is not the type stored on [`Host`] -- see
-/// [`HealthFlags`] for why a host needs two independent axes, not one enum.
+/// A two-state health view, used by [`health_check::HealthCheckEngine`]'s consecutive-count tracker. It is not
+/// the type stored on [`Host`]: a host needs two independent axes (see [`HealthFlags`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthStatus {
     #[default]
@@ -62,44 +56,33 @@ pub enum HealthStatus {
     Unhealthy,
 }
 
-/// A host's health as two independent axes, matching Envoy's own
-/// `Host::HealthFlag` bitset model: active health checking and
-/// outlier detection each fail/clear a host *independently* --  a
-/// host can be ejected by the outlier detector while still passing its
-/// active health check (or vice versa), and either one alone is enough to
-/// make the host unusable for new traffic.
+/// A host's health as two independent axes, matching Envoy's `Host::HealthFlag` bitset. Active health checking
+/// and outlier detection each set and clear their own flag, so either one alone makes the host unusable for new
+/// traffic.
 ///
-/// Rust note: a `struct` of two `bool`s (rather than a 4-variant enum) is the
-/// right shape here because the two axes are genuinely
-/// independent and owned by two different subsystems -- `health_check.rs`
-/// only ever touches `failed_active_hc`, `outlier.rs` only ever touches
-/// `failed_outlier_check`, and neither has to know the other's bit exists.
+/// Rust note: two `bool`s rather than a 4-variant enum, because the axes are independent and owned by different
+/// subsystems. `health_check.rs` only touches `failed_active_hc`, and `outlier.rs` only touches
+/// `failed_outlier_check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HealthFlags {
     /// Set by [`health_check::HealthCheckEngine`] on a failed consecutive-
     /// threshold run of active health checks; cleared on a passing run.
     pub failed_active_hc: bool,
-    /// Set by [`outlier::OutlierDetector`] when a host is ejected; cleared
-    /// when its ejection expires, an active health check passes (if
-    /// configured to do so), or it's manually un-ejected.
+    /// Set by [`outlier::OutlierDetector`] on ejection. Cleared when the ejection expires, when an active health
+    /// check passes (if configured to), or on manual un-ejection.
     pub failed_outlier_check: bool,
 }
 
 impl HealthFlags {
-    /// A host is usable for new traffic only when *no* flag is set --
-    /// matching Envoy's `Host::healthy()`, which is `!healthFlagsGet(...)`
-    /// across every flag it tracks.
+    /// Usable for new traffic only when no flag is set (Envoy's `Host::healthy()`).
     pub fn is_healthy(&self) -> bool {
         !self.failed_active_hc && !self.failed_outlier_check
     }
 }
 
 impl std::fmt::Display for HealthFlags {
-    /// Envoy-compatible rendering for the admin endpoint and the
-    /// diff rig: `""` when healthy, else each failing flag's
-    /// `/failed_active_hc`/`/failed_outlier_check` token concatenated in
-    /// that fixed order (Envoy always lists `FAILED_ACTIVE_HC` before
-    /// `FAILED_OUTLIER_CHECK` in its own health-flag enum ordering).
+    /// Envoy-compatible rendering for the admin endpoint and the diff rig: `""` when healthy, else each failing
+    /// flag's token (`/failed_active_hc`, `/failed_outlier_check`) in Envoy's fixed order.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.failed_active_hc {
             write!(f, "/failed_active_hc")?;
@@ -116,20 +99,14 @@ impl std::fmt::Display for HealthFlags {
 #[derive(Debug)]
 pub struct Host {
     pub address: SocketAddr,
-    /// The DNS name this host was resolved from (`STRICT_DNS`/`LOGICAL_DNS`),
-    /// or `None` for `STATIC` clusters whose endpoints are literal IPs.
-    ///
-    /// This is what upstream TLS uses as the SNI / certificate-verification
-    /// name when the cluster's `transport_socket` doesn't override it with an
-    /// explicit `sni`: by the time a host exists, `address` is an IP, and no
-    /// public CA issues certificates for IP addresses. Envoy keeps the same
-    /// thing on its own `Host` (`hostname()`), for the same reason.
+    /// The DNS name this host was resolved from (`STRICT_DNS`/`LOGICAL_DNS`), or `None` for literal-IP `STATIC`
+    /// endpoints. Upstream TLS uses it as the SNI and verification name unless `sni` overrides it. By the time a
+    /// host exists `address` is an IP, and no public CA issues certificates for IPs. Envoy keeps the same value
+    /// on its `Host` (`hostname()`).
     pub hostname: Option<String>,
-    /// Operator-facing endpoint labels, copied from the accepted
-    /// `io.llmproxy.endpoint` metadata namespace. They are intentionally
-    /// carried with the live host rather than re-read from config: a host set
-    /// may have arrived through EDS, and `/clusters` must describe the set
-    /// traffic can actually select.
+    /// Operator-facing endpoint labels, copied from the `io.llmproxy.endpoint` metadata namespace. They live with
+    /// the live host, not in config, because EDS can deliver the set and `/clusters` must describe what traffic
+    /// can select.
     pub metadata: BTreeMap<String, String>,
     pub weight: u32,
     /// Failover priority this host belongs to; 0 = primary (S5/S7).
@@ -137,34 +114,27 @@ pub struct Host {
     /// Active-health-check state and outlier-ejection state, tracked
     /// independently -- see [`HealthFlags`].
     pub health_flags: HealthFlags,
-    /// In-flight request count, read by `LEAST_REQUEST`'s power-of-two-choices
-    /// pick (S7). The router takes an [`ActiveRequestGuard`] from
-    /// [`Host::begin_request`] for every upstream attempt and holds it until
-    /// the response body completes or is dropped.
+    /// In-flight request count, read by `LEAST_REQUEST`'s power-of-two-choices pick (S7). The router takes an
+    /// [`ActiveRequestGuard`] from [`Host::begin_request`] per upstream attempt and holds it until the response
+    /// body completes or drops.
     ///
-    /// Rust note: an `Arc`, not a bare atomic, because `Host` is an immutable
-    /// snapshot that health checks, outlier detection and discovery rebuild.
-    /// Every rebuild of the same endpoint clones this `Arc`, so a guard
-    /// taken on an old snapshot still decrements the counter the new
-    /// snapshot reads. Only a genuinely new endpoint gets a fresh counter.
+    /// Rust note: an `Arc`, because health checks, outlier detection, and discovery rebuild `Host` snapshots.
+    /// Every rebuild of the same endpoint clones this `Arc`, so a guard taken on an old snapshot still decrements
+    /// the counter the new one reads.
     pub active_requests: Arc<AtomicU64>,
     // TODO: locality.
 }
 
 impl Host {
-    /// Usable for new traffic -- no health flag set. Load balancers (S7)
-    /// and priority spillover both read this rather than comparing
-    /// `health_flags` to a specific variant, so a third flag (should one
-    /// ever get added) doesn't require touching every call site.
+    /// Usable for new traffic: no health flag set. Load balancers and priority spillover read this, rather than
+    /// matching on `health_flags`, so a new flag does not touch every call site.
     pub fn is_healthy(&self) -> bool {
         self.health_flags.is_healthy()
     }
 
     /// Current in-flight request count (see [`Host::active_requests`]).
     ///
-    /// Rust note: `Relaxed` is enough here -- this counter has no other
-    /// memory it needs to be ordered with (we're not using it to publish or
-    /// guard access to anything else), it's just a number LB picks read.
+    /// Rust note: `Relaxed` is enough. The counter publishes nothing else, and LB picks only read the number.
     pub fn active_request_count(&self) -> u64 {
         self.active_requests.load(Ordering::Relaxed)
     }
@@ -186,9 +156,8 @@ impl Host {
     }
 }
 
-/// RAII handle for one in-flight request on a [`Host`]; dropping it
-/// decrements the host's counter, so every exit path (completion, error,
-/// downstream cancel) is balanced without explicit bookkeeping.
+/// RAII handle for one in-flight request on a [`Host`]. Dropping it decrements the counter, so every exit path
+/// (completion, error, downstream cancel) stays balanced.
 #[derive(Debug)]
 pub struct ActiveRequestGuard {
     counter: Arc<AtomicU64>,
@@ -207,49 +176,33 @@ pub struct LoadBalancerContext {
     pub hash: Option<u64>,
     /// Host override from an endpoint picker (`x-gateway-destination-endpoint`).
     pub host_override: Option<SocketAddr>,
-    /// Cluster names an earlier attempt of this same request already dialed.
-    /// An aggregate skips these when choosing a member, so a retry
-    /// falls over to the next provider instead of re-picking the one that
-    /// just failed. Empty on the first attempt; ignored by non-aggregate
-    /// clusters, which have no members to skip among.
+    /// Cluster names an earlier attempt of this request already dialed. An aggregate skips them when choosing a
+    /// member, so a retry falls over to the next provider instead of re-picking the one that just failed. Empty
+    /// on the first attempt, and ignored by non-aggregate clusters.
     ///
-    /// Rust note: a plain `Vec`, not a `HashSet` -- member lists and retry
-    /// counts are both single digits, so a linear scan is cheaper than
-    /// hashing, and there's no risk of the list growing large enough for
-    /// that to matter.
+    /// Rust note: a plain `Vec`, not a `HashSet`. Member lists are single digits, so a linear scan is cheaper.
     pub attempted_clusters: Vec<ClusterName>,
-    /// Socket addresses dispatched by earlier attempts of this request. The
-    /// list is only consulted when the route configured Envoy's
-    /// `previous_hosts` retry predicate; keeping it in the selection context
-    /// makes the predicate apply consistently to every LB policy.
+    /// Socket addresses dispatched by earlier attempts of this request. Consulted only when the route configured
+    /// Envoy's `previous_hosts` retry predicate, which applies to every LB policy.
     pub attempted_hosts: Vec<SocketAddr>,
-    /// Whether [`Self::attempted_hosts`] must reject a selected host, and how
-    /// many times a picker may re-run selection after such a rejection.
-    /// These are route policy, not cluster policy, so they belong beside the
-    /// rest of the per-request selection input.
+    /// Whether [`Self::attempted_hosts`] must reject a selected host, and how many times a picker may re-run
+    /// selection after such a rejection. These are route policy, not cluster policy.
     pub avoid_previous_hosts: bool,
     pub host_selection_retry_max_attempts: u32,
-    /// When `Some`, the request may only be sent on a tenant's own
-    /// credential, and these are the provider names it holds one for
-    /// (ADR-0007). An aggregate skips a member whose tenant-credential slot
-    /// names a provider not in this list, or that has no slot. `None` means
-    /// no such restriction.
+    /// When `Some`, the request may use only a tenant's own credential, and these are the providers it holds one
+    /// for (ADR-0007). An aggregate skips a member whose credential slot names a provider not in this list, or
+    /// that has no slot. `None` means no restriction.
     ///
-    /// Rust note: `Arc<[String]>` rather than `Vec` -- the list is built once
-    /// per control-plane snapshot and shared by every request of that tenant,
-    /// so each request clones a pointer, not the strings.
+    /// Rust note: `Arc<[String]>` because the list is built once per snapshot and shared by every request of that
+    /// tenant. Each request clones a pointer, not the strings.
     pub credential_providers: Option<std::sync::Arc<[String]>>,
 }
 
-/// Circuit-breaker accounting for one (cluster, priority) — S5's four
-/// per-priority budgets. The router enforces `max_requests` and retry
-/// admission (fixed `max_retries` or a configured dynamic `retry_budget`);
-/// connection and pending-request limits are enforced by the pool.
+/// Circuit-breaker accounting for one (cluster, priority): S5's four per-priority budgets. The router enforces
+/// `max_requests` and retry admission. Connection and pending limits are enforced by the pool.
 ///
-/// Rust note: the gauges live behind `Arc<AtomicU32>` rather than borrowed --
-/// [`CbGuard`] rides inside a streaming response body that must outlive the
-/// handler stack frame that acquired it, so it can't hold a borrow of
-/// `self`.
+/// Rust note: the gauges sit behind `Arc<AtomicU32>`, because a [`CbGuard`] rides inside a streaming response body
+/// that outlives the handler's stack frame, so it cannot borrow `self`.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerState {
     connections: BudgetHandle,
@@ -258,11 +211,9 @@ pub struct CircuitBreakerState {
     retries: RetryLimit,
 }
 
-/// The retry breaker is either Envoy's fixed `max_retries` ceiling or its
-/// dynamic `retry_budget`. Keeping both alternatives behind one acquisition
-/// method prevents router call sites from accidentally treating a configured
-/// percentage budget as an additional fixed cap (Envoy says it *replaces*
-/// `max_retries`).
+/// The retry breaker is either Envoy's fixed `max_retries` ceiling or its dynamic `retry_budget`. One acquisition
+/// method covers both, so a call site cannot treat a percentage budget as an extra fixed cap (Envoy says it
+/// *replaces* `max_retries`).
 #[derive(Debug, Clone)]
 enum RetryLimit {
     Fixed(BudgetHandle),
@@ -274,25 +225,16 @@ enum RetryLimit {
     },
 }
 
-/// A budget's live gauge plus its limit, with the gauge pre-wrapped in `Arc`
-/// so a guard can clone just the atomic out without holding the whole
-/// `CircuitBreakerState` alive.
+/// A budget's live gauge plus its limit. The gauge is pre-wrapped in `Arc`, so a guard clones only the atomic.
 #[derive(Debug, Clone)]
 struct BudgetHandle {
     active: Arc<std::sync::atomic::AtomicU32>,
     limit: u32,
-    /// Wakes a parked waiter when a slot frees. `max_pending_requests` is a
-    /// real parking queue in front of `max_connections`. `Some` only
-    /// for the `connections` budget -- `pending`/`requests`/`retries` have no
-    /// parking behaviour, so a `Notify` nobody ever `.notified()`s would just
-    /// be dead weight on every guard.
+    /// Wakes a parked waiter when a slot frees. `max_pending_requests` is a real parking queue in front of
+    /// `max_connections`. `Some` only for the `connections` budget; a `Notify` nobody waits on would be dead weight.
     ///
-    /// Rust note: `Arc<Notify>`, not a bare `Notify`. The caller that needs
-    /// to wait for a freed slot (`pool::ConnectPool::new_stream`) doesn't
-    /// hold a `CbGuard` yet -- that's the whole problem, it's waiting for
-    /// one -- so it can't reach a `Notify` through a guard's borrow. It has
-    /// to clone an owned handle out of the budget itself before it has
-    /// anything else to hold onto.
+    /// Rust note: `Arc<Notify>`, because the waiter (`pool::ConnectPool::new_stream`) holds no `CbGuard` yet, so it
+    /// must clone an owned handle out of the budget before it waits.
     notify: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -315,28 +257,19 @@ impl BudgetHandle {
         }
     }
 
-    /// Optimistic increment-then-check-then-rollback: claim a slot first,
-    /// and only give it back if that claim turned out to overflow the
-    /// limit. This avoids a check-then-act race between two threads racing
-    /// the same budget (both could pass a `load` check before either
-    /// increments) at the cost of a harmless bounce off the limit under
-    /// contention.
+    /// Optimistic increment, then check, then roll back: claim a slot first, and give it back only if the claim
+    /// overflowed the limit. This avoids a check-then-act race between threads at the cost of a harmless bounce off
+    /// the limit under contention.
     ///
-    /// Rust note: the claiming `fetch_add` uses `Acquire` so a prior
-    /// release (another guard's `Drop`, below) is visible before we decide
-    /// whether we're over budget; the rollback `fetch_sub` uses `Release`
-    /// so a losing thread's "give the slot back" is visible to whoever
-    /// reads `active` next. A successful acquire doesn't need to *release*
-    /// anything itself -- the guard's `Drop` is the operation other threads
-    /// need to observe, and that already uses `Release`.
+    /// Rust note: the claiming `fetch_add` uses `Acquire`, so a prior release (another guard's `Drop`) is visible
+    /// before we decide. The rollback uses `Release`. A successful acquire needs no release of its own: the guard's
+    /// `Drop` is what other threads must observe.
     fn try_acquire(&self) -> Option<CbGuard> {
         self.try_acquire_with_limit(self.limit)
     }
 
-    /// The same atomic claim as [`Self::try_acquire`], but with a limit
-    /// calculated at the call site. This is only used for Envoy's dynamic
-    /// retry budget; its own gauge remains the atomic being claimed, so two
-    /// workers cannot both observe a free retry slot and over-admit it.
+    /// The same atomic claim as [`Self::try_acquire`], with a limit computed at the call site. Used only for Envoy's
+    /// dynamic retry budget, and the claimed gauge stays the atomic itself, so two workers cannot over-admit.
     fn try_acquire_with_limit(&self, limit: u32) -> Option<CbGuard> {
         let prev = self
             .active
@@ -353,15 +286,12 @@ impl BudgetHandle {
     }
 }
 
-/// An acquired S5 budget slot. Owns a clone of the budget's gauge (not a
-/// borrow), so it's `'static` and can be moved into a response body that
-/// outlives the request handler; dropping it releases the slot.
+/// An acquired S5 budget slot. It owns a clone of the gauge, so it is `'static` and can move into a response body.
+/// Dropping it releases the slot.
 #[derive(Debug)]
 pub struct CbGuard {
     active: Arc<std::sync::atomic::AtomicU32>,
-    /// Set only on a `max_connections` slot: wakes
-    /// one parked waiter after this guard's `Drop` frees the slot. `None`
-    /// for every other budget's guard.
+    /// Set only on a `max_connections` slot: wakes one parked waiter after this guard's `Drop` frees the slot.
     notify: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -369,13 +299,8 @@ impl Drop for CbGuard {
     fn drop(&mut self) {
         self.active
             .fetch_sub(1, std::sync::atomic::Ordering::Release);
-        // Rust note: the release above MUST come before `notify_one` below,
-        // not after -- ordering, not just "eventually both happen". If we
-        // notified first, a waiter woken early could re-run
-        // `try_acquire_connection`, observe the gauge still at its old
-        // (full) value, lose that race, and go back to sleep having gained
-        // nothing from the wakeup. Releasing first guarantees whoever we
-        // wake sees the freed slot.
+        // Rust note: the release must come BEFORE `notify_one`. A waiter woken early could re-check the gauge, still
+        // see it full, and go back to sleep. Releasing first guarantees the woken waiter sees the freed slot.
         if let Some(notify) = &self.notify {
             notify.notify_one();
         }
@@ -411,41 +336,29 @@ impl CircuitBreakerState {
         }
     }
 
-    /// The one budget wired to a real call site today: the router acquires
-    /// this before dialing/forwarding and holds it for the full response
-    /// stream (LLM streaming keeps a request "active" far longer than
-    /// time-to-headers).
+    /// The one budget wired to a real call site today. The router holds it for the full response stream, since LLM
+    /// streaming keeps a request active far longer than time-to-headers.
     pub fn try_acquire_request(&self) -> Option<CbGuard> {
         self.requests.try_acquire()
     }
 
-    /// The `max_connections` budget: acquired in [`pool::ConnectPool::new_stream`]
-    /// before dialing (so an over-budget cluster never opens the socket), and
-    /// held for the life of the physical connection -- see
-    /// [`UpstreamStream::cb_guard`].
+    /// The `max_connections` budget, acquired in [`pool::ConnectPool::new_stream`] before dialing (so an over-budget
+    /// cluster never opens a socket). It is held for the life of the physical connection (see
+    /// [`UpstreamStream::cb_guard`]).
     pub fn try_acquire_connection(&self) -> Option<CbGuard> {
         self.connections.try_acquire()
     }
 
-    /// The `max_pending_requests` budget: a bounded parking queue in
-    /// front of `max_connections`. [`pool::ConnectPool::new_stream`] acquires
-    /// this only after `try_acquire_connection` fails, holds it only for the
-    /// duration of the park, and drops it the instant a connection slot
-    /// actually opens up -- so "pending" and "active" never double-count the
-    /// same request.
+    /// The `max_pending_requests` budget: a bounded parking queue in front of `max_connections`. It is acquired only
+    /// after `try_acquire_connection` fails, and dropped the instant a connection slot opens, so pending and active
+    /// never double-count a request.
     pub fn try_acquire_pending(&self) -> Option<CbGuard> {
         self.pending.try_acquire()
     }
 
-    /// A clone of the `connections` budget's wake channel. A caller
-    /// that fails `try_acquire_connection` clones this out *before* parking
-    /// and awaits `.notified()` on its own clone, so a later
-    /// `CbGuard::Drop` on that same budget (releasing a connection slot)
-    /// wakes it back up. Only the `connections` budget carries a `Notify`
-    /// (`BudgetHandle::notify`'s field doc), so this never returns `None` in
-    /// practice; it panics rather than silently handing back a handle
-    /// nobody will ever wake, which would be a hang, not a bug that shows up
-    /// as a compile error.
+    /// A clone of the `connections` budget's wake channel. A caller that fails `try_acquire_connection` clones this
+    /// before parking and awaits it, so a later release wakes it. Only `connections` carries a `Notify`, so this
+    /// panics rather than hand back a handle that nobody will wake, which would be a hang.
     pub(crate) fn connections_notify(&self) -> Arc<tokio::sync::Notify> {
         self.connections
             .notify
@@ -453,14 +366,10 @@ impl CircuitBreakerState {
             .expect("the connections budget always carries a Notify (see from_thresholds)")
     }
 
-    /// Claim a slot for a retry or hedge. A configured Envoy `retry_budget`
-    /// overrides `max_retries` and calculates its cap as
-    /// `max(min_retry_concurrency, floor(percent * (active + pending)))`.
-    /// The request/pending gauges are sampled immediately before the retry
-    /// gauge's atomic claim. Their values can naturally change a moment
-    /// later as requests finish, but the retry gauge itself is claimed and
-    /// rolled back atomically, so concurrent workers can never both consume
-    /// the same slot.
+    /// Claim a slot for a retry or hedge. A configured `retry_budget` overrides `max_retries` with
+    /// `max(min_retry_concurrency, floor(percent * (active + pending)))`. The request and pending gauges are sampled
+    /// just before the retry gauge's atomic claim. The retry gauge itself is claimed and rolled back atomically, so
+    /// concurrent workers never consume the same slot.
     pub fn try_acquire_retry(&self) -> Option<CbGuard> {
         match &self.retries {
             RetryLimit::Fixed(retries) => retries.try_acquire(),
@@ -492,51 +401,35 @@ impl Default for CircuitBreakerState {
     }
 }
 
-/// A stream slot on a pooled upstream connection. v1 ([`pool::ConnectPool`])
-/// is connect-per-stream: this just carries a freshly-dialed transport, no
-/// pooling/reuse yet.
+/// A stream slot on a pooled upstream connection. v1 ([`pool::ConnectPool`]) is connect-per-stream, so this carries
+/// a freshly dialed transport with no reuse yet.
 pub struct UpstreamStream {
-    /// The connected upstream transport: a freshly-dialed TCP connection,
-    /// already wrapped by the cluster's [`transport::UpstreamTransportSocket`]
-    /// (plaintext passthrough, or a completed TLS handshake). The router runs
-    /// the upstream h1/h2 codec over it, and both codecs are generic over
-    /// `AsyncRead + AsyncWrite + Unpin`, so they don't care which it is.
+    /// The connected upstream transport, already wrapped by the cluster's [`transport::UpstreamTransportSocket`]
+    /// (plaintext, or a completed TLS handshake). The router runs the h1 or h2 codec over it. Both codecs are generic
+    /// over `AsyncRead + AsyncWrite + Unpin`.
     pub io: BoxedUpstreamIo,
     /// The S5 `max_connections` slot this physical connection holds (see
-    /// [`CircuitBreakerState::try_acquire_connection`]). Dropping it releases
-    /// the slot, so it must live exactly as long as `io`'s underlying
-    /// connection does -- for h1 (connect-per-stream) that's this struct's
-    /// own lifetime; for a pooled connection (`proxy-http`'s
-    /// `upstream_pool`) the caller takes the guard out and moves it into the
-    /// byte stream itself (`SlotIo`), so the slot is released when the
-    /// socket is dropped, however the cache entry ended.
+    /// [`CircuitBreakerState::try_acquire_connection`]). Dropping it releases the slot, so it must live as long as
+    /// the connection. For h1 that is this struct's lifetime. For a pooled connection (`proxy-http`'s
+    /// `upstream_pool`), the caller moves the guard into the byte stream (`SlotIo`), so the slot is released when
+    /// the socket drops.
     ///
-    /// `None` only on paths with no real budget to acquire against (test
-    /// helpers, or a caller that never runs `new_stream` through a
-    /// `ConnectPool`) -- every real dial sets it.
+    /// `None` only on paths with no real budget (test helpers, or callers that bypass `ConnectPool`).
     pub cb_guard: Option<CbGuard>,
     // TODO: (for keep-alive reuse on the h1 path) hold the codec
     // `SendRequest` handle rather than a raw transport -- at which point
     // this seam changes shape. The pool-guard half of this TODO is done.
 }
 
-/// The byte transport under an upstream HTTP stream, type-erased so a cluster
-/// can be plaintext or TLS without every consumer becoming generic over the
-/// transport.
+/// The byte transport under an upstream HTTP stream, type-erased so a cluster can be plaintext or TLS without
+/// every consumer becoming generic.
 ///
-/// Rust note: this is the standard "trait alias by blanket impl" idiom --
-/// `dyn AsyncRead + AsyncWrite + Unpin` is not a legal trait object (only one
-/// non-auto trait per object), so we declare a single trait with the three as
-/// supertraits and blanket-impl it for everything that qualifies.
-// Rust note: `Send` (S10) is required by hyper's low-level
-// CLIENT upgrade API (`http1::Connection::with_upgrades`), symmetric to
-// the bound on the downstream `serve_http1`. It is a pure
-// bound-widening, not an ADR-0003 breach: `UpstreamTransportSocket::wrap` only
-// ever boxes a `TcpStream` or a rustls-wrapped `TcpStream` (both already
-// `Send`), and ADR-0003's `!Send` rule governs handler/body/filter STATE (the
-// `StreamBody`, `Rc`/`RefCell` data-plane state), not the raw upstream byte
-// stream. Making the stream `Send` only ALLOWS thread-hopping; the workers
-// still run on per-worker current_thread runtimes.
+/// Rust note: this is the "trait alias by blanket impl" idiom. `dyn AsyncRead + AsyncWrite + Unpin` is not a legal
+/// trait object (only one non-auto trait per object), so one trait takes the three as supertraits and is
+/// blanket-implemented for everything that qualifies.
+// `Send` (S10) is required by hyper's low-level client upgrade API, symmetric to the downstream `serve_http1`
+// bound. It only widens the bound: the transports boxed here are already `Send`, and the workers still run on
+// per-worker current_thread runtimes (ADR-0003).
 pub trait UpstreamIo:
     tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
 {
@@ -565,11 +458,9 @@ pub enum PoolError {
     /// `connect_timeout` elapsed -> retriable under `connect-failure` (S3.2).
     #[error("upstream connect timeout")]
     ConnectTimeout,
-    /// The TCP connect succeeded but the transport socket's handshake failed
-    /// (TLS: bad certificate, no shared ALPN protocol, protocol version
-    /// mismatch...). Envoy folds this into the same `UF`/`connect-failure`
-    /// bucket as a TCP failure; it is a separate variant here so the log line
-    /// says which half actually broke.
+    /// The TCP connect succeeded but the transport handshake failed (TLS: bad certificate, no shared ALPN, protocol
+    /// version mismatch). Envoy folds this into the connect-failure bucket. It is a separate variant so the log
+    /// says which half broke.
     #[error("upstream TLS handshake failed: {0}")]
     TlsHandshake(std::io::Error),
     /// Connection died before response headers -> retriable under `reset` (S3.2).
@@ -589,15 +480,11 @@ pub trait HttpConnPool: Send + Sync {
 #[derive(Debug)]
 pub struct HostSelection {
     pub host: Arc<Host>,
-    /// Set **only** when the entry that made the pick is an aggregate: the
-    /// member cluster the host actually belongs to. `None` means the entry
-    /// the caller already holds owns the host -- true for every
-    /// non-aggregate cluster -- so the common path allocates nothing.
+    /// Set only when the entry that made the pick is an aggregate: the member cluster the host belongs to. `None`
+    /// means the caller's entry owns the host, which is true for every non-aggregate cluster.
     ///
-    /// The owning cluster, not the routed one, is what supplies the
-    /// transport socket, the upstream protocol, and the provider
-    /// credentials. A caller that ignores this field sends the aggregate's
-    /// (empty) credentials to a real provider.
+    /// The owning cluster supplies the transport socket, the upstream protocol, and the provider credentials. A
+    /// caller that ignores this field sends the aggregate's (empty) credentials to a real provider.
     pub member: Option<SelectedMember>,
 }
 
@@ -623,36 +510,26 @@ impl std::fmt::Debug for SelectedMember {
 
 /// What the router sees of a cluster.
 pub trait ClusterEntry: Send + Sync {
-    /// Load-balancer host pick (S7: policy, panic threshold, priority
-    /// spillover), plus the cluster that owns the picked host (an
-    /// aggregate's members are different providers with different
-    /// credentials, so "which cluster owns this host" is no longer always
-    /// the entry the caller already holds).
+    /// Load-balancer host pick (S7: policy, panic threshold, priority spillover), plus the cluster that owns the
+    /// picked host. An aggregate's members are different providers with different credentials, so the owner is
+    /// not always the entry the caller holds.
     ///
-    /// This is the *only* way to get a host out of a `ClusterEntry` --
-    /// there is exactly one implementation and two call sites, both updated
-    /// alongside this trait, so there is no reason to keep an old
-    /// `pick_host` around next to it. A second way to get a host that
-    /// silently drops the owner is a way to send provider A's API key to
-    /// provider B (AGENTS.md invariant 1: dropping that information is exactly the
-    /// class of silent config error the rule exists to prevent, even though
-    /// no proto field is involved here).
+    /// This is the only way to get a host out of a `ClusterEntry`. A second path that drops the owner could send
+    /// provider A's API key to provider B (AGENTS.md invariant 1).
     fn select_host(&self, ctx: &LoadBalancerContext) -> Option<HostSelection>;
 
     /// The pool for a picked host.
     fn http_pool(&self, host: &Arc<Host>, proto: UpstreamProtocol) -> Arc<dyn HttpConnPool>;
 
-    /// Which HTTP protocol the router must speak to this cluster's upstreams,
-    /// from the cluster's `upstream_protocol` config (Envoy default HTTP/1.1).
-    /// The router reads this to pick both the pool and the upstream codec.
+    /// Which HTTP protocol the router must speak to this cluster's upstreams (Envoy default HTTP/1.1). The router
+    /// uses it to pick both the pool and the upstream codec.
     fn upstream_protocol(&self) -> UpstreamProtocol;
 
     /// Circuit-breaker bucket for the request's priority (S5).
     fn circuit_breaker(&self, prio: RoutingPriority) -> &CircuitBreakerState;
 
-    /// Request header mutations to apply because this cluster was the one the
-    /// attempt dialed. Carries provider credentials under the `llmproxy`
-    /// dialect -- see `ClusterConfig::request_headers_to_add`.
+    /// Request header mutations for this cluster, applied when it is the cluster the attempt dialed. Carries
+    /// provider credentials under the `llmproxy` dialect (see `ClusterConfig::request_headers_to_add`).
     fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation];
 
     /// Provider-owned path/query rewrite to apply after route transforms.
@@ -665,12 +542,9 @@ pub trait ClusterEntry: Send + Sync {
     /// `None` for ordinary clusters that never set the llmproxy usage metadata.
     fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect>;
 
-    /// Feed one upstream attempt's outcome to this cluster's S6 outlier
-    /// detector. `addr` is the host the attempt actually dialed. A
-    /// no-op when the cluster configures no outlier detection, so the router
-    /// can call it unconditionally after every attempt. Takes `&self` (not
-    /// `&mut`) because the detector owns its own interior locking -- the
-    /// router holds only a shared `&dyn ClusterEntry`.
+    /// Feeds one upstream attempt's outcome to this cluster's S6 outlier detector. `addr` is the host the attempt
+    /// dialed. A no-op without outlier detection, so the router can call it after every attempt. Takes `&self`
+    /// because the detector does its own interior locking.
     fn report_outlier_result(&self, addr: std::net::SocketAddr, result: outlier::RequestResult);
 }
 
@@ -716,9 +590,8 @@ mod cb_tests {
         let retry1 = cb.try_acquire_retry().expect("minimum permits one retry");
         assert!(cb.try_acquire_retry().is_none(), "minimum is a real cap");
 
-        // Ten active requests make the proportional cap two. The existing
-        // retry occupies one; adding eight requests raises the cap enough for
-        // a second without replacing the dynamic budget by max_retries.
+        // Ten active requests make the proportional cap two. The existing retry takes one, and eight more raise the
+        // cap enough for a second without replacing the dynamic budget with `max_retries`.
         let _more: Vec<_> = (0..8).map(|_| cb.try_acquire_request().unwrap()).collect();
         let retry2 = cb.try_acquire_retry().expect("20% of ten permits two");
         assert!(cb.try_acquire_retry().is_none());
@@ -744,10 +617,8 @@ mod cb_tests {
         let g2 = cb.try_acquire_request().expect("acquire 2");
         drop(g1);
         drop(g2);
-        // Rust note: `requests.active` is private, so we prove "back to
-        // zero" behaviorally -- re-acquiring up to the full limit must
-        // succeed again, which is only possible if both prior guards
-        // actually released their slots.
+        // Rust note: `requests.active` is private, so "back to zero" is proven behaviorally. Re-acquiring up to the
+        // full limit succeeds only if both prior guards released their slots.
         let g3 = cb
             .try_acquire_request()
             .expect("full budget available again");

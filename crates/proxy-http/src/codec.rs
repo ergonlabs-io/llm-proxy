@@ -1,24 +1,8 @@
-//! The downstream HTTP/1.1 codec: drives one accepted
-//! connection as HTTP/1.1, converting each request into
-//! [`crate::handler::HttpRequestParts`], handing it to a
-//! [`crate::handler::StreamHandler`], and streaming the returned
-//! [`crate::handler::HttpResponseParts`] back incrementally (headers flush
-//! before the body completes -- see `tests/hyper_spike.rs` finding (a), the
-//! SSE first-token-early requirement this whole codec exists to preserve).
-//!
-//! Scope: downstream h1 and h2 (`serve_http1`/`serve_http2`), plus the
-//! upstream (proxy-to-origin) h1/h2 codecs (`send_upstream_http1`/
-//! `send_upstream_http2`). HTTP upgrades (envoy-semantics.md S10) are layered on
-//! top of these (see `serve_one`'s upgrade path). `serve_http2` itself is transport-agnostic -- HTTP/2 framing (and
-//! its client connection preface, RFC 9113 S3.4) is identical whether the
-//! bytes arrived over an ALPN-negotiated TLS stream or plaintext "prior
-//! knowledge" h2c, so this module needed no change to serve the latter; it's
-//! `proxy-core`'s listener that decides *whether* to call `serve_http2` at
-//! all for a given connection (ALPN for TLS, a preface peek for plaintext --
-//! see `HttpConnectionManagerConfig::codec_type` and its dispatch). The h1
-//! `Upgrade: h2c` mechanism remains out of scope. This module is tested
-//! standalone, over an in-memory pipe, in `tests/http1_codec.rs` and
-//! `tests/http2_codec.rs`.
+//! HTTP codecs for downstream and upstream HTTP/1.1 and HTTP/2 connections.
+//! Request and response bodies stream incrementally so response headers reach
+//! clients before long LLM response bodies complete. Upgrades follow Envoy S10.
+//! HTTP/2 framing is the same over TLS and prior-knowledge plaintext; listener
+//! dispatch decides when to use it. HTTP/1.1 `Upgrade: h2c` is unsupported.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -68,21 +52,8 @@ pub enum CodecError {
     Connection(#[source] hyper::Error),
 }
 
-/// Serve one accepted downstream connection as HTTP/1.1 until the peer
-/// closes it, `shutdown` fires (see below), or a connection-level error
-/// occurs.
-///
-/// Generic over `IO` so this same function serves both plaintext
-/// `TcpStream`s and (once TLS termination is wired to HTTP
-/// listeners) TLS-terminated streams.
-///
-/// `shutdown` is the drain signal (mirrors `proxy-core`'s
-/// `tokio::sync::watch`-based drain elsewhere in the workspace, but this
-/// crate takes any future so it stays decoupled from that machinery). When
-/// it resolves, the connection is told to gracefully shut down: finish
-/// serving any in-flight request, then refuse to accept a next one on this
-/// connection and return -- matching spike finding (d)'s description of
-/// `graceful_shutdown`.
+/// Serve an HTTP/1.1 connection until peer close, shutdown, or connection error.
+/// Shutdown drains the current request and prevents another from starting.
 pub async fn serve_http1<IO>(
     io: IO,
     handler: Rc<dyn StreamHandler>,
@@ -169,38 +140,8 @@ where
     result.map_err(CodecError::Connection)
 }
 
-/// Serve one accepted downstream connection as HTTP/2 until the peer closes
-/// it, `shutdown` fires, or a connection-level error occurs -- the h2 mirror
-/// of `serve_http1`.
-///
-/// Divergence from `serve_http1`: there is no `Http2Options`/`keep_alive`
-/// parameter. HTTP/2 multiplexes many streams over one connection with no
-/// per-request `Connection: close` concept, so there is no per-connection
-/// keep-alive knob to thread through (same reasoning `send_upstream_http2`'s
-/// doc comment gives for dropping it on the client side).
-///
-/// Per-stream isolation: `hyper::server::conn::http2::Builder` requires an
-/// [`hyper::rt::Executor`] and uses it to spawn each h2 stream's
-/// `service_fn` call as its own task (see `H2Stream` in hyper's internals) --
-/// concurrent streams are NOT driven cooperatively inside one poll of this
-/// function's `Connection` future. That's what makes concurrency real rather
-/// than serialized, and why this reuses [`LocalExec`] (ADR-0003: those spawned
-/// tasks are `!Send`, so a `Send`-requiring executor like
-/// `hyper_util::rt::TokioExecutor` can't be used -- same rationale as the
-/// upstream h2 client above). Each spawned stream task calls `serve_one`
-/// fresh, which builds a new `HttpRequestParts`/hands the handler a new
-/// `HttpRequestParts` -- `handler.handle()` in turn builds a fresh
-/// `FilterManager` per call (see `FilterChainHandler::handle`'s doc comment),
-/// so two concurrent streams on this connection never share a `StreamInfo` or
-/// filter-chain instance.
-///
-/// Transport-agnostic (see the module doc): driven over an
-/// already-ALPN-negotiated `h2` TLS stream, or over a plaintext connection
-/// `proxy-core`'s listener detected as h2 prior-knowledge by peeking for the
-/// client connection preface -- either way this function reads the same
-/// framing starting with that same preface, so it needed no h2c-specific
-/// code. The h1 `Upgrade: h2c` mechanism (a *different* connection starting
-/// out speaking h1) remains out of scope.
+/// Serve an HTTP/2 connection until peer close, shutdown, or connection error.
+/// Streams run as worker-local tasks, each with its own filter manager.
 pub async fn serve_http2<IO>(
     io: IO,
     handler: Rc<dyn StreamHandler>,
@@ -652,11 +593,8 @@ where
     }
 }
 
-/// Handshake a fresh HTTP/2 client connection over `io` and spawn its
-/// connection-driving task, returning the request sender -- the "dial" half
-/// of what `send_upstream_http2` used to do in one shot, split out so `crate::upstream_pool::UpstreamConnCache` can handshake once
-/// per `ConnKey` and hand clones of the resulting sender to many requests,
-/// instead of every request handshaking its own connection.
+/// Handshake an HTTP/2 client connection and spawn its driver. The returned
+/// sender can be cloned for requests sharing a cached connection.
 ///
 /// Rust note: same `spawn_local` + dropped `JoinHandle` shape
 /// `send_upstream_http1` uses, and for the same reason (the `Connection`

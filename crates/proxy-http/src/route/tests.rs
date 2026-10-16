@@ -1,12 +1,6 @@
 //! Acceptance tests for the route matching engine.
 //!
-//! Fixtures build real `RouteTable`s through `proxy_config`'s YAML lowering
-//! pipeline (the same helper shape as `proxy-config/tests/ir.rs`) rather than
-//! constructing `PathMatch`/`HeaderMatchKind` variants by hand: those hold
-//! compiled `regex::Regex` values, and `regex` is not a direct dependency of
-//! this crate (only of `proxy-config`, which compiles patterns at lowering
-//! time) — going through the real config loader keeps this module fully
-//! decoupled from the `regex` crate, as intended.
+//! Fixtures use YAML lowering so compiled matchers follow the production path.
 
 use http::HeaderMap;
 use proxy_config::ir::{
@@ -43,9 +37,7 @@ static_resources:
     build_snapshot(&loaded).expect("config must lower to IR")
 }
 
-/// Owns the snapshot so tests can borrow a `&RouteTable` with a named
-/// lifetime, matching the shape callers actually have (an `Arc<ConfigSnapshot>`
-/// held alive for the whole request).
+/// Owns the snapshot for the lifetime of borrowed route tables.
 struct Fixture {
     snapshot: ConfigSnapshot,
 }
@@ -187,9 +179,7 @@ fn vhost_matches_but_no_route_matches() {
 
 #[test]
 fn first_match_wins_even_when_second_route_is_more_specific() {
-    // The second route (`/foo/bar`, exact) is objectively "more specific"
-    // than the first (`/`, prefix) but MUST NOT be selected: S1.2 forbids
-    // any specificity re-ordering.
+    // S1.2 preserves route order even when a later match is more specific.
     let fx = Fixture::new(
         r#"
                   name: rt

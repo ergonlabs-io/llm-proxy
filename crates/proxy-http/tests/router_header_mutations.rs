@@ -1,14 +1,7 @@
-//! P0 regression: `RouteEntry::request_headers_to_add` (populated by both
-//! config front-ends -- Envoy-mode lowering and the simple dialect's
-//! provider-credential injection) has to actually reach the upstream
-//! request. Standalone (not `router.rs`'s own `#[cfg(test)]` module) for the
-//! same reason as `router_retry.rs`: a fresh, focused set of upstream
-//! helpers rather than reusing the existing one-shot ones.
+//! Verifies route and cluster `request_headers_to_add` mutations on upstream requests.
 //!
-//! Rust note: same shape as `router.rs`'s own tests --
-//! `send_upstream_http1` spawns a non-`Send` connection driver task via
-//! `tokio::task::spawn_local`, so every test needs a `LocalSet` on a
-//! `current_thread` runtime.
+//! Rust note: `send_upstream_http1` uses `spawn_local`, so tests need a
+//! `LocalSet` on a `current_thread` runtime.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -36,10 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::LocalSet;
 
-/// A fresh, single-worker [`RouterStats`] resolved for
-/// exactly `cluster_names` -- what [`RouterFilterFactory::new`] needs,
-/// mirroring how `crates/proxy/src/main.rs` builds the real one from the
-/// boot config snapshot's cluster names.
+/// Builds router stats for the configured clusters.
 fn test_router_stats(cluster_names: &[&str]) -> Arc<RouterStats> {
     let control = StatsControl::new(1);
     let handles = Arc::new(StatHandles::build(&control, cluster_names.iter().copied()));
@@ -73,11 +63,7 @@ fn mutation(key: &str, value: &str, action: HeaderAppendAction) -> HeaderMutatio
     }
 }
 
-/// Build a one-cluster, one-route [`FilterChainHandler`] (no configured
-/// filters, just the router terminal) forwarding to `addr` under cluster name
-/// `"up"`, with `mutations` as the route's `request_headers_to_add` --
-/// mirrors `router.rs`'s own `build_router` test helper, plus the field this
-/// file exists to exercise.
+/// Builds a one-route router with route-level header mutations.
 async fn build_router(
     addr: SocketAddr,
     fwd: ForwardAction,
@@ -86,10 +72,7 @@ async fn build_router(
     build_router_with_cluster_mutations(addr, fwd, mutations, Vec::new()).await
 }
 
-/// Same as [`build_router`], but also lets a test set the cluster's own
-/// `request_headers_to_add` -- the mutations applied
-/// per attempt because of which cluster the attempt dialed, as opposed to
-/// `mutations`, which is the route-level set applied once up front.
+/// Also configures cluster mutations, which are applied per upstream attempt.
 async fn build_router_with_cluster_mutations(
     addr: SocketAddr,
     fwd: ForwardAction,
@@ -101,7 +84,6 @@ async fn build_router_with_cluster_mutations(
     snapshot.insert(
         "up".to_string(),
         Arc::new(ClusterConfig {
-            // Non-EDS fixture: hosts come from `endpoints`/`discovery`.
             eds: None,
             name: "up".to_string(),
             discovery: DiscoveryType::Static,
@@ -187,10 +169,7 @@ fn request_with_headers(path: &'static str, headers: HeaderMap) -> HttpRequestPa
     }
 }
 
-/// A one-shot "reflecting" upstream: accepts a single connection, reads
-/// until the request's header terminator, hands the raw request-line+headers
-/// text back over `rx`, then answers 200 -- same shape as `router.rs`'s own
-/// `spawn_reflecting_upstream`.
+/// Accepts one request, returns its raw headers, and responds with 200.
 async fn spawn_reflecting_upstream() -> (SocketAddr, oneshot::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -218,9 +197,7 @@ async fn spawn_reflecting_upstream() -> (SocketAddr, oneshot::Receiver<String>) 
     (addr, rx)
 }
 
-/// Count how many times `needle` (a full header line, e.g. `"x-foo: bar"`)
-/// appears in `request_text` -- used to distinguish "one value" from
-/// "appended as a second instance" for `AppendIfExistsOrAdd`.
+/// Counts exact header-line occurrences in the captured request.
 fn count_header_line(request_text: &str, needle: &str) -> usize {
     request_text
         .to_ascii_lowercase()
@@ -228,8 +205,6 @@ fn count_header_line(request_text: &str, needle: &str) -> usize {
         .filter(|line| line == &needle.to_ascii_lowercase())
         .count()
 }
-
-// --- the core regression: a configured Authorization header reaches the upstream ---
 
 #[tokio::test(flavor = "current_thread")]
 async fn configured_authorization_header_reaches_the_upstream() {
@@ -258,8 +233,6 @@ async fn configured_authorization_header_reaches_the_upstream() {
         })
         .await;
 }
-
-// --- one test per HeaderAppendAction variant ---
 
 #[tokio::test(flavor = "current_thread")]
 async fn append_if_exists_or_add_keeps_the_existing_value_and_adds_a_second() {
@@ -533,8 +506,6 @@ async fn overwrite_if_exists_does_not_insert_when_absent() {
         .await;
 }
 
-// --- ordering / interaction with the S9/S4 rewrites ---
-
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_mutations_apply_in_config_order() {
     LocalSet::new()
@@ -574,10 +545,7 @@ async fn multiple_mutations_apply_in_config_order() {
         .await;
 }
 
-/// Pins the ordering decision documented on `apply_request_transforms`: a
-/// route-level `request_headers_to_add` entry that targets `host` wins over
-/// `host_rewrite_literal`, matching Envoy's `finalizeRequestHeaders` (rewrite
-/// first, then header mutations).
+/// Route header mutations run after `host_rewrite_literal`, matching Envoy finalization.
 #[tokio::test(flavor = "current_thread")]
 async fn a_header_mutation_targeting_host_wins_over_host_rewrite_literal() {
     LocalSet::new()
@@ -610,8 +578,6 @@ async fn a_header_mutation_targeting_host_wins_over_host_rewrite_literal() {
         .await;
 }
 
-// --- no-op regression: an empty mutation list behaves exactly as today ---
-
 #[tokio::test(flavor = "current_thread")]
 async fn empty_mutation_list_does_not_change_existing_behavior() {
     LocalSet::new()
@@ -636,9 +602,6 @@ async fn empty_mutation_list_does_not_change_existing_behavior() {
         })
         .await;
 }
-
-// --- `ClusterConfig::request_headers_to_add`, applied per
-// attempt because of which cluster the attempt dialed ---
 
 #[tokio::test(flavor = "current_thread")]
 async fn cluster_level_mutation_reaches_the_upstream() {
@@ -669,12 +632,7 @@ async fn cluster_level_mutation_reaches_the_upstream() {
         .await;
 }
 
-/// The load-bearing guarantee: a cluster's `request_headers_to_add`
-/// wins over the route's on a key collision, since the cluster is more
-/// specific -- and critically, the route-level (e.g. a *different*
-/// provider's) credential must not leak upstream at all. Asserting only that
-/// the cluster's value is present would pass even if both were sent, so this
-/// asserts the route-level value's absence explicitly.
+/// Cluster mutations win collisions; the route-level credential must not leak upstream.
 #[tokio::test(flavor = "current_thread")]
 async fn cluster_level_mutation_overrides_route_level_and_route_value_does_not_leak() {
     LocalSet::new()

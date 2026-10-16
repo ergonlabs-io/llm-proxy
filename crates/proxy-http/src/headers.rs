@@ -1,16 +1,10 @@
 //! envoy-semantics.md S9 — header sanitization & standard mutations.
 //!
-//! Pure, synchronous header transforms only: every function here takes an
-//! `&mut http::HeaderMap` (plus whatever small bits of context it needs) and
-//! returns nothing async, does no I/O, and never reaches into
-//! `proxy_config::ir`. The router is the caller that threads
-//! config values (`use_remote_address`, `xff_num_trusted_hops`, ...) and the
-//! live connection's remote address/transport into these functions.
+//! Synchronous header transforms for Envoy S9. The router supplies config and
+//! connection context; these functions mutate headers without I/O.
 //!
-//! ⚠️ marks below correspond 1:1 to the `⚠️` marks in S9 of
-//! `internal-docs/envoy-semantics.md`: the text itself says "verify against Envoy docs"
-//! at these points. Where the semantics text does not resolve the ambiguity, the
-//! choice made here is written down next to the `⚠️`.
+//! ⚠️ marks match unresolved choices in S9; each implementation records its
+//! choice where the normative semantics leave ambiguity.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -99,25 +93,10 @@ pub fn apply_xff(headers: &mut HeaderMap, remote: IpAddr, opts: &XffOptions) {
     set_xff_tokens(headers, &tokens);
 }
 
-/// Resolve "the" client address per `xff_num_trusted_hops`, for the
-/// `use_remote_address = false` case: with `N` trusted hops, skip the `N`
-/// rightmost (most-recently-appended) XFF entries and take the next one.
-/// `N = 0` means "trust the rightmost entry as-is"; `N` larger than the
-/// number of entries falls back to the leftmost (original client-supplied)
-/// entry, matching Envoy's saturating behavior rather than panicking or
-/// returning nothing.
-///
-/// When `use_remote_address = true`, the resolved address is always the
-/// downstream remote address itself — that's what [`apply_xff`] just
-/// appended as the new rightmost entry.
-///
-/// Never panics on a garbage (non-IP) token: falls back to `remote`.
-/// The client address limits attribute a request to (`StreamInfo::
-/// client_address`). It is the TCP peer unless this is a non-edge HCM with
-/// `xff_num_trusted_hops` set, where it is the `x-forwarded-for` entry those
-/// trusted hops vouch for. With no trusted hops `x-forwarded-for` is never
-/// read: the client can write it, and a limit keyed on it could be dodged by
-/// sending a fresh value per request.
+/// Resolve the client address using `xff_num_trusted_hops`. Skip that many
+/// rightmost XFF entries; if the count exceeds the list, use its leftmost entry.
+/// With `use_remote_address`, or malformed/missing XFF, use `remote`. Without
+/// trusted hops, never attribute limits to client-controlled XFF (Envoy S9).
 pub fn client_address(headers: &HeaderMap, remote: IpAddr, opts: &XffOptions) -> IpAddr {
     if opts.use_remote_address || opts.xff_num_trusted_hops == 0 {
         return remote;

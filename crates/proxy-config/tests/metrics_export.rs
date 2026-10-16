@@ -1,20 +1,9 @@
-//! Acceptance, config half: OTLP metric export is
-//! configured, validated, and lowered entirely independently of OTLP *trace*
-//! export.
-//!
-//! The load-bearing claim this file exists to pin is the one
-//! `docs/telemetry-design.md` §5.3 states: "Configure OTLP metric export
-//! independently of trace sampling/export. Disabling traces must not disable
-//! metrics." Before this, `ConfigSnapshot::tracing` was the only OTLP field in
-//! the IR, so a config with no `tracing` block exported no metrics over OTLP
-//! even though the registry they are read from is always populated. Every test
-//! here is written to fail if someone merges the two namespaces back together.
-//!
-//! Same shape as `tests/tracing.rs` (see its module doc): the strict-parse ->
-//! PGV -> IR pipeline a hand-written Envoy config goes through, so a config
-//! that sets neither surface must be completely unaffected, and every malformed
-//! shape is a hard error carrying its full dotted path (AGENTS.md invariant 1), never
-//! a silent skip.
+//! Acceptance tests for independent OTLP metric export configuration.
+
+//! Metrics and traces are configured independently; either can be enabled
+//! without the other. Tests cover both isolated and combined configurations.
+//! Tests use the strict parse, PGV, and IR pipeline; malformed shapes must
+//! fail with their dotted paths.
 
 use std::time::Duration;
 
@@ -38,10 +27,7 @@ const METRICS_PATH: &str = "node.metadata[\"io.llmproxy.metrics\"]";
 
 // ---------------------------------------------------- independence from tracing --
 
-/// The headline case. Metrics configured, tracing entirely absent: metrics
-/// MUST lower, and tracing MUST stay off. If the two namespaces ever merge, or
-/// if `convert_metrics_metadata` is ever gated on `snapshot.tracing`, this is
-/// the test that catches it.
+/// Metrics lower when tracing is absent, and tracing remains off.
 #[test]
 fn metrics_lower_with_no_tracing_block_at_all() {
     let yaml = r#"
@@ -62,11 +48,7 @@ node:
     assert_eq!(metrics.export_deadline, Duration::from_secs(10));
 }
 
-/// The mirror image: tracing configured, metrics absent. Must leave metrics
-/// off. A test of the other direction, because "metrics off does not require
-/// tracing off" is only half the claim -- turning tracing ON must not
-/// accidentally imply metrics on either, since that would make an operator who
-/// wanted traces only start paying for full metric snapshots.
+/// Tracing alone leaves metric export disabled.
 #[test]
 fn tracing_alone_leaves_metrics_unset() {
     let yaml = r#"
@@ -84,10 +66,7 @@ node:
     );
 }
 
-/// Both configured, in the same `node.metadata`, with DIFFERENT endpoints and
-/// service names -- which is the ordinary deployment (metrics and traces
-/// usually go to different collectors) and is only expressible because the two
-/// are separate structs rather than one block with an enable flag.
+/// Both surfaces can use distinct endpoints and service names in one metadata map.
 #[test]
 fn both_surfaces_coexist_with_independent_endpoints() {
     let yaml = r#"
@@ -136,10 +115,8 @@ node:
     assert_eq!(snapshot.metrics, None);
 }
 
-/// A namespace that is present but not an object is a hard error. Silently
-/// treating a malformed metrics block as "metrics off" is the exact failure
-/// mode AGENTS.md invariant 1 exists to prevent: the operator wrote the block, so
-/// something must have been meant by it.
+/// A malformed namespace is an error, not silently treated as disabled
+/// (AGENTS.md invariant 1).
 #[test]
 fn non_object_namespace_is_a_hard_error() {
     let yaml = r#"
@@ -265,12 +242,7 @@ node:
     assert_eq!(err_path(&err), &format!("{METRICS_PATH}.interval"));
 }
 
-/// A `0` interval is rejected rather than read as "export every 0 seconds".
-/// `Duration::from_secs_f64(0)` is legal, so nothing downstream would have
-/// complained -- the interval would simply be zero and `tokio::time::interval`
-/// would panic on the control runtime, taking the whole proxy down. Catching
-/// it at config load is the difference between a bad config file and a dead
-/// process.
+/// Reject zero intervals; `tokio::time::interval` panics on a zero duration.
 #[test]
 fn zero_interval_is_a_hard_error() {
     let yaml = r#"
@@ -284,17 +256,8 @@ node:
     assert_eq!(err_path(&err), &format!("{METRICS_PATH}.export_interval"));
 }
 
-/// The P1 review finding: a huge but perfectly FINITE value. `1e100` passes
-/// `is_finite`, passes the positivity check, and would reach
-/// `Duration::from_secs_f64` -- which PANICS on overflow, not on NaN or
-/// infinity alone. That panic aborted config load with exit code 101, turning
-/// a typo into a dead process, exactly the class of bug the checks around it
-/// exist to prevent. `try_from_secs_f64` must turn it into a dotted-path error
-/// instead.
-///
-/// This test is the regression pin, and it was reproduced against the real
-/// binary before the fix (`--mode validate` aborted); after it, config load
-/// fails as configuration and the process lives.
+/// A huge finite value must become a dotted-path config error; converting it
+/// with `Duration::from_secs_f64` would panic on overflow.
 #[test]
 fn huge_finite_interval_is_a_hard_error_not_a_panic() {
     for huge in ["1.0e100", "1e308", "1.7976931348623157e308"] {

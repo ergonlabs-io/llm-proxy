@@ -18,12 +18,7 @@ fn err_path(err: &ConfigError) -> &str {
     match err {
         ConfigError::UnsupportedField { field_path, .. } => field_path,
         ConfigError::InvalidValue { field_path, .. } => field_path,
-        // A required field left unset (`timeout`, `interval`,
-        // `unhealthy_threshold`, `healthy_threshold`, the `health_checker`
-        // oneof) is caught by the PGV validator during
-        // `parse_bootstrap`, before `convert_health_check` ever runs -- same
-        // defense-in-depth relationship as `aggregate_cluster.rs`'s
-        // `empty_member_list_is_rejected`.
+        // PGV catches missing required fields before typed health-check lowering.
         ConfigError::Validation { field_path, .. } => field_path,
         other => panic!("expected a field-scoped error, got: {other}"),
     }
@@ -168,10 +163,7 @@ static_resources:
     }
 }
 
-/// The two-trap pin: `Payload.text` is HEX-ENCODED, not raw text. Envoy's
-/// `text: "504F4E47"` is the four bytes `PONG`, NOT the eight-character
-/// ASCII string `"504F4E47"` -- the two readings visibly differ, which is
-/// exactly what this test pins.
+/// `Payload.text` is hex-encoded: `504F4E47` represents the bytes `PONG`.
 #[test]
 fn payload_text_is_hex_decoded_not_raw() {
     let yaml = r#"

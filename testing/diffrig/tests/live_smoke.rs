@@ -1,13 +1,9 @@
-//! **v0.0.1 ship-gate**: a live, network-hitting end-to-end proof that a
-//! client can call the real `llm-proxy` binary, have it forward to a real
-//! provider gateway (OpenAI and Anthropic, over the public internet, with
-//! real API keys), and get the provider's response back intact --
-//! non-streaming and streamed (SSE) -- for both providers.
+//! Live end-to-end proof: the real `llm-proxy` binary forwards to OpenAI and
+//! Anthropic over the public internet, and the provider responses come back
+//! intact. Both non-streaming and SSE are covered.
 //!
-//! This is the single test that defines the v0.0.1 release milestone. It is
-//! deliberately **not** part of `make ci`: it costs real money (small,
-//! `max_tokens`-limited requests, but non-zero) and needs live credentials.
-//! Every test in this file is `#[ignore]`d for that reason.
+//! It is deliberately not part of `make ci`. It costs real money and needs
+//! live credentials, so every test here is `#[ignore]`d.
 //!
 //! ## How to run
 //!

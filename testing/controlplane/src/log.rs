@@ -103,13 +103,8 @@ impl Default for Inner {
     }
 }
 
-/// Thread-safe, cloneable handle onto every stream's recorded requests.
-///
-/// Rust note: `Arc<Mutex<..>>` is the standard "shared, mutable, from
-/// multiple tasks" shape — the gRPC handler task appends to it while test
-/// code reads a snapshot from a different task/thread. `Mutex` (not
-/// `tokio::sync::Mutex`) is fine here because we never hold the lock across
-/// an `.await`.
+/// Thread-safe handle to recorded requests. Rust note: the synchronous mutex is
+/// sufficient because the lock is never held across `.await`.
 #[derive(Debug, Clone, Default)]
 pub struct RequestLog {
     inner: Arc<Mutex<Inner>>,

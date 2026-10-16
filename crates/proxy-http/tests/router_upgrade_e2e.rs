@@ -1,20 +1,7 @@
-//! S10 acceptance tests: the HTTP/1.1 WebSocket
-//! TUNNEL, end to end through the real router.
-//!
-//! `websocket_upgrade_tunnel_echoes_bytes_end_to_end` is the core proof and
-//! is the one test in this file that must fail if `codec::bridge_upgrade`
-//! (the `tokio::io::copy_bidirectional` spawn in `codec::serve_one`) is
-//! removed -- it drives a REAL downstream client through the REAL
-//! `proxy_http::serve_http1` codec (not just `FilterChainHandler::handle`
-//! called directly, which never reaches `serve_one` and so never spawns the
-//! bridge at all) against a mock h1 upstream that answers `101` and then
-//! echoes raw bytes.
-//!
-//! The other two tests (403 gate, upstream declines) only need to prove what
-//! `HttpResponseParts` the router itself produces, so they call
-//! `FilterChainHandler::handle` directly, same convention as
-//! `response_flags.rs`/`router.rs`'s own tests -- there is no tunnel to
-//! bridge in either case.
+//! S10 acceptance tests for HTTP/1.1 WebSocket tunnels through the router.
+//! The echo test uses the real codec to exercise `bridge_upgrade`; the 403
+//! and upstream-decline tests inspect router responses directly because no
+//! tunnel is established.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -73,13 +60,9 @@ fn forward_to_up() -> ForwardAction {
     }
 }
 
-/// One-cluster (`"up"`, pointed at `addr`), one-route (`/`, `Forward`)
-/// `FilterChainHandler`, with `upgrade_configs` set to `upgrade_configs` --
-/// the S10 knob every test in this file varies. Otherwise identical shape to
-/// `router.rs`'s own `build_router_with_stats_table` / `response_flags.rs`'s
-/// `build_router`, duplicated here because each `tests/*.rs` file is its own
-/// compilation unit (see `harness.rs`'s doc in `testing/diffrig` for the same
-/// reasoning, in a different crate).
+/// One-cluster, one-route handler with the supplied `upgrade_configs`.
+/// Each integration-test file is a separate compilation unit, so this helper
+/// is local to the file.
 async fn build_router(addr: SocketAddr, upgrade_configs: Vec<UpgradeConfig>) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
@@ -150,12 +133,8 @@ async fn build_router(addr: SocketAddr, upgrade_configs: Vec<UpgradeConfig>) -> 
     )
 }
 
-/// A request carrying (or not) the `Upgrade`/`Connection: Upgrade` header
-/// pair -- `on_upgrade` is a synthetic `hyper::upgrade::OnUpgrade` built via
-/// `hyper::upgrade::on` on a hand-built (never wire-parsed) request, exactly
-/// as `codec::serve_one` would produce for a real one; see this module's
-/// doc for why the two direct-`.handle()` tests can use a handle that never
-/// resolves (they never await it).
+/// Build an upgrade request with a synthetic `OnUpgrade` handle, as
+/// `codec::serve_one` does for a wire-parsed request.
 fn upgrade_request(path: &'static str, want_upgrade: bool) -> HttpRequestParts {
     let mut headers = HeaderMap::new();
     headers.insert(http::header::HOST, HeaderValue::from_static("test.local"));
@@ -189,12 +168,8 @@ fn upgrade_request(path: &'static str, want_upgrade: bool) -> HttpRequestParts {
     }
 }
 
-/// A mock h1 WebSocket upstream: on the first request, answers `101
-/// Switching Protocols` + `Upgrade`/`Connection` headers (the handshake
-/// shape S10.1 tunnels), then echoes every subsequent byte back verbatim
-/// until the peer closes -- what `websocket_upgrade_tunnel_echoes_bytes_end_to_end`
-/// drives raw bytes through. `accepted` lets the 403 test assert this was
-/// never even dialed.
+/// Accept a WebSocket handshake, echo bytes until the peer closes, and
+/// record whether the upstream was dialed.
 async fn spawn_upgrade_echo_upstream(accepted: Arc<AtomicUsize>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -214,9 +189,8 @@ async fn spawn_upgrade_echo_upstream(accepted: Arc<AtomicUsize>) -> SocketAddr {
             }
         }
         let request_text = String::from_utf8_lossy(&buf).to_ascii_lowercase();
-        // S9 rule 6 strips the client's `Connection` header; the h1 codec
-        // must ask for the switch again, or a real WebSocket server refuses.
-        // A failed assertion drops the stream, so the client sees no `101`.
+        // S9 rule 6 strips `Connection`, so the h1 codec must request the
+        // protocol switch again.
         let wants_switch = request_text.contains("upgrade: websocket")
             && request_text.contains("connection: upgrade\r\n")
             && !request_text.contains("keep-alive");
@@ -232,9 +206,7 @@ async fn spawn_upgrade_echo_upstream(accepted: Arc<AtomicUsize>) -> SocketAddr {
             )
             .await
             .unwrap();
-        // Raw byte echo, forever -- no WebSocket framing, matching the
-        // task's "raw bytes are the point" (mirrors `hyper_spike.rs`
-        // finding (e)).
+        // Echo raw tunnel bytes; WebSocket framing is outside this codec test.
         let mut echo_buf = [0u8; 4096];
         loop {
             let n = stream.read(&mut echo_buf).await.unwrap();
@@ -247,9 +219,7 @@ async fn spawn_upgrade_echo_upstream(accepted: Arc<AtomicUsize>) -> SocketAddr {
     addr
 }
 
-/// A mock upstream that DECLINES every upgrade request outright: answers a
-/// plain `200 OK` instead of `101` -- what
-/// `upstream_declining_upgrade_passes_the_response_through` drives.
+/// Decline upgrade requests with a plain `200 OK`.
 async fn spawn_upgrade_declining_upstream() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -266,15 +236,9 @@ async fn spawn_upgrade_declining_upstream() -> SocketAddr {
     addr
 }
 
-/// **The core proof.** Drives a REAL downstream client through the REAL
-/// `proxy_http::serve_http1` codec (not `FilterChainHandler::handle` called
-/// directly -- see this module's doc) against a router whose HCM enables
-/// `websocket` in `upgrade_configs`, forwarding to the mock echo upstream
-/// above. Asserts the `101` handshake, then a raw byte round-trip through
-/// the tunnel -- this is exactly what breaks if `codec::bridge_upgrade`'s
-/// `tokio::task::spawn_local` is removed (the client's `write_all`/
-/// `read_exact` below would simply hang, since nothing would ever be
-/// draining the downstream `Upgraded` stream into the upstream one).
+/// Exercise the real codec and verify the `101` handshake and raw byte
+/// round-trip. This catches a missing `bridge_upgrade` task, which would
+/// leave the downstream upgraded stream undrained.
 #[tokio::test(flavor = "current_thread")]
 async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
     LocalSet::new()
@@ -293,12 +257,7 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
                 .await,
             );
 
-            // Serve the downstream side of a `tokio::io::duplex` with the
-            // REAL codec, in the background -- same shape
-            // `tests/hyper_spike.rs` finding (e) uses for its server half,
-            // just through the actual proxy stack instead of a bare
-            // `service_fn`. `serve_http1`'s own `.with_upgrades()` (S10) is what lets
-            // the eventual `101` response's `OnUpgrade` resolve at all.
+            // `.with_upgrades()` lets the `101` response's `OnUpgrade` resolve.
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             tokio::task::spawn_local(async move {
@@ -317,10 +276,7 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
                 .await;
             });
 
-            // The downstream CLIENT, low-level hyper API, `.with_upgrades()`
-            // on both the connection AND (below) via `hyper::upgrade::on` --
-            // spike finding (e)'s caveat (1): the client side is the one
-            // that's easy to forget.
+            // The client also needs `.with_upgrades()` for `hyper::upgrade::on`.
             let io = TokioIo::new(client_io);
             let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(io)
                 .await
@@ -349,8 +305,7 @@ async fn websocket_upgrade_tunnel_echoes_bytes_end_to_end() {
                 response.headers().get(http::header::UPGRADE).unwrap(),
                 "websocket"
             );
-            // The upstream's hop-by-hop tokens stay on the upstream hop; the
-            // client gets exactly the `Connection: upgrade` a 101 needs.
+            // The client needs `Connection: upgrade` on the 101 response.
             assert_eq!(
                 response.headers().get(http::header::CONNECTION).unwrap(),
                 "upgrade"
@@ -408,10 +363,7 @@ async fn disallowed_upgrade_returns_403_and_never_dials_upstream() {
                 "a disallowed upgrade must never produce a tunnel"
             );
 
-            // Give the (would-be) dial every chance to have happened before
-            // asserting it didn't -- there is no dial to await here, so a
-            // short yield is the honest way to let a wrongly-spawned one
-            // surface if the gate were broken.
+            // Let a wrongly spawned upstream request surface before asserting.
             tokio::task::yield_now().await;
             assert_eq!(
                 accepted.load(Ordering::SeqCst),

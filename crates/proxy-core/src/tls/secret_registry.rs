@@ -1,33 +1,20 @@
-//! The seam that maps an SDS secret NAME to the
-//! [`DownstreamTlsFactory`] instances that named it, so an accepted secret
-//! (`ResourceApplier`'s `PublishSecrets` sink, `crates/proxy-xds/src/apply.rs`)
-//! actually reaches a serving TLS chain instead of stopping at the sink.
+//! Maps an SDS secret name to the [`DownstreamTlsFactory`] instances that use it, so an accepted secret (the
+//! `PublishSecrets` sink in `crates/proxy-xds/src/apply.rs`) reaches a serving TLS chain instead of stopping at the sink.
 //!
-//! Named `SdsSecretRegistry`, not `SecretRegistry` -- `listener.rs` already
-//! threads a `registry` that is a `ConnectionRegistry` and a `FilterRegistry`,
-//! and a third bare "registry" in the same argument lists would be a reading
-//! hazard.
+//! Named `SdsSecretRegistry`, not `SecretRegistry`: `listener.rs` already threads a `registry` argument, and a third
+//! bare "registry" in the same lists would be a reading hazard.
 //!
-//! # Why both directions
+//! # Both orderings
 //!
-//! A secret can arrive before or after the factory that needs it exists:
-//! - **Factory first, secret later** is the ordinary case: a worker binds a
-//!   listener at startup, and the control plane delivers the certificate
-//!   afterwards. [`SdsSecretRegistry::publish`] handles this -- it pushes
-//!   straight to every already-registered factory.
-//! - **Secret first, factory later** is the *normal* case, not an edge case:
-//!   workers bind on their own schedule, and an accept loop rebuilds its TLS
-//!   factories lazily whenever it notices the config snapshot's version
-//!   changed (`listener.rs`'s `spawn_accept_loop`). A secret the control
-//!   plane already delivered before that rebuild must not wait for a second,
-//!   unprompted resend. [`SdsSecretRegistry::register`] handles this -- it
-//!   replays the last delivered certs for a name immediately, before
-//!   returning, if any are cached.
+//! - **Factory first, secret later** is the ordinary case: the listener binds at startup and the certificate arrives
+//!   afterwards. [`SdsSecretRegistry::publish`] pushes straight to every registered factory.
+//! - **Secret first, factory later** is also normal. Workers bind on their own schedule, and an accept loop rebuilds
+//!   its TLS factories when the snapshot version changes (`listener.rs`'s `spawn_accept_loop`). A secret delivered
+//!   before that rebuild must not wait for a resend. [`SdsSecretRegistry::register`] replays the last delivered certs
+//!   for a name before returning.
 //!
-//! Getting only one of these two right leaves an SDS-named chain unserved in
-//! exactly the ordering that isn't exercised by whichever test happens to be
-//! written -- see `crates/proxy-core/tests/tls.rs`'s "publish-then-serve" and
-//! "late registration" tests, which pin both orderings independently.
+//! Only one of these handled leaves an SDS-named chain unserved in an ordering the tests do not exercise.
+//! `crates/proxy-core/tests/tls.rs` pins both orderings independently.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -36,39 +23,23 @@ use proxy_config::ir::{SecretName, TlsCertificateIR, ValidationContextIR};
 
 use super::{DownstreamTlsFactory, TlsBuildError};
 
-/// Everything the registry holds, behind one lock -- see [`SdsSecretRegistry`]
-/// for why a single `Mutex` (not two) is correct here: `register` and
-/// `publish` both need to read one field while mutating the other, and
-/// keeping them under one lock is what makes "check `delivered`, then act on
-/// `factories`" atomic with respect to a concurrent call on the other name.
+/// Everything the registry holds, behind one lock. `register` and `publish` each read one field while mutating the
+/// other, so one `Mutex` makes "check `delivered`, then act on `factories`" atomic.
 struct Inner {
     /// Who to push a newly delivered secret to, by `Secret.name`.
     ///
-    /// Rust note: `Weak`, not `Arc`. A factory's owner is the accept loop's
-    /// `Rc<ListenerTls>` cache (`listener.rs`), which is replaced -- not
-    /// mutated -- every time that loop rebuilds on a snapshot version change,
-    /// or when a listener is removed entirely (`reconcile`). If this map held
-    /// `Arc<DownstreamTlsFactory>`, every rebuild would leave the OLD
-    /// factory alive forever (this registry would be the only thing still
-    /// referencing it) and leak one entry per rebuild for the life of the
-    /// process. `Weak::upgrade` turns "is this factory still alive" into an
-    /// `Option`, so a dead entry costs nothing beyond eventually being
-    /// pruned -- never a strong reference this registry has no business
-    /// holding.
+    /// Rust note: `Weak`, not `Arc`. The factory's owner is the accept loop's `Rc<ListenerTls>` cache, which is replaced
+    /// on every rebuild or listener removal. An `Arc` here would keep every old factory alive, leaking one entry per
+    /// rebuild for the life of the process. `Weak::upgrade` makes a dead entry cost nothing beyond eventual pruning.
     certificate_factories: HashMap<SecretName, Vec<Weak<DownstreamTlsFactory>>>,
     validation_factories: HashMap<SecretName, Vec<Weak<DownstreamTlsFactory>>>,
-    /// The last certs delivered for each name, so a factory that registers
-    /// AFTER a secret already arrived (the normal case -- see the module
-    /// doc) can be caught up immediately instead of waiting for a resend
-    /// that may never come.
+    /// The last certs delivered per name. A factory that registers after a secret arrived is caught up at once.
     delivered_certificates: HashMap<SecretName, Vec<TlsCertificateIR>>,
     delivered_validation_contexts: HashMap<SecretName, ValidationContextIR>,
 }
 
-/// Maps an SDS `Secret.name` to the [`DownstreamTlsFactory`] instances
-/// currently serving it, and replays the last delivered certificate set to a
-/// factory that registers late. See the module doc for the two orderings
-/// this exists to cover.
+/// Maps an SDS `Secret.name` to the [`DownstreamTlsFactory`] instances serving it, and replays the last delivered
+/// certificate set to a factory that registers late. See the module doc for the two orderings.
 pub struct SdsSecretRegistry {
     inner: Mutex<Inner>,
 }
@@ -91,19 +62,11 @@ impl SdsSecretRegistry {
         }
     }
 
-    /// Register `factory` as a server of every name in `names` (a chain's
-    /// `DownstreamTlsSpec::certificate_sds_names`), and immediately hot-swap
-    /// in any certs already delivered for one of those names -- see the
-    /// module doc's "secret first, factory later" case. `context` is used
-    /// only for that immediate hot-swap's error message, the same shape
-    /// `DownstreamTlsFactory::build`'s own `context` parameter uses.
+    /// Registers `factory` as a server of every name in `names` (a chain's `certificate_sds_names`), and immediately
+    /// hot-swaps in any certs already delivered for those names. `context` only labels that swap's error message.
     ///
-    /// A late-registration hot-swap failure (a cached secret that this
-    /// factory's crypto provider can't load, for instance) is returned to
-    /// the caller rather than swallowed -- `listener.rs`'s callers already
-    /// treat a `TlsBuildError` from factory construction as a startup/
-    /// reconcile failure, and a registry-driven swap failing is the same
-    /// kind of problem.
+    /// A late-registration swap failure (for example a cached secret this factory's crypto provider cannot load) is
+    /// returned, not swallowed. Callers already treat a `TlsBuildError` as a startup or reconcile failure.
     pub fn register(
         &self,
         names: &[SecretName],
@@ -113,22 +76,14 @@ impl SdsSecretRegistry {
         let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
         let weak = Arc::downgrade(factory);
         for name in names {
-            // Rust note: pruned here (not just in `publish`) so a name that
-            // has cycled through many dead factories (repeated rebuilds of a
-            // chain that never got fresh secrets) doesn't grow this `Vec`
-            // without bound -- `Weak::strong_count` is enough to tell a dead
-            // entry apart from a live one without paying for a full
-            // `upgrade` on each.
+            // Rust note: pruned here, not only in `publish`, so a name cycled through many dead factories does not grow
+            // this `Vec` without bound. `Weak::strong_count` tells a dead entry from a live one without an `upgrade`.
             let list = inner.certificate_factories.entry(name.clone()).or_default();
             list.retain(|w| w.strong_count() > 0);
             list.push(weak.clone());
         }
-        // Late registration: replay whatever is already cached for any of
-        // these names. Deliberately a second loop (not folded into the one
-        // above) -- `inner.delivered` (read) and `inner.factories` (written)
-        // are different fields of the same `Inner`, so borrowing both at
-        // once from `&mut inner` is fine, but keeping the two concerns in
-        // separate loops reads clearer than interleaving them.
+        // Late registration: replay whatever is cached for these names. This is a second loop because `delivered`
+        // (read) and `factories` (written) are different fields of `Inner`, so the two loops read more clearly apart.
         for name in names {
             if let Some(certs) = inner.delivered_certificates.get(name) {
                 factory.update_certificates(certs, context)?;
@@ -137,11 +92,8 @@ impl SdsSecretRegistry {
         Ok(())
     }
 
-    /// Register a factory for a downstream
-    /// `validation_context_sds_secret_config`. This deliberately has a
-    /// separate map/cache from certificate registration: an SDS name denotes
-    /// one secret *kind*, and delivering a certificate where a trust anchor
-    /// is expected must never accidentally mutate the other reload seam.
+    /// Registers a factory for a downstream `validation_context_sds_secret_config`. It has its own map, so an SDS
+    /// name's kind stays fixed: a certificate delivered where a trust anchor is expected must not touch the other seam.
     pub fn register_validation_context(
         &self,
         name: &str,
@@ -161,39 +113,25 @@ impl SdsSecretRegistry {
         Ok(())
     }
 
-    /// Record `certs` as the current delivery for `name`, and hot-swap every
-    /// live factory registered under it -- see the module doc's "factory
-    /// first, secret later" case. A name with no registered factory yet is
-    /// `Ok(())`: the certs are cached (so a later `register` catches up
-    /// immediately) and this is logged at `debug`, not treated as an error --
-    /// a control plane is allowed to push a secret before any listener that
-    /// names it has bound.
+    /// Records `certs` as the current delivery for `name` and hot-swaps every live factory registered under it. A
+    /// name with no factory yet is `Ok(())`: the certs are cached for a later `register`, and this is logged at
+    /// `debug`. A control plane may push a secret before any listener names it.
     ///
-    /// Returns `Err` naming `name` if hot-swapping any live factory fails --
-    /// that becomes an SDS NACK one layer up
-    /// (`crates/proxy/src/main.rs`'s secret sink), which is the right answer
-    /// to a control plane sending a certificate this proxy cannot load: ACKing
-    /// it would tell the control plane the proxy is serving something it
-    /// is not.
+    /// `Err` names `name` when a live swap fails. The caller turns that into an SDS NACK, since ACKing a certificate
+    /// this proxy cannot load would tell the control plane it is serving something it is not.
     pub fn publish(&self, name: &str, certs: Vec<TlsCertificateIR>) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
         inner.delivered_certificates.insert(name.to_string(), certs);
 
-        // Rust note: `list` below is cloned (not held as a borrow of
-        // `inner.factories`) specifically so the borrow checker sees the
-        // `factories` and `delivered` borrows as sequential rather than
-        // overlapping -- a `Weak` clone is cheap (it just bumps a weak
-        // count), so this costs nothing but is what lets us then borrow
-        // `inner.delivered` immutably for `certs` below without the two
-        // borrows fighting over the same `MutexGuard`.
+        // Rust note: `list` is cloned, not borrowed from `inner.factories`, so the `factories` and `delivered`
+        // borrows do not overlap. A `Weak` clone is cheap, and this lets `inner.delivered` be borrowed for `certs`
+        // below without fighting over the same `MutexGuard`.
         let list = inner
             .certificate_factories
             .entry(name.to_string())
             .or_default();
-        // Pruning here is what makes a publish to a name whose only
-        // registered factory has since been dropped read as "no factories",
-        // not as a dangling `Weak` that upgrades to nothing on every call
-        // forever -- see the module doc's `Weak` note.
+        // Pruning here means a name whose only factory was dropped reads as "no factories", not as a dangling `Weak`
+        // that upgrades to nothing on every call.
         list.retain(|w| w.strong_count() > 0);
         let list = list.clone();
 
@@ -206,11 +144,8 @@ impl SdsSecretRegistry {
         let mut reached = 0usize;
         let mut failures: Vec<String> = Vec::new();
         for weak in list.iter() {
-            // Rust note: `upgrade` (not just the `strong_count` check above)
-            // -- a concurrent drop between the `retain` and this loop is
-            // possible in principle (this lock is held across both, so in
-            // practice it isn't here, but `upgrade`'s `Option` is the correct
-            // way to handle it regardless of how tight that window is).
+            // Rust note: `upgrade` rather than the `strong_count` check above. A drop between the two is possible in
+            // principle, and `upgrade`'s `Option` handles it however narrow the window is.
             let Some(factory) = weak.upgrade() else {
                 continue;
             };
@@ -244,10 +179,8 @@ impl SdsSecretRegistry {
         Ok(())
     }
 
-    /// Record and publish a validation-context SDS secret. The new
-    /// `ServerConfig` is built before any factory swaps it in; a bad CA bundle
-    /// therefore NACKs while every affected listener retains its previous
-    /// trust anchors (or its initial fail-closed pending config).
+    /// Records and publishes a validation-context SDS secret. The new `ServerConfig` is built before any factory
+    /// swaps it in, so a bad CA bundle is NACKed while every affected listener keeps its previous trust anchors.
     pub fn publish_validation_context(
         &self,
         name: &str,
@@ -280,9 +213,8 @@ impl SdsSecretRegistry {
                 failures.join("; ")
             ));
         }
-        // Cache only a fully accepted value. If construction failed above,
-        // retaining an invalid CA would make a later factory registration
-        // fail against a secret the control plane has already been NACKed.
+        // Cache only a fully accepted value. Caching an invalid CA would make a later factory registration fail against
+        // a secret the control plane has already been NACKed for.
         inner
             .delivered_validation_contexts
             .insert(name.to_string(), validation);
@@ -301,9 +233,8 @@ impl SdsSecretRegistry {
         Ok(())
     }
 
-    /// Evict a delivered SDS secret and return every live consumer of that
-    /// name to its fail-closed pending state. Unknown and unregistered names
-    /// are successful no-ops, matching delta xDS removal semantics.
+    /// Evicts a delivered SDS secret and returns every live consumer of that name to its fail-closed pending state.
+    /// Unknown and unregistered names are successful no-ops, matching delta xDS removal semantics.
     pub fn remove(&self, name: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("SdsSecretRegistry mutex poisoned");
 

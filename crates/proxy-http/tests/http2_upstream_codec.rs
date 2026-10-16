@@ -1,13 +1,5 @@
-//! Standalone tests for the upstream HTTP/2 codec
-//! (`proxy_http::codec::send_upstream_http2`), the h2 mirror of
-//! `tests/http1_upstream_codec.rs`. The loopback h2 server here is lifted
-//! from the now-deleted de-risking spike (`h2_upstream_spike.rs`) -- this
-//! test file supersedes it.
-//!
-//! `send_upstream_http2` spawns its connection-driving future with
-//! `tokio::task::spawn_local`, so every test needs a running `LocalSet` --
-//! provided here via `#[tokio::test(flavor = "current_thread")]` +
-//! `LocalSet::run_until`, per the module doc on `send_upstream_http2`.
+//! Tests for the upstream HTTP/2 codec, including streaming and wire-level
+//! reset handling. The codec uses `spawn_local`, so tests run inside a `LocalSet`.
 
 use std::future::Future;
 use std::rc::Rc;
@@ -25,10 +17,7 @@ use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamB
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::LocalSet;
 
-/// Same-shape executor as `codec::LocalExec`, but this one only needs to
-/// exist on the *server* side of these tests (the server-side response body
-/// here is also driven by an executor-spawned pump under a `current_thread`
-/// runtime) -- the codec under test supplies its own internally.
+/// Executor for the test server's local connection driver.
 #[derive(Clone)]
 struct LocalExec;
 
@@ -41,9 +30,7 @@ where
     }
 }
 
-/// Loopback h2 "upstream" server: accepts one connection and replies to every
-/// request with a response body that streams two frames, so the round trip
-/// exercises streaming rather than a single buffered reply.
+/// Loopback server that returns a two-frame streaming response.
 async fn spawn_h2_upstream() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -90,8 +77,7 @@ async fn h2_round_trip_streams_response_with_non_send_request_body() {
             let addr = spawn_h2_upstream().await;
             let io = TcpStream::connect(addr).await.expect("connect");
 
-            // Request body that is provably `!Send`: the `map_err` closure
-            // captures an `Rc`, exactly like the deleted spike's test.
+            // Capturing `Rc` makes the request body provably `!Send`.
             let not_send: Rc<()> = Rc::new(());
             let body: StreamBody = local_boxed(Full::new(Bytes::from_static(b"req-body")).map_err(
                 move |infallible: std::convert::Infallible| {
@@ -100,9 +86,7 @@ async fn h2_round_trip_streams_response_with_non_send_request_body() {
                 },
             ));
 
-            // Origin-form URI + a `Host` header, matching the shape our
-            // router actually produces after h1-style processing -- this
-            // exercises the `:authority` reconstruction path.
+            // Origin-form plus Host exercises `:authority` reconstruction.
             let mut headers = HeaderMap::new();
             headers.insert(http::header::HOST, "localhost".parse().unwrap());
             let req = HttpRequestParts {
@@ -136,8 +120,7 @@ async fn h2_round_trip_streams_response_with_non_send_request_body() {
 async fn connect_to_nothing_yields_handshake_error() {
     LocalSet::new()
         .run_until(async {
-            // Bind then immediately drop the listener so the port is
-            // guaranteed closed on this host, then connect straight to it.
+            // Dropping the listener leaves this ephemeral port closed.
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local_addr");
             drop(listener);
@@ -170,16 +153,7 @@ async fn connect_to_nothing_yields_handshake_error() {
         .await;
 }
 
-/// A loopback h2 "upstream" that accepts one stream and immediately answers
-/// `RST_STREAM(REFUSED_STREAM)`.
-///
-/// Built on the raw `h2` server API rather than hyper's, deliberately:
-/// hyper's server has no way to refuse a stream (it always intends to serve
-/// one), and the whole point of this test is that a REFUSED_STREAM arrives on
-/// the actual wire. `reason` is a parameter so the negative case below can
-/// send a *different* reset through the identical path -- the two tests
-/// differ in exactly one byte of protocol, which is what makes the
-/// comparison mean anything.
+/// Raw h2 server that resets a stream; hyper's server API cannot send this reset.
 async fn spawn_h2_resetting_upstream(reason: h2::Reason) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -193,11 +167,7 @@ async fn spawn_h2_resetting_upstream(reason: h2::Reason) -> std::net::SocketAddr
             let (_req, mut respond) = accepted.expect("accept stream");
             respond.send_reset(reason);
         }
-        // Keep polling the connection so the RST_STREAM is actually flushed
-        // to the wire -- `send_reset` only queues it. Without this the client
-        // sees the connection close instead of the reset, which projects to a
-        // completely different outcome and would make this test pass for the
-        // wrong reason.
+        // `send_reset` only queues the frame; polling flushes it before close.
         while let Some(accepted) = conn.accept().await {
             drop(accepted);
         }
@@ -224,16 +194,7 @@ fn refused_stream_request() -> HttpRequestParts {
     }
 }
 
-/// S3.2 `refused-stream`, end to end on a real connection.
-///
-/// This drives an actual `RST_STREAM(REFUSED_STREAM)` rather than
-/// constructing an `UpstreamCodecError` by hand, and that is the entire
-/// point. The decode works by downcasting the `hyper::Error`'s source chain
-/// to `h2::Error`, which is sound only while `h2` is the same compiled crate
-/// hyper links -- if the tree ever resolved two semver-incompatible copies,
-/// `downcast_ref` would return `None`, the decode would become a silent
-/// permanent no-op, and a hand-built-error test would still pass. See
-/// `codec::h2_reason`.
+/// S3.2 refusal handling over a real connection, exercising Hyper's h2 error downcast.
 #[tokio::test(flavor = "current_thread")]
 async fn refused_stream_is_decoded_from_a_real_rst_stream() {
     LocalSet::new()
@@ -258,11 +219,7 @@ async fn refused_stream_is_decoded_from_a_real_rst_stream() {
         .await;
 }
 
-/// The negative case, and the one that stops the test above from passing for
-/// the wrong reason: an identical path, identical harness, one different
-/// reason code. `CANCEL` means the peer may well have done work, so it must
-/// stay a conservative `Send` -- only REFUSED_STREAM carries the "nothing
-/// happened, replay freely" guarantee S3.2 relies on.
+/// CANCEL may arrive after work was done, so unlike REFUSED_STREAM it remains a send error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_non_refused_reset_is_not_decoded_as_refused_stream() {
     LocalSet::new()

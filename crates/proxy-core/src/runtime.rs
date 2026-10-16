@@ -1,13 +1,9 @@
-//! Worker runtime pool and control -> worker config propagation (ADR-0003).
+//! Worker runtime pool and control-to-worker config propagation (ADR-0003).
 //!
-//! Workers are share-nothing, `!Send` `current_thread` tokio runtimes, each
-//! on a dedicated OS thread driving a `LocalSet` (optionally core-pinned).
-//! Config crosses threads only as an immutable `Arc<ConfigSnapshot>`,
-//! published into each worker's [`WorkerConfigHandle`] and followed by a
-//! `watch` ping that wakes the worker to reload. Any other snapshot consumer
-//! (the admin server, today) enrolls its handle in the same
-//! [`SnapshotHandles`] registry so [`ConfigPublisher::publish`] cannot leave
-//! it behind -- see that type's doc comment.
+//! Workers are share-nothing, `!Send` `current_thread` tokio runtimes, each on a dedicated OS thread driving a
+//! `LocalSet`. Config crosses threads only as an immutable `Arc<ConfigSnapshot>`, published into each worker's
+//! [`WorkerConfigHandle`] and followed by a `watch` ping. Every other snapshot consumer (the admin server) enrolls
+//! its handle in the same [`SnapshotHandles`] registry, so [`ConfigPublisher::publish`] cannot leave it behind.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -54,14 +50,12 @@ pub struct WorkerContext {
     /// This worker's slice of config: `load()`/`load_full()` returns the
     /// latest snapshot published by the control runtime.
     pub config: Arc<WorkerConfigHandle>,
-    /// Fires whenever the control runtime calls `ConfigPublisher::publish`.
-    /// The new snapshot is already visible via `config` by the time this
-    /// resolves (see [`ConfigPublisher::publish`] for the ordering).
+    /// Fires whenever the control runtime calls `ConfigPublisher::publish`. The new snapshot is already visible via
+    /// `config` by the time this resolves.
     pub config_ping: watch::Receiver<SnapshotVersion>,
     /// Flips to `true` when `ConfigPublisher::shutdown` is called.
     pub shutdown: watch::Receiver<bool>,
-    /// Fires when the control runtime calls `ConfigPublisher::start_drain`.
-    /// Worker mains hand this to
+    /// Fires when the control runtime calls `ConfigPublisher::start_drain`. Worker mains hand it to
     /// [`crate::drain::drain_worker`].
     pub drain: watch::Receiver<DrainState>,
     /// The worker reports here (via `drain_worker`) once its connection
@@ -72,30 +66,15 @@ pub struct WorkerContext {
     pub connection_limiter: crate::admission::ConnectionLimiter,
 }
 
-/// Every live [`WorkerConfigHandle`] that must observe a republished
-/// snapshot: one per worker, plus, when the admin server is running, its own.
-/// [`ConfigPublisher::publish`] walks this registry instead of a private
-/// `Vec` assembled once inside `WorkerPool::spawn` -- that used to be exactly
-/// how the admin server's handle went stale after a SIGHUP reload: it built
-/// its own `WorkerConfigHandle` outside `spawn`'s loop, so nothing about
-/// `publish` ever touched it. `WorkerConfigHandle::new` is `pub(crate)`, so
-/// [`SnapshotHandles::register`] is the only way anything outside
-/// `proxy-core` can obtain a handle, and it always enrolls the handle it
-/// hands back -- a new consumer (a second admin listener, a future
-/// control-plane reader, whatever comes next) is registered by construction
-/// rather than by an author remembering a second call site. (A handful of
-/// unit tests inside this crate still call `WorkerConfigHandle::new`
-/// directly, which visibility can't prevent; they aren't production
-/// consumers of `publish`, so that isn't the gap this type closes.)
+/// Every live [`WorkerConfigHandle`] that must observe a republished snapshot: one per worker, plus the admin
+/// server's when it runs. [`ConfigPublisher::publish`] walks this registry. `WorkerConfigHandle::new` is
+/// `pub(crate)`, so [`SnapshotHandles::register`] is the only way outside `proxy-core` to get a handle, and it
+/// always enrolls the handle it returns. A new consumer is therefore registered by construction. (Unit tests in
+/// this crate may still call `WorkerConfigHandle::new` directly.)
 ///
-/// Rust note: `Mutex<Vec<_>>`, not a `Vec` behind `&mut self`, because
-/// registration happens from two independent call sites on the control
-/// runtime -- `WorkerPool::spawn` (one call per worker) and `start_admin` in
-/// `crates/proxy/src/main.rs` (a separate, earlier call) -- both of which
-/// need to add to the *same* registry through a shared `Arc`. Contention is a
-/// non-issue: registration only happens at startup, and `store_all` only runs
-/// on the rare SIGHUP-triggered `publish`, never on the per-connection hot
-/// path.
+/// Rust note: `Mutex<Vec<_>>`, because registration comes from two call sites on the control runtime
+/// (`WorkerPool::spawn` and `start_admin`) that share one `Arc`. Registration happens only at startup, and
+/// `store_all` runs only on a SIGHUP publish, never on the per-connection hot path.
 #[derive(Default)]
 pub struct SnapshotHandles {
     handles: Mutex<Vec<Arc<WorkerConfigHandle>>>,
@@ -106,13 +85,9 @@ impl SnapshotHandles {
         Self::default()
     }
 
-    /// Build a [`WorkerConfigHandle`] seeded with `initial`, enroll it in
-    /// this registry, and hand it back. `WorkerConfigHandle::new` is
-    /// `pub(crate)`, so this is the only way a caller outside `proxy-core`
-    /// can get one -- constructing one directly and skipping registration
-    /// (as `start_admin` used to) is exactly the bug this closes, and now the
-    /// compiler refuses the shortcut instead of a doc comment discouraging
-    /// it.
+    /// Builds a [`WorkerConfigHandle`] seeded with `initial`, enrolls it in this registry, and returns it.
+    /// Constructing one directly and skipping registration is the bug this prevents: the compiler refuses the
+    /// shortcut.
     pub fn register(&self, initial: Arc<ConfigSnapshot>) -> Arc<WorkerConfigHandle> {
         let handle = Arc::new(WorkerConfigHandle::new(initial));
         self.handles
@@ -122,11 +97,8 @@ impl SnapshotHandles {
         handle
     }
 
-    /// Store `snapshot` into every registered handle. [`ConfigPublisher::publish`]
-    /// calls this (see that method's doc for the store-before-ping ordering
-    /// it preserves) -- exposed as `pub` rather than crate-private so a test
-    /// can drive a registry directly without needing a full `ConfigPublisher`
-    /// (which only `WorkerPool::spawn` can build).
+    /// Stores `snapshot` into every registered handle. [`ConfigPublisher::publish`] calls this, and the store comes
+    /// before the ping. It is `pub` so a test can drive a registry directly.
     pub fn store_all(&self, snapshot: &Arc<ConfigSnapshot>) {
         for handle in self
             .handles
@@ -139,34 +111,23 @@ impl SnapshotHandles {
     }
 }
 
-/// Owns nothing after `spawn` returns; it only exists to give `spawn` a
-/// natural home (`WorkerPool::spawn(...)`). The real handles a caller needs
-/// -- to publish config, to shut down, to join -- live on [`ConfigPublisher`].
+/// Owns nothing after `spawn` returns. It exists to give `spawn` a home (`WorkerPool::spawn(...)`). The handles a
+/// caller needs live on [`ConfigPublisher`].
 pub struct WorkerPool;
 
 impl WorkerPool {
-    /// Spawn `config.concurrency` worker threads, each running a
-    /// `current_thread` tokio runtime + `LocalSet`, and return the
-    /// [`ConfigPublisher`] the control runtime uses to talk to them.
+    /// Spawns `config.concurrency` worker threads, each running a `current_thread` tokio runtime and `LocalSet`, and
+    /// returns the [`ConfigPublisher`] the control runtime uses to talk to them.
     ///
-    /// `worker_main` is called once per worker, *on that worker's own OS
-    /// thread*, to build the future which then drives the worker's
-    /// `LocalSet`. It has to run there: the `!Send` future it returns could
-    /// not be moved onto the worker thread after the fact.
+    /// `worker_main` runs once per worker, on that worker's own OS thread, to build the future that drives its
+    /// `LocalSet`. The future cannot move threads after the fact, since it may be `!Send`.
     ///
-    /// `snapshot_handles` is the registry every worker's [`WorkerConfigHandle`]
-    /// is enrolled into (see [`SnapshotHandles`]'s doc for why); pass the same
-    /// registry a caller already handed to any other snapshot consumer (e.g.
-    /// the admin server's `start_admin`) so [`ConfigPublisher::publish`] keeps
-    /// all of them current, not just the workers spawned here.
+    /// `snapshot_handles` is the registry every worker's handle is enrolled into. Pass the same one any other
+    /// snapshot consumer (the admin server) already uses, so `publish` keeps all of them current.
     ///
-    /// Rust note: the bound is deliberately asymmetric. `worker_main` (the
-    /// closure *factory*) must be `Send + Clone + 'static` so a copy of it
-    /// can move into each new `std::thread::spawn`. But the future `F` it
-    /// returns is *not* required to be `Send` -- per ADR-0003 it is built
-    /// and polled entirely on the worker thread it was created on (via
-    /// `LocalSet::block_on`) and may hold `Rc`/`RefCell`/other `!Send`
-    /// worker-local state across an `.await`.
+    /// Rust note: the bound is deliberately asymmetric. `worker_main` must be `Send + Clone + 'static` to move into
+    /// each `std::thread::spawn`. The future it returns need not be `Send`: per ADR-0003 it is built and polled on
+    /// the thread it was created on, and may hold `Rc` or `RefCell` across an `.await`.
     pub fn spawn<F, W>(
         config: WorkerPoolConfig,
         initial_snapshot: Arc<ConfigSnapshot>,
@@ -188,10 +149,8 @@ impl WorkerPool {
         let mut threads = Vec::with_capacity(config.concurrency);
         let mut config_txs = Vec::with_capacity(config.concurrency);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        // Rust note: `DrainCoordinator::new` hands back one `watch::Receiver`
-        // that every worker clones (watch receivers are `Clone`) plus the
-        // coordinator itself, which owns the `mpsc` sender side worker
-        // clones report drain completion through.
+        // Rust note: `DrainCoordinator::new` returns one `watch::Receiver` that every worker clones, plus the
+        // coordinator, which owns the `mpsc` sender workers report drain completion through.
         let (drain_coordinator, drain_rx) = DrainCoordinator::new(config.concurrency);
         let drain_done_tx = drain_coordinator.done_sender();
 
@@ -199,10 +158,8 @@ impl WorkerPool {
         for i in 0..config.concurrency {
             let id = WorkerId(i);
             let connection_limiter = connection_limiter.clone();
-            // `register` both builds this worker's handle AND enrolls it in
-            // `snapshot_handles` -- no separate `handles.push(..)` needed
-            // (or possible to forget) the way a bare `WorkerConfigHandle::new`
-            // used to require.
+            // `register` builds this worker's handle and enrolls it in `snapshot_handles`, so the enrollment cannot be
+            // forgotten.
             let handle_for_thread = snapshot_handles.register(initial_snapshot.clone());
             let (config_tx, config_rx) = watch::channel(initial_snapshot.version);
             let shutdown_rx = shutdown_rx.clone();
@@ -240,12 +197,9 @@ impl WorkerPool {
                         connection_limiter,
                     };
 
-                    // Rust note: `new_current_thread` + `LocalSet` is the
-                    // `!Send` half of ADR-0003. Everything spawned with
-                    // `tokio::task::spawn_local` inside this `LocalSet` is
-                    // pinned to this OS thread for its whole lifetime, so
-                    // data-plane code can reach for `Rc`/`RefCell` instead of
-                    // `Arc`/`Mutex` on the hot path.
+                    // Rust note: `new_current_thread` plus `LocalSet` is the `!Send` half of ADR-0003. Everything
+                    // spawned with `tokio::task::spawn_local` stays on this OS thread, so data-plane code can use
+                    // `Rc` and `RefCell` instead of `Arc` and `Mutex`.
                     let rt = Builder::new_current_thread()
                         .enable_all()
                         .build()
@@ -272,39 +226,28 @@ impl WorkerPool {
 /// Control-plane handle to a running [`WorkerPool`]: publishes config
 /// snapshots, signals shutdown, and joins the worker threads.
 pub struct ConfigPublisher {
-    /// Every consumer `publish` must keep current -- see [`SnapshotHandles`]'s
-    /// doc for why this is a shared registry rather than a `Vec` this type
-    /// assembles privately: the admin server's handle lives in the SAME
-    /// registry, registered by `crates/proxy/src/main.rs`'s `start_admin`
-    /// before `WorkerPool::spawn` (which built this `ConfigPublisher`) even
-    /// ran.
+    /// Every consumer `publish` must keep current. Shared as a registry, not a `Vec` built here: the admin server's
+    /// handle is registered by `start_admin` before `WorkerPool::spawn` builds this publisher.
     handles: Arc<SnapshotHandles>,
     config_txs: Vec<watch::Sender<SnapshotVersion>>,
     shutdown_tx: watch::Sender<bool>,
     threads: Vec<JoinHandle<()>>,
-    /// Drain coordination: kept here, not as a separate
-    /// handle callers juggle alongside this one, so "publish config",
-    /// "shut down", and "drain" all live on the one control-side type.
+    /// Drain coordination lives here too, so publish, shutdown, and drain all sit on one control-side type.
     drain: DrainCoordinator,
 }
 
 impl ConfigPublisher {
-    /// Publish a new snapshot to every registered [`WorkerConfigHandle`] --
-    /// every worker's, plus any other consumer (e.g. the admin server) that
-    /// was registered into the same [`SnapshotHandles`] this publisher holds.
+    /// Publishes a new snapshot to every handle registered in this publisher's [`SnapshotHandles`], workers and
+    /// others alike.
     ///
-    /// Ordering matters: this stores into every handle *before* sending the
-    /// `watch` ping. That way a worker woken by the ping is guaranteed to
-    /// observe the new snapshot the moment it calls `config.load()` -- it can
-    /// never race ahead of the store and see a stale one. A non-worker
-    /// consumer like the admin server has no ping to race; it simply sees the
-    /// new snapshot on its next `load()` after this returns.
+    /// Ordering matters: this stores into every handle before sending the `watch` ping. A worker woken by the ping
+    /// then always sees the new snapshot on `config.load()`. A non-worker consumer has no ping to race and sees the
+    /// new snapshot on its next `load()`.
     pub fn publish(&self, snapshot: Arc<ConfigSnapshot>) {
         self.handles.store_all(&snapshot);
         for tx in &self.config_txs {
-            // Rust note: `send` only errors if every receiver was dropped
-            // (i.e. the worker thread is gone); that's not our problem to
-            // report here, so we ignore it rather than unwrap.
+            // Rust note: `send` errors only if every receiver is gone, meaning the worker thread has exited. That is not
+            // ours to report, so the error is ignored rather than unwrapped.
             let _ = tx.send(snapshot.version);
         }
     }
@@ -315,8 +258,7 @@ impl ConfigPublisher {
         let _ = self.shutdown_tx.send(true);
     }
 
-    /// Begin a drain: broadcast the new [`DrainState`] to every worker.
-    /// Workers see this via `WorkerContext::drain` and react through
+    /// Begins a drain: broadcasts the new [`DrainState`] to every worker. Workers react through
     /// [`crate::drain::drain_worker`].
     pub fn start_drain(&self, duration: std::time::Duration) -> std::time::Instant {
         self.drain.start_drain(duration)
@@ -331,18 +273,16 @@ impl ConfigPublisher {
     /// Block until every worker thread has exited.
     pub fn join(self) {
         for thread in self.threads {
-            // A worker thread panicking is a bug we want surfaced, not
-            // swallowed -- but `join`'s `Err` is a `Box<dyn Any>`, not
-            // something we can usefully act on here beyond logging.
+            // A worker panic is a bug to surface, not swallow. `join`'s `Err` is a `Box<dyn Any>` we cannot act on
+            // here beyond logging.
             if let Err(err) = thread.join() {
                 tracing::error!(?err, "worker thread panicked");
             }
         }
     }
 
-    /// Like [`ConfigPublisher::join`], but waits on a blocking-pool thread so
-    /// an async caller (the shutdown path on the control runtime) never parks
-    /// one of its own threads while workers finish.
+    /// Like [`ConfigPublisher::join`], but waits on a blocking-pool thread, so the async shutdown path on the control
+    /// runtime never parks one of its own threads while workers finish.
     pub async fn join_async(self) {
         if let Err(err) = tokio::task::spawn_blocking(move || self.join()).await {
             tracing::error!(?err, "worker join task failed");
@@ -403,9 +343,8 @@ mod tests {
         );
         publisher.shutdown();
 
-        // A current-thread runtime has one thread: a blocking join inside it
-        // would wait for a release that only this same thread can send, and
-        // the test would hang (nextest's terminate-after fails it).
+        // A current-thread runtime has one thread. A blocking join inside it would wait for a release only this thread
+        // can send, so the test would hang.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -433,9 +372,8 @@ mod tests {
             move |mut ctx: WorkerContext| {
                 let result_tx = result_tx.clone();
                 async move {
-                    // Wait for the ping, then report what the snapshot looks
-                    // like *after* seeing it -- proving publish()'s
-                    // store-then-ping ordering.
+                    // Wait for the ping, then report the snapshot seen after it, proving publish's store-then-ping
+                    // ordering.
                     let _ = ctx.config_ping.changed().await;
                     let seen = ctx.config.load().version.0;
                     let _ = result_tx.send((ctx.id, seen));
@@ -501,10 +439,8 @@ mod tests {
 
     #[test]
     fn worker_main_future_can_hold_non_send_state_across_await() {
-        // Proves the !Send seam compiles: an `Rc` (which is !Send and
-        // !Sync) lives across an `.await` inside the future returned by
-        // `worker_main`. This would fail to compile if `WorkerPool::spawn`
-        // required `F: Send`.
+        // An `Rc` (which is `!Send`) lives across an `.await` inside the future `worker_main` returns. This fails to
+        // compile if `WorkerPool::spawn` requires `F: Send`.
         let done = Arc::new(AtomicUsize::new(0));
         let done_for_worker = done.clone();
 
@@ -570,19 +506,13 @@ mod tests {
         assert_eq!(value, 5);
     }
 
-    /// Defect 1's regression guard at the unit level: a handle registered
-    /// into the SAME [`SnapshotHandles`] a `ConfigPublisher` was built with,
-    /// but *not* created by `WorkerPool::spawn` -- exactly the shape of the
-    /// admin server's handle in `crates/proxy/src/main.rs` -- must still see
-    /// a `publish()`. Before this fix, `ConfigPublisher` built its own
-    /// private `Vec` inside `spawn`, so a handle registered from outside that
-    /// call (like the admin server's) was never touched by `publish`.
+    /// A handle registered into the SAME [`SnapshotHandles`] but not created by `WorkerPool::spawn` (the admin
+    /// server's shape) must still see a `publish()`. Before the registry existed, `publish` walked a private `Vec`
+    /// built inside `spawn`, so an externally registered handle was never touched.
     #[test]
     fn publish_updates_a_handle_registered_outside_spawn() {
         let registry = handles();
-        // Stands in for `start_admin`'s handle: registered into the shared
-        // registry BEFORE `WorkerPool::spawn` runs, exactly like `main.rs`
-        // registers the admin handle before the worker pool exists.
+        // Stands in for `start_admin`'s handle, registered BEFORE `WorkerPool::spawn`, as `main.rs` does.
         let external_handle = registry.register(snapshot(0));
 
         let publisher = WorkerPool::spawn(

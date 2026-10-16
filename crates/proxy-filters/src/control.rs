@@ -1,44 +1,11 @@
-//! The control-plane store seam, its published
-//! snapshot, and `ControlPlane`, the type that turns one into the other.
+//! Control-plane stores, the immutable snapshot published to request workers,
+//! and the admin writes that rebuild it. Authentication reads the shared
+//! snapshot on each request; store I/O stays off the hot path.
 //!
-//! Implements the `ControlPlaneStore` trait seam, an in-memory and a `redb`
-//! store (Redis lives in `control_redis`), the published snapshot, the admin
-//! write methods on [`ControlPlane`], and the rewiring of
-//! [`crate::auth::VirtualKeyAuthenticator`] onto the snapshot.
-//!
-//! # The seam, restated for this crate
-//!
-//! ```text
-//!                     admin write (mint/revoke/CRUD)
-//!                                    │  rebuild + swap
-//! store.load() ──▶ ControlPlane ──publish──▶ Arc<ArcSwap<ControlPlaneSnapshot>>
-//!  (control-side)   (owns store,                     ▲
-//!                  HMAC secret, bootstrap)    lock-free load
-//!                                              auth filter
-//! ```
-//!
-//! [`ControlPlane`] owns the [`ControlPlaneStore`], the operator's HMAC
-//! secret, the config's bootstrap [`crate::auth::KeySet`], and the published
-//! `Arc<ArcSwap<ControlPlaneSnapshot>>`. [`VirtualKeyAuthenticator`] (in
-//! `auth.rs`) holds a clone of that same `Arc<ArcSwap<..>>` and `load()`s it
-//! on every request -- a lock-free `Arc` clone, no store I/O on the hot path.
-//!
-//! # Boot vs. refresh: the fail-closed split that must not be "simplified"
-//!
-//! A `load()` failure means two different things depending on when it
-//! happens, and conflating them is exactly the P0 this split exists to avoid:
-//!
-//! - **At boot** ([`ControlPlane::new`]): there is no snapshot yet to fall
-//!   back to, so a `load` failure is a **hard error** -- the caller (the auth
-//!   filter's factory) must refuse to start rather than publish an empty
-//!   snapshot and silently 401 every request with nothing in the logs to
-//!   explain why.
-//! - **On refresh** ([`ControlPlane::rebuild`]): a *previous* good snapshot
-//!   is already published and serving traffic. A transient store blip must
-//!   not nuke it -- see AGENTS.md "Fail-open controls" ("a security control that fails
-//!   open must be loud"; the mirror image applies here too: a control that
-//!   fails *closed* on a blip is its own outage). `rebuild` on `Err` leaves
-//!   `published` untouched and `tracing::warn!`s loudly instead.
+//! At boot, a failed load is fatal because there is no safe snapshot to serve.
+//! On refresh, a failed load leaves the last good snapshot published and logs
+//! a warning, avoiding an outage from a transient store failure (AGENTS.md
+//! "Fail-open controls").
 //!
 //! [`VirtualKeyAuthenticator`]: crate::auth::VirtualKeyAuthenticator
 
@@ -59,10 +26,8 @@ use crate::tenant_credential_crypto::{
 };
 use proxy_http::tenant_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
 use zeroize::Zeroizing;
-// Spend rows are keyed by a `PeriodKey`, which
-// `spend.rs` owns (it also owns the calendar-alignment logic that produces
-// one) -- `control.rs` only stores and retrieves values already computed
-// there. See `spend.rs`'s module doc for why the boundary is drawn there.
+// Spend owns period-key and calendar-alignment logic; this module only stores
+// and retrieves the resulting keys.
 use crate::spend::{key_spend_subject, PeriodKey, TenantBudget};
 
 /// Names a key's row in both the budgets and policies tables.
@@ -84,10 +49,8 @@ fn reject_control_characters(field: &str, id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// One key row exactly as a [`ControlPlaneStore`] persists it -- the
-/// admin-write shape, not the digest-keyed [`KeySet`] the data plane reads.
-/// [`ControlPlane::rebuild`] converts a `Vec<StoredKey>` into a [`KeySet`]
-/// once per rebuild; nothing on the request path ever sees a `StoredKey`.
+/// Persisted admin-write shape. Rebuild converts rows to the digest-keyed
+/// [`KeySet`] before publishing; request workers never see `StoredKey`.
 #[derive(Clone)]
 pub struct StoredKey {
     pub key_id: KeyId,
@@ -117,8 +80,7 @@ impl std::fmt::Debug for StoredKey {
 /// decrypts rows into the snapshot, and nothing on the request path sees a
 /// `StoredTenantCredential`.
 ///
-/// The encryption fields are plain bytes rather than the crypto module's own
-/// type, so the storage format does not change when that code does.
+/// Plain byte fields keep the storage format independent of the crypto type.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoredTenantCredential {
     pub schema_version: u16,

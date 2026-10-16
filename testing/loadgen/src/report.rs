@@ -1,7 +1,4 @@
-//! The self-describing JSON output this driver produces, and the compact
-//! human summary printed alongside it. Phase 2 (the N-sweep search and
-//! report rendering, not built here) is meant to consume exactly this JSON
-//! shape.
+//! JSON and human-readable reports for load runs.
 
 use serde::Serialize;
 
@@ -81,13 +78,8 @@ pub struct RunReport {
     pub rig: RigInfo,
     pub result: RunSummary,
     pub open_loop: Option<OpenLoopStats>,
-    /// Present only when `--baseline-target` was given. Documented in the
-    /// CLI help and the crate's task brief: the baseline pass runs
-    /// *sequentially* after the primary (proxy) pass, not interleaved --
-    /// interleaving two full-throttle passes on the same 8-core/16GB box
-    /// would have each pass steal CPU/fd/port budget from the other,
-    /// contaminating exactly the overhead number this comparison exists to
-    /// measure. Sequential costs wall-clock time, not correctness.
+    /// Present when `--baseline-target` runs a sequential pass to avoid
+    /// resource contention with the primary run.
     pub baseline: Option<RunSummary>,
     pub overhead: Option<Overhead>,
 }

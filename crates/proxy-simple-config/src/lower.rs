@@ -1,53 +1,11 @@
 //! Lowering: dialect -> Envoy bootstrap resources.
 //!
-//! Deterministic rules (each checked against the code below):
-//! - Each provider -> one cluster `provider:<name>` (STATIC for IP hosts,
-//!   LOGICAL_DNS for hostnames), ROUND_ROBIN, `connect_timeout` (default 5s).
-//!   https providers get upstream TLS with SNI and a validation context (the
-//!   provider's `ca_file`, else the system roots) plus a DNS-exact SAN matcher
-//!   on the host: unlike raw Envoy mode, which accepts any certificate by
-//!   default, the dialect verifies identity. `protocol: http2` adds the
-//!   cluster's HTTP/2 protocol options.
-//! - Per-provider values live on the CLUSTER, never the route (AGENTS.md
-//!   invariant 6): the credential headers (auth header, `anthropic-version`,
-//!   `extra_headers`) and `Host` ride the cluster's
-//!   `request_headers_to_add`, so the provider actually dialled supplies them
-//!   even after failover. The route also sets `host_rewrite_literal` to the
-//!   primary's host, which is a no-op for the primary and is overridden by the
-//!   cluster `Host` for a fallback member.
-//! - `routes` -> one listener + HCM + route table. Each rule matches the
-//!   `x-llmproxy-model` request header by its model glob: no `*` is exact, one
-//!   trailing `*` is a prefix, any other glob is an escaped regex, and a bare
-//!   `*` matches without a header condition. First match wins, mirroring S1.
-//!   `models:` entries then get an implicit route per name (exact > longest
-//!   prefix > `*`), and a 404 `direct_response` backstops unmatched requests
-//!   unless some rule or catalogue entry is a catch-all.
-//! - `fallbacks` (and multi-provider `models:` entries) -> an
-//!   `envoy.clusters.aggregate` cluster (`fallback:route-<i>` /
-//!   `fallback:model-<name>`) whose members are the provider clusters in listed
-//!   order; the route targets the aggregate, so each retry advances to the next
-//!   member. Fallbacks must share the primary's usage dialect (AGENTS.md
-//!   invariant 7); a mismatch is a hard error. An aggregate carries no
-//!   endpoints, TLS, protocol options, or metadata.
-//! - LLM-safe defaults: the total route `timeout` is `0s` (disabled --
-//!   generations are long). `idle_timeout` (default 90s, per-rule override)
-//!   bounds gaps between response chunks, and the listener's
-//!   `stream_idle_timeout` (default 10m) bounds the wait for the provider's
-//!   response headers, so a provider that accepts and never answers is cut. A
-//!   listener `max_stream_duration` is opt-in. This is a deliberate
-//!   dialect-only divergence from Envoy's 15s route default. Retries fire only on
-//!   connect-failure/refused-stream/reset or status 429/500/502/503, which
-//!   Envoy's router never applies once response bytes have streamed (S3).
-//!   `num_retries` is the rule's `retries.attempts` (default 1), raised to
-//!   members-1 so the last fallback is reachable.
-//! - Usage metering is per route: each route's `typed_per_filter_config` names
-//!   its own provider's dialect, because one listener can serve several.
-//!
-//! The result is standard Envoy config: it goes through the same strict
-//! parse, PGV validation, and IR pipeline as `-c` mode, and `--mode
-//! translate` prints it. Dialect features that are accepted but not yet
-//! enforced (for example model rewrite and some limits) produce explicit
-//! warnings, never silent drops (AGENTS.md invariant 1).
+//! Providers lower to clusters; routes and model aliases lower to Envoy route
+//! tables and aggregate clusters. Provider credentials, host, and usage dialect
+//! stay on the selected cluster so failover uses that provider's settings.
+//! LLM defaults disable total route timeouts and bound idle waits; the resulting
+//! bootstrap uses the same strict parse, validation, and IR pipeline as Envoy
+//! mode. Accepted but unenforced features produce warnings.
 
 use std::collections::HashMap;
 
@@ -58,29 +16,17 @@ use crate::model::*;
 use crate::parse::parse_host_port;
 
 /// The request header the route table matches models against. Populated
-/// from the request BODY by the body-rewrite filter (body-based routing,
-/// `proxy_filters::body_rewrite_filter`) before routing runs -- overwriting
-/// or removing any client-supplied value, never trusting it (see that
-/// filter's module doc). `needs_body_rewrite_filter` below is what actually
-/// guarantees the filter is in the chain whenever this header is matched
-/// against.
+/// The body-rewrite filter populates this from the request body and removes
+/// any client-supplied value before routing.
 pub const MODEL_HEADER: &str = "x-llmproxy-model";
 
 const DOWNSTREAM_CONNECTIONS_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig";
 const HCM_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
 const ROUTER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router";
 
-/// The auth filter's name in `http_filters` -- always the FIRST entry when
-/// `auth:` is configured (see [`lower_listener`]): ahead of
-/// `llmproxy.body_rewrite` so an unauthenticated request is refused before
-/// the body-peek filter parses it (the body itself is capped at the listener's
-/// buffer limit before any filter runs), and ahead of `llmproxy.token_limit`
-/// so the limiter buckets on the tenant this filter resolves --
-/// `proxy_config::lower::check_lane_h_filter_order` enforces the second half
-/// of that ordering as a hard error, so getting it wrong fails loudly rather
-/// than silently. No per-route override exists for this filter, so unlike
-/// [`USAGE_FILTER_NAME`]/[`BODY_REWRITE_FILTER_NAME`] this name never appears
-/// in a route's `typed_per_filter_config`.
+/// Authentication runs before body rewriting and token limiting, so denial
+/// precedes body inspection and limits use the resolved tenant. The config
+/// lowerer enforces this order; auth has no per-route override.
 const AUTH_FILTER_NAME: &str = "llmproxy.auth";
 
 /// Must equal `proxy_filters::model_authz_filter::TYPE_URL`; pinned by
@@ -133,11 +79,7 @@ const MODEL_RESOLVER_FILTER_NAME: &str = "llmproxy.model_resolver";
 /// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
 /// `tests/auto_model.rs` pins it.
 const MODEL_RESOLVER_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelResolver";
-/// The token-limit filter's name in `http_filters`, emitted only when a
-/// `limits` entry actually lowers (see [`lower_limits`]). No per-route
-/// override exists for this filter (its module doc: "no per-route config in
-/// this increment"), so unlike [`USAGE_FILTER_NAME`] / [`BODY_REWRITE_FILTER_NAME`]
-/// this name never appears in a route's `typed_per_filter_config`.
+/// Emitted when a `limits` entry lowers; there is no per-route override.
 const TOKEN_LIMIT_FILTER_NAME: &str = "llmproxy.token_limit";
 
 /// Must equal `proxy_filters::token_limit_filter::TYPE_URL`. Duplicated for

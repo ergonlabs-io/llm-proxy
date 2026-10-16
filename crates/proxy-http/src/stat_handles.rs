@@ -1,79 +1,6 @@
-//! The router-side half of wiring the stats registry to
-//! real traffic. This module owns exactly two things: a per-cluster lookup
-//! table of pre-resolved [`Handle`]/[`HistogramHandle`]s
-//! ([`StatHandles`]/[`ClusterStatHandles`]), and a thin, panic-free recording
-//! API over it ([`RouterStats`]) that `router.rs` calls from the attempt
-//! loop. See `router.rs`'s module doc for exactly where/why each of the two
-//! instruments (`UPSTREAM_RQ`, `UPSTREAM_RQ_TIME`) is recorded.
-//!
-//! # Why resolution happens once, at boot, on the control side
-//!
-//! `proxy_observability::stats::Registry` (the hot-path type every worker
-//! holds as `Arc<Registry>`) deliberately has no public `resolve` -- only
-//! [`proxy_observability::stats::StatsControl`] can grow the registry (see
-//! that module's docs). [`StatHandles::build`] is the
-//! one call site in the whole data plane that touches `StatsControl`: it
-//! runs once, in `crates/proxy/src/main.rs`, against the boot-time config
-//! snapshot's cluster names, and the resulting table is hands out as
-//! `Arc<StatHandles>` to every worker -- exactly the "control computes,
-//! workers `load`" shape the registry itself already uses internally.
-//!
-//! # A cluster with no entry is a no-op, not a panic
-//!
-//! `StatHandles` is built once, from the cluster names present in the boot
-//! snapshot -- but the table itself is not frozen after that:
-//! [`StatHandles::resolve_missing`] lets a SIGHUP config reload
-//! (`crates/proxy/src/main.rs`) extend the SAME table (every worker holds a
-//! clone of the one `Arc<StatHandles>`, so a resolve there is visible to
-//! every worker's `for_cluster` immediately) with any cluster name the new
-//! snapshot introduces. Until a reload does that, though -- and for any
-//! cluster this process never learns about at all -- a name the router asks
-//! about that isn't in the table is a real possibility, and must never be
-//! allowed to fail a request: [`RouterStats::record_attempt`]/
-//! [`RouterStats::record_attempt_duration_ms`] silently no-op on a lookup
-//! miss, logging at most once per unique unknown name (see
-//! [`RouterStats::warn_unknown_cluster_once`]) so the gap stays visible
-//! without spamming a line per request.
-//!
-//! A miss also happens for a name that WAS configured: once a name is absent
-//! from two consecutive configs, the registry drains its series and
-//! `resolve_missing` drops the entry, but a minutes-long stream dialled
-//! before that still finishes against it. Under config churn those names are
-//! unbounded, so the per-worker dedup sets hold at most
-//! `UNKNOWN_NAME_WARN_CAP` names each and then log one line saying further
-//! names are suppressed (see `UnknownNames`).
-//!
-//! # The other two instruments
-//!
-//! [`DownstreamStatHandles`]/[`DownstreamStats`] and
-//! [`TokenUsageStatHandles`]/[`GenAiTokenStats`] mirror
-//! [`StatHandles`]/[`RouterStats`]'s shape exactly (same
-//! resolve-once-at-boot, `ArcSwap`-not-`Mutex`, warn-once-on-a-miss rules),
-//! just for `DOWNSTREAM_CX_TOTAL{listener}` (`crate::listener`'s accept
-//! loop, `proxy-core`) and `LLM_CLIENT_TOKEN_USAGE{provider,type,tenant}`
-//! (`crate::access_logging::LoggingBody::finish`) respectively, instead of
-//! `UPSTREAM_RQ`/`UPSTREAM_RQ_TIME`. See each type's own doc for what's
-//! different: a single instrument keyed by listener name for the first, and
-//! four handles per provider (one per token bucket) for the second.
-//!
-//! # `tenant` is the one attribute this file resolves OFF the boot
-//! control side
-//!
-//! Every other resolve in this module happens once, at boot (or on a SIGHUP
-//! reload), against this process's own config -- exactly the "why resolution
-//! happens once, at boot" section above. `tenant` cannot follow that rule:
-//! it comes from a caller's credential
-//! (`proxy_http::stream_info::AuthInfo::tenant`), so it isn't known until a
-//! request actually authenticates. [`GenAiTokenStats::record_usage`] resolves
-//! it per call, via [`proxy_observability::stats::Registry::resolve_capped_memo`]
-//! -- reachable from a worker's plain `Arc<Registry>`, unlike the general
-//! `resolve`, and capped so a caller cannot grow the registry without bound
-//! (see that method's doc). A per-worker memo serves a tenant already seen,
-//! so only a new tenant takes the registry's lock. [`TokenUsageStatHandles`] still pre-resolves,
-//! at boot, the ONE tenant value that IS known ahead of time for every
-//! provider: "no tenant at all"
-//! (`instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT`) -- unauthenticated
-//! traffic is the common case and stays on the fast, boot-resolved path.
+//! Pre-resolved stats handles and panic-free recorders for router, listener,
+//! and token usage metrics. Config-derived handles are shared with workers;
+//! request-derived tenant labels use capped resolution and per-worker memos.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -187,11 +114,8 @@ pub struct ClusterStatHandles {
     pub rq_time: HistogramHandle,
 }
 
-/// Cluster name -> [`ClusterStatHandles`], built at boot from the config
-/// snapshot's cluster set and, since the SIGHUP reload path landed, grown in
-/// place by [`Self::resolve_missing`] for any cluster a later reload
-/// introduces. See the module doc for why growing this table is safe to do
-/// from outside the router.
+/// Cluster name to pre-resolved handles. Reloads add newly configured names
+/// through [`Self::resolve_missing`].
 ///
 /// Rust note: `by_cluster` is an `ArcSwap`, not a plain `HashMap` behind a
 /// `Mutex` -- the same "control computes, workers `load`" shape

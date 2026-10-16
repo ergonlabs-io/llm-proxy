@@ -36,15 +36,8 @@ struct Cli {
     #[arg(long = "self-check")]
     self_check: bool,
 
-    /// How many ephemeral ports one logical stream is assumed to burn, end
-    /// to end, when computing the rig's own port-budget ceiling (see
-    /// `rig::RigInfo::sockets_per_stream`). `2` (the default) is
-    /// connect-per-stream on both hops -- loadgen->proxy and proxy->upstream
-    /// -- correct for an HTTP/1.1 upstream with no connection reuse. `1` is
-    /// the honest number once the upstream hop is pooled: an HTTP/2 upstream
-    /// reaching `crates/proxy-http/src/upstream_pool.rs`'s connection cache
-    /// multiplexes every concurrent stream over one connection, so that hop
-    /// costs approximately zero new ports per stream.
+    /// Ports budgeted per stream: two for unpooled HTTP/1.1 hops, one when the
+    /// upstream HTTP/2 connection is multiplexed.
     #[arg(long = "rig-sockets-per-stream", default_value_t = rig::DEFAULT_SOCKETS_PER_STREAM)]
     rig_sockets_per_stream: u64,
 

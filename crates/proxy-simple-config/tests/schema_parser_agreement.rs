@@ -1,16 +1,8 @@
 //! The schema and the parser accept the same field names and enum values.
 //!
-//! The schema is normative for the dialect (AGENTS.md "Architecture
-//! Invariants", 5) and the parser is strict (invariant 1), so a field added
-//! to one and not the other is either an undocumented field or a documented
-//! one that fails to load. Both directions fail here.
-//!
-//! The parser side is read from the parser itself, not from a hand-kept list:
-//! every model struct is `deny_unknown_fields`, and serde's error for an
-//! unknown key names every field the struct accepts. Unit enums report their
-//! variants the same way. The tables below only pair a schema location with
-//! a model type; the completeness checks make sure no schema object, no
-//! `deny_unknown_fields` struct and no unit enum is left out of them.
+//! The normative schema and strict parser must accept the same fields and enum
+//! values. The parser's accepted names come from serde errors; completeness
+//! checks ensure every schema object and strict model type is compared.
 
 mod schema_support;
 
@@ -208,10 +200,8 @@ fn at<'a>(schema: &'a serde_json::Value, pointer: &str) -> &'a serde_json::Value
         .unwrap_or_else(|| panic!("schema has no {pointer}"))
 }
 
-/// Pointers of every closed object (`additionalProperties: false`) and every
-/// `enum` in the schema, except keyed maps. Open helper objects inside `if`/`anyOf` that only
-/// constrain properties declared elsewhere are not closed, so they are not
-/// collected.
+/// Pointers to closed schema objects and enums, excluding keyed maps and open
+/// helper objects inside conditionals.
 fn schema_locations(schema: &serde_json::Value) -> (BTreeSet<String>, BTreeSet<String>) {
     fn walk(
         node: &serde_json::Value,
@@ -314,8 +304,7 @@ fn schema_and_parser_accept_the_same_enum_values() {
     );
 }
 
-/// A new closed object or enum in the schema must get a row in a table, or
-/// the two tests above would never look at it.
+/// Every closed schema object and enum must have a comparison-table entry.
 #[test]
 fn every_schema_object_and_enum_is_paired_with_a_model_type() {
     let (objects, enums) = schema_locations(&schema_support::schema());
@@ -329,9 +318,8 @@ fn every_schema_object_and_enum_is_paired_with_a_model_type() {
     assert_eq!(enums, paired_enums, "schema enums vs enum_table()");
 }
 
-/// A new strict struct or unit enum in the model must get a row too, so a
-/// parser-only type cannot slip past. Read from the source because Rust has
-/// no reflection over a module's types.
+/// Every strict model struct and unit enum must have a table entry; Rust has
+/// no reflection over module types, so the source is scanned.
 #[test]
 fn every_strict_model_type_is_paired_with_a_schema_location() {
     let source = include_str!("../src/model.rs");

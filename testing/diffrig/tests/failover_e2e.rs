@@ -1,17 +1,5 @@
-//! v0.1.0 ship-gate drill (third and last clause): "the proxy fails over
-//! from one provider to another without dropping the request", per the
-//! failover acceptance criteria -- primary 429s, fallback within policy, exact
-//! attempt accounting, and a credential-isolation test that is not optional
-//! (see below). This is the end-to-end version: the real `llm-proxy`
-//! binary, a real `llmproxy` dialect config with `fallbacks:`, real HTTP
-//! over sockets. `crates/proxy-http/tests/router_aggregate.rs` covers the
-//! same behavior at the router-unit level; this file proves it survives the
-//! whole pipeline (dialect lowering, the strict Envoy loader, and the real
-//! router) wired together.
-//!
-//! Structural sibling of `mock_e2e.rs`: same `dialect_config`/`spawn_suite`
-//! shape, same shared machinery from `diffrig::harness`. Read that file
-//! first if this one is unfamiliar.
+//! Exercises provider failover, attempt accounting, and credential isolation
+//! through the real binary and dialect config.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -27,11 +15,7 @@ use serde_json::Value;
 
 // ------------------------------------------------------------------ config --
 
-/// How long the client waits for a response before failing the test outright
-/// instead of hanging the whole suite. `mock_e2e.rs`/`tls_e2e.rs` send
-/// unwrapped requests, and an unbounded wait there was the reason a hang in
-/// eight tests turned a 79s workspace run into 656-863s (see
-/// `ProxyProcess::wait_until_ready`'s doc comment) -- do not repeat that here.
+/// Bounds client waits so a stalled request fails instead of hanging the suite.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PRIMARY_KEY: &str = "key-primary";
@@ -42,37 +26,10 @@ const CLIENT_KEY_ID: &str = "fallback-billing-key";
 const HMAC_SECRET: &str = "fallback-billing-hmac-secret";
 const ADMIN_TOKEN: &str = "fallback-billing-admin-token";
 
-/// Render the dialect (`llmproxy-v0`) config: one listener, one route whose
-/// provider is `primary` with `fallbacks: [standby]`. Neither provider is
-/// named `openai`/`anthropic`, so both default to `openai-compatible`
-/// (`Provider::effective_type`) -- same dialect on both sides, the only
-/// shape a fallback chain is allowed to mix
-/// (`crates/proxy-simple-config/tests/fallbacks.rs::cross_dialect_fallback_is_rejected`).
-///
-/// `standby`'s `base_url` deliberately addresses the upstream as `127.1`
-/// (the old BSD numbers-and-dots shorthand for `127.0.0.1`), where
-/// `primary`'s uses the canonical `127.0.0.1` -- both are numeric literals
-/// the platform resolver expands locally with no DNS query and no
-/// `/etc/hosts` dependency (unlike the hostname `localhost`, which this
-/// machine's resolver returns as `::1` FIRST -- an early version of this
-/// test used `localhost` and failed with "upstream connect failure" because
-/// the standby mock only binds IPv4), so both land on the exact loopback
-/// address the mocks are actually bound to. But `"127.1"` fails Rust's
-/// `IpAddr::from_str` (`lower.rs::provider_upstream` checks that to choose
-/// STATIC vs. LOGICAL_DNS discovery), so it is carried through as a literal
-/// STRING distinct from `"127.0.0.1"` -- which is exactly what makes Test
-/// 3's Host-header assertion mean anything: with both providers addressed
-/// identically, a route-level rewrite pinned to the primary and a correctly
-/// per-member-corrected one would be indistinguishable on the wire.
-///
-/// **Portability caveat, verified on macOS only.** The `127.1` shorthand is
-/// resolved here by the platform's `getaddrinfo`, and glibc has tightened its
-/// numeric-address parsing over the years (rejecting non-canonical dotted
-/// forms in some versions). If this test ever fails on Linux with an upstream
-/// connect error, THIS is why -- the fix is to find another pair of literals
-/// that both reach the mock while remaining textually distinct, not to weaken
-/// the assertion. The property under test (a per-attempt Host correction)
-/// needs two distinguishable host strings; it does not care which two.
+/// Renders a same-dialect fallback config. `127.1` and `127.0.0.1` both
+/// resolve to loopback here but remain distinct host strings, allowing the test
+/// to verify per-member Host rewriting. The shorthand may not resolve on all
+/// platforms; preserve distinct loopback host strings if changing it.
 fn dialect_config(listener_port: u16, primary_port: u16, standby_port: u16) -> String {
     format!(
         r#"

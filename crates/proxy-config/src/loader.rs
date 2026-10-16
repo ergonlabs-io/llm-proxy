@@ -1,14 +1,8 @@
 //! Bootstrap loading — Envoy config files into typed protos.
 //!
-//! Pipeline (ADR-0002): bytes -> (YAML|JSON) -> `serde_json::Value` ->
-//! prost-reflect proto3-JSON deserialize against the embedded Envoy descriptor
-//! pool (unknown fields denied) -> typed [`Bootstrap`]. `.pb` files decode the
-//! protobuf directly. The same pipeline will serve xDS resources, which
-//! arrive as protobuf `Any` rather than files.
-//!
-//! Error quality is a product feature here (`internal-docs/architecture.md` §12.1 rule 1): every failure
-//! carries the full dotted field path, produced by threading the deserializer
-//! through `serde_path_to_error`.
+//! YAML/JSON files deserialize against the embedded Envoy descriptors; `.pb`
+//! files decode directly. Errors retain full dotted paths via
+//! `serde_path_to_error` (ADR-0002).
 
 use std::path::Path;
 
@@ -117,11 +111,9 @@ fn transcode(dynamic: &DynamicMessage) -> Result<Bootstrap, ConfigError> {
         .map_err(|e| ConfigError::Parse(format!("internal transcode failure: {e}")))
 }
 
-/// Deserialize a JSON value as Bootstrap. In [`StrictMode::Permissive`],
-/// unknown fields are stripped one at a time (strict parse -> on unknown-field
-/// error, remove that node, record a warning, retry) so we can report *exactly*
-/// which fields were ignored — prost-reflect's lenient mode would drop them
-/// silently, which AGENTS.md invariant 1 forbids.
+/// Deserialize a JSON value as Bootstrap. Permissive mode strips unknown
+/// fields one at a time and records each warning; lenient deserialization would
+/// silently drop them (AGENTS.md invariant 1).
 fn parse_json_value(
     mut value: serde_json::Value,
     mode: StrictMode,

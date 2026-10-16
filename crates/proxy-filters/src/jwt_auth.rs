@@ -1,88 +1,11 @@
-//! JWT verification against a cached JWKS snapshot.
+//! Verifies JWTs against a cached JWKS snapshot. Virtual-key authentication
+//! runs first; this authenticator claims other `Bearer` values and treats
+//! verification failures as terminal (see [`crate::auth::AuthOutcome`]).
 //!
-//! This module is a second `impl` [`crate::auth::Authenticator`].
-//! [`crate::auth_filter`] pushes one [`JwtAuthenticator`] per configured JWT
-//! provider onto its `AuthenticatorChain`, after the virtual-key
-//! authenticator. The key set is either static (from config) or kept fresh
-//! over HTTPS by [`crate::jwks_refresh`]; see this module's closing section,
-//! "What this module does not build", for the split.
-//!
-//! # Which algorithms this authenticator accepts, and only these
-//!
-//! **RS256 only** (RSASSA-PKCS1-v1_5 using SHA-256). [`JwtAuthenticator`]
-//! builds exactly one [`jsonwebtoken::Validation`] with
-//! `algorithms: vec![Algorithm::RS256]`, and `jsonwebtoken` checks a
-//! presented token's `alg` header against that allow-list *before* any
-//! signature byte is examined (`jsonwebtoken::decoding::verify_signature`).
-//! This is what makes the classic RS256/HS256 "key confusion" attack --
-//! taking an RSA public key's bytes and replaying them as an HMAC secret --
-//! fail closed here: an attacker-supplied `alg: HS256` header is rejected for
-//! not being in the allow-list, independently of what bytes they used to
-//! sign it. See this module's tests
-//! `alg_none_is_rejected` and
-//! `algorithm_confusion_hmac_signed_with_the_rsa_public_key_is_rejected`
-//! for both attacks proven directly against this authenticator rather than
-//! trusted from the library's changelog.
-//!
-//! `alg: none` (RFC 8725 §3.1's own worked example of a JWT vulnerability) is
-//! rejected the same way, for a stronger reason: `jsonwebtoken::Algorithm`
-//! has no `none` variant at all, so a token naming it fails to deserialize as
-//! a `Header` and is [`crate::auth::AuthError::JwtMalformed`] before
-//! `Validation` is even consulted.
-//!
-//! # Why `ring` again, not a second crypto stack
-//!
-//! `jsonwebtoken` is pinned to its 9.x line in `Cargo.toml` specifically
-//! because that is the last line whose only crypto backend is `ring` --
-//! reused at the exact version (0.17) rustls already pins in this workspace.
-//! See that `Cargo.toml` entry's comment for why 10.x/11.x are not used
-//! instead (both dropped `ring`, for `aws_lc_rs` or a `rust_crypto` feature --
-//! either would be a second crypto stack, not a reuse of the first one).
-//!
-//! # The `NoCredential`/`Rejected` split, mirrored from the other side
-//!
-//! [`crate::auth::VirtualKeyAuthenticator`] claims a `Bearer` value as its
-//! own kind by checking for the `llmp_` prefix and defers (`NoCredential`)
-//! anything else -- including a JWT -- to a later authenticator. This
-//! authenticator is that later authenticator: it claims every `Bearer` value
-//! that does *not* start with `llmp_` as a JWT, and from that point on every
-//! outcome is terminal (`Authenticated` or `Rejected`), never `NoCredential`.
-//! A caller cannot probe "is this recognized as a JWT" and "is this JWT
-//! valid" as two separate free bits -- see [`crate::auth::AuthOutcome`]'s doc
-//! for why that distinction is load-bearing, not stylistic.
-//!
-//! # The tenant claim is configurable, and a missing one is `Rejected`
-//!
-//! [`JwtValidationConfig::tenant_claim`] names which claim becomes
-//! [`crate::auth::Principal::tenant`] -- never hardcoded to `sub`, because
-//! different identity providers put the tenant in different places. A
-//! verified token whose named claim is absent, or present but not a
-//! non-empty string, is [`crate::auth::AuthError::JwtMissingTenantClaim`],
-//! never a default tenant -- a
-//! control that silently degrades (here, to some fallback tenant) is worse
-//! than one that refuses.
-//!
-//! # `Principal::key_id` for a JWT is the JWKS `kid`, not a per-caller value
-//!
-//! Virtual keys mint a `key_id` per credential; a JWKS key is shared by every
-//! caller whose identity provider signs with it. The best available audit
-//! analog is still naming *which signing key* verified the token, so
-//! `key_id` carries the JWKS `kid` here -- see [`crate::auth::KeyId`]'s doc
-//! for why the field exists at all (revoking one leaked thing must not revoke
-//! everything that used it; for a JWKS key, "everything that used it" is a
-//! key ROTATION, which is exactly the granularity `kid` already exists to
-//! express).
-//!
-//! # What this module does not build
-//!
-//! No network JWKS fetch and no refresh timer *here*. The synchronous
-//! [`crate::auth::Authenticator`] trait accommodates asynchronous refresh
-//! with no reshaping, because refresh publishes and verification only ever
-//! loads. [`crate::jwks_refresh`] owns the OIDC
-//! discovery document fetch, the JWKS fetch, the background thread, and the
-//! shared snapshot; this module only ever `load()`s it. Filter wiring
-//! (`auth_filter`'s `AuthenticatorChain`, `typed_config` parsing including
-//! `tenant_values` and discovery) lives in [`crate::auth_filter`].
+//! Only RS256 is accepted, preventing algorithm confusion. The tenant claim
+//! is configurable and required; JWT `key_id` records the JWKS `kid` for audit
+//! and rotation. Network discovery and refresh live in [`crate::jwks_refresh`];
+//! this module only reads the published snapshot.
 
 use std::collections::HashMap;
 use std::fmt;

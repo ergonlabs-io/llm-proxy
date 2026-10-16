@@ -1,20 +1,10 @@
-//! Upstream transport sockets: what a cluster's connection pool wraps a
-//! freshly-dialed TCP connection in before the HTTP codec runs over it.
+//! Upstream transport sockets: what a cluster's connection pool wraps a freshly dialed TCP connection in before the
+//! HTTP codec runs over it.
 //!
-//! # Why the trait lives here and the TLS implementation doesn't
-//!
-//! The rustls machinery (crypto provider, cert resolvers, the Envoy-parity
-//! verifiers) lives in `proxy-core::tls`, and `proxy-core` already depends on
-//! this crate -- so `proxy-cluster` cannot reach up to it without a
-//! dependency cycle. The standard Rust answer is to invert the dependency:
-//! the *consumer* (this crate) declares the [`UpstreamTransportSocket`] trait,
-//! and the *implementor* (`proxy-core`) provides it. The cluster manager is
-//! then handed a [`TransportSocketBuilder`] at construction time, which is
-//! the single injection point for "how do I turn an `UpstreamTlsSpec` into a
-//! working TLS originator".
-//!
-//! This also matches Envoy's own layering, where transport
-//! sockets sit *below* clusters.
+//! The rustls machinery (crypto provider, cert resolvers, Envoy-parity verifiers) lives in `proxy-core::tls`, and
+//! `proxy-core` already depends on this crate, so this crate cannot reach up to it without a cycle. The dependency is
+//! inverted: this crate declares [`UpstreamTransportSocket`], and `proxy-core` implements it. The cluster manager takes
+//! a [`TransportSocketBuilder`] at construction as the single injection point for TLS.
 
 use std::io;
 use std::sync::Arc;
@@ -29,14 +19,11 @@ use crate::BoxedUpstreamIo;
 /// configures. One instance per cluster, shared by every worker (`Send +
 /// Sync`, built on the control runtime alongside the cluster itself).
 pub trait UpstreamTransportSocket: Send + Sync {
-    /// `server_name` is the endpoint's DNS name (see [`crate::Host::hostname`]),
-    /// falling back to the IP literal for `STATIC` clusters. TLS uses it as
-    /// the SNI / verification name unless the config sets an explicit `sni`;
-    /// the plaintext socket ignores it entirely.
+    /// `server_name` is the endpoint's DNS name (see [`crate::Host::hostname`]), or the IP literal for `STATIC`. TLS
+    /// uses it as the SNI and verification name unless the config sets `sni`. Plaintext ignores it.
     ///
-    /// Rust note: the returned future is `'static` so a pool can move it into
-    /// a task -- implementations clone the (cheap, `Arc`-backed) state they
-    /// need out of `&self` rather than borrowing it.
+    /// Rust note: the returned future is `'static`, so a pool can move it into a task. Implementations clone their
+    /// `Arc`-backed state out of `&self`.
     fn wrap(
         &self,
         io: TcpStream,
@@ -76,15 +63,9 @@ pub type TransportSocketBuilder = Arc<
         + Sync,
 >;
 
-/// The default builder: plaintext clusters work, and a cluster that actually
-/// configures upstream TLS is **rejected** rather than silently downgraded to
-/// cleartext.
-///
-/// That refusal is the point. AGENTS.md invariant 1 says a configured field must
-/// never be silently ignored, and "you asked for TLS, you got plaintext to
-/// port 443" is the worst possible way to ignore one. Production installs the
-/// real builder from `proxy-core`; this fallback exists so `proxy-cluster`'s
-/// own tests (and any embedder that forgets to install one) fail loudly.
+/// The default builder: plaintext clusters work, and a cluster that configures upstream TLS is **rejected**, not
+/// downgraded to cleartext. AGENTS.md invariant 1 forbids silently ignoring a configured field, and "TLS requested,
+/// plaintext sent" is the worst way to ignore one. Production installs the real builder from `proxy-core`.
 pub fn reject_tls_builder() -> TransportSocketBuilder {
     Arc::new(|config: &ClusterConfig| {
         if config.transport_socket.is_some() {
@@ -161,9 +142,7 @@ mod tests {
             client_certificate: None,
             validation: None,
         });
-        // Rust note: not `.expect_err(...)` -- that requires `T: Debug`
-        // (here, `Arc<dyn UpstreamTransportSocket>`, which isn't and
-        // shouldn't be `Debug`), so match instead.
+        // Rust note: `expect_err` needs `T: Debug`, which `Arc<dyn UpstreamTransportSocket>` lacks, so match instead.
         let err = match reject_tls_builder()(&config) {
             Err(err) => err,
             Ok(_) => panic!("TLS must not silently downgrade"),

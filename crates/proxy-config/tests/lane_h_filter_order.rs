@@ -1,23 +1,11 @@
-//! llmproxy HTTP filter ordering is a config error, not
-//! a doc comment.
-//!
-//! Two orderings among the llmproxy filters fail **silently** when reversed —
-//! every request succeeds, nothing is logged, and the affected filter just
-//! reads `None` out of `StreamInfo` forever. That is exactly AGENTS.md invariant 1's
-//! failure mode, so `lower::check_lane_h_filter_order` rejects both at config
-//! load. These are its acceptance tests.
-//!
-//! The two rules run in **opposite** directions because decode callbacks run
-//! in config order and encode callbacks in reverse (S2.1). That is the single
-//! most confusing thing here, and it is why each direction gets its own test
-//! rather than one parameterised pair.
+//! Invalid filter ordering is rejected at config load because reversed order
+//! can silently disable authentication, authorization, or usage controls.
+//! Decode callbacks follow config order; encode callbacks follow reverse order (S2.1).
 
 use proxy_config::ir::*;
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
 
-// The type URLs under test are `lower.rs`'s OWN constants, not fresh copies:
-// a test that re-declared these literals would pin itself to the filters and
-// leave `lower.rs` free to drift from both.
+// Resolve type URLs from the lowerer so the tests also pin its constants.
 use proxy_config::lower::{
     AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
     LEGACY_BODY_REWRITE_FILTER_TYPE as LEGACY_BODY_REWRITE,
@@ -27,18 +15,8 @@ use proxy_config::lower::{
     USAGE_FILTER_TYPE as USAGE,
 };
 
-/// `lower.rs` cannot import the filters' constants — `proxy-filters` depends
-/// on `proxy-config`, so the production dependency cannot point back — and
-/// duplicates them as string literals instead. That duplication is only safe
-/// if something fails when the two copies drift, which is this test.
-///
-/// **What drift would actually cost.** `check_lane_h_filter_order` matches on
-/// `type_url` equality. Rename a filter's `TYPE_URL` without updating
-/// `lower.rs` and the ordering rules stop matching anything: no error, no
-/// warning, and every wrongly-ordered chain loads clean again — the exact
-/// silent failure the check was written to remove, reintroduced by a rename
-/// that looks purely local. A `proxy-filters` dev-dependency is a cheap price
-/// for making that impossible.
+/// The config crate duplicates filter type URLs to avoid a production
+/// dependency cycle; these assertions catch drift that would disable ordering checks.
 #[test]
 fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
     assert_eq!(
@@ -273,10 +251,8 @@ fn token_limit_before_usage_is_accepted() {
     .expect("the limiter ahead of the usage filter is the correct order");
 }
 
-/// The direction here is the OPPOSITE of what "must run first" suggests,
-/// because the limiter's `record` is encode-side and encode runs in reverse
-/// config order. Reversed, every request records zero tokens against its
-/// budget and the limit never fires.
+/// Encode callbacks run in reverse config order; wrong ordering records zero
+/// tokens and the limit never fires.
 #[test]
 fn usage_before_token_limit_is_rejected_because_the_limiter_would_record_zero_tokens() {
     let (field_path, reason) = expect_invalid(chain(&[
@@ -433,10 +409,8 @@ fn spend_limit_before_usage_is_accepted() {
     .expect("the spend filter ahead of the usage filter is the correct order");
 }
 
-/// The direction here is the OPPOSITE of what "must run first" suggests,
-/// because the spend filter's `record` is encode-side and encode runs in
-/// reverse config order. Reversed, every request is priced as free and a
-/// configured ceiling can never be reached.
+/// Encode callbacks run in reverse config order; wrong ordering prices every
+/// request as free and prevents the ceiling from firing.
 #[test]
 fn usage_before_spend_limit_is_rejected_because_the_spend_filter_would_price_every_request_as_free()
 {

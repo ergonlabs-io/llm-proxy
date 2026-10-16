@@ -1,133 +1,50 @@
-//! Renders a [`Registry`] into Envoy's flat `/stats`
-//! text format, and nothing else: no Prometheus, no OTLP. See
-//! `stats.rs` Decision 4 for the naming rules this module implements.
+//! Renders a [`Registry`] into Envoy's flat `/stats` text format. No
+//! Prometheus, no OTLP. The naming rules are in `stats.rs` Decision 4.
 //!
-//! # Name rendering: one-to-many, and some render to nothing
+//! # Name rendering
 //!
-//! Each `(instrument, attrs)` pair the registry has resolved maps to
-//! **zero or one** Envoy `/stats` name:
+//! Each resolved `(instrument, attrs)` pair maps to zero or one Envoy name:
 //!
 //! | OTel | Envoy `/stats` |
 //! |---|---|
 //! | `upstream_rq` `{cluster, status_class}` | `cluster.<cluster>.upstream_rq_<class>` |
 //! | `upstream_rq` `{cluster}` | `cluster.<cluster>.upstream_rq_total` |
 //! | `upstream_rq_time` `{cluster}` | `cluster.<cluster>.upstream_rq_time` |
-//! | anything else (e.g. `llm.client.token.usage`) | *(no Envoy equivalent — omitted)* |
+//! | anything else (e.g. `llm.client.token.usage`) | omitted |
 //!
-//! [`envoy_counter_name`]/[`envoy_histogram_name`] are the only functions
-//! that know this table; nothing else in this module inspects an
-//! instrument's name. An instrument this table doesn't recognize is
-//! **omitted from the output entirely**, never rendered under an invented
-//! name — `/stats` is a compatibility surface, and a name Envoy never had
-//! is not compatibility (`stats.rs` Decision 4, point 2).
-//!
-//! This mapping is deliberately independent of any particular `Instrument`
-//! const's declared `attribute_keys` — it only looks at the attribute keys
-//! actually present on a given resolved handle. That is what lets the same
-//! OTel instrument *name* (e.g. `"upstream_rq"`) expand into several Envoy
-//! names depending on which attributes a given call site resolved it with
-//! (`stats.rs` Decision 4, point 1), without this module needing to
-//! know how many attribute-shaped variants of `UPSTREAM_RQ` exist.
+//! [`envoy_counter_name`] and [`envoy_histogram_name`] are the only functions
+//! that know this table. An unrecognized instrument is omitted, never rendered
+//! under an invented name. `/stats` is a compatibility surface.
 //!
 //! # Output ordering
 //!
-//! [`render`] sorts by the **rendered** Envoy name, not by resolve order or
-//! OTel instrument name, and produces byte-identical output for two calls
-//! against unchanged registry state. Envoy's own `/stats` output is
-//! sorted, and an unstable order would make every diff-based test against
-//! this one worthless.
+//! [`render`] sorts by the rendered Envoy name, so output is byte-identical for
+//! unchanged state and diff-based tests stay meaningful.
 //!
-//! # The histogram line format — CONFIRMED against Envoy's own source, 2026-08-09
+//! # Histogram line format
 //!
-//! This was first written as an unverified recollection (`P<n>(a,b)`
-//! space-separated pairs) because nothing in this repo could confirm or
-//! refute it. The later research had network access to
-//! `envoyproxy/envoy` itself, so this is now settled rather than guessed:
-//! fetched directly from `source/common/stats/histogram_impl.cc` and
-//! `source/server/admin/stats_render.cc` at commit
-//! `d57118924c85fcaa07758dddbb9c5da4e89045af` (`main`, fetched 2026-08-09).
+//! Envoy's admin endpoint renders parent histograms with
+//! `ParentHistogramImpl::quantileSummary()` in
+//! `source/common/stats/thread_local_store.cc`. Each quantile prints as
+//! `P{:g}(interval,cumulative)`, space-joined, over the fixed set
+//! [`ENVOY_STATS_TEXT_PERCENTILES`]. The other `quantileSummary()` in
+//! `histogram_impl.cc` uses a different shape and is not the one the endpoint
+//! calls.
 //!
-//! `StatsTextRender::generate(..., const Stats::ParentHistogram&)` (in
-//! `stats_render.cc`) is the function that decides what a plain `/stats`
-//! request (no `histogram_buckets` query parameter — which this proxy does
-//! not implement either, so this is the only mode that applies here) prints
-//! for a histogram:
+//! This registry keeps only lifetime figures, so both halves of each pair carry
+//! the same value. That is a deliberate divergence from Envoy. A histogram with
+//! no recorded values prints `No recorded values`, as Envoy does.
 //!
-//! ```text
-//! response.addFragments({name, ": ", histogram.quantileSummary(), "\n"});
-//! ```
-//!
-//! The argument is a **`ParentHistogram`**, and that is the whole subtlety:
-//! Envoy has TWO `quantileSummary()` implementations and they produce
-//! different strings.
-//!
-//! - `HistogramStatisticsImpl::quantileSummary()` (in `histogram_impl.cc`)
-//!   formats `"P{:g}: {:g}"` and joins with `", "`.
-//! - `ParentHistogramImpl::quantileSummary()` (in
-//!   `source/common/stats/thread_local_store.cc`) formats
-//!   `"P{:g}({},{})"` — the *interval* and *cumulative* quantiles as a pair —
-//!   and joins with `" "`.
-//!
-//! **The admin endpoint calls the second one.** `/stats` renders parent
-//! histograms, so the wire format is the parenthesized pair, space-joined:
-//!
-//! ```text
-//! summary.push_back(fmt::format("P{:g}({},{})", 100 * supported_quantiles_ref[i],
-//!                               interval_statistics_.computedQuantiles()[i],
-//!                               cumulative_statistics_.computedQuantiles()[i]));
-//! return absl::StrJoin(summary, " ");
-//! ```
-//!
-//! over the fixed quantile set `{0, 0.25, 0.5, 0.75, 0.90, 0.95, 0.99,
-//! 0.995, 0.999, 1}` — i.e. exactly [`ENVOY_STATS_TEXT_PERCENTILES`].
-//!
-//! **So the original recollection was RIGHT**, both in the pair shape and in
-//! the space-joining, and it is confirmed here rather than replaced. An
-//! earlier pass at this section read `histogram_impl.cc` alone, concluded the
-//! pair shape was wrong, rewrote [`render_histogram_line`] to
-//! `P<n>: <value>`, and marked it confirmed — reading a real function in the
-//! real repo, just not the one the admin endpoint calls. That is the failure
-//! mode worth naming: "checked against the source" is only as good as having
-//! checked the right symbol, and a plausible near-miss reads exactly like a
-//! confirmation.
-//!
-//! This registry has no "interval since last flush" figure, only the lifetime
-//! one, so both halves of each pair carry the same value. That is a real
-//! divergence from Envoy and it is deliberate; a scraper reading the second
-//! element gets the right number.
-//!
-//! One thing the same research DID settle, and it is kept: Envoy's
-//! `used() == false` case prints `No recorded values` instead of a percentile
-//! line. [`render_histogram_line`] matches it, using this registry's
-//! `count == 0` as the equivalent of `!used()`.
-//!
-//! **One narrower thing remains unconfirmed**, isolated the same way the
-//! whole shape used to be: Envoy formats each individual number with C++'s
-//! `fmt::format("{:g}", ...)`, which is `printf`'s `%g` — roughly six
-//! significant digits, switching to scientific notation outside a threshold
-//! range, always trimming trailing zeros. Rust's default `f64` `Display`
-//! (used here) instead prints the *shortest string that round-trips exactly*
-//! back to the same `f64`, which is a different rule and can disagree with
-//! `%g` on values with more than ~6 significant digits (small integers and
-//! "nice" decimals like the ones in [`ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS`]
-//! agree under both rules, which is why the existing tests don't catch the
-//! difference). Replicating `%g` exactly was judged out of scope for this
-//! WP; this is the whole remaining gap, and it is far narrower than "the
-//! entire shape might be wrong".
+//! Known gap: Envoy formats numbers with `%g`, while Rust's `Display` prints
+//! the shortest round-trip string. The two can differ for values with more than
+//! about six significant digits.
 
 use super::{percentile_of, HistogramHandle, Instrument, Registry};
 
 /// Percentiles Envoy's `/stats` text endpoint reports per histogram, in
-/// rendering order. The quantile *set* is confirmed against
-/// `HistogramStatisticsImpl::supportedQuantiles()` in Envoy's own
-/// `source/common/stats/histogram_impl.cc` — both of Envoy's
-/// `quantileSummary()` implementations share this same fixed set. The *line
-/// format* this set is rendered into is a different symbol,
-/// `ParentHistogramImpl::quantileSummary()` in
-/// `source/common/stats/thread_local_store.cc` — see the module doc's
-/// "CONFIRMED" section for why that one, specifically, is the one the admin
-/// endpoint calls, and for the near-miss with the other `quantileSummary()`
-/// that this file's history records.
+/// rendering order. The set matches `HistogramStatisticsImpl::supportedQuantiles()`
+/// in Envoy's `source/common/stats/histogram_impl.cc`. See the module doc for the
+/// line format.
 const ENVOY_STATS_TEXT_PERCENTILES: [(&str, f64); 10] = [
     ("P0", 0.0),
     ("P25", 25.0),
@@ -141,19 +58,11 @@ const ENVOY_STATS_TEXT_PERCENTILES: [(&str, f64); 10] = [
     ("P100", 100.0),
 ];
 
-/// Renders `registry`'s current state into Envoy's flat `/stats` text
-/// format: `name: value` for every counter/up-down-counter that has an
-/// Envoy name (see the module doc's table), and a percentile line (see
-/// [`render_histogram_line`]) for every histogram that does — one line per
-/// stat, each `\n`-terminated, sorted by rendered name. Instruments with no
-/// Envoy equivalent (e.g. `llm.client.token.usage`) contribute no line
-/// at all.
+/// Renders `registry` into Envoy's flat `/stats` text format: `name: value` for
+/// each counter with an Envoy name, and a percentile line for each histogram
+/// with one. Lines are `\n`-terminated and sorted by rendered name.
 ///
-/// **Reads only.** This walks already-resolved handles and sums
-/// already-stored atomics via [`Registry::counters`]/[`Registry::histograms`]/
-/// [`Registry::percentile`] — no I/O, no blocking, safe to call from an
-/// admin request handler on the control runtime (see
-/// `proxy-admin/src/server.rs`'s `/stats` route).
+/// Reads only, with no I/O or blocking. It is safe to call from an admin handler.
 pub fn render(registry: &Registry) -> String {
     let mut lines: Vec<(String, String)> = Vec::new();
 
@@ -220,21 +129,11 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
                 None => Some(format!("cluster.{cluster}.upstream_rq_total")),
             }
         }
-        // Envoy's listener stat family. **Divergence, deliberate:** Envoy
-        // keys these by the listener's ADDRESS by default
-        // (`listener.0.0.0.0_80.downstream_cx_total`), falling back to a
-        // configured `Listener.stat_prefix` when one is set. This renders the
-        // configured listener NAME instead, unconditionally — see
-        // internal-docs/envoy-divergences.md for the reasoning. The short version:
-        // the attribute this instrument carries IS the name
-        // (`DOWNSTREAM_CX_TOTAL.attribute_keys`), the address is not
-        // available at the recording site, and a name is stable across a
-        // rebind where an address is not.
-        //
-        // This is "rendered under a different key", not "invented": the stat
-        // itself is Envoy's, unlike `llm.*` below. Rule 2 forbids making
-        // up a stat that has no Envoy equivalent, not choosing between two
-        // real Envoy key schemes.
+        // Envoy's listener family. **Deliberate divergence:** Envoy keys these by
+        // listener address by default, and this renders the listener name
+        // instead (`internal-docs/envoy-divergences.md`). The address is not
+        // known at the recording site, and a name survives a rebind. The stat
+        // itself is Envoy's, so this is a different key, not an invented stat.
         "downstream_cx_total" => {
             let listener = attr(attrs, "listener")?;
             Some(format!("listener.{listener}.downstream_cx_total"))
@@ -267,14 +166,9 @@ fn envoy_histogram_name(instrument: &Instrument, attrs: &[(String, String)]) -> 
     }
 }
 
-/// Renders one histogram handle's `/stats` text line body (everything
-/// after `"name: "`). **Confirmed shape** — see the module doc's "CONFIRMED"
-/// section for the exact Envoy source this was checked against. Still
-/// isolated here, and only here, so the one remaining unconfirmed detail
-/// (the module doc's `%g`-vs-`Display` note) stays contained to one
-/// function if it's ever tightened up further.
-///
-/// Every percentile comes from one read, so the line describes one moment.
+/// Renders one histogram handle's `/stats` line body (everything after
+/// `"name: "`). Every percentile comes from one read, so the line describes one
+/// moment.
 /// `None` if `handle` went stale.
 fn render_histogram_line(registry: &Registry, handle: HistogramHandle) -> Option<String> {
     let (snapshot, boundaries) = registry.histogram_view(handle)?;
@@ -319,13 +213,9 @@ mod tests {
 
     #[test]
     fn attribute_expansion_produces_one_to_many_envoy_names() {
-        // The production UPSTREAM_RQ const (stats.rs) only carries
-        // `cluster` today (no call site resolves it with `status_class`
-        // yet — that comes later). Rendering only depends on
-        // instrument.name and the attrs actually present on a handle (see
-        // this module's doc), so a locally-defined instrument sharing the
-        // same OTel name is enough to exercise the status_class expansion
-        // rule without touching stats.rs's `instruments` module.
+        // Rendering depends only on the instrument name and the attrs present on
+        // the handle, so a local instrument with the same name exercises the
+        // `status_class` expansion.
         static UPSTREAM_RQ_BY_CLASS: Instrument = Instrument {
             name: "upstream_rq",
             kind: InstrumentKind::Counter,
@@ -466,12 +356,8 @@ mod tests {
 
         let line = render_histogram_line(&registry, h).unwrap();
 
-        // "P<n>(interval,cumulative)" entries, space-joined -- confirmed
-        // against `ParentHistogramImpl::quantileSummary()` in Envoy's own
-        // `source/common/stats/thread_local_store.cc`, the symbol the admin
-        // endpoint actually calls (see the module doc's "CONFIRMED"
-        // section). This registry has no separate interval figure, so both
-        // halves of each pair carry the same (percentile) value.
+        // "P<n>(interval,cumulative)" entries, space-joined. Both halves carry
+        // the same lifetime value; see the module doc.
         for (label, p) in ENVOY_STATS_TEXT_PERCENTILES {
             let value = registry.percentile(h, p);
             assert!(

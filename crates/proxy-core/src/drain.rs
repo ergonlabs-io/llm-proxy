@@ -1,15 +1,10 @@
-//! Drain state machine, per-worker connection registry, and control/worker
-//! coordination for graceful shutdown.
+//! Drain state machine, per-worker connection registry, and control and worker coordination for graceful shutdown.
 //!
-//! Drain semantics follow Envoy v1.38's `--drain-time-s`, with one deliberate
-//! departure (`internal-docs/envoy-divergences.md`, "Drain strategy"): every
-//! drain behaves like Envoy's `immediate` strategy. At drain start the
-//! listener manager closes the listening sockets and each HTTP connection is
-//! told to shut down gracefully (idle keep-alive connections close now,
-//! in-flight requests finish, then `Connection: close` on HTTP/1 or `GOAWAY`
-//! on HTTP/2). Those reactions live in `listener.rs`; this module holds the
-//! state they watch, the per-worker connection registry, and the
-//! control/worker coordination around them.
+//! Drain follows Envoy v1.38's `--drain-time-s`, with one deliberate departure (`internal-docs/envoy-divergences.md`,
+//! "Drain strategy"): every drain behaves like Envoy's `immediate` strategy. The listener manager closes the listening
+//! sockets, and each HTTP connection shuts down gracefully (idle keep-alives close, in-flight requests finish, then
+//! `Connection: close` or `GOAWAY`). Those reactions live in `listener.rs`. This module holds the state they watch and
+//! the per-worker registry.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -20,17 +15,11 @@ use tokio::sync::{mpsc, watch, Notify};
 
 use crate::runtime::WorkerId;
 
-/// Envoy's default `--drain-time-s`.
-///
-/// See Envoy v1.38 docs: the drain sequence lasts this long before
-/// connections still open are forcibly closed.
+/// Envoy's default `--drain-time-s`. Connections still open after this long are force-closed.
 pub const DEFAULT_DRAIN_TIME: Duration = Duration::from_secs(600);
 
-/// Drain state broadcast from the control runtime to every worker.
-///
-/// `Send + Sync` (in fact `Copy`): it crosses control -> worker over a
-/// `tokio::sync::watch` channel per ADR-0003 ("cross-worker interaction is
-/// explicit message passing").
+/// Drain state broadcast from the control runtime to every worker. It is `Copy`, and it crosses over a `watch`
+/// channel, per ADR-0003 ("cross-worker interaction is explicit message passing").
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum DrainState {
     #[default]
@@ -41,9 +30,8 @@ pub enum DrainState {
     },
 }
 
-/// Resolves once `drain` reports [`DrainState::Draining`], immediately if it
-/// already does. Never resolves if the control runtime dropped the sender
-/// without draining, so a torn-down publisher cannot look like a drain.
+/// Resolves once `drain` reports [`DrainState::Draining`], immediately if it already does. It never resolves if the
+/// sender was dropped without draining, so a torn-down publisher cannot look like a drain.
 pub async fn drain_started(drain: &mut watch::Receiver<DrainState>) {
     loop {
         if matches!(*drain.borrow_and_update(), DrainState::Draining { .. }) {
@@ -55,12 +43,11 @@ pub async fn drain_started(drain: &mut watch::Receiver<DrainState>) {
     }
 }
 
-/// Worker-local registry of live connections, consulted by
-/// [`drain_worker`]'s `wait_empty` race against the drain deadline.
+/// Worker-local registry of live connections, consulted by [`drain_worker`]'s `wait_empty` race against the drain
+/// deadline.
 ///
-/// Rust note: deliberately `!Send` (built on `Rc`/`Cell`, not `Arc`/atomics)
-/// per ADR-0003 -- each worker owns exactly one of these, never shared
-/// across threads, so there is no need to pay for atomics or locking.
+/// Rust note: `!Send` (built on `Rc` and `Cell`, not `Arc` and atomics). Each worker owns exactly one, so no atomics
+/// or locks are needed (ADR-0003).
 #[derive(Clone)]
 pub struct ConnectionRegistry {
     inner: Rc<RegistryInner>,
@@ -68,9 +55,8 @@ pub struct ConnectionRegistry {
 
 struct RegistryInner {
     live: Cell<usize>,
-    // Rust note: `Notify` gives us "wake anyone awaiting `notified()`"
-    // without a full channel; we re-check the `live` count after each wake
-    // since `Notify` doesn't carry a payload.
+    // Rust note: `Notify` wakes anyone awaiting `notified()` without a payload, so the `live` count is re-checked after
+    // each wake.
     empty: Notify,
 }
 
@@ -110,23 +96,17 @@ impl ConnectionRegistry {
             if self.inner.live.get() == 0 {
                 return;
             }
-            // Rust note: `notify_waiters` (used in ConnectionGuard::drop)
-            // wakes only tasks *already* awaiting `notified()` -- it stores
-            // nothing for later. That would be a missed-wakeup race in
-            // multi-threaded code (drop could fire between our count check
-            // and this await). It is safe here only because this registry is
-            // `!Send` on a current-thread runtime: there is no await point
-            // between the check above and the first poll of `notified()`
-            // (which registers us), so no other task can run -- and thus no
-            // guard can drop -- in that gap.
+            // Rust note: `notify_waiters` wakes only tasks already awaiting `notified()` and stores nothing for later. That
+            // would be a missed-wakeup race under multi-threading. It is safe here because the registry is `!Send` on a
+            // current-thread runtime: no await point separates the count check from the first poll of `notified()`, so no
+            // guard can drop in that gap.
             self.inner.empty.notified().await;
         }
     }
 }
 
-/// RAII handle for a single registered connection. Rust note: this is the
-/// idiomatic "resource acquired, released on `Drop`" pattern -- nothing needs
-/// to remember to call an explicit `unregister()`; scope does it.
+/// RAII handle for one registered connection. The connection is unregistered on `Drop`, so nothing needs an explicit
+/// `unregister()` call.
 pub struct ConnectionGuard {
     inner: Rc<RegistryInner>,
 }
@@ -149,14 +129,10 @@ pub enum DrainOutcome {
     DeadlineExpired { workers_pending: usize },
 }
 
-/// Control-side drain coordination: broadcasts [`DrainState`] to every
-/// worker and tracks which workers have reported back that they've drained
-/// (registry empty, or they gave up at the deadline).
+/// Control-side drain coordination: broadcasts [`DrainState`] to every worker and tracks which have reported back
+/// (registry empty, or the deadline passed).
 ///
-/// Owned by [`crate::runtime::ConfigPublisher`], which is the public surface
-/// callers use (`publisher.start_drain(..)` / `publisher.wait_drained(..)`);
-/// this type just keeps that coordination logic in one cohesive place
-/// instead of spreading `watch`/`mpsc` bookkeeping across `runtime.rs`.
+/// Owned by [`crate::runtime::ConfigPublisher`], which is the public surface (`start_drain`, `wait_drained`).
 pub struct DrainCoordinator {
     drain_tx: watch::Sender<DrainState>,
     done_tx: mpsc::UnboundedSender<WorkerId>,
@@ -165,11 +141,8 @@ pub struct DrainCoordinator {
 }
 
 impl DrainCoordinator {
-    /// Build a coordinator for `worker_count` workers. The returned
-    /// `watch::Receiver` should be cloned once per worker into their
-    /// [`crate::runtime::WorkerContext::drain`]; the returned
-    /// `mpsc::UnboundedSender` is cloned once per worker into their
-    /// `drain_done` field.
+    /// Builds a coordinator for `worker_count` workers. Clone the returned `watch::Receiver` once per worker into
+    /// [`crate::runtime::WorkerContext::drain`], and clone the `mpsc` sender into each worker's `drain_done`.
     pub fn new(worker_count: usize) -> (Self, watch::Receiver<DrainState>) {
         let (drain_tx, drain_rx) = watch::channel(DrainState::NotDraining);
         let (done_tx, done_rx) = mpsc::unbounded_channel();
@@ -190,10 +163,8 @@ impl DrainCoordinator {
         self.done_tx.clone()
     }
 
-    /// Broadcast a new draining state to every worker, starting now and
-    /// lasting `duration`.
-    /// Returns the deadline (`started + duration`) so the caller can wait on
-    /// exactly the same instant the workers use.
+    /// Broadcasts a draining state to every worker, lasting `duration`. Returns the deadline (`started + duration`),
+    /// so the caller waits on the same instant the workers use.
     pub fn start_drain(&self, duration: Duration) -> Instant {
         let started = Instant::now();
         let until = started + duration;
@@ -207,9 +178,8 @@ impl DrainCoordinator {
         let mut reported: HashMap<WorkerId, ()> = HashMap::with_capacity(self.worker_count);
 
         loop {
-            // Consume reports that are already buffered BEFORE judging the
-            // deadline: after an admin drain the workers finish early, and a
-            // signal long past the deadline must still see them as drained.
+            // Consume reports already buffered BEFORE judging the deadline. After an admin drain the workers finish early,
+            // and a report that arrives after the deadline must still count as drained.
             while let Ok(id) = self.done_rx.try_recv() {
                 reported.insert(id, ());
             }
@@ -247,19 +217,16 @@ impl DrainCoordinator {
     }
 }
 
-/// Worker-side drain routine: waits for a drain signal, then races the
-/// registry hitting empty against the drain deadline, then reports back to
-/// the control runtime via `drain_done`. Worker mains compose this with
-/// `tokio::task::spawn_local`.
+/// Worker-side drain routine: waits for a drain signal, races the registry emptying against the drain deadline, then
+/// reports to the control runtime via `drain_done`. Worker mains compose it with `tokio::task::spawn_local`.
 pub async fn drain_worker(
     id: WorkerId,
     mut drain: watch::Receiver<DrainState>,
     drain_done: mpsc::UnboundedSender<WorkerId>,
     registry: ConnectionRegistry,
 ) {
-    // Wait for the control runtime to actually start a drain; `NotDraining`
-    // is the initial value so the first `changed()` (or an already-draining
-    // value observed via `borrow()`) is what we're after.
+    // Wait for a drain to start. `NotDraining` is the initial value, so the first `changed()`, or an already-draining
+    // value seen via `borrow()`, is what we want.
     let until = loop {
         let state = *drain.borrow();
         if let DrainState::Draining { until, .. } = state {
@@ -402,27 +369,21 @@ mod tests {
             move |ctx: WorkerContext| async move {
                 let registry = ConnectionRegistry::new();
                 if ctx.id.0 == 0 {
-                    // Worker 0 holds a guard for the whole test -- its
-                    // registry never empties, so `drain_worker` only
-                    // returns (and reports) once its own deadline
-                    // (`sleep_until(until)`) fires.
+                    // Worker 0 holds a guard for the whole test, so its registry never empties. `drain_worker` returns
+                    // only when its own deadline fires.
                     let _guard = registry.register();
                     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
                 } else {
-                    // Worker 1 has nothing registered, so its `wait_empty`
-                    // resolves immediately once the drain starts and it
-                    // reports done well before the coordinator's own
-                    // deadline below.
+                    // Worker 1 has nothing registered, so `wait_empty` resolves at once and it reports before the
+                    // coordinator's deadline.
                     drain_worker(ctx.id, ctx.drain, ctx.drain_done, registry).await;
                 }
             },
         );
 
         run_local(async {
-            // Give workers a drain window comfortably longer than the
-            // coordinator-side deadline below, so the coordinator gives up
-            // first (with worker 0 still pending) and we exercise
-            // `DeadlineExpired` deterministically.
+            // Give workers a drain window longer than the coordinator's deadline below. The coordinator gives up first,
+            // with worker 0 still pending, so `DeadlineExpired` is exercised deterministically.
             publisher.start_drain(Duration::from_secs(5));
             let deadline = Instant::now() + Duration::from_millis(50);
             let outcome = publisher.wait_drained(deadline).await;

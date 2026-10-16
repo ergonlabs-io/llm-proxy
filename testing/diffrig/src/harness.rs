@@ -1,16 +1,8 @@
-//! Shared end-to-end test harness: spawning the real `llm-proxy` binary
-//! against a dialect config, waiting for its listener to come up, and a
-//! minimal HTTP/1.1 client (plain JSON request/response, plus incremental
-//! SSE collection with per-event timestamps).
+//! Shared harness for spawning the real proxy and sending HTTP/1.1 JSON or SSE
+//! requests from multiple integration-test binaries.
 //!
-//! Rust note: this lives in the library (`src/`) rather than a `tests/`
-//! helper module because each file under `testing/diffrig/tests/` is its own
-//! separate compilation unit (a standalone integration-test crate) — there is
-//! no way for `tests/tls_e2e.rs` to `mod`-include code from
-//! `tests/live_smoke.rs` or vice versa. Only code that lives in the crate's
-//! *library* target (what `src/lib.rs` declares) can be `use diffrig::...`'d
-//! from more than one integration-test binary, which is why this machinery
-//! was extracted here instead of staying duplicated in both files.
+//! Rust note: shared helpers belong in the library target because each
+//! integration-test file is a separate crate.
 
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::path::{Path, PathBuf};
@@ -30,18 +22,8 @@ use tokio::net::TcpStream;
 /// binary in `target/<profile>/`, building it first if this is a standalone
 /// `cargo test -p diffrig` run that never built crate `proxy`.
 pub fn resolve_llm_proxy_bin() -> PathBuf {
-    // Rust note: `OnceLock` runs the initializer exactly once per PROCESS and
-    // blocks any concurrent caller until it finishes, so every test in this
-    // binary gets the same freshly-built path.
-    //
-    // This memoization is a pure win, not a weakening of the guarantee below.
-    // Without it every test shelled out to `cargo build` independently: with
-    // tests running in parallel they then contended on cargo's build-directory
-    // lock ("Blocking waiting for file lock on build directory"), so N tests
-    // paid N builds AND serialized on the lock. `mock_e2e.rs` spent 42s of a
-    // 61s workspace test run doing this for 6 tests. The anti-stale-binary
-    // property is unchanged: the build still happens during THIS run, before
-    // any test uses the binary -- just once instead of once per test.
+    // Rust note: `OnceLock` shares one build result across concurrent callers;
+    // the binary is still rebuilt during this run to avoid stale artifacts.
     static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BIN.get_or_init(build_llm_proxy_bin).clone()
 }
@@ -67,19 +49,9 @@ fn build_llm_proxy_bin() -> PathBuf {
 
     let candidate = dir.join(bin_name);
 
-    // ALWAYS rebuild -- do not short-circuit on "the file is already there".
-    //
-    // This bit us for real: `cargo test -p diffrig` alone never rebuilds
-    // sibling crate `proxy` (diffrig depends on its *binary* at runtime, not
-    // on it as a library), so an early return on `candidate.is_file()` runs
-    // this end-to-end test against whatever `llm-proxy` was last built --
-    // possibly from before the fix under test. A router bug was fixed, this
-    // test still failed, and the binary was the stale part. A test that can
-    // silently validate an old artifact is worse than no test, so we pay a
-    // no-op `cargo build` (fast when nothing changed) on every run.
-    //
-    // No network is needed: every dependency is already resolved in
-    // `Cargo.lock` (and fetched, since building diffrig itself required it).
+    // `diffrig` depends on the proxy binary at runtime, so cargo test may
+    // leave a stale sibling binary. Rebuild to ensure the test exercises the
+    // current source.
     let is_release = dir.file_name().and_then(|n| n.to_str()) == Some("release");
     let mut build = Command::new("cargo");
     build.args(["build", "-p", "proxy", "--bin", "llm-proxy"]);
@@ -134,24 +106,14 @@ impl ProxyProcess {
     /// Spawn `llm-proxy -c config_path` (Envoy mode), otherwise identical to
     /// [`Self::spawn`].
     ///
-    /// This exists because some filters (e.g. the auth filter, as of this
-    /// writing) have no dialect (`llmproxy.yaml`) surface yet --
-    /// `--config` only understands the fields `proxy-simple-config` knows
-    /// how to lower, so a test that needs `llmproxy.auth` in `http_filters`
-    /// must hand the proxy a real Envoy bootstrap document instead. Prefer
-    /// [`Self::spawn`] once a dialect `auth:` block lands; it exercises the
-    /// same lowering path real users hit and needs no hand-written YAML.
+    /// Use Envoy mode for filters not exposed by the simple dialect, such as
+    /// `llmproxy.auth` in `http_filters`.
     pub fn spawn_envoy(bin: &Path, config_path: &Path, log_path: &Path) -> Self {
         Self::spawn_with_flag(bin, "-c", config_path, log_path, &[])
     }
 
-    /// Same as [`Self::spawn_envoy`], plus `envs` set in the CHILD's
-    /// environment only (via `Command::env`, never `std::env::set_var` --
-    /// that call is process-global and would race every other test binary
-    /// running concurrently in this workspace). Used by the admin write API
-    /// drill (`admin_e2e.rs`), which must set
-    /// `LLMPROXY_ADMIN_TOKEN` for the spawned proxy without touching this
-    /// test process's own environment.
+    /// Set environment variables only on the child process; changing the
+    /// test process environment would race concurrent tests.
     pub fn spawn_envoy_with_env(
         bin: &Path,
         config_path: &Path,
@@ -194,22 +156,13 @@ impl ProxyProcess {
     /// child has already exited -- a listener that will never come up
     /// should not eat the whole timeout budget.
     ///
-    /// **This function BLOCKS the calling thread** (`std::thread::sleep`, and
-    /// a blocking `connect_timeout`), and callers are `async fn`s. Any test
-    /// calling it must therefore use a **multi-threaded** runtime:
+    /// This blocks the calling thread, so async callers must use a
+    /// multi-threaded runtime; a current-thread runtime would also freeze the
+    /// spawned mock upstreams.
     ///
     /// ```ignore
     /// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     /// ```
-    ///
-    /// Plain `#[tokio::test]` is a `current_thread` runtime -- ONE thread. The
-    /// mock upstreams are `tokio::spawn`ed onto that same runtime, so blocking
-    /// here freezes them: the proxy waits on upstreams that cannot be polled
-    /// by the only thread that could poll them, and the test hangs. Measured
-    /// 2026-08-07, that was the cause of 8 tests (6 in `mock_e2e`, 2 in
-    /// `tls_e2e`) intermittently hanging and turning a 79s workspace run into
-    /// 656-863s. Nothing bounded it, because no request in those tests is
-    /// wrapped in `tokio::time::timeout`.
     pub fn wait_until_ready(&mut self, addr: SocketAddr, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {

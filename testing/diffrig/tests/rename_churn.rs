@@ -157,8 +157,8 @@ async fn reload_probe(listener_port: u16) {
 #[ignore = "5k-rps acceptance; run on a dedicated capacity host"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn rename_churn_at_5k_rps_keeps_last_good_generation_live() {
-    // A lower diagnostic rate can reproduce reload failures on a workstation;
-    // the release gate always uses the 5k default.
+    // A lower diagnostic rate can reproduce reload failures on a workstation.
+    // The default is the 5k rate.
     let rate = std::env::var("RENAME_CHURN_DIAGNOSTIC_RPS")
         .ok()
         .map(|value| value.parse::<f64>().expect("valid diagnostic rps"))

@@ -1,25 +1,8 @@
-//! S1 route matching engine: pure, synchronous, allocation-light
-//! selection of virtual host -> route -> cluster on top of the pre-compiled
-//! IR in `proxy_config::ir`. No async, no I/O — this module only reads data
-//! the caller hands it.
+//! Synchronous route matching over the compiled IR (Envoy S1).
 //!
-//! TODO: the IR (`proxy_config::ir`) does not yet model the
-//! following S1 features, so they are unimplemented here for lack of a place
-//! to store the compiled matcher. The orchestrator will extend the IR
-//! separately:
-//! - `path_separated_prefix` path specifier (S1.3): match `p` exactly or
-//!   `p/`-prefixed. `RouteMatcher`/`PathMatch` has no variant for it.
-//! - `query_parameters` route-level matching (S1.4): `RouteMatcher` has no
-//!   field for query-parameter matchers.
-//! - Header `range` and `contains` matchers, and `invert_match` on any header
-//!   matcher (S1.4): `HeaderMatchKind` has no `Range`/`Contains` variants and
-//!   no per-matcher invert flag.
-//! - `runtime_fraction`-gated route matching (S1.4): `RouteEntry` has no
-//!   runtime-fraction field, so a route can't be probabilistically skipped
-//!   before the rest of its matcher is evaluated.
-//! - `grpc` route-match flag (S1.4): no field on `RouteMatcher`.
-//! - `metadata_match` merge between route- and weighted-cluster-level
-//!   overrides (S1.5): `WeightedClusters`/`ForwardTarget` carry no metadata.
+//! The IR does not currently represent path-separated prefixes, query
+//! parameter matchers, header range/contains/invert matchers, runtime fractions,
+//! the gRPC flag, or route/weighted-cluster metadata merges.
 
 use std::sync::Arc;
 
@@ -28,24 +11,9 @@ use proxy_config::ir::{
     VirtualHostIR,
 };
 
-// S1.3 note on regex anchoring — **do not re-anchor here.** Envoy's
-// `safe_regex` is a FULL match, and that is already enforced at *config
-// compile time*: `proxy-config`'s `lower.rs::compile_regex` wraps every
-// pattern as `^(?:{pattern})$` before handing it to `regex::Regex::new`, and
-// all three `Regex` sites in the IR (path `safe_regex`, header `safe_regex`,
-// and `StringMatcherIR::SafeRegex`) go through it. So `is_match` on an IR
-// regex is already a whole-string test, and matching here is just a call to
-// the IR's own helpers.
-//
-// Anchoring a second time at each call site would be redundant, and doing it
-// by inspecting `find()`'s match span would actually be *wrong* on an
-// unanchored pattern: `regex` returns the leftmost-first match, so an
-// alternation like `/foo|/foobar` against `/foobar` yields the 4-byte `/foo`
-// and a span check would reject it, even though the pattern does match the
-// whole string. Compile-time anchoring has no such failure mode.
-//
-// `case_sensitive` is never applied to regexes (S1.3) — which holds here for
-// free, since this module never case-folds a regex input.
+// Regexes are anchored during config compilation, so matching here is already
+// whole-string. Re-anchoring or checking match spans would change alternation
+// behavior; Envoy ignores `case_sensitive` for regex matches (S1.3).
 
 /// One inbound request's routing-relevant data. Borrowed for the lifetime of
 /// the call — this module never clones or owns request data.
@@ -66,17 +34,8 @@ pub struct RouteRequest<'a> {
 pub enum RouteMatch<'t> {
     Found {
         vhost: &'t VirtualHostIR,
-        // Rust note: `&'t Arc<RouteEntry>`, not `&'t RouteEntry` -- the extra
-        // layer matters. `VirtualHostIR.routes` is `Vec<Arc<RouteEntry>>`
-        // and the filter manager's route cache (S2.8) needs to hold
-        // an OWNED, cheaply-cloned handle to the matched route across the
-        // rest of the stream (past this call's borrow of the route table),
-        // not just read its fields. Borrowing the `Arc` itself (rather than
-        // deref'ing straight to `&RouteEntry`, which would throw the `Arc`
-        // away) lets a caller do `route.clone()` -- an `Arc` refcount bump,
-        // not a deep copy -- to get that owned handle. Every existing caller
-        // that only reads fields off `route` (`route.action`, `route.matcher`,
-        // ...) keeps compiling unchanged: `Arc<T>` derefs to `&T` automatically.
+        // Keep the Arc borrow so callers can cheaply clone a route into the
+        // filter manager's stream-lifetime cache.
         route: &'t Arc<RouteEntry>,
     },
     /// A virtual host matched but no route did -> 404, response flag `NR`.

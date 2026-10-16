@@ -1,9 +1,9 @@
 //! Acceptance tests for the descriptor pool.
 //!
-//! Gate: `Bootstrap`, `Listener`, `Cluster`,
-//! `RouteConfiguration`, `ClusterLoadAssignment`, `HttpConnectionManager`,
-//! `Router`, ADS service types all addressable; the descriptor pool resolves
-//! every `type.googleapis.com/envoy.*` URL used in the config corpus.
+//! Checks that `Bootstrap`, `Listener`, `Cluster`, `RouteConfiguration`,
+//! `ClusterLoadAssignment`, `HttpConnectionManager`, `Router`, and the ADS
+//! service types are addressable. It also checks that the descriptor pool
+//! resolves every `type.googleapis.com/envoy.*` URL in the config corpus.
 
 use proxy_api::descriptor_pool;
 
