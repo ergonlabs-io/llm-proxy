@@ -83,10 +83,19 @@ pub const DEFAULT_WINDOW_RECONCILIATION_BOUND: Duration = Duration::from_secs(10
 /// one gauge, so a long outage does not flood the log.
 pub const STALE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often the lease publisher runs by default. The lease TTL is three
-/// times this (addendum §3), so one slow tick never drops a live replica's
-/// leases.
+/// How often the lease publisher runs by default: the same one-second
+/// cadence as the window reconcile, so concurrency over-admission is bounded
+/// by about one second of stream arrivals on the other replicas (amendment G).
 pub const DEFAULT_LEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a published lease row lives without a refresh by default: five
+/// publish intervals, above the minimum of three (addendum §3). A publish to
+/// Redis can block for its one-second I/O timeout before the next interval
+/// starts, so three intervals would leave room for only one slow publish
+/// before a live replica's leases expired and the others over-admitted. Five
+/// survive two failed publishes in a row. It is also how long a crashed
+/// replica's slots stay held, and five seconds is short beside a stream.
+pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(5);
 
 /// The retry hint a concurrency refusal carries: a stream slot frees when a
 /// stream ends, which has no schedule to report.
@@ -1087,24 +1096,31 @@ impl GaugeInner {
                     return;
                 }
             }
-            let now = SystemTime::now();
-            let published = self.publish_at(now);
-            self.publish_age(SystemTime::now());
-            if let Err(e) = published {
-                let lease_age = self.reconciliation_age(now);
-                let warn_last = self.last_stale_warn_millis.load(Ordering::Acquire);
-                let now_ms = unix_millis(now);
-                if warn_last == NEVER
-                    || now_ms.saturating_sub(warn_last) >= STALE_WARN_INTERVAL.as_millis() as i64
-                {
-                    self.last_stale_warn_millis.store(now_ms, Ordering::Release);
-                    tracing::warn!(error = %e, scope = %self.scope,
-                        lease_age_seconds = lease_age.as_secs(),
-                        "llmproxy.token_limit: stream-lease publish failed; enforcing concurrency \
-                         against the last known fleet counts (fail open)");
-                }
+            let _ = self.tick(SystemTime::now());
+        }
+    }
+
+    /// One publisher tick: publish, export the age, and on a failure warn at
+    /// most once per [`STALE_WARN_INTERVAL`]. Admission is unaffected either
+    /// way: it fails open against the last known fleet counts.
+    fn tick(&self, now: SystemTime) -> Result<(), StoreError> {
+        let published = self.publish_at(now);
+        self.publish_age(SystemTime::now());
+        if let Err(e) = &published {
+            let lease_age = self.reconciliation_age(now);
+            let warn_last = self.last_stale_warn_millis.load(Ordering::Acquire);
+            let now_ms = unix_millis(now);
+            if warn_last == NEVER
+                || now_ms.saturating_sub(warn_last) >= STALE_WARN_INTERVAL.as_millis() as i64
+            {
+                self.last_stale_warn_millis.store(now_ms, Ordering::Release);
+                tracing::warn!(error = %e, scope = %self.scope,
+                    lease_age_seconds = lease_age.as_secs(),
+                    "llmproxy.token_limit: stream-lease publish failed; enforcing concurrency \
+                     against the last known fleet counts (fail open)");
             }
         }
+        published
     }
 
     /// Publish every slot's local count (including a final zero for a slot
@@ -1500,6 +1516,63 @@ mod tests {
         assert!(
             b.try_acquire(&key, 1).is_err(),
             "the last known count still applies during the outage"
+        );
+    }
+
+    /// A shared store that cannot be reached fails open, loudly: streams are
+    /// still admitted up to the ceiling against local counts, every publish
+    /// fails, and the warning is logged once per interval, not per tick. The
+    /// store is the real Redis client pointed at a port nothing listens on.
+    #[test]
+    fn an_unreachable_redis_fails_open_and_warns_once_per_interval() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("reserve a port")
+            .port();
+        let store = crate::control_redis::RedisControlPlaneStore::open(&format!(
+            "redis://:lease-test-password@127.0.0.1:{port}"
+        ))
+        .expect("open only parses the URL");
+        let g = LeaseGauge::new(
+            "ingress".to_string(),
+            Arc::new(store),
+            "a".to_string(),
+            Duration::from_secs(3),
+        );
+        let key = tenant("", "acme");
+        let (capture, _guard) = crate::control::log_capture::Capture::start();
+
+        let _first = g.try_acquire(&key, 2).expect("fails open: admitted");
+        let _second = g.try_acquire(&key, 2).expect("fails open: admitted");
+        assert!(
+            g.try_acquire(&key, 2).is_err(),
+            "the local count still enforces the ceiling"
+        );
+
+        let now = SystemTime::now();
+        for tick in 0..5 {
+            assert!(
+                g.inner.tick(now + Duration::from_secs(tick)).is_err(),
+                "nothing listens on the port"
+            );
+        }
+        let warned = || capture.rendered_at_or_above(tracing::Level::WARN);
+        assert_eq!(warned().len(), 1, "one warning for five failed ticks");
+        let line = &warned()[0];
+        assert!(
+            line.contains("fail open") && line.contains("scope=ingress"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("lease-test-password"),
+            "the Redis URL's password never reaches the log: {line}"
+        );
+
+        assert!(g.inner.tick(now + STALE_WARN_INTERVAL).is_err());
+        assert_eq!(
+            warned().len(),
+            2,
+            "a still-failing store warns again an interval later"
         );
     }
 

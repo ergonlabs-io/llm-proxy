@@ -40,7 +40,15 @@
 //! {ns}:generation                           STRING, INCR
 //! {ns}:spend:{<prefix>|<tenant>|<period>}   STRING, micros
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
+//! {ns}:lease:{<scope>}:counts               HASH <esc(subject)>|<esc(node_id)> -> streams in flight
+//! {ns}:lease:{<scope>}:expiry               ZSET <esc(subject)>|<esc(node_id)> -> expiry, Unix ms
 //! ```
+//!
+//! The two `lease` keys are this store's [`LeaseStore`] rows (ADR-0006
+//! amendment E): one row per replica per subject, with its own expiry in the
+//! sorted set. Both keys of a scope share the hash tag `{<scope>}`, so one
+//! script can write a replica's rows and sum the whole scope. See
+//! [`PUBLISH_LEASES_LUA`].
 //!
 //! The `spend` and `seq` keys of a period expire together, a fixed retention
 //! after the period ends (`SPEND_RETENTION_AFTER_PERIOD`); every other key is
@@ -89,6 +97,7 @@ use crate::control::{
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
+use crate::window_counter::{FleetLeases, LeaseRow, LeaseStore};
 
 /// Namespace prefix used when a caller does not supply one -- see
 /// [`RedisControlPlaneStore::open`].
@@ -217,6 +226,10 @@ enum Lane {
     /// `last_flush_seq` and `load_spend` batches, the `load_spend` batch that
     /// fills buckets at bind time, and the operator's `overwrite_spend`.
     Spend,
+    /// Tier 4: the stream-lease publisher, once per publish interval. Its
+    /// own connection, so a long spend flush cannot hold a publish past the
+    /// lease TTL and expire this replica's live leases.
+    Lease,
 }
 
 /// [`ControlPlaneStore::add_spend`]'s Lua script. ADR-0006 §2 decides that
@@ -283,6 +296,77 @@ local expires_at = tonumber(ARGV[4])
 redis.call('EXPIREAT', KEYS[1], expires_at)
 redis.call('EXPIREAT', KEYS[2], expires_at)
 return total
+"#;
+
+/// [`LeaseStore::publish_leases`] as one script: drop the scope's expired
+/// rows, write this replica's rows, and return the fleet sum per subject.
+///
+/// `KEYS[1]` = the scope's counts hash, `KEYS[2]` = its expiry sorted set.
+/// `ARGV[1]` = the TTL in milliseconds, `ARGV[2]` = the escaped node id, then
+/// pairs of escaped subject and in-flight count. A count of zero removes the
+/// row. Returns a flat array of escaped subject and fleet sum, one pair per
+/// subject with at least one live row.
+///
+/// Expiry uses the Redis server's clock (`TIME`), so the replicas' clocks
+/// never need to agree. Both keys also expire as a whole at the latest row
+/// expiry, so a scope whose replicas all stop leaves nothing behind. A field
+/// is `<esc(subject)>|<esc(node_id)>`; an escaped component holds no `|`, so
+/// the last `|` is the separator.
+///
+/// A script, not a pipeline: the pruning reads which rows expired and the
+/// writes depend on that read (see [`ADD_SPEND_LUA`]). On Redis 7 a script
+/// replicates its effects, so `TIME` before a write is allowed;
+/// `replicate_commands` asks for the same on older servers.
+const PUBLISH_LEASES_LUA: &str = r#"
+if redis.replicate_commands then redis.replicate_commands() end
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now)
+for _, member in ipairs(expired) do
+  redis.call('HDEL', KEYS[1], member)
+end
+if #expired > 0 then
+  redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
+end
+local ttl = tonumber(ARGV[1])
+for i = 3, #ARGV, 2 do
+  local member = ARGV[i] .. '|' .. ARGV[2]
+  local count = tonumber(ARGV[i + 1])
+  if count == 0 then
+    redis.call('HDEL', KEYS[1], member)
+    redis.call('ZREM', KEYS[2], member)
+  else
+    redis.call('HSET', KEYS[1], member, count)
+    redis.call('ZADD', KEYS[2], now + ttl, member)
+  end
+end
+local latest = redis.call('ZRANGE', KEYS[2], -1, -1, 'WITHSCORES')
+if #latest == 0 then
+  redis.call('DEL', KEYS[1], KEYS[2])
+  return {}
+end
+local expires_at = math.floor(tonumber(latest[2]))
+redis.call('PEXPIREAT', KEYS[1], expires_at)
+redis.call('PEXPIREAT', KEYS[2], expires_at)
+local sums = {}
+local order = {}
+local all = redis.call('HGETALL', KEYS[1])
+for i = 1, #all, 2 do
+  local subject = string.match(all[i], '^(.*)|')
+  if subject then
+    if sums[subject] == nil then
+      sums[subject] = 0
+      order[#order + 1] = subject
+    end
+    sums[subject] = sums[subject] + tonumber(all[i + 1])
+  end
+end
+local out = {}
+for _, subject in ipairs(order) do
+  out[#out + 1] = subject
+  out[#out + 1] = sums[subject]
+end
+return out
 "#;
 
 /// How long a spend row stays in Redis after its period ends: 32 days.
@@ -529,6 +613,8 @@ pub struct RedisControlPlaneStore {
     control_conn: Mutex<Option<Connection>>,
     /// The [`Lane::Spend`] connection, opened on first use.
     spend_conn: Mutex<Option<Connection>>,
+    /// The [`Lane::Lease`] connection, opened on first use.
+    lease_conn: Mutex<Option<Connection>>,
     /// Connect, read, and write timeout of both lanes: [`IO_TIMEOUT`] in
     /// production. A field rather than the constant read in place so the
     /// lane tests can hold a call in flight far longer than that without
@@ -541,6 +627,7 @@ pub struct RedisControlPlaneStore {
     delete_tenant_credential_script: Script,
     delete_tenant_script: Script,
     put_rate_card_if_absent_script: Script,
+    publish_leases_script: Script,
     /// Where `load` exports its duration and size; `None` until
     /// [`Self::with_load_stats`].
     load_stats: Option<LoadStats>,
@@ -581,6 +668,7 @@ impl RedisControlPlaneStore {
             client,
             control_conn: Mutex::new(None),
             spend_conn: Mutex::new(None),
+            lease_conn: Mutex::new(None),
             io_timeout: IO_TIMEOUT,
             namespace: namespace.into(),
             add_spend_script: Script::new(ADD_SPEND_LUA),
@@ -589,6 +677,7 @@ impl RedisControlPlaneStore {
             delete_tenant_credential_script: Script::new(DELETE_TENANT_CREDENTIAL_LUA),
             delete_tenant_script: Script::new(DELETE_TENANT_LUA),
             put_rate_card_if_absent_script: Script::new(PUT_RATE_CARD_IF_ABSENT_LUA),
+            publish_leases_script: Script::new(PUBLISH_LEASES_LUA),
             load_stats: None,
         })
     }
@@ -620,6 +709,7 @@ impl RedisControlPlaneStore {
         let slot = match lane {
             Lane::Control => &self.control_conn,
             Lane::Spend => &self.spend_conn,
+            Lane::Lease => &self.lease_conn,
         };
         let mut guard = slot
             .lock()
@@ -741,6 +831,17 @@ impl RedisControlPlaneStore {
             "{}:winseq:{{{}}}",
             self.namespace,
             Self::window_tag(scope, row)
+        )
+    }
+
+    /// The counts hash and the expiry sorted set of one lease scope. Both
+    /// carry the hash tag `{<esc(scope)>}` so [`PUBLISH_LEASES_LUA`] can
+    /// touch them in one script on Redis Cluster.
+    fn lease_keys(&self, scope: &str) -> (String, String) {
+        let tag = escape_component(scope);
+        (
+            format!("{}:lease:{{{tag}}}:counts", self.namespace),
+            format!("{}:lease:{{{tag}}}:expiry", self.namespace),
         )
     }
 
@@ -1467,6 +1568,43 @@ impl ControlPlaneStore for RedisControlPlaneStore {
 
 // Tests that run in every `make tq`, against an in-process fake Redis; the
 // `#[ignore]`d tests in `tests` below need a real one.
+/// Tier-4 lease rows (ADR-0006 amendment E) on [`Lane::Lease`]: one
+/// [`PUBLISH_LEASES_LUA`] call per publish, whatever the number of rows.
+impl LeaseStore for RedisControlPlaneStore {
+    fn publish_leases(
+        &self,
+        scope: &str,
+        node_id: &str,
+        rows: &[LeaseRow],
+        ttl: Duration,
+    ) -> Result<FleetLeases, StoreError> {
+        let (counts, expiry) = self.lease_keys(scope);
+        let mut invocation = self.publish_leases_script.key(counts);
+        invocation
+            .key(expiry)
+            .arg(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+            .arg(escape_component(node_id));
+        for row in rows {
+            invocation
+                .arg(escape_component(&row.subject))
+                .arg(row.in_flight);
+        }
+        let sums: HashMap<String, u64> =
+            self.with_connection(Lane::Lease, |conn| invocation.invoke(conn))?;
+        sums.into_iter()
+            .map(|(subject, sum)| {
+                unescape_component(&subject)
+                    .map(|subject| (subject, sum))
+                    .ok_or_else(|| {
+                        StoreError::Unavailable(
+                            "lease row with a malformed subject in the shared store".to_string(),
+                        )
+                    })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod fake_redis_tests;
 
@@ -1635,6 +1773,130 @@ mod tests {
                 .unwrap();
             assert_eq!(at, want, "{key}");
         }
+    }
+
+    fn lease(subject: &str, in_flight: u64) -> LeaseRow {
+        LeaseRow {
+            subject: subject.to_string(),
+            in_flight,
+        }
+    }
+
+    fn fleet(pairs: &[(&str, u64)]) -> FleetLeases {
+        pairs.iter().map(|(s, n)| (s.to_string(), *n)).collect()
+    }
+
+    /// Lease rows against a real Redis: sums across nodes, a zero removes
+    /// only the writer's row, every live subject of the scope comes back
+    /// (including ones this node never wrote), subjects round-trip through
+    /// the escaping, and scopes do not see each other.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_lease_rows_sum_across_nodes_for_the_whole_scope() {
+        let store = test_store("lease-sum");
+        let ttl = Duration::from_secs(30);
+        let odd = "route=a|b{c}%|tenant=t";
+
+        assert_eq!(
+            store.publish_leases("chain", "node-a", &[lease("s1", 2), lease(odd, 1)], ttl),
+            Ok(fleet(&[("s1", 2), (odd, 1)]))
+        );
+        assert_eq!(
+            store.publish_leases("chain", "node-b", &[lease("s1", 1), lease("s2", 4)], ttl),
+            Ok(fleet(&[("s1", 3), (odd, 1), ("s2", 4)]))
+        );
+        assert_eq!(
+            store.publish_leases("chain", "node-a", &[lease("s1", 0), lease(odd, 0)], ttl),
+            Ok(fleet(&[("s1", 1), ("s2", 4)])),
+            "a zero removes node-a's rows and leaves node-b's"
+        );
+        assert_eq!(
+            store.publish_leases("other-chain", "node-a", &[], ttl),
+            Ok(FleetLeases::new()),
+            "another scope sees none of these rows"
+        );
+        assert_eq!(
+            store.publish_leases("chain", "node-c", &[], ttl),
+            Ok(fleet(&[("s1", 1), ("s2", 4)])),
+            "a node that writes nothing still reads the scope"
+        );
+    }
+
+    /// A silent node's rows expire one TTL after its last publish, on the
+    /// next publish from anyone, and the scope's keys expire with the last
+    /// row so a fleet that stops leaves nothing behind.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_lease_rows_expire_after_the_ttl_and_take_their_keys_with_them() {
+        let store = test_store("lease-ttl");
+        let short = Duration::from_millis(200);
+        store
+            .publish_leases("chain", "crashed", &[lease("s1", 1)], short)
+            .unwrap();
+        let (counts, expiry) = store.lease_keys("chain");
+        for key in [&counts, &expiry] {
+            let ttl_ms: i64 = store
+                .with_connection(Lane::Lease, |conn| redis::cmd("PTTL").arg(key).query(conn))
+                .unwrap();
+            assert!(
+                (1..=200).contains(&ttl_ms),
+                "{key} expires with its last row, got PTTL {ttl_ms}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            store.publish_leases("chain", "live", &[lease("s1", 1)], Duration::from_secs(30)),
+            Ok(fleet(&[("s1", 1)])),
+            "the crashed node's row no longer counts"
+        );
+        let crashed: Option<u64> = store
+            .with_connection(Lane::Lease, |conn| {
+                redis::cmd("HGET")
+                    .arg(&counts)
+                    .arg("s1|crashed")
+                    .query(conn)
+            })
+            .unwrap();
+        assert_eq!(crashed, None, "the expired row is pruned, not just skipped");
+        store
+            .publish_leases("chain", "live", &[lease("s1", 0)], Duration::from_secs(30))
+            .unwrap();
+        let exists: u64 = store
+            .with_connection(Lane::Lease, |conn| {
+                redis::cmd("EXISTS").arg(&counts).arg(&expiry).query(conn)
+            })
+            .unwrap();
+        assert_eq!(exists, 0, "an empty scope deletes its keys");
+    }
+
+    /// Two gauges on one real Redis, as two replicas would run: one ceiling
+    /// for both, including for a replica that has never served the subject.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_two_lease_gauges_enforce_one_concurrency_ceiling() {
+        use crate::token_limit::LimitKey;
+        use crate::window_counter::LeaseGauge;
+        let store: Arc<dyn LeaseStore> = Arc::new(test_store("lease-gauge"));
+        let ttl = Duration::from_secs(30);
+        let a = LeaseGauge::new("chain".into(), Arc::clone(&store), "a".into(), ttl);
+        let b = LeaseGauge::new("chain".into(), Arc::clone(&store), "b".into(), ttl);
+        let key = LimitKey::for_tenant("", "acme");
+
+        let held = a.try_acquire(&key, 1).expect("the first stream");
+        a.publish_now().unwrap();
+        b.publish_now().unwrap();
+        assert!(
+            b.try_acquire(&key, 1).is_err(),
+            "a holds the ceiling, so b refuses its first stream"
+        );
+
+        drop(held);
+        a.publish_now().unwrap();
+        b.publish_now().unwrap();
+        let _mine = b.try_acquire(&key, 1).expect("a released its stream");
+        b.publish_now().unwrap();
+        a.publish_now().unwrap();
+        assert!(a.try_acquire(&key, 1).is_err(), "now b holds the ceiling");
     }
 
     #[test]

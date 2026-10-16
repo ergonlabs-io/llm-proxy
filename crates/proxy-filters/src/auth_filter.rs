@@ -85,6 +85,7 @@ use crate::jwks_refresh::{
 };
 use crate::jwt_auth::{JwkRsaKey, JwtAuthenticator, JwtKeySet, JwtValidationConfig};
 use crate::tenant_credential_crypto::{CredentialKek, KekError, KeyRing};
+use crate::window_counter::LeaseStore;
 
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
@@ -1039,6 +1040,7 @@ impl HttpFilterFactory for AuthFilterFactory {
                 for (snapshot, spec) in jwt_refreshes {
                     crate::jwks_refresh::start_jwks_refresher(snapshot, spec);
                 }
+                let mut lease_store: Option<Arc<dyn LeaseStore>> = None;
                 let store: Box<dyn ControlPlaneStore> = match store_spec {
                     StoreSpec::InMemory => Box::new(InMemoryControlPlaneStore::default()),
                     StoreSpec::Persistent(path) => {
@@ -1074,11 +1076,18 @@ impl HttpFilterFactory for AuthFilterFactory {
                         // `StoreError`. The dotted path already names where
                         // the URL came from, so the URL itself is still
                         // never echoed.
-                        let store = match namespace {
+                        let open = || match &namespace {
                             Some(ns) => RedisControlPlaneStore::open_with_namespace(&url, ns),
                             None => RedisControlPlaneStore::open(&url),
-                        }
-                        .map(|store| match &stats_registry {
+                        };
+                        // Stream leases go to the same Redis and namespace as
+                        // the counters (ADR-0006 amendment E). A second
+                        // handle, so the lease publisher only ever opens its
+                        // own lane's connection.
+                        lease_store = open()
+                            .ok()
+                            .map(|leases| Arc::new(leases) as Arc<dyn LeaseStore>);
+                        let store = open().map(|store| match &stats_registry {
                             Some(registry) => {
                                 store.with_load_stats(Arc::clone(registry), &ctx.stat_prefix)
                             }
@@ -1109,6 +1118,10 @@ impl HttpFilterFactory for AuthFilterFactory {
                         format!("control-plane snapshot could not be built: {e}"),
                     )
                 })?;
+                let cp = match lease_store {
+                    Some(leases) => cp.with_lease_store(leases),
+                    None => cp,
+                };
                 // Start the policy poller HERE, not in `main.rs` --
                 // `main.rs` never holds a `ControlPlane` handle at all (this
                 // `get_or_try_init` closure is the one place a fresh

@@ -3227,6 +3227,10 @@ pub struct ControlPlane {
     /// reads the chain's own registry, which a watch below keeps current.
     rate_cards: Mutex<HashMap<String, StoredRateCard>>,
     rate_card_watches: Mutex<Vec<RateCardWatch>>,
+    /// Where `llmproxy.token_limit` publishes concurrent-stream leases
+    /// (ADR-0006 amendment E): set for a shared store, so the leases live in
+    /// the same Redis as the counters; `None` keeps them in process.
+    lease_store: Option<Arc<dyn crate::window_counter::LeaseStore>>,
 }
 
 /// Who wants to hear when a chain's stored rate card changes.
@@ -3320,6 +3324,7 @@ impl ControlPlane {
             credential_warnings,
             rate_cards: Mutex::new(rate_cards),
             rate_card_watches: Mutex::new(Vec::new()),
+            lease_store: None,
         })
     }
 
@@ -3582,6 +3587,21 @@ impl ControlPlane {
     /// must not queue behind each other".
     pub fn store(&self) -> Arc<dyn ControlPlaneStore> {
         Arc::clone(&self.store)
+    }
+
+    /// Publish concurrent-stream leases to `leases` rather than in process.
+    /// Set before the control plane is shared, alongside the store it
+    /// belongs with.
+    pub fn with_lease_store(mut self, leases: Arc<dyn crate::window_counter::LeaseStore>) -> Self {
+        self.lease_store = Some(leases);
+        self
+    }
+
+    /// The lease store [`Self::with_lease_store`] set, if any. A chain whose
+    /// counters are shared must share its stream leases too, or N replicas
+    /// admit N times a concurrent-stream ceiling.
+    pub fn lease_store(&self) -> Option<Arc<dyn crate::window_counter::LeaseStore>> {
+        self.lease_store.clone()
     }
 
     /// How many unusable-credential warnings have been emitted, for tests of

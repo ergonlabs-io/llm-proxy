@@ -46,8 +46,10 @@ and logs a warning when the counters stay unreconciled past their bound. The
 gauge `envoy_llmproxy_counter_reconciliation_age_seconds` on
 `/stats/prometheus` shows how long ago the counters last reconciled, with
 `seam="rate_window"` for token and request counts and
-`seam="stream_lease"` for concurrent streams. A `limits` entry on a listener
-with no `auth:` counts per process.
+`seam="stream_lease"` for concurrent streams. Concurrent streams are shared
+in the same way with a `shared` store: each replica publishes its count about
+once a second, and the count of a replica that stops expires after 5
+seconds. A `limits` entry on a listener with no `auth:` counts per process.
 
 This page also covers the read side: `GET /v1/usage`, an endpoint the proxy
 answers itself so an authenticated caller can see its own budget without an

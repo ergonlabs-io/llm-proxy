@@ -49,10 +49,10 @@ the same record.
 | 1 · configuration | listeners, routes, clusters, filters | operator / xDS | already solved, unrelated to this page | wrong routing |
 | 2 · identity & policy | tenants, virtual keys, revocations, budget ceilings | admin API | yes, if `store: shared` | a revoked key still authenticates |
 | 3 · accrued counters | spend in micro-dollars, per stable key per period | data plane, constantly | yes, if `store: shared` | budget over-admitted |
-| 4 · live gauges | concurrency / in-flight requests | data plane, constantly | **no — see below** | unscoped, not designed yet |
+| 4 · live gauges | concurrent streams in flight | data plane, constantly | yes, if `store: shared`, as leases | streams over-admitted |
 
-Tiers 2 and 3 are what `store: shared` gives you. Tier 4 is not part of this
-feature at all; see [What stays local](#what-stays-local-even-with-a-shared-store).
+`store: shared` shares tiers 2, 3 and 4. Tier 4 uses leases, not counters;
+see [Concurrent streams share leases](#concurrent-streams-share-leases).
 
 ## Configuring a shared store
 
@@ -323,18 +323,35 @@ remain volatile; without a journal, the entire unflushed outage backlog is
 volatile. See [Spend policies and recovery](../../limits-and-budgets/spend-policies/)
 for configuration, migration, key lifecycle, and concurrent admission limits.
 
+## Concurrent streams share leases
+
+With `store: shared`, a concurrent-stream ceiling applies to the fleet. This
+includes `concurrent_sessions` in the `limits:` block and `concurrent_streams`
+in tenant and key limits (ADR-0006 amendment E).
+
+- Each replica admits a stream against its own in-flight count plus the
+  count that the other replicas last published. Admission never waits for
+  Redis.
+- Once a second, each replica writes its in-flight count per limit to Redis
+  as a lease row with a 5-second TTL, and reads the fleet total for every
+  limit, including limits it has not served yet.
+- A replica that stops (a crash or `SIGKILL`) does not release its slots.
+  Its lease rows expire 5 seconds after its last write, and the other
+  replicas then admit again.
+- Between two writes, replicas do not see each other's new streams. The
+  fleet can admit up to about one second of stream arrivals on the other
+  replicas over a ceiling.
+- If Redis cannot be reached, each replica keeps enforcing against the last
+  fleet counts it read, plus its own streams (fail open). It logs one
+  `stream-lease publish failed` warning per filter chain per minute, and the
+  gauge `envoy_llmproxy_counter_reconciliation_age_seconds` with
+  `seam="stream_lease"` grows.
+
+Set a distinct `--service-node` on each replica. The lease rows of a replica
+are keyed by its node ID.
+
 ## What stays local, even with a shared store
 
-- **Concurrent stream limits (tier 4) stay per replica, and ADR-0006 rules
-  that they will.** They need lease/TTL semantics and a reaper — a crashed
-  replica's in-flight count has to be actively released, unlike a counter
-  that simply expires with its window. ADR-0006 declines to extend the tier-3
-  store to cover it (`internal-docs/adr/0006-shared-state-tiers.md`, "Not
-  decided here"). `concurrent_sessions` in the `limits:` dialect block is
-  enforced, and each replica admits against its own in-flight count. Two
-  replicas each admit the full value. The shared store does not change this
-  (`crates/proxy-filters/src/window_counter.rs`, "Concurrent streams: a local
-  gauge and a lease store").
 - **Usage history is export-only.** The shared store holds current-window
   spend counters and nothing else — never per-request history. That lives in
   access logs and the usage filter, and stays there by owner decision:

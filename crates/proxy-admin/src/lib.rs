@@ -59,9 +59,9 @@
 //! optional `tokens_per_minute`, `requests_per_minute`, and
 //! `concurrent_streams` fields. Omitted fields set no limit; zero is an
 //! explicit refusal at that scope. A tenant limit bounds all its keys, and a
-//! key limit can narrow it. Counters are per process today, so N replicas
-//! can admit up to N times a configured limit until a shared counter backend
-//! exists.
+//! key limit can narrow it. With a shared store the counters and the
+//! concurrent-stream leases are shared across replicas (ADR-0006); with any
+//! other store, N replicas can admit up to N times a configured limit.
 //!
 //! Every write endpoint also has a **scoped** form (as do the gated spend
 //! read and the `GET /keys` listing),

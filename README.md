@@ -498,11 +498,12 @@ Stated plainly, because a feature list without this is not much use:
 - **JWT verification is reachable from Envoy mode only.** `jwt_providers`
   exists on the `llmproxy.auth` filter of a bootstrap. The `llmproxy` dialect
   has no field for it. A JWT principal stays on the operator key.
-- **Concurrent-stream limits are counted per replica.** Token and request
-  windows reconcile through the shared store, about once a second, when
-  `auth.store` is `shared`. The fleet can admit a little over a limit between
-  reconciles. Concurrent streams have no shared store implementation, so N
-  replicas admit up to N times the limit.
+- **Limits apply to the fleet only with a `shared` store, and loosely.**
+  With `auth.store: shared`, token and request windows reconcile through Redis
+  about once a second, and each replica publishes its concurrent streams as a
+  lease row once a second. The fleet can admit a little over a limit between
+  reconciles. With another store each replica counts alone, so N replicas
+  admit up to N times a limit.
 - **Spend over-admission is bounded, not zero.** With a `shared` store,
   replicas share spend totals. During a store outage each replica enforces
   against the last confirmed total plus its own spend.

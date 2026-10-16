@@ -233,8 +233,8 @@ use crate::token_limit::{
 };
 use crate::usage::TokenUsage;
 use crate::window_counter::{
-    unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, WindowAccumulator,
-    DEFAULT_LEASE_PUBLISH_INTERVAL, DEFAULT_WINDOW_FLUSH_INTERVAL,
+    unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, LeaseStore, WindowAccumulator,
+    DEFAULT_LEASE_PUBLISH_INTERVAL, DEFAULT_LEASE_TTL, DEFAULT_WINDOW_FLUSH_INTERVAL,
 };
 use crate::window_usage::{
     ChainRouteNames, RouteTotals, UsageAnswer, UsageReader, ROUTE_NAMES_KEY, USAGE_READ_TIMEOUT,
@@ -683,6 +683,13 @@ fn create_filter_factory_with_clock(
         Some(cp) => cp.store(),
         None => Arc::new(InMemoryControlPlaneStore::default()),
     };
+    // Stream leases follow the same choice: the shared store's lease rows
+    // when `auth.store` is shared, so a concurrent-stream ceiling holds
+    // across replicas, and in process otherwise (ADR-0006 amendment E).
+    let lease_store: Arc<dyn LeaseStore> = control_plane
+        .as_ref()
+        .and_then(|cp| cp.lease_store())
+        .unwrap_or_else(|| Arc::new(InMemoryLeaseStore::default()));
     let node_id = if ctx.node_id().is_empty() {
         unconfigured_node_id()
     } else {
@@ -712,9 +719,9 @@ fn create_filter_factory_with_clock(
             counters.start_flusher(DEFAULT_WINDOW_FLUSH_INTERVAL);
             let streams = Arc::new(LeaseGauge::new(
                 stat_prefix.clone(),
-                Arc::new(InMemoryLeaseStore::default()),
+                Arc::clone(&lease_store),
                 node_id.clone(),
-                DEFAULT_LEASE_PUBLISH_INTERVAL * 3,
+                DEFAULT_LEASE_TTL,
             ));
             streams.start_publisher(DEFAULT_LEASE_PUBLISH_INTERVAL);
             // ADR-0006 amendment F: each seam publishes how long it has gone

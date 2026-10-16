@@ -37,7 +37,7 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   minute), so every replica counts the same minute under the same name. The first window a
   caller sees can be shorter than the configured length. Token and request counts
   reconcile through `auth.store` about once a second, and a `shared` store shares them
-  across replicas. Concurrent streams are counted per replica. The gauge
+  across replicas. The gauge
   `envoy_llmproxy_counter_reconciliation_age_seconds{seam}` on `/stats/prometheus` reports
   the age of the last reconcile for `rate_window` and `stream_lease`.
 - `GET /v1/usage` now reports each tenant rule that has a `tokens_per_minute` limit, as a
@@ -60,6 +60,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- Concurrent-stream limits (`concurrent_sessions` in `limits:`, and
+  `concurrent_streams` in tenant and key limits) now apply to the fleet when
+  `auth.store` is `shared`. Each replica publishes its in-flight count to Redis
+  once a second as a lease row with a 5-second TTL, so a replica that is killed
+  releases its slots within 5 seconds. If Redis cannot be reached, the proxy
+  keeps enforcing against the last fleet counts it read and logs one warning
+  per chain per minute.
 - Every `limits[]` field and bucket key of the dialect is now enforced:
   `tokens_per_minute`, `requests_per_minute`, `concurrent_sessions` and `models`, with the
   keys `global`, `client-ip`, `tenant` and `header:<name>`. The load-time "not enforced"
@@ -75,10 +82,9 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Known limitations
 
-- Concurrent-stream limits are counted per replica: N replicas can admit up to N times
-  `concurrent_streams`, until shared leases ship. Token and request counts are shared only
-  with `auth.store: shared`, and between reconciles the fleet can admit a little over a
-  limit.
+- Limits apply to the fleet only with `auth.store: shared`. With another store each
+  replica counts alone, so N replicas can admit up to N times a limit. Between reconciles
+  the fleet can admit a little over a limit.
 - `client-ip` behind a load balancer is the balancer's address, because the dialect has no
   trusted-hops setting. Trusted hops are available in Envoy mode (`xff_num_trusted_hops`).
 - A key budget counts one credential source (the operator key or the tenant's own key),
