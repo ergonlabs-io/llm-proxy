@@ -752,17 +752,58 @@ valid in the filter config and in its `typed_per_filter_config` override. Proof:
 
 ### `GET /v1/models`
 
-When `models` is not empty, the proxy answers `GET /v1/models` itself. It does
-not call a provider. The body is a fixed JSON list built at load time, with one
-entry for each `models` key that has no `*`:
+The proxy answers `GET /v1/models` itself. It never sends the request to a
+provider. The list is the model catalogue: each `routes[].model` and each
+`models` key that names one model, sorted, with no duplicates. A name with a
+`*` is a routing rule, so it is not listed. The `auto` name is not listed. If
+no name qualifies, there is no catalogue and the request is handled like any
+other request. With model policy enforced it is then refused with `403`,
+because it names no model.
+
+Each entry has this shape:
 `{"id": "<name>", "object": "model", "created": 0, "owned_by": "llm-proxy"}`.
-Wildcard keys are routing rules, so they are not listed. The route matches the
-path `/v1/models` and sits before the first catch-all route (a `routes` rule
-with `model: "*"`, a `models` key `*`, or the 404 backstop). I did not verify
-whether the `auth` filter gates this route. Proof:
-`configured_catalog_lists_aliases_and_excludes_wildcards` in
-`crates/proxy-simple-config/tests/openrouter.rs`, and the lowering in
-`crates/proxy-simple-config/src/lower.rs` (`llmproxy_model_catalog`).
+The body is `{"object": "list", "data": [...]}`.
+
+When `auth` is set and `auth.enforce.model_policy` is on (the default), the
+list contains only the models that the caller can use. That is the models that
+the tenant's policy grants and that the key's own policy permits. A key with no
+policy gets its tenant's grant. A tenant with no policy gets an empty list,
+unless `auth.enforce.tenants_without_policy` is `allow`. A request with no
+valid key gets `401`, as every request does. A model in the list is a model
+that a request from the same key can use; the same policy check decides both.
+An admin policy change applies to the next listing, with no reload.
+
+Without `auth`, or with `auth.enforce.model_policy: false`, every caller can
+use every routed model, so the list is the full catalogue.
+
+Proof: `models_lists_only_what_the_caller_may_use_and_is_never_forwarded` and
+`models_without_auth_lists_the_whole_catalogue` in
+`crates/proxy/tests/embeddings_e2e.rs`. In Envoy mode, the same behavior is
+the `model_catalog` field of `llmproxy.filters.v0.ModelAuthz`.
+
+### `POST /v1/embeddings`
+
+An embeddings request is routed, authorized and metered like a chat request.
+The proxy reads `model` from the request body, so `routes`, `models`, model
+policies and `limits[].models` apply to it. The proxy reads
+`usage.prompt_tokens` from the response as input tokens. An embeddings
+response has no output tokens, so the output count is `0`. The input tokens:
+
+- appear in the access log (`%LLM_INPUT_TOKENS%`, `%LLM_TOTAL_TOKENS%`), and
+  `%LLM_OUTPUT_TOKENS%` is `0`,
+- count against token limits: `limits` entries, and tenant and key limits from
+  the admin API,
+- are priced with the `pricing` entry of the provider that served the request
+  (after a fallback, the fallback provider and its model), and are charged to
+  the tenant and key budgets.
+
+A path that ends in `/embeddings` is always read as the OpenAI response shape,
+also from a provider whose dialect is `anthropic`. The latency metrics use the
+operation name `embeddings`. Proof:
+`an_embeddings_request_is_metered_and_charged_at_the_serving_providers_card`,
+`a_models_scoped_token_limit_refuses_the_next_embeddings_request` and
+`a_key_token_limit_refuses_the_next_embeddings_request` in
+`crates/proxy/tests/embeddings_e2e.rs`.
 
 ## Shared value shapes
 

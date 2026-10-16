@@ -69,7 +69,8 @@ Notes on the traffic metrics:
 - **Latency histograms.** The proxy records them only for a response with no
   response flags and a `2xx` status. The request path must end in
   `/chat/completions` or `/messages` (operation `chat`), `/completions`
-  (`text_completion`), or `/responses` (`responses`). The request must also
+  (`text_completion`), `/responses` (`responses`), or `/embeddings`
+  (`embeddings`). The request must also
   have a model name that the body-rewrite filter read from the body. The proxy
   never uses a cluster name in its place. The time-per-output-token histogram
   needs at least two output tokens and a duration that is not shorter than the

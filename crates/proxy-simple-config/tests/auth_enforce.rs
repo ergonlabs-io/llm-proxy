@@ -312,20 +312,28 @@ fn tenants_without_policy_lowers_deny_by_default_and_allow_loudly() {
 /// real factory accept it.
 #[test]
 fn the_model_catalogue_reaches_model_authz_and_the_catalogue_route() {
-    let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
-         routes:\n  - {{ model: gpt-4o, provider: openai }}\n  - {{ model: \"claude-*\", provider: openai }}\n\
-         models:\n  text-embedding-3-small: {{ providers: [openai] }}\n  gpt-4o: {{ providers: [openai] }}\n  \
-         \"*\": {{ providers: [openai] }}\n\
-         auth:\n  hmac_secret: \"test-operator-secret\"\n  keys: []\n"
-    );
+    let text = r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - { model: gpt-4o, provider: openai }
+  - { model: "claude-*", provider: openai }
+models:
+  text-embedding-3-small: { providers: [openai] }
+  gpt-4o: { providers: [openai] }
+  "*": { providers: [openai] }
+auth:
+  hmac_secret: "test-operator-secret"
+  keys: []
+"#;
     let expected = ["gpt-4o", "text-embedding-3-small"];
     assert_eq!(
-        model_authz_config(&text)["model_catalog"],
+        model_authz_config(text)["model_catalog"],
         serde_json::json!(expected)
     );
 
-    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    let lowered = lower(&parse(text).unwrap()).unwrap();
     let routes = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
         ["filters"][0]["typed_config"]["route_config"]["virtual_hosts"][0]["routes"]
         .as_array()
@@ -348,7 +356,7 @@ fn the_model_catalogue_reaches_model_authz_and_the_catalogue_route() {
         .collect();
     assert_eq!(ids, expected);
 
-    let loaded = lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts it");
+    let loaded = lower_to_loaded(&parse(text).unwrap()).expect("strict loader accepts it");
     let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
     let listener = snapshot.listeners.values().next().expect("one listener");
     let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
