@@ -197,6 +197,31 @@ mint_tenant_key() {
     admin "$1" PUT /tenants/t1/policy '{"access":"all"}' >/dev/null
 }
 
+# A replica learns keys, policy and limits written through another replica on
+# its policy poll: 48 s, jittered up to 60 s (the revocation bound in
+# auth_filter.rs). Wait out one bound after the last admin write, then prove
+# every replica admits KEY, so no scenario measures a replica that has not
+# yet seen the limit.
+wait_policy_converged() {
+    echo "waiting up to 90 s for every replica to load the shared policy..."
+    sleep 62
+    local i ok
+    for ((i = 0; i < ${#LISTEN[@]}; i++)); do
+        ok=""
+        for _ in $(seq 1 28); do
+            if curl -fsS --max-time 10 -o /dev/null -H "authorization: Bearer $KEY" \
+                -H 'content-type: application/json' \
+                -d '{"model":"mock-model","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+                "http://127.0.0.1:${LISTEN[i]}/v1/chat/completions" 2>/dev/null; then
+                ok=yes; break
+            fi
+            sleep 1
+        done
+        [[ -n "$ok" ]] || { echo "replica $((i + 1)) never admitted the shared key" >&2; exit 1; }
+    done
+    echo "policy converged on ${#LISTEN[@]} replicas"
+}
+
 scrape_all() { # scrape_all DIR TAG
     local i
     for ((i = 0; i < ${#ADMIN[@]}; i++)); do
@@ -250,6 +275,7 @@ s0() {
     start_redis "$d"
     start_replicas "$d" 3 shared
     mint_tenant_key 0
+    wait_policy_converged
     local i
     for ((i = 0; i < 3; i++)); do
         curl -fsS --max-time 10 -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
@@ -334,6 +360,7 @@ s4a() {
     start_replicas "$d" 3 shared
     mint_tenant_key 0
     admin 0 PUT /tenants/t1/limits '{"limits":{"requests_per_minute":'"$S4_RPM"'}}' >/dev/null
+    wait_policy_converged
     start_samplers "$d"
     # Start 2 s into a minute so the run covers exactly three epoch windows.
     local now; now="$(date +%s)"; sleep $(( (60 - now % 60) + 2 ))
@@ -372,6 +399,7 @@ s4b() {
     start_replicas "$d" 3 shared
     mint_tenant_key 0
     admin 0 PUT /tenants/t1/limits '{"limits":{"concurrent_streams":'"$S4_STREAMS"'}}' >/dev/null
+    wait_policy_converged
     start_samplers "$d"
     start_cx_sampler "$d"
     scrape_all "$d" before
@@ -435,6 +463,7 @@ s6() {
     start_redis "$d"
     start_replicas "$d" 3 shared
     mint_tenant_key 0
+    wait_policy_converged
     start_samplers "$d"
     for ((i = 0; i < 3; i++)); do
         loadgen --target "http://127.0.0.1:${LISTEN[i]}" --api-key "$KEY" \
