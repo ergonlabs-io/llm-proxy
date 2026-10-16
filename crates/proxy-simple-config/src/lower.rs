@@ -2396,10 +2396,10 @@ fn check_readable_non_empty_file(file: &str, field_path: &str) -> Result<(), Con
 /// applies to it; the filter owns those semantics, this function only
 /// translates fields.
 ///
-/// Behavior note: `key: header:authorization` buckets on the hashed
-/// `authorization` value as written, even when `auth:` is configured. It used
-/// to switch to the authenticated tenant silently; write `key: tenant` for
-/// that.
+/// Behavior note: `key: header:authorization` counts each credential apart.
+/// Behind `auth:` the filter buckets on the authenticated key id, since
+/// `llmproxy.auth` removes the verified header. It used to switch to the
+/// authenticated tenant silently; write `key: tenant` for that.
 fn lower_limits(config: &SimpleConfig) -> Result<Option<Value>, ConfigError> {
     let mut rules: Vec<Value> = Vec::with_capacity(config.limits.len());
 

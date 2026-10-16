@@ -170,6 +170,11 @@ the same budget and cannot be used to reset it, proven end to end by
 tenant gets a `429` once the shared budget the first key already spent is
 exhausted.
 
+A `limits:` entry with `key: header:authorization` does not get this
+protection. It counts each credential apart: with `auth:` configured, each
+virtual key gets its own bucket, so a tenant with two keys gets two buckets.
+Use `key: tenant` for a limit that all keys of a tenant share.
+
 `crates/proxy-config/src/lower.rs`'s `check_lane_h_filter_order` enforces the
 ordering this depends on: `llmproxy.auth` must run before
 `llmproxy.token_limit` in the filter chain, because decode-path callbacks run

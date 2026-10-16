@@ -325,17 +325,16 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
 
 ## What stays local, even with a shared store
 
-- **Concurrency / in-flight request limits (tier 4) are not part of this
-  feature, and ADR-0006 rules that they will stay per-replica even once
-  built.** They need lease/TTL semantics and a reaper — a crashed replica's
-  in-flight count has to be actively released, unlike a counter that simply
-  expires with its window — and ADR-0006 explicitly declines to extend the
-  tier-3 store to cover it (`internal-docs/adr/0006-shared-state-tiers.md`,
-  "Not decided here"). Today `concurrent_sessions` in the `limits:` dialect
-  block is not enforced at all yet, by any replica count — it is recorded
-  and produces a load-time warning (`schema/llmproxy-v0.schema.json`, the
-  `concurrent_sessions` field description). Enforcement is not built yet. When
-  it is, do not expect the shared store above to cover it.
+- **Concurrent stream limits (tier 4) stay per replica, and ADR-0006 rules
+  that they will.** They need lease/TTL semantics and a reaper — a crashed
+  replica's in-flight count has to be actively released, unlike a counter
+  that simply expires with its window. ADR-0006 declines to extend the tier-3
+  store to cover it (`internal-docs/adr/0006-shared-state-tiers.md`, "Not
+  decided here"). `concurrent_sessions` in the `limits:` dialect block is
+  enforced, and each replica admits against its own in-flight count. Two
+  replicas each admit the full value. The shared store does not change this
+  (`crates/proxy-filters/src/window_counter.rs`, "Concurrent streams: a local
+  gauge and a lease store").
 - **Usage history is export-only.** The shared store holds current-window
   spend counters and nothing else — never per-request history. That lives in
   access logs and the usage filter, and stays there by owner decision:

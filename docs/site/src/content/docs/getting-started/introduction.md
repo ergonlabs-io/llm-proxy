@@ -38,9 +38,9 @@ These LLM-specific behaviors are implemented and exercised by tests:
   `%LLM_INPUT_TOKENS%`, `%LLM_OUTPUT_TOKENS%`, `%LLM_CACHED_TOKENS%`,
   `%LLM_CACHE_CREATION_TOKENS%`, and `%LLM_TOTAL_TOKENS%`, plus TTFT and TPOT
   timing (`crates/proxy-observability/src/access_log.rs`).
-- **Token-based rate limiting.** A limit keyed on `header:authorization` (or
-  `tenant`, when `auth:` is configured) admits or refuses a request based on a
-  rolling token budget, with a 429 and `x-ratelimit-*` headers on refusal.
+- **Rate limiting.** A `limits` entry keyed on `global`, `client-ip`,
+  `tenant`, or `header:<name>` caps tokens, requests, or concurrent streams
+  in a one-minute window. A refusal is a 429 with `x-ratelimit-*` headers.
   A request already streaming is never truncated
   (`crates/proxy-filters/src/token_limit_filter.rs`).
 - **Provider failover.** A route's `fallbacks` list is tried in order when the

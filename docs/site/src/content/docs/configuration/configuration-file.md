@@ -39,7 +39,7 @@ applied before parsing.
 | `models` | object of `ModelDef`, keyed by name | no | `{}` | A client-facing model name mapped to an ordered list of providers. See "The `models` catalogue" below. The first provider is the primary. Later providers are fallbacks. The proxy also serves `GET /v1/models` from this table. |
 | `routes` | array of `Route` | yes | — | Ordered routing rules. The first rule whose `model` pattern matches wins; there is no specificity reordering. At least one route is required. |
 | `auto` | `AutoModel` object | no | none (`auto` is an ordinary model name) | Resolves the reserved model `auto` to a real model per tenant. Has `default` and `tenants`; set at least one. `tenants` needs an `auth` block. While set, a `models` key or `routes[].model` of `auto` is a load error. See [The auto model](../../providers-and-routing/auto-model/). |
-| `limits` | array of `Limit` | no | `[]` | Rate limits and quotas. See "What `limits` actually enforces" below — most combinations are recorded but not enforced. |
+| `limits` | array of `Limit` | no | `[]` | Rate limits and quotas. The proxy enforces every field and every key. See "What `limits` enforces" below. |
 | `observability` | `Observability` object | no | none (no access log, no OTLP export) | Access logging, OTLP metric export, and OTLP trace export. See "`observability` (`Observability`)" below. |
 | `pricing` | `Pricing` object | no | none (no request has a price) | The rate card. It prices each completed request in integer nanodollars, using all four token buckets. A `SIGHUP` reload installs a change, unless an `auth` store holds the rate card. See "`pricing` (`Pricing`)" below. |
 
@@ -332,47 +332,108 @@ An explicit value below 2 x `poll_interval_seconds` is a load error.
 
 ## `limits[]` (`Limit`)
 
+Each entry is one limit. The proxy enforces every field and every key. No
+load warning remains for a `limits` entry.
+
 | Field | Type | Required | Default | What it does |
 |---|---|---|---|---|
-| `key` | string matching `global`, `client-ip`, `tenant`, or `header:<name>` | yes | — | What the limit is counted against. See "What `limits` actually enforces" below. |
-| `tokens_per_minute` | `TokenAmount` | no | — | Total (input + output) tokens allowed per minute per bucket. |
-| `requests_per_minute` | `TokenAmount` | no | — | Requests allowed per minute per bucket. |
-| `concurrent_sessions` | integer, ≥1 | no | — | Maximum simultaneous long-lived sessions (WebSocket or active SSE streams) per bucket. |
-| `models` | array of `ModelPattern` | no | applies to all traffic | Restricts this limit to requests whose model matches one of these patterns. |
+| `key` | string matching `global`, `client-ip`, `tenant`, or `header:<name>` | yes | — | What the limit is counted against. See "Keys" below. |
+| `tokens_per_minute` | `TokenAmount` | no | — | Total (input + output) tokens allowed per minute per bucket. The proxy checks it at admission. It charges the actual usage when the stream ends. |
+| `requests_per_minute` | `TokenAmount` | no | — | Requests allowed per minute per bucket. The proxy counts a request at admission. |
+| `concurrent_sessions` | integer, ≥1 | no | — | Maximum streams in flight per bucket. A stream holds a slot until it ends. A value above 4294967295 is a load error at `limits[i].concurrent_sessions`. |
+| `models` | array of `ModelPattern` | no | applies to all traffic | Restricts this limit to requests whose model matches one of these patterns. A pattern is an exact name or has one trailing `*`. Any other pattern is a load error at `limits[i].models[j]`. |
 
-### What `limits` actually enforces
+### What `limits` enforces
 
-Only one combination is enforced today: `key: header:authorization` with
-`tokens_per_minute` set. That combination returns a 429 with `x-ratelimit-*`
-headers before the request reaches a provider; a request already admitted
-and in flight is never truncated, and streamed responses still contribute
-their usage to the budget. When `auth:` is configured, the bucket key
-automatically prefers the authenticated tenant instead of the raw header
-value, so `key: tenant` is the form to use alongside `auth:`.
+A limit that is over its value returns a 429 with `x-ratelimit-*` headers
+before the request reaches a provider. A request already admitted and in
+flight is never truncated. A streamed response still adds its usage to the
+budget.
 
-If a request's usage cannot be read from the provider's response — most
-commonly because the configured `dialect` does not match that provider's
-actual response shape — the request is still allowed and nothing is charged
-against the budget for it: the proxy fails open on a metering gap rather
-than refusing traffic. This is logged as a warning (at most once per budget
-key per minute, so a busy route does not flood the log) rather than
-happening silently, so it is visible to an operator even though it does not
-change the request's outcome.
+The proxy lowers each entry to one rule of the `llmproxy.token_limit` filter
+(`lower_limits` in `crates/proxy-simple-config/src/lower.rs`).
 
-Every other combination is accepted, recorded, and produces a
-load-time warning naming the exact field: `key: global`, `key:
-client-ip`, any other `header:<name>`, `requests_per_minute`,
-`concurrent_sessions`, and per-model scoping via `models`. A config using
-one of these still loads and serves traffic — it is not rejected — but the
-limit itself does nothing until a later schema version implements it.
+#### Keys
 
-Limits are enforced per proxy instance in this schema version. Two replicas
-each admit up to `tokens_per_minute`, so the fleet admits twice that.
+| `key` | Bucket |
+|---|---|
+| `global` | One bucket for all traffic. |
+| `client-ip` | One bucket for each TCP peer address. |
+| `tenant` | One bucket for each authenticated tenant. It needs an `auth:` block. Without one, the config does not load and the error names `limits[i].key`. |
+| `header:<name>` | One bucket for each distinct value of the header. The header name is not case-sensitive. |
 
-The shared `ControlPlaneStore` that llm-proxy has does not change this. That
-store reconciles currency *spend* for the Envoy-mode `llmproxy.spend_limit`
-filter. It holds no token-rate-limit counters, and this schema version cannot
-reach it.
+Two details of `client-ip`:
+
+- The dialect has no setting for trusted proxy hops. The proxy uses the TCP
+  peer address and never reads `x-forwarded-for`
+  (`client_address` in `crates/proxy-http/src/headers.rs`).
+- Behind a load balancer, every request has the address of the balancer. All
+  requests then share one bucket. Use `header:<name>` or `tenant` there.
+
+Two details of `header:<name>`:
+
+- The proxy hashes the header value. It never stores or logs the raw value.
+- A request without the header is not counted by that entry.
+
+`key: header:authorization` counts each credential apart. With `auth:`
+configured, the proxy removes the verified `authorization` header before the
+limiter runs, so the entry counts each virtual key apart. Older versions
+switched to the tenant in that case. Use `key: tenant` for a limit for each
+tenant.
+
+#### Combining entries
+
+Every entry that applies to a request must pass. The first entry that the
+request exceeds rejects it.
+
+Entries with the same key and the same `models` list share one counter. For
+each kind of limit, the lowest value applies. The proxy counts the request
+once.
+
+When `models` is set, the entry counts only requests whose model matches.
+The proxy decides this after it reads the request body. A request for another
+model, or with no model, is not counted and is not rejected by that entry.
+
+Example. This config limits all traffic to 1,000 requests a minute. It also
+limits each tenant to 100,000 tokens a minute and 5 streams at one time.
+
+```yaml
+limits:
+  - key: global
+    requests_per_minute: 1000
+  - key: tenant
+    tokens_per_minute: 100000
+    concurrent_sessions: 5
+```
+
+Proof: `every_rule_that_applies_must_pass`,
+`two_rules_on_one_bucket_count_once_against_the_lower_limit`, and
+`a_models_scoped_rule_counts_only_matching_models_once_the_body_names_one` in
+`crates/proxy-filters/src/token_limit_filter.rs`. The lowering is in
+`crates/proxy-simple-config/tests/dialect.rs`.
+
+#### Windows and replicas
+
+Token and request windows are one minute and aligned to the Unix epoch. See
+[Windows](../../limits-and-budgets/token-rate-limiting/#windows).
+
+Replicas share token and request counts only when `auth.store` is `shared`.
+Otherwise each replica counts alone, and two replicas each admit the full
+value. The proxy always counts concurrent sessions per process.
+
+#### Tenant and key limits from the admin API
+
+Limits that you set with `PUT /tenants/{id}/limits` and
+`PUT /keys/{id}/limits` are separate from `limits` entries. Both apply to a
+request. See `auth.enforce.limits` above.
+
+#### Missing usage
+
+If the proxy cannot read the usage of a response, it still allows the
+request and charges nothing. The usual cause is a `dialect` that does not
+match the shape of the provider response. The proxy fails open on a metering
+gap and logs a warning. It logs at most one warning for each budget key in
+one minute.
 
 ## `observability` (`Observability`)
 

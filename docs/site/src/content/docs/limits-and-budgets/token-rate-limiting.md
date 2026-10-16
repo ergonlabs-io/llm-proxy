@@ -13,16 +13,18 @@ related:
 
 # Token rate limiting
 
-A `limits:` entry in the configuration file can cap the tokens a caller may
-spend per minute. Only one combination is enforced today —
-`key: tenant` (which needs `auth:` configured) or `key: header:authorization`,
-with `tokens_per_minute` set. Every other `limits:` field is accepted,
-recorded, and produces a load-time warning rather than a rejection; see
-[Configuration file](../../configuration/configuration-file/)'s `limits[]`
-reference for the full field table, and
-[Virtual keys](../../authentication/virtual-keys/) for why the limiter buckets
-on the authenticated tenant rather than the caller's raw header once `auth:`
-is configured.
+A `limits:` entry in the configuration file caps the tokens, the requests,
+or the concurrent streams of a group of callers. The proxy enforces every
+`limits` field and every key: `global`, `client-ip`, `tenant`, and
+`header:<name>`. No load warning remains for them. See the `limits[]`
+reference in [Configuration file](../../configuration/configuration-file/#limits-limit)
+for the field table, the keys, and how entries combine.
+
+`key: header:authorization` counts each credential apart. With `auth:`
+configured, the proxy removes the verified `authorization` header, so the
+entry counts each virtual key apart (two keys of one tenant get two
+buckets). Use `key: tenant` for a limit for each tenant. See [Virtual keys](../../authentication/virtual-keys/) for why the
+tenant is the safer key.
 
 ## Windows
 
@@ -44,7 +46,7 @@ and logs a warning when the counters stay unreconciled past their bound. The
 gauge `envoy_llmproxy_counter_reconciliation_age_seconds` on
 `/stats/prometheus` shows how long ago the counters last reconciled, with
 `seam="rate_window"` for token and request counts and
-`seam="stream_lease"` for concurrent streams. A `limits` rule on a listener
+`seam="stream_lease"` for concurrent streams. A `limits` entry on a listener
 with no `auth:` counts per process.
 
 This page also covers the read side: `GET /v1/usage`, an endpoint the proxy
@@ -56,8 +58,9 @@ operator reading logs on its behalf.
 The proxy intercepts `GET /v1/usage` before any budget check and answers it
 directly — it is never forwarded to a provider
 (`crates/proxy-filters/src/token_limit_filter.rs`'s `decode_headers`, the
-`USAGE_PATH` branch). It reports the current-window standing of every route
-the caller's tenant has a budget on.
+`USAGE_PATH` branch). It reports the current-window standing of the one
+per-route rule of a bootstrap (Envoy-mode) `TokenLimit`. It does not report
+`limits` entries of the `llmproxy` dialect. See "What the endpoint reports".
 
 ### The key authenticates and scopes
 
@@ -77,7 +80,7 @@ numbers
 (`no_query_parameter_header_or_path_segment_can_read_a_different_tenants_usage`
 in `crates/proxy-filters/src/token_limit_filter.rs`).
 
-### Requires both `auth:` and an enforced `limits:` entry
+### Requires `auth:` and the token limiter
 
 Two things must be true for this endpoint to return real data:
 
@@ -87,18 +90,33 @@ Two things must be true for this endpoint to return real data:
    `auth:` block" true by construction, not by a separate check
    (`crates/proxy-filters/src/token_limit_filter.rs`'s module doc, and
    `with_no_auth_filter_in_the_chain_the_usage_endpoint_never_returns_200`).
-2. **A `limits:` entry must actually produce the token limiter.** The
-   endpoint is implemented inside the `llmproxy.token_limit` filter itself,
-   so a listener with `auth:` but no enforced `limits:` entry (see
-   [Configuration file](../../configuration/configuration-file/)) never loads
-   that filter at all — `GET /v1/usage` is then an ordinary, unmatched
-   request like any other, not a 401
-   (`crates/proxy-simple-config/src/lower.rs`'s `lower_limits`, which emits
-   at most one `llmproxy.token_limit` filter per listener, only for
-   `key: tenant` or `key: header:authorization` with `tokens_per_minute`
-   set).
+2. **The token limiter must be in the filter chain.** The endpoint is
+   part of the `llmproxy.token_limit` filter. The dialect adds that filter
+   when the config has a `limits` entry. It also adds it when `auth:` is set
+   and `auth.enforce.limits` is `true`. With neither, `GET /v1/usage` is an
+   ordinary request, not a 401
+   (`lower_limits` and `enforces_tenant_limits` in
+   `crates/proxy-simple-config/src/lower.rs`).
+
+### What the endpoint reports
+
+The endpoint reads only the per-route rule of a bootstrap `TokenLimit`: the
+rule set with `max_tokens` and `fill_rate`. A `limits` entry of the dialect
+is not that rule. It lowers to a keyed rule with a bucket that does not
+depend on the route. The endpoint does not read those buckets. Tenant and
+key limits from the admin API do not appear in it either.
+
+With the dialect, `routes` is therefore always `[]`, also when `limits`
+entries are enforced and have used budget. Use the 429 headers or the access
+log to see that usage. The proxy returns `routes` rows only for a bootstrap
+that sets `max_tokens` and `fill_rate`
+(`handle_usage_request` in `crates/proxy-filters/src/token_limit_filter.rs`:
+with no static rule it sends `render_usage_response(&tenant, &[])`).
 
 ### Example
+
+The dialect config below enforces a tenant limit. The endpoint still answers
+with an empty `routes` list.
 
 ```yaml
 version: 0
@@ -125,9 +143,16 @@ curl -s http://127.0.0.1:8080/v1/usage \
   -H "Authorization: Bearer llmp_<the key>"
 ```
 
-A tenant `acme` that has spent 2,200 of its 100,000-token-per-minute budget
-on a route named `chat`, 43 seconds into the current window, gets this body
-(`content-type: application/json`, status `200`):
+The caller gets status `200`, `content-type: application/json`, and this
+body:
+
+```json
+{"routes":[],"tenant":"acme","window":"fixed"}
+```
+
+With the bootstrap in "Bootstrap configuration" below, a tenant `acme` that
+has spent 2,200 of its 100,000 tokens on a route named `chat`, 43 seconds
+into the current window, gets this body:
 
 ```json
 {"routes":[{"limit":100000.0,"remaining":97800.0,"reset_after_seconds":43,"route":"chat","used":2200.0}],"tenant":"acme","window":"fixed"}
@@ -146,7 +171,7 @@ Do not parse this response positionally; parse it as JSON.
 |---|---|---|
 | `tenant` | string | The authenticated caller's tenant, exactly as configured in `auth.keys[].tenant`. |
 | `window` | string, always `"fixed"` | The limiter's windowing algorithm. Only a fixed window exists today, so this never varies. |
-| `routes` | array of objects | One entry per route this tenant has a current-window budget on. Empty (`[]`) if the tenant has never been bucketed against any route — a true answer, not an error. |
+| `routes` | array of objects | One entry per route this tenant has a current-window budget on, for the per-route rule of a bootstrap `TokenLimit`. Always empty (`[]`) with `limits` entries of the dialect. Also empty if the tenant has never been bucketed against any route — a true answer, not an error. |
 | `routes[].route` | string | The route name the budget is bucketed under. |
 | `routes[].used` | number | Weighted tokens consumed in the current window. |
 | `routes[].limit` | number | The configured `tokens_per_minute` cap for this window. |
