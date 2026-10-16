@@ -4,8 +4,9 @@ summary: Field-by-field reference for the llm-proxy configuration file
   (--config), derived from schema/llmproxy-v0.schema.json, the normative
   source. Covers what each field does, its default, and whether it is
   enforced yet.
-last_updated: 2026-10-13
+last_updated: 2026-10-15
 related:
+  - ../reference/
   - ../getting-started/introduction/
   - ../getting-started/quickstart/
 ---
@@ -15,6 +16,11 @@ related:
 This page documents `schema/llmproxy-v0.schema.json` — the normative schema
 for the file passed with `--config`. If this page and the schema disagree,
 the schema is right; report the difference.
+
+This page explains the fields and gives examples. The complete list of every
+field, type, default and rule is the
+[Configuration field reference](../reference/). That page is generated from
+the schema, so it always matches it.
 
 ## Strict parsing
 
@@ -53,7 +59,7 @@ JSON error body listing known models.
 | `type` | enum: `openai`, `anthropic`, `openai-compatible`, `openrouter`, `azure-openai`, `vertex`, `bedrock` | no | `openai-compatible`, unless the provider's name is `openai`, `anthropic`, or `openrouter` | The wire shape. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. `openrouter` sends OpenAI-shaped requests and rewrites the `/v1` path prefix to `/api/v1`. `azure-openai`, `vertex`, and `bedrock` need the extra fields in "Provider-specific fields" below. |
 | `base_url` | string (URI) | only if the name/type does not imply one | `https://api.openai.com` for `openai`, `https://api.anthropic.com` for `anthropic`, `https://openrouter.ai` for `openrouter`. No default for `openai-compatible`, `azure-openai`, `vertex`, or `bedrock`. | The API base URL. Host and port only — a path prefix (e.g. `/openai` for Groq) is a load error in this schema version, not a silent truncation. |
 | `api_key` | string | no (mutually exclusive with `api_key_file`) | none | The API key. The proxy sends it as `Authorization: Bearer` for OpenAI-shaped APIs, `x-api-key` for Anthropic, and `api-key` for `azure-openai`. Omit both `api_key` and `api_key_file` for an unauthenticated local backend. A `vertex` or `bedrock` provider rejects both fields: use its own credential fields. |
-| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup — despite the schema's own field description, this is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](../../operations/config-reload/). |
+| `api_key_file` | string (path) | no (mutually exclusive with `api_key`) | none | Read the API key from a file, trimmed of trailing whitespace. Read once at startup; it is **not** watched or hot-reloaded automatically; the lowering step emits a load-time warning on `providers.<name>.api_key_file` saying so. A `SIGHUP` config reload does re-read it, since a reload re-parses the whole config file from scratch — see [Config reload](../../operations/config-reload/). |
 | `extra_headers` | object of string | no | `{}` | Extra headers sent on every request to this provider. An Anthropic provider also gets a default `anthropic-version` header; setting it here overrides that default. |
 | `ca_file` | string (path) | no | system roots | PEM CA bundle for verifying this provider's TLS certificate. Only needed for a self-hosted backend with a private CA. |
 | `connect_timeout` | `Duration` | no | `5s` | TCP/TLS connection establishment timeout for this provider. |
@@ -169,7 +175,7 @@ catalogue. Proof: `openrouter_example_builds_cluster_owned_auth_and_path_rewrite
 | Field | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `model` | `ModelPattern` (glob) | yes | — | Matched against the request's `model` body field (or the `model` query parameter for realtime WebSocket endpoints). `*` matches any run of characters and matching is case-sensitive. |
-| `provider` | `ProviderModelRef` | yes | — | Where a matching request goes: `provider-name`, or `provider-name/model-name` to rewrite the model name before forwarding. |
+| `provider` | `ProviderModelRef` | yes | — | Where a matching request goes: `provider-name`, or `provider-name/model-name`. On a route, the model part is not applied yet; see below. |
 | `fallbacks` | array of `ProviderModelRef` | no | `[]` | Providers tried in order when the primary fails: a connection failure, a 429, or a 5xx received before any response byte — never after the client has started receiving a stream. Every provider in the chain must speak the same wire dialect as the primary; a cross-dialect entry is a load error naming the route and fallback index. |
 | `retries.attempts` | integer, 0–5 | no | `1` | Extra attempts against the *same* provider before moving to `fallbacks`. `0` disables same-provider retries. |
 | `idle_timeout` | `Duration` | no | `90s` | Maximum time with no bytes flowing (between chunks, SSE events, or WebSocket frames). There is deliberately no total-duration timeout — LLM generations are long-lived, so an idle-based guard is used instead. |
@@ -463,8 +469,7 @@ that starts at `node.metadata["io.llmproxy.metrics"]`, not at
 is `must be less than `export_interval` (<n>s), got <n>s -- otherwise every
 export is abandoned as a timeout before the next one is due`.
 
-Tracing exports spans. This differs from the schema's description of
-`observability.tracing`, which says "nothing exports a span yet". The proxy
+Tracing exports spans. The proxy
 starts an OTLP trace exporter when `tracing` is set and logs `OTLP trace
 export enabled`. When a request carries a valid `traceparent` header, the
 proxy joins that trace as a child span and keeps the sampled decision of the
@@ -698,12 +703,6 @@ timeout is always `90s`. Proof: `lower_model` in
 `models_multiple_providers_lower_to_ordered_fallback` in
 `crates/proxy-simple-config/tests/dialect.rs`.
 
-> **Schema conflict.** The schema descriptions of `models` and
-> `models.<name>.providers` say that only `providers[0]` serves traffic and
-> that later entries produce a load-time warning. The code does not do this:
-> `lower_model` builds the fallback chain, and the test above asserts that
-> lowering produces no warnings. This page follows the code.
-
 Use the object form (`ModelProvider`) only when you need to set `dialect`
 explicitly — the shorthand string form cannot carry it:
 
@@ -813,7 +812,7 @@ operation name `embeddings`. Proof:
 | `Duration` | integer + unit: `ms`, `s`, `m`, `h` | `500ms`, `30s`, `5m`, `1h` |
 | `TokenAmount` | integer, or a string with a `k` (thousand) or `m` (million) suffix | `8000`, `"100k"`, `"2m"` |
 | `ModelPattern` | a glob matched against the request's model name; `*` matches any run of characters | `gpt-5*`, `claude-*`, `*` |
-| `ProviderModelRef` | `provider-name`, or `provider-name/model-name` to rewrite the model | `openai`, `anthropic/claude-sonnet-5` |
+| `ProviderModelRef` | `provider-name`, or `provider-name/model-name` (the model part applies in a `models` entry, not yet on a route) | `openai`, `anthropic/claude-sonnet-5` |
 
 ## `listen` as an object (`Listener`)
 
@@ -887,23 +886,3 @@ time (`update_certificates` in `crates/proxy-core/src/tls/`), but only when an
 xDS secret (SDS) delivers the new certificate
 (`crates/proxy-core/src/tls/secret_registry.rs`). The `--config` format has no
 SDS field. See [TLS](../../operations/tls/).
-
-## Schema and code differences
-
-The schema and the code disagree in these places. This page follows the code,
-and the list is a request to correct the schema descriptions.
-
-- `observability.tracing` says "nothing exports a span yet". The proxy exports
-  spans. See [`observability`](#observability-observability).
-- The top-level `observability` description says two instruments are "defined
-  but NOT yet recorded". For the current list of instruments, see
-  [Metrics and /stats](../../observability/metrics-and-stats/) and
-  [Admin endpoints](../../observability/admin-endpoints/). Both endpoints are
-  read-only and take no configuration beyond the `admin` bind address.
-- `models` and `models.<name>.providers` say that only `providers[0]` serves
-  traffic. See "The `models` catalogue".
-- `ModelProvider.model` says the upstream model ID is not substituted. See
-  "The `models` catalogue".
-- `Provider.protocol` says `http2` keeps one connection per worker. The code
-  keeps up to 4 per address. See
-  [Providers and clusters](../../providers-and-routing/providers-and-clusters/).

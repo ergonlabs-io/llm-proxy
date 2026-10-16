@@ -182,7 +182,7 @@ lint: ## Clippy with warnings denied (what CI enforces)
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: ci
-ci: ## Everything CI runs: format check, lint, citations, tests, doctests, dep audit, black-box QA
+ci: ## Everything CI runs: format check, lint, citations, tests (incl. schema gate), doctests, dep audit, config reference, black-box QA
 	cargo fmt --all --check
 	@$(MAKE) version-check
 	@$(MAKE) citations-check
@@ -190,6 +190,7 @@ ci: ## Everything CI runs: format check, lint, citations, tests, doctests, dep a
 	cargo nextest run --workspace
 	@$(MAKE) tq-doc
 	@$(MAKE) deps-check
+	@$(MAKE) config-reference-check
 	@$(MAKE) qa
 
 .PHONY: clean
@@ -347,6 +348,23 @@ boards: ## Render the build board + release tracker from internal-docs/boards/*.
 .PHONY: boards-check
 boards-check: ## Fail if the rendered HTML has drifted from the YAML
 	python3 scripts/render-boards.py --check
+
+# ------------------------------------------------------------ dialect schema --
+# schema/llmproxy-v0.schema.json is normative for the --config dialect
+# (AGENTS.md "Architecture Invariants", 5). The gate tests run in every
+# `cargo nextest run --workspace`; schema-check runs only them.
+
+.PHONY: schema-check
+schema-check: ## Validate every example dialect config against the schema; check schema/parser field agreement
+	cargo nextest run -p proxy-simple-config --test schema_gate --test schema_parser_agreement
+
+.PHONY: config-reference
+config-reference: ## Regenerate the docs-site configuration field reference from the schema
+	python3 scripts/gen-config-reference.py
+
+.PHONY: config-reference-check
+config-reference-check: ## Fail if the committed configuration field reference is stale
+	python3 scripts/gen-config-reference.py --check
 
 # --------------------------------------------------------------- docs site --
 # The Astro + Starlight site at docs/site/. `npm install` is not run by these

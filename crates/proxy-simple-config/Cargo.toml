@@ -38,6 +38,9 @@ tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"
 # HMAC-SHA256 digest `auth_filter::parse_config` verifies against, so its
 # fixtures exercise the real filter rather than a value nobody checked.
 ring = { workspace = true }
+# Test-only: `tests/schema_gate.rs` validates every dialect example against
+# the normative schema (AGENTS.md invariant 5).
+jsonschema = { workspace = true }
 
 [lints]
 workspace = true

@@ -51,6 +51,7 @@ export default defineConfig({
 					label: 'Configuration',
 					items: [
 						{ label: 'Configuration file', slug: 'configuration/configuration-file' },
+						{ label: 'Field reference', slug: 'configuration/reference' },
 						// { label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
 					],
 				},

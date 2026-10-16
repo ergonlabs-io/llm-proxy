@@ -34,6 +34,12 @@ listen:
   tls:
     cert_file: /etc/llmproxy/tls.crt
     key_file: /etc/llmproxy/tls.key
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+routes:
+  - model: "*"
+    provider: openai
 ```
 
 `tls.cert_file` is the PEM certificate chain. `tls.key_file` is the PEM

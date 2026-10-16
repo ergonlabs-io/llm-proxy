@@ -1848,6 +1848,11 @@ pub(crate) enum ModelKeyShape {
 /// is not: see the module doc on why `models:` keys are deliberately a
 /// smaller grammar.
 pub(crate) fn classify_model_key(name: &str) -> Result<ModelKeyShape, String> {
+    // The schema's key pattern needs at least one character; an empty key
+    // would otherwise lower to an exact route for an empty model name.
+    if name.is_empty() {
+        return Err("a model name must not be empty".to_string());
+    }
     match name.find('*') {
         None => Ok(ModelKeyShape::Exact),
         // The FIRST `*` sits at the last byte -- the only way that can be

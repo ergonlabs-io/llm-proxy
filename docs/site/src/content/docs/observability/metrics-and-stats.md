@@ -351,10 +351,6 @@ creates a new root span (test
 `crates/proxy-http/src/access_logging.rs:796-835` and
 `crates/proxy-http/src/router.rs:992`).
 
-The description of `observability.tracing` in the schema says that nothing
-exports a span yet. The code and the tests show that it does. Treat that
-schema text as out of date.
-
 ### If the collector fails
 
 A hung or unreachable collector costs one bounded timeout for each attempt, and

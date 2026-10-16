@@ -43,7 +43,7 @@
       }
     },
     "models": {
-      "description": "Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. Today this is naming and data model only: only `providers[0]` is ever used to serve traffic, and every provider entry after the first produces a load-time warning naming its exact path instead of being silently accepted -- picking among them (fallback / weighted split / cost-aware) is not supported yet.",
+      "description": "Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. The providers are tried in order: `providers[0]` serves the request, and each later entry is a fallback with the same retry rules as `routes[].fallbacks`. Weighted or cost-aware selection among them is not supported.",
       "default": {},
       "type": "object",
       "patternProperties": {
@@ -73,7 +73,7 @@
       "items": { "$ref": "#/$defs/Limit" }
     },
     "observability": {
-      "description": "Metrics and access logging. Access logging is fully implemented, including token counts and TTFT/TPOT. Metrics are recorded and served on the admin endpoint at `/stats` and `/stats/prometheus`: per-cluster upstream request counts and an upstream request-time histogram. Two instruments are defined but NOT yet recorded and so never appear -- downstream connection counts, and GenAI token usage -- so do not build alerting on those two.",
+      "description": "Access logging, OTLP metric export, and OTLP trace export. Access log lines include token counts and TTFT/TPOT. Metrics are always served on the admin endpoint at `/stats` and `/stats/prometheus`, with no configuration here; `metrics` adds OTLP export of the same instruments.",
       "$ref": "#/$defs/Observability"
     },
     "pricing": {
@@ -134,7 +134,7 @@
     },
     "ProviderModelRef": {
       "type": "string",
-      "description": "A provider reference: `provider-name` (keep the request's model name) or `provider-name/model-name` (rewrite the model before forwarding, e.g. fall back from `gpt-5` to `anthropic/claude-sonnet-5`).",
+      "description": "A provider reference: `provider-name`, or `provider-name/model-name`. In a `models.<name>.providers` entry the model part is applied, like `ModelProvider.model`. In `routes[].provider` and `routes[].fallbacks` it is accepted but not applied yet: the request's original model name is forwarded, and the load emits a warning naming the field.",
       "pattern": "^[a-z0-9][a-z0-9-]*(/[^\\s]+)?$",
       "examples": ["openai", "anthropic/claude-sonnet-5", "local-vllm/llama-3.3-70b"]
     },
@@ -453,7 +453,7 @@
           "default": "5s"
         },
         "protocol": {
-          "description": "Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse: the proxy keeps one multiplexed connection per worker to this provider instead of connecting fresh on every request. Most hosted providers (OpenAI, Anthropic, and most OpenAI-compatible APIs) support it; many local/self-hosted plaintext servers do not. Defaults to `http1`.",
+          "description": "Upstream HTTP protocol for this provider's cluster. `http2` enables upstream connection reuse: each worker keeps up to 4 multiplexed connections to each address of this provider, dialling another when every open one carries 100 streams, instead of connecting fresh on every request. Most hosted providers (OpenAI, Anthropic, and most OpenAI-compatible APIs) support it; many local/self-hosted plaintext servers do not. Defaults to `http1`.",
           "enum": ["http1", "http2"],
           "default": "http1"
         },
@@ -636,7 +636,7 @@
         "providers": {
           "type": "array",
           "minItems": 1,
-          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. Only `providers[0]` is used to serve traffic today -- every later entry is validated at load time (a bad one still fails to load) but produces a load-time warning naming its exact path instead of being selected; choosing among them is not supported yet.",
+          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. `providers[0]` serves the request; each later entry is a fallback, tried in order on a connection failure or a 429, 500, 502 or 503 response, never after the first response byte of a stream. Every entry must speak the same dialect as `providers[0]`; a mismatch is a load error.",
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/ProviderModelRef" },
@@ -667,7 +667,7 @@
         },
         "model": {
           "type": "string",
-          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). Recorded; substituting it into the request body needs a request-body rewriter, which is not supported yet, so this produces a load-time warning until then and the client's original model name is forwarded as-is.",
+          "description": "Upstream model ID at this provider, if different from the model's own catalogue name (e.g. Anthropic's dated model IDs, or a Vertex publisher-model path). The proxy writes it into the request body's `model` field for the provider that serves the attempt (and into the path for `vertex` and `bedrock`); after a fallback, the next provider gets its own value.",
           "examples": ["claude-sonnet-4-5-20250929", "moonshotai/Kimi-K2-Instruct"]
         },
         "dialect": {
@@ -685,10 +685,10 @@
         "model": { "$ref": "#/$defs/ModelPattern" },
         "provider": {
           "$ref": "#/$defs/ProviderModelRef",
-          "description": "Where matching requests go. `provider/model` form rewrites the model name before forwarding."
+          "description": "Where matching requests go. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`."
         },
         "fallbacks": {
-          "description": "Tried in order when the primary provider fails (connection failure, 429, or 5xx — and never after the first response byte of a stream has been sent to the client). Each fallback gets a fresh attempt with the same request body, model-rewritten if the `provider/model` form is used.",
+          "description": "Tried in order when the primary provider fails (connection failure, or a 429, 500, 502 or 503 response — and never after the first response byte of a stream has been sent to the client). Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
           "type": "array",
           "items": { "$ref": "#/$defs/ProviderModelRef" }
         },
@@ -808,7 +808,7 @@
         },
         "tracing": {
           "type": "object",
-          "description": "OTLP trace export: config surface only -- nothing exports a span yet. Omit entirely to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
+          "description": "OTLP trace export. With this block set, the proxy exports spans to `otlp_endpoint`; omit it to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
           "additionalProperties": false,
           "required": ["otlp_endpoint"],
           "properties": {
@@ -843,8 +843,8 @@
       "additionalProperties": false,
       "properties": {
         "catalog": { "type": "object", "description": "Public source pricing metadata exposed by the admin pricing inventory; never used as token rates." },
-        "price_list_file": { "type": "string" },
-        "price_list": { "$ref": "#/$defs/PriceList" }
+        "price_list_file": { "type": "string", "description": "A file holding one price list, in YAML or JSON, with the same fields as `price_list`. Read at startup and on each reload; a file the proxy cannot read is a load error naming it." },
+        "price_list": { "$ref": "#/$defs/PriceList", "description": "The price list, written inline." }
       },
       "oneOf": [
         { "required": ["price_list_file"], "not": { "required": ["price_list"] } },
@@ -857,8 +857,8 @@
       "required": ["effective_from", "entries"],
       "properties": {
         "version": { "type": "string", "description": "Human label; recorded version includes a content hash." },
-        "effective_from": { "type": "string", "format": "date-time" },
-        "entries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PriceEntry" } }
+        "effective_from": { "type": "string", "format": "date-time", "description": "An RFC 3339 date for the list, shown in `GET /pricing`. A list applies from the moment the proxy installs it, not from this date; a date in the future is an error." },
+        "entries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PriceEntry" }, "description": "The prices. Each pair of `provider_type` and `model` may appear once; a duplicate pair is a load error." }
       }
     },
     "PriceEntry": {
@@ -868,10 +868,10 @@
       "properties": {
         "cached_input_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cached input remain unpriced." },
         "cache_write_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cache creation remain unpriced." },
-        "provider_type": { "type": "string", "minLength": 1 },
-        "model": { "type": "string", "minLength": 1 },
-        "tier_mode": { "enum": ["whole_request", "graduated"] },
-        "tiers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PricingTier" } }
+        "provider_type": { "type": "string", "minLength": 1, "description": "The provider type the price applies to, for example `openai` or `anthropic`. Matches the `type` of the provider that served the request, set or inferred from its name." },
+        "model": { "type": "string", "minLength": 1, "description": "The model name, matched exactly and case-sensitively against the selected model: the upstream model name for the provider that served the request, or the requested model when no mapping applies." },
+        "tier_mode": { "enum": ["whole_request", "graduated"], "description": "How `tiers` price a request. `whole_request`: the band selected by the input context size prices every token of the request. `graduated`: each context token costs the rate of the band that holds its position, and output tokens cost the rate of the band the whole context selects. No default, because the two modes give different prices." },
+        "tiers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PricingTier" }, "description": "The price bands, in increasing `up_to` order; exactly one band, the last, leaves `up_to` out." }
       }
     },
     "PricingTier": {
@@ -879,11 +879,11 @@
       "additionalProperties": false,
       "required": ["input_nanodollars_per_token", "cached_input_nanodollars_per_token", "cache_write_nanodollars_per_token", "output_nanodollars_per_token"],
       "properties": {
-        "up_to": { "type": "integer", "minimum": 0 },
-        "input_nanodollars_per_token": { "type": "integer", "minimum": 0 },
-        "cached_input_nanodollars_per_token": { "type": "integer", "minimum": 0 },
-        "cache_write_nanodollars_per_token": { "type": "integer", "minimum": 0 },
-        "output_nanodollars_per_token": { "type": "integer", "minimum": 0 }
+        "up_to": { "type": "integer", "minimum": 0, "description": "The largest input context size, in tokens (input plus cache-read plus cache-write), that this band covers, inclusive. Leave it out on the last band." },
+        "input_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one input token, in nanodollars (2.50 USD per million tokens is `2500`)." },
+        "cached_input_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one cache-read token, in nanodollars." },
+        "cache_write_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one cache-write token, in nanodollars." },
+        "output_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one output token, in nanodollars." }
       }
     }
   }

@@ -134,9 +134,12 @@ checked against a subject-alternative-name match on its hostname, verified
 against `ca_file` if set or the platform trust store otherwise
 (`crates/proxy-simple-config/src/lower.rs`'s `lower_provider`). `ca_file` on a
 plaintext (`http://`) provider is ignored and produces a load-time warning.
-`protocol: http2` (default `http1`) reuses one multiplexed connection per
-worker to that provider instead of connecting fresh on every request; most
-hosted providers support it, many local plaintext servers do not.
+`protocol: http2` (default `http1`) reuses multiplexed connections instead of
+connecting fresh on every request: each worker keeps up to 4 connections to
+each address of that provider, and dials another when every open one carries
+100 streams (`MAX_CONNECTIONS_PER_KEY` and `SOFT_STREAMS_PER_CONNECTION` in
+`crates/proxy-http/src/upstream_pool.rs`). Most hosted providers support it;
+many local plaintext servers do not.
 
 `http1` reuses connections too, automatically, with no field to configure it.
 Each worker keeps up to 8 idle keep-alive connections per (cluster, address);
