@@ -396,7 +396,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "controlplane"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "corpus"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "proxy-config",
@@ -516,7 +516,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "diffrig"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1262,7 +1262,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "loadgen"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "mockupstream"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "base64",
  "clap",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-admin"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "http-body-util",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-api"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-reflect",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-capture-agent"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "clap",
  "proxy-capture-protocol",
@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-capture-protocol"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-capture-spool"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "redb",
  "ring",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-cluster"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -1995,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-config"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "http",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2051,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-filters"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -2088,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-http"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-observability"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-simple-config"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-xds"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "controlplane",
  "futures",

@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-16
+
 ### Breaking
 
 - `auth.store: shared` now requires a node id. In the dialect, pass
@@ -96,6 +98,17 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - `client-ip` counts the TCP peer address. `x-forwarded-for` is read only on a non-edge
   connection manager with `xff_num_trusted_hops`, so a client cannot pick its own bucket
   by writing the header.
+
+### Fixed
+
+- The key that `llm-proxy init` and `scripts/install.sh` print now works at once. The
+  starter config sets `auth.enforce.tenants_without_policy: allow`, and the proxy warns
+  about it at startup. Before, the `default` tenant had no model policy, so the printed
+  key got `403 forbidden` until an operator stored one with `PUT /tenants/{id}/policy`.
+  An existing config is not changed. The quickstart now shows the OpenAI path from
+  `init`.
+- The warning logged when a tenant without a model policy is refused no longer contains
+  runs of spaces.
 
 ### Known limitations
 
