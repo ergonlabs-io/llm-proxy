@@ -655,7 +655,15 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "cached_per_million",
             "cache_creation_per_million",
         ],
-        "llmproxy.filters.v0.TokenLimit" => &["max_tokens", "fill_rate"],
+        "llmproxy.filters.v0.TokenLimit" => &["max_tokens", "fill_rate", "rules"],
+        "llmproxy.filters.v0.LimitRule" => &[
+            "key",
+            "header",
+            "tokens_per_minute",
+            "requests_per_minute",
+            "concurrent_streams",
+            "models",
+        ],
         // One-release compatibility for the old borrowed token-limit type.
         // RateLimitSettings has unrelated xDS fields; accepting any of them
         // would claim the limiter honors a knob it never reads.

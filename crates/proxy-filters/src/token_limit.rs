@@ -85,6 +85,10 @@ pub enum LimitSubject {
     /// A key's control-plane limit (`PUT /keys/{id}/limits`). Enforced in
     /// addition to its tenant's bucket, so a key only narrows.
     KeyPolicy(String),
+    /// A keyed rule from `TokenLimit.rules`, route-independent. The string is
+    /// the rule's canonical subject (key kind, key value, model scope);
+    /// header values in it are already hashed.
+    Rule(String),
 }
 
 impl LimitKey {
@@ -128,6 +132,15 @@ impl LimitKey {
         }
     }
 
+    /// The bucket for a keyed rule's canonical `subject`; see
+    /// [`LimitSubject::Rule`]. The caller hashes any secret-shaped part.
+    pub(crate) fn for_rule(subject: String) -> Self {
+        LimitKey {
+            route: String::new(),
+            subject: LimitSubject::Rule(subject),
+        }
+    }
+
     /// The route name this key was bucketed under.
     pub fn route(&self) -> &str {
         &self.route
@@ -163,6 +176,7 @@ impl std::fmt::Display for LimitKey {
             // Key ids, like tenant ids, are operator-chosen identifiers.
             LimitSubject::TenantPolicy(tenant) => write!(f, "tenant-policy={tenant}"),
             LimitSubject::KeyPolicy(key_id) => write!(f, "key-policy={key_id}"),
+            LimitSubject::Rule(subject) => write!(f, "rule={subject}"),
         }
     }
 }

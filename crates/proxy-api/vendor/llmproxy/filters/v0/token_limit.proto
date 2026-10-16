@@ -31,4 +31,42 @@ message TokenLimit {
   // `optional` distinguishes an omitted value from an explicit zero, letting
   // validation report the right field for each invalid configuration.
   optional double fill_rate = 2;
+
+  // Keyed limits, each enforced in addition to the rule above and to tenant
+  // and key limits from the control plane. A request must pass every rule
+  // that applies to it. Windows are one minute, aligned to the Unix epoch.
+  repeated LimitRule rules = 3;
+}
+
+// One keyed limit. At least one of tokens_per_minute, requests_per_minute and
+// concurrent_streams must be set.
+message LimitRule {
+  // Who the limit is counted against.
+  enum Key {
+    KEY_UNSPECIFIED = 0;
+    // One bucket for all traffic through the filter.
+    GLOBAL = 1;
+    // One bucket per client address: the TCP peer, or the address the
+    // HCM's trusted x-forwarded-for hops vouch for.
+    CLIENT_IP = 2;
+    // One bucket per authenticated tenant; requires llmproxy.auth earlier in
+    // the chain.
+    TENANT = 3;
+    // One bucket per distinct value of `header` (hashed, never stored raw).
+    // A request without the header is not counted by this rule.
+    HEADER = 4;
+  }
+  Key key = 1;
+  // The request header to bucket on; set exactly when key is HEADER.
+  string header = 2;
+  // Total tokens per minute, checked at admission and charged at stream end.
+  optional uint64 tokens_per_minute = 3;
+  // Requests per minute, counted at admission.
+  optional uint64 requests_per_minute = 4;
+  // Streams in flight at once; a slot is held until the stream ends.
+  optional uint32 concurrent_streams = 5;
+  // Restrict the rule to requests whose model matches one of these patterns
+  // (an exact name or a single trailing `*`). Empty applies to every request.
+  // A scoped rule is checked once the request body has named the model.
+  repeated string models = 6;
 }

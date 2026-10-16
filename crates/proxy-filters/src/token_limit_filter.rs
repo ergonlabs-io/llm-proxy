@@ -206,7 +206,7 @@ use proxy_config::ConfigError;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders,
-    ResponseHeaders, ResponseTrailers,
+    RequestTrailers, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::LlmTokenUsage;
 use proxy_observability::ResponseFlag;
@@ -219,7 +219,10 @@ use crate::control::{
     ControlPlane, ControlPlaneSnapshot, ControlPlaneStore, InMemoryControlPlaneStore, LimitPolicy,
     WindowDimension, WindowKey,
 };
-use crate::token_limit::{LimitDecision, LimitKey, LimitOn, LimitRule, StreamLease, TenantUsage};
+use crate::model_authz::ModelPattern;
+use crate::token_limit::{
+    CredentialDigest, LimitDecision, LimitKey, LimitOn, LimitRule, StreamLease, TenantUsage,
+};
 use crate::usage::TokenUsage;
 use crate::window_counter::{
     unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, WindowAccumulator,
@@ -336,6 +339,166 @@ fn parse_config(config: &DynamicMessage) -> Result<Option<LimitRule>, ConfigErro
     .map(Some)
 }
 
+/// Who a keyed rule counts against; mirrors `LimitRule.Key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuleKey {
+    Global,
+    ClientIp,
+    Tenant,
+    Header(http::HeaderName),
+}
+
+/// One `TokenLimit.rules` entry, validated.
+#[derive(Debug, Clone)]
+struct KeyedRule {
+    key: RuleKey,
+    limits: LimitPolicy,
+    models: Vec<ModelPattern>,
+    /// `|models=...` with the patterns sorted, or empty when unscoped. Part
+    /// of the bucket subject, so a scoped rule counts only matching requests.
+    scope: String,
+}
+
+/// `LimitRule.Key` enum numbers.
+const RULE_KEY_GLOBAL: i32 = 1;
+const RULE_KEY_CLIENT_IP: i32 = 2;
+const RULE_KEY_TENANT: i32 = 3;
+const RULE_KEY_HEADER: i32 = 4;
+
+/// Read and validate `TokenLimit.rules`. Every error names the rule's
+/// dotted path (AGENTS.md invariant 1).
+fn parse_rules(config: &DynamicMessage) -> Result<Vec<KeyedRule>, ConfigError> {
+    let invalid = |field_path: String, reason: &str| ConfigError::InvalidValue {
+        field_path,
+        reason: reason.to_string(),
+    };
+    let Some(list) = config.get_field_by_name("rules") else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = list.as_list() else {
+        return Ok(Vec::new());
+    };
+    let mut rules = Vec::with_capacity(list.len());
+    for (i, entry) in list.iter().enumerate() {
+        let path = format!("typed_config.rules[{i}]");
+        let Some(msg) = entry.as_message() else {
+            return Err(invalid(path, "must be a LimitRule message"));
+        };
+        let header = msg
+            .get_field_by_name("header")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let key_number = msg
+            .get_field_by_name("key")
+            .and_then(|v| v.as_enum_number())
+            .unwrap_or(0);
+        let key = match key_number {
+            RULE_KEY_GLOBAL => RuleKey::Global,
+            RULE_KEY_CLIENT_IP => RuleKey::ClientIp,
+            RULE_KEY_TENANT => RuleKey::Tenant,
+            RULE_KEY_HEADER => {
+                if header.is_empty() {
+                    return Err(invalid(
+                        format!("{path}.header"),
+                        "is required when `key` is HEADER",
+                    ));
+                }
+                let name = http::HeaderName::from_bytes(header.to_ascii_lowercase().as_bytes())
+                    .map_err(|_| invalid(format!("{path}.header"), "is not a valid header name"))?;
+                RuleKey::Header(name)
+            }
+            _ => {
+                return Err(invalid(
+                    format!("{path}.key"),
+                    "must be GLOBAL, CLIENT_IP, TENANT or HEADER",
+                ))
+            }
+        };
+        if key_number != RULE_KEY_HEADER && !header.is_empty() {
+            return Err(invalid(
+                format!("{path}.header"),
+                "is only meaningful when `key` is HEADER",
+            ));
+        }
+        let optional_u64 = |name: &str| {
+            msg.has_field_by_name(name)
+                .then(|| msg.get_field_by_name(name).and_then(|v| v.as_u64()))
+                .flatten()
+        };
+        let limits = LimitPolicy {
+            tokens_per_minute: optional_u64("tokens_per_minute"),
+            requests_per_minute: optional_u64("requests_per_minute"),
+            concurrent_streams: msg
+                .has_field_by_name("concurrent_streams")
+                .then(|| {
+                    msg.get_field_by_name("concurrent_streams")
+                        .and_then(|v| v.as_u32())
+                })
+                .flatten(),
+        };
+        if limits == LimitPolicy::default() {
+            return Err(invalid(
+                path,
+                "sets no limit; set tokens_per_minute, requests_per_minute or concurrent_streams",
+            ));
+        }
+        let mut models = Vec::new();
+        if let Some(patterns) = msg.get_field_by_name("models") {
+            for (j, pattern) in patterns.as_list().unwrap_or(&[]).iter().enumerate() {
+                let pattern = pattern.as_str().unwrap_or_default();
+                if !ModelPattern::is_valid(pattern) {
+                    return Err(invalid(
+                        format!("{path}.models[{j}]"),
+                        "must be an exact model name or a single trailing `*` glob",
+                    ));
+                }
+                models.push(ModelPattern::new(pattern));
+            }
+        }
+        let scope = if models.is_empty() {
+            String::new()
+        } else {
+            let mut names: Vec<&str> = models.iter().map(ModelPattern::as_str).collect();
+            names.sort_unstable();
+            format!("|models={}", names.join(","))
+        };
+        rules.push(KeyedRule {
+            key,
+            limits,
+            models,
+            scope,
+        });
+    }
+    Ok(rules)
+}
+
+/// Fold buckets that share a key into one, keeping the lowest limit of each
+/// kind: two rules counting the same requests in the same bucket must not
+/// count them twice.
+fn merge_buckets(buckets: Vec<PolicyBucket>) -> Vec<PolicyBucket> {
+    fn min_opt<T: Ord + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+    let mut merged: Vec<PolicyBucket> = Vec::with_capacity(buckets.len());
+    for (key, limits) in buckets {
+        match merged.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, existing)) => {
+                existing.tokens_per_minute =
+                    min_opt(existing.tokens_per_minute, limits.tokens_per_minute);
+                existing.requests_per_minute =
+                    min_opt(existing.requests_per_minute, limits.requests_per_minute);
+                existing.concurrent_streams =
+                    min_opt(existing.concurrent_streams, limits.concurrent_streams);
+            }
+            None => merged.push((key, limits)),
+        }
+    }
+    merged
+}
+
 /// Decode the borrowed one-release compatibility message.
 fn parse_legacy_config(config: &DynamicMessage) -> Result<LimitRule, ConfigError> {
     let invalid = |field_path: &str, reason: String| ConfigError::InvalidValue {
@@ -397,7 +560,7 @@ impl HttpFilterFactory for TokenLimitFilterFactory {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        create_filter_factory(parse_config(config)?, TYPE_URL, ctx)
+        create_filter_factory(parse_config(config)?, parse_rules(config)?, TYPE_URL, ctx)
     }
 }
 
@@ -426,7 +589,12 @@ impl HttpFilterFactory for LegacyTokenLimitFilterFactory {
             replacement_type_url = TYPE_URL,
             "llmproxy.token_limit uses a deprecated borrowed typed_config; migrate to llmproxy.filters.v0.TokenLimit before the next release"
         );
-        create_filter_factory(Some(parse_legacy_config(config)?), LEGACY_TYPE_URL, ctx)
+        create_filter_factory(
+            Some(parse_legacy_config(config)?),
+            Vec::new(),
+            LEGACY_TYPE_URL,
+            ctx,
+        )
     }
 }
 
@@ -435,16 +603,18 @@ impl HttpFilterFactory for LegacyTokenLimitFilterFactory {
 /// acquire different runtime semantics by accident.
 fn create_filter_factory(
     rule: Option<LimitRule>,
+    rules: Vec<KeyedRule>,
     config_type_url: &'static str,
     ctx: &FactoryContext,
 ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-    create_filter_factory_with_clock(rule, config_type_url, ctx, SystemTime::now)
+    create_filter_factory_with_clock(rule, rules, config_type_url, ctx, SystemTime::now)
 }
 
 /// [`create_filter_factory`] with the wall-clock source the filter reads,
 /// so tests can pin windows.
 fn create_filter_factory_with_clock(
     rule: Option<LimitRule>,
+    rules: Vec<KeyedRule>,
     config_type_url: &'static str,
     ctx: &FactoryContext,
     clock: fn() -> SystemTime,
@@ -461,15 +631,26 @@ fn create_filter_factory_with_clock(
         )
     });
     let policy = control_plane.as_ref().map(|cp| cp.handle());
-    if rule.is_none() && policy.is_none() {
+    if rule.is_none() && rules.is_empty() && policy.is_none() {
         return Err(ConfigError::InvalidValue {
             field_path: "typed_config".to_string(),
-            reason: "llmproxy.token_limit has no `max_tokens`/`fill_rate` rule and no \
-                     llmproxy.auth earlier in the same filter chain, so it would enforce \
+            reason: "llmproxy.token_limit has no `max_tokens`/`fill_rate` rule, no `rules` and \
+                     no llmproxy.auth earlier in the same filter chain, so it would enforce \
                      nothing; configure a rule or add llmproxy.auth"
                 .to_string(),
         });
     }
+    // A TENANT rule with no authenticator would never see a tenant and so
+    // never count anything.
+    if policy.is_none() {
+        if let Some(i) = rules.iter().position(|r| r.key == RuleKey::Tenant) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("typed_config.rules[{i}].key"),
+                reason: "TENANT needs llmproxy.auth earlier in the same filter chain".to_string(),
+            });
+        }
+    }
+    let rules: Arc<[KeyedRule]> = rules.into();
 
     // One set of counters (and one `UsageMissingWarner`) per chain. The
     // HTTP filter chain is rebuilt once PER WORKER (ADR-0003;
@@ -557,6 +738,7 @@ fn create_filter_factory_with_clock(
         counters: Arc::clone(&shared.counters),
         streams: Arc::clone(&shared.streams),
         rule,
+        rules,
         policy,
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
         usage_reader: shared.usage_reader.clone(),
@@ -583,6 +765,7 @@ struct TokenLimitInstanceFactory {
     counters: Arc<WindowAccumulator>,
     streams: Arc<LeaseGauge>,
     rule: Option<LimitRule>,
+    rules: Arc<[KeyedRule]>,
     policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     usage_reader: Option<Arc<UsageReader>>,
@@ -596,6 +779,9 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
             streams: Arc::clone(&self.streams),
             clock: self.clock,
             rule: self.rule,
+            rules: Arc::clone(&self.rules),
+            scoped_pending: Vec::new(),
+            scoped_decided: false,
             policy: self.policy.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             usage_reader: self.usage_reader.clone(),
@@ -822,6 +1008,13 @@ struct TokenLimitFilterInstance {
     /// The configured static rule, keyed per route; `None` in policy-only
     /// mode.
     rule: Option<LimitRule>,
+    /// Keyed rules from `TokenLimit.rules`.
+    rules: Arc<[KeyedRule]>,
+    /// Model-scoped rules that apply to this request by key, with their
+    /// bucket, waiting for the body to name the model.
+    scoped_pending: Vec<(usize, LimitKey)>,
+    /// Set once the model-scoped rules have been decided.
+    scoped_decided: bool,
     /// The published control-plane snapshot holding tenant and key limits;
     /// `None` when no `llmproxy.auth` precedes this filter.
     policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
@@ -893,12 +1086,27 @@ impl TokenLimitFilterInstance {
         if tenant_bucket.is_none() && key_bucket.is_none() {
             return None;
         }
-        let window = policy_window(now_secs);
         let tenant_first: Vec<&PolicyBucket> =
             tenant_bucket.iter().chain(key_bucket.iter()).collect();
         let key_first: Vec<&PolicyBucket> = key_bucket.iter().chain(tenant_bucket.iter()).collect();
+        self.admit_buckets(&tenant_first, &key_first, now_secs)
+    }
 
-        for (key, limits) in &tenant_first {
+    /// Admit against `buckets`: token budgets first (the check counts
+    /// nothing), then stream permits in `streams_order`, then request counts
+    /// in `requests_order`. On admission keeps the permits and the token
+    /// buckets to charge at stream end, alongside any already held.
+    fn admit_buckets(
+        &mut self,
+        streams_order: &[&PolicyBucket],
+        requests_order: &[&PolicyBucket],
+        now_secs: u64,
+    ) -> Option<(LimitDecision, Refusal)> {
+        let window = policy_window(now_secs);
+        let tenant_first = streams_order;
+        let key_first = requests_order;
+
+        for (key, limits) in tenant_first {
             if let Some(tokens) = limits.tokens_per_minute {
                 let used = self
                     .counters
@@ -911,7 +1119,7 @@ impl TokenLimitFilterInstance {
         }
 
         let mut leases = Vec::new();
-        for (key, limits) in &tenant_first {
+        for (key, limits) in tenant_first {
             if let Some(max_streams) = limits.concurrent_streams {
                 match self.streams.try_acquire(key, max_streams) {
                     Ok(lease) => leases.push(lease),
@@ -921,7 +1129,7 @@ impl TokenLimitFilterInstance {
             }
         }
 
-        for (key, limits) in &key_first {
+        for (key, limits) in key_first {
             if let Some(max_requests) = limits.requests_per_minute {
                 if let Admission::Refused { used } =
                     self.counters
@@ -933,14 +1141,67 @@ impl TokenLimitFilterInstance {
             }
         }
 
-        self.leases = leases;
-        self.policy_charges = tenant_first
-            .into_iter()
-            .filter_map(|(key, limits)| {
+        self.leases.extend(leases);
+        self.policy_charges
+            .extend(tenant_first.iter().filter_map(|(key, limits)| {
                 limits.tokens_per_minute.map(|tokens| (key.clone(), tokens))
-            })
-            .collect();
+            }));
         None
+    }
+
+    /// The bucket a keyed rule counts this request in, or `None` when the
+    /// rule does not apply: no tenant, no client address, or no such header.
+    fn rule_key(
+        rule: &KeyedRule,
+        tenant: Option<&str>,
+        client: Option<std::net::IpAddr>,
+        headers: &RequestHeaders,
+    ) -> Option<LimitKey> {
+        let subject = match &rule.key {
+            RuleKey::Global => "global".to_string(),
+            RuleKey::ClientIp => format!("ip={}", client?),
+            RuleKey::Tenant => format!("tenant={}", tenant?),
+            // Hashed like an unauthenticated credential: the header may carry
+            // a secret, and the bucket key reaches logs and the shared store.
+            RuleKey::Header(name) => {
+                let value = headers.headers.get(name)?;
+                let digest = CredentialDigest::hash(&String::from_utf8_lossy(value.as_bytes()));
+                format!("header={name}:{digest}")
+            }
+        };
+        Some(LimitKey::for_rule(format!("{subject}{}", rule.scope)))
+    }
+
+    /// Admit the model-scoped rules once the model is known (the request
+    /// body has been read, as for `llmproxy.model_authz`). A request whose
+    /// model is unknown matches no scoped rule.
+    fn admit_scoped(&mut self, cb: &mut dyn DecoderCallbacks) {
+        if self.scoped_decided || self.scoped_pending.is_empty() {
+            return;
+        }
+        self.scoped_decided = true;
+        let model: Option<String> = cb.stream_info().routing_model().map(str::to_owned);
+        let Some(model) = model else {
+            return;
+        };
+        let buckets = merge_buckets(
+            self.scoped_pending
+                .iter()
+                .filter(|(i, _)| self.rules[*i].models.iter().any(|p| p.matches(&model)))
+                .map(|(i, key)| (key.clone(), self.rules[*i].limits))
+                .collect(),
+        );
+        if buckets.is_empty() {
+            return;
+        }
+        let order: Vec<&PolicyBucket> = buckets.iter().collect();
+        let now = (self.clock)();
+        match self.admit_buckets(&order, &order, unix_secs(now)) {
+            Some((deny, refusal)) => self.refuse(cb, deny, refusal),
+            None => {
+                self.counters.note_admission(now);
+            }
+        }
     }
 
     /// Read `StreamInfo::llm.usage` and, if present, record it against the
@@ -1368,12 +1629,56 @@ impl HttpFilter for TokenLimitFilterInstance {
             self.refuse(cb, deny, refusal);
             return FilterHeadersStatus::Continue;
         }
+
+        if !self.rules.is_empty() {
+            let client: Option<std::net::IpAddr> = cb.stream_info().client_address;
+            let mut unscoped = Vec::new();
+            for (i, rule) in self.rules.iter().enumerate() {
+                let Some(key) = Self::rule_key(rule, tenant.as_deref(), client, headers) else {
+                    continue;
+                };
+                if rule.models.is_empty() {
+                    unscoped.push((key, rule.limits));
+                } else {
+                    self.scoped_pending.push((i, key));
+                }
+            }
+            let buckets = merge_buckets(unscoped);
+            let order: Vec<&PolicyBucket> = buckets.iter().collect();
+            if let Some((deny, refusal)) = self.admit_buckets(&order, &order, now_secs) {
+                self.refuse(cb, deny, refusal);
+                return FilterHeadersStatus::Continue;
+            }
+        }
         // Counted (and warned about) only while the counters are past their
         // reconciliation bound; see `window_counter`'s "Store outage".
         if self.key.is_some() || !self.policy_charges.is_empty() || !self.leases.is_empty() {
             self.counters.note_admission(now);
         }
         FilterHeadersStatus::Continue
+    }
+
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _data: &mut bytes::Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        if end_stream {
+            self.admit_scoped(cb);
+        }
+        FilterDataStatus::Continue
+    }
+
+    /// A request that ends in trailers never sends `end_stream` on data, so
+    /// the scoped rules are decided here too.
+    fn decode_trailers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _trailers: &mut RequestTrailers,
+    ) -> FilterTrailersStatus {
+        self.admit_scoped(cb);
+        FilterTrailersStatus::Continue
     }
 
     fn encode_headers(
@@ -1857,6 +2162,9 @@ mod tests {
     fn filter_at(store: Arc<TestStore>, clock: fn() -> SystemTime) -> TokenLimitFilterInstance {
         TokenLimitFilterInstance {
             rule: Some(store.rule),
+            rules: Arc::from(Vec::new()),
+            scoped_pending: Vec::new(),
+            scoped_decided: false,
             counters: Arc::clone(&store.counters),
             streams: Arc::clone(&store.streams),
             clock,
@@ -1877,7 +2185,13 @@ mod tests {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        create_filter_factory_with_clock(parse_config(config)?, TYPE_URL, ctx, fixed_clock)
+        create_filter_factory_with_clock(
+            parse_config(config)?,
+            parse_rules(config)?,
+            TYPE_URL,
+            ctx,
+            fixed_clock,
+        )
     }
 
     /// Drive one full request/response cycle: a FRESH `TokenLimitFilterInstance`
@@ -3683,5 +3997,357 @@ mod tests {
                 "only scope and seam label the series: {line}"
             );
         }
+    }
+
+    // --- keyed rules (TokenLimit.rules) ---------------------------------------
+
+    fn limit_rule_desc() -> prost_reflect::MessageDescriptor {
+        proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.LimitRule")
+            .expect("LimitRule is compiled into proxy-api")
+    }
+
+    /// A `LimitRule` message. `key` is the enum number; limits are set only
+    /// when `Some`.
+    fn limit_rule(
+        key: i32,
+        header: &str,
+        tokens: Option<u64>,
+        requests: Option<u64>,
+        streams: Option<u32>,
+        models: &[&str],
+    ) -> prost_reflect::Value {
+        let mut msg = DynamicMessage::new(limit_rule_desc());
+        msg.set_field_by_name("key", prost_reflect::Value::EnumNumber(key));
+        if !header.is_empty() {
+            msg.set_field_by_name("header", prost_reflect::Value::String(header.to_string()));
+        }
+        if let Some(n) = tokens {
+            msg.set_field_by_name("tokens_per_minute", prost_reflect::Value::U64(n));
+        }
+        if let Some(n) = requests {
+            msg.set_field_by_name("requests_per_minute", prost_reflect::Value::U64(n));
+        }
+        if let Some(n) = streams {
+            msg.set_field_by_name("concurrent_streams", prost_reflect::Value::U32(n));
+        }
+        if !models.is_empty() {
+            msg.set_field_by_name(
+                "models",
+                prost_reflect::Value::List(
+                    models
+                        .iter()
+                        .map(|m| prost_reflect::Value::String(m.to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        prost_reflect::Value::Message(msg)
+    }
+
+    fn rules_config(rules: Vec<prost_reflect::Value>) -> DynamicMessage {
+        let mut msg = DynamicMessage::new(token_limit_desc());
+        msg.set_field_by_name("rules", prost_reflect::Value::List(rules));
+        msg
+    }
+
+    /// A pinned-clock factory over `config`, with `cp` registered as
+    /// `llmproxy.auth`'s control plane when given.
+    fn rules_factory(
+        config: &DynamicMessage,
+        cp: Option<&Arc<ControlPlane>>,
+    ) -> Box<dyn FilterInstanceFactory> {
+        let ctx = FactoryContext::default();
+        if let Some(cp) = cp {
+            ctx.get_or_try_init(auth_filter::TYPE_URL, || {
+                Ok(Arc::clone(cp) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+        }
+        match pinned_factory(config, &ctx) {
+            Ok(factory) => factory,
+            Err(e) => panic!("valid rules config must build: {e:?}"),
+        }
+    }
+
+    fn rules_error(config: &DynamicMessage) -> String {
+        match pinned_factory(config, &FactoryContext::default()) {
+            Ok(_) => panic!("config must be refused"),
+            Err(ConfigError::InvalidValue { field_path, .. }) => field_path,
+            Err(other) => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    /// One request through `decode_headers` and, when admitted, an empty
+    /// final body (which is when model-scoped rules decide). Returns the 429
+    /// body, or `None` when admitted. `filter` stays alive in the result so a
+    /// test can hold its stream slots.
+    struct RuleRequest<'a> {
+        tenant: Option<&'a str>,
+        client: Option<&'a str>,
+        header: Option<(&'a str, &'a str)>,
+        model: Option<&'a str>,
+    }
+
+    impl Default for RuleRequest<'_> {
+        fn default() -> Self {
+            RuleRequest {
+                tenant: None,
+                client: Some("10.0.0.1"),
+                header: None,
+                model: None,
+            }
+        }
+    }
+
+    fn send(
+        factory: &dyn FilterInstanceFactory,
+        req: RuleRequest<'_>,
+    ) -> (Box<dyn HttpFilter>, TestCallbacks, Option<String>) {
+        let mut filter = factory.create_filter();
+        let mut cb = TestCallbacks::new(Some(route_named("r1")));
+        if let Some(tenant) = req.tenant {
+            cb.set_authenticated_tenant(tenant);
+        }
+        cb.stream_info.borrow_mut().client_address = req.client.map(|ip| ip.parse().unwrap());
+        let mut head = request_headers(None);
+        if let Some((name, value)) = req.header {
+            head.headers.insert(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        filter.decode_headers(&mut cb, &mut head, false);
+        if cb.local_reply.is_none() {
+            if let Some(model) = req.model {
+                cb.stream_info.borrow_mut().requested_model = Some(model.to_string());
+            }
+            filter.decode_data(&mut cb, &mut Bytes::new(), true);
+        }
+        let refused = cb.local_reply.as_ref().map(|(status, _, body)| {
+            assert_eq!(*status, StatusCode::TOO_MANY_REQUESTS);
+            body.clone()
+        });
+        (filter, cb, refused)
+    }
+
+    fn refused(factory: &dyn FilterInstanceFactory, req: RuleRequest<'_>) -> Option<String> {
+        send(factory, req).2
+    }
+
+    const GLOBAL: i32 = RULE_KEY_GLOBAL;
+    const CLIENT_IP: i32 = RULE_KEY_CLIENT_IP;
+    const TENANT_KEY: i32 = RULE_KEY_TENANT;
+    const HEADER: i32 = RULE_KEY_HEADER;
+
+    #[test]
+    fn invalid_rules_are_refused_with_their_dotted_path() {
+        let cases = [
+            (
+                limit_rule(0, "", None, Some(1), None, &[]),
+                "typed_config.rules[0].key",
+            ),
+            (
+                limit_rule(HEADER, "", None, Some(1), None, &[]),
+                "typed_config.rules[0].header",
+            ),
+            (
+                limit_rule(GLOBAL, "x-a", None, Some(1), None, &[]),
+                "typed_config.rules[0].header",
+            ),
+            (
+                limit_rule(GLOBAL, "", None, None, None, &[]),
+                "typed_config.rules[0]",
+            ),
+            (
+                limit_rule(GLOBAL, "", None, Some(1), None, &["gpt-*-mini"]),
+                "typed_config.rules[0].models[0]",
+            ),
+            // No authenticator in the chain: a tenant rule could never count.
+            (
+                limit_rule(TENANT_KEY, "", None, Some(1), None, &[]),
+                "typed_config.rules[0].key",
+            ),
+        ];
+        for (rule, path) in cases {
+            assert_eq!(rules_error(&rules_config(vec![rule])), path);
+        }
+    }
+
+    #[test]
+    fn a_global_request_limit_counts_every_caller_together() {
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(GLOBAL, "", None, Some(2), None, &[])]),
+            None,
+        );
+        let a = || RuleRequest {
+            client: Some("10.0.0.1"),
+            ..Default::default()
+        };
+        let b = || RuleRequest {
+            client: Some("10.0.0.2"),
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, a()), None);
+        assert_eq!(refused(&*factory, b()), None);
+        assert_eq!(
+            refused(&*factory, a()).as_deref(),
+            Some("request rate exceeded")
+        );
+    }
+
+    #[test]
+    fn a_client_ip_limit_counts_each_address_alone() {
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(CLIENT_IP, "", None, Some(1), None, &[])]),
+            None,
+        );
+        let from = |ip| RuleRequest {
+            client: Some(ip),
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, from("10.0.0.1")), None);
+        assert!(refused(&*factory, from("10.0.0.1")).is_some());
+        assert_eq!(refused(&*factory, from("10.0.0.2")), None);
+    }
+
+    #[test]
+    fn a_header_limit_buckets_on_the_hashed_value_and_skips_a_missing_header() {
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(
+                HEADER,
+                "X-Api-Key",
+                None,
+                Some(1),
+                None,
+                &[],
+            )]),
+            None,
+        );
+        let with = |value| RuleRequest {
+            header: Some(("x-api-key", value)),
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, with("k-1")), None);
+        assert!(refused(&*factory, with("k-1")).is_some());
+        assert_eq!(refused(&*factory, with("k-2")), None);
+        // Without the header the rule does not apply.
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+        let key = TokenLimitFilterInstance::rule_key(
+            &parse_rules(&rules_config(vec![limit_rule(
+                HEADER,
+                "x-api-key",
+                None,
+                Some(1),
+                None,
+                &[],
+            )]))
+            .unwrap()[0],
+            None,
+            None,
+            &{
+                let mut head = request_headers(None);
+                head.headers
+                    .insert("x-api-key", HeaderValue::from_static("secret-value"));
+                head
+            },
+        )
+        .unwrap();
+        assert!(!key.to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn a_tenant_token_limit_counts_each_tenant_and_charges_usage() {
+        let cp = control_plane();
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(TENANT_KEY, "", Some(10), None, None, &[])]),
+            Some(&cp),
+        );
+        let as_tenant = |t| RuleRequest {
+            tenant: Some(t),
+            ..Default::default()
+        };
+        let (mut filter, mut cb, refusal) = send(&*factory, as_tenant("t1"));
+        assert_eq!(refusal, None);
+        cb.set_usage(usage(10));
+        filter.encode_headers(&mut cb, &mut response_headers(), true);
+        assert_eq!(
+            refused(&*factory, as_tenant("t1")).as_deref(),
+            Some("token budget exceeded")
+        );
+        assert_eq!(refused(&*factory, as_tenant("t2")), None);
+    }
+
+    #[test]
+    fn a_concurrent_stream_limit_holds_a_slot_until_the_stream_completes() {
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(GLOBAL, "", None, None, Some(1), &[])]),
+            None,
+        );
+        let (mut first, mut first_cb, refusal) = send(&*factory, RuleRequest::default());
+        assert_eq!(refusal, None);
+        assert_eq!(
+            refused(&*factory, RuleRequest::default()).as_deref(),
+            Some("too many concurrent streams")
+        );
+        first.on_stream_complete(&mut first_cb);
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+    }
+
+    #[test]
+    fn a_models_scoped_rule_counts_only_matching_models_once_the_body_names_one() {
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(
+                GLOBAL,
+                "",
+                None,
+                Some(1),
+                None,
+                &["gpt-4*"],
+            )]),
+            None,
+        );
+        let model = |m| RuleRequest {
+            model: m,
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, model(Some("gpt-4o"))), None);
+        assert_eq!(
+            refused(&*factory, model(Some("gpt-4o-mini"))).as_deref(),
+            Some("request rate exceeded")
+        );
+        // Another model, or none named, is not counted by this rule.
+        assert_eq!(refused(&*factory, model(Some("claude-3"))), None);
+        assert_eq!(refused(&*factory, model(None)), None);
+    }
+
+    #[test]
+    fn two_rules_on_one_bucket_count_once_against_the_lower_limit() {
+        let factory = rules_factory(
+            &rules_config(vec![
+                limit_rule(GLOBAL, "", None, Some(3), None, &[]),
+                limit_rule(GLOBAL, "", None, Some(2), None, &[]),
+            ]),
+            None,
+        );
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+        // Counted once per request: two admissions, not one.
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+        assert!(refused(&*factory, RuleRequest::default()).is_some());
+    }
+
+    #[test]
+    fn every_rule_that_applies_must_pass() {
+        let factory = rules_factory(
+            &rules_config(vec![
+                limit_rule(GLOBAL, "", None, Some(10), None, &[]),
+                limit_rule(CLIENT_IP, "", None, Some(1), None, &[]),
+            ]),
+            None,
+        );
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+        // The global rule has room; the client's own rule does not.
+        assert!(refused(&*factory, RuleRequest::default()).is_some());
     }
 }
