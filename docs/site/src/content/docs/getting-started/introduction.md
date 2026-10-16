@@ -82,7 +82,7 @@ the process.
 Provider fallback is scoped to same-dialect chains, as described above — it
 is not yet a general "try any provider on failure" mechanism. And the
 `models` catalogue in the configuration (a named model mapped to an ordered
-list of providers) records every provider you list but, in this schema
-version, only ever routes to the first one; see
+list of providers) lowers a list of more than one provider to an ordered
+fallback chain, and the same-dialect rule applies to it; see
 [Configuration file reference](../../configuration/configuration-file/)
 for the exact field-by-field behavior.

@@ -11,6 +11,79 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- Per-key model allow-lists. `PUT /keys/{id}/policy` (scoped form
+  `PUT /chains/{stat_prefix}/keys/{id}/policy`) takes the body of
+  `PUT /tenants/{id}/policy`. The effective models of a request are the tenant grant
+  intersected with the key list: a key only narrows, a key with no policy keeps its
+  tenant's grant, and `{"access":"all"}` returns a key to that grant. A refusal is the same
+  `403 model_not_permitted`. The policy applies to the next request, survives a restart on
+  the persistent store, and also narrows under `tenants_without_policy: allow`. The route
+  answers `409 not_enforced` if no chain runs `llmproxy.model_authz`.
+- Tenant and key rate limits. `PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits`
+  (scoped forms under `/chains/{stat_prefix}/`) set `tokens_per_minute`,
+  `requests_per_minute` and `concurrent_streams`; `{"limits": null}` clears them. A request
+  must pass the tenant limits and the key limits, so a key only narrows its tenant. A
+  refusal is `429` with `x-ratelimit-*` and `retry-after` headers and a body of
+  `token budget exceeded`, `request rate exceeded` or `too many concurrent streams`.
+  Limits apply to the next request and survive a restart on the persistent store. The
+  routes answer `409 not_enforced` if no chain runs `llmproxy.token_limit`. `GET /keys`
+  lists the limits of each key.
+- `auth.enforce.limits` (default `true`): with `auth` set, the dialect adds
+  `llmproxy.token_limit`, so tenant and key limits are enforced without a `limits:` entry.
+  With `false` and no `limits:` entry the filter is omitted.
+- Rate windows are aligned to the Unix epoch (a 60-second window starts on a whole
+  minute), so every replica counts the same minute under the same name. The first window a
+  caller sees can be shorter than the configured length. Token and request counts
+  reconcile through `auth.store` about once a second, and a `shared` store shares them
+  across replicas. Concurrent streams are counted per replica. The gauge
+  `envoy_llmproxy_counter_reconciliation_age_seconds{seam}` on `/stats/prometheus` reports
+  the age of the last reconcile for `rate_window` and `stream_lease`.
+- `GET /v1/usage` now reports each tenant rule that has a `tokens_per_minute` limit, as a
+  route named `*` (plus its model scope). With `auth.store: shared` it reads the fleet
+  totals from the store off the worker, and a store error or a read past about 2 seconds
+  answers `503 usage unavailable` with `retry-after: 1`.
+- `GET /v1/models` is answered by the proxy and never forwarded. It lists the catalogue:
+  each exact `routes[].model` and `models` key, without names that contain `*` and
+  without `auto`. With `auth` and `auth.enforce.model_policy` on, it lists only the models
+  that the tenant grant and the key policy both permit. Envoy mode: `ModelAuthz.model_catalog`.
+- `/v1/embeddings` is metered on every cluster dialect. Usage reaches the access log
+  (`gen_ai.operation.name=embeddings`), token limits, and tenant and key spend, priced at
+  the rate card of the provider that served the request.
+- Schema gate: `make schema-check`, part of `make ci`, validates every example dialect
+  config against `schema/llmproxy-v0.schema.json` and checks that the schema and the
+  parser agree on fields.
+- Generated configuration reference: `make config-reference` regenerates
+  `docs/site/src/content/docs/configuration/reference.md` from the schema.
+  `make config-reference-check` fails if the committed copy is stale, and `make ci` runs it.
+
+### Changed
+
+- Every `limits[]` field and bucket key of the dialect is now enforced:
+  `tokens_per_minute`, `requests_per_minute`, `concurrent_sessions` and `models`, with the
+  keys `global`, `client-ip`, `tenant` and `header:<name>`. The load-time "not enforced"
+  warnings and the matching schema text are removed.
+- `key: header:authorization` buckets on the hashed header value as written, also with
+  `auth` set. A rule on it behind `auth`, which removes the verified header, counts one
+  bucket per authenticated virtual key.
+- A chain that enforces model policy answers `GET /v1/models` with the permitted
+  catalogue. Before, it refused the request with `403` because it named no model.
+- `client-ip` counts the TCP peer address. `x-forwarded-for` is read only on a non-edge
+  connection manager with `xff_num_trusted_hops`, so a client cannot pick its own bucket
+  by writing the header.
+
+### Known limitations
+
+- Concurrent-stream limits are counted per replica: N replicas can admit up to N times
+  `concurrent_streams`, until shared leases ship. Token and request counts are shared only
+  with `auth.store: shared`, and between reconciles the fleet can admit a little over a
+  limit.
+- `client-ip` behind a load balancer is the balancer's address, because the dialect has no
+  trusted-hops setting. Trusted hops are available in Envoy mode (`xff_num_trusted_hops`).
+- A key budget counts one credential source (the operator key or the tenant's own key),
+  not all spend of the key.
+
 ## [0.3.6] - 2026-10-14
 
 ### Fixed

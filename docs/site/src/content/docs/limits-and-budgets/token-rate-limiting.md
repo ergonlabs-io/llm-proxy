@@ -58,9 +58,10 @@ operator reading logs on its behalf.
 The proxy intercepts `GET /v1/usage` before any budget check and answers it
 directly — it is never forwarded to a provider
 (`crates/proxy-filters/src/token_limit_filter.rs`'s `decode_headers`, the
-`USAGE_PATH` branch). It reports the current-window standing of the one
-per-route rule of a bootstrap (Envoy-mode) `TokenLimit`. It does not report
-`limits` entries of the `llmproxy` dialect. See "What the endpoint reports".
+`USAGE_PATH` branch). It reports the current-window standing of the
+caller's tenant: each `key: tenant` entry of `limits` that sets
+`tokens_per_minute`, and the per-route rule of a bootstrap (Envoy-mode)
+`TokenLimit`. See "What the endpoint reports".
 
 ### The key authenticates and scopes
 
@@ -100,23 +101,25 @@ Two things must be true for this endpoint to return real data:
 
 ### What the endpoint reports
 
-The endpoint reads only the per-route rule of a bootstrap `TokenLimit`: the
-rule set with `max_tokens` and `fill_rate`. A `limits` entry of the dialect
-is not that rule. It lowers to a keyed rule with a bucket that does not
-depend on the route. The endpoint does not read those buckets. Tenant and
-key limits from the admin API do not appear in it either.
+The endpoint reports two kinds of row (`usage_entries` in
+`crates/proxy-filters/src/token_limit_filter.rs`):
 
-With the dialect, `routes` is therefore always `[]`, also when `limits`
-entries are enforced and have used budget. Use the 429 headers or the access
-log to see that usage. The proxy returns `routes` rows only for a bootstrap
-that sets `max_tokens` and `fill_rate`
-(`handle_usage_request` in `crates/proxy-filters/src/token_limit_filter.rs`:
-with no static rule it sends `render_usage_response(&tenant, &[])`).
+- Each `limits` entry with `key: tenant` and `tokens_per_minute`. Such a rule
+  does not depend on the route, so its row has `route` set to `*`. A rule
+  with `models` adds its scope to the name, for example
+  `*|models=gpt-4o`. Two rules on the same bucket give one row with the
+  lower limit.
+- The per-route rule of a bootstrap `TokenLimit` (the rule set with
+  `max_tokens` and `fill_rate`): one row per route.
+
+Entries keyed on `global`, `client-ip` or a header, request and
+concurrent-stream limits, and tenant and key limits from the admin API do not
+appear. Use the 429 headers or the access log to see that usage.
 
 ### Example
 
-The dialect config below enforces a tenant limit. The endpoint still answers
-with an empty `routes` list.
+The dialect config below enforces a tenant limit. The endpoint reports it as
+the route `*`.
 
 ```yaml
 version: 0
@@ -143,11 +146,12 @@ curl -s http://127.0.0.1:8080/v1/usage \
   -H "Authorization: Bearer llmp_<the key>"
 ```
 
-The caller gets status `200`, `content-type: application/json`, and this
-body:
+The caller gets status `200`, `content-type: application/json`, and a body
+like this one, after the tenant used 2,200 tokens, 43 seconds into the
+current window:
 
 ```json
-{"routes":[],"tenant":"acme","window":"fixed"}
+{"routes":[{"limit":100000.0,"remaining":97800.0,"reset_after_seconds":17,"route":"*","used":2200.0}],"tenant":"acme","window":"fixed"}
 ```
 
 With the bootstrap in "Bootstrap configuration" below, a tenant `acme` that
@@ -171,7 +175,7 @@ Do not parse this response positionally; parse it as JSON.
 |---|---|---|
 | `tenant` | string | The authenticated caller's tenant, exactly as configured in `auth.keys[].tenant`. |
 | `window` | string, always `"fixed"` | The limiter's windowing algorithm. Only a fixed window exists today, so this never varies. |
-| `routes` | array of objects | One entry per route this tenant has a current-window budget on, for the per-route rule of a bootstrap `TokenLimit`. Always empty (`[]`) with `limits` entries of the dialect. Also empty if the tenant has never been bucketed against any route — a true answer, not an error. |
+| `routes` | array of objects | One entry per route this tenant has a current-window budget on, for a `key: tenant` entry of `limits` with `tokens_per_minute` (route `*`) or the per-route rule of a bootstrap `TokenLimit`. Empty with neither. Also empty if the tenant has never been bucketed against any route — a true answer, not an error. |
 | `routes[].route` | string | The route name the budget is bucketed under. |
 | `routes[].used` | number | Weighted tokens consumed in the current window. |
 | `routes[].limit` | number | The configured `tokens_per_minute` cap for this window. |

@@ -319,11 +319,12 @@ Caution: token and request counts are shared between replicas only when
 `auth.store` is `shared`. They reconcile about once a second, so the fleet
 can admit a little over a limit between reconciles. With the `in_memory` or
 `persistent` store each replica counts alone, so N replicas can admit up to
-N times a limit. Concurrent-stream slots are counted per process with every
-store; sharing them between replicas is planned and is not available now.
+N times a limit. Concurrent-stream slots are counted per replica with every
+store. Replicas do not share them.
 
-`GET /v1/usage` does not report these limits. It reports only the `limits`
-rule of the route in the config file (`token_limit_filter.rs`, module doc).
+`GET /v1/usage` does not report these limits. It reports the `key: tenant`
+token limits of the config file's `limits` and the per-route rule of a
+bootstrap `TokenLimit` (`usage_entries` in `token_limit_filter.rs`).
 
 `GET /keys` reports the limits of each key in the `limits` field. The value
 is `null` when the key has no limits (`render_limits`, `handle_list_keys`).

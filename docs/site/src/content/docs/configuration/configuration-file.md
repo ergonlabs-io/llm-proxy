@@ -3,7 +3,7 @@ title: Configuration file reference
 summary: Field-by-field reference for the llm-proxy configuration file
   (--config), derived from schema/llmproxy-v0.schema.json, the normative
   source. Covers what each field does, its default, and whether it is
-  enforced yet.
+  enforced.
 last_updated: 2026-10-15
 related:
   - ../reference/

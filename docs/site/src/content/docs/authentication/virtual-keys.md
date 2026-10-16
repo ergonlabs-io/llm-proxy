@@ -138,20 +138,15 @@ same file and, end to end over a real socket, by
 `testing/diffrig/tests/auth_e2e.rs`). A caller must not be able to learn from
 the response alone whether a key they guessed was ever valid.
 
-The three reasons are recorded separately, but only internally: each call
+The three reasons are recorded separately: each call
 sets `StreamInfo::response_code_details` to one of `auth_no_credential`,
 `auth_unknown_key`, or `auth_revoked_key`
 (`crates/proxy-filters/src/auth_filter.rs:357-376`, and
 `the_three_failure_reasons_produce_three_different_details_strings` pins the
-exact three strings). **This is a real gap, not a documented feature yet:**
-`StreamInfo::response_code_details` is populated on every local reply
-(`crates/proxy-http/src/filter_manager.rs:1293`, `:1382`, `:2866`), but the
-access-log format-string engine has no `%RESPONSE_CODE_DETAILS%` operator —
-`crates/proxy-observability/src/access_log.rs`'s operator match has no case
-for it, and it does not appear in either the text or JSON access-log format
-described in [Access logs](../../observability/access-logs/). So today, an
-operator cannot yet tell an unknown key from a revoked one by reading the
-access log; only the identical 401 is externally visible either way.
+exact three strings). The access log can show them: add
+`%RESPONSE_CODE_DETAILS%` to the format (see
+[Access logs](../../observability/access-logs/)) to tell an unknown key from a
+revoked one. The client still sees the same 401 either way.
 
 ## The token limiter keys on the identity the proxy assigned, not the header the caller sent
 
@@ -469,8 +464,11 @@ status codes, and the rules, see "Key model policy" in
 Rate limits follow the same rule. `PUT /tenants/{id}/limits` sets the
 ceiling. A request must pass the limits of its tenant and the limits of its
 key. A key with no limits is bound by its tenant alone. The limits persist
-with the configured store. The counters are per process, so with N replicas
-the fleet can admit up to N times a limit. A shared counter is planned.
+with the configured store. Token and request counts are shared between
+replicas when `auth.store` is `shared`, and the fleet can admit a little over a
+limit between reconciles. With another store, each replica counts alone.
+Concurrent streams are always counted per replica, so with N replicas the
+fleet can admit up to N times that limit.
 For the body, the `429` responses, and the rules, see "Tenant and key limits"
 in
 [Admin endpoints](../../observability/admin-endpoints/#tenant-and-key-limits).

@@ -124,7 +124,8 @@ provider on failover. That has been a real key-disclosure bug here twice.
 
 - **Meters tokens.** Input, output, and separately-priced buckets are read from
   provider responses, for streaming and non-streaming requests alike, and land in
-  the access log.
+  the access log. `/v1/embeddings` requests are metered and charged the same way.
+  The proxy answers `GET /v1/models` itself, with the models the caller may use.
 
 - **Enforces token budgets.** A tenant over its limit gets a 429 with
   `x-ratelimit-*` headers before the request reaches a provider. A request already
@@ -150,8 +151,9 @@ provider on failover. That has been a real key-disclosure bug here twice.
 
 - **Authorizes models.** A tenant can be restricted to named models and exclude
   specific models from that grant. The effective access is allow minus deny,
-  enforced before routing. It fails closed on an unauthenticated request and
-  defaults to all models for an authenticated tenant with no policy. The dialect's `auth:` block turns this on; `auth.enforce.model_policy: false` turns it off, and the admin API then refuses policy writes with `409`.
+  enforced before routing. It fails closed on an unauthenticated request. It
+  also refuses an authenticated tenant with no stored policy (403), unless
+  `auth.enforce.tenants_without_policy` is `allow`. The dialect's `auth:` block turns this on; `auth.enforce.model_policy: false` turns it off, and the admin API then refuses policy writes with `409`.
 
 - **Mints and revokes keys at runtime.** A bearer-gated admin write API creates
   tenants, mints and revokes virtual keys, and sets per-tenant policies and
@@ -362,9 +364,9 @@ cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode validate
 ```
 
 `examples/llmproxy-ollama.yaml` runs against a local Ollama and needs no API
-keys or environment variables. `--mode validate` warns about any field that
-parses but is not yet enforced, so a configuration that says more than the proxy
-does tells you at load time rather than in production.
+keys or environment variables. `--mode validate` warns when you switch a control off
+(for example `auth.enforce.model_policy: false`), so a configuration that says
+more than the proxy does tells you at load time rather than in production.
 
 **2. See what it lowers to.**
 
@@ -460,14 +462,14 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.3.2** | Dynamic configuration — ADS/xDS gate, plus live-defect fixes | Shipped 2026-10-14 in tag v0.3.5 |
 | **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 |
 | **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Shipped 2026-10-14 in tag v0.3.5 |
-| **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Current |
+| **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Gate met; not yet tagged |
 | — | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Unscheduled |
-| **v1.0.0** | Full LLM layer — Gateway API Inference Extension, realtime sessions | Planned |
+| **v1.0.0** | To be re-planned. The old theme (Gateway API Inference Extension, realtime sessions) was retired on 2026-10-15 | No gate, no scope |
 
 Ship gates, evidence, and deliberate caveats for each release:
 [`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md). Data-plane parity
-keeps its instrument, a corpus scorecard that climbs only when real-world bootstrap
-configs stop being rejected, but it is not scheduled.
+is not scheduled. Its corpus scorecard now belongs to the Envoy differential rig
+work.
 
 ## What is not built yet
 
@@ -481,40 +483,39 @@ Stated plainly, because a feature list without this is not much use:
   HTTP/2 provider is offered `h2` and nothing else, so a backend that cannot
   speak it fails the TLS handshake rather than downgrading, which rules out most
   local plaintext servers. Upgrade requests bypass the cache by design.
-- **Dynamic configuration is partial.** CDS, LDS, RDS, SDS, and EDS are wired.
-  RDS-dependent and replacement listeners warm while last-good generations keep
-  serving, and ADS initial-fetch timeout is honored. Delta xDS runs end to end
-  for strict incremental updates; file transport, init-manager sequencing, SDS
-  removal, and full 5k-rps differential rename-churn verification remain open
-  (`v0.3.2`). SDS supports downstream certificate and validation-context
-  delivery with inline data sources. Static config plus SIGHUP remains
-  supported.
+- **The Envoy-baselined rename-churn comparison was waived.** The v0.3.2 gate
+  is met without it. A zero-5xx run on a capacity host passed, but no run
+  compares the proxy with Envoy at 5k requests per second
+  (`internal-docs/MILESTONES.md`, v0.3.2 section). Static config plus SIGHUP
+  remains supported; SIGHUP is refused when `dynamic_resources` is set.
 - **File-sourced credentials and certificates are read once.** `api_key_file`,
   `hmac_secret_file`, `cert_file`/`key_file` take effect on restart or SIGHUP —
   nothing watches them. Changing the control-plane store spec or its poll
   interval needs a restart even with SIGHUP.
-- **Authorization defaults open, and covers models only.** Authentication fails
-  closed, and so does model authz for an unauthenticated request — but an
-  authenticated tenant absent from the policy snapshot is allowed everything.
-  There is no per-provider authorization.
-- **Model authz and spend budgets are bootstrap-mode only.** Neither filter is
-  in the chain the `llmproxy` dialect lowers to.
-- **Spend ceilings are enforced per process.** N replicas means N ceilings, even
-  with a shared store.
-- **JWT verification is library-only.** `jwt_auth` verifies RS256 against a
-  static JWKS but is not wired into the authenticator chain, so it cannot be
-  reached from configuration.
-- **Three dialect fields parse but do nothing:** `limits[].requests_per_minute`,
-  `limits[].concurrent_sessions`, and `limits[].models`. Rate-limit bucket keys
-  are also not configurable — the token limiter keys on the authenticated
-  tenant, or on the `authorization` header when there is none, so only
-  `key: tenant` and `key: header:authorization` do anything. All of these warn
-  at load rather than failing silently.
+- **Authorization covers models only.** There is no per-provider
+  authorization. An authenticated tenant with no stored model policy is refused
+  with 403 unless `auth.enforce.tenants_without_policy` is `allow`.
+- **JWT verification is reachable from Envoy mode only.** `jwt_providers`
+  exists on the `llmproxy.auth` filter of a bootstrap. The `llmproxy` dialect
+  has no field for it. A JWT principal stays on the operator key.
+- **Concurrent-stream limits are counted per replica.** Token and request
+  windows reconcile through the shared store, about once a second, when
+  `auth.store` is `shared`. The fleet can admit a little over a limit between
+  reconciles. Concurrent streams have no shared store implementation, so N
+  replicas admit up to N times the limit.
+- **Spend over-admission is bounded, not zero.** With a `shared` store,
+  replicas share spend totals. During a store outage each replica enforces
+  against the last confirmed total plus its own spend.
+- **`client-ip` buckets see the balancer address behind a load balancer.** The
+  dialect has no trusted-hops setting. It uses the TCP peer address and never
+  reads `x-forwarded-for`.
+- **A key budget counts one credential source.** A budget is scoped to
+  `platform` or `tenant` credentials. It ignores spend of the other source
+  (ADR-0007). Whether a key budget should cover all of the key's spend is an
+  open owner decision.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
 - **`--drain-strategy` has no effect.** It is accepted and warns at startup when given; both values drain like Envoy's `immediate`.
-- **No embeddings and no `/v1/models` handling.** A request to any other path
-  proxies through, but gets no token metering.
 - **No Kubernetes controller or CRDs.**
 
 ## Layout
