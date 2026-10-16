@@ -100,10 +100,18 @@
 //! tenant's bucket and its key's; a key with no limits row is bounded by its
 //! tenant alone. These buckets are per tenant and per key across every route,
 //! in their own key spaces ([`crate::token_limit::LimitSubject::TenantPolicy`]
-//! and `KeyPolicy`), apart from the static rule's per-route buckets, which are
-//! still the only ones `GET /v1/usage` reports. A write applies on the next
-//! request. Counters are per process, so N replicas admit up to N times a
-//! limit until a shared counter backend exists.
+//! and `KeyPolicy`), apart from the static rule's per-route buckets. A write
+//! applies on the next request.
+//!
+//! # Keyed rules
+//!
+//! `rules` (what the dialect's `limits` lower to) are counted per key: one
+//! bucket for all traffic, per client address, per tenant, or per value of a
+//! header, optionally scoped to models. They are route-independent, every
+//! rule that applies must pass, and rules sharing a bucket are merged to the
+//! lowest limit so a request is counted once. `GET /v1/usage` reports the
+//! static rule's per-route buckets and each tenant rule with a token limit,
+//! labelled `*`.
 //!
 //! # The bucket key: an authenticated tenant if there is one, else the credential
 //!
@@ -194,7 +202,7 @@
 //! [`crate::token_limit::TenantUsage`] carries only a route name and plain
 //! numbers, by construction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -217,7 +225,7 @@ use crate::auth::{KeyId, TenantId};
 use crate::auth_filter;
 use crate::control::{
     ControlPlane, ControlPlaneSnapshot, ControlPlaneStore, InMemoryControlPlaneStore, LimitPolicy,
-    WindowDimension, WindowKey,
+    WindowDimension, WindowKey, WindowRow,
 };
 use crate::model_authz::ModelPattern;
 use crate::token_limit::{
@@ -1154,6 +1162,7 @@ impl TokenLimitFilterInstance {
     fn rule_key(
         rule: &KeyedRule,
         tenant: Option<&str>,
+        key_id: Option<&str>,
         client: Option<std::net::IpAddr>,
         headers: &RequestHeaders,
     ) -> Option<LimitKey> {
@@ -1163,11 +1172,19 @@ impl TokenLimitFilterInstance {
             RuleKey::Tenant => format!("tenant={}", tenant?),
             // Hashed like an unauthenticated credential: the header may carry
             // a secret, and the bucket key reaches logs and the shared store.
-            RuleKey::Header(name) => {
-                let value = headers.headers.get(name)?;
-                let digest = CredentialDigest::hash(&String::from_utf8_lossy(value.as_bytes()));
-                format!("header={name}:{digest}")
-            }
+            RuleKey::Header(name) => match headers.headers.get(name) {
+                Some(value) => {
+                    let digest = CredentialDigest::hash(&String::from_utf8_lossy(value.as_bytes()));
+                    format!("header={name}:{digest}")
+                }
+                // `llmproxy.auth` removes the `authorization` header once it
+                // has verified it (auth_filter, "The verified credential is
+                // removed before forwarding"). The authenticated key id names
+                // that credential one to one, so it keeps "one bucket per
+                // distinct value".
+                None if *name == AUTHORIZATION => format!("header={name}:key={}", key_id?),
+                None => return None,
+            },
         };
         Some(LimitKey::for_rule(format!("{subject}{}", rule.scope)))
     }
@@ -1382,47 +1399,119 @@ impl TokenLimitFilterInstance {
         };
 
         let now_secs = unix_secs((self.clock)());
-        let Some(rule) = self.rule else {
+        let entries = self.usage_entries(&tenant, now_secs);
+        if entries.is_empty() {
             send_usage_body(cb, &render_usage_response(&tenant, &[]));
             return FilterHeadersStatus::Continue;
-        };
-        let window = rule.window_at(now_secs);
-        let local = self
-            .counters
-            .tenant_totals(&tenant, rule.on.dimension(), window);
+        }
 
         let Some(reader) = &self.usage_reader else {
-            let routes = usage_rows(rule, window, now_secs, &local);
+            let routes: Vec<TenantUsage> = entries
+                .iter()
+                .map(|entry| {
+                    let used = self
+                        .counters
+                        .used(&entry.key, entry.dimension, entry.window);
+                    entry.usage(used, now_secs)
+                })
+                .collect();
             send_usage_body(cb, &render_usage_response(&tenant, &routes));
             return FilterHeadersStatus::Continue;
         };
 
-        // Every route of the chain, plus any this replica holds a bucket for
-        // that the published names lack (an unnamed route, or a test chain
-        // with no connection manager).
-        let mut routes: Vec<String> = self
-            .route_names
-            .as_ref()
-            .map(|names| names.load().as_ref().clone())
-            .unwrap_or_default();
-        routes.extend(local.into_iter().map(|(route, _)| route));
-        let answer = reader.read(&tenant, rule.on.dimension(), window, routes, Instant::now());
+        let rows = entries
+            .iter()
+            .map(|entry| {
+                let row = WindowRow {
+                    subject: entry.key.to_string(),
+                    dimension: entry.dimension,
+                    window: entry.window,
+                };
+                (entry.label.clone(), row)
+            })
+            .collect();
+        let answer = reader.read_rows(&tenant, rows, Instant::now());
         self.usage_read = UsageRead::Waiting {
-            tenant,
-            window,
+            held: Held { tenant, entries },
             answer,
         };
         FilterHeadersStatus::StopIteration
     }
 
-    /// Reply 200 with `totals`, read for `held`.
+    /// Reply 200 with `totals`, read for `held`. A per-route entry the
+    /// store holds no count for is left out, as locally; a tenant rule is
+    /// always reported.
     fn reply_usage(&self, cb: &mut dyn DecoderCallbacks, held: &Held, totals: &RouteTotals) {
         let now_secs = unix_secs((self.clock)());
-        let routes = match self.rule {
-            Some(rule) => usage_rows(rule, held.window, now_secs, totals),
-            None => Vec::new(),
-        };
+        let routes: Vec<TenantUsage> = held
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let used = totals
+                    .iter()
+                    .find(|(label, _)| *label == entry.label)
+                    .map(|(_, used)| *used);
+                match used {
+                    Some(used) => Some(entry.usage(used, now_secs)),
+                    None if entry.always => Some(entry.usage(0, now_secs)),
+                    None => None,
+                }
+            })
+            .collect();
         send_usage_body(cb, &render_usage_response(&held.tenant, &routes));
+    }
+
+    /// What `GET /v1/usage` reports for `tenant`: the static rule's
+    /// per-route buckets (those this replica holds, plus, with a shared
+    /// store, every route of the chain), then each `TENANT` rule with a token
+    /// limit. A rule is route-independent, so it is labelled `*`, followed by
+    /// its model scope when it has one.
+    fn usage_entries(&self, tenant: &str, now_secs: u64) -> Vec<UsageEntry> {
+        let mut entries = Vec::new();
+        if let Some(rule) = self.rule {
+            let window = rule.window_at(now_secs);
+            let dimension = rule.on.dimension();
+            let mut routes: BTreeSet<String> = self
+                .counters
+                .tenant_totals(tenant, dimension, window)
+                .into_iter()
+                .map(|(route, _)| route)
+                .collect();
+            if self.usage_reader.is_some() {
+                if let Some(names) = &self.route_names {
+                    let names: Vec<String> = names.load().as_ref().clone();
+                    routes.extend(names);
+                }
+            }
+            entries.extend(routes.into_iter().map(|route| UsageEntry {
+                key: LimitKey::for_tenant(&route, tenant),
+                label: route,
+                dimension,
+                window,
+                limit: rule.max_tokens,
+                always: false,
+            }));
+        }
+        let window = policy_window(now_secs);
+        for rule in self.rules.iter().filter(|r| r.key == RuleKey::Tenant) {
+            let Some(limit) = rule.limits.tokens_per_minute else {
+                continue;
+            };
+            let key = LimitKey::for_rule(format!("tenant={tenant}{}", rule.scope));
+            match entries.iter_mut().find(|e| e.key == key) {
+                // Two rules on one bucket: the lower limit applies.
+                Some(existing) => existing.limit = existing.limit.min(limit),
+                None => entries.push(UsageEntry {
+                    key,
+                    label: format!("*{}", rule.scope),
+                    dimension: WindowDimension::TotalTokens,
+                    window,
+                    limit,
+                    always: true,
+                }),
+            }
+        }
+        entries
     }
 }
 
@@ -1430,8 +1519,7 @@ impl TokenLimitFilterInstance {
 enum UsageRead {
     Idle,
     Waiting {
-        tenant: String,
-        window: WindowKey,
+        held: Held,
         answer: tokio::sync::oneshot::Receiver<UsageAnswer>,
     },
     Answered {
@@ -1440,10 +1528,10 @@ enum UsageRead {
     },
 }
 
-/// The tenant and window a held usage read was made for.
+/// The tenant and entries a held usage read was made for.
 struct Held {
     tenant: String,
-    window: WindowKey,
+    entries: Vec<UsageEntry>,
 }
 
 /// Why a shared-store usage read produced no answer.
@@ -1453,23 +1541,30 @@ enum UsageFailure {
     Timeout,
 }
 
-fn usage_rows(
-    rule: LimitRule,
+/// One bucket `GET /v1/usage` reports.
+struct UsageEntry {
+    /// The `route` field of the response: a route name, or `*` for a
+    /// route-independent rule.
+    label: String,
+    key: LimitKey,
+    dimension: WindowDimension,
     window: WindowKey,
-    now_secs: u64,
-    totals: &[(String, u64)],
-) -> Vec<TenantUsage> {
-    let reset_after = Duration::from_secs(window.end_secs().saturating_sub(now_secs));
-    totals
-        .iter()
-        .map(|(route, used)| TenantUsage {
-            route: route.clone(),
-            used: *used as f64,
-            limit: rule.max_tokens as f64,
-            remaining: rule.max_tokens.saturating_sub(*used) as f64,
-            reset_after,
-        })
-        .collect()
+    limit: u64,
+    /// Report even when nothing has been counted (a configured tenant
+    /// rule); a per-route bucket is reported only once it holds a count.
+    always: bool,
+}
+
+impl UsageEntry {
+    fn usage(&self, used: u64, now_secs: u64) -> TenantUsage {
+        TenantUsage {
+            route: self.label.clone(),
+            used: used as f64,
+            limit: self.limit as f64,
+            remaining: self.limit.saturating_sub(used) as f64,
+            reset_after: Duration::from_secs(self.window.end_secs().saturating_sub(now_secs)),
+        }
+    }
 }
 
 fn send_usage_body(cb: &mut dyn DecoderCallbacks, body: &str) {
@@ -1634,7 +1729,9 @@ impl HttpFilter for TokenLimitFilterInstance {
             let client: Option<std::net::IpAddr> = cb.stream_info().client_address;
             let mut unscoped = Vec::new();
             for (i, rule) in self.rules.iter().enumerate() {
-                let Some(key) = Self::rule_key(rule, tenant.as_deref(), client, headers) else {
+                let Some(key) =
+                    Self::rule_key(rule, tenant.as_deref(), key_id.as_deref(), client, headers)
+                else {
                     continue;
                 };
                 if rule.models.is_empty() {
@@ -1752,11 +1849,8 @@ impl HttpFilter for TokenLimitFilterInstance {
         if !matches!(self.usage_read, UsageRead::Waiting { .. }) {
             return None;
         }
-        let UsageRead::Waiting {
-            tenant,
-            window,
-            answer,
-        } = std::mem::replace(&mut self.usage_read, UsageRead::Idle)
+        let UsageRead::Waiting { held, answer } =
+            std::mem::replace(&mut self.usage_read, UsageRead::Idle)
         else {
             unreachable!("checked just above");
         };
@@ -1766,10 +1860,7 @@ impl HttpFilter for TokenLimitFilterInstance {
                 Ok(Ok(Err(_))) | Ok(Err(_)) => Err(UsageFailure::Store),
                 Err(_) => Err(UsageFailure::Timeout),
             };
-            self.usage_read = UsageRead::Answered {
-                held: Held { tenant, window },
-                answer,
-            };
+            self.usage_read = UsageRead::Answered { held, answer };
         }))
     }
 }
@@ -3752,6 +3843,14 @@ mod tests {
 
     impl Replica {
         fn over(store: Box<dyn ControlPlaneStore>, routes: &[&str]) -> Self {
+            Self::with_config(store, routes, &token_limit(10_000, 10_000.0 / 60.0))
+        }
+
+        fn with_config(
+            store: Box<dyn ControlPlaneStore>,
+            routes: &[&str],
+            config: &DynamicMessage,
+        ) -> Self {
             let ctx = FactoryContext {
                 stat_prefix: "ingress".to_string(),
                 ..FactoryContext::default()
@@ -3770,7 +3869,7 @@ mod tests {
                 Ok(names as Arc<dyn std::any::Any + Send + Sync>)
             })
             .unwrap();
-            let factory = match pinned_factory(&token_limit(10_000, 10_000.0 / 60.0), &ctx) {
+            let factory = match pinned_factory(config, &ctx) {
                 Ok(factory) => factory,
                 Err(e) => panic!("valid config must build: {e:?}"),
             };
@@ -4246,6 +4345,7 @@ mod tests {
             .unwrap()[0],
             None,
             None,
+            None,
             &{
                 let mut head = request_headers(None);
                 head.headers
@@ -4349,5 +4449,116 @@ mod tests {
         assert_eq!(refused(&*factory, RuleRequest::default()), None);
         // The global rule has room; the client's own rule does not.
         assert!(refused(&*factory, RuleRequest::default()).is_some());
+    }
+
+    // --- GET /v1/usage reports tenant rules ------------------------------------
+
+    /// A tenant token rule of 1 000 per minute, and one scoped to `gpt-4*`
+    /// of 500.
+    fn tenant_rules() -> DynamicMessage {
+        rules_config(vec![
+            limit_rule(TENANT_KEY, "", Some(1_000), None, None, &[]),
+            limit_rule(TENANT_KEY, "", Some(500), None, None, &["gpt-4*"]),
+        ])
+    }
+
+    fn reported_limits(body: &str) -> Vec<(String, u64, u64)> {
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+        parsed["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|route| {
+                (
+                    route["route"].as_str().unwrap().to_string(),
+                    route["used"].as_f64().unwrap() as u64,
+                    route["limit"].as_f64().unwrap() as u64,
+                )
+            })
+            .collect()
+    }
+
+    /// Dialect `key: tenant` entries lower to rules, not the per-route rule,
+    /// so the endpoint must report them or a dialect tenant sees nothing.
+    #[test]
+    fn usage_reports_each_tenant_rule_as_a_route_independent_entry() {
+        let a = Replica::with_config(
+            Box::new(InMemoryControlPlaneStore::default()),
+            &["chat"],
+            &tenant_rules(),
+        );
+        a.serve("acme", "chat", 300);
+
+        let (held, (status, _, body)) = a.usage_reply("acme");
+
+        assert!(!held);
+        assert_eq!(status, StatusCode::OK);
+        // The scoped rule saw no request naming a gpt-4 model, so it holds
+        // nothing, and is still reported: it is configured for this tenant.
+        assert_eq!(
+            reported_limits(&body),
+            [
+                ("*".to_string(), 300, 1_000),
+                ("*|models=gpt-4*".to_string(), 0, 500)
+            ]
+        );
+    }
+
+    #[test]
+    fn usage_reads_tenant_rules_from_a_shared_store() {
+        let (store, _) = SharedMemoryStore::new();
+        let a = Replica::with_config(Box::new(store.handle()), &["chat"], &tenant_rules());
+        let b = Replica::with_config(Box::new(store.handle()), &["chat"], &tenant_rules());
+        a.serve("acme", "chat", 300);
+        a.counters().flush_now().unwrap();
+
+        let (held, (status, _, body)) = b.usage_reply("acme");
+
+        assert!(held);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            reported_limits(&body),
+            [
+                ("*".to_string(), 300, 1_000),
+                ("*|models=gpt-4*".to_string(), 0, 500)
+            ]
+        );
+    }
+
+    /// `llmproxy.auth` strips `authorization` after verifying it, so an
+    /// `authorization` rule behind it buckets on the authenticated key id:
+    /// still one bucket per distinct credential.
+    #[test]
+    fn an_authorization_rule_behind_auth_buckets_per_authenticated_key() {
+        let rule = |name| {
+            parse_rules(&rules_config(vec![limit_rule(
+                HEADER,
+                name,
+                None,
+                Some(1),
+                None,
+                &[],
+            )]))
+            .unwrap()
+            .remove(0)
+        };
+        let authorization = rule("authorization");
+        let stripped = request_headers(None);
+        let key = |rule: &KeyedRule, key_id| {
+            TokenLimitFilterInstance::rule_key(rule, Some("t"), key_id, None, &stripped)
+        };
+        assert!(key(&authorization, Some("k-a")).is_some());
+        assert_ne!(
+            key(&authorization, Some("k-a")),
+            key(&authorization, Some("k-b")),
+            "two keys of one tenant get two buckets"
+        );
+        assert_eq!(
+            key(&authorization, None),
+            None,
+            "no header and no key: not counted"
+        );
+        // Any other missing header is still not counted, key id or not.
+        assert_eq!(key(&rule("x-api-key"), Some("k-a")), None);
     }
 }

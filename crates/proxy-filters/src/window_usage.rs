@@ -47,8 +47,9 @@ pub const USAGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// The least time between two warnings about failed usage reads.
 const READ_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Per-route totals for one tenant, sorted by route. Routes the store holds
-/// no count for are left out, as the local view leaves out routes with no
+/// Totals for one tenant by row label (a route name, or the label the filter
+/// gives a route-independent rule), sorted by label. Rows the store holds no
+/// count for are left out, as the local view leaves out routes with no
 /// bucket.
 pub type RouteTotals = Arc<[(String, u64)]>;
 
@@ -92,11 +93,12 @@ impl ChainRouteNames {
     }
 }
 
+/// One read: the tenant it answers for and the labelled rows it reads. Two
+/// requests for the same rows share a read in flight and a reused answer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReadKey {
     tenant: String,
-    dimension: WindowDimension,
-    window: WindowKey,
+    rows: Vec<(String, WindowRow)>,
 }
 
 enum Entry {
@@ -108,7 +110,6 @@ enum Entry {
 
 struct Job {
     key: ReadKey,
-    routes: Vec<String>,
 }
 
 struct Shared {
@@ -157,11 +158,33 @@ impl UsageReader {
         routes: Vec<String>,
         now: Instant,
     ) -> oneshot::Receiver<UsageAnswer> {
+        let routes: BTreeSet<String> = routes.into_iter().collect();
+        let rows = routes
+            .into_iter()
+            .map(|route| {
+                let row = WindowRow {
+                    subject: LimitKey::for_tenant(&route, tenant).to_string(),
+                    dimension,
+                    window,
+                };
+                (route, row)
+            })
+            .collect();
+        self.read_rows(tenant, rows, now)
+    }
+
+    /// Ask for `tenant`'s totals on labelled `rows`, which may mix
+    /// dimensions and windows. Same reuse and coalescing as [`Self::read`].
+    pub fn read_rows(
+        &self,
+        tenant: &str,
+        rows: Vec<(String, WindowRow)>,
+        now: Instant,
+    ) -> oneshot::Receiver<UsageAnswer> {
         let (tx, rx) = oneshot::channel();
         let key = ReadKey {
             tenant: tenant.to_string(),
-            dimension,
-            window,
+            rows,
         };
         {
             let mut entries = self.shared.lock_entries();
@@ -187,7 +210,7 @@ impl UsageReader {
                 }
             }
         }
-        if let Err(mpsc::SendError(job)) = self.jobs.send(Job { key, routes }) {
+        if let Err(mpsc::SendError(job)) = self.jobs.send(Job { key }) {
             self.shared.complete(
                 &job.key,
                 Err(StoreError::Unavailable(
@@ -215,23 +238,16 @@ impl Shared {
     }
 
     fn read_store(&self, job: &Job) -> UsageAnswer {
-        let routes: BTreeSet<&String> = job.routes.iter().collect();
-        let rows: Vec<WindowRow> = routes
-            .iter()
-            .map(|route| WindowRow {
-                subject: LimitKey::for_tenant(route, &job.key.tenant).to_string(),
-                dimension: job.key.dimension,
-                window: job.key.window,
-            })
-            .collect();
+        let rows: Vec<WindowRow> = job.key.rows.iter().map(|(_, row)| row.clone()).collect();
         let results = self.store.load_window_batch(&self.scope, &rows);
         let mut totals = Vec::new();
-        for (route, result) in routes.into_iter().zip(results) {
+        for ((label, _), result) in job.key.rows.iter().zip(results) {
             let used = result?;
             if used > 0 {
-                totals.push((route.clone(), used));
+                totals.push((label.clone(), used));
             }
         }
+        totals.sort();
         Ok(totals.into())
     }
 
