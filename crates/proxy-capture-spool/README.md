@@ -102,4 +102,4 @@ Use `make tq-proxy-capture-spool` for production redb behavior, faults, abrupt
 termination. The v1-versus-redb comparison experiment was retired after redb
 was chosen; it is recoverable from git history at commit b74f604. New throughput and integrated qualification must use
 freshly built production redb binaries. See
-[the selected design](../../internal-docs/capture-spool-redb-design.md).
+[the design](DESIGN.md).

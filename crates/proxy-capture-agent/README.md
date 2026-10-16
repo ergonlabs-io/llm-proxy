@@ -73,7 +73,7 @@ operational exporters. They do not implement the broader capture-policy IR
 proposal. `--request-records-file` conflicts with agent mode; the legacy JSONL
 path and its semantics are unchanged. `--request-record-max-attempts` remains
 1–64, default 64. Capture stays off when neither destination is supplied.
-The separate [strict capture runtime](../../internal-docs/end-user-capture-runtime.md)
+The separate [strict capture runtime](PROXY_RUNTIME.md)
 supports `node.metadata["io.llmproxy.capture"]`, including bounded policy/IR
 consumers, SIGHUP reload, and authenticated emergency control. It cannot be
 combined with these legacy CLI destinations. No simple-config capture fields
@@ -152,6 +152,6 @@ Use `make tq-proxy-capture-protocol`, `make tq-proxy-capture-agent`,
 `make tq-doc`, and workspace lint/dependency checks. Local socket and upstream
 tests require sandbox permission to bind isolated endpoints. Backend, transcript,
 and scale qualification remain separate work. The proxy's
-[strict capture runtime](../../internal-docs/end-user-capture-runtime.md) now
+[strict capture runtime](PROXY_RUNTIME.md) now
 provides policy reload and authenticated emergency control, independently of
 this agent's deployment configuration.
