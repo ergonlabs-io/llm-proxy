@@ -669,7 +669,13 @@ fn client_address_ignores_x_forwarded_for_without_trusted_hops() {
 #[test]
 fn client_address_uses_the_entry_trusted_hops_vouch_for() {
     let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4, 10.0.0.1"));
+    headers.insert(
+        "x-forwarded-for",
+        HeaderValue::from_static("1.2.3.4, 10.0.0.1"),
+    );
     let remote = v4(10, 0, 0, 9);
-    assert_eq!(client_address(&headers, remote, &opts(false, 1)), v4(1, 2, 3, 4));
+    assert_eq!(
+        client_address(&headers, remote, &opts(false, 1)),
+        v4(1, 2, 3, 4)
+    );
 }
