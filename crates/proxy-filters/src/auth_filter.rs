@@ -258,6 +258,82 @@ impl std::fmt::Debug for StoreSpec {
     }
 }
 
+impl StoreSpec {
+    /// The `auth.store` variant name, as the dialect spells it.
+    fn kind(&self) -> &'static str {
+        match self {
+            StoreSpec::InMemory => "in_memory",
+            StoreSpec::Persistent(_) => "persistent",
+            StoreSpec::Shared { .. } => "shared",
+        }
+    }
+}
+
+/// Makes N replicas on a per-replica store visible (ADR-0006 addendum
+/// "Admission stays local" §5). The proxy never knows the replica count, so
+/// it cannot detect the mistake; it warns where a configured node id
+/// suggests a fleet, and exports the store kind so the fleet can be checked
+/// from metrics alone. Called once per chain, from the closure that builds
+/// the chain's control plane, so a reload does not repeat either.
+///
+/// This fails open loudly (AGENTS.md "Fail-open controls"): the config
+/// still loads and each replica enforces its own limits.
+fn report_store_kind(
+    store: &'static str,
+    node_id: &str,
+    stat_prefix: &str,
+    registry: Option<&Arc<proxy_observability::stats::Registry>>,
+) {
+    let configured = node_id_is_configured(node_id);
+    if configured && store != "shared" {
+        tracing::warn!(
+            stat_prefix = %stat_prefix,
+            node_id = %node_id,
+            store = %store,
+            "llmproxy.auth: a node id is configured, which suggests more than one replica, \
+             but auth.store is not shared: limits and budgets apply per replica, so N \
+             replicas admit up to N times each limit. Set auth.store to shared to enforce \
+             them across the fleet"
+        );
+    }
+    if let Some(registry) = registry {
+        let node_label = if configured { node_id } else { "-" };
+        let handle = registry.resolve_capped(
+            &proxy_observability::stats::instruments::CONTROL_PLANE_STORE_INFO,
+            &[
+                ("scope", stat_prefix),
+                ("store", store),
+                ("node_id", node_label),
+            ],
+            STORE_INFO_SERIES_CEILING,
+            &[
+                ("scope", "overflow"),
+                ("store", store),
+                ("node_id", node_label),
+            ],
+        );
+        registry.add(proxy_observability::stats::WorkerId(0), handle, 1);
+    }
+}
+
+/// One series per chain, so the ceiling bounds the number of chains.
+const STORE_INFO_SERIES_CEILING: usize = 256;
+
+/// Whether the effective node id names this replica. Empty is unset, and `-`
+/// is what an unset id renders as; `spend_limit` treats both as unset too.
+fn node_id_is_configured(node_id: &str) -> bool {
+    !node_id.is_empty() && node_id != "-"
+}
+
+/// Why `store: shared` needs a configured node id (ADR-0006 addendum
+/// "Admission stays local" §5). Without one each boot writes under a fresh
+/// per-boot id, and the shared store keeps that boot's dedup state: spend
+/// rows for periods that never end keep it forever. `proxy-simple-config`
+/// returns the dialect's own wording, which can name only `--service-node`.
+const SHARED_STORE_NEEDS_NODE_ID: &str = "a shared store requires a configured node id: pass \
+     --service-node <name> (or set the bootstrap node.id) to a name unique to this replica and \
+     stable across its restarts";
+
 /// Reads `typed_config.store` (the `oneof` on `llmproxy.filters.v0.Authentication`).
 /// Unset and `in_memory` are indistinguishable here on purpose -- both mean
 /// [`StoreSpec::InMemory`] -- see the proto's doc for why unset defaults to
@@ -984,6 +1060,13 @@ impl HttpFilterFactory for AuthFilterFactory {
             jwt_validations.push(validation);
         }
 
+        if matches!(store_spec, StoreSpec::Shared { .. }) && !node_id_is_configured(ctx.node_id()) {
+            return Err(invalid(
+                "typed_config.store.shared",
+                SHARED_STORE_NEEDS_NODE_ID,
+            ));
+        }
+
         // The stats registry a shared store exports its policy-load cost to.
         // Looked up before `get_or_try_init`: its closure runs under the
         // singleton map's lock, which `get` also takes.
@@ -1040,6 +1123,12 @@ impl HttpFilterFactory for AuthFilterFactory {
                 for (snapshot, spec) in jwt_refreshes {
                     crate::jwks_refresh::start_jwks_refresher(snapshot, spec);
                 }
+                report_store_kind(
+                    store_spec.kind(),
+                    ctx.node_id(),
+                    &ctx.stat_prefix,
+                    stats_registry.as_ref(),
+                );
                 let mut lease_store: Option<Arc<dyn LeaseStore>> = None;
                 let store: Box<dyn ControlPlaneStore> = match store_spec {
                     StoreSpec::InMemory => Box::new(InMemoryControlPlaneStore::default()),
@@ -2507,6 +2596,163 @@ mod tests {
             .expect("a stale snapshot must refuse the key");
         assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reply.details, "auth_policy_stale");
+    }
+
+    // --- N replicas on a per-replica store (ADR-0006 addendum §5) ----------
+
+    /// A context carrying `node_id` as the effective node id, the way
+    /// `main.rs` builds one from `--service-node` or the bootstrap `node.id`.
+    fn ctx_for_node(node_id: &str) -> FactoryContext {
+        FactoryContext {
+            shared: Arc::new(SharedFactoryState::for_node(node_id.to_string())),
+            stat_prefix: "ingress".to_string(),
+            ..FactoryContext::default()
+        }
+    }
+
+    fn store_warnings(capture: &crate::control::log_capture::Capture) -> Vec<String> {
+        capture
+            .rendered_at_or_above(tracing::Level::WARN)
+            .into_iter()
+            .filter(|line| line.contains("auth.store is not shared"))
+            .collect()
+    }
+
+    /// A configured node id with `in_memory` or `persistent` warns once per
+    /// chain, naming the effect, and a second build of the chain (another
+    /// worker, or a reload) does not repeat it.
+    #[test]
+    fn a_node_id_on_a_per_replica_store_warns_once_naming_the_effect() {
+        let path = temp_db_path("store-warning");
+        let path_str = path.to_str().unwrap().to_string();
+        let base = || authentication(inline_secret("operator-hmac-secret"), vec![]);
+        for (store, config) in [
+            ("in_memory", with_in_memory_store(base())),
+            ("persistent", with_persistent_store(base(), &path_str)),
+        ] {
+            let ctx = ctx_for_node("replica-a");
+            let (capture, _guard) = crate::control::log_capture::Capture::start();
+            for _ in 0..2 {
+                if let Err(e) = AuthFilterFactory.create(&config, &ctx) {
+                    panic!("{store}: valid config must build: {e:?}");
+                }
+            }
+            let warnings = store_warnings(&capture);
+            assert_eq!(
+                warnings.len(),
+                1,
+                "{store}: exactly one warning: {warnings:?}"
+            );
+            let line = &warnings[0];
+            assert!(
+                line.contains("N replicas admit up to N times each limit"),
+                "{store}: the warning names the effect: {line}"
+            );
+            assert!(line.contains("node_id=replica-a"), "{store}: {line}");
+            assert!(line.contains(&format!("store={store}")), "{store}: {line}");
+            assert!(line.contains("stat_prefix=ingress"), "{store}: {line}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No node id configured: a single replica is the likely deployment, so
+    /// the store warning stays silent (AGENTS.md "Fail-open controls": warn
+    /// only where the control was meant to apply).
+    #[test]
+    fn no_node_id_means_no_store_warning() {
+        let config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        let (capture, _guard) = crate::control::log_capture::Capture::start();
+        for ctx in [FactoryContext::default(), ctx_for_node("-")] {
+            if let Err(e) = AuthFilterFactory.create(&config, &ctx) {
+                panic!("valid config must build: {e:?}");
+            }
+        }
+        assert!(store_warnings(&capture).is_empty());
+    }
+
+    /// A shared store is what a fleet should run, so a node id with it is
+    /// silent. Called directly: building a shared store needs a Redis.
+    #[test]
+    fn a_node_id_on_the_shared_store_does_not_warn() {
+        let (capture, _guard) = crate::control::log_capture::Capture::start();
+        report_store_kind("shared", "replica-a", "ingress", None);
+        assert!(store_warnings(&capture).is_empty());
+    }
+
+    /// `store: shared` with no configured node id is a load error at the
+    /// store's dotted path, naming the fix. With a node id the refusal does
+    /// not fire: the build gets as far as dialling the (unreachable) Redis.
+    #[test]
+    fn a_shared_store_without_a_node_id_is_refused() {
+        let config = with_shared_store(
+            authentication(inline_secret("operator-hmac-secret"), vec![]),
+            "redis://127.0.0.1:1/0",
+        );
+        for ctx in [FactoryContext::default(), ctx_for_node("-")] {
+            match AuthFilterFactory.create(&config, &ctx) {
+                Err(ConfigError::InvalidValue { field_path, reason }) => {
+                    assert_eq!(field_path, "typed_config.store.shared");
+                    assert!(reason.contains("--service-node"), "{reason}");
+                    assert!(reason.contains("node.id"), "{reason}");
+                }
+                Err(other) => panic!("expected InvalidValue, got {other:?}"),
+                Ok(_) => panic!("a shared store without a node id must be refused"),
+            }
+            assert!(ctx.get(TYPE_URL).is_none(), "no control plane is built");
+        }
+        if let Err(ConfigError::InvalidValue { field_path, reason }) =
+            AuthFilterFactory.create(&config, &ctx_for_node("replica-a"))
+        {
+            assert!(
+                !reason.contains("--service-node"),
+                "a configured node id passes the check: {field_path}: {reason}"
+            );
+        }
+    }
+
+    /// The store kind is exported once per chain, labelled by node id, so an
+    /// operator can see from metrics alone that a fleet's replicas each run
+    /// their own store. An unconfigured id renders as `-`, never as the
+    /// per-boot id, which would leave a new series after every restart.
+    #[test]
+    fn the_store_kind_is_exported_labelled_by_node_id() {
+        let config = authentication(inline_secret("operator-hmac-secret"), vec![]);
+        for (ctx, node_label) in [
+            (ctx_for_node("replica-a"), "replica-a"),
+            (
+                FactoryContext {
+                    stat_prefix: "ingress".to_string(),
+                    ..FactoryContext::default()
+                },
+                "-",
+            ),
+        ] {
+            let registry = proxy_observability::stats::StatsControl::new(1).registry();
+            ctx.shared
+                .get_or_try_init("", "", crate::usage_filter::STATS_REGISTRY_KEY, || {
+                    Ok(Arc::clone(&registry) as Arc<dyn std::any::Any + Send + Sync>)
+                })
+                .unwrap();
+            for _ in 0..2 {
+                if let Err(e) = AuthFilterFactory.create(&config, &ctx) {
+                    panic!("valid config must build: {e:?}");
+                }
+            }
+            let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+            let series: Vec<&str> = rendered
+                .lines()
+                .filter(|line| line.starts_with("envoy_llmproxy_control_plane_store_info{"))
+                .collect();
+            assert_eq!(
+                series,
+                vec![format!(
+                    "envoy_llmproxy_control_plane_store_info{{node_id=\"{node_label}\",\
+                     scope=\"ingress\",store=\"in_memory\"}} 1"
+                )
+                .as_str()],
+                "one series at 1, however many workers build the chain"
+            );
+        }
     }
 
     // 19: the shared-singleton property.

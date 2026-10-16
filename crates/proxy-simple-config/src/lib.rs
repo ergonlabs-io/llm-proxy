@@ -10,8 +10,8 @@ pub mod model;
 pub mod parse;
 
 pub use lower::{
-    has_inline_secrets, lower, lower_to_loaded, to_envoy_yaml, to_envoy_yaml_with_secrets, Lowered,
-    MODEL_HEADER, REDACTED,
+    has_inline_secrets, lower, lower_to_loaded, require_node_id_for_shared_store, to_envoy_yaml,
+    to_envoy_yaml_with_secrets, Lowered, MODEL_HEADER, REDACTED,
 };
 pub use model::SimpleConfig;
 pub use parse::{

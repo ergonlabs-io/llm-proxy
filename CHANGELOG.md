@@ -11,6 +11,17 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Breaking
+
+- `auth.store: shared` now requires a node id. In the dialect, pass
+  `--service-node <name>` (the dialect has no node id field); in Envoy mode,
+  pass `--service-node` or set the bootstrap `node.id`. Without one, the config
+  is a load error at `auth.store.shared` (dialect) or
+  `typed_config.store.shared` (Envoy mode). Use a name that is unique to the
+  replica and stable across its restarts, such as the pod name. Before, each
+  boot wrote under a new per-boot id, and the shared store kept that boot's
+  dedup state; spend rows for periods that never end kept it permanently.
+
 ### Added
 
 - Per-key model allow-lists. `PUT /keys/{id}/policy` (scoped form
@@ -57,6 +68,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - Generated configuration reference: `make config-reference` regenerates
   `docs/site/src/content/docs/configuration/reference.md` from the schema.
   `make config-reference-check` fails if the committed copy is stale, and `make ci` runs it.
+- A node id with `auth.store` set to `in_memory` or `persistent` now logs one
+  warning per auth chain at startup: limits and budgets apply per replica, so N
+  replicas admit up to N times each limit.
+- `envoy_llmproxy_control_plane_store_info{scope,store,node_id}` (always 1)
+  reports the store each auth chain uses and the replica's node id, so a fleet
+  can be checked from metrics.
 
 ### Changed
 

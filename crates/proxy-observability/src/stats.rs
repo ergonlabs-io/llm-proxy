@@ -873,6 +873,21 @@ pub mod instruments {
         attribute_keys: &["scope", "seam"],
         buckets: None,
     };
+    /// The control-plane store a chain's `llmproxy.auth` filter selected
+    /// (`auth.store`): one series per chain, value 1. `store` is `in_memory`,
+    /// `persistent` or `shared`. `node_id` is this replica's configured node
+    /// id, or `-` when none is configured; it is bounded at one value per
+    /// replica (ADR-0006 addendum "Admission stays local" §5). A fleet whose
+    /// replicas report several node ids and a store other than `shared`
+    /// enforces every limit and budget per replica. `scope` is the
+    /// operator-chosen HCM `stat_prefix`. Prometheus surface only.
+    pub const CONTROL_PLANE_STORE_INFO: Instrument = Instrument {
+        name: "llmproxy_control_plane_store_info",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{store}",
+        attribute_keys: &["scope", "store", "node_id"],
+        buckets: None,
+    };
     /// The rate card a chain is pricing with: one series per card version this
     /// process has held, value 1 for the active card and 0 for each retired
     /// one, and no series at 1 while the chain has no card. `scope` is the

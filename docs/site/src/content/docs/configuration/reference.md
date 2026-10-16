@@ -242,7 +242,7 @@ Exactly one of `in_memory`, `persistent`, or `shared`.
 |---|---|---|---|---|
 | `in_memory` | object | no | none | Keys and policy live only for the life of the process. Takes no fields. |
 | `persistent` | [AuthStorePersistent](#authstorepersistent) | no | none | Keys and policy survive a restart in an embedded `redb` file. The file is created if missing and takes a lock, so one process owns it at a time. |
-| `shared` | [AuthStoreShared](#authstoreshared) | no | none | Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. |
+| `shared` | [AuthStoreShared](#authstoreshared) | no | none | Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`. |
 
 Any other field is a load error.
 
@@ -379,7 +379,7 @@ Any other field is a load error.
 
 Used at: `auth.store.shared`.
 
-Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`.
+Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|

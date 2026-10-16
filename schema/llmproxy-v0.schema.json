@@ -267,7 +267,7 @@
     },
     "AuthStoreShared": {
       "type": "object",
-      "description": "Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`.",
+      "description": "Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`.",
       "additionalProperties": false,
       "properties": {
         "url": { "type": "string", "minLength": 1, "description": "The Redis connection URL, e.g. `redis://:${REDIS_PASSWORD}@host:6379/0`. Use `${ENV_VAR}` interpolation rather than inlining a password." },

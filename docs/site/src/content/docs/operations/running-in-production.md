@@ -97,6 +97,12 @@ http_filters:
       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 ```
 
+A `shared` store requires a node id. Start each replica with
+`--service-node <name>`, or set the bootstrap `node.id`. Without one, the
+proxy does not start: the load error names `typed_config.store.shared` (or
+`auth.store.shared` in the dialect). See
+[Node identity](#node-identity-service_node).
+
 `llmproxy.spend_limit` has no `store` field of its own. It resolves the
 `ControlPlane` singleton `llmproxy.auth` already built and flushes into
 whatever store that filter was given
@@ -153,7 +159,14 @@ llm-proxy --mode serve -c bootstrap.yaml --service-node replica-a
 `llmproxy.spend_limit` uses as the writer identity in every `FlushToken` it
 sends to the store.
 
-**If you never set it, the proxy does not refuse to start.** It synthesizes
+**With `auth.store: shared`, the node id is required.** Without one, the
+config is a load error at `auth.store.shared` (dialect) or
+`typed_config.store.shared` (Envoy mode), and the proxy does not start. The
+reason: a per-boot id leaves that boot's dedup state in the shared store
+after every restart, and spend rows for periods that never end keep it
+permanently.
+
+**With any other store, an unset node id does not stop the proxy.** It synthesizes
 `unconfigured-<pid>-<nanos>` (process id plus a nanosecond timestamp) and
 logs a warning once, at filter creation:
 
@@ -177,6 +190,26 @@ which exists so a metering detail never blocks the process from starting
 
 With `recovery_journal_path` configured, a stable node ID is required at load;
 the synthesized fallback is rejected for recoverable replicas.
+
+### A node id with a per-replica store
+
+The proxy does not know how many replicas you run, so it cannot detect N
+replicas that each use their own store. When a node id is set (bootstrap
+`node.id` or `--service-node`) and `auth.store` is `in_memory` or
+`persistent`, each auth chain logs one warning at startup:
+
+```text
+llmproxy.auth: a node id is configured, which suggests more than one replica,
+but auth.store is not shared: limits and budgets apply per replica, so N
+replicas admit up to N times each limit. Set auth.store to shared to enforce
+them across the fleet
+```
+
+The proxy still starts. To check a fleet from metrics, read
+`envoy_llmproxy_control_plane_store_info` on each replica: one series per
+chain, with labels `scope`, `store`, and `node_id`. If replicas report
+different `node_id` values and `store` is not `shared`, each replica enforces
+its own limits.
 
 ## Spend counters converge — they do not update instantly
 

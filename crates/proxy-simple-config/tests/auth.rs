@@ -5,7 +5,10 @@
 use proxy_config::ConfigError;
 use proxy_filters::auth_filter::AuthFilterFactory;
 use proxy_http::filter::{FactoryContext, HttpFilterFactory};
-use proxy_simple_config::{lower, lower_to_loaded, parse_simple_config_with_env, SimpleConfig};
+use proxy_simple_config::{
+    lower, lower_to_loaded, parse_simple_config_with_env, require_node_id_for_shared_store,
+    SimpleConfig,
+};
 
 fn test_env(name: &str) -> Option<String> {
     match name {
@@ -658,6 +661,32 @@ fn shared_store_inline_url_lowers_with_namespace_and_the_real_filter_accepts_it(
     assert!(auth_typed_config(&no_ns)["shared"]
         .get("namespace")
         .is_none());
+}
+
+/// ADR-0006 addendum "Admission stays local" §5: the dialect has no node id
+/// field, so `auth.store.shared` without `--service-node` is refused at its
+/// dialect path, naming the flag. Every other store needs no node id.
+#[test]
+fn shared_store_without_a_service_node_is_refused_naming_the_flag() {
+    let shared = parse(&config_with_store(
+        "{ shared: { url: \"redis://127.0.0.1:1/0\" } }",
+    ))
+    .expect("must parse");
+    for service_node in [None, Some(""), Some("-")] {
+        match require_node_id_for_shared_store(&shared, service_node) {
+            Err(ConfigError::InvalidValue { field_path, reason }) => {
+                assert_eq!(field_path, "auth.store.shared", "for {service_node:?}");
+                assert!(reason.contains("--service-node"), "{reason}");
+            }
+            other => panic!("expected InvalidValue for {service_node:?}, got {other:?}"),
+        }
+    }
+    require_node_id_for_shared_store(&shared, Some("replica-a"))
+        .expect("a configured node id satisfies the check");
+
+    let in_memory = parse(&config_with_store("{ in_memory: {} }")).expect("must parse");
+    require_node_id_for_shared_store(&in_memory, None)
+        .expect("a per-replica store needs no node id");
 }
 
 #[test]

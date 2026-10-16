@@ -2281,6 +2281,38 @@ fn lower_auth_store(
     }
 }
 
+/// Refuses `auth.store.shared` when this replica has no configured node id
+/// (ADR-0006 addendum "Admission stays local" §5). The dialect has no node id
+/// field, so `--service-node` is the only source; the caller passes its
+/// value. Lowering cannot check this itself: the node id is a CLI input, not
+/// part of the config. The Envoy-mode check in `proxy-filters`' `auth_filter`
+/// is the backstop and reports `typed_config.store.shared`.
+pub fn require_node_id_for_shared_store(
+    config: &SimpleConfig,
+    service_node: Option<&str>,
+) -> Result<(), ConfigError> {
+    let shared = config
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.store.as_ref())
+        .is_some_and(|store| store.shared.is_some());
+    let configured = service_node.is_some_and(|id| !id.is_empty() && id != "-");
+    if shared && !configured {
+        return Err(ConfigError::InvalidValue {
+            field_path: "auth.store.shared".to_string(),
+            reason: SHARED_STORE_NEEDS_NODE_ID.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Why `auth.store.shared` needs `--service-node`. Without it each boot
+/// writes under a fresh per-boot id and the shared store keeps that boot's
+/// dedup state.
+const SHARED_STORE_NEEDS_NODE_ID: &str = "a shared store requires a configured node id: pass \
+     --service-node <name> with a name unique to this replica and stable across its restarts \
+     (the dialect has no node id field)";
+
 /// Why `auth.tenant_credentials` needs `auth.store.persistent` or `shared`. The same words
 /// as the Envoy-mode check in `proxy-filters`' `auth_filter`, so both entry
 /// points report one message.

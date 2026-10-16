@@ -67,7 +67,11 @@ fn redis_two_processes_share_tenant_and_key_stream_ceilings_and_a_killed_replica
     let dir_a = scratch_dir("a");
     let dir_b = scratch_dir("b");
 
-    let mut a = Proxy::start(&dir_a, &config_text(mock.addr, &redis, &namespace));
+    let mut a = Proxy::start(
+        &dir_a,
+        "replica-a",
+        &config_text(mock.addr, &redis, &namespace),
+    );
     let k1 = mint_key(&a, "k1");
     let k2 = mint_key(&a, "k2");
     admin_put(
@@ -85,7 +89,11 @@ fn redis_two_processes_share_tenant_and_key_stream_ceilings_and_a_killed_replica
         "/keys/k1/limits",
         r#"{"limits":{"concurrent_streams":1}}"#,
     );
-    let b = Proxy::start(&dir_b, &config_text(mock.addr, &redis, &namespace));
+    let b = Proxy::start(
+        &dir_b,
+        "replica-b",
+        &config_text(mock.addr, &redis, &namespace),
+    );
     let (k1, k2) = (format!("Bearer {k1}"), format!("Bearer {k2}"));
 
     // Key ceiling: k1 holds its one stream on A, so B refuses k1.
@@ -202,7 +210,9 @@ struct Proxy {
 }
 
 impl Proxy {
-    fn start(dir: &Path, config: &str) -> Proxy {
+    /// `node` is the replica's `--service-node`: a shared store refuses to
+    /// load without one (ADR-0006 addendum "Admission stays local" §5).
+    fn start(dir: &Path, node: &str, config: &str) -> Proxy {
         let listen = port_after(config, "listen: 127.0.0.1:").expect("listen port");
         let admin = port_after(config, "admin: 127.0.0.1:").expect("admin port");
         let path = dir.join("llmproxy.yaml");
@@ -213,6 +223,8 @@ impl Proxy {
                 path.to_str().expect("utf-8 path"),
                 "--concurrency",
                 "1",
+                "--service-node",
+                node,
             ])
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())

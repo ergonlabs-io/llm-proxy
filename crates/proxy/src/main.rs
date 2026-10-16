@@ -406,6 +406,15 @@ fn load(args: &Args) -> Result<(String, LoadedBootstrap), (String, String)> {
     }
     let config = proxy_simple_config::load_simple_config_file(path)
         .map_err(|e| (display.clone(), e.to_string()))?;
+    // Translate only prints the lowering; validate and serve run as a
+    // replica, which needs a node id with a shared store.
+    if args.mode != Mode::Translate {
+        proxy_simple_config::require_node_id_for_shared_store(
+            &config,
+            args.service_node.as_deref(),
+        )
+        .map_err(|e| (display.clone(), e.to_string()))?;
+    }
 
     if args.mode == Mode::Translate {
         // Secrets are redacted unless asked for.

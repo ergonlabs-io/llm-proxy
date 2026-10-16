@@ -588,3 +588,97 @@ impl WaitTimeoutOrKill for std::process::Child {
         }
     }
 }
+
+/// A dialect config with `auth.store.shared`, listening on an ephemeral port.
+/// Nothing here dials the Redis: the refusal comes first.
+fn shared_store_dialect_config(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "llm-proxy-shared-node-id-{tag}-{}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        "version: 0\n\
+         listen: 127.0.0.1:0\n\
+         providers:\n  openai:\n    type: openai\n    base_url: http://127.0.0.1:9\n    api_key: sk-x\n\
+         routes:\n  - { model: \"*\", provider: openai }\n\
+         auth:\n  hmac_secret: shared-node-id-secret\n  \
+         store: { shared: { url: \"redis://127.0.0.1:1/0\" } }\n",
+    )
+    .unwrap();
+    path
+}
+
+/// ADR-0006 addendum "Admission stays local" §5, dialect: `auth.store.shared`
+/// without `--service-node` fails validate (and so serve) at the dialect
+/// path, naming the flag; the same config with the flag validates.
+#[test]
+fn dialect_shared_store_without_service_node_is_refused() {
+    let path = shared_store_dialect_config("dialect");
+    let validate = |service_node: Option<&str>| {
+        let mut command = Command::new(BIN);
+        command.args(["--config", path.to_str().unwrap(), "--mode", "validate"]);
+        if let Some(node) = service_node {
+            command.args(["--service-node", node]);
+        }
+        command.output().expect("failed to run llm-proxy")
+    };
+    let refused = validate(None);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(stderr.contains("`auth.store.shared`"), "{stderr}");
+    assert!(stderr.contains("--service-node"), "{stderr}");
+    let accepted = validate(Some("replica-a"));
+    assert!(accepted.status.success(), "{accepted:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same refusal in Envoy mode, where it comes from the auth filter's
+/// factory as the workers build the chain: serve exits non-zero at startup
+/// with the full dotted path, before any listener serves.
+#[test]
+fn envoy_shared_store_without_a_node_id_fails_serve_at_startup() {
+    let dialect = shared_store_dialect_config("envoy-src");
+    let translated = Command::new(BIN)
+        .args([
+            "--config",
+            dialect.to_str().unwrap(),
+            "--mode",
+            "translate",
+            "--reveal-secrets",
+        ])
+        .output()
+        .expect("failed to run llm-proxy");
+    assert!(translated.status.success(), "{translated:?}");
+    let bootstrap = std::env::temp_dir().join(format!(
+        "llm-proxy-shared-node-id-envoy-{}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&bootstrap, &translated.stdout).unwrap();
+
+    let mut child = Command::new(BIN)
+        .args(["-c", bootstrap.to_str().unwrap(), "--concurrency", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn llm-proxy");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("serve did not refuse the config within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(!status.success(), "{status:?}");
+    assert!(stderr.contains("`typed_config.store.shared`"), "{stderr}");
+    assert!(stderr.contains("--service-node"), "{stderr}");
+    let _ = std::fs::remove_file(&dialect);
+    let _ = std::fs::remove_file(&bootstrap);
+}

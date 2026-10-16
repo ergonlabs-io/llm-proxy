@@ -490,7 +490,10 @@ Keys and tenant policy live in one of three stores. The default,
 `in_memory`, holds everything only for the life of the process. `persistent`
 (a `path`) selects an embedded `redb` file that survives a restart of that
 one process. `shared` (a Redis `url` or `url_file`, optional `namespace`)
-selects Redis, which every replica shares.
+selects Redis, which every replica shares. A `shared` store requires a node
+id: start each replica with `--service-node <name>`, or the config does not
+load (see
+[Running in production](../../operations/running-in-production/#node-identity-service_node)).
 
 In the `llmproxy` dialect, set `auth.store` to one of those shapes; see
 [Configuration file](../../configuration/configuration-file/). In Envoy mode the
