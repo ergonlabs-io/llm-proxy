@@ -418,6 +418,7 @@ pub struct FilterChainHandler {
     /// check.
     tracing: Option<TracingWiring>,
     request_record_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    ledger: Option<Arc<proxy_observability::records::Ledger>>,
 }
 
 /// [`FilterChainHandler::tracing`]'s payload -- bundled rather than two
@@ -460,6 +461,7 @@ impl FilterChainHandler {
             latency_stats: None,
             tracing: None,
             request_record_sink: None,
+            ledger: None,
         }
     }
 
@@ -628,6 +630,13 @@ impl FilterChainHandler {
         sink: Arc<dyn proxy_observability::records::RequestRecordSink>,
     ) -> Self {
         self.request_record_sink = Some(sink);
+        self
+    }
+
+    /// Wires the billing ledger (ADR-0009): every request this handler
+    /// dials to an upstream gets an entry at stream end.
+    pub fn with_ledger(mut self, ledger: Arc<proxy_observability::records::Ledger>) -> Self {
+        self.ledger = Some(ledger);
         self
     }
 }
@@ -845,6 +854,7 @@ impl StreamHandler for FilterChainHandler {
                 && self.latency_stats.is_none()
                 && self.tracing.is_none()
                 && !stream_info.borrow().metadata_enabled
+                && self.ledger.is_none()
             {
                 return resp;
             }
@@ -880,6 +890,7 @@ impl StreamHandler for FilterChainHandler {
                 latency_stats: self.latency_stats.clone(),
                 span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
                 request_record_sink,
+                ledger: self.ledger.clone(),
             };
             HttpResponseParts {
                 head: resp.head,

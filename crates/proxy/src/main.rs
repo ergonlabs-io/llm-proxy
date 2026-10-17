@@ -3000,6 +3000,8 @@ async fn worker_main(
         latency: latency_stats,
         tracing: tracing_handles,
         metadata: metadata_sink,
+        // No ledger writer exists yet, so nothing is wired (ADR-0009 decision 6).
+        ledger: None,
         connection_limiter: ctx.connection_limiter.clone(),
     };
 

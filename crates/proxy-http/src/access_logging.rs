@@ -22,7 +22,7 @@ use hyper::body::{Body, Frame};
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
 use proxy_observability::access_log::{render_into, FormatOp, FormatString, LlmTokens, LogContext};
 use proxy_observability::records::{
-    RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
+    Ledger, LedgerCharge, RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
 };
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
@@ -299,6 +299,9 @@ pub(crate) struct AccessLogContext {
     /// Optional end-user metadata sink. Submission is a single nonblocking
     /// try-send at terminal completion; capture loss never changes the reply.
     pub(crate) request_record_sink: Option<Arc<dyn RequestRecordSink>>,
+    /// The billing ledger, when one is wired. Unlike the record sink, it
+    /// takes an entry for every dialled request, captured or not.
+    pub(crate) ledger: Option<Arc<Ledger>>,
 }
 
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
@@ -644,7 +647,12 @@ impl LoggingBody {
             )
         };
 
-        if let Some(sink) = ctx.request_record_sink.as_ref().filter(|_| capture_allowed) {
+        let record_sink = ctx.request_record_sink.as_ref().filter(|_| capture_allowed);
+        // ADR-0009 decision 2: a request dialled to an upstream gets an
+        // entry, even one charged zero, since the provider may still bill
+        // it. One refused before dialling never set an upstream host.
+        let ledger = ctx.ledger.as_ref().filter(|_| upstream_host.is_some());
+        if record_sink.is_some() || ledger.is_some() {
             // Request records never use the caller's x-request-id as their
             // identity. Internal identity is pinned at request admission.
             let request_id = ctx
@@ -832,33 +840,47 @@ impl LoggingBody {
                     }
                 }
             }
-            // No validity pre-check here: a malformed record must reach the
-            // sink (or capture permit) so it is counted as `invalid` in
-            // `llmproxy_metadata_admission` rather than vanishing. Dropping the
-            // permit on that path releases its reservation.
-            #[cfg(unix)]
-            if let Some(Ok(permit)) = terminal {
-                // Trusted ownership identifiers are rejected, never truncated into collisions.
-                if tenant
-                    .as_ref()
-                    .is_none_or(|t| t.len() <= MAX_PRINCIPAL_ID_BYTES)
-                    && usage_attribution
-                        .0
-                        .as_ref()
-                        .is_none_or(|k| k.len() <= MAX_PRINCIPAL_ID_BYTES)
-                    && user_id
-                        .as_ref()
-                        .is_none_or(|u| u.len() <= MAX_PRINCIPAL_ID_BYTES)
-                {
-                    let _ = permit.submit(record);
-                } else if let Some(lease) = &lease {
-                    lease.identity_limit();
+            let mut record = Some(record);
+            if let Some(ledger) = ledger {
+                // Cloned only when the best-effort record sink also takes it.
+                let entry_record = if record_sink.is_some() {
+                    record.clone()
+                } else {
+                    record.take()
+                };
+                if let Some(entry_record) = entry_record {
+                    ledger.append(entry_record, ledger_charge(&ctx.stream_info.borrow().llm));
                 }
-            } else {
+            }
+            if let (Some(sink), Some(record)) = (record_sink, record) {
+                // No validity pre-check here: a malformed record must reach the
+                // sink (or capture permit) so it is counted as `invalid` in
+                // `llmproxy_metadata_admission` rather than vanishing. Dropping the
+                // permit on that path releases its reservation.
+                #[cfg(unix)]
+                if let Some(Ok(permit)) = terminal {
+                    // Trusted ownership identifiers are rejected, never truncated into collisions.
+                    if tenant
+                        .as_ref()
+                        .is_none_or(|t| t.len() <= MAX_PRINCIPAL_ID_BYTES)
+                        && usage_attribution
+                            .0
+                            .as_ref()
+                            .is_none_or(|k| k.len() <= MAX_PRINCIPAL_ID_BYTES)
+                        && user_id
+                            .as_ref()
+                            .is_none_or(|u| u.len() <= MAX_PRINCIPAL_ID_BYTES)
+                    {
+                        let _ = permit.submit(record);
+                    } else if let Some(lease) = &lease {
+                        lease.identity_limit();
+                    }
+                } else {
+                    let _ = sink.submit(record);
+                }
+                #[cfg(not(unix))]
                 let _ = sink.submit(record);
             }
-            #[cfg(not(unix))]
-            let _ = sink.submit(record);
         }
 
         #[cfg(unix)]
@@ -1025,6 +1047,27 @@ impl LoggingBody {
         for logger in ctx.loggers.iter() {
             logger.log(&log_ctx);
         }
+    }
+}
+
+/// The charge a ledger entry records: the spend filter's own when it
+/// charged, else the list price rounded the way the spend filter rounds it,
+/// else nothing (ADR-0009 decision 4). Never recomputed from tokens here.
+fn ledger_charge(llm: &crate::stream_info::LlmStats) -> LedgerCharge {
+    if let Some(charge) = &llm.spend_charge {
+        LedgerCharge {
+            charged_micro_usd: charge.micro_usd,
+            charged_scopes: charge.scopes.clone(),
+            rate_card_version: charge.rate_card_version.clone(),
+        }
+    } else if let Some(cost) = &llm.list_cost {
+        LedgerCharge {
+            charged_micro_usd: cost.micro_usd,
+            charged_scopes: Vec::new(),
+            rate_card_version: Some(cost.rate_card_version.clone()),
+        }
+    } else {
+        LedgerCharge::default()
     }
 }
 
@@ -1268,6 +1311,7 @@ mod tests {
             latency_stats: None,
             span_sink: None,
             request_record_sink: None,
+            ledger: None,
         };
 
         let body = local_boxed(
@@ -1398,6 +1442,7 @@ mod tests {
         assert_eq!(render_with_stream_info(fmt, |_| {}).await, "- -");
         let cost = || crate::stream_info::LlmListCost {
             nanodollars: 5,
+            micro_usd: 1,
             rate_card_version: "v1".into(),
         };
         let line = render_with_stream_info(fmt, |info| {
@@ -1551,6 +1596,7 @@ mod tests {
         let llm = crate::stream_info::LlmStats {
             list_cost: Some(crate::stream_info::LlmListCost {
                 nanodollars: 987_654,
+                micro_usd: 988,
                 rate_card_version: "v1+abcdef".into(),
             }),
             ..Default::default()
@@ -1609,6 +1655,7 @@ mod tests {
             });
             info.llm.list_cost = Some(crate::stream_info::LlmListCost {
                 nanodollars: 987_654,
+                micro_usd: 988,
                 rate_card_version: version.clone(),
             });
         }
@@ -1634,6 +1681,53 @@ mod tests {
         assert_eq!(cost.kind, "list");
         assert_eq!(cost.rate_card_version, version);
         assert!(records.try_recv().is_err());
+    }
+
+    /// The spend filter and the usage filter each price from their own card
+    /// snapshot, which differ across a card swap. The entry copies the
+    /// charge the spend counters received, not the list price.
+    #[tokio::test]
+    async fn the_ledger_entry_copies_the_spend_charge_over_the_list_price() {
+        #[derive(Default)]
+        struct Entries(Mutex<Vec<proxy_observability::records::LedgerEntry>>);
+        impl proxy_observability::records::LedgerSink for Entries {
+            fn append(&self, entry: proxy_observability::records::LedgerEntry) {
+                self.0.lock().unwrap().push(entry);
+            }
+        }
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        let entries = Arc::new(Entries::default());
+        ctx.ledger = Some(Arc::new(Ledger::new("i".into(), 1, entries.clone())));
+        let scope = proxy_observability::records::ChargedScope {
+            scope: proxy_observability::records::ChargeScope::Key,
+            id: "key-a".into(),
+            period: "2026-10".into(),
+        };
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.upstream_host = Some("127.0.0.1:1".into());
+            info.llm.list_cost = Some(crate::stream_info::LlmListCost {
+                nanodollars: 9_000,
+                micro_usd: 9,
+                rate_card_version: "new-card".into(),
+            });
+            info.llm.spend_charge = Some(crate::stream_info::LlmSpendCharge {
+                micro_usd: 5,
+                rate_card_version: Some("old-card".into()),
+                scopes: vec![scope.clone()],
+            });
+        }
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|never: std::convert::Infallible| match never {}),
+        );
+        LoggingBody::new(body, ctx).collect().await.unwrap();
+        let entries = entries.0.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].charged_micro_usd, 5);
+        assert_eq!(entries[0].rate_card_version.as_deref(), Some("old-card"));
+        assert_eq!(entries[0].charged_scopes, [scope]);
     }
 
     #[tokio::test]
@@ -2088,6 +2182,7 @@ mod tests {
             latency_stats: None,
             span_sink: None,
             request_record_sink: None,
+            ledger: None,
         }
     }
 

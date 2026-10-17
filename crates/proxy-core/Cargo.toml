@@ -44,6 +44,8 @@ hyper = { workspace = true }
 http-body-util = { workspace = true }
 proxy-xds = { workspace = true, features = ["test-support"] }
 proxy-api = { workspace = true }
+# The ledger tests build their HTTP chain from a dialect config, as production does.
+proxy-simple-config = { workspace = true }
 # Test helpers build a `StatsControl` to resolve the
 # `RouterStats` `initial_bind`/`build_listener_hcm` now require -- production
 # code only ever consumed `proxy_http::stat_handles::RouterStats`, already

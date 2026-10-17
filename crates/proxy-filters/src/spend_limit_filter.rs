@@ -29,7 +29,9 @@ use proxy_http::filter::{
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders,
     ResponseHeaders, ResponseTrailers,
 };
+use proxy_http::stream_info::LlmSpendCharge;
 use proxy_http::tenant_credentials::CredentialSource;
+use proxy_observability::records::{ChargeScope, ChargedScope};
 use proxy_observability::ResponseFlag;
 
 use crate::auth::{KeyId, TenantId};
@@ -668,6 +670,7 @@ impl SpendLimitFilterInstance {
         }
 
         let now = Utc::now();
+        let mut scopes = Vec::new();
         // ADR-0007 decision 8: spend is added to a budget only when the
         // attempt's source matches the budget's scope. A subject with NO
         // configured budget records unconditionally -- those counters also
@@ -687,6 +690,11 @@ impl SpendLimitFilterInstance {
                 cluster.as_deref(),
                 selected_model.as_deref().or(model.as_deref()),
             );
+            scopes.push(ChargedScope {
+                scope: ChargeScope::Key,
+                id: key_id.as_str().to_owned(),
+                period: period.key_for(now).as_str().to_owned(),
+            });
         }
         if let Some((tenant, tenant_period)) = &self.tenant {
             if self
@@ -701,8 +709,30 @@ impl SpendLimitFilterInstance {
                     cluster.as_deref(),
                     selected_model.as_deref().or(model.as_deref()),
                 );
+                scopes.push(ChargedScope {
+                    scope: ChargeScope::Tenant,
+                    id: tenant.as_str().to_owned(),
+                    period: tenant_period.key_for(now).as_str().to_owned(),
+                });
             }
         }
+        // The ledger copies this rather than pricing the request again: the
+        // usage filter's card snapshot can differ from this one across a
+        // card swap (ADR-0009 decision 4).
+        let (micro_usd, rate_card_version) = match charge {
+            Charge::Priced(amount) => (
+                amount.as_micros(),
+                self.pricing_snapshot
+                    .as_ref()
+                    .map(|pricing| pricing.version().to_owned()),
+            ),
+            Charge::Unpriced => (0, None),
+        };
+        cb.stream_info().llm.spend_charge = Some(LlmSpendCharge {
+            micro_usd,
+            rate_card_version,
+            scopes,
+        });
     }
 }
 

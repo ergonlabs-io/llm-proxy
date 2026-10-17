@@ -35,7 +35,27 @@ pub struct LlmTokenUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmListCost {
     pub nanodollars: u64,
+    /// `nanodollars` rounded up to micro-USD by the same function the spend
+    /// filter charges with, so a request with no spend filter is entered in
+    /// the ledger at the amount it would have been charged (ADR-0009
+    /// decision 4).
+    pub micro_usd: u64,
     pub rate_card_version: String,
+}
+
+/// What the spend filter added to the spend counters for this request,
+/// published when it priced the request's usage so the ledger entry copies
+/// the charge instead of pricing it a second time (ADR-0009 decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmSpendCharge {
+    /// The charge; 0 when the rate card does not price the request.
+    pub micro_usd: u64,
+    /// The version of the card the spend filter priced with; `None` when it
+    /// had no card.
+    pub rate_card_version: Option<String>,
+    /// The counters it was added to. Empty when no budget's credential scope
+    /// matched the attempt (ADR-0007 decision 8).
+    pub scopes: Vec<proxy_observability::records::ChargedScope>,
 }
 
 impl LlmTokenUsage {
@@ -75,6 +95,9 @@ pub struct LlmStats {
     pub usage: Option<LlmTokenUsage>,
     /// Filled once, alongside final usage, after the response stream ends.
     pub list_cost: Option<LlmListCost>,
+    /// Written by the spend filter when it charged this request; `None` when
+    /// no spend filter ran or it saw no usage.
+    pub spend_charge: Option<LlmSpendCharge>,
     /// The model the provider's response says it served (JSON `model`, or the
     /// first SSE frame that names one), bounded by the usage filter. Audit
     /// evidence, and the price key when the rate card lists it. `None` when the

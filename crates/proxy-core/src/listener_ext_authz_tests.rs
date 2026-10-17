@@ -126,6 +126,7 @@ async fn handler_with(
         latency_stats: &latency,
         tracing_handles: None,
         metadata: None,
+        ledger: None,
         factory_state: &shared,
     };
     build_listener_hcm(&snapshot.listeners["authorized_http"], &runtime)

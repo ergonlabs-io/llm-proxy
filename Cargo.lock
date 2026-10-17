@@ -2032,6 +2032,7 @@ dependencies = [
  "proxy-filters",
  "proxy-http",
  "proxy-observability",
+ "proxy-simple-config",
  "proxy-xds",
  "rcgen",
  "regex",

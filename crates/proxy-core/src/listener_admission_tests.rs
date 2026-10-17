@@ -220,6 +220,7 @@ async fn start(initial: Arc<ConfigSnapshot>) -> Harness {
         latency: tests::latency_stats_for(&control),
         tracing: None,
         metadata: None,
+        ledger: None,
         connection_limiter: limiter.clone(),
     };
     let factory_state = Arc::new(SharedFactoryState::default());

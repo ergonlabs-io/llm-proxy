@@ -263,6 +263,7 @@ struct HcmRuntime<'a> {
     latency_stats: &'a Arc<GenAiLatencyStats>,
     tracing_handles: Option<&'a TracingHandles>,
     metadata: Option<&'a Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    ledger: Option<&'a Arc<proxy_observability::records::Ledger>>,
     factory_state: &'a Arc<SharedFactoryState>,
 }
 
@@ -390,6 +391,9 @@ pub struct StatsRecorders {
     /// means [`build_hcm_handler`] never enables tracing, so handlers pay nothing extra.
     pub tracing: Option<TracingHandles>,
     pub metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    /// The billing ledger (ADR-0009). `None` until a ledger writer is configured; every worker
+    /// shares the one `Ledger` so its `seq` is gapless across the instance.
+    pub ledger: Option<Arc<proxy_observability::records::Ledger>>,
     /// The process-wide downstream connection counter. Not a recorder, but bundled for the same
     /// argument-count reason.
     pub connection_limiter: crate::admission::ConnectionLimiter,
@@ -430,6 +434,7 @@ struct WorkerShared<'a> {
     /// Span sink and head-sampling ratio; see [`StatsRecorders::tracing`].
     tracing: &'a Option<TracingHandles>,
     metadata: &'a Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    ledger: &'a Option<Arc<proxy_observability::records::Ledger>>,
     /// The per-serve [`SharedFactoryState`], shared by every worker's filter-factory build. Passed
     /// to each `HttpFilterFactory::create` through `FactoryContext`.
     factory_state: &'a Arc<SharedFactoryState>,
@@ -458,6 +463,7 @@ fn spawn_bound(
         latency_stats: shared.latency_stats,
         tracing_handles: shared.tracing.as_ref(),
         metadata: shared.metadata.as_ref(),
+        ledger: shared.ledger.as_ref(),
         factory_state: shared.factory_state,
     };
     let hcm = build_listener_hcm(listener_ir, &hcm_runtime)?;
@@ -487,6 +493,7 @@ fn spawn_bound(
             latency_stats: shared.latency_stats.clone(),
             tracing_handles: shared.tracing.clone(),
             metadata: shared.metadata.clone(),
+            ledger: shared.ledger.clone(),
             factory_state: shared.factory_state.clone(),
             secret_registry: shared.secret_registry.clone(),
         },
@@ -547,6 +554,7 @@ pub fn initial_bind(
         latency_stats: &stats.latency,
         tracing: &stats.tracing,
         metadata: &stats.metadata,
+        ledger: &stats.ledger,
         factory_state,
         secret_registry,
     };
@@ -621,6 +629,7 @@ struct AcceptLoopShared {
     /// (`tracing::warn!` a few lines below the destructure).
     tracing_handles: Option<TracingHandles>,
     metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    ledger: Option<Arc<proxy_observability::records::Ledger>>,
     /// This worker's [`SharedFactoryState`] handle -- see
     /// [`WorkerShared::factory_state`]; needed here (not just at
     /// [`spawn_bound`] time) for the identical reason `token_stats` is (the
@@ -661,6 +670,7 @@ fn spawn_accept_loop(
         latency_stats,
         tracing_handles,
         metadata,
+        ledger,
         factory_state,
         secret_registry,
     } = shared;
@@ -751,6 +761,7 @@ fn spawn_accept_loop(
                         latency_stats: &latency_stats,
                         tracing_handles: tracing_handles.as_ref(),
                         metadata: metadata.as_ref(),
+                        ledger: ledger.as_ref(),
                         factory_state: &factory_state,
                     };
                     match build_listener_hcm(l, &hcm_runtime) {
@@ -1400,6 +1411,9 @@ fn build_hcm_handler(
     if let Some(sink) = runtime.metadata {
         handler = handler.with_request_record_sink(sink.clone());
     }
+    if let Some(ledger) = runtime.ledger {
+        handler = handler.with_ledger(ledger.clone());
+    }
     // `.with_tracing` on the FilterChainHandler half: it mints the SERVER span and joins or propagates
     // an inbound `traceparent`. The CLIENT-span half is on the router above.
     if let Some(t) = runtime.tracing_handles {
@@ -1549,6 +1563,7 @@ fn reconcile(
         latency_stats: &stats.latency,
         tracing: &stats.tracing,
         metadata: &stats.metadata,
+        ledger: &stats.ledger,
         factory_state,
         secret_registry,
     };
@@ -1745,6 +1760,10 @@ pub async fn run_listener_manager(
 #[cfg(test)]
 #[path = "listener_ext_authz_tests.rs"]
 mod ext_authz_tests;
+
+#[cfg(test)]
+#[path = "listener_ledger_tests.rs"]
+mod ledger_tests;
 
 #[cfg(test)]
 #[path = "listener_admission_tests.rs"]
@@ -2330,6 +2349,7 @@ mod tests {
             latency: latency_stats_for(&stats_control),
             tracing: None,
             metadata: None,
+            ledger: None,
             connection_limiter: crate::admission::ConnectionLimiter::default(),
         };
         let factory_state = Arc::new(SharedFactoryState::default());
@@ -3545,6 +3565,7 @@ mod tests {
                 latency: latency_stats_for(&stats_control),
                 tracing: None,
                 metadata: None,
+                ledger: None,
                 connection_limiter: crate::admission::ConnectionLimiter::default(),
             };
             let factory_state = Arc::new(SharedFactoryState::default());
@@ -4511,6 +4532,7 @@ static_resources:
             latency_stats: &latency_stats,
             tracing_handles: None,
             metadata: None,
+            ledger: None,
             factory_state: &factory_state,
         };
         let err = match build_listener_hcm(listener_ir, &hcm_runtime) {
@@ -4635,6 +4657,7 @@ static_resources:
             latency_stats: &latency_stats,
             tracing_handles: None,
             metadata: None,
+            ledger: None,
             factory_state: &factory_state,
         };
         build_listener_hcm(l1, &hcm_runtime).expect("listener l1's filter chain must build");
@@ -4729,6 +4752,7 @@ static_resources:
             latency_stats: &latency_stats,
             tracing_handles: None,
             metadata: None,
+            ledger: None,
             factory_state,
         };
         build_listener_hcm(

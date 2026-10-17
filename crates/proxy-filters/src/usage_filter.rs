@@ -213,7 +213,14 @@ impl PricingRegistry {
         pricing?
             .list
             .list_cost_for_cluster(cluster?, model?, usage)
-            .map(|nano| nano.saturating_add(999) / 1000)
+            .map(Self::charge_micro_usd)
+    }
+
+    /// A list price in nanodollars as the micro-USD amount a request is
+    /// charged: rounded up, so a charge is never smaller than the price. The
+    /// one conversion both the spend filter and the ledger use.
+    pub(crate) fn charge_micro_usd(nanodollars: u64) -> u64 {
+        nanodollars.saturating_add(999) / 1000
     }
 
     /// As [`Self::cost_micro_usd_for`], priced at the provider-reported model
@@ -1075,6 +1082,12 @@ pub(crate) struct PricingContext {
 }
 
 impl PricingContext {
+    /// The card's immutable version, as request records and ledger entries
+    /// name it.
+    pub(crate) fn version(&self) -> &str {
+        self.list.version().as_str()
+    }
+
     /// The wire document `PUT /pricing` accepts, rendered from the parsed
     /// card: what the store keeps. Rendering it from the parsed card, not
     /// keeping the caller's text, means every source (configuration, a `PUT`,
@@ -1711,6 +1724,7 @@ impl UsageFilterInstance {
                 .list_cost_nanodollars(provider_type, model, &usage)
                 .map(|nanodollars| LlmListCost {
                     nanodollars,
+                    micro_usd: PricingRegistry::charge_micro_usd(nanodollars),
                     rate_card_version: pricing.list.version().as_str().to_string(),
                 });
             if repriced && cost.is_some() {

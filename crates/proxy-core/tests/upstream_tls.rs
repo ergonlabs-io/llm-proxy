@@ -296,6 +296,7 @@ async fn spawn_listener(snapshot: Arc<ConfigSnapshot>) -> Harness {
         latency: latency_stats,
         tracing: None,
         metadata: None,
+        ledger: None,
         connection_limiter: proxy_core::admission::ConnectionLimiter::default(),
     };
 

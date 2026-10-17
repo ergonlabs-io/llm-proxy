@@ -20,6 +20,16 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   subject claim the value stays null. A `user` field in the request body is
   never used. No metric carries the user as a label.
 
+### Internal
+
+- The billing-ledger entry (ADR-0009) is built at stream end for every request
+  dialled to an upstream: the terminal request record, the micro-USD the spend
+  counters were charged (copied from the spend filter, or the list price rounded
+  up the same way when no spend filter ran), the charged tenant and key scopes
+  with their budget periods, the rate-card version, and a gapless per-instance
+  sequence number. Requests refused before dialling get no entry. Nothing writes
+  entries yet; there is no configuration and no change in behavior.
+
 ## [0.4.1] - 2026-10-17
 
 ### Removed

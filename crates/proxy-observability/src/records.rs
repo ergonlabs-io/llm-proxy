@@ -369,6 +369,111 @@ impl RequestRecord {
     }
 }
 
+/// Version of the [`LedgerEntry`] shape, separate from [`SCHEMA_VERSION`]:
+/// the ledger is the invoice source (ADR-0009) and changes on its own terms.
+pub const LEDGER_SCHEMA_VERSION: u16 = 1;
+
+/// One billing-ledger entry: the terminal [`RequestRecord`] of a request that
+/// was dialled to an upstream, plus what it was charged (ADR-0009 decision 3).
+/// `record.event_id` is the deduplication key; `(instance_id, epoch, seq)`
+/// lets a consumer see that no entry of an epoch is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub schema_version: u16,
+    /// The writing instance. Unique per writer, like the spend `node_id`.
+    pub instance_id: String,
+    /// Chosen once per process start.
+    pub epoch: u64,
+    /// Consecutive per `(instance_id, epoch)`, starting at 0, no gaps.
+    pub seq: u64,
+    /// The amount added to the spend counters when the spend filter charged
+    /// this request, else the same function's price for its usage. 0 when
+    /// there was no usage or no price. Never derived from `record.cost`,
+    /// whose nanodollars sum to less than the charges (ADR-0009 Context).
+    pub charged_micro_usd: u64,
+    /// The spend counters the charge was added to, each with its budget
+    /// period. Empty when no spend filter charged.
+    pub charged_scopes: Vec<ChargedScope>,
+    /// The rate-card version that priced `charged_micro_usd`; `None` when
+    /// nothing priced it.
+    pub rate_card_version: Option<String>,
+    /// The control-plane policy the request was admitted under; the same
+    /// value as `record.policy_generation`.
+    pub policy_generation: Option<u64>,
+    pub record: RequestRecord,
+}
+
+/// Which spend counter a charge was added to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeScope {
+    Tenant,
+    /// The virtual key, which is also the user.
+    Key,
+}
+
+/// One spend counter a charge was added to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChargedScope {
+    pub scope: ChargeScope,
+    pub id: String,
+    /// The UTC budget period the charge fell in: `YYYY-MM-DD` or `YYYY-MM`.
+    pub period: String,
+}
+
+/// What [`Ledger::append`] adds to the record to make an entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerCharge {
+    pub charged_micro_usd: u64,
+    pub charged_scopes: Vec<ChargedScope>,
+    pub rate_card_version: Option<String>,
+}
+
+/// Where ledger entries go. Called with the [`Ledger`]'s lock held, so an
+/// implementation receives entries in `seq` order and must not block.
+pub trait LedgerSink: Send + Sync {
+    fn append(&self, entry: LedgerEntry);
+}
+
+/// Numbers entries for one process start and hands them to a sink. Shared
+/// by every worker, so `seq` is gapless across the instance, not per worker.
+pub struct Ledger {
+    instance_id: String,
+    epoch: u64,
+    next_seq: std::sync::Mutex<u64>,
+    sink: Arc<dyn LedgerSink>,
+}
+
+impl Ledger {
+    pub fn new(instance_id: String, epoch: u64, sink: Arc<dyn LedgerSink>) -> Self {
+        Self {
+            instance_id,
+            epoch,
+            next_seq: std::sync::Mutex::new(0),
+            sink,
+        }
+    }
+
+    /// Assign the next `seq` and append. The sequence number and the append
+    /// happen under one lock, so the sink sees entries in `seq` order.
+    pub fn append(&self, record: RequestRecord, charge: LedgerCharge) {
+        let mut next_seq = self.next_seq.lock().expect("ledger lock poisoned");
+        let entry = LedgerEntry {
+            schema_version: LEDGER_SCHEMA_VERSION,
+            instance_id: self.instance_id.clone(),
+            epoch: self.epoch,
+            seq: *next_seq,
+            charged_micro_usd: charge.charged_micro_usd,
+            charged_scopes: charge.charged_scopes,
+            rate_card_version: charge.rate_card_version,
+            policy_generation: record.policy_generation,
+            record,
+        };
+        *next_seq += 1;
+        self.sink.append(entry);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitResult {
     Accepted,
