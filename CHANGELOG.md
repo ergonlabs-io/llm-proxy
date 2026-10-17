@@ -19,6 +19,23 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   issuer- and tenant-scoped subject, the same string as the key id. Without a
   subject claim the value stays null. A `user` field in the request body is
   never used. No metric carries the user as a label.
+- Billing ledger (ADR-0009): the dialect's top-level `ledger` block (Envoy
+  mode: `node.metadata["io.llmproxy.ledger"]`) writes one encrypted entry for
+  every request dialled to a provider to a local spool, committed in groups of
+  `group_commit_max_entries` or every `group_commit_interval` (default 50ms).
+  Each request reserves a ledger slot before it is dialled. With no slot (all
+  `max_reservations` held, the writer failed, or the spool at
+  `max_disk_bytes`), `on_unavailable: reject` (the default) answers 503 naming
+  the reason, and `admit` serves the request without an entry, counted in
+  `llmproxy_ledger_unledgered_total` and warned about at most once every 5
+  seconds. The ledger needs `--service-node`, which becomes every entry's
+  `instance_id`; each start opens a later `epoch`, and `seq` is gapless per
+  epoch. A crash loses at most the last group-commit interval. Committed
+  entries are never evicted, and there is no read or acknowledgement API yet,
+  so size `max_disk_bytes` accordingly. A reload that changes the ledger is
+  refused. New counters: `llmproxy_ledger_rejected_total`,
+  `llmproxy_ledger_unledgered_total`, `llmproxy_ledger_entries_committed_total`,
+  `llmproxy_ledger_entries_lost_total`.
 
 ### Internal
 
@@ -27,8 +44,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   counters were charged (copied from the spend filter, or the list price rounded
   up the same way when no spend filter ran), the charged tenant and key scopes
   with their budget periods, the rate-card version, and a gapless per-instance
-  sequence number. Requests refused before dialling get no entry. Nothing writes
-  entries yet; there is no configuration and no change in behavior.
+  sequence number. Requests refused before dialling get no entry. The ledger
+  writer thread assigns the sequence numbers, so the request path takes no lock.
 
 ## [0.4.1] - 2026-10-17
 
