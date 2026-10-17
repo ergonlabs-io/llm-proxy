@@ -327,8 +327,8 @@ mod writer {
     use std::io::Read;
     use std::time::Instant;
 
-    /// Why the ledger could not start. Messages name the config field and
-    /// the path, never key material.
+    /// Why the ledger could not start. `Key` and `Spool` messages start with
+    /// the config field they concern; none renders key material.
     #[derive(Debug, thiserror::Error)]
     pub enum LedgerOpenError {
         #[error("{field}: cannot load key file {path}: {reason}")]
@@ -337,7 +337,7 @@ mod writer {
             path: PathBuf,
             reason: String,
         },
-        #[error("cannot open ledger spool at {path}: {source}")]
+        #[error("directory: cannot open ledger spool at {path}: {source}")]
         Spool {
             path: PathBuf,
             #[source]

@@ -76,6 +76,12 @@ pub struct ConfigSnapshot {
     /// Presence is retained so an explicitly disabled namespace still conflicts
     /// with legacy capture CLI controls rather than silently choosing a mode.
     pub end_user_capture_configured: bool,
+    /// The billing ledger (ADR-0009), from
+    /// `node.metadata["io.llmproxy.ledger"]`. `None` means no ledger: no
+    /// admission reservation and no entries. Bootstrap-scoped: one writer
+    /// per process, carried forward unchanged by xDS deliveries and not
+    /// applied by a reload.
+    pub ledger: Option<proxy_observability::ledger::LedgerConfig>,
     /// ADS transport configuration, from bootstrap `dynamic_resources`.
     /// `None` -- the default, and every release through v0.2.0 -- means fully
     /// static configuration and no control-plane connection is ever attempted.
@@ -175,6 +181,7 @@ impl ConfigSnapshot {
             #[cfg(unix)]
             end_user_capture: self.end_user_capture.clone(),
             end_user_capture_configured: self.end_user_capture_configured,
+            ledger: self.ledger.clone(),
             ads: self.ads.clone(),
             max_downstream_connections: self.max_downstream_connections,
             version,

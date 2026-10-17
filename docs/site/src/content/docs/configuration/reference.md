@@ -32,6 +32,7 @@ The configuration format for llm-proxy. This file is the single source of truth 
 | `observability` | [Observability](#observability) | no | none | Access logging, OTLP metric export, and OTLP trace export. Access log lines include token counts and TTFT/TPOT. Metrics are always served on the admin endpoint at `/stats` and `/stats/prometheus`, with no configuration here; `metrics` adds OTLP export of the same instruments. |
 | `pricing` | [Pricing](#pricing) | no | none | Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused. |
 | `auto` | [AutoModel](#automodel) | no | none | Resolution of the reserved model name `auto`. A request whose `model` is `auto` is routed as the model this block selects: the tenant's entry in `tenants`, otherwise `default`. With no matching entry and no `default`, the request is refused with 400. Any other model name is routed unchanged. The provider's response is passed through unchanged, so its `model` field names the model the provider served, not `auto`. Access logs and usage records show both `auto` and the resolved model. While this block is set, `auto` is reserved: a `models` key or `routes[].model` of exactly `auto` is a load error. Absent means `auto` is an ordinary model name. Examples: `{"default": "gpt-4o-mini", "tenants": {"acme": "claude-sonnet"}}`. |
+| `ledger` | [Ledger](#ledger) | no | none | The billing ledger: one durable, encrypted entry for every request dialled to a provider, including requests charged zero. An entry carries the request record, the amount charged to spend (or the list price on a route with no budget), the scopes charged, and an `instance_id`, a per-start `epoch` and a gapless `seq`. Each request reserves ledger capacity before it is dialled. When none is available (every slot held, the writer failed, or the spool at `max_disk_bytes`), `on_unavailable` decides what happens. Entries are committed in groups, so a crash loses at most the entries of the last `group_commit_interval`. Committed entries are never evicted. The proxy needs a node id unique to this replica and stable across restarts (`--service-node`); it is the entries' `instance_id`. Absent means no ledger. Examples: `{"directory": "/var/lib/llm-proxy/ledger", "encryption_key_file": "/etc/llm-proxy/ledger.key", "encryption_key_id": "ledger-2026", "max_disk_bytes": 10737418240}`. |
 
 Any other field is a load error.
 
@@ -206,6 +207,24 @@ Used at: `auto`.
 
 Any other field is a load error.
 
+## `Ledger`
+
+Used at: `ledger`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `directory` | string; minimum length 1 | yes | none | Absolute path of the ledger spool directory. Created owner-only (0700) if absent; an existing directory must be owner-only. One proxy process writes it at a time. |
+| `encryption_key_file` | string; minimum length 1 | yes | none | Absolute path of the key new entries are sealed under: a 0600 file holding exactly 32 raw bytes. Read at startup; a missing or unreadable key stops the proxy from starting. |
+| `encryption_key_id` | string; minimum length 1 | yes | none | Names `encryption_key_file`'s key, at most 128 bytes. Stored beside each entry so the right key opens it. |
+| `previous_keys` | array of [LedgerKey](#ledgerkey) | no | `[]` | Retired keys, at most 31, kept decrypt-only so entries sealed before a key rotation still open. Ids must be unique across this list and `encryption_key_id`. |
+| `max_disk_bytes` | integer; minimum 2097152, maximum 1099511627776 | yes | none | Disk budget for the spool. At this cap new requests follow `on_unavailable`, and committed entries are never evicted to make room. Only an acknowledgement frees space, and this release has no acknowledgement API yet: size the budget for every entry the proxy will write until one exists. |
+| `max_reservations` | integer; minimum 1, maximum 1048576 | no | `16384` | Ledger slots: requests in flight plus entries not yet committed. A request holds its slot from admission until its entry is committed. With every slot held, new requests follow `on_unavailable`. |
+| `group_commit_max_entries` | integer; minimum 1, maximum 4096 | no | `512` | A group of entries is committed when it reaches this size or `group_commit_interval`, whichever comes first. |
+| `group_commit_interval` | [Duration](#duration) | no | `50ms` | The longest an entry waits to be committed, and so the most a crash can lose. Bounded to 1ms-1s. |
+| `on_unavailable` | one of `reject`, `admit` | no | `reject` | What a request gets when no ledger capacity is available. `reject`: a local 503 naming the reason (`queue_full`, `writer_failed` or `disk_full`), counted in `llmproxy_ledger_rejected_total`; no request reaches a provider unledgered, so ledger health becomes availability. `admit`: the request is served without an entry, counted in `llmproxy_ledger_unledgered_total` and warned about at most once every 5 seconds. |
+
+Any other field is a load error.
+
 ## `listen.tls`
 
 Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.
@@ -363,6 +382,19 @@ Used at: `pricing.price_list`.
 
 Any other field is a load error.
 
+## `LedgerKey`
+
+Used at: `ledger.previous_keys[]`.
+
+One retired ledger encryption key.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `id` | string; minimum length 1 | yes | none | Names this key, at most 128 bytes. Stored beside each entry it sealed. |
+| `file` | string; minimum length 1 | yes | none | Absolute path of the retired key file. Same file rules as `encryption_key_file`. |
+
+Any other field is a load error.
+
 ## `AuthStorePersistent`
 
 Used at: `auth.store.persistent`.
@@ -453,7 +485,7 @@ Type: string; pattern `^[0-9]+(ms|s|m|h)$`.
 
 A duration: integer plus unit — `ms` (milliseconds), `s` (seconds), `m` (minutes), or `h` (hours).
 
-Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.tracing.export_deadline`.
+Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.tracing.export_deadline`.
 
 Examples: `500ms`, `30s`, `5m`, `1h`.
 

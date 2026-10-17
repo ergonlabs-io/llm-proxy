@@ -66,6 +66,7 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     snapshot.tracing = convert_tracing_metadata(b.node.as_ref(), "node")?;
     // Metrics export remains independently configurable when tracing is off.
     snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
+    snapshot.ledger = crate::ledger::convert(b.node.as_ref(), "node")?;
     snapshot.end_user_capture_configured = b
         .node
         .as_ref()

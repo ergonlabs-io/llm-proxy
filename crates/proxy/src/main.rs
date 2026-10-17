@@ -989,6 +989,21 @@ async fn run_serve(
         ),
     };
 
+    // ADR-0009: the billing ledger, opened before any worker starts so the
+    // first request already reserves. A ledger that cannot open stops startup:
+    // with the default `on_unavailable: reject` it would refuse every request.
+    let running_ledger = snapshot.ledger.clone();
+    let (ledger, ledger_writer) = match &snapshot.ledger {
+        None => (None, None),
+        Some(config) => match open_ledger(config, &node.id, &stats_control) {
+            Ok((ledger, writer)) => (Some(ledger), Some(writer)),
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
     // Resolve operational health series even when exporters are disabled.
     // Only configured tracing creates a channel; its sender is owned by workers
     // so joining them closes the channel and triggers the final trace flush.
@@ -1297,6 +1312,7 @@ async fn run_serve(
                 token_usage_stat_handles.clone(),
                 tracing_handles.clone(),
                 metadata_sink.clone(),
+                ledger.clone(),
                 factory_state.clone(),
                 secret_registry.clone(),
             )
@@ -1419,6 +1435,7 @@ async fn run_serve(
                         &stats_control,
                         &stat_handle_tables_for_reload,
                         capture_supervisor.as_ref().map(|s|(s,concurrency)),
+                        running_ledger.as_ref(),
                     )
                     .await
                     {
@@ -1525,6 +1542,28 @@ async fn run_serve(
             budget_ms = log_flush_budget.as_millis() as u64,
             "access-log writers did not drain before the shutdown budget; queued lines are lost"
         );
+    }
+
+    // Workers are gone, so no entry can be handed over any more: commit what
+    // the writer holds. Bounded, so a stuck disk cannot hang exit.
+    if let Some(writer) = ledger_writer {
+        let budget = if fast_exit {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        let finished = tokio::task::spawn_blocking(move || writer.shutdown(budget))
+            .await
+            .unwrap_or(false);
+        if finished {
+            tracing::info!("billing ledger writer committed its queue and stopped");
+        } else {
+            tracing::error!(
+                budget_ms = budget.as_millis() as u64,
+                "billing ledger writer did not finish before the shutdown budget; entries not yet \
+                 committed are lost"
+            );
+        }
     }
 
     // Capture admissions close only now, after the drain, so a request that
@@ -1923,6 +1962,10 @@ async fn apply_ads_snapshot(
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
+// The two boot-scoped inputs (capture, ledger) are each checked against the
+// reloaded snapshot here, where it is loaded; bundling them only for the lint
+// would hide which one refused a reload.
+#[allow(clippy::too_many_arguments)]
 async fn reload(
     source: &ConfigSource,
     current_version: SnapshotVersion,
@@ -1931,6 +1974,7 @@ async fn reload(
     stats_control: &proxy_observability::stats::StatsControl,
     tables: &StatHandleTables,
     capture: Option<(&proxy_observability::capture::CaptureSupervisor, usize)>,
+    running_ledger: Option<&proxy_observability::ledger::LedgerConfig>,
 ) -> Option<SnapshotVersion> {
     let mut snapshot = match source.load() {
         Ok(snapshot) => snapshot,
@@ -1958,6 +2002,16 @@ async fn reload(
     // stamps its own versions differently (from the discovery response, not
     // from a local counter) -- versioning is producer-specific, applying is not.
     snapshot.version = SnapshotVersion(current_version.0 + 1);
+    // The ledger writer is opened once at boot; a reload cannot move its
+    // spool, keys or admission policy. Refusing the whole reload is the only
+    // way the change is not silently ignored (AGENTS.md invariant 1).
+    if snapshot.ledger.as_ref() != running_ledger {
+        tracing::error!(
+            "SIGHUP: node.metadata[\"io.llmproxy.ledger\"] (the dialect's `ledger`) cannot change \
+             on reload; restart the process to apply it. Continuing to serve the previous snapshot"
+        );
+        return None;
+    }
     if let Some((capture, concurrency)) = capture {
         if let Err(error) = capture.configure(snapshot.end_user_capture.clone(), concurrency) {
             tracing::error!(%error,"SIGHUP: capture reload rejected; retaining previous snapshot");
@@ -2179,6 +2233,36 @@ fn effective_node(
             .map(str::to_string)
             .unwrap_or_else(|| bootstrap.cluster.clone()),
     }
+}
+
+/// Opens the billing ledger (ADR-0009). Its `instance_id` is the node id,
+/// under the shared spend store's rule (ADR-0006 addendum): configured,
+/// unique to this replica and stable across its restarts. A per-boot id
+/// would start a new instance on every restart, and two replicas sharing one
+/// would interleave sequences no consumer can tell apart.
+fn open_ledger(
+    config: &proxy_observability::ledger::LedgerConfig,
+    node_id: &str,
+    stats: &proxy_observability::stats::StatsControl,
+) -> Result<
+    (
+        Arc<proxy_observability::ledger::Ledger>,
+        proxy_observability::ledger::LedgerWriter,
+    ),
+    String,
+> {
+    const ROOT: &str = "node.metadata[\"io.llmproxy.ledger\"]";
+    if node_id.is_empty() || node_id == "-" || node_id.len() > 128 {
+        return Err(format!(
+            "{ROOT}: the ledger requires a configured node id of at most 128 bytes, unique to \
+             this replica and stable across its restarts: pass --service-node <name> (or set \
+             the bootstrap node.id); it becomes every entry's instance_id"
+        ));
+    }
+    proxy_observability::ledger::open(config, node_id, stats).map_err(|e| match e {
+        proxy_observability::ledger::LedgerOpenError::Thread(_) => format!("{ROOT}: {e}"),
+        _ => format!("{ROOT}.{e}"),
+    })
 }
 
 /// Builds and spawns the dynamic-resource client tasks when `snapshot.ads`
@@ -2932,6 +3016,7 @@ async fn worker_main(
     token_usage_stat_handles: Arc<proxy_http::stat_handles::TokenUsageStatHandles>,
     tracing_handles: Option<proxy_core::listener::TracingHandles>,
     metadata_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
+    ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
     // This worker's clone of the ONE per-serve
     // `SharedFactoryState` -- see `run_serve`'s own comment on the Arc this
     // is cloned from.
@@ -3000,8 +3085,8 @@ async fn worker_main(
         latency: latency_stats,
         tracing: tracing_handles,
         metadata: metadata_sink,
-        // No ledger writer exists yet, so nothing is wired (ADR-0009 decision 6).
-        ledger: None,
+        // One shared handle: admission is process-wide (ADR-0009 decision 5).
+        ledger,
         connection_limiter: ctx.connection_limiter.clone(),
     };
 

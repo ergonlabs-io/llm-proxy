@@ -52,6 +52,48 @@ pub struct SimpleConfig {
     /// an ordinary model name.
     #[serde(default)]
     pub auto: Option<AutoModel>,
+    /// The billing ledger (ADR-0009): one durable, encrypted entry per
+    /// dialled request. Absent means no ledger.
+    #[serde(default)]
+    pub ledger: Option<Ledger>,
+}
+
+/// `ledger`: lowers to `node.metadata["io.llmproxy.ledger"]`, which owns the
+/// defaults and range checks. Required fields are `Option`s so a missing one
+/// is reported at `ledger.<field>` rather than as serde's missing field on
+/// the enclosing block.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ledger {
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub encryption_key_file: Option<String>,
+    #[serde(default)]
+    pub encryption_key_id: Option<String>,
+    #[serde(default)]
+    pub previous_keys: Vec<PreviousCredentialKey>,
+    #[serde(default)]
+    pub max_disk_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_reservations: Option<u64>,
+    #[serde(default)]
+    pub group_commit_max_entries: Option<u64>,
+    #[serde(default)]
+    pub group_commit_interval: Option<SimpleDuration>,
+    /// Unset means `reject`.
+    #[serde(default)]
+    pub on_unavailable: Option<LedgerOnUnavailable>,
+}
+
+/// `ledger.on_unavailable`: what admission does with no ledger slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerOnUnavailable {
+    /// A local 503; nothing reaches a provider unledgered.
+    Reject,
+    /// Serve without an entry; counted and warned (fail-open).
+    Admit,
 }
 
 /// `auto`: which model a request for `auto` gets. Lowers to the

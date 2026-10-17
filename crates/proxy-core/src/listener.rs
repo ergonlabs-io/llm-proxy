@@ -391,8 +391,9 @@ pub struct StatsRecorders {
     /// means [`build_hcm_handler`] never enables tracing, so handlers pay nothing extra.
     pub tracing: Option<TracingHandles>,
     pub metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    /// The billing ledger (ADR-0009). `None` until a ledger writer is configured; every worker
-    /// shares the one `Ledger` so its `seq` is gapless across the instance.
+    /// The billing ledger (ADR-0009). `None` when no ledger is configured. Every worker shares
+    /// the one `Ledger`: admission slots are process-wide, and its single writer numbers
+    /// entries, so `seq` is gapless across the instance.
     pub ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
     /// The process-wide downstream connection counter. Not a recorder, but bundled for the same
     /// argument-count reason.

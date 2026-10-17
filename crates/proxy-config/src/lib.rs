@@ -12,6 +12,7 @@ pub mod authorization;
 mod capture;
 pub mod error;
 pub mod ir;
+mod ledger;
 pub mod loader;
 pub mod lower;
 pub mod validate;

@@ -483,6 +483,9 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     {
         metadata.insert(METRICS_METADATA_KEY.to_string(), lower_metrics(metrics)?);
     }
+    if let Some(ledger) = &config.ledger {
+        metadata.insert(LEDGER_METADATA_KEY.to_string(), lower_ledger(ledger)?);
+    }
     if !metadata.is_empty() {
         bootstrap["node"] = json!({ "metadata": metadata });
     }
@@ -2667,6 +2670,80 @@ fn lower_tracing(tracing: &crate::model::Tracing) -> Result<Value, ConfigError> 
         "sample_ratio": tracing.sample_ratio,
         "export_deadline": tracing.export_deadline.0.as_secs_f64(),
     }))
+}
+
+// ------------------------------------------------------------------ ledger --
+
+/// Must equal `proxy_config`'s `LEDGER_METADATA_KEY`; `tests/ledger.rs`
+/// round-trips the dialect through the real Envoy-mode loader, so a drift
+/// here shows up as a ledger that never reaches the snapshot.
+const LEDGER_METADATA_KEY: &str = "io.llmproxy.ledger";
+
+/// `ledger` -> `Bootstrap.node.metadata["io.llmproxy.ledger"]`. Required
+/// fields are checked here so a missing one is reported at `ledger.<field>`;
+/// unset optional fields are left out, so the Envoy-mode reader's defaults
+/// apply to both modes. Ranges are that reader's to enforce, the same split
+/// as `lower_metrics`. Durations go over as seconds numbers.
+fn lower_ledger(ledger: &crate::model::Ledger) -> Result<Value, ConfigError> {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "directory".into(),
+        json!(required_non_empty(
+            ledger.directory.as_deref(),
+            "ledger.directory"
+        )?),
+    );
+    out.insert(
+        "encryption_key_file".into(),
+        json!(required_non_empty(
+            ledger.encryption_key_file.as_deref(),
+            "ledger.encryption_key_file"
+        )?),
+    );
+    out.insert(
+        "encryption_key_id".into(),
+        json!(required_non_empty(
+            ledger.encryption_key_id.as_deref(),
+            "ledger.encryption_key_id"
+        )?),
+    );
+    let max_disk_bytes = ledger
+        .max_disk_bytes
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field_path: "ledger.max_disk_bytes".to_string(),
+            reason: "is required".to_string(),
+        })?;
+    out.insert("max_disk_bytes".into(), json!(max_disk_bytes));
+    if !ledger.previous_keys.is_empty() {
+        let mut keys = Vec::with_capacity(ledger.previous_keys.len());
+        for (i, key) in ledger.previous_keys.iter().enumerate() {
+            keys.push(json!({
+                "id": required_non_empty(key.id.as_deref(), &format!("ledger.previous_keys[{i}].id"))?,
+                "file": required_non_empty(key.file.as_deref(), &format!("ledger.previous_keys[{i}].file"))?,
+            }));
+        }
+        out.insert("previous_keys".into(), Value::Array(keys));
+    }
+    if let Some(n) = ledger.max_reservations {
+        out.insert("max_reservations".into(), json!(n));
+    }
+    if let Some(n) = ledger.group_commit_max_entries {
+        out.insert("group_commit_max_entries".into(), json!(n));
+    }
+    if let Some(interval) = ledger.group_commit_interval {
+        out.insert(
+            "group_commit_interval".into(),
+            json!(interval.0.as_secs_f64()),
+        );
+    }
+    if let Some(mode) = ledger.on_unavailable {
+        let mode = match mode {
+            crate::model::LedgerOnUnavailable::Reject => "reject",
+            crate::model::LedgerOnUnavailable::Admit => "admit",
+        };
+        out.insert("on_unavailable".into(), json!(mode));
+    }
+    Ok(Value::Object(out))
 }
 
 // ----------------------------------------------------------------- metrics --

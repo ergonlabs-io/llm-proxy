@@ -31,6 +31,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# `ledger_e2e.rs` reads the spool the binary wrote.
+proxy-observability = { workspace = true, features = ["test-support"] }
 proxy-capture-agent = { path = "../proxy-capture-agent" }
 proxy-capture-spool = { path = "../proxy-capture-spool" }
 tempfile = { version = "=3.27.0", default-features = false }
