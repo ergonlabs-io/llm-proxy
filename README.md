@@ -14,7 +14,7 @@ and cluster policy on top of it, not a parallel system.
 
 [![CI](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Version: v0.3.6](https://img.shields.io/badge/version-v0.4.0-blue.svg)
+![Version: v0.4.1](https://img.shields.io/badge/version-v0.4.1-blue.svg)
 ![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
@@ -28,7 +28,7 @@ cargo run -p proxy -- --config examples/llmproxy.yaml --mode translate  # print 
 
 > [!NOTE]
 > **The data plane serves real traffic; workspace qualification passed 2,335 tests.**
-> `v0.4.0` is the current release.
+> `v0.4.1` is the current release.
 > Interfaces still change between releases and there are no backports to earlier
 > tags. Read [What is not built yet](#what-is-not-built-yet) before you depend
 > on it — that section is deliberately specific — and
@@ -341,7 +341,7 @@ Re-run the same command to upgrade. It keeps the existing configuration,
 secrets, and admin token. Pass options after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.4.0 --port 8080 --admin-port 8081
+curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.4.1 --port 8080 --admin-port 8081
 ```
 
 | Option | Effect |
@@ -461,7 +461,7 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 | **v0.3.2** | Dynamic configuration — ADS/xDS gate, plus live-defect fixes | Shipped 2026-10-14 in tag v0.3.5 |
 | **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 |
 | **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Shipped 2026-10-14 in tag v0.3.5 |
-| **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Shipped 2026-10-16 in tag v0.4.0 (latest release) |
+| **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Shipped 2026-10-16 in tag v0.4.0; latest release is tag v0.4.1 |
 | — | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Unscheduled |
 | **v1.0.0** | To be re-planned. The old theme (Gateway API Inference Extension, realtime sessions) was retired on 2026-10-15 | No gate, no scope |
 

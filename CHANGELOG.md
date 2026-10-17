@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-17
+
 ### Removed
 
 - **Breaking (Envoy mode):** the `pricing` field of `llmproxy.spend_limit`
