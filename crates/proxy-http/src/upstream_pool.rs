@@ -27,7 +27,7 @@ use hyper::body::{Body, Frame, SizeHint};
 use hyper::client::conn::http1::SendRequest as Http1SendRequest;
 use hyper::client::conn::http2::SendRequest;
 use proxy_cluster::pool::ClusterBuildId;
-use proxy_cluster::{HttpConnPool, PoolError, UpstreamProtocol, UpstreamStream};
+use proxy_cluster::{ConnectTiming, HttpConnPool, PoolError, UpstreamProtocol, UpstreamStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -284,6 +284,9 @@ const MAX_CONNECTIONS_PER_KEY: usize = 4;
 struct PooledConn {
     sender: SendRequest<StreamBody>,
     activity: Rc<ConnActivity>,
+    /// When this connection was dialed; every stream leased from it reports
+    /// these values.
+    timing: ConnectTiming,
 }
 
 impl PooledConn {
@@ -328,9 +331,15 @@ type Slot = Rc<tokio::sync::Mutex<Vec<PooledConn>>>;
 pub struct PooledSendRequest {
     sender: SendRequest<StreamBody>,
     guard: StreamGuard,
+    timing: ConnectTiming,
 }
 
 impl PooledSendRequest {
+    /// When the leased connection was dialed, for `US_CX_*` and `US_HS_END`.
+    pub fn connect_timing(&self) -> ConnectTiming {
+        self.timing
+    }
+
     /// Send `req` over this leased connection and keep this stream counted
     /// as in-flight (see `StreamGuard`) for as long as the *response body*
     /// lives, not just until `codec::send_on_http2`'s `.await` resolves at
@@ -347,7 +356,7 @@ impl PooledSendRequest {
         self,
         req: HttpRequestParts,
     ) -> Result<HttpResponseParts, UpstreamCodecError> {
-        let PooledSendRequest { sender, guard } = self;
+        let PooledSendRequest { sender, guard, .. } = self;
         let mut response = send_on_http2(sender, req).await?;
         response.body = guard.attach(response.body);
         Ok(response)
@@ -570,7 +579,9 @@ impl UpstreamConnCache {
             // fail must still sweep.
             self.ensure_sweeper();
             let dialed = async {
-                let io = SlotIo::new(pool.new_stream().await?);
+                let stream = pool.new_stream().await?;
+                let timing = stream.timing;
+                let io = SlotIo::new(stream);
                 // A handshake failure is folded into `PoolError::TlsHandshake`:
                 // there's no dedicated pool-error variant for "connected, but
                 // the h2 preface/settings exchange failed" (`PoolError` lives in
@@ -580,11 +591,12 @@ impl UpstreamConnCache {
                 // (`AttemptOutcome::from_pool_error`).
                 handshake_upstream_http2(io)
                     .await
+                    .map(|sender| (sender, timing))
                     .map_err(|err| PoolError::TlsHandshake(std::io::Error::other(err)))
             }
             .await;
-            let sender = match dialed {
-                Ok(sender) => sender,
+            let (sender, timing) = match dialed {
+                Ok(dialed) => dialed,
                 Err(err) => {
                     let unused = conns.is_empty();
                     drop(conns);
@@ -597,6 +609,7 @@ impl UpstreamConnCache {
             conns.push(PooledConn {
                 sender,
                 activity: Rc::new(ConnActivity::new()),
+                timing,
             });
             let conn = conns.last().expect("just pushed one line above");
             return Ok(lease(conn));
@@ -664,6 +677,7 @@ fn lease(conn: &PooledConn) -> PooledSendRequest {
         guard: StreamGuard {
             activity: conn.activity.clone(),
         },
+        timing: conn.timing,
     }
 }
 
@@ -774,6 +788,7 @@ const MAX_IDLE_PER_KEY: usize = 8;
 struct IdleH1Conn {
     sender: Http1SendRequest<StreamBody>,
     conn_task: tokio::task::JoinHandle<()>,
+    timing: ConnectTiming,
     /// When this connection was returned to the idle queue, for
     /// [`UPSTREAM_IDLE_TIMEOUT`].
     idle_since: Instant,
@@ -921,13 +936,17 @@ impl H1ConnCache {
                 continue;
             }
             let IdleH1Conn {
-                sender, conn_task, ..
+                sender,
+                conn_task,
+                timing,
+                ..
             } = idle;
             return Ok(LeasedH1 {
                 sender,
                 conn_task,
                 cache: self,
                 key,
+                timing,
             });
         }
 
@@ -935,7 +954,9 @@ impl H1ConnCache {
         // connection's `max_connections` slot moves into the stream
         // (`SlotIo`), so it goes back when the socket does, wherever the
         // connection ends up -- idle in this cache, leased, or discarded.
-        let io = SlotIo::new(pool.new_stream().await?);
+        let stream = pool.new_stream().await?;
+        let timing = stream.timing;
+        let io = SlotIo::new(stream);
         // A handshake failure folds into `PoolError::TlsHandshake`, same
         // "never got a usable connection" bucket `UpstreamConnCache::get_or_connect`
         // already folds its own h2 handshake failure into -- see that call
@@ -950,6 +971,7 @@ impl H1ConnCache {
             conn_task,
             cache: self,
             key,
+            timing,
         })
     }
 }
@@ -963,9 +985,16 @@ pub struct LeasedH1 {
     conn_task: tokio::task::JoinHandle<()>,
     cache: Rc<H1ConnCache>,
     key: ConnKey,
+    timing: ConnectTiming,
 }
 
 impl LeasedH1 {
+    /// When the leased connection was dialed, for `US_CX_*` and `US_HS_END`.
+    /// A reused connection reports its original dial.
+    pub fn connect_timing(&self) -> ConnectTiming {
+        self.timing
+    }
+
     /// Send `req` over this leased connection and return the response,
     /// head-first with a streaming body -- the reuse-aware counterpart to
     /// `codec::send_upstream_http1`. Builds the outgoing request the same
@@ -982,6 +1011,7 @@ impl LeasedH1 {
             conn_task,
             cache,
             key,
+            timing,
         } = self;
 
         let RequestHeaders {
@@ -1042,6 +1072,7 @@ impl LeasedH1 {
             conn_task: Some(conn_task),
             cache,
             key,
+            timing,
             reusable,
             completed: false,
             errored: false,
@@ -1079,6 +1110,8 @@ struct H1ReuseBody {
     conn_task: Option<tokio::task::JoinHandle<()>>,
     cache: Rc<H1ConnCache>,
     key: ConnKey,
+    /// Returned with the connection, so its next lease reports the same dial.
+    timing: ConnectTiming,
     /// Decided once, from the response head, in `LeasedH1::send` -- see that
     /// method's doc for what makes a response reusable at all.
     reusable: bool,
@@ -1169,6 +1202,7 @@ impl Drop for H1ReuseBody {
                 idle_conns.push_back(IdleH1Conn {
                     sender,
                     conn_task,
+                    timing: self.timing,
                     idle_since: Instant::now(),
                 });
                 return;

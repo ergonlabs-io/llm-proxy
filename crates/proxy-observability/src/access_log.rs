@@ -52,6 +52,14 @@ pub enum FormatOp {
     /// who populates it.
     ResponseCodeDetails,
     Duration,
+    /// `%COMMON_DURATION(START:END[:PRECISION])%`: the time from one
+    /// [`TimePoint`] to another. `-` when either point never happened or
+    /// `END` precedes `START` (Envoy v1.38 `CommonDurationFormatter`).
+    CommonDuration {
+        start: TimePoint,
+        end: TimePoint,
+        precision: DurationPrecision,
+    },
     BytesReceived,
     BytesSent,
     UpstreamHost,
@@ -122,6 +130,64 @@ pub enum FormatOp {
     /// there is no cost.
     LlmCostKind,
     LlmRateCardVersion,
+}
+
+/// The unit `%COMMON_DURATION%` renders in. Envoy truncates toward zero, so
+/// 1.9 ms renders as `1` at `ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationPrecision {
+    /// `ms`, the default when the third argument is omitted.
+    Milliseconds,
+    /// `us`.
+    Microseconds,
+    /// `ns`.
+    Nanoseconds,
+}
+
+/// Parse `%COMMON_DURATION%`'s `START:END[:PRECISION]` argument.
+///
+/// Envoy treats a name that is not one of its points as a custom time point a
+/// filter may set by key. No filter here sets one, so such a name could only
+/// ever render `-`; it is rejected instead, which also catches a misspelled
+/// point (AGENTS.md invariant 1, `internal-docs/envoy-divergences.md`).
+fn common_duration(args: Option<String>, input: &str) -> Result<FormatOp, FormatParseError> {
+    let args = args.ok_or_else(|| {
+        err(format!(
+            "`%COMMON_DURATION%` requires `(START:END)` or `(START:END:PRECISION)` in format string `{input}`"
+        ))
+    })?;
+    let parts: Vec<&str> = args.split(':').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return Err(err(format!(
+            "invalid `%COMMON_DURATION({args})%`: expected `START:END` or `START:END:PRECISION` in format string `{input}`"
+        )));
+    }
+    let point = |name: &str| {
+        TimePoint::from_name(name).ok_or_else(|| {
+            let known: Vec<&str> = TimePoint::ALL.iter().map(|p| p.name()).collect();
+            err(format!(
+                "unknown `%COMMON_DURATION%` time point `{name}` (expected one of {}) in format string `{input}`",
+                known.join(", ")
+            ))
+        })
+    };
+    let start = point(parts[0])?;
+    let end = point(parts[1])?;
+    let precision = match parts.get(2) {
+        None | Some(&"ms") => DurationPrecision::Milliseconds,
+        Some(&"us") => DurationPrecision::Microseconds,
+        Some(&"ns") => DurationPrecision::Nanoseconds,
+        Some(other) => {
+            return Err(err(format!(
+                "invalid `%COMMON_DURATION%` precision `{other}` (expected `ms`, `us` or `ns`) in format string `{input}`"
+            )));
+        }
+    };
+    Ok(FormatOp::CommonDuration {
+        start,
+        end,
+        precision,
+    })
 }
 
 /// The argument to `%REQ%`/`%RESP%`/`%TRAILER%`: a primary header name, an
@@ -326,6 +392,14 @@ fn build_op(
         "DURATION" => {
             bare(name, args, truncate, input)?;
             FormatOp::Duration
+        }
+        "COMMON_DURATION" => {
+            if truncate.is_some() {
+                return Err(err(format!(
+                    "`%COMMON_DURATION%` does not support `:Z` truncation in format string `{input}`"
+                )));
+            }
+            common_duration(args, input)?
         }
         "BYTES_RECEIVED" => {
             bare(name, args, truncate, input)?;
@@ -689,6 +763,28 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
             }
             None => out.push('-'),
         },
+        FormatOp::CommonDuration {
+            start,
+            end,
+            precision,
+        } => {
+            let span = ctx
+                .time_points
+                .get(*start)
+                .zip(ctx.time_points.get(*end))
+                .and_then(|(start, end)| end.checked_duration_since(start));
+            match span {
+                Some(d) => {
+                    let count = match precision {
+                        DurationPrecision::Milliseconds => d.as_millis(),
+                        DurationPrecision::Microseconds => d.as_micros(),
+                        DurationPrecision::Nanoseconds => d.as_nanos(),
+                    };
+                    let _ = write!(out, "{count}");
+                }
+                None => out.push('-'),
+            }
+        }
         FormatOp::BytesReceived => {
             let _ = write!(out, "{}", ctx.bytes_received);
         }
@@ -1586,5 +1682,115 @@ mod tests {
             "{LLM_FMT} %LLM_TPOT% %LLM_MAX_STALL% %LLM_RESPONSE_CHUNKS%"
         ));
         assert_eq!(render(&fs, &c), "11 22 33 40 106 200 20.000 150 7");
+    }
+
+    // ------------------------------------------------- %COMMON_DURATION% --
+
+    #[test]
+    fn common_duration_parses_every_point_and_precision() {
+        for start in TimePoint::ALL {
+            for end in TimePoint::ALL {
+                let src = format!("%COMMON_DURATION({}:{})%", start.name(), end.name());
+                assert_eq!(
+                    parse(&src).0,
+                    vec![FormatOp::CommonDuration {
+                        start,
+                        end,
+                        precision: DurationPrecision::Milliseconds,
+                    }],
+                    "{src}"
+                );
+            }
+        }
+        for (suffix, precision) in [
+            ("ms", DurationPrecision::Milliseconds),
+            ("us", DurationPrecision::Microseconds),
+            ("ns", DurationPrecision::Nanoseconds),
+        ] {
+            assert_eq!(
+                parse(&format!("%COMMON_DURATION(DS_RX_BEG:DS_TX_END:{suffix})%")).0,
+                vec![FormatOp::CommonDuration {
+                    start: TimePoint::DsRxBeg,
+                    end: TimePoint::DsTxEnd,
+                    precision,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn common_duration_rejects_malformed_arguments() {
+        for (src, needle) in [
+            ("%COMMON_DURATION%", "requires"),
+            ("%COMMON_DURATION(DS_RX_BEG)%", "expected `START:END`"),
+            (
+                "%COMMON_DURATION(DS_RX_BEG:DS_RX_END:ms:x)%",
+                "expected `START:END`",
+            ),
+            ("%COMMON_DURATION(DS_RX_BEG:DS_RX_END:s)%", "precision `s`"),
+            // Case-sensitive, as in Envoy.
+            (
+                "%COMMON_DURATION(DS_RX_BEG:DS_RX_END:MS)%",
+                "precision `MS`",
+            ),
+            ("%COMMON_DURATION(ds_rx_beg:DS_RX_END)%", "`ds_rx_beg`"),
+            // Envoy would read this as a custom time point; nothing here sets
+            // one, so it is a config error rather than a column of `-`.
+            (
+                "%COMMON_DURATION(DS_RX_BEG:MY_FILTER_POINT)%",
+                "`MY_FILTER_POINT`",
+            ),
+            ("%COMMON_DURATION(DS_RX_BEG:DS_RX_END):5%", "truncation"),
+        ] {
+            let e = parse_format(src).unwrap_err();
+            assert!(e.0.contains(needle), "{src}: {e}");
+        }
+    }
+
+    /// Each point renders on its own: set only that point and the span from
+    /// it to itself is `0`, while a span to any unset point is `-`.
+    #[test]
+    fn common_duration_renders_each_point_and_dash_for_a_missing_one() {
+        let empty = http::HeaderMap::new();
+        let at = std::time::Instant::now();
+        for point in TimePoint::ALL {
+            let mut c = ctx(&empty, &empty, &empty, &[]);
+            c.time_points.set(point, Some(at));
+            let same = parse(&format!("%COMMON_DURATION({0}:{0})%", point.name()));
+            assert_eq!(render(&same, &c), "0", "{}", point.name());
+            for other in TimePoint::ALL.into_iter().filter(|p| *p != point) {
+                let to = parse(&format!(
+                    "%COMMON_DURATION({}:{})% %COMMON_DURATION({}:{})%",
+                    point.name(),
+                    other.name(),
+                    other.name(),
+                    point.name()
+                ));
+                assert_eq!(
+                    render(&to, &c),
+                    "- -",
+                    "{} / {}",
+                    point.name(),
+                    other.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn common_duration_truncates_to_the_precision_and_dashes_a_negative_span() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let start = std::time::Instant::now();
+        let end = start + std::time::Duration::from_nanos(1_234_567);
+        c.time_points.set(TimePoint::UsTxEnd, Some(start));
+        c.time_points.set(TimePoint::UsRxBeg, Some(end));
+        let fs = parse(
+            "%COMMON_DURATION(US_TX_END:US_RX_BEG)% %COMMON_DURATION(US_TX_END:US_RX_BEG:ms)% \
+             %COMMON_DURATION(US_TX_END:US_RX_BEG:us)% %COMMON_DURATION(US_TX_END:US_RX_BEG:ns)% \
+             %COMMON_DURATION(US_RX_BEG:US_TX_END:ns)%",
+        );
+        // Envoy returns no value when END precedes START, rendered `-`.
+        assert_eq!(render(&fs, &c), "1 1 1234 1234567 -");
     }
 }

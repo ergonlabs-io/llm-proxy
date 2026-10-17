@@ -449,3 +449,110 @@ async fn no_access_logs_configured_writes_nothing_and_behaves_like_before() {
         })
         .await;
 }
+
+/// Render `%COMMON_DURATION(DS_RX_BEG:X:ns)%` for each `X`, `|`-separated, and
+/// report which points rendered a value.
+fn rendered_points(line: &str, points: &[&str]) -> Vec<(String, bool)> {
+    let fields: Vec<&str> = line.trim_end().split('|').collect();
+    assert_eq!(fields.len(), points.len(), "{line:?}");
+    points
+        .iter()
+        .zip(fields)
+        .map(|(point, field)| {
+            assert!(
+                field == "-" || field.parse::<u64>().is_ok(),
+                "{point}: {field:?}"
+            );
+            (point.to_string(), field != "-")
+        })
+        .collect()
+}
+
+fn offsets_format(points: &[&str]) -> String {
+    let fields: Vec<String> = points
+        .iter()
+        .map(|p| format!("%COMMON_DURATION(DS_RX_BEG:{p}:ns)%"))
+        .collect();
+    format!("{}\n", fields.join("|"))
+}
+
+const ALL_POINTS: [&str; 12] = [
+    "DS_RX_BEG",
+    "DS_RX_END",
+    "US_CX_BEG",
+    "US_CX_END",
+    "US_HS_END",
+    "US_TX_BEG",
+    "US_TX_END",
+    "US_RX_BEG",
+    "US_RX_BODY_BEG",
+    "US_RX_END",
+    "DS_TX_BEG",
+    "DS_TX_END",
+];
+
+/// A local reply never reaches an upstream: every `US_*` point renders `-`,
+/// while the downstream points the request did reach still render.
+#[tokio::test(flavor = "current_thread")]
+async fn a_local_reply_has_downstream_points_and_no_upstream_points() {
+    LocalSet::new()
+        .run_until(async {
+            let path = temp_path("common-duration-local");
+            let handler = build_router(
+                None,
+                vec![text_logger(&path, &offsets_format(&ALL_POINTS), None)],
+            )
+            .await;
+
+            let resp = handler.handle(request("/v1/chat/completions")).await;
+            assert_eq!(resp.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            resp.body.collect().await.unwrap();
+
+            let line = read_to_string(&path);
+            for (point, present) in rendered_points(&line, &ALL_POINTS) {
+                let expected = point.starts_with("DS_");
+                assert_eq!(present, expected, "{point} in {line:?}");
+            }
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+/// A provider that dies mid-body: the response head and first body bytes
+/// arrived, but neither the upstream nor the downstream stream ended, so
+/// `US_RX_END` and `DS_TX_END` render `-`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_response_cut_mid_body_has_no_rx_end_or_tx_end() {
+    LocalSet::new()
+        .run_until(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+                    .await;
+                // Dropping the stream closes it 93 bytes short.
+            });
+            let path = temp_path("common-duration-cut");
+            let handler = build_router(
+                Some(addr),
+                vec![text_logger(&path, &offsets_format(&ALL_POINTS), None)],
+            )
+            .await;
+
+            let resp = handler.handle(request("/v1/chat/completions")).await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            assert!(resp.body.collect().await.is_err());
+
+            let line = read_to_string(&path);
+            for (point, present) in rendered_points(&line, &ALL_POINTS) {
+                let expected = !matches!(point.as_str(), "US_HS_END" | "US_RX_END" | "DS_TX_END");
+                assert_eq!(present, expected, "{point} in {line:?}");
+            }
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}

@@ -66,12 +66,21 @@ llm_list_cost_nanodollars="%LLM_LIST_COST%"
 llm_credential_source="%LLM_CREDENTIAL_SOURCE%" llm_served_model="%LLM_SERVED_MODEL%"
 llm_usage_completeness="%LLM_USAGE_COMPLETENESS%" llm_cost_kind="%LLM_COST_KIND%"
 llm_upstream_id="%LLM_UPSTREAM_ID%"
+timing_us="ds_rx=%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%
+pre_upstream=%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%
+us_connect=%COMMON_DURATION(US_CX_BEG:US_CX_END:us)%
+us_tx=%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%
+us_wait=%COMMON_DURATION(US_TX_END:US_RX_BEG:us)%
+resp_head=%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)%
+ds_tx=%COMMON_DURATION(DS_TX_BEG:DS_TX_END:us)%"
 ```
 
 The real format is one line that ends with a newline. The block above is
-wrapped for reading. The last seven lines of the block carry the key, tenant,
-user, model, provider, rate-card, and cost fields. The JSON format carries the
-same fields.
+wrapped for reading. The key, tenant, user, model, provider, rate-card, and
+cost fields come before `timing_us`. The JSON format carries the same fields.
+
+`timing_us` divides the request into phases, in microseconds. See
+[Request phases](#request-phases).
 
 For a request that fails to connect to its provider, `%RESPONSE_FLAGS%` is `UF`. See "Response
 flags" below. A dash in `llm_tokens="-/-/-/-/-"` is not a zero. A dash means
@@ -121,6 +130,7 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `llm_usage_completeness`, `llm_cost_kind` | `%LLM_USAGE_COMPLETENESS%`, `%LLM_COST_KIND%` |
 | `llm_upstream_id` | `%LLM_UPSTREAM_ID%` |
 | `llm_upstream_usage` | `%LLM_UPSTREAM_USAGE%`, embedded as a JSON object |
+| `ds_rx_us`, `pre_upstream_us`, `us_connect_us`, `us_tx_us`, `us_wait_us`, `resp_head_us`, `ds_tx_us` | The `%COMMON_DURATION%` phases of `timing_us` in the text format. See [Request phases](#request-phases). |
 | `llm_served_model` | `%LLM_SERVED_MODEL%`: the `model` the provider's response says it served, which can be a dated snapshot of the selected model or a different model. The cost is computed at this model when the rate card lists it for the provider; otherwise at the selected model. `-` when the response named none. |
 
 The text format uses the same names without the `llm_` prefix for `key_id`,
@@ -161,6 +171,7 @@ is a load error, never silently dropped or emitted as literal text.
 | `%RESPONSE_FLAGS%` | Comma-joined response flags (see below), or `-` if none fired. |
 | `%RESPONSE_CODE_DETAILS%` | The reason string set by the filter or router that ended the response, for example `cluster_not_found`. `-` when none was set. |
 | `%DURATION%` | Total request duration, in milliseconds. |
+| `%COMMON_DURATION(START:END)%` / `%COMMON_DURATION(START:END:PRECISION)%` | The time from time point `START` to time point `END`. `PRECISION` is `ms` (the default), `us`, or `ns`; the value is truncated, not rounded. `-` when the request did not reach one of the two points, or when `END` is before `START`. See [Request phases](#request-phases). |
 | `%BYTES_RECEIVED%` / `%BYTES_SENT%` | Request/response body byte counts. |
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
 | `%DOWNSTREAM_REMOTE_ADDRESS%` | The client's socket address. |
@@ -184,6 +195,48 @@ is a load error, never silently dropped or emitted as literal text.
 | `%LLM_UPSTREAM_USAGE%` | The provider's `usage` object exactly as it sent it (the last one, when a stream carries several). Evidence only: the proxy never reads a field of it, and `%LLM_LIST_COST%` comes from the rate card alone. In a `json_format` field whose whole value is this operator it is embedded as a JSON object (`null` when absent); elsewhere it is text, `-` when absent. Over 4096 bytes it is not stored and `llmproxy_usage_upstream_usage_oversized_total` counts the miss. Never a metric label. |
 
 A literal `%` is written as `%%`.
+
+## Request phases
+
+`%COMMON_DURATION%` measures the time between two points in the life of one
+request. The points are the same as in Envoy v1.38. The names are
+case-sensitive.
+
+| Point | The time when |
+|---|---|
+| `DS_RX_BEG` | The request started. `%DURATION%` starts at the same time. |
+| `DS_RX_END` | The proxy received the last byte of the request body. |
+| `US_CX_BEG` | The TCP connect to the provider started. |
+| `US_CX_END` | The TCP connect to the provider completed. |
+| `US_HS_END` | The TLS handshake with the provider completed. A plaintext provider has no handshake, so a duration that uses this point is `-`. |
+| `US_TX_BEG` | The proxy started to send the request to the provider. |
+| `US_TX_END` | The proxy sent the last byte of the request body to the provider. |
+| `US_RX_BEG` | The proxy received the response headers from the provider. |
+| `US_RX_BODY_BEG` | The proxy received the first byte of the response body. |
+| `US_RX_END` | The proxy received the last byte of the response. |
+| `DS_TX_BEG` | The proxy started to send the response to the client. |
+| `DS_TX_END` | The proxy sent the last byte of the response to the client. |
+
+"Sent" and "received" mean given to or taken from the HTTP codec, not the
+socket.
+
+The proxy keeps connections to a provider open and uses them again. A request
+on a connection that is used again shows the `US_CX_*` and `US_HS_END` points
+of the connect that opened the connection. Envoy does the same. Thus
+`%COMMON_DURATION(US_CX_BEG:US_CX_END)%` is not a cost of that request.
+`%COMMON_DURATION(DS_RX_BEG:US_CX_BEG)%` is `-` on such a request, because the
+connect started before the request.
+
+The upstream points come from the attempt that gave the response. After a
+retry, they come from the last attempt. A local reply, for example a `404` with
+no route, has no upstream points.
+
+A response that does not end correctly has no `DS_TX_END`. For example, the
+client disconnects, or the provider resets the stream.
+
+Envoy accepts other names as custom points that a filter sets. No filter in
+this proxy sets a custom point, so a name that is not in the table above is a
+config error.
 
 ## Response flags
 

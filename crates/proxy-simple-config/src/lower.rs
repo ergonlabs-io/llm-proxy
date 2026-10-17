@@ -120,6 +120,10 @@ const FILE_ACCESS_LOG_TYPE_URL: &str =
 /// The dialect picks only `text` or `json`, with no custom format string, so
 /// if this line omitted `%LLM_TPOT%`, `%LLM_MAX_STALL%` or
 /// `%LLM_RESPONSE_CHUNKS%`, a dialect user could not get them at all.
+///
+/// `timing_us` is the same reasoning applied to `%COMMON_DURATION%`: it
+/// splits the request into consecutive phases, in microseconds, so one line
+/// says where the time went. See [`TIMING_PHASES`].
 const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" ",
     "%RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% ",
@@ -136,8 +140,41 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "llm_credential_source=\"%LLM_CREDENTIAL_SOURCE%\" ",
     "llm_served_model=\"%LLM_SERVED_MODEL%\" ",
     "llm_usage_completeness=\"%LLM_USAGE_COMPLETENESS%\" llm_cost_kind=\"%LLM_COST_KIND%\" ",
-    "llm_upstream_id=\"%LLM_UPSTREAM_ID%\"\n",
+    "llm_upstream_id=\"%LLM_UPSTREAM_ID%\" ",
+    "timing_us=\"ds_rx=%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)% ",
+    "pre_upstream=%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)% ",
+    "us_connect=%COMMON_DURATION(US_CX_BEG:US_CX_END:us)% ",
+    "us_tx=%COMMON_DURATION(US_TX_BEG:US_TX_END:us)% ",
+    "us_wait=%COMMON_DURATION(US_TX_END:US_RX_BEG:us)% ",
+    "resp_head=%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)% ",
+    "ds_tx=%COMMON_DURATION(DS_TX_BEG:DS_TX_END:us)%\"\n",
 );
+
+/// The request phases both dialect access-log formats carry, as
+/// `(name, %COMMON_DURATION% operator)`, in microseconds and in request order:
+///
+/// - `ds_rx`: reading the client's request.
+/// - `pre_upstream`: the filter chain, routing and, for a new connection, the
+///   upstream connect.
+/// - `us_connect`: the upstream TCP connect. A reused connection repeats the
+///   value from when it was dialed (Envoy semantics); it is not a cost this
+///   request paid.
+/// - `us_tx`: handing the request to the upstream codec.
+/// - `us_wait`: the provider's time to response headers.
+/// - `resp_head`: the response head's way back through the encode filters.
+/// - `ds_tx`: streaming the response body to the client.
+///
+/// A phase whose points the request never reached renders `-`, for example
+/// every upstream phase of a local reply.
+const TIMING_PHASES: [(&str, &str); 7] = [
+    ("ds_rx", "%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%"),
+    ("pre_upstream", "%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%"),
+    ("us_connect", "%COMMON_DURATION(US_CX_BEG:US_CX_END:us)%"),
+    ("us_tx", "%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%"),
+    ("us_wait", "%COMMON_DURATION(US_TX_END:US_RX_BEG:us)%"),
+    ("resp_head", "%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)%"),
+    ("ds_tx", "%COMMON_DURATION(DS_TX_BEG:DS_TX_END:us)%"),
+];
 
 /// The header Anthropic requires on every Messages API request.
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
@@ -2499,8 +2536,8 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
     // sinks differ only in `name`/`@type` (and the file sink's extra `path`).
     let log_format = match access_logs.format {
         LogFormat::Text => json!({ "text_format": ACCESS_LOG_TEXT_FORMAT }),
-        LogFormat::Json => json!({
-            "json_format": {
+        LogFormat::Json => {
+            let mut format = json!({
                 "start_time": "%START_TIME%",
                 "method": "%REQ(:METHOD)%",
                 "path": "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%",
@@ -2545,8 +2582,12 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 // Embedded as a JSON value, not a string; it has no text-format
                 // twin because raw JSON would break that line's quoting.
                 "llm_upstream_usage": "%LLM_UPSTREAM_USAGE%",
+            });
+            for (phase, operator) in TIMING_PHASES {
+                format[format!("{phase}_us")] = json!(operator);
             }
-        }),
+            json!({ "json_format": format })
+        }
     };
 
     match access_logs.output.as_str() {

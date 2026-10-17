@@ -386,6 +386,17 @@ impl LoggingBody {
         }
     }
 
+    /// `DS_TX_END`: the last response byte went to the downstream codec. Only
+    /// a clean end sets it; a failed or abandoned stream never sent its last
+    /// byte, so the point stays unset and renders `-`, as in Envoy.
+    fn mark_tx_end(&self) {
+        if let Some(ctx) = &self.ctx {
+            ctx.stream_info
+                .borrow_mut()
+                .mark_downstream(proxy_observability::access_log::TimePoint::DsTxEnd);
+        }
+    }
+
     /// Classifies a body-stream failure into the `ResponseFlag` an operator
     /// needs to tell the three shapes apart: the client went away
     /// (`BodyError::Downstream` -> DC), the upstream connection died mid-body
@@ -916,6 +927,7 @@ impl LoggingBody {
             return;
         }
 
+        let time_points = ctx.stream_info.borrow().time_points();
         let log_ctx = LogContext {
             start_time: ctx.start_time,
             request_headers: &ctx.request.headers,
@@ -968,7 +980,7 @@ impl LoggingBody {
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),
             request_scheme: ctx.request.scheme.as_deref(),
-            time_points: Default::default(),
+            time_points,
         };
         for logger in ctx.loggers.iter() {
             logger.log(&log_ctx);
@@ -1047,12 +1059,16 @@ impl Body for LoggingBody {
                 // clean end right here rather than waiting for a `None` that
                 // is never coming.
                 if finished_by_length {
+                    this.mark_tx_end();
                     this.finish();
                 }
             }
             // A clean end-of-stream needs no flag -- see the `Err` arm below
             // for the failure case.
-            Poll::Ready(None) => this.finish(),
+            Poll::Ready(None) => {
+                this.mark_tx_end();
+                this.finish();
+            }
             // An error is terminal too, but -- unlike a clean end -- it's a
             // failure an operator needs visible in the access log: classify
             // it into a `ResponseFlag` and warn *before* `finish()` snapshots

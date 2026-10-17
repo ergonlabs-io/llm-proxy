@@ -11,6 +11,23 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- The `%COMMON_DURATION(START:END[:PRECISION])%` access-log operator, as in
+  Envoy v1.38. It gives the time between two of the twelve standard points
+  of a request (`DS_RX_BEG` to `DS_TX_END`, including `US_CX_*`,
+  `US_HS_END`, `US_TX_*` and `US_RX_*`), in `ms` (the default), `us` or `ns`.
+  A point the request did not reach renders `-`. A request on a reused
+  upstream connection repeats the connect points of that connection, as in
+  Envoy. A name that is not a standard point is a config error; Envoy
+  accepts it as a custom point (`internal-docs/envoy-divergences.md` #35).
+- The `llmproxy` dialect's default access-log lines now carry the request
+  phases, in microseconds: `timing_us="ds_rx=... pre_upstream=...
+  us_connect=... us_tx=... us_wait=... resp_head=... ds_tx=..."` in the text
+  format, and `ds_rx_us` ... `ds_tx_us` in the JSON format. `us_wait` is the
+  provider's time to response headers. See "Request phases" in the access-log
+  docs.
+
 ### Changed
 
 - A policy load that finds the shared store empty after it held tenants or

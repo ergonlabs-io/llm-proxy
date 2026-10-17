@@ -400,6 +400,69 @@ fn router_forwards_a_real_request_to_a_real_tls_upstream_over_http1() {
     });
 }
 
+/// A TLS upstream records `US_HS_END` after `US_CX_END`: the handshake point
+/// comes from the TLS transport, which a plaintext cluster does not have
+/// (`proxy-cluster` `pool::tests` pins the plaintext `-`).
+#[test]
+fn a_tls_upstream_records_the_handshake_end_after_the_tcp_connect() {
+    run_local(async {
+        let ca = mint_ca("test CA");
+        let upstream_key = KeyPair::generate().unwrap();
+        let upstream_cert = mint_leaf(&ca, &["upstream.test"], &upstream_key);
+        let upstream_addr = spawn_tls_http_upstream(&upstream_cert, &upstream_key, b"ok").await;
+
+        let listener_port = free_port().await;
+        let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+        let log = std::env::temp_dir().join(format!(
+            "proxy-core-upstream-tls-timing-{}-{listener_port}.log",
+            std::process::id()
+        ));
+        let yaml = bootstrap_yaml(
+            listener_port,
+            upstream_addr.port(),
+            "upstream.test",
+            &ca.cert.pem(),
+            None,
+        )
+        .replace(
+            "                stat_prefix: http\n",
+            &format!(
+                r#"                stat_prefix: http
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: {}
+                      log_format:
+                        text_format: "%COMMON_DURATION(US_CX_BEG:US_CX_END:ns)% %COMMON_DURATION(US_CX_END:US_HS_END:ns)% %COMMON_DURATION(US_HS_END:US_TX_BEG:ns)%\n"
+"#,
+                log.display()
+            ),
+        );
+        assert!(yaml.contains("access_log:"), "access log not injected");
+        let harness = spawn_listener(snapshot_from(&yaml)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = get_response(listener_addr).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+        harness.shutdown().await;
+
+        assert!(proxy_observability::sink::flush_all_queued(
+            Duration::from_secs(5)
+        ));
+        let line = std::fs::read_to_string(&log).expect("access log written");
+        let _ = std::fs::remove_file(&log);
+        let fields: Vec<&str> = line.trim_end().split(' ').collect();
+        assert_eq!(fields.len(), 3, "{line:?}");
+        for field in fields {
+            assert!(
+                field.parse::<u64>().is_ok(),
+                "connect, handshake and handshake-to-send spans must all render, got {line:?}"
+            );
+        }
+    });
+}
+
 /// Verification must actually verify: the cluster's `trusted_ca` is a DIFFERENT CA from the one that signed the
 /// upstream's certificate. Accepting that certificate would be a security defect.
 #[test]

@@ -128,6 +128,7 @@ impl HttpConnPool for ConnectPool {
         let server_name = self.server_name.clone();
         let connect_timeout = self.connect_timeout;
         let connections = self.connections.clone();
+        let has_handshake = self.transport.has_handshake();
         Box::pin(async move {
             // S5's `max_connections` and `max_pending_requests`: claim a connection slot before dialing, so an
             // over-budget cluster never opens a socket. A caller that loses the race parks in the pending queue until
@@ -138,7 +139,7 @@ impl HttpConnPool for ConnectPool {
             // fails the same way as a dial that never connects. Envoy bounds a pending request by the request timeout,
             // not the connect timeout. This is an MVP simplification: a long request timeout with a short
             // `connect_timeout` sheds load here sooner than Envoy would.
-            let (guard, connected) = tokio::time::timeout(connect_timeout, async {
+            let (guard, connected, timing) = tokio::time::timeout(connect_timeout, async {
                 let guard = match connections.try_acquire_connection() {
                     Some(guard) => guard,
                     None => {
@@ -165,9 +166,13 @@ impl HttpConnPool for ConnectPool {
                         guard
                     }
                 };
+                // `US_CX_BEG` is taken after the slot, as Envoy starts its
+                // connect timer only once the pool decides to dial.
+                let connect_start = std::time::Instant::now();
                 let tcp = tokio::net::TcpStream::connect(addr)
                     .await
                     .map_err(classify_connect_error)?;
+                let connect_end = std::time::Instant::now();
                 // Envoy sets `TCP_NODELAY` on every upstream connection. Without it, Nagle holds a small request
                 // write until the upstream's delayed ACK arrives. A failure is logged and the connection is still
                 // used, matching the dial in `proxy-core`'s `tcp_proxy`.
@@ -178,14 +183,19 @@ impl HttpConnPool for ConnectPool {
                     .wrap(tcp, &server_name)
                     .await
                     .map_err(PoolError::TlsHandshake)?;
-                Ok((guard, io))
+                let timing = crate::ConnectTiming {
+                    connect_start: Some(connect_start),
+                    connect_end: Some(connect_end),
+                    handshake_end: has_handshake.then(std::time::Instant::now),
+                };
+                Ok((guard, io, timing))
             })
             .await
             .map_err(|_elapsed| PoolError::ConnectTimeout)??;
             Ok(UpstreamStream {
                 io: connected,
                 cb_guard: Some(guard),
-                timing: crate::ConnectTiming::default(),
+                timing,
             })
         })
     }
@@ -252,6 +262,59 @@ mod tests {
         let mut buf = [0u8; 1];
         accepted.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, *b"x");
+    }
+
+    /// `US_CX_BEG`/`US_CX_END` come from the real dial, and a plaintext
+    /// transport leaves `US_HS_END` unset.
+    #[tokio::test]
+    async fn new_stream_records_connect_timing_and_no_handshake_for_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let before = std::time::Instant::now();
+        let stream = plaintext_pool(addr).new_stream().await.unwrap();
+        let timing = stream.timing;
+        let start = timing.connect_start.expect("connect start recorded");
+        let end = timing.connect_end.expect("connect end recorded");
+        assert!(before <= start && start <= end, "{timing:?}");
+        assert_eq!(timing.handshake_end, None);
+    }
+
+    /// A transport with a handshake gets `US_HS_END` after the handshake, not
+    /// at the TCP connect: the slow handshake below must show up between them.
+    #[tokio::test]
+    async fn new_stream_records_handshake_end_after_a_handshaking_transport() {
+        struct SlowHandshake;
+        impl UpstreamTransportSocket for SlowHandshake {
+            fn wrap(
+                &self,
+                io: tokio::net::TcpStream,
+                _server_name: &str,
+            ) -> BoxFuture<'static, std::io::Result<crate::BoxedUpstreamIo>> {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(Box::new(io) as crate::BoxedUpstreamIo)
+                })
+            }
+            fn has_handshake(&self) -> bool {
+                true
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = ConnectPool::new(
+            addr,
+            Arc::new(SlowHandshake),
+            addr.ip().to_string(),
+            AMPLE_TIMEOUT,
+            CircuitBreakerState::default(),
+        );
+        let timing = pool.new_stream().await.unwrap().timing;
+        let connected = timing.connect_end.expect("connect end recorded");
+        let handshaken = timing.handshake_end.expect("handshake end recorded");
+        assert!(
+            handshaken.duration_since(connected) >= Duration::from_millis(30),
+            "{timing:?}"
+        );
     }
 
     /// Records whether the dialled socket had `TCP_NODELAY` when the pool handed it to the transport, then passes

@@ -721,6 +721,8 @@ impl StreamHandler for FilterChainHandler {
                 let mut info = stream_info.borrow_mut();
                 info.downstream = Some(req.downstream);
                 info.client_address = Some(client_address);
+                // `DS_RX_BEG` and `%DURATION%` share one start.
+                info.request_started_at = start_instant;
             }
             if let Some(sink) = &self.request_record_sink {
                 #[cfg(unix)]
@@ -860,6 +862,11 @@ impl StreamHandler for FilterChainHandler {
                 .request_record_sink
                 .clone()
                 .filter(|_| stream_info.borrow().metadata_enabled);
+            // The response head leaves the filter chain for the downstream
+            // codec here, Envoy's first downstream TX byte.
+            stream_info
+                .borrow_mut()
+                .mark_downstream(proxy_observability::access_log::TimePoint::DsTxBeg);
             let log_ctx = AccessLogContext {
                 loggers: self.access_loggers.clone(),
                 stream_info,
@@ -1416,7 +1423,13 @@ impl FilterManager {
             None => collect_request(req, buffer_limit).await,
         };
         let (mut head, req_trailers, mut body) = match collected {
-            Ok(parts) => parts,
+            Ok(parts) => {
+                // The whole request is in: Envoy's last downstream RX byte.
+                ctx.stream_info
+                    .borrow_mut()
+                    .mark_downstream(proxy_observability::access_log::TimePoint::DsRxEnd);
+                parts
+            }
             // The body future was dropped mid-read, so hyper sees an unread
             // request body and closes an HTTP/1 connection after this reply
             // instead of reusing it, same as the 413 path below.

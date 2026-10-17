@@ -27,6 +27,7 @@ use proxy_cluster::{
 use proxy_config::ir::{
     DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher, UpgradeConfig,
 };
+use proxy_observability::access_log::TimePoint;
 use proxy_observability::stats::instruments;
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, TraceContext};
 use proxy_observability::ResponseFlag;
@@ -90,6 +91,7 @@ struct HedgedResponse {
     trace: Option<TraceContext>,
     started_system: SystemTime,
     attempt_info: Option<std::rc::Rc<std::cell::RefCell<crate::stream_info::AttemptInfo>>>,
+    timing: std::rc::Rc<crate::stream_info::UpstreamTiming>,
 }
 
 impl Drop for HedgedResponse {
@@ -103,6 +105,7 @@ impl Drop for HedgedResponse {
 }
 
 mod guarded;
+mod timing;
 // Rust note: `pub(crate)` (not private) so `access_logging::LoggingBody`, a
 // sibling of `router` rather than a child, can name `idle::IdleTimeoutError`
 // to distinguish "upstream went quiet" (SI) from "upstream connection died"
@@ -862,7 +865,17 @@ impl RouterHandler {
                 return local_reply(StatusCode::SERVICE_UNAVAILABLE, msg);
             }
         };
-        let proxy_cluster::UpstreamStream { io, cb_guard, .. } = upstream_stream;
+        let proxy_cluster::UpstreamStream {
+            io,
+            cb_guard,
+            timing: connect_timing,
+        } = upstream_stream;
+        // A tunnel's upstream points: its own dial, and the handshake request
+        // and response. Bytes bridged after a `101` are not part of the
+        // request, so `US_TX_END`/`US_RX_END` come only from the handshake.
+        let upgrade_timing = std::rc::Rc::new(crate::stream_info::UpstreamTiming::default());
+        upgrade_timing.set_connect(connect_timing);
+        dcb.stream_info().upstream_timing = Some(upgrade_timing.clone());
         // `LEAST_REQUEST` reads this count. It lives as long as `cb_guard`:
         // the declined path ties both to the response body, and the accepted
         // path hands both to `UpgradeTunnel`, held until the bridge ends.
@@ -901,13 +914,17 @@ impl RouterHandler {
         } else {
             StatusCode::SWITCHING_PROTOCOLS
         };
+        upgrade_timing.mark(TimePoint::UsTxBeg);
         let send_result = if upstream_is_h2 {
             crate::codec::send_upstream_h2_connect(io, upstream_req).await
         } else {
             crate::codec::send_upstream_http1_upgrade(io, upstream_req).await
         };
         let (resp, upstream_on_upgrade) = match send_result {
-            Ok(pair) => pair,
+            Ok(pair) => {
+                upgrade_timing.mark(TimePoint::UsRxBeg);
+                pair
+            }
             Err(err) => {
                 attempt_guard.finish(proxy_observability::records::Termination::UpstreamError);
                 tracing::debug!(cluster = %attempt_cluster, error = %err, "S10: upgrade send failed");
@@ -1399,9 +1416,14 @@ impl RouterHandler {
                 // `Instant`, used only for the duration stat) because a span
                 // timestamp has to be an absolute epoch offset (see
                 // `FinishedSpan`'s own doc for why).
+                // Each physical attempt records its own `US_*` points; the
+                // log reports this one unless an earlier hedge wins below.
+                let attempt_timing =
+                    std::rc::Rc::new(crate::stream_info::UpstreamTiming::default());
                 let (attempt_trace, attempt_started_system, attempt_info) = {
                     let mut info = dcb.stream_info();
                     let routing_model = info.routing_model().map(str::to_owned);
+                    info.upstream_timing = Some(attempt_timing.clone());
                     info.upstream_cluster = Some(attempt_cluster.to_string());
                     // Written on every attempt, `None` included, so a fallback
                     // member without a dialect never inherits the failed
@@ -1473,7 +1495,15 @@ impl RouterHandler {
                         .map(Connected::Http1),
                 };
                 let connected = match connect_result {
-                    Ok(connected) => connected,
+                    Ok(connected) => {
+                        // Envoy's `onPoolReady`: copy the connection's dial
+                        // points, which a reused connection repeats.
+                        attempt_timing.set_connect(match &connected {
+                            Connected::Http1(leased) => leased.connect_timing(),
+                            Connected::Http2(pooled) => pooled.connect_timing(),
+                        });
+                        connected
+                    }
                     Err(err) => {
                         self.stats
                             .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
@@ -1706,6 +1736,12 @@ impl RouterHandler {
                         false,
                     ));
                 }
+                let attempt_body = timing::timed(
+                    attempt_body,
+                    attempt_timing.clone(),
+                    None,
+                    TimePoint::UsTxEnd,
+                );
 
                 let upstream_req = HttpRequestParts {
                     head: attempt_head,
@@ -1747,11 +1783,22 @@ impl RouterHandler {
                     Connected::Http2(pooled) => Box::pin(pooled.send(upstream_req)),
                 };
                 let response_info = attempt_info.clone();
+                let send_timing = attempt_timing.clone();
                 let mut send = Box::pin(async move {
                     let mut guard = attempt_guard;
+                    // The request head goes to the upstream codec on this
+                    // first poll; an empty body was already marked sent.
+                    send_timing.mark(TimePoint::UsTxBeg);
                     let result = send.await;
                     match result {
                         Ok(mut response) => {
+                            send_timing.mark(TimePoint::UsRxBeg);
+                            response.body = timing::timed(
+                                response.body,
+                                send_timing,
+                                Some(TimePoint::UsRxBodyBeg),
+                                TimePoint::UsRxEnd,
+                            );
                             if let Some(info) = response_info {
                                 info.borrow_mut().status = Some(response.head.status.as_u16());
                                 response.body =
@@ -1819,6 +1866,7 @@ impl RouterHandler {
                 // measures from the wrong dispatch.
                 let mut winning_attempt_dispatched_at = attempt_dispatched_at;
                 let mut winning_attempt_info = attempt_info.clone();
+                let mut winning_timing = attempt_timing.clone();
                 let mut earlier_winner = None;
                 let attempt_result = if let Some(hedge) = hedged_response.as_mut() {
                     // The original request was still alive when the previous
@@ -1835,6 +1883,7 @@ impl RouterHandler {
                                 Ok(response) => {
                                     winning_attempt_dispatched_at = hedge.dispatched_at;
                                     winning_attempt_info = hedge.attempt_info.clone();
+                                    winning_timing = hedge.timing.clone();
                                     earlier_winner = Some((hedge.cluster.clone(), hedge.address, hedge.trace, hedge.started_system));
                                     hedge.attempt_info = None;
                                     Ok(response)
@@ -1870,6 +1919,7 @@ impl RouterHandler {
                                     Ok(response) => {
                                         winning_attempt_dispatched_at = hedge.dispatched_at;
                                         winning_attempt_info = hedge.attempt_info.clone();
+                                        winning_timing = hedge.timing.clone();
                                         earlier_winner = Some((hedge.cluster.clone(), hedge.address, hedge.trace, hedge.started_system));
                                         hedge.attempt_info = None;
                                         Ok(response)
@@ -1961,6 +2011,7 @@ impl RouterHandler {
                                             trace: attempt_trace,
                                             started_system: attempt_started_system,
                                             attempt_info: attempt_info.clone(),
+                                            timing: attempt_timing.clone(),
                                         });
                                         continue;
                                     }
@@ -2075,6 +2126,7 @@ impl RouterHandler {
                                 );
                             }
                             info.selected_attempt = winning_attempt_info.clone();
+                            info.upstream_timing = Some(winning_timing.clone());
                         }
                         self.stats.record_attempt_duration_since(
                             outcome_cluster,

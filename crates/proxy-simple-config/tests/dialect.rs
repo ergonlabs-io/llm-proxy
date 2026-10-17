@@ -782,6 +782,50 @@ observability:
     }
 }
 
+/// The dialect has no custom format, so its default formats are the only way
+/// a dialect user gets the per-phase `%COMMON_DURATION%` breakdown. Each phase
+/// is checked by name and operator, in both formats.
+#[test]
+fn default_access_log_formats_carry_the_request_phase_timings() {
+    const PHASES: [(&str, &str); 7] = [
+        ("ds_rx", "%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%"),
+        ("pre_upstream", "%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%"),
+        ("us_connect", "%COMMON_DURATION(US_CX_BEG:US_CX_END:us)%"),
+        ("us_tx", "%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%"),
+        ("us_wait", "%COMMON_DURATION(US_TX_END:US_RX_BEG:us)%"),
+        ("resp_head", "%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)%"),
+        ("ds_tx", "%COMMON_DURATION(DS_TX_BEG:DS_TX_END:us)%"),
+    ];
+    for format in ["json", "text"] {
+        let config = parse(&format!(
+            r#"
+version: 0
+providers:
+  openai: {{ api_key: ${{OPENAI_API_KEY}} }}
+routes:
+  - {{ model: "*", provider: openai }}
+observability:
+  access_logs: {{ output: stdout, format: {format} }}
+"#,
+        ))
+        .expect("must parse");
+        let lowered = proxy_simple_config::lower(&config).expect("must lower");
+        let log_format =
+            &hcm_typed_config(&lowered.bootstrap)["access_log"][0]["typed_config"]["log_format"];
+        for (phase, operator) in PHASES {
+            if format == "json" {
+                assert_eq!(log_format["json_format"][format!("{phase}_us")], operator);
+            } else {
+                let text = log_format["text_format"].as_str().expect("text_format");
+                assert!(
+                    text.contains(&format!("{phase}={operator}")),
+                    "text format must carry {phase}, got {text}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn access_logs_file_text_lands_on_the_hcm() {
     let config = parse(
@@ -4155,8 +4199,8 @@ observability:
                 "text format must carry completeness and cost kind, got {text}"
             );
             assert!(
-                text.ends_with("llm_upstream_id=\"%LLM_UPSTREAM_ID%\"\n"),
-                "text format must end with the upstream id, got {text}"
+                text.contains("llm_upstream_id=\"%LLM_UPSTREAM_ID%\" "),
+                "text format must carry the upstream id, got {text}"
             );
             // Raw JSON would break the text line's quoting.
             assert!(!text.contains("%LLM_UPSTREAM_USAGE%"), "got {text}");

@@ -1,10 +1,11 @@
 //! Per-stream bookkeeping shared by filters, the router, access logs, and stats.
 
 use proxy_observability::records::Termination;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
+use proxy_observability::access_log::{TimePoint, TimePoints};
 use proxy_observability::trace::TraceContext;
 use proxy_observability::ResponseFlag;
 
@@ -181,6 +182,45 @@ impl AttemptInfo {
     }
 }
 
+/// The upstream half of `%COMMON_DURATION%` for one physical attempt: the
+/// `US_*` points. Each attempt gets its own, so a retry or a losing hedge
+/// never writes into the timing of the attempt that produced the response;
+/// [`StreamInfo::upstream_timing`] names the one the log reports.
+///
+/// Rust note: a `Cell` of a `Copy` value, not a `RefCell`, because the body
+/// wrappers that stamp it are polled by hyper outside any `StreamInfo`
+/// borrow, and a `Cell` can never fail a borrow check at runtime.
+#[derive(Debug, Default)]
+pub(crate) struct UpstreamTiming(Cell<TimePoints>);
+
+impl UpstreamTiming {
+    /// Record `point` as happening now, unless it already happened: each
+    /// point marks the first time its condition held.
+    pub(crate) fn mark(&self, point: TimePoint) {
+        let mut points = self.0.get();
+        if points.get(point).is_none() {
+            points.set(point, Some(Instant::now()));
+            self.0.set(points);
+        }
+    }
+
+    /// Copy the connection's establishment points, as Envoy's router does in
+    /// `onPoolReady`. A reused connection repeats the values from when it was
+    /// dialed (Envoy v1.38 docs: they "repeat for all requests in a given
+    /// connection").
+    pub(crate) fn set_connect(&self, connect: proxy_cluster::ConnectTiming) {
+        let mut points = self.0.get();
+        points.set(TimePoint::UsCxBeg, connect.connect_start);
+        points.set(TimePoint::UsCxEnd, connect.connect_end);
+        points.set(TimePoint::UsHsEnd, connect.handshake_end);
+        self.0.set(points);
+    }
+
+    pub(crate) fn points(&self) -> TimePoints {
+        self.0.get()
+    }
+}
+
 /// Per-request state consumed by access logging and stats.
 #[derive(Debug)]
 pub struct StreamInfo {
@@ -305,6 +345,13 @@ pub struct StreamInfo {
     /// every path that does NOT end in a tunnel, which is the correct signal
     /// to hyper that no upgrade happened.
     pub on_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    /// The downstream `%COMMON_DURATION%` points other than `DS_RX_BEG`,
+    /// which is [`Self::request_started_at`].
+    pub(crate) downstream_timing: TimePoints,
+    /// The upstream points of the attempt this request is logged against:
+    /// the last one dispatched, or the hedge that won. `None` when no attempt
+    /// was made.
+    pub(crate) upstream_timing: Option<Rc<UpstreamTiming>>,
 }
 
 impl Default for StreamInfo {
@@ -342,6 +389,8 @@ impl Default for StreamInfo {
             selected_attempt: None,
             trace: None,
             on_upgrade: None,
+            downstream_timing: TimePoints::default(),
+            upstream_timing: None,
         }
     }
 }
@@ -447,6 +496,27 @@ impl StreamInfo {
     /// end-to-end first-body-byte duration for OTel metrics.
     pub fn elapsed_since_request_started(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.request_started_at)
+    }
+
+    /// Record a downstream `%COMMON_DURATION%` point as happening now.
+    pub(crate) fn mark_downstream(&mut self, point: TimePoint) {
+        if self.downstream_timing.get(point).is_none() {
+            self.downstream_timing.set(point, Some(Instant::now()));
+        }
+    }
+
+    /// Every `%COMMON_DURATION%` point this request reached.
+    pub(crate) fn time_points(&self) -> TimePoints {
+        let mut points = self
+            .upstream_timing
+            .as_ref()
+            .map(|timing| timing.points())
+            .unwrap_or_default();
+        points.set(TimePoint::DsRxBeg, Some(self.request_started_at));
+        for point in [TimePoint::DsRxEnd, TimePoint::DsTxBeg, TimePoint::DsTxEnd] {
+            points.set(point, self.downstream_timing.get(point));
+        }
+        points
     }
 
     pub fn set_response_flag(&mut self, flag: ResponseFlag) {
