@@ -12,10 +12,11 @@ the database has closed. Existing directories/files require owner-only permissio
 
 - `append` durably reserves a monotonically increasing sequence before encrypting
   the payload in memory. `AppendReceipt` is not a payload durability receipt.
-- `append_batch` accepts at most eight borrowed payloads and reserves the whole
-  range in one Immediate transaction. Per-record size failures leave gaps.
-  At most eight pending payloads may exist across calls; excess admission returns
-  `Full`. Drop never commits pending payloads.
+- `append_batch` accepts at most `max_pending_records` (1..=4096) borrowed
+  payloads and reserves the whole range in one Immediate transaction. Per-record
+  size failures leave gaps. At most `max_pending_records` pending payloads may
+  exist across calls; excess admission returns `Full`. Drop never commits pending
+  payloads.
 - `commit` and `seal` atomically publish encrypted records and authenticated
   inventory in a redb Immediate transaction. Only successful completion returns
   `DurableReceipt`. `seal` flushes; there is no segment rotation.
@@ -68,8 +69,14 @@ library does not enforce a global cryptographic budget or prevent snapshot rollb
 
 Pre-publication size and pending-count rejections are definitive. Backend write,
 resize, transaction, or synchronization failures poison the writer and return
-storage errors, including growth failures at the disk ceiling. They are never
-reported as definitive `Full` rejections. No positive receipt is emitted. Recovery
+storage errors.
+
+Reaching the disk ceiling does not poison. The refused transaction published
+nothing; the spool reopens its database from the last commit and returns `Full`.
+A refused commit keeps its records pending. Appends and commits return `Full`
+until `acknowledge` commits and its deleted rows free pages; the next `commit`
+then publishes the pending records. An acknowledgement refused at the ceiling
+changes nothing; acknowledge a shorter prefix. No positive receipt is emitted. Recovery
 can select either atomic commit outcome; previously durable records must survive.
 Reopen before further mutation. Replay authentication failures also poison handles.
 
@@ -83,7 +90,7 @@ checks every write/resize before growth. File lengths do not measure filesystem
 blocks; deployment must provide filesystem overhead separately. No quota increase,
 compaction copy, eviction, or invented backend ACK extends a full spool.
 
-Cache is not a total-process memory limit. Up to eight pending encrypted payloads,
+Cache is not a total-process memory limit. Up to `max_pending_records` pending encrypted payloads,
 caller serialization, encryption/decryption scratch, transaction/page allocations,
 keys, and returned replay bytes consume separate memory. Recovery holds at most
 one decrypted record at a time. Backend acknowledgement recomputes the remaining

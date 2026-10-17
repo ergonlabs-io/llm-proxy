@@ -17,6 +17,7 @@ fn open(root: &Path) -> MetadataSpool {
         max_record_bytes: 1024,
         max_disk_bytes: 8 * 1024 * 1024,
         cache_bytes: 1024 * 1024,
+        max_pending_records: 64,
     };
     let key = EncryptionKey::new("crash-test-key", [37; 32]).unwrap();
     MetadataSpool::open(config, key, Vec::new()).unwrap()
@@ -67,6 +68,17 @@ fn crash_child() {
     let root = std::path::PathBuf::from(root);
     let stage = std::env::var(CHILD_STAGE).unwrap();
     let mut spool = open(&root);
+    if stage == "between-commits" {
+        let committed = spool.append_batch(&[PAYLOAD; 20]).unwrap();
+        assert!(committed.iter().all(Result::is_ok));
+        assert_eq!(spool.commit().unwrap().through_sequence, 20);
+        let pending = spool.append_batch(&[PAYLOAD; 10]).unwrap();
+        assert!(pending.iter().all(Result::is_ok));
+        std::fs::write(root.join("ready"), b"ready").unwrap();
+        loop {
+            std::thread::park_timeout(Duration::from_secs(1));
+        }
+    }
     let last = if stage.starts_with("batch-") {
         let appended = spool.append_batch(&[PAYLOAD; 3]).unwrap();
         appended.into_iter().last().unwrap().unwrap().sequence
@@ -108,6 +120,19 @@ fn sigkill_committed_batch_replays_every_durable_record() {
         assert_eq!(record.sequence, index as u64 + 1);
         assert_eq!(record.payload, PAYLOAD);
     }
+}
+
+#[test]
+fn sigkill_between_commits_loses_only_the_uncommitted_batch() {
+    let root = tempfile::tempdir().unwrap();
+    crash_at(root.path(), "between-commits");
+    let mut recovered = open(root.path());
+    let replay = recovered.replay(0, 64, 64 * 1024).unwrap();
+    let sequences: Vec<u64> = replay.iter().map(|record| record.sequence).collect();
+    assert_eq!(sequences, (1..=20).collect::<Vec<_>>());
+    assert!(replay.iter().all(|record| record.payload == PAYLOAD));
+    // The lost batch's reserved sequences 21..=30 are never reissued.
+    assert_eq!(recovered.append(PAYLOAD).unwrap().sequence, 31);
 }
 
 #[test]

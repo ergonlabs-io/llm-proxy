@@ -12,7 +12,7 @@ const PREFIX_BYTES: usize = 14;
 pub(crate) const MAX_ENVELOPE_OVERHEAD: usize = PREFIX_BYTES + 128 + 12 + 16;
 pub(crate) const MAX_STATE_BYTES: usize = 8 + 4 + 2 + 128 + 32 + 32;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct State {
     pub next: u64,
     pub durable: u64,

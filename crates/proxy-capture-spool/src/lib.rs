@@ -31,7 +31,8 @@ pub const DEFAULT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 // redb 4.2 starts with 1 MiB usable pages plus metadata and commit headroom.
 pub const MIN_DISK_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_PENDING_RECORDS: usize = 8;
+/// Upper bound for `SpoolConfig::max_pending_records`.
+pub const MAX_PENDING_RECORDS: usize = 4096;
 const RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
 const STATE: TableDefinition<u64, &[u8]> = TableDefinition::new("state");
 const DATABASE: &str = "capture.redb";
@@ -107,6 +108,9 @@ pub struct SpoolConfig {
     pub max_disk_bytes: u64,
     /// Database cache only; pending records and caller scratch are separate.
     pub cache_bytes: usize,
+    /// Records held between `commit` calls, which is also the largest batch one
+    /// commit publishes. Pending memory is at most this many encrypted records.
+    pub max_pending_records: usize,
 }
 impl SpoolConfig {
     pub fn validate(&self) -> Result<()> {
@@ -119,6 +123,9 @@ impl SpoolConfig {
             return Err(Error::InvalidConfig(
                 "record size must be finite and positive",
             ));
+        }
+        if self.max_pending_records == 0 || self.max_pending_records > MAX_PENDING_RECORDS {
+            return Err(Error::InvalidConfig("max_pending_records must be 1..=4096"));
         }
         if self.cache_bytes == 0 || self.cache_bytes > MAX_CACHE_BYTES {
             return Err(Error::InvalidConfig("cache_bytes must be 1..=16777216"));
@@ -172,7 +179,16 @@ pub struct SpoolStats {
 /// Single-writer synchronous library. Never call from request workers.
 /// The database is dropped before releasing the writer lock, including on error.
 pub struct MetadataSpool {
-    db: Database,
+    // Only `None` between closing a database refused at the disk ceiling and
+    // reopening it; a failed reopen poisons the handle.
+    db: Option<Database>,
+    file: Arc<File>,
+    quota: Arc<storage::Quota>,
+    /// Database byte ceiling: the disk budget less the other charged files.
+    database_cap: u64,
+    /// Set when a transaction was refused at the ceiling; admissions are refused
+    /// without touching storage until an acknowledgement commits.
+    at_cap: bool,
     config: SpoolConfig,
     keys: BTreeMap<String, EncryptionKey>,
     active_id: String,
@@ -298,17 +314,15 @@ impl MetadataSpool {
                 .open(&path)?,
         );
         let other_bytes = inventory.bytes - inventory.database_bytes;
-        let backend = storage::Backend {
-            file,
-            cap: config.max_disk_bytes - other_bytes,
+        let database_cap = config.max_disk_bytes - other_bytes;
+        let quota = Arc::new(storage::Quota::new(database_cap));
+        let db = match open_database(
+            &file,
+            &quota,
+            config.cache_bytes,
             #[cfg(test)]
-            hooks: hooks.clone(),
-        };
-        let db = match Database::builder()
-            .set_cache_size(config.cache_bytes)
-            .create_with_backend(backend)
-            .map_err(storage_error)
-        {
+            &hooks,
+        ) {
             Ok(db) => db,
             Err(error) => {
                 if matches!(error, Error::Corrupt) {
@@ -322,7 +336,11 @@ impl MetadataSpool {
             }
         };
         let mut spool = Self {
-            db,
+            db: Some(db),
+            file,
+            quota,
+            database_cap,
+            at_cap: false,
             config,
             keys,
             active_id,
@@ -382,11 +400,11 @@ impl MetadataSpool {
 
     /// A successful append reserves a sequence, but does not acknowledge durability.
     pub fn append(&mut self, payload: &[u8]) -> Result<AppendReceipt> {
-        self.healthy()?;
+        self.admissible()?;
         if payload.len() > self.config.max_record_bytes {
             return Err(Error::RecordTooLarge);
         }
-        if self.pending.len() == MAX_PENDING_RECORDS {
+        if self.pending.len() == self.config.max_pending_records {
             return Err(Error::Full);
         }
         let first = self.reserve(1)?;
@@ -394,15 +412,17 @@ impl MetadataSpool {
     }
     /// Reserve the complete range before encryption; per-record rejections leave gaps.
     pub fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<Vec<Result<AppendReceipt>>> {
-        self.healthy()?;
-        if payloads.len() > MAX_PENDING_RECORDS {
-            return Err(Error::InvalidConfig("append batch exceeds eight records"));
+        self.admissible()?;
+        if payloads.len() > self.config.max_pending_records {
+            return Err(Error::InvalidConfig(
+                "append batch exceeds max_pending_records",
+            ));
         }
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
         // Pending-capacity rejection is definitive: this batch cannot publish payloads.
-        if self.pending.len() + payloads.len() > MAX_PENDING_RECORDS {
+        if self.pending.len() + payloads.len() > self.config.max_pending_records {
             return Err(Error::Full);
         }
         let first = self.reserve(payloads.len() as u64)?;
@@ -420,6 +440,7 @@ impl MetadataSpool {
         let first = self.state.next;
         let mut state = self.state;
         state.next = first.checked_add(count).ok_or(Error::SequenceExhausted)?;
+        self.quota.arm(self.database_cap);
         let result = (|| {
             #[cfg(test)]
             self.hooks.trip(Fault::ReserveBeforeCommit)?;
@@ -429,7 +450,7 @@ impl MetadataSpool {
             self.state = state;
             Ok(first)
         })();
-        self.poison_on_failure(result)
+        self.settle(result)
     }
     fn append_reserved(&mut self, sequence: u64, payload: &[u8]) -> Result<AppendReceipt> {
         let result = (|| {
@@ -447,6 +468,9 @@ impl MetadataSpool {
         })();
         self.poison_on_failure(result)
     }
+    /// Publishes every pending record in one transaction. `Full` means the disk
+    /// ceiling refused it: nothing was published and the records stay pending,
+    /// so a commit after an acknowledgement frees space can still publish them.
     pub fn commit(&mut self) -> Result<DurableReceipt> {
         self.healthy()?;
         if self.pending.is_empty() {
@@ -454,6 +478,8 @@ impl MetadataSpool {
                 through_sequence: self.state.durable,
             });
         }
+        self.admissible()?;
+        self.quota.arm(self.database_cap);
         let result = (|| {
             let mut hash = self.hash.clone();
             for (sequence, bytes) in &self.pending {
@@ -478,7 +504,7 @@ impl MetadataSpool {
                 through_sequence: state.durable,
             })
         })();
-        self.poison_on_failure(result)
+        self.settle(result)
     }
     /// Flushes pending payloads. There is no segment rotation in the redb format.
     pub fn seal(&mut self) -> Result<DurableReceipt> {
@@ -497,7 +523,7 @@ impl MetadataSpool {
             if max_records == 0 || max_bytes == 0 || after == u64::MAX {
                 return Ok(Vec::new());
             }
-            let tx = self.db.begin_read().map_err(storage_error)?;
+            let tx = self.db()?.begin_read().map_err(storage_error)?;
             let table = tx.open_table(RECORDS).map_err(storage_error)?;
             let mut records = Vec::new();
             let mut used = 0;
@@ -534,6 +560,10 @@ impl MetadataSpool {
 
     /// Only the caller's genuine backend confirmation permits deletion.
     /// The local-only capture agent never invokes this API.
+    ///
+    /// Deletes the covered rows; redb reuses their pages, which is how a spool at
+    /// its ceiling accepts appends again. `Full` means even this transaction did
+    /// not fit: nothing changed, and a shorter prefix frees fewer pages to record.
     pub fn acknowledge(&mut self, through_sequence: u64) -> Result<()> {
         self.healthy()?;
         if through_sequence > self.state.durable {
@@ -542,11 +572,12 @@ impl MetadataSpool {
         if through_sequence <= self.state.acknowledged {
             return Ok(());
         }
+        self.quota.arm(self.database_cap);
         let result = (|| {
             let mut hash = format::inventory_hash();
             let mut count = 0u64;
             {
-                let tx = self.db.begin_read().map_err(storage_error)?;
+                let tx = self.db()?.begin_read().map_err(storage_error)?;
                 let table = tx.open_table(RECORDS).map_err(storage_error)?;
                 for row in table.range(through_sequence + 1..).map_err(storage_error)? {
                     let (sequence, envelope) = row.map_err(storage_error)?;
@@ -574,9 +605,10 @@ impl MetadataSpool {
             self.hooks.trip(Fault::AcknowledgeAfterCommit)?;
             self.state = state;
             self.hash = hash;
+            self.at_cap = false;
             Ok(())
         })();
-        self.poison_on_failure(result)
+        self.settle(result)
     }
     pub fn stats(&self) -> Result<SpoolStats> {
         let inventory = inventory(&self.config.directory)?;
@@ -602,6 +634,65 @@ impl MetadataSpool {
             Ok(())
         }
     }
+    /// Refuses admissions while the last transaction was refused at the disk
+    /// ceiling, so a full spool answers without reopening its database each time.
+    fn admissible(&self) -> Result<()> {
+        self.healthy()?;
+        if self.at_cap {
+            Err(Error::Full)
+        } else {
+            Ok(())
+        }
+    }
+    fn db(&self) -> Result<&Database> {
+        self.db.as_ref().ok_or(Error::Poisoned)
+    }
+    /// Classifies a failed storage mutation. redb latches every backend error, so
+    /// a transaction refused at the disk ceiling leaves the database unusable
+    /// although nothing in it is wrong. Reopen it from its last commit and report
+    /// `Full`; any other failure poisons the handle (DESIGN.md "Append, commit, and
+    /// failures").
+    fn settle<T>(&mut self, result: Result<T>) -> Result<T> {
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !self.quota.refused() {
+            self.poisoned.set(true);
+            return Err(error);
+        }
+        match self.reload() {
+            Ok(()) => {
+                self.at_cap = true;
+                Err(Error::Full)
+            }
+            Err(error) => {
+                self.poisoned.set(true);
+                Err(error)
+            }
+        }
+    }
+    /// Reopens the database after a refusal at the ceiling and re-authenticates
+    /// it. A refusal precedes redb's commit point, so the recovered state is the
+    /// one this handle already holds; anything else is treated as corruption.
+    fn reload(&mut self) -> Result<()> {
+        let before = self.state;
+        // Close the latched database before another handle opens the file.
+        drop(self.db.take());
+        self.quota.arm(self.database_cap);
+        self.db = Some(open_database(
+            &self.file,
+            &self.quota,
+            self.config.cache_bytes,
+            #[cfg(test)]
+            &self.hooks,
+        )?);
+        self.recover()?;
+        if self.state != before {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
     fn poison_on_failure<T>(&self, result: Result<T>) -> Result<T> {
         if result.is_err() {
             self.poisoned.set(true);
@@ -621,7 +712,7 @@ impl MetadataSpool {
             0,
             &state.encode(&self.config.node_id),
         )?;
-        let mut tx = self.db.begin_write().map_err(storage_error)?;
+        let mut tx = self.db()?.begin_write().map_err(storage_error)?;
         tx.set_durability(Durability::Immediate)
             .map_err(storage_error)?;
         {
@@ -644,7 +735,7 @@ impl MetadataSpool {
         tx.commit().map_err(storage_error)
     }
     fn recover(&mut self) -> Result<String> {
-        let tx = self.db.begin_read().map_err(storage_error)?;
+        let tx = self.db()?.begin_read().map_err(storage_error)?;
         let mut table_count = 0;
         for table in tx.list_tables().map_err(storage_error)? {
             if !matches!(table.name(), "records" | "state") {
@@ -716,6 +807,23 @@ impl MetadataSpool {
     }
 }
 
+fn open_database(
+    file: &Arc<File>,
+    quota: &Arc<storage::Quota>,
+    cache_bytes: usize,
+    #[cfg(test)] hooks: &Arc<Hooks>,
+) -> Result<Database> {
+    let backend = storage::Backend {
+        file: file.clone(),
+        quota: quota.clone(),
+        #[cfg(test)]
+        hooks: hooks.clone(),
+    };
+    Database::builder()
+        .set_cache_size(cache_bytes)
+        .create_with_backend(backend)
+        .map_err(storage_error)
+}
 fn storage_error(error: impl Into<redb::Error>) -> Error {
     match error.into() {
         redb::Error::Io(e)

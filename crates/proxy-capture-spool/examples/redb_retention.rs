@@ -70,6 +70,7 @@ fn spool_config(root: &Path) -> SpoolConfig {
         max_record_bytes: RECORD_LIMIT,
         max_disk_bytes: DISK_LIMIT,
         cache_bytes: CACHE_BYTES,
+        max_pending_records: BATCH_SIZE,
     }
 }
 

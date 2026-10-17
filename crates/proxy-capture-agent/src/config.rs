@@ -206,6 +206,8 @@ impl Config {
             max_record_bytes: self.spool.max_record_bytes,
             max_disk_bytes: self.spool.max_disk_bytes,
             cache_bytes: self.spool.cache_bytes,
+            // The writer batches at most one record per connection.
+            max_pending_records: crate::MAX_CLIENTS,
         }
     }
 

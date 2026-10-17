@@ -21,6 +21,7 @@ fn test_config(temp: &TempDir) -> SpoolConfig {
         max_record_bytes: 256,
         max_disk_bytes: 8 * 1024 * 1024,
         cache_bytes: DEFAULT_CACHE_BYTES,
+        max_pending_records: 8,
     }
 }
 
@@ -262,7 +263,7 @@ fn empty_database_and_unrecognized_inventory_fail_closed() {
 }
 
 #[test]
-fn config_bounds_reject_small_disk_and_oversized_database_cache() {
+fn config_bounds_reject_small_disk_pending_limits_and_oversized_database_cache() {
     let temp = TempDir::new().unwrap();
     let mut config = test_config(&temp);
     config.max_disk_bytes = MIN_DISK_BYTES - 1;
@@ -271,6 +272,14 @@ fn config_bounds_reject_small_disk_and_oversized_database_cache() {
         Err(Error::InvalidConfig(_))
     ));
     config.max_disk_bytes = 8 * 1024 * 1024;
+    for pending in [0, MAX_PENDING_RECORDS + 1] {
+        let mut config = config.clone();
+        config.max_pending_records = pending;
+        assert!(matches!(
+            MetadataSpool::open(config, key(), []),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
     config.cache_bytes = MAX_CACHE_BYTES + 1;
     assert!(matches!(
         MetadataSpool::open(config, key(), []),
@@ -292,49 +301,111 @@ fn writer_lock_is_exclusive_and_released_on_drop() {
     assert_eq!(spool.append(b"after reopen").unwrap().sequence, 1);
 }
 
-#[test]
-fn redb_disk_quota_failure_is_a_storage_error_and_poisons_the_handle() {
-    let temp = TempDir::new().unwrap();
-    let mut config = test_config(&temp);
-    config.max_record_bytes = 128 * 1024;
-    config.max_disk_bytes = 2 * 1024 * 1024;
-    let mut spool = MetadataSpool::open(config.clone(), key(), []).unwrap();
-    spool.append(b"durable prefix").unwrap();
-    spool.commit().unwrap();
-    let payload = vec![0x5a; config.max_record_bytes];
-    let mut confirmed = 1;
-    let mut saw_storage_failure = false;
-    for _ in 0..64 {
-        match spool.append(&payload) {
-            Ok(_) => {
-                if let Err(error) = spool.commit() {
-                    assert!(matches!(error, Error::Io(_) | Error::Storage(_)));
-                    saw_storage_failure = true;
-                    break;
-                }
-                confirmed += 1;
-            }
-            Err(error) => {
-                assert!(matches!(error, Error::Io(_) | Error::Storage(_)));
-                saw_storage_failure = true;
-                break;
+/// Commits `payload` records one batch at a time until the disk ceiling refuses
+/// a commit. Returns the sequences that committed and the batch left pending.
+fn fill_to_cap(spool: &mut MetadataSpool, payload: &[u8], batch: usize) -> (Vec<u64>, usize) {
+    let mut committed = Vec::new();
+    for _ in 0..256 {
+        let mut appended = Vec::new();
+        for _ in 0..batch {
+            match spool.append(payload) {
+                Ok(receipt) => appended.push(receipt.sequence),
+                Err(Error::Full) => return (committed, appended.len()),
+                Err(error) => panic!("append failed with {error:?}, not Full"),
             }
         }
+        match spool.commit() {
+            Ok(_) => committed.extend(appended),
+            Err(Error::Full) => return (committed, appended.len()),
+            Err(error) => panic!("commit failed with {error:?}, not Full"),
+        }
     }
-    assert!(saw_storage_failure, "bounded quota profile did not exhaust");
-    assert!(spool.stats().unwrap().poisoned);
-    assert!(spool.stats().unwrap().disk_bytes <= config.max_disk_bytes);
-    assert!(matches!(
-        spool.append(b"after quota failure"),
-        Err(Error::Poisoned)
-    ));
+    panic!("the disk ceiling never refused a commit");
+}
+
+#[test]
+fn disk_cap_refuses_admissions_without_poisoning_until_an_ack_reclaims_space() {
+    let temp = TempDir::new().unwrap();
+    let mut config = test_config(&temp);
+    config.max_record_bytes = 16 * 1024;
+    config.max_disk_bytes = 4 * 1024 * 1024;
+    let mut spool = open(config.clone());
+    let payload = vec![0x5a; config.max_record_bytes];
+    // Three fill-and-drain cycles: each refill needs the pages the previous
+    // acknowledgement freed, so the file cannot simply keep growing.
+    for cycle in 0..3 {
+        let (committed, pending) = fill_to_cap(&mut spool, &payload, 4);
+        assert!(committed.len() >= 8, "cycle {cycle} filled too little");
+        let stats = spool.stats().unwrap();
+        assert!(!stats.poisoned, "a full disk must not poison the handle");
+        assert!(stats.disk_bytes <= config.max_disk_bytes);
+        assert_eq!(stats.pending_records, pending as u64);
+        // Admissions stay refused while at the ceiling; reads still work.
+        assert!(matches!(spool.append(b"while full"), Err(Error::Full)));
+        let replayed: Vec<u64> = spool
+            .replay(0, 1024, usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|row| row.sequence)
+            .collect();
+        assert_eq!(replayed, committed, "cycle {cycle} lost a committed row");
+
+        spool.acknowledge(*committed.last().unwrap()).unwrap();
+        assert!(payloads(&spool).is_empty());
+        // The records refused at the ceiling are still pending and now publish.
+        let durable = spool.commit().unwrap().through_sequence;
+        assert_eq!(spool.stats().unwrap().pending_records, 0);
+        assert_eq!(
+            spool.replay(0, 1024, usize::MAX).unwrap().len(),
+            pending,
+            "cycle {cycle}"
+        );
+        spool.acknowledge(durable).unwrap();
+    }
+    let last = spool.append(b"after three cycles").unwrap().sequence;
+    spool.commit().unwrap();
     drop(spool);
-    let recovered = open(config);
-    let rows = recovered.replay(0, 64, 8 * 1024 * 1024).unwrap();
-    assert!(rows.len() >= confirmed);
-    assert_eq!(rows[0].payload, b"durable prefix");
-    assert!(rows[1..].iter().all(|row| row.payload == payload));
-    assert!(recovered.stats().unwrap().next_sequence > confirmed as u64);
+    let reopened = open(config);
+    assert_eq!(
+        payloads(&reopened),
+        vec![(last, b"after three cycles".to_vec())]
+    );
+}
+
+#[test]
+fn a_batch_larger_than_eight_commits_in_one_transaction() {
+    let temp = TempDir::new().unwrap();
+    let mut config = test_config(&temp);
+    config.max_record_bytes = 16 * 1024;
+    config.max_disk_bytes = 4 * 1024 * 1024;
+    config.max_pending_records = 512;
+    let mut spool = open(config.clone());
+    let payload = vec![0x33; config.max_record_bytes];
+    let batch = vec![payload.as_slice(); 40];
+    assert!(spool
+        .append_batch(&batch)
+        .unwrap()
+        .iter()
+        .all(Result::is_ok));
+    assert_eq!(spool.commit().unwrap().through_sequence, 40);
+    assert_eq!(spool.replay(0, 1024, usize::MAX).unwrap().len(), 40);
+
+    // 300 records outgrow the 4 MiB ceiling: committing them in smaller
+    // transactions would publish a prefix before the refusal.
+    let oversized = vec![payload.as_slice(); 300];
+    assert!(spool
+        .append_batch(&oversized)
+        .unwrap()
+        .iter()
+        .all(Result::is_ok));
+    assert!(matches!(spool.commit(), Err(Error::Full)));
+    assert_eq!(spool.replay(0, 1024, usize::MAX).unwrap().len(), 40);
+    drop(spool);
+    assert_eq!(
+        open(config).replay(0, 1024, usize::MAX).unwrap().len(),
+        40,
+        "a refused batch must publish none of its records"
+    );
 }
 
 #[test]
@@ -638,7 +709,7 @@ fn replay_authentication_failure_poison_blocks_writes_until_reopen() {
     let mut spool = open(config.clone());
     spool.append(PAYLOAD).unwrap();
     spool.commit().unwrap();
-    corrupt_record_envelope_in_database(&spool.db, 1);
+    corrupt_record_envelope_in_database(spool.db().unwrap(), 1);
     assert!(matches!(spool.replay(0, 10, 1024), Err(Error::Corrupt)));
     assert!(spool.stats().unwrap().poisoned);
     assert!(matches!(spool.append(b"unsafe"), Err(Error::Poisoned)));
@@ -727,6 +798,7 @@ fn child_stage(stage: &str, root: &Path, marker: &Path) {
         max_record_bytes: 256,
         max_disk_bytes: 8 * 1024 * 1024,
         cache_bytes: DEFAULT_CACHE_BYTES,
+        max_pending_records: 8,
     };
     let hooks = Arc::new(Hooks::default());
     let (fault, operation) = match stage {
