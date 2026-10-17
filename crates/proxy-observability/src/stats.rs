@@ -857,6 +857,20 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Times this replica's control-plane load found no tenants and no keys
+    /// after the previous load found some: the store was emptied under it
+    /// (a shared Redis restarted without persistence, or flushed), or an
+    /// operator removed every tenant and key. Every virtual key the store
+    /// held gets 401 from then on. Counted once per transition, not per
+    /// poll. `scope` is the operator-chosen HCM `stat_prefix`. Prometheus
+    /// surface only (no Envoy equivalent).
+    pub const POLICY_STORE_EMPTIED: Instrument = Instrument {
+        name: "llmproxy_policy_store_emptied_total",
+        kind: InstrumentKind::Counter,
+        unit: "{event}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// Seconds since one of a chain's counter seams last reconciled with the
     /// store `auth.store` selects (ADR-0006 §5 and its 2026-10-15 amendment
     /// F), as of the seam's last control-side tick. `seam` is `rate_window`

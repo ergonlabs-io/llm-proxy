@@ -4,7 +4,7 @@ summary: What changes when you run more than one replica — which state is
   shared, which stays local, the propagation and staleness bounds for each,
   and what the store does when it cannot be reached. Configuring a shared
   store is Envoy-mode only today; the `llmproxy` dialect has no field for it.
-last_updated: 2026-10-13
+last_updated: 2026-10-16
 related:
   - ../authentication/virtual-keys/
   - ../limits-and-budgets/token-rate-limiting/
@@ -355,6 +355,39 @@ backlog across SIGKILL. Charges since the last successful local checkpoint
 remain volatile; without a journal, the entire unflushed outage backlog is
 volatile. See [Spend policies and recovery](../../limits-and-budgets/spend-policies/)
 for configuration, migration, key lifecycle, and concurrent admission limits.
+
+## The shared store needs persistence
+
+The shared Redis is the only copy of the minted keys, the tenants, and their
+policies. Configure Redis persistence (AOF, RDB, or both) on it. A Redis that
+restarts without persistence, or that is flushed, comes back empty. At their
+next poll, all replicas load the empty state and adopt it. From then on,
+every virtual key that the store held gets 401. This revokes every key on all
+replicas, and it stays that way until you restore the data or mint the keys
+again. Keys in the bootstrap `virtual_keys` list are not stored in Redis, so
+they continue to authenticate.
+
+The proxy cannot tell a lost store from an operator who removed every tenant
+and key, so it does not refuse the empty state. It makes the transition loud.
+When a load finds no tenants and no keys after the previous load found some,
+the replica logs one `error` line:
+`control-plane store is now EMPTY after holding tenants or keys`. The line has
+these fields:
+
+| Field | Meaning |
+|---|---|
+| `tenants_before`, `keys_before` | Row counts of the previous load. |
+| `tenants_after`, `keys_after` | Row counts of this load (both 0). |
+| `generation_before`, `generation_after` | The policy generation stamps. A lost Redis reads back as `Some(0)`, lower than before. An operator removal makes the stamp go up. |
+
+The replica also increments `envoy_llmproxy_policy_store_emptied_total` (see
+[Metrics and stats](../../observability/metrics-and-stats/)). Each replica
+logs and counts once per transition, not once per poll. Alert on any increase
+of this counter.
+
+To recover, restore the Redis data from a backup or AOF file. The replicas
+pick up the restored state at their next poll. If you have no copy, mint the
+keys again and give them to their users.
 
 ## Concurrent streams share leases
 

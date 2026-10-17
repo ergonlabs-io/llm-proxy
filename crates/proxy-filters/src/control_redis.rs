@@ -2534,6 +2534,86 @@ mod tests {
             .is_none_or(|set| set.get("openai").is_none()));
     }
 
+    /// A shared Redis restarted without persistence comes back empty. The
+    /// replica's next poll adopts that, so every key it held gets 401, and it
+    /// must say so: an ERROR naming the before and after counts, and the
+    /// emptied counter. Only this test's namespace is deleted, not the whole
+    /// database, because other tests share the server; to the replica that
+    /// is the same as a flush, generation stamp included.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_a_flushed_store_between_polls_is_loud() {
+        use crate::auth::{
+            AuthOutcome, Authenticator, HmacSecret, KeySet, VirtualKeyAuthenticator,
+        };
+        use crate::control::{rendered_emptied_count, ControlPlane, ErrorCapture};
+
+        let store = test_store("flushed");
+        let namespace = store.namespace.clone();
+        let cp = ControlPlane::new(
+            Box::new(store),
+            HmacSecret::new(b"operator-secret"),
+            KeySet::new(),
+        )
+        .expect("replica must load");
+        cp.create_tenant(&TenantId::new("tenant-a")).unwrap();
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .unwrap();
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        cp.export_snapshot_age(Arc::clone(&registry), "ingress");
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(b"operator-secret"), cp.handle());
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Bearer {}", minted.plaintext)).unwrap(),
+        );
+        assert!(matches!(
+            authenticator.authenticate(&headers),
+            AuthOutcome::Authenticated(_)
+        ));
+
+        let url = std::env::var("LLM_PROXY_TEST_REDIS").unwrap();
+        let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{namespace}:*"))
+            .query(&mut conn)
+            .unwrap();
+        assert!(!keys.is_empty());
+        let _: () = redis::cmd("DEL").arg(&keys).query(&mut conn).unwrap();
+
+        let capture = ErrorCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        assert!(
+            cp.poll_once().unwrap(),
+            "the generation stamp moved back to 0"
+        );
+
+        let lines = capture.lines.lock().unwrap().clone();
+        let emptied = lines
+            .iter()
+            .find(|line| line.contains("store is now EMPTY"))
+            .unwrap_or_else(|| panic!("no emptied-store ERROR in {lines:?}"));
+        for field in [
+            "tenants_before=1",
+            "keys_before=1",
+            "tenants_after=0",
+            "keys_after=0",
+            "generation_after=Some(0)",
+        ] {
+            assert!(emptied.contains(field), "{field} missing from {emptied}");
+        }
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
+        assert!(
+            !matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Authenticated(_)
+            ),
+            "the replica adopted the empty store"
+        );
+    }
+
     fn dt(y: i32, mo: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.with_ymd_and_hms(y, mo, d, 12, 0, 0).unwrap()
     }

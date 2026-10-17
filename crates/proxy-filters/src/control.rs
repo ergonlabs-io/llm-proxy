@@ -3154,6 +3154,32 @@ struct AgeGauge {
     last: u64,
 }
 
+/// Tenant and key row counts of one control-plane load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LoadedRows {
+    tenants: usize,
+    keys: usize,
+}
+
+impl LoadedRows {
+    fn of(loaded: &StoredControlPlane) -> Self {
+        LoadedRows {
+            tenants: loaded.tenants.len(),
+            keys: loaded.keys.len(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.tenants == 0 && self.keys == 0
+    }
+}
+
+/// The `llmproxy_policy_store_emptied_total` series for one control plane.
+struct EmptiedCounter {
+    registry: Arc<proxy_observability::stats::Registry>,
+    handle: proxy_observability::stats::Handle,
+}
+
 /// Owns the store, the operator's HMAC secret, the config bootstrap keys, and
 /// the published snapshot. See the module doc for the full seam and the
 /// boot/refresh fail-closed split.
@@ -3177,6 +3203,13 @@ pub struct ControlPlane {
     freshness: Arc<PolicyFreshness>,
     /// Set by [`Self::export_snapshot_age`]; published by the poller.
     age_gauge: Mutex<Option<AgeGauge>>,
+    /// Tenant and key rows in the last load this replica published, so a
+    /// load that finds the store suddenly empty can say what it lost. See
+    /// [`Self::note_emptied_store`].
+    loaded_rows: Mutex<LoadedRows>,
+    /// `llmproxy_policy_store_emptied_total`, resolved alongside the age
+    /// gauge by [`Self::export_snapshot_age`].
+    emptied_counter: Mutex<Option<EmptiedCounter>>,
     poller: Mutex<Option<PolicyPoller>>,
     /// Key-encryption keys for tenant provider credentials (ADR-0007
     /// decision 2). `None` means `typed_config.tenant_credentials` is not
@@ -3256,6 +3289,7 @@ impl ControlPlane {
         // not a missed revocation.
         let generation = store.policy_generation().ok();
         let mut loaded = store.load()?;
+        let loaded_rows = LoadedRows::of(&loaded);
         let rate_cards = Self::take_rate_cards(&mut loaded);
         let snapshot = Self::build_snapshot(
             &bootstrap_keys,
@@ -3281,6 +3315,8 @@ impl ControlPlane {
                 Arc::new(freshness)
             },
             age_gauge: Mutex::new(None),
+            loaded_rows: Mutex::new(loaded_rows),
+            emptied_counter: Mutex::new(None),
             poller: Mutex::new(None),
             credential_keys,
             credential_warnings,
@@ -3323,7 +3359,7 @@ impl ControlPlane {
         let generation = self.store.policy_generation().ok();
         match self.store.load() {
             Ok(loaded) => {
-                let snapshot = self.snapshot_from(loaded);
+                let snapshot = self.snapshot_from(loaded, generation);
                 self.published.store(Arc::new(snapshot));
                 *self
                     .last_generation
@@ -3368,7 +3404,7 @@ impl ControlPlane {
             return Ok(false);
         }
         let loaded = self.store.load()?;
-        let snapshot = self.snapshot_from(loaded);
+        let snapshot = self.snapshot_from(loaded, Some(generation));
         self.published.store(Arc::new(snapshot));
         *self
             .last_generation
@@ -3417,6 +3453,18 @@ impl ControlPlane {
             256,
             &[("scope", "overflow")],
         );
+        *self
+            .emptied_counter
+            .lock()
+            .expect("control plane mutex poisoned") = Some(EmptiedCounter {
+            handle: registry.resolve_capped(
+                &proxy_observability::stats::instruments::POLICY_STORE_EMPTIED,
+                &[("scope", scope)],
+                256,
+                &[("scope", "overflow")],
+            ),
+            registry: Arc::clone(&registry),
+        });
         *gauge = Some(AgeGauge {
             registry,
             handle,
@@ -3443,6 +3491,57 @@ impl ControlPlane {
             age.wrapping_sub(gauge.last) as i64,
         );
         gauge.last = age;
+    }
+
+    /// Makes a load that finds no tenants and no keys, after the last load
+    /// found some, loud: an ERROR with both counts and generation stamps,
+    /// and one increment of `llmproxy_policy_store_emptied_total`.
+    ///
+    /// AGENTS.md "Fail-open controls": the replica adopts the empty state,
+    /// which fails closed (every virtual key the store held now gets 401),
+    /// but at INFO it was indistinguishable from a quiet store. A shared
+    /// Redis restarted without persistence, or flushed, looks exactly like
+    /// this: its generation stamp also reads back as 0. One line per
+    /// transition, not per poll: once this load is recorded as empty, the
+    /// next empty load compares equal and stays silent.
+    fn note_emptied_store(&self, loaded: &StoredControlPlane, generation: Option<u64>) {
+        let now = LoadedRows::of(loaded);
+        let before = std::mem::replace(
+            &mut *self
+                .loaded_rows
+                .lock()
+                .expect("control plane mutex poisoned"),
+            now,
+        );
+        if !now.is_empty() || before.is_empty() {
+            return;
+        }
+        let generation_before = *self
+            .last_generation
+            .lock()
+            .expect("control plane mutex poisoned");
+        tracing::error!(
+            tenants_before = before.tenants,
+            keys_before = before.keys,
+            tenants_after = now.tenants,
+            keys_after = now.keys,
+            generation_before = ?generation_before,
+            generation_after = ?generation,
+            "control-plane store is now EMPTY after holding tenants or keys; every \
+             virtual key it held now gets 401. Unless an operator removed them, the \
+             store lost its data: a Redis restarted without persistence (AOF or RDB) \
+             or flushed revokes every key fleet-wide"
+        );
+        if let Some(counter) = self
+            .emptied_counter
+            .lock()
+            .expect("control plane mutex poisoned")
+            .as_ref()
+        {
+            counter
+                .registry
+                .incr(proxy_observability::stats::WorkerId(0), counter.handle, 1);
+        }
     }
 
     /// Starts the background policy-poller thread, ticking roughly every
@@ -4130,7 +4229,15 @@ impl ControlPlane {
         Ok(())
     }
 
-    fn snapshot_from(&self, mut loaded: StoredControlPlane) -> ControlPlaneSnapshot {
+    /// `generation` is the stamp read before `loaded`, for the log line of
+    /// [`Self::note_emptied_store`]; `last_generation` still holds the
+    /// previous one when this runs.
+    fn snapshot_from(
+        &self,
+        mut loaded: StoredControlPlane,
+        generation: Option<u64>,
+    ) -> ControlPlaneSnapshot {
+        self.note_emptied_store(&loaded, generation);
         let cards = Self::take_rate_cards(&mut loaded);
         *self
             .rate_cards
@@ -4463,6 +4570,63 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
     })))
+}
+
+/// Records every ERROR event's message and fields, rendered as one line, for
+/// tests that assert a control is loud. Install it with
+/// `tracing::subscriber::set_default`, which is per thread, so the code under
+/// test must run on the test's own thread.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ErrorCapture {
+    pub(crate) lines: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl tracing::Subscriber for ErrorCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() != tracing::Level::ERROR {
+            return;
+        }
+        struct Line(String);
+        impl tracing::field::Visit for Line {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={:?} ", field.name(), value));
+            }
+        }
+        let mut line = Line(String::new());
+        event.record(&mut line);
+        self.lines
+            .lock()
+            .expect("capture mutex poisoned")
+            .push(line.0);
+    }
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// The value of `llmproxy_policy_store_emptied_total{scope}` in `registry`'s
+/// Prometheus rendering.
+#[cfg(test)]
+pub(crate) fn rendered_emptied_count(
+    registry: &proxy_observability::stats::Registry,
+    scope: &str,
+) -> u64 {
+    let prefix = format!("envoy_llmproxy_policy_store_emptied_total{{scope=\"{scope}\"}}");
+    proxy_observability::stats::prometheus_render::render(registry)
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("the emptied counter is exported")
 }
 
 /// A store several [`ControlPlane`]s can share in a test, standing in for a
@@ -7133,6 +7297,41 @@ mod tests {
             "a failed poll must not reset last_reconciled_at -- the snapshot is getting \
              staler, not fresher, while the store is down"
         );
+    }
+
+    #[test]
+    fn a_load_that_finds_the_store_emptied_logs_an_error_and_counts_once() {
+        // The in-process path to an empty store: the last tenant is deleted.
+        // A flushed Redis reaches the same transition; see
+        // `control_redis.rs::redis_a_flushed_store_between_polls_is_loud`.
+        let (store, inner) = SharedMemoryStore::new();
+        inner.create_tenant(&TenantId::new("tenant-a")).unwrap();
+        let cp = ControlPlane::new(Box::new(store), HmacSecret::new(b"s"), KeySet::new()).unwrap();
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        cp.export_snapshot_age(Arc::clone(&registry), "ingress");
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 0);
+
+        let capture = ErrorCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        inner.delete_tenant(&TenantId::new("tenant-a")).unwrap();
+        assert!(cp.poll_once().unwrap());
+        // Still empty on the next change: one signal per transition.
+        inner.create_tenant(&TenantId::new("tenant-b")).unwrap();
+        inner.delete_tenant(&TenantId::new("tenant-b")).unwrap();
+        assert!(cp.poll_once().unwrap());
+
+        let lines = capture.lines.lock().unwrap().clone();
+        let emptied: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("store is now EMPTY"))
+            .collect();
+        assert_eq!(emptied.len(), 1, "one ERROR per transition: {lines:?}");
+        assert!(
+            emptied[0].contains("tenants_before=1") && emptied[0].contains("tenants_after=0"),
+            "{}",
+            emptied[0]
+        );
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
     }
 
     // --- the hard staleness bound (review H4; ADR-0005: auth fails closed) --

@@ -11,6 +11,17 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Changed
+
+- A policy load that finds the shared store empty after it held tenants or
+  keys now logs an `error` line with the before and after counts and
+  generation stamps, and increments
+  `llmproxy_policy_store_emptied_total{scope}`. Before, the replica logged
+  the empty load at `info` and every stored key got 401 with no other signal.
+  A Redis restarted without persistence, or flushed, causes this; the shared
+  Redis needs AOF or RDB persistence (see "The shared store needs
+  persistence" in Running in production).
+
 ## [0.4.0] - 2026-10-16
 
 ### Breaking

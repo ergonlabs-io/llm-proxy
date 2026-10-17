@@ -3,7 +3,7 @@ title: Metrics and /stats
 summary: The metrics llm-proxy records, how /stats, /stats/prometheus, and OTLP
   export show them, the limits on label cardinality, how a series ends when
   its cluster or listener leaves the config, and how to turn on OTLP export.
-last_updated: 2026-10-13
+last_updated: 2026-10-16
 related:
   - ../configuration/configuration-file/
   - ../operations/config-reload/
@@ -101,6 +101,7 @@ reachable).
 |---|---|---|---|
 | `llmproxy_access_log_dropped_lines` | counter | none | Access-log lines that the proxy dropped because a destination queue was full. See [Access logs](../access-logs/#where-a-line-goes). |
 | `envoy_llmproxy_policy_snapshot_age_seconds` | gauge | `scope` (the HCM `stat_prefix`) | Age of the replica's copy of keys, revocations, and policies, in whole seconds. Updated each poll tick, so it lags by up to one poll interval. Only on `/stats/prometheus`. See [Policy staleness](../../authentication/virtual-keys/#policy-staleness). |
+| `envoy_llmproxy_policy_store_emptied_total` | counter | `scope` (the HCM `stat_prefix`) | Policy loads that found no tenants and no keys after the previous load found some. The usual cause is a shared Redis that restarted without persistence or was flushed. Every virtual key the store held then gets 401. Counted once per transition. Only on `/stats/prometheus`. See [Running in production](../../operations/running-in-production/#the-shared-store-needs-persistence). |
 | `envoy_llmproxy_counter_reconciliation_age_seconds` | gauge | `scope` (the HCM `stat_prefix`), `seam` (`rate_window`, `stream_lease`, or `spend`) | Time since the counters of one seam last reconciled with the store that `auth.store` selects, in whole seconds. `rate_window` is the token and request counts of `llmproxy.token_limit`, `stream_lease` is its concurrent-stream counts, and `spend` is the spend totals of `llmproxy.spend_limit`. The value increases while the store is unreachable. During that time the proxy continues to admit requests against the last known totals. Updated after each reconcile attempt. Only on `/stats/prometheus`. See [Token rate limiting](../../limits-and-budgets/token-rate-limiting/#windows). |
 | `envoy_llmproxy_control_plane_store_info` | gauge | `scope` (the HCM `stat_prefix`), `store` (`in_memory`, `persistent`, or `shared`), `node_id` (the configured node id, or `-` when none is set) | Always 1. One series for each `llmproxy.auth` chain, which names the store that `auth.store` selects. If replicas report different `node_id` values and `store` is not `shared`, each replica enforces its own limits and budgets. Only on `/stats/prometheus`. See [Running in production](../../operations/running-in-production/#a-node-id-with-a-per-replica-store). |
 | `llmproxy_otel_export_failures` | counter | `signal` (`traces` or `metrics`) | OTLP export attempts that failed: a connect error, a collector rejection, or an expired deadline. |
