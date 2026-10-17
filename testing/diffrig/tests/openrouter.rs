@@ -165,12 +165,26 @@ observability:
         }
     }
     worker.join().unwrap();
-    let logs = std::fs::read_to_string(scratch.path().join("proxy.log")).unwrap();
-    assert!(
+    // The access-log writer batches lines on its own thread, so the line
+    // lands shortly after the response, not before it.
+    let has_cost = |logs: &str| {
         logs.lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .any(|entry| entry["llm_list_cost_nanodollars"] == "750"
-                || entry["llm_list_cost_nanodollars"] == 750),
+            .any(|entry| {
+                entry["llm_list_cost_nanodollars"] == "750"
+                    || entry["llm_list_cost_nanodollars"] == 750
+            })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let logs = loop {
+        let logs = std::fs::read_to_string(scratch.path().join("proxy.log")).unwrap();
+        if has_cost(&logs) || std::time::Instant::now() >= deadline {
+            break logs;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        has_cost(&logs),
         "request token cost must be recorded: {logs}"
     );
 }

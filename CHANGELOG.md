@@ -32,6 +32,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- Access logs cost less CPU: about 0.11 ms less per non-streaming request
+  with the `llmproxy` dialect's default JSON log, which now costs about
+  0.06 ms (it was 0.15 ms). The rendered lines do not change. The log
+  writer now batches lines and flushes every 100 ms, or sooner when 64 KiB
+  are waiting, so a line can reach its file or stdout up to 100 ms after
+  the response. Shutdown and a reopen still flush first.
 - An HTTP/1.1 upstream connection is now reused after a response framed by
   `Content-Length`, including an empty one. Before, through a real client
   connection, only a chunked response returned its connection to the pool:
