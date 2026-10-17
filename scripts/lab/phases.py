@@ -16,8 +16,10 @@ Two derived columns sit beside the phases:
   the upstream's own time to response headers (the mock's TTFT), so `proxy`
   is the time the request spent in the proxy or on the loopback hops. It is
   a per-request sum, so its p50 is not the sum of the phase p50s.
-- `duration`: %DURATION% (JSON format only), for a sanity check that the
-  phases cover the request.
+- `total`: the sum of every phase but `us_connect`. The phases are
+  consecutive, so this is DS_RX_BEG to DS_TX_END: the request's whole time
+  between the proxy's codec reading it and writing the last byte back.
+  (%DURATION% is whole milliseconds, too coarse at this scale.)
 
 The log holds the warm-up requests too, which loadgen leaves out of its own
 numbers. --skip-s drops the requests that started in the first N seconds of
@@ -54,7 +56,7 @@ def micros(value):
 
 
 def records(path):
-    """(start, {phase: us or None}, duration_us or None) per log line."""
+    """(start, {phase: us or None}) per log line."""
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -63,15 +65,14 @@ def records(path):
             if line.startswith("{"):
                 rec = json.loads(line)
                 phases = {p: micros(rec.get(f"{p}_us")) for p in PHASES}
-                dur = micros(rec.get("duration_ms"))
-                yield parse_time(rec.get("start_time")), phases, None if dur is None else dur * 1000
+                yield parse_time(rec.get("start_time")), phases
             else:
                 start, timing = TEXT_START.match(line), TEXT_TIMING.search(line)
                 if not timing:
                     continue
                 kv = dict(f.split("=", 1) for f in timing.group(1).split() if "=" in f)
                 phases = {p: micros(kv.get(p)) for p in PHASES}
-                yield parse_time(start.group(1)) if start else None, phases, None
+                yield parse_time(start.group(1)) if start else None, phases
 
 
 def load(path, skip_s):
@@ -91,8 +92,8 @@ def pct(values, q):
 
 
 def summarize(rows):
-    cols = {p: [] for p in PHASES + ["proxy", "duration"]}
-    for _, phases, dur in rows:
+    cols = {p: [] for p in PHASES + ["proxy", "total"]}
+    for _, phases in rows:
         for p in PHASES:
             if phases[p] is not None:
                 cols[p].append(phases[p])
@@ -100,11 +101,10 @@ def summarize(rows):
         # sum; us_connect is left out because a reused connection repeats
         # the connect from when it was dialed, and a real connect is inside
         # pre_upstream already.
-        summed = [phases[p] for p in PHASES if p not in ("us_wait", "us_connect")]
-        if all(v is not None for v in summed):
-            cols["proxy"].append(sum(summed))
-        if dur is not None:
-            cols["duration"].append(dur)
+        consecutive = [phases[p] for p in PHASES if p != "us_connect"]
+        if all(v is not None for v in consecutive):
+            cols["total"].append(sum(consecutive))
+            cols["proxy"].append(sum(consecutive) - phases["us_wait"])
     return {
         "requests": len(rows),
         "phases": {
