@@ -11,6 +11,9 @@ mod capture_tests;
 #[cfg(unix)]
 pub mod capture_transport;
 pub mod flags;
+pub mod ledger;
+#[cfg(all(test, unix))]
+mod ledger_tests;
 pub mod metadata;
 /// Maps [`trace::FinishedSpan`] to the OTLP wire types
 /// and drains a [`trace::SpanSink`]'s receiver into a real collector.

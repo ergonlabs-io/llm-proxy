@@ -48,6 +48,8 @@ h2 = "0.4"
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time", "test-util"] }
 # Captures the stats recorders' warn-once lines in `stat_handles` tests.
 tracing-subscriber = { workspace = true }
+# The ledger tests open a real ledger spool in a temporary directory.
+proxy-observability = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

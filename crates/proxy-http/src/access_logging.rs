@@ -21,8 +21,9 @@ use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
 use proxy_observability::access_log::{render_into, FormatOp, FormatString, LlmTokens, LogContext};
+use proxy_observability::ledger::LedgerTicket;
 use proxy_observability::records::{
-    Ledger, LedgerCharge, RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
+    LedgerCharge, RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
 };
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
@@ -299,9 +300,11 @@ pub(crate) struct AccessLogContext {
     /// Optional end-user metadata sink. Submission is a single nonblocking
     /// try-send at terminal completion; capture loss never changes the reply.
     pub(crate) request_record_sink: Option<Arc<dyn RequestRecordSink>>,
-    /// The billing ledger, when one is wired. Unlike the record sink, it
-    /// takes an entry for every dialled request, captured or not.
-    pub(crate) ledger: Option<Arc<Ledger>>,
+    /// This request's billing-ledger admission, when a ledger is wired.
+    /// Unlike the record sink, it takes an entry for every dialled request,
+    /// captured or not. Dropped unused when nothing was dialled, which gives
+    /// the slot back.
+    pub(crate) ledger: Option<LedgerTicket>,
 }
 
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
@@ -496,7 +499,7 @@ impl LoggingBody {
     }
 
     fn finish(&mut self) {
-        let Some(ctx) = self.ctx.take() else {
+        let Some(mut ctx) = self.ctx.take() else {
             // Already logged (`poll_frame` beat `Drop` to it, or vice versa).
             return;
         };
@@ -651,8 +654,16 @@ impl LoggingBody {
         // ADR-0009 decision 2: a request dialled to an upstream gets an
         // entry, even one charged zero, since the provider may still bill
         // it. One refused before dialling never set an upstream host.
-        let ledger = ctx.ledger.as_ref().filter(|_| upstream_host.is_some());
-        if record_sink.is_some() || ledger.is_some() {
+        let reservation = match (ctx.ledger.take(), upstream_host.is_some()) {
+            (Some(LedgerTicket::Reserved(reservation)), true) => Some(reservation),
+            (Some(LedgerTicket::Unledgered(unledgered)), true) => {
+                unledgered.dialled();
+                None
+            }
+            // Not dialled: dropping the ticket releases its slot.
+            _ => None,
+        };
+        if record_sink.is_some() || reservation.is_some() {
             // Request records never use the caller's x-request-id as their
             // identity. Internal identity is pinned at request admission.
             let request_id = ctx
@@ -841,7 +852,7 @@ impl LoggingBody {
                 }
             }
             let mut record = Some(record);
-            if let Some(ledger) = ledger {
+            if let Some(reservation) = reservation {
                 // Cloned only when the best-effort record sink also takes it.
                 let entry_record = if record_sink.is_some() {
                     record.clone()
@@ -849,7 +860,7 @@ impl LoggingBody {
                     record.take()
                 };
                 if let Some(entry_record) = entry_record {
-                    ledger.append(entry_record, ledger_charge(&ctx.stream_info.borrow().llm));
+                    reservation.append(entry_record, ledger_charge(&ctx.stream_info.borrow().llm));
                 }
             }
             if let (Some(sink), Some(record)) = (record_sink, record) {
@@ -1688,17 +1699,13 @@ mod tests {
     /// charge the spend counters received, not the list price.
     #[tokio::test]
     async fn the_ledger_entry_copies_the_spend_charge_over_the_list_price() {
-        #[derive(Default)]
-        struct Entries(Mutex<Vec<proxy_observability::records::LedgerEntry>>);
-        impl proxy_observability::records::LedgerSink for Entries {
-            fn append(&self, entry: proxy_observability::records::LedgerEntry) {
-                self.0.lock().unwrap().push(entry);
-            }
-        }
         let capture = Arc::new(CaptureSink::default());
         let mut ctx = flags_ctx(&capture);
-        let entries = Arc::new(Entries::default());
-        ctx.ledger = Some(Arc::new(Ledger::new("i".into(), 1, entries.clone())));
+        let mut ledger = proxy_observability::ledger::testing::TempLedger::open(
+            1,
+            proxy_observability::ledger::OnUnavailable::Reject,
+        );
+        ctx.ledger = Some(ledger.ledger.admit().unwrap());
         let scope = proxy_observability::records::ChargedScope {
             scope: proxy_observability::records::ChargeScope::Key,
             id: "key-a".into(),
@@ -1723,7 +1730,7 @@ mod tests {
                 .map_err(|never: std::convert::Infallible| match never {}),
         );
         LoggingBody::new(body, ctx).collect().await.unwrap();
-        let entries = entries.0.lock().unwrap();
+        let entries = ledger.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].charged_micro_usd, 5);
         assert_eq!(entries[0].rate_card_version.as_deref(), Some("old-card"));

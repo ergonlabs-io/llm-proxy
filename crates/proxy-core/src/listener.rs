@@ -263,7 +263,7 @@ struct HcmRuntime<'a> {
     latency_stats: &'a Arc<GenAiLatencyStats>,
     tracing_handles: Option<&'a TracingHandles>,
     metadata: Option<&'a Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    ledger: Option<&'a Arc<proxy_observability::records::Ledger>>,
+    ledger: Option<&'a Arc<proxy_observability::ledger::Ledger>>,
     factory_state: &'a Arc<SharedFactoryState>,
 }
 
@@ -393,7 +393,7 @@ pub struct StatsRecorders {
     pub metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     /// The billing ledger (ADR-0009). `None` until a ledger writer is configured; every worker
     /// shares the one `Ledger` so its `seq` is gapless across the instance.
-    pub ledger: Option<Arc<proxy_observability::records::Ledger>>,
+    pub ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
     /// The process-wide downstream connection counter. Not a recorder, but bundled for the same
     /// argument-count reason.
     pub connection_limiter: crate::admission::ConnectionLimiter,
@@ -434,7 +434,7 @@ struct WorkerShared<'a> {
     /// Span sink and head-sampling ratio; see [`StatsRecorders::tracing`].
     tracing: &'a Option<TracingHandles>,
     metadata: &'a Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    ledger: &'a Option<Arc<proxy_observability::records::Ledger>>,
+    ledger: &'a Option<Arc<proxy_observability::ledger::Ledger>>,
     /// The per-serve [`SharedFactoryState`], shared by every worker's filter-factory build. Passed
     /// to each `HttpFilterFactory::create` through `FactoryContext`.
     factory_state: &'a Arc<SharedFactoryState>,
@@ -629,7 +629,7 @@ struct AcceptLoopShared {
     /// (`tracing::warn!` a few lines below the destructure).
     tracing_handles: Option<TracingHandles>,
     metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    ledger: Option<Arc<proxy_observability::records::Ledger>>,
+    ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
     /// This worker's [`SharedFactoryState`] handle -- see
     /// [`WorkerShared::factory_state`]; needed here (not just at
     /// [`spawn_bound`] time) for the identical reason `token_stats` is (the

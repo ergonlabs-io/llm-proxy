@@ -1007,6 +1007,47 @@ pub mod instruments {
         buckets: None,
     };
 
+    // ------------------------------------------------------- billing ledger --
+    //
+    // ADR-0009. `reason` is the closed set `queue_full`, `writer_failed`,
+    // `disk_full` for the first two; `writer_failed`, `oversize`, `shutdown`
+    // for lost entries.
+
+    /// Requests refused with a local 503 because no ledger reservation was
+    /// available and `on_unavailable` is `reject`.
+    pub const LEDGER_REJECTED: Instrument = Instrument {
+        name: "llmproxy_ledger_rejected_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Requests dialled without a ledger entry under `on_unavailable: admit`.
+    /// The fail-open path's record (AGENTS.md "Fail-open controls").
+    pub const LEDGER_UNLEDGERED: Instrument = Instrument {
+        name: "llmproxy_ledger_unledgered_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Entries committed to the ledger spool.
+    pub const LEDGER_COMMITTED: Instrument = Instrument {
+        name: "llmproxy_ledger_entries_committed_total",
+        kind: InstrumentKind::Counter,
+        unit: "{entry}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Entries handed to the writer that were never committed.
+    pub const LEDGER_LOST: Instrument = Instrument {
+        name: "llmproxy_ledger_entries_lost_total",
+        kind: InstrumentKind::Counter,
+        unit: "{entry}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+
     /// Queue occupancy measured from producer reservation to collector dequeue
     /// observation. `depth / llmproxy_metadata_queue_capacity` estimates queue
     /// utilization. Concurrent reservation/dequeue updates can briefly include

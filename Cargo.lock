@@ -2124,6 +2124,7 @@ dependencies = [
  "http",
  "proxy-api",
  "proxy-capture-protocol",
+ "proxy-capture-spool",
  "rand",
  "ring",
  "serde",

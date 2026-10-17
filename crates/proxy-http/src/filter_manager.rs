@@ -418,7 +418,7 @@ pub struct FilterChainHandler {
     /// check.
     tracing: Option<TracingWiring>,
     request_record_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
-    ledger: Option<Arc<proxy_observability::records::Ledger>>,
+    ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
 }
 
 /// [`FilterChainHandler::tracing`]'s payload -- bundled rather than two
@@ -635,7 +635,7 @@ impl FilterChainHandler {
 
     /// Wires the billing ledger (ADR-0009): every request this handler
     /// dials to an upstream gets an entry at stream end.
-    pub fn with_ledger(mut self, ledger: Arc<proxy_observability::records::Ledger>) -> Self {
+    pub fn with_ledger(mut self, ledger: Arc<proxy_observability::ledger::Ledger>) -> Self {
         self.ledger = Some(ledger);
         self
     }
@@ -699,16 +699,15 @@ impl StreamHandler for FilterChainHandler {
                 crate::headers::apply_xff(&mut req.head.headers, req.downstream.remote.ip(), &xff);
                 crate::headers::set_forwarded_proto(&mut req.head.headers, req.downstream.is_tls);
             }
-            // Rust note: a fresh, `!Send` instance vector per request — filters
-            // may freely hold `Rc`/`RefCell` (ADR-0003).
-            let filters: Vec<Box<dyn HttpFilter>> =
-                self.factories.iter().map(|f| f.create_filter()).collect();
-            // ADR-0004 step 3: the terminal instance is minted LAST, after
-            // every configured filter -- it's created and destroyed exactly
-            // like any other filter instance (S2.1: reverse creation order),
-            // just via its own factory type since `TerminalHttpFilter` isn't
-            // `HttpFilter`-uniform (it also exposes `respond`).
-            let terminal = self.terminal_factory.create_terminal_filter();
+            // ADR-0009 decision 5: reserve ledger capacity before any filter
+            // runs, so nothing is dialled unledgered unless the operator chose
+            // `on_unavailable: admit`. One atomic increment; it never waits on
+            // the ledger writer. A refused request runs no filter at all.
+            let (ledger_ticket, ledger_refusal) = match self.ledger.as_ref().map(|l| l.admit()) {
+                None => (None, None),
+                Some(Ok(ticket)) => (Some(ticket), None),
+                Some(Err(reason)) => (None, Some(reason)),
+            };
             // The one `StreamInfo` for this stream (Envoy's model, module
             // doc): created once here, cloned (cheap `Rc` bump) into `ctx`
             // for every filter (including the terminal, which reads it
@@ -813,27 +812,42 @@ impl StreamHandler for FilterChainHandler {
                 };
                 stream_info.borrow_mut().trace = Some(ctx);
             }
-            let mgr = FilterManager {
-                filters,
-                ctx: ChainCtx::new(stream_info.clone())
-                    .with_route_table(self.route_table.clone())
-                    .with_per_route(self.per_route.clone())
-                    .with_stream_limits(StreamLimits {
-                        idle: self.stream_idle_timeout,
-                        deadline: self.max_stream_duration.map(|d| start_instant + d),
-                    }),
-                terminal,
-                buffer_limit: self.buffer_limit,
-                request_deadline: self.request_timeout.map(|t| start_instant + t),
+            let (resp, request_headers_snapshot) = if let Some(reason) = ledger_refusal {
+                let request = Rc::new(RefCell::new(Some(snapshot_request(&req.head))));
+                (ledger_unavailable_reply(&stream_info, reason), request)
+            } else {
+                // Rust note: a fresh, `!Send` instance vector per request — filters
+                // may freely hold `Rc`/`RefCell` (ADR-0003).
+                let filters: Vec<Box<dyn HttpFilter>> =
+                    self.factories.iter().map(|f| f.create_filter()).collect();
+                // ADR-0004 step 3: the terminal instance is minted LAST, after
+                // every configured filter -- it's created and destroyed exactly
+                // like any other filter instance (S2.1: reverse creation order),
+                // just via its own factory type since `TerminalHttpFilter` isn't
+                // `HttpFilter`-uniform (it also exposes `respond`).
+                let terminal = self.terminal_factory.create_terminal_filter();
+                let mgr = FilterManager {
+                    filters,
+                    ctx: ChainCtx::new(stream_info.clone())
+                        .with_route_table(self.route_table.clone())
+                        .with_per_route(self.per_route.clone())
+                        .with_stream_limits(StreamLimits {
+                            idle: self.stream_idle_timeout,
+                            deadline: self.max_stream_duration.map(|d| start_instant + d),
+                        }),
+                    terminal,
+                    buffer_limit: self.buffer_limit,
+                    request_deadline: self.request_timeout.map(|t| start_instant + t),
+                };
+                // Rust note: `mgr` is still a plain local value here (not yet
+                // moved into `run()`), so its `ctx.request_headers_snapshot` --
+                // an `Rc<RefCell<Option<HeaderMap>>>` `ChainCtx::new` mints
+                // internally -- can be cloned out now and read back after `run()`
+                // returns, without changing `run()`'s own return type (which
+                // every direct `FilterManager` test below also relies on).
+                let request_headers_snapshot = mgr.ctx.request_headers_snapshot.clone();
+                (mgr.run(req).await, request_headers_snapshot)
             };
-            // Rust note: `mgr` is still a plain local value here (not yet
-            // moved into `run()`), so its `ctx.request_headers_snapshot` --
-            // an `Rc<RefCell<Option<HeaderMap>>>` `ChainCtx::new` mints
-            // internally -- can be cloned out now and read back after `run()`
-            // returns, without changing `run()`'s own return type (which
-            // every direct `FilterManager` test below also relies on).
-            let request_headers_snapshot = mgr.ctx.request_headers_snapshot.clone();
-            let resp = mgr.run(req).await;
 
             // The wrap is what runs `finish()` at end-of-stream, and `finish()`
             // does TWO jobs: it renders the access log AND it records the
@@ -890,7 +904,7 @@ impl StreamHandler for FilterChainHandler {
                 latency_stats: self.latency_stats.clone(),
                 span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
                 request_record_sink,
-                ledger: self.ledger.clone(),
+                ledger: ledger_ticket,
             };
             HttpResponseParts {
                 head: resp.head,
@@ -904,6 +918,36 @@ impl StreamHandler for FilterChainHandler {
                 upgrade: resp.upgrade,
             }
         })
+    }
+}
+
+/// The local 503 for a request refused because no ledger reservation was
+/// available under `on_unavailable: reject` (ADR-0009 decision 5). The
+/// reason is one of a closed set; it is also the counter's label.
+fn ledger_unavailable_reply(
+    stream_info: &Rc<RefCell<StreamInfo>>,
+    reason: proxy_observability::ledger::Unavailable,
+) -> HttpResponseParts {
+    {
+        let mut info = stream_info.borrow_mut();
+        info.is_local_reply = true;
+        info.response_code_details = Some(format!("ledger_unavailable_{}", reason.as_str()));
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    HttpResponseParts {
+        head: ResponseHeaders {
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            headers,
+        },
+        body: bytes_to_seam_body(
+            Bytes::from(format!("billing ledger unavailable: {}\n", reason.as_str())),
+            None,
+        ),
+        upgrade: None,
     }
 }
 

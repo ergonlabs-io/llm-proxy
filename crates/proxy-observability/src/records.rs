@@ -421,57 +421,13 @@ pub struct ChargedScope {
     pub period: String,
 }
 
-/// What [`Ledger::append`] adds to the record to make an entry.
+/// What the terminal-record point adds to the record to make an entry; the
+/// ledger writer adds the numbering (`crate::ledger`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerCharge {
     pub charged_micro_usd: u64,
     pub charged_scopes: Vec<ChargedScope>,
     pub rate_card_version: Option<String>,
-}
-
-/// Where ledger entries go. Called with the [`Ledger`]'s lock held, so an
-/// implementation receives entries in `seq` order and must not block.
-pub trait LedgerSink: Send + Sync {
-    fn append(&self, entry: LedgerEntry);
-}
-
-/// Numbers entries for one process start and hands them to a sink. Shared
-/// by every worker, so `seq` is gapless across the instance, not per worker.
-pub struct Ledger {
-    instance_id: String,
-    epoch: u64,
-    next_seq: std::sync::Mutex<u64>,
-    sink: Arc<dyn LedgerSink>,
-}
-
-impl Ledger {
-    pub fn new(instance_id: String, epoch: u64, sink: Arc<dyn LedgerSink>) -> Self {
-        Self {
-            instance_id,
-            epoch,
-            next_seq: std::sync::Mutex::new(0),
-            sink,
-        }
-    }
-
-    /// Assign the next `seq` and append. The sequence number and the append
-    /// happen under one lock, so the sink sees entries in `seq` order.
-    pub fn append(&self, record: RequestRecord, charge: LedgerCharge) {
-        let mut next_seq = self.next_seq.lock().expect("ledger lock poisoned");
-        let entry = LedgerEntry {
-            schema_version: LEDGER_SCHEMA_VERSION,
-            instance_id: self.instance_id.clone(),
-            epoch: self.epoch,
-            seq: *next_seq,
-            charged_micro_usd: charge.charged_micro_usd,
-            charged_scopes: charge.charged_scopes,
-            rate_card_version: charge.rate_card_version,
-            policy_generation: record.policy_generation,
-            record,
-        };
-        *next_seq += 1;
-        self.sink.append(entry);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

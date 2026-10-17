@@ -46,6 +46,17 @@ proxy-api = { workspace = true }
 tonic = { workspace = true }
 proxy-capture-protocol = { path = "../proxy-capture-protocol" }
 
+# The billing ledger's writer appends to the encrypted spool (ADR-0009).
+[target.'cfg(unix)'.dependencies]
+proxy-capture-spool = { path = "../proxy-capture-spool" }
+# `ledger::testing`, behind `test-support`.
+tempfile = { version = "=3.27.0", default-features = false, optional = true }
+
+[features]
+# Shared test infrastructure for the billing ledger (`ledger::testing`): the
+# HTTP and listener tests open a real ledger in a temporary directory.
+test-support = ["dep:tempfile"]
+
 [dev-dependencies]
 tempfile = { version = "=3.27.0", default-features = false }
 # Captures the once-only series-cap warning in stats.rs tests.

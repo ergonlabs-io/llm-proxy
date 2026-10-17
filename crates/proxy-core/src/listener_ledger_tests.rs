@@ -1,8 +1,9 @@
 //! The billing ledger (ADR-0009) across the real HTTP chain a dialect config
 //! builds: auth, spend, usage, the router and access logging, against a mock
-//! provider on a loopback socket. Entries go to an in-memory [`LedgerSink`];
-//! there is no writer yet. Charges are checked against the spend accumulator
-//! the filter wrote, never against a price this test computes from tokens.
+//! provider on a loopback socket. Entries go through the real writer to an
+//! encrypted spool in a temporary directory and are read back from it.
+//! Charges are checked against the spend accumulator the filter wrote, never
+//! against a price this test computes from tokens.
 
 use super::*;
 use bytes::Bytes;
@@ -16,7 +17,10 @@ use proxy_http::{
     handler::{local_boxed, DownstreamInfo, HttpRequestParts},
     tenant_credentials::CredentialSource,
 };
-use proxy_observability::records::{ChargeScope, Ledger, LedgerEntry, LedgerSink};
+use proxy_observability::ledger::testing::TempLedger;
+use proxy_observability::ledger::OnUnavailable;
+use proxy_observability::records::ChargeScope;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::{
@@ -33,26 +37,13 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_NANO: u64 = 1_001;
 const OUTPUT_NANO: u64 = 2_003;
 
-#[derive(Default)]
-struct CaptureLedger(Mutex<Vec<LedgerEntry>>);
-
-impl LedgerSink for CaptureLedger {
-    fn append(&self, entry: LedgerEntry) {
-        self.0.lock().unwrap().push(entry);
-    }
-}
-
-impl CaptureLedger {
-    fn entries(&self) -> Vec<LedgerEntry> {
-        self.0.lock().unwrap().clone()
-    }
-}
-
 /// A provider that answers by the request's model: `priced-model` with a
 /// JSON reply reporting 3 input and 2 output tokens, `cut-model` with two
 /// SSE frames and then a reset, `silent-model` never.
 struct Provider {
     address: std::net::SocketAddr,
+    /// Connections accepted: how a test sees whether anything was dialled.
+    connections: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -66,12 +57,19 @@ impl Provider {
     async fn spawn() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(Self::serve(socket));
             }
         });
-        Self { address, task }
+        Self {
+            address,
+            connections,
+            task,
+        }
     }
 
     async fn serve(mut socket: TcpStream) {
@@ -128,22 +126,28 @@ async fn read_request(socket: &mut TcpStream) -> Option<String> {
     Some(String::from_utf8_lossy(&received).into_owned())
 }
 
+const LISTEN: &str = r#""127.0.0.1:1""#;
+
 async fn chain(spend: bool) -> Chain {
-    chain_on(spend, r#""127.0.0.1:1""#).await
+    chain_on(spend, LISTEN).await
+}
+
+async fn chain_on(spend: bool, listen: &str) -> Chain {
+    chain_with(spend, listen, TempLedger::open(1024, OnUnavailable::Reject)).await
 }
 
 struct Chain {
     handler: Rc<dyn StreamHandler>,
-    ledger: Arc<CaptureLedger>,
+    ledger: TempLedger,
     control_plane: Arc<ControlPlane>,
     accumulator: Arc<SpendAccumulator>,
-    _provider: Provider,
+    provider: Provider,
 }
 
 /// `spend` decides whether the dialect keeps `llmproxy.spend_limit` in the
 /// chain; without it the ledger prices from the usage filter's list cost.
 /// `listen` is the dialect `listen:` value.
-async fn chain_on(spend: bool, listen: &str) -> Chain {
+async fn chain_with(spend: bool, listen: &str, ledger: TempLedger) -> Chain {
     let provider = Provider::spawn().await;
     let text = format!(
         r#"version: 0
@@ -191,12 +195,6 @@ limits:
     let token = tests::token_stats_for(&control, &snapshot);
     let latency = tests::latency_stats_for(&control);
     let shared = Arc::new(SharedFactoryState::default());
-    let sink = Arc::new(CaptureLedger::default());
-    let ledger = Arc::new(Ledger::new(
-        "test-instance".to_owned(),
-        7,
-        sink.clone() as Arc<dyn LedgerSink>,
-    ));
     let runtime = HcmRuntime {
         snapshot_version: snapshot.version,
         routes: &snapshot.routes,
@@ -206,7 +204,7 @@ limits:
         latency_stats: &latency,
         tracing_handles: None,
         metadata: None,
-        ledger: Some(&ledger),
+        ledger: Some(&ledger.ledger),
         factory_state: &shared,
     };
     let listener = snapshot.listeners.values().next().unwrap();
@@ -243,10 +241,10 @@ limits:
     };
     Chain {
         handler,
-        ledger: sink,
+        ledger,
         control_plane,
         accumulator,
-        _provider: provider,
+        provider,
     }
 }
 
@@ -258,9 +256,7 @@ impl Chain {
             .plaintext
     }
 
-    /// Sends one chat request and drains the response, so the stream ends and
-    /// its access-log point runs. Returns the status.
-    async fn send(&self, key: &str, model: &str, stream: bool) -> u16 {
+    fn request(&self, key: &str, model: &str, stream: bool) -> HttpRequestParts {
         let body = format!(
             r#"{{"model":"{model}","stream":{stream},"messages":[{{"role":"user","content":"hello"}}]}}"#
         );
@@ -273,7 +269,7 @@ impl Chain {
             http::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
         );
-        let request = HttpRequestParts {
+        HttpRequestParts {
             head: RequestHeaders {
                 method: http::Method::POST,
                 uri: "/v1/chat/completions".parse().unwrap(),
@@ -282,16 +278,52 @@ impl Chain {
             body: local_boxed(Full::new(Bytes::from(body)).map_err(|never| match never {})),
             downstream: DownstreamInfo::loopback(),
             on_upgrade: None,
-        };
+        }
+    }
+
+    /// Sends one chat request and drains the response, so the stream ends and
+    /// its access-log point runs. Returns the status.
+    async fn send(&self, key: &str, model: &str, stream: bool) -> u16 {
+        self.send_for_body(key, model, stream).await.0
+    }
+
+    async fn send_for_body(&self, key: &str, model: &str, stream: bool) -> (u16, String) {
+        let request = self.request(key, model, stream);
         let response = tokio::time::timeout(IO_TIMEOUT, self.handler.handle(request))
             .await
             .expect("response head in time");
         let status = response.head.status.as_u16();
         // A cut stream ends in an error; either way the body is finished.
-        let _ = tokio::time::timeout(IO_TIMEOUT, response.body.collect())
+        let body = tokio::time::timeout(IO_TIMEOUT, response.body.collect())
             .await
-            .expect("response body ends in time");
-        status
+            .expect("response body ends in time")
+            .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    fn dialled(&self) -> usize {
+        self.provider.connections.load(Ordering::SeqCst)
+    }
+
+    /// Starts a request the provider never answers and returns once it has
+    /// been dialled, so it holds its ledger slot. Aborting it drops the
+    /// request mid-flight.
+    async fn hold_a_slot(&self, key: &str) -> tokio::task::JoinHandle<()> {
+        let before = self.dialled();
+        let handler = Rc::clone(&self.handler);
+        let request = self.request(key, "silent-model", false);
+        let task = tokio::task::spawn_local(async move {
+            let _ = handler.handle(request).await;
+        });
+        tokio::time::timeout(IO_TIMEOUT, async {
+            while self.dialled() == before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the held request is dialled");
+        task
     }
 
     fn key_spend(&self, key_id: &str, period: &str) -> u64 {
@@ -328,7 +360,7 @@ fn run(test: impl std::future::Future<Output = ()>) {
 #[test]
 fn a_charged_request_is_entered_at_the_accumulators_amount() {
     run(async {
-        let chain = chain(true).await;
+        let mut chain = chain(true).await;
         let key = chain.mint("key-a");
         assert_eq!(chain.send(&key, "priced-model", false).await, 200);
         let entries = chain.ledger.entries();
@@ -363,10 +395,7 @@ fn a_charged_request_is_entered_at_the_accumulators_amount() {
             .is_some_and(|v| v.starts_with("ledger-card")));
         assert_eq!(entry.policy_generation, entry.record.policy_generation);
         assert!(entry.policy_generation.is_some());
-        assert_eq!(
-            (entry.instance_id.as_str(), entry.epoch),
-            ("test-instance", 7)
-        );
+        assert_eq!(entry.instance_id, "test-instance");
     });
 }
 
@@ -375,7 +404,7 @@ fn a_charged_request_is_entered_at_the_accumulators_amount() {
 #[test]
 fn without_a_spend_filter_the_entry_is_the_list_price_rounded_up() {
     run(async {
-        let chain = chain(false).await;
+        let mut chain = chain(false).await;
         let key = chain.mint("key-a");
         assert_eq!(chain.send(&key, "priced-model", false).await, 200);
         let entries = chain.ledger.entries();
@@ -390,7 +419,7 @@ fn without_a_spend_filter_the_entry_is_the_list_price_rounded_up() {
 #[test]
 fn a_cut_stream_is_entered_at_its_estimate_charge() {
     run(async {
-        let chain = chain(true).await;
+        let mut chain = chain(true).await;
         let key = chain.mint("key-a");
         chain.send(&key, "cut-model", true).await;
         let entries = chain.ledger.entries();
@@ -415,7 +444,7 @@ fn a_cut_stream_is_entered_at_its_estimate_charge() {
 #[test]
 fn a_timeout_before_response_headers_is_entered_at_zero() {
     run(async {
-        let chain = chain_on(
+        let mut chain = chain_on(
             true,
             r#"{ address: "127.0.0.1:1", max_stream_duration: 300ms }"#,
         )
@@ -436,7 +465,7 @@ fn a_timeout_before_response_headers_is_entered_at_zero() {
 #[test]
 fn refused_requests_get_no_entry_and_seq_has_no_gaps() {
     run(async {
-        let chain = chain(true).await;
+        let mut chain = chain(true).await;
         let key = chain.mint("key-a");
         let broke = chain.mint("key-broke");
         chain
@@ -475,5 +504,125 @@ fn refused_requests_get_no_entry_and_seq_has_no_gaps() {
         assert!(entries
             .iter()
             .all(|e| e.record.key_id.as_deref() == Some("key-a")));
+    });
+}
+
+/// Captures `tracing` output for one test.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A counter's value in the scrape: the line `name{labels} value`.
+fn counter(scrape: &str, series: &str) -> u64 {
+    scrape
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(series))
+        .and_then(|l| l.split_whitespace().last())
+        .unwrap_or_else(|| panic!("no series {series} in:\n{scrape}"))
+        .parse()
+        .unwrap()
+}
+
+/// With every slot held by a request in flight, `reject` (the default)
+/// answers a local 503 that names the reason, counts it, and dials nothing.
+/// A request dropped mid-flight gives its slot back.
+#[test]
+fn with_every_slot_held_a_request_is_refused_503_and_never_dialled() {
+    run(async {
+        let chain = chain_with(true, LISTEN, TempLedger::open(1, OnUnavailable::Reject)).await;
+        let key = chain.mint("key-a");
+        let held = chain.hold_a_slot(&key).await;
+        let dialled = chain.dialled();
+
+        let (status, body) = chain.send_for_body(&key, "priced-model", false).await;
+        assert_eq!(status, 503);
+        assert_eq!(body, "billing ledger unavailable: queue_full\n");
+        assert_eq!(chain.dialled(), dialled, "the refused request was dialled");
+        assert_eq!(
+            counter(
+                &chain.ledger.scrape(),
+                "envoy_llmproxy_ledger_rejected_total{reason=\"queue_full\"}"
+            ),
+            1
+        );
+
+        held.abort();
+        let _ = held.await;
+        assert_eq!(chain.ledger.ledger.reserved(), 0);
+        assert_eq!(chain.send(&key, "priced-model", false).await, 200);
+    });
+}
+
+/// Under `admit`, a request with no slot is served without an entry: it is
+/// counted, and one warning covers a burst. The warning names the reason
+/// only, never the caller's key.
+#[test]
+fn under_admit_a_request_without_a_slot_is_served_counted_and_warned_once() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    run(async {
+        let mut chain = chain_with(true, LISTEN, TempLedger::open(1, OnUnavailable::Admit)).await;
+        let key = chain.mint("key-a");
+        let held = chain.hold_a_slot(&key).await;
+        let dialled = chain.dialled();
+
+        assert_eq!(chain.send(&key, "priced-model", false).await, 200);
+        assert_eq!(chain.send(&key, "priced-model", false).await, 200);
+        assert_eq!(chain.dialled(), dialled + 2);
+        assert_eq!(
+            counter(
+                &chain.ledger.scrape(),
+                "envoy_llmproxy_ledger_unledgered_total{reason=\"queue_full\"}"
+            ),
+            2
+        );
+        held.abort();
+        let _ = held.await;
+        assert!(chain.ledger.entries().is_empty());
+
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("served without a ledger entry").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.contains("WARN") && text.contains("queue_full"),
+            "{text}"
+        );
+        assert!(!text.contains(&key), "the warning rendered the key: {text}");
+    });
+}
+
+/// A request refused before dialling releases its slot: with one slot,
+/// three refusals in a row still leave room for the request after them.
+#[test]
+fn a_request_refused_before_dialling_gives_its_slot_back() {
+    run(async {
+        let mut chain = chain_with(true, LISTEN, TempLedger::open(1, OnUnavailable::Reject)).await;
+        let key = chain.mint("key-a");
+        for _ in 0..3 {
+            assert_eq!(
+                chain.send("llmp_not-a-key", "priced-model", false).await,
+                401
+            );
+        }
+        assert_eq!(chain.send(&key, "priced-model", false).await, 200);
+        assert_eq!(chain.ledger.entries().len(), 1);
+        assert_eq!(chain.ledger.ledger.reserved(), 0);
     });
 }
