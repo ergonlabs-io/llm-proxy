@@ -1025,6 +1025,15 @@ impl LeasedH1 {
             .body(req.body)
             .expect("method/uri were already valid; building can't fail here");
 
+        // A connection goes back to the cache on the last byte of its
+        // response, which can be before hyper's dispatcher has finished that
+        // response and can take another; `send_request` on a dispatcher that
+        // is not ready fails. Wait for it. A closed connection fails here, the
+        // same as a failed send below.
+        if let Err(not_ready) = sender.ready().await {
+            conn_task.abort();
+            return Err(UpstreamCodecError::Send(not_ready));
+        }
         let response = match sender.send_request(request).await {
             Ok(response) => response,
             Err(send_err) => {
@@ -1066,6 +1075,10 @@ impl LeasedH1 {
         // raw hyper body).
         let inner: StreamBody = local_boxed(incoming.map_err(|e| BodyError::Upstream(Box::new(e))));
 
+        // An empty body (`Content-Length: 0`, a 204, a HEAD reply) is complete
+        // with the head. hyper never polls a body that reports its end, so
+        // `poll_frame` would never get to say so.
+        let completed = inner.is_end_stream();
         let body: StreamBody = local_boxed(H1ReuseBody {
             inner,
             sender: Some(sender),
@@ -1074,7 +1087,7 @@ impl LeasedH1 {
             key,
             timing,
             reusable,
-            completed: false,
+            completed,
             errored: false,
         });
 
@@ -1115,9 +1128,10 @@ struct H1ReuseBody {
     /// Decided once, from the response head, in `LeasedH1::send` -- see that
     /// method's doc for what makes a response reusable at all.
     reusable: bool,
-    /// Set by `poll_frame` the moment `inner` reports a clean end of stream
-    /// (`Poll::Ready(None)`). Never set at all if the body is dropped before
-    /// that happens -- which is exactly the "client hung up mid-read, or we
+    /// Set by `poll_frame` the moment `inner` reports a clean end of stream:
+    /// `Poll::Ready(None)`, or a frame after which `inner.is_end_stream()`
+    /// holds (the last byte of a `Content-Length` body). Never set at all if
+    /// the body is dropped before that happens -- which is exactly the "client hung up mid-read, or we
     /// gave up early" case `Drop` below must never reuse.
     completed: bool,
     /// Set by `poll_frame` the moment `inner` reports an error frame. A body
@@ -1148,6 +1162,12 @@ impl Body for H1ReuseBody {
         match &poll {
             Poll::Ready(Some(Err(_))) => this.errored = true,
             Poll::Ready(None) => this.completed = true,
+            // A `Content-Length` body is complete once its last byte has
+            // arrived: hyper's `Incoming` then reports `is_end_stream()`. The
+            // downstream h1 writer stops polling there, so the terminal
+            // `None` above never comes for such a response, and without this
+            // arm the connection was never reused.
+            Poll::Ready(Some(Ok(_))) if this.inner.is_end_stream() => this.completed = true,
             _ => {}
         }
         poll
@@ -2169,6 +2189,151 @@ mod tests {
             .run_until(an_idle_connection_closed_by_its_peer_gives_its_slot_back(
                 UpstreamProtocol::Http2,
             ))
+            .await;
+    }
+
+    /// A keep-alive h1 upstream whose every response carries `body` framed by
+    /// `Content-Length`. Returns its address and its accepted-connection count.
+    async fn spawn_content_length_h1(body: &'static [u8]) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::task::spawn_local(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::task::spawn_local(async move {
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        head.clear();
+                        let reply =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        if stream.write_all(reply.as_bytes()).await.is_err()
+                            || stream.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// Read `body` the way hyper's downstream h1 writer does for a
+    /// `Content-Length` response: frame by frame until `is_end_stream()`, never
+    /// asking for the terminal `None`. Then drop it.
+    async fn read_like_the_downstream_writer(mut body: crate::handler::StreamBody) {
+        while !body.is_end_stream() {
+            body.frame()
+                .await
+                .expect("a frame before the end")
+                .expect("a clean frame");
+        }
+    }
+
+    /// The connection goes back to the cache when the last `Content-Length`
+    /// byte arrives, even though the terminal `None` is never polled. The next
+    /// lease is taken at once, before hyper's dispatcher may have finished the
+    /// previous response, so it must also wait for the dispatcher to be ready.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_content_length_response_read_to_its_length_is_reused_at_once() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_content_length_h1(b"ok").await;
+                let cache = Rc::new(H1ConnCache::new());
+                let pool = plaintext_pool(addr);
+                for n in 1..=3 {
+                    let response = cache
+                        .clone()
+                        .get_or_connect_h1(test_key("up", addr, UpstreamProtocol::Http1), &pool)
+                        .await
+                        .expect("lease")
+                        .send(get_request())
+                        .await
+                        .unwrap_or_else(|e| panic!("request {n} on the reused connection: {e}"));
+                    assert_eq!(response.head.status, StatusCode::OK);
+                    read_like_the_downstream_writer(response.body).await;
+                }
+                assert_eq!(accepted.load(Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    /// An empty `Content-Length: 0` body is complete with the head; hyper
+    /// never polls it, and the connection must still be reused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_body_that_is_never_polled_is_reused() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_content_length_h1(b"").await;
+                let cache = Rc::new(H1ConnCache::new());
+                let pool = plaintext_pool(addr);
+                for _ in 0..2 {
+                    let response = cache
+                        .clone()
+                        .get_or_connect_h1(test_key("up", addr, UpstreamProtocol::Http1), &pool)
+                        .await
+                        .expect("lease")
+                        .send(get_request())
+                        .await
+                        .expect("response");
+                    assert!(response.body.is_end_stream());
+                    drop(response);
+                }
+                assert_eq!(accepted.load(Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    /// The other half of the rule: a body dropped after some of its bytes but
+    /// before its last one is not complete, so its connection never enters
+    /// the idle queue. (hyper also closes such a connection, so the queue, not
+    /// a later dial count, is what shows this guard working.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_content_length_body_dropped_before_its_end_is_not_returned() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::task::spawn_local(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n01234")
+                        .await;
+                    // Hold the rest back until the client goes away.
+                    let _ = stream.read(&mut buf).await;
+                });
+                let cache = Rc::new(H1ConnCache::new());
+                let key = test_key("up", addr, UpstreamProtocol::Http1);
+                let mut body = cache
+                    .clone()
+                    .get_or_connect_h1(key.clone(), &plaintext_pool(addr))
+                    .await
+                    .expect("lease")
+                    .send(get_request())
+                    .await
+                    .expect("response")
+                    .body;
+                let first = body.frame().await.expect("a frame").expect("clean");
+                assert_eq!(first.data_ref().map(|d| d.len()), Some(5));
+                assert!(!body.is_end_stream());
+                drop(body);
+                let idle = cache.slots.borrow().get(&key).map_or(0, VecDeque::len);
+                assert_eq!(
+                    idle, 0,
+                    "a half-read response must not be returned for reuse"
+                );
+            })
             .await;
     }
 

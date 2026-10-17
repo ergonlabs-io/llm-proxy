@@ -30,6 +30,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- An HTTP/1.1 upstream connection is now reused after a response framed by
+  `Content-Length`, including an empty one. Before, through a real client
+  connection, only a chunked response returned its connection to the pool:
+  every other HTTP/1.1 request to a provider opened a new TCP (and TLS)
+  connection. A response the client abandons is still never reused.
 - A policy load that finds the shared store empty after it held tenants or
   keys now logs an `error` line with the before and after counts and
   generation stamps, and increments

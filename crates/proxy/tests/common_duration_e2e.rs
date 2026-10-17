@@ -80,7 +80,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 /// A keep-alive HTTP/1.1 provider: for each request on a connection it reads
 /// the head and the `Content-Length` body, waits [`DELAY`], and answers
-/// `200` with a small chunked JSON body. Returns its address and a count of the
+/// `200` with a small JSON body. Returns its address and a count of the
 /// connections it accepted.
 fn spawn_delayed_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock upstream");
@@ -126,15 +126,12 @@ fn serve_keep_alive(mut stream: TcpStream) {
         }
         pending.drain(..head_end + body_len);
         std::thread::sleep(DELAY);
-        // Chunked, not `Content-Length`: through the real downstream codec
-        // only a chunked response returns its h1 connection to the pool
-        // today, and this test needs the second request to reuse it.
-        let body = r#"{"object":"list","data":[]}"#;
+        let body = br#"{"object":"list","data":[]}"#;
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        if stream.write_all(response.as_bytes()).is_err() {
+        if stream.write_all(response.as_bytes()).is_err() || stream.write_all(body).is_err() {
             return;
         }
     }
