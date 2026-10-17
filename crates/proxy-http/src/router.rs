@@ -355,9 +355,18 @@ impl TerminalHttpFilter for RouterHandler {
                     .as_ref()
                     .map(|(name, version)| (name.as_str(), *version))
                     .unwrap_or(("unknown", 0));
+                let Some(suppressed) = local_503_log::admit(
+                    listener,
+                    info.upstream_cluster.as_deref(),
+                    info.response_flags(),
+                    tokio::time::Instant::now(),
+                ) else {
+                    return response;
+                };
                 tracing::warn!(
                     listener,
                     snapshot_version = version,
+                    suppressed,
                     route_name = ?route.as_ref().and_then(|route| route.name.as_deref()),
                     route_index = ?route.as_ref().map(|route| route.route_index),
                     response_code_details = ?info.response_code_details,
@@ -368,6 +377,83 @@ impl TerminalHttpFilter for RouterHandler {
                 );
             }
             response
+        })
+    }
+}
+
+/// Repeat suppression for the "local 503 response" warning (AGENTS.md
+/// "Fail-open controls"). A sweep that trips a circuit breaker turns every
+/// request into a local 503, and one line per 503 makes the log the
+/// incident. Only this warning is throttled: access logs and stats still see
+/// every 503.
+///
+/// State is per worker thread, like the upstream connection caches, so the
+/// 503 path takes no lock and the healthy path never touches it. The cost is
+/// one line per key per worker per interval instead of one per process.
+mod local_503_log {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::time::Duration;
+
+    use proxy_observability::ResponseFlag;
+    use tokio::time::Instant;
+
+    /// One line per key per worker in this window; the next line reports
+    /// how many were dropped.
+    pub(super) const INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Keys are bounded by config (listeners x clusters x flag sets), but a
+    /// long run of reloads can retire names. Past this many entries, entries
+    /// whose window has closed are dropped; a dropped entry's suppressed
+    /// count is lost, which only costs a number in a log line.
+    const MAX_KEYS: usize = 1024;
+
+    struct Window {
+        opened: Instant,
+        suppressed: u64,
+    }
+
+    thread_local! {
+        // Keyed by a hash of (listener, cluster, flags) so a lookup does not
+        // allocate. A collision only merges two keys' suppression.
+        static WINDOWS: RefCell<HashMap<u64, Window>> = RefCell::new(HashMap::new());
+    }
+
+    /// Returns `Some(suppressed)` when this 503 should be logged, where
+    /// `suppressed` counts the 503s for the same key that were not logged
+    /// since the previous line. Returns `None` when this one is suppressed.
+    pub(super) fn admit(
+        listener: &str,
+        cluster: Option<&str>,
+        flags: &[ResponseFlag],
+        now: Instant,
+    ) -> Option<u64> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (listener, cluster, flags).hash(&mut hasher);
+        let key = hasher.finish();
+        WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            if let Some(window) = windows.get_mut(&key) {
+                if now.duration_since(window.opened) < INTERVAL {
+                    window.suppressed += 1;
+                    return None;
+                }
+                let suppressed = std::mem::take(&mut window.suppressed);
+                window.opened = now;
+                return Some(suppressed);
+            }
+            if windows.len() >= MAX_KEYS {
+                windows.retain(|_, w| now.duration_since(w.opened) < INTERVAL);
+            }
+            windows.insert(
+                key,
+                Window {
+                    opened: now,
+                    suppressed: 0,
+                },
+            );
+            Some(0)
         })
     }
 }
