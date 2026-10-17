@@ -477,6 +477,100 @@ impl LlmTokens {
     }
 }
 
+/// One of Envoy's `%COMMON_DURATION%` time points (v1.38
+/// `CommonDurationFormatter`). Each names a moment in one request's life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimePoint {
+    /// `DS_RX_BEG`: the stream started (Envoy's `startTimeMonotonic`).
+    DsRxBeg,
+    /// `DS_RX_END`: the last downstream request byte was received.
+    DsRxEnd,
+    /// `US_CX_BEG`: the upstream TCP connect began.
+    UsCxBeg,
+    /// `US_CX_END`: the upstream TCP connect completed.
+    UsCxEnd,
+    /// `US_HS_END`: the upstream TLS handshake completed. Never set for a
+    /// plaintext upstream.
+    UsHsEnd,
+    /// `US_TX_BEG`: the request head was handed to the upstream codec.
+    UsTxBeg,
+    /// `US_TX_END`: the last request body byte was handed to the upstream codec.
+    UsTxEnd,
+    /// `US_RX_BEG`: the upstream response head was received.
+    UsRxBeg,
+    /// `US_RX_BODY_BEG`: the first upstream response body byte was received.
+    UsRxBodyBeg,
+    /// `US_RX_END`: the last upstream response byte was received.
+    UsRxEnd,
+    /// `DS_TX_BEG`: the response head was handed to the downstream codec.
+    DsTxBeg,
+    /// `DS_TX_END`: the last response byte was handed to the downstream codec.
+    DsTxEnd,
+}
+
+impl TimePoint {
+    /// Every point, in [`TimePoints`] storage order.
+    pub const ALL: [TimePoint; 12] = [
+        TimePoint::DsRxBeg,
+        TimePoint::DsRxEnd,
+        TimePoint::UsCxBeg,
+        TimePoint::UsCxEnd,
+        TimePoint::UsHsEnd,
+        TimePoint::UsTxBeg,
+        TimePoint::UsTxEnd,
+        TimePoint::UsRxBeg,
+        TimePoint::UsRxBodyBeg,
+        TimePoint::UsRxEnd,
+        TimePoint::DsTxBeg,
+        TimePoint::DsTxEnd,
+    ];
+
+    /// The case-sensitive name Envoy's format strings use.
+    pub const fn name(self) -> &'static str {
+        match self {
+            TimePoint::DsRxBeg => "DS_RX_BEG",
+            TimePoint::DsRxEnd => "DS_RX_END",
+            TimePoint::UsCxBeg => "US_CX_BEG",
+            TimePoint::UsCxEnd => "US_CX_END",
+            TimePoint::UsHsEnd => "US_HS_END",
+            TimePoint::UsTxBeg => "US_TX_BEG",
+            TimePoint::UsTxEnd => "US_TX_END",
+            TimePoint::UsRxBeg => "US_RX_BEG",
+            TimePoint::UsRxBodyBeg => "US_RX_BODY_BEG",
+            TimePoint::UsRxEnd => "US_RX_END",
+            TimePoint::DsTxBeg => "DS_TX_BEG",
+            TimePoint::DsTxEnd => "DS_TX_END",
+        }
+    }
+
+    /// The point a format string names, `None` for any other name.
+    pub fn from_name(name: &str) -> Option<TimePoint> {
+        TimePoint::ALL.into_iter().find(|p| p.name() == name)
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The monotonic instant of each [`TimePoint`] a request reached. A point
+/// that never happened stays `None` and renders as `-`.
+///
+/// Rust note: a fixed array indexed by the enum's discriminant, not a map, so
+/// the type is `Copy` and building a [`LogContext`] stays allocation-free.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimePoints([Option<std::time::Instant>; 12]);
+
+impl TimePoints {
+    pub fn get(&self, point: TimePoint) -> Option<std::time::Instant> {
+        self.0[point.index()]
+    }
+
+    pub fn set(&mut self, point: TimePoint, at: Option<std::time::Instant>) {
+        self.0[point.index()] = at;
+    }
+}
+
 /// Everything a request or stream knows when it is logged. The caller builds it
 /// and passes it to [`render`].
 ///
@@ -537,6 +631,9 @@ pub struct LogContext<'a> {
     /// `list` / `estimate`; `None` when there is no cost.
     pub llm_cost_kind: Option<&'a str>,
     pub llm_rate_card_version: Option<&'a str>,
+
+    /// The request's `%COMMON_DURATION%` time points.
+    pub time_points: TimePoints,
 
     /// Envoy request pseudo-header `:method` -- e.g. `GET`. These four fields
     /// exist because `:method`/`:path`/`:authority`/`:scheme` are not legal
@@ -1019,6 +1116,7 @@ mod tests {
             request_path: Some("/v1/chat/completions"),
             request_authority: Some("api.example.com"),
             request_scheme: Some("https"),
+            time_points: TimePoints::default(),
         }
     }
 

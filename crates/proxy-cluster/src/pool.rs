@@ -185,6 +185,7 @@ impl HttpConnPool for ConnectPool {
             Ok(UpstreamStream {
                 io: connected,
                 cb_guard: Some(guard),
+                timing: crate::ConnectTiming::default(),
             })
         })
     }

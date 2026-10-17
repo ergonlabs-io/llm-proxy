@@ -182,7 +182,7 @@ struct SlotIo {
 impl SlotIo {
     /// Take the slot out of `stream` and bind it to the stream's lifetime.
     fn new(stream: UpstreamStream) -> Self {
-        let UpstreamStream { io, cb_guard } = stream;
+        let UpstreamStream { io, cb_guard, .. } = stream;
         Self {
             io,
             _slot: cb_guard,

@@ -29,6 +29,13 @@ pub trait UpstreamTransportSocket: Send + Sync {
         io: TcpStream,
         server_name: &str,
     ) -> BoxFuture<'static, io::Result<BoxedUpstreamIo>>;
+
+    /// Whether [`Self::wrap`] performs a handshake (TLS). Envoy records
+    /// `US_HS_END` only for a transport that has one, so a plaintext upstream
+    /// renders it as `-`.
+    fn has_handshake(&self) -> bool {
+        false
+    }
 }
 
 /// Plaintext: hand the TCP stream straight through. Used by every cluster

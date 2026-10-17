@@ -416,9 +416,30 @@ pub struct UpstreamStream {
     ///
     /// `None` only on paths with no real budget (test helpers, or callers that bypass `ConnectPool`).
     pub cb_guard: Option<CbGuard>,
+    /// When this connection was dialed. A pooled connection keeps it for its
+    /// whole life, so every request it carries reports the same values, as
+    /// Envoy's `US_CX_*` and `US_HS_END` points do.
+    pub timing: ConnectTiming,
     // TODO: (for keep-alive reuse on the h1 path) hold the codec
     // `SendRequest` handle rather than a raw transport -- at which point
     // this seam changes shape. The pool-guard half of this TODO is done.
+}
+
+/// The connection-establishment instants of one upstream connection, for
+/// `%COMMON_DURATION%`'s `US_CX_BEG`, `US_CX_END` and `US_HS_END`.
+///
+/// `None` means the point was not observed: a stream built outside
+/// [`pool::ConnectPool`] has no connect timing, and a plaintext transport has
+/// no handshake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectTiming {
+    /// The TCP connect began, after the connection slot was acquired.
+    pub connect_start: Option<std::time::Instant>,
+    /// The TCP connect completed.
+    pub connect_end: Option<std::time::Instant>,
+    /// The transport handshake completed. Set only when the transport has one
+    /// ([`transport::UpstreamTransportSocket::has_handshake`]).
+    pub handshake_end: Option<std::time::Instant>,
 }
 
 /// The byte transport under an upstream HTTP stream, type-erased so a cluster can be plaintext or TLS without

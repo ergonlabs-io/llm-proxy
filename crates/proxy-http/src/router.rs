@@ -862,7 +862,7 @@ impl RouterHandler {
                 return local_reply(StatusCode::SERVICE_UNAVAILABLE, msg);
             }
         };
-        let proxy_cluster::UpstreamStream { io, cb_guard } = upstream_stream;
+        let proxy_cluster::UpstreamStream { io, cb_guard, .. } = upstream_stream;
         // `LEAST_REQUEST` reads this count. It lives as long as `cb_guard`:
         // the declined path ties both to the response body, and the accepted
         // path hands both to `UpgradeTunnel`, held until the bridge ends.

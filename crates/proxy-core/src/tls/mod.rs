@@ -508,6 +508,10 @@ impl UpstreamTransportSocket for UpstreamTlsFactory {
             Ok(Box::new(stream) as BoxedUpstreamIo)
         })
     }
+
+    fn has_handshake(&self) -> bool {
+        true
+    }
 }
 
 /// Builds the [`proxy_cluster::transport::TransportSocketBuilder`]: plaintext for a cluster with no

@@ -1127,6 +1127,7 @@ mod tests {
             request_path: None,
             request_authority: None,
             request_scheme: None,
+            time_points: Default::default(),
         };
         let line = render(&fmt, &ctx);
         assert_eq!(line, "HTTP/1.1 200\n");

@@ -968,6 +968,7 @@ impl LoggingBody {
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),
             request_scheme: ctx.request.scheme.as_deref(),
+            time_points: Default::default(),
         };
         for logger in ctx.loggers.iter() {
             logger.log(&log_ctx);
@@ -1420,6 +1421,7 @@ mod tests {
             request_path: None,
             request_authority: None,
             request_scheme: None,
+            time_points: Default::default(),
         };
         let parsed: serde_json::Value = serde_json::from_str(&render_json(&fields, &ctx)).unwrap();
         assert_eq!(parsed["usage"]["prompt_tokens"], 7);
