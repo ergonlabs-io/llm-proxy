@@ -230,11 +230,12 @@ async fn put_pricing_with_a_durable_store_writes_the_store_and_says_so() {
     let (status, body) = put(addr, Some(ADMIN_TOKEN), &good_card("v1", 10)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["persisted"], true);
+    // A redb file is one replica's: the note must not promise propagation.
     assert!(
         body["note"]
             .as_str()
             .unwrap()
-            .contains("control-plane store"),
+            .contains("other replicas do not read it"),
         "{body}"
     );
 

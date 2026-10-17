@@ -373,21 +373,53 @@ fn with_a_store_a_reload_never_replaces_the_stored_card() {
     assert_eq!(active(&r), Some(published.rate_card_version));
 }
 
+/// `PUT /pricing` says where the card lives per store kind. Only a shared
+/// store reaches other replicas; `persistent` is one replica's file, so its
+/// note must not promise propagation.
 #[test]
-fn an_in_memory_store_says_a_published_card_is_not_persisted() {
-    let cp = Arc::new(
-        ControlPlane::new(
+fn the_publish_note_says_which_stores_survive_a_restart_and_reach_other_replicas() {
+    let path = std::env::temp_dir().join(format!(
+        "llm-proxy-rate-card-note-{}-{}.redb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (shared, _) = SharedMemoryStore::new();
+    let cases: [(&str, Box<dyn ControlPlaneStore>, bool, &str); 3] = [
+        (
+            "in_memory",
             Box::new(crate::control::InMemoryControlPlaneStore::default()),
-            HmacSecret::new(b"s"),
-            KeySet::new(),
-        )
-        .unwrap(),
-    );
-    let r = registry();
-    apply(&r, None, Some(&cp)).unwrap();
-    let published = r.publish_json(&card_json("v1", 10)).unwrap();
-    assert!(!published.persisted, "it dies with the process");
-    assert!(cp.rate_card(CHAIN).is_some(), "but it is in the store");
+            false,
+            "a restart loses it",
+        ),
+        (
+            "persistent",
+            Box::new(crate::control::RedbControlPlaneStore::open(&path).unwrap()),
+            true,
+            "other replicas do not read it",
+        ),
+        (
+            "shared",
+            Box::new(shared.handle()),
+            true,
+            "replicas that share it install it",
+        ),
+    ];
+    for (kind, store, persisted, note) in cases {
+        let cp = Arc::new(ControlPlane::new(store, HmacSecret::new(b"s"), KeySet::new()).unwrap());
+        let r = registry();
+        apply(&r, None, Some(&cp)).unwrap();
+        let published = r.publish_json(&card_json("v1", 10)).unwrap();
+        assert_eq!(published.persisted, persisted, "{kind}");
+        assert!(published.note.contains(note), "{kind}: {}", published.note);
+        assert!(
+            cp.rate_card(CHAIN).is_some(),
+            "{kind}: the card is in the store"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 // --- refusals ---------------------------------------------------------------

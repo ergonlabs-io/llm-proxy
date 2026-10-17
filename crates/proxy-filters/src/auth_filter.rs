@@ -270,7 +270,9 @@ impl StoreSpec {
 }
 
 /// Makes N replicas on a per-replica store visible (ADR-0006 addendum
-/// "Admission stays local" §5). The proxy never knows the replica count, so
+/// "Admission stays local" §5). The rate card rides the same store, so the
+/// warning names it too: `persistent` survives a restart but is still one
+/// replica's file. The proxy never knows the replica count, so
 /// it cannot detect the mistake; it warns where a configured node id
 /// suggests a fleet, and exports the store kind so the fleet can be checked
 /// from metrics alone. Called once per chain, from the closure that builds
@@ -292,8 +294,9 @@ fn report_store_kind(
             store = %store,
             "llmproxy.auth: a node id is configured, which suggests more than one replica, \
              but auth.store is not shared: limits and budgets apply per replica, so N \
-             replicas admit up to N times each limit. Set auth.store to shared to enforce \
-             them across the fleet"
+             replicas admit up to N times each limit, and a rate card published with \
+             PUT /pricing reaches only the replica that receives it. Set auth.store to \
+             shared to enforce them and share the rate card across the fleet"
         );
     }
     if let Some(registry) = registry {
@@ -2647,6 +2650,10 @@ mod tests {
             assert!(
                 line.contains("N replicas admit up to N times each limit"),
                 "{store}: the warning names the effect: {line}"
+            );
+            assert!(
+                line.contains("reaches only the replica that receives it"),
+                "{store}: the warning names the rate card: {line}"
             );
             assert!(line.contains("node_id=replica-a"), "{store}: {line}");
             assert!(line.contains(&format!("store={store}")), "{store}: {line}");

@@ -4075,6 +4075,12 @@ impl ControlPlane {
         self.store.is_durable()
     }
 
+    /// Whether other replicas read this control plane's store. See
+    /// [`ControlPlaneStore::is_shared`].
+    pub fn store_is_shared(&self) -> bool {
+        self.store.is_shared()
+    }
+
     /// Calls `callback` with `chain`'s rate card now, if the store has one,
     /// and again every time a load brings a different card for that chain.
     /// Loads happen on this replica's policy poll (a generation bump from any

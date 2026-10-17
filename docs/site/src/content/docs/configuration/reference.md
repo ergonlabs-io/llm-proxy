@@ -30,7 +30,7 @@ The configuration format for llm-proxy. This file is the single source of truth 
 | `routes` | array of [Route](#route); minimum items 0 | yes | none | Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule and no `models` entry get a 404 with a JSON error body listing known models. |
 | `limits` | array of [Limit](#limit) | no | none | Rate limits and quotas. Every field is enforced as written. Each entry becomes one rule; a request must pass every rule that applies to it, and the first rule it exceeds rejects it with a 429 carrying `x-ratelimit-*` headers before the request is forwarded. Rule buckets are independent of the route. Token and request windows are one minute and epoch-aligned (they reset on the wall-clock minute, not a minute after first use). Token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated. Token and request counts reconcile with the store `auth.store` selects about once a second: with `auth.store: shared` replicas share them (and the fleet can admit a little over a limit between reconciles); with `in_memory` or `persistent`, or with no `auth:` block, each replica counts alone. Concurrent sessions follow the same rule: with `auth.store: shared` replicas share them through lease rows, and a replica that stops holds its slots for at most 5 seconds. |
 | `observability` | [Observability](#observability) | no | none | Access logging, OTLP metric export, and OTLP trace export. Access log lines include token counts and TTFT/TPOT. Metrics are always served on the admin endpoint at `/stats` and `/stats/prometheus`, with no configuration here; `metrics` adds OTLP export of the same instruments. |
-| `pricing` | [Pricing](#pricing) | no | none | Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime: it is stored (and reaches every replica sharing the store within one policy poll) when the store is `persistent` or `shared`, and is lost on restart otherwise. A card whose `effective_from` is in the future is refused. |
+| `pricing` | [Pricing](#pricing) | no | none | Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused. |
 | `auto` | [AutoModel](#automodel) | no | none | Resolution of the reserved model name `auto`. A request whose `model` is `auto` is routed as the model this block selects: the tenant's entry in `tenants`, otherwise `default`. With no matching entry and no `default`, the request is refused with 400. Any other model name is routed unchanged. The provider's response is passed through unchanged, so its `model` field names the model the provider served, not `auto`. Access logs and usage records show both `auto` and the resolved model. While this block is set, `auto` is reserved: a `models` key or `routes[].model` of exactly `auto` is a load error. Absent means `auto` is an ordinary model name. Examples: `{"default": "gpt-4o-mini", "tenants": {"acme": "claude-sonnet"}}`. |
 
 Any other field is a load error.
@@ -241,8 +241,8 @@ Exactly one of `in_memory`, `persistent`, or `shared`.
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `in_memory` | object | no | none | Keys and policy live only for the life of the process. Takes no fields. |
-| `persistent` | [AuthStorePersistent](#authstorepersistent) | no | none | Keys and policy survive a restart in an embedded `redb` file. The file is created if missing and takes a lock, so one process owns it at a time. |
-| `shared` | [AuthStoreShared](#authstoreshared) | no | none | Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`. |
+| `persistent` | [AuthStorePersistent](#authstorepersistent) | no | none | Keys, policy and the rate card survive a restart in an embedded `redb` file. The file is created if missing and takes a lock, so one process owns it at a time: replicas do not share it. |
+| `shared` | [AuthStoreShared](#authstoreshared) | no | none | Keys, policy and the rate card are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`. |
 
 Any other field is a load error.
 
@@ -367,7 +367,7 @@ Any other field is a load error.
 
 Used at: `auth.store.persistent`.
 
-Keys and policy survive a restart in an embedded `redb` file. The file is created if missing and takes a lock, so one process owns it at a time.
+Keys, policy and the rate card survive a restart in an embedded `redb` file. The file is created if missing and takes a lock, so one process owns it at a time: replicas do not share it.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -379,7 +379,7 @@ Any other field is a load error.
 
 Used at: `auth.store.shared`.
 
-Keys and policy are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`.
+Keys, policy and the rate card are shared by every replica through Redis. Exactly one of `url` / `url_file` is required -- a Redis URL may embed a password, so it belongs in the environment or a mounted file, same as `hmac_secret`. Requires `--service-node`: each replica needs a node id that is unique and stable across restarts, and the dialect has no field for it, so without the flag this block is a load error at `auth.store.shared`.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|

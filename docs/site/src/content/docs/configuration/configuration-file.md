@@ -646,11 +646,14 @@ With a store, the store holds the rate card and wins:
   changed `pricing` differs from it.
 - `PUT /pricing` writes the store. It does not install the rate card itself.
   The receiving replica installs the rate card that the store's watcher
-  delivers right after the write. Every other replica that shares the store
-  installs it on its next policy poll, which is 48 to 60 seconds at the default
-  `poll_interval_seconds`. The response says `"persisted": true` when the store
-  is `persistent` or `shared`. The default `in_memory` store keeps the rate card
-  only for the life of the process, and the response says `"persisted": false`.
+  delivers right after the write. With `auth.store: shared`, every other
+  replica installs it on its next policy poll, which is 48 to 60 seconds at the
+  default `poll_interval_seconds`. A `persistent` store is one replica's file:
+  the rate card survives a restart, but other replicas do not read it. The
+  response says `"persisted": true` when the store is `persistent` or `shared`.
+  The default `in_memory` store keeps the rate card only for the life of the
+  process, and the response says `"persisted": false`. To give more than one
+  replica the same rate card, use `auth.store: shared`.
   If the store refuses the write, the response is `503` and no replica changes.
 - A second replica can write to the same store between your write and the
   watcher delivery. The later write wins. The receiving replica then serves the

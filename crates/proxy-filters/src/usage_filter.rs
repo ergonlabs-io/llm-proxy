@@ -552,11 +552,19 @@ impl PricingRegistry {
                         "written, but a concurrent publish to the same store superseded it; \
                          this replica now serves the store's card",
                     )
-                } else if store.store_is_durable() {
+                } else if store.store_is_shared() {
                     (
                         true,
                         "stored in the control-plane store; replicas that share it install it on \
                          their next policy poll",
+                    )
+                } else if store.store_is_durable() {
+                    // A `persistent` store is one replica's file: durable,
+                    // but no other replica reads it.
+                    (
+                        true,
+                        "stored in this replica's persistent store; it survives a restart, but \
+                         other replicas do not read it",
                     )
                 } else {
                     (

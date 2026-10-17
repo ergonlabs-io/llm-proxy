@@ -2163,6 +2163,40 @@ mod tests {
         );
     }
 
+    /// With both a rate card and the legacy `pricing` table, the card prices
+    /// every model it lists and the table prices only the rest, so a stale
+    /// table entry never overrides the card that replicas share.
+    ///
+    /// Mutation: try `price_table.cost_of` before the registry, or drop the
+    /// table fallback.
+    #[test]
+    fn the_card_wins_over_the_legacy_table_which_prices_only_the_rest() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let mut table = PriceTable::new();
+        for model in ["gpt-5", "gpt-6"] {
+            table.insert(
+                "cluster-a",
+                model,
+                ModelPrices {
+                    input_per_million: MicroUsd::from_micros(3_000_000),
+                    ..Default::default()
+                },
+            );
+        }
+        let harness = filter_with(&cp, table, Period::Monthly);
+        harness
+            .pricing_registry
+            .publish_json(
+                r#"{"price_list":{"effective_from":"2026-01-01T00:00:00Z","entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":1000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":1000}]}]},"providers":{"cluster-a":"openai"}}"#,
+            )
+            .unwrap();
+
+        run_request(&harness, "tenant-a", Some(("cluster-a", "gpt-5")), Some(10));
+        assert_eq!(spent(&harness), 10, "the card's 1 micro per token, not 3");
+        run_request(&harness, "tenant-a", Some(("cluster-a", "gpt-6")), Some(10));
+        assert_eq!(spent(&harness), 40, "the card lacks gpt-6: the table's 3");
+    }
+
     // --- no tenant / no budget: admitted -----------------------------------
 
     #[test]

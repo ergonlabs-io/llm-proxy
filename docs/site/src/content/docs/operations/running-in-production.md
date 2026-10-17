@@ -432,9 +432,10 @@ are keyed by its node ID.
   `BudgetStore`, not `ControlPlaneStore`, and only an in-process
   implementation exists — this is unaffected by everything above. See
   [Token rate limiting](../../limits-and-budgets/token-rate-limiting/).
-- **The rate card is shared only through a store.** With an `auth` store, the
-  rate card is stored per chain and `PUT /pricing` writes it there. Every replica
-  that shares the store installs it on its next policy poll, which is 48 to 60
+- **The rate card is shared only through `auth.store: shared`.** With an `auth`
+  store, the rate card is stored per chain and `PUT /pricing` writes it there.
+  A `persistent` store is one replica's file, so only `shared` reaches other
+  replicas. Every replica that shares the store installs it on its next policy poll, which is 48 to 60
   seconds at the default `poll_interval_seconds`, the same bound as a key
   revocation. The configured `pricing` only seeds an empty store. A restart or a
   `SIGHUP` reload never replaces a stored rate card, and the stored rate card
