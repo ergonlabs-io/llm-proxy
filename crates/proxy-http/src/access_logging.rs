@@ -680,11 +680,12 @@ impl LoggingBody {
                     .as_deref()
                     .map(proxy_observability::records::bounded_field),
                 trace_id: trace.map(|t| hex_bytes(&t.trace_id)),
-                // Integration owner: pin routing, authenticated policy, and capture
-                // snapshot versions in StreamInfo at FilterChainHandler::handle
-                // admission. Do not read current versions at terminal emission.
+                // Versions are pinned at admission, never read at terminal
+                // emission. Routing has no pinned revision yet.
                 routing_revision: None,
-                policy_generation: None,
+                // Pinned by the auth filter at admission from the snapshot
+                // that verified the key; `None` without that filter.
+                policy_generation: ctx.stream_info.borrow().auth.policy_generation,
                 capture_policy_version: {
                     #[cfg(unix)]
                     {
@@ -1551,6 +1552,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(render_one_fmt("%LLM_LIST_COST%", llm).await, "987654");
+    }
+
+    /// The record names the policy generation the auth filter pinned at
+    /// admission, and stays null for a stream nothing authenticated.
+    #[tokio::test]
+    async fn the_record_carries_the_policy_generation_pinned_at_admission() {
+        for pinned in [Some(7), None] {
+            let capture = Arc::new(CaptureSink::default());
+            let mut ctx = flags_ctx(&capture);
+            let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+            ctx.request_record_sink = Some(Arc::new(sink));
+            {
+                let mut info = ctx.stream_info.borrow_mut();
+                info.metadata_enabled = true;
+                info.auth.policy_generation = pinned;
+            }
+            let body = local_boxed(
+                Full::new(Bytes::from_static(b"hi"))
+                    .map_err(|never: std::convert::Infallible| match never {}),
+            );
+            LoggingBody::new(body, ctx).collect().await.unwrap();
+            assert_eq!(records.try_recv().unwrap().policy_generation, pinned);
+        }
     }
 
     #[tokio::test]

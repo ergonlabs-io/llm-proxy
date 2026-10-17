@@ -1114,6 +1114,7 @@ mod tests {
             key_policies,
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
+            generation: None,
         })));
         ModelAuthzFilterInstance {
             snapshot,

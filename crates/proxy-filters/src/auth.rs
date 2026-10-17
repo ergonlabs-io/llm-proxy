@@ -236,6 +236,10 @@ pub struct Principal {
     /// snapshot. Left out of the hand-written `Debug` below on purpose: it
     /// holds plaintext keys.
     pub tenant_credentials: Option<Arc<TenantCredentialSet>>,
+    /// The `policy_generation` of the snapshot that verified the credential
+    /// (see `ControlPlaneSnapshot::generation`). `None` for authenticators
+    /// that do not read the control-plane snapshot.
+    pub policy_generation: Option<u64>,
 }
 
 impl fmt::Debug for Principal {
@@ -694,6 +698,7 @@ impl VirtualKeyAuthenticator {
             key_policies: Default::default(),
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
+            generation: None,
         })));
         VirtualKeyAuthenticator {
             secret,
@@ -767,6 +772,7 @@ impl Authenticator for VirtualKeyAuthenticator {
                 key_id: record.key_id.clone(),
                 policy: Arc::new(TenantPolicy::default()),
                 tenant_credentials: snapshot.tenant_credentials.get(&record.tenant).cloned(),
+                policy_generation: snapshot.generation,
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
@@ -918,6 +924,7 @@ mod tests {
             key_policies: HashMap::new(),
             key_tenants: HashMap::new(),
             tenant_credentials: HashMap::from([(TenantId::new("tenant-t"), Arc::new(set))]),
+            generation: None,
         })))
     }
 

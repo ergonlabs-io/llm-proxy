@@ -510,6 +510,58 @@ fn a_future_dated_card_is_refused_on_put_at_boot_and_from_the_store() {
     assert_eq!(capture.rendered_at_or_above(tracing::Level::WARN).len(), 1);
 }
 
+/// A card published by a replica whose clock runs well ahead is refused here,
+/// once, and installed when this replica's clock reaches its date. The store
+/// re-offers it on every poll (covered in `control.rs`); this pins that the
+/// refusal is a deferral, that retries stay quiet, and that a later clock
+/// installs the same row.
+#[test]
+fn a_card_dated_ahead_of_this_clock_is_deferred_quietly_and_installed_once_reached() {
+    let ahead = chrono::Utc::now() + chrono::Duration::hours(1);
+    let json = card_json_dated(
+        "ahead",
+        10,
+        &[("provider:openai", "openai")],
+        &ahead.to_rfc3339(),
+    );
+    let (store, raw) = SharedMemoryStore::new();
+    let cp = control_plane(&store);
+    let r = registry();
+    apply(&r, Some(&card_json("current", 10)), Some(&cp)).unwrap();
+    let before = active(&r);
+    let stored = StoredRateCard {
+        chain: CHAIN.into(),
+        version: "ahead".into(),
+        card_json: context(&json).to_wire_json(),
+    };
+
+    let (capture, guard) = Capture::start();
+    raw.put_rate_card(&stored).unwrap();
+    for _ in 0..3 {
+        cp.poll_once().unwrap();
+    }
+    drop(guard);
+    assert_eq!(active(&r), before);
+    let warnings = capture.rendered_at_or_above(tracing::Level::WARN);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "only the first refusal logs: {warnings:?}"
+    );
+    // Deferred, not settled: a settled refusal is never offered again.
+    assert_eq!(
+        r.install_stored(&stored, SystemTime::now()),
+        RateCardDelivery::Deferred
+    );
+
+    let reached = SystemTime::from(ahead) + Duration::from_secs(1);
+    assert_eq!(
+        r.install_stored(&stored, reached),
+        RateCardDelivery::Settled
+    );
+    assert_eq!(active(&r), Some(version_of(&json)));
+}
+
 /// A card the writer dated "now" can look a little ahead to a replica whose
 /// clock is behind. That must not strand the replica on the old card.
 #[test]

@@ -1338,6 +1338,7 @@ impl HttpFilter for AuthFilterInstance {
                     info.auth = AuthInfo {
                         tenant: Some(principal.tenant.as_str().to_string()),
                         key_id: Some(principal.key_id.as_str().to_string()),
+                        policy_generation: principal.policy_generation,
                     };
                     // Hand-off of the set the key was verified against, so the
                     // router never reads the snapshot itself. A request keeps
@@ -2213,6 +2214,47 @@ mod tests {
         assert_eq!(info.auth.key_id.as_deref(), Some("key-1"));
     }
 
+    // 11a: the request is stamped with the policy generation of the snapshot
+    // that verified its key, so its record names the policy it was admitted
+    // under. A second write must move the stamp: a constant would also pass a
+    // single request.
+    #[test]
+    fn an_admitted_request_carries_the_policy_generation_that_verified_it() {
+        let cp = ControlPlane::new(
+            Box::new(crate::control::InMemoryControlPlaneStore::new()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let tenant = TenantId::new("tenant-a");
+        cp.create_tenant(&tenant).unwrap();
+        let minted = cp.mint_key(&tenant, &KeyId::new("key-1")).unwrap();
+        let mut filter = AuthFilterInstance {
+            chain: Arc::new(AuthenticatorChain::new(vec![Box::new(
+                VirtualKeyAuthenticator::new(HmacSecret::new(b"secret"), cp.handle()),
+            )])),
+        };
+        let admit = |filter: &mut AuthFilterInstance| {
+            let mut cb = TestCallbacks::new(Some(route_named("r1")));
+            let bearer = format!("Bearer {}", minted.plaintext);
+            let mut head = request_headers(Some(&bearer));
+            assert_eq!(
+                filter.decode_headers(&mut cb, &mut head, true),
+                FilterHeadersStatus::Continue
+            );
+            let generation = cb.stream_info.borrow().auth.policy_generation;
+            generation
+        };
+
+        let first = admit(&mut filter);
+        assert_eq!(first, Some(cp.store().policy_generation().unwrap()));
+
+        cp.create_tenant(&TenantId::new("tenant-b")).unwrap();
+        let second = admit(&mut filter);
+        assert_eq!(second, Some(cp.store().policy_generation().unwrap()));
+        assert_ne!(first, second, "a policy write must move the stamp");
+    }
+
     /// One snapshot with a key for `tenant-t` (which holds an `openrouter`
     /// credential) and a key for `tenant-u` (which holds none). Built by hand
     /// so these tests cover only the hand-off from snapshot to `StreamInfo`.
@@ -2255,6 +2297,7 @@ mod tests {
                 TenantId::new("tenant-t"),
                 Arc::new(set),
             )]),
+            generation: None,
         };
         let handle = Arc::new(arc_swap::ArcSwap::new(Arc::new(snapshot)));
         let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
@@ -2483,6 +2526,7 @@ mod tests {
                 key_id: KeyId::new("should-never-be-reached"),
                 policy: Arc::new(Default::default()),
                 tenant_credentials: None,
+                policy_generation: None,
             })
         }
     }

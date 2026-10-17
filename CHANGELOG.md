@@ -69,6 +69,18 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   Redis needs AOF or RDB persistence (see "The shared store needs
   persistence" in Running in production).
 
+### Fixed
+
+- Request records now carry `policy_generation`: the generation of the
+  control-plane snapshot that verified the request's key. Before, the field
+  was always null. It stays null for a request that `llmproxy.auth` did not
+  authenticate with a virtual key, for example a JWT.
+- A rate card in the store dated more than five minutes ahead of a replica's
+  clock is no longer refused for good on that replica. The replica keeps its
+  current card, logs a warning once, and installs the stored card on the first
+  policy poll after its clock reaches the date. Before, it stayed on the old
+  card until another write to the store.
+
 ## [0.4.0] - 2026-10-16
 
 ### Breaking

@@ -410,6 +410,7 @@ impl Authenticator for JwtAuthenticator {
             // reads the JWKS snapshot, not the control-plane snapshot, and
             // must not add a second load to reach tenant credentials.
             tenant_credentials: None,
+            policy_generation: None,
         })
     }
 }
@@ -1135,6 +1136,7 @@ GdGIML90cFtpXr13uutgIg==
                     key_id: KeyId::new("should-never-be-reached"),
                     policy: Arc::new(TenantPolicy::default()),
                     tenant_credentials: None,
+                    policy_generation: None,
                 })
             }
         }

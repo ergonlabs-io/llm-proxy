@@ -133,6 +133,11 @@ pub struct AuthInfo {
     /// revoking one leaked key must not revoke the whole account, and an
     /// audit trail needs to name the key.
     pub key_id: Option<String>,
+    /// The control-plane `policy_generation` of the snapshot that verified
+    /// the credential, so a request record names the policy it was admitted
+    /// under. `None` when the authenticator does not read that snapshot (JWT)
+    /// or the store's stamp could not be read.
+    pub policy_generation: Option<u64>,
 }
 
 /// Physical upstream attempt snapshots. A new entry is created at dispatch,

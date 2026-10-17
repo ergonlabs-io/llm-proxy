@@ -27,7 +27,7 @@ use proxy_observability::stats::{instruments, Handle, Instrument, Registry, Work
 use serde::{Deserialize, Serialize};
 
 use crate::auth_filter;
-use crate::control::{ControlPlane, StoredRateCard};
+use crate::control::{ControlPlane, RateCardDelivery, StoredRateCard};
 use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
 use crate::usage::{
     extract_json_served_model, extract_json_upstream, extract_json_upstream_from_tail,
@@ -68,6 +68,10 @@ pub struct PricingRegistry {
     config: Mutex<ConfigState>,
     /// Exports the active card's version; see [`RateCardGauge`].
     gauge: Mutex<RateCardGauge>,
+    /// The stored card last deferred for being dated ahead of this replica's
+    /// clock. The store offers it again on every policy poll, and this keeps
+    /// those retries from logging the refusal each time.
+    deferred: Mutex<Option<StoredRateCard>>,
 }
 
 /// Ceiling on `llmproxy_usage_rate_card_active` series. Each published card
@@ -123,6 +127,7 @@ impl PricingRegistry {
             current: RwLock::new(None),
             config: Mutex::new(ConfigState::default()),
             gauge: Mutex::new(RateCardGauge::default()),
+            deferred: Mutex::new(None),
         }
     }
 
@@ -333,10 +338,9 @@ impl PricingRegistry {
         // make the store keep the registry alive and the registry keep the
         // store alive, and neither would ever be freed.
         let weak = Arc::downgrade(self);
-        store.watch_rate_card(&self.chain, move |stored| {
-            if let Some(registry) = weak.upgrade() {
-                registry.install_stored(stored);
-            }
+        store.watch_rate_card(&self.chain, move |stored| match weak.upgrade() {
+            Some(registry) => registry.install_stored(stored, SystemTime::now()),
+            None => RateCardDelivery::Settled,
         });
         state.control_plane = Some(store);
         true
@@ -391,7 +395,9 @@ impl PricingRegistry {
                         // The watcher refused the stored card and already said
                         // why. Pricing nothing would turn every budgeted request
                         // into a free one, so this process falls back to the
-                        // configured card and leaves the store alone.
+                        // configured card and leaves the store alone. A card
+                        // refused only for its date replaces this one once
+                        // this replica's clock reaches it.
                         tracing::warn!(
                             chain = %self.chain,
                             "the stored rate card could not be installed; pricing with the \
@@ -472,10 +478,14 @@ impl PricingRegistry {
         }
     }
 
-    /// Installs a card read from the store. A card that cannot be used is
-    /// refused loudly and the previous card stays: the store's watch hands a
-    /// card over once, so this logs once per bad card.
-    fn install_stored(&self, stored: &StoredRateCard) {
+    /// Installs a card read from the store as of `now`. A card that cannot
+    /// be parsed is refused loudly for good and the previous card stays; the
+    /// store's watch hands that card over once, so this logs once per bad
+    /// card. A card dated ahead of `now` (beyond the skew allowance) is
+    /// deferred instead: another replica with a faster clock published it,
+    /// and it becomes usable here once this clock catches up. The store
+    /// offers it again on each policy poll; only the first refusal logs.
+    fn install_stored(&self, stored: &StoredRateCard, now: SystemTime) -> RateCardDelivery {
         let card = match parse_card_json(&stored.card_json) {
             Ok(card) => card,
             Err(error) => {
@@ -486,26 +496,36 @@ impl PricingRegistry {
                     "the rate card in the control-plane store is not usable; keeping the \
                      current rate card"
                 );
-                return;
+                return RateCardDelivery::Settled;
             }
         };
-        if let Err(reason) = check_effective_from(&card, SystemTime::now(), STORED_CARD_CLOCK_SKEW)
         {
-            tracing::warn!(
-                chain = %self.chain,
-                stored_version = %stored.version,
-                %reason,
-                "the rate card in the control-plane store is not usable; keeping the current \
-                 rate card"
-            );
-            return;
+            let mut deferred = self
+                .deferred
+                .lock()
+                .expect("pricing deferred lock poisoned");
+            if let Err(reason) = check_effective_from(&card, now, STORED_CARD_CLOCK_SKEW) {
+                if deferred.as_ref() != Some(stored) {
+                    tracing::warn!(
+                        chain = %self.chain,
+                        stored_version = %stored.version,
+                        %reason,
+                        "the rate card in the control-plane store is dated ahead of this \
+                         replica's clock; keeping the current rate card and retrying on each \
+                         policy poll"
+                    );
+                    *deferred = Some(stored.clone());
+                }
+                return RateCardDelivery::Deferred;
+            }
+            *deferred = None;
         }
         let mut current = self
             .current
             .write()
             .expect("pricing registry lock poisoned");
         if current.as_ref() == Some(&card) {
-            return;
+            return RateCardDelivery::Settled;
         }
         let previous = current.as_ref().map(|p| p.list.version().to_string());
         let version = card.list.version().to_string();
@@ -518,6 +538,7 @@ impl PricingRegistry {
             previous_version = previous,
             "installed the rate card from the control-plane store"
         );
+        RateCardDelivery::Settled
     }
 
     /// `PUT /pricing`: validates `json`, then publishes it. With a store the

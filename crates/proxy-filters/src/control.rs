@@ -850,6 +850,10 @@ pub struct ControlPlaneSnapshot {
     /// closed.
     pub tenant_credentials:
         HashMap<TenantId, Arc<proxy_http::tenant_credentials::TenantCredentialSet>>,
+    /// The store's `policy_generation`, read before the load this snapshot
+    /// was built from, so it can lag the data by one write but never lead
+    /// it. `None` when that read failed. Request records carry it.
+    pub generation: Option<u64>,
 }
 
 /// In-memory [`ControlPlaneStore`]. Backed by a `Mutex` because the trait's write methods
@@ -3231,10 +3235,23 @@ pub struct ControlPlane {
 /// Who wants to hear when a chain's stored rate card changes.
 struct RateCardWatch {
     chain: String,
-    /// The card this watcher was last given, so an unrelated generation bump
-    /// (a key minted, say) does not hand it the same card again.
+    /// The card this watcher last settled, so an unrelated generation bump
+    /// (a key minted, say) does not hand it the same card again. A deferred
+    /// card is not recorded here, so it is offered again.
     last_delivered: Option<StoredRateCard>,
-    callback: Box<dyn Fn(&StoredRateCard) + Send + Sync>,
+    callback: Box<dyn Fn(&StoredRateCard) -> RateCardDelivery + Send + Sync>,
+}
+
+/// What a rate-card watcher did with a card it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateCardDelivery {
+    /// Installed, or refused for a reason that a later offer cannot change.
+    /// The card is not offered again.
+    Settled,
+    /// Refused for now, for example because the card is dated ahead of this
+    /// replica's clock. The card is offered again on every policy poll until
+    /// the watcher settles it, even when the store does not change.
+    Deferred,
 }
 
 impl ControlPlane {
@@ -3296,6 +3313,7 @@ impl ControlPlane {
             credential_keys.as_ref(),
             &credential_warnings,
             loaded,
+            generation,
         );
         // Rust note: `ArcSwap::new` takes the initial `Arc<T>` directly --
         // unlike `rebuild` below, there is no "leave it alone on error"
@@ -3401,6 +3419,9 @@ impl ControlPlane {
             .expect("control plane mutex poisoned");
         if previous == Some(generation) {
             self.freshness.mark_reconciled();
+            // Nothing changed, but a deferred rate card may have become
+            // usable since the last poll.
+            self.notify_rate_card_watches();
             return Ok(false);
         }
         let loaded = self.store.load()?;
@@ -4084,7 +4105,9 @@ impl ControlPlane {
     /// Calls `callback` with `chain`'s rate card now, if the store has one,
     /// and again every time a load brings a different card for that chain.
     /// Loads happen on this replica's policy poll (a generation bump from any
-    /// replica), after one of its own writes, and on `rebuild`. The callback
+    /// replica), after one of its own writes, and on `rebuild`. A card the
+    /// callback defers is offered again on every poll, changed or not, until
+    /// it settles; see [`RateCardDelivery`]. The callback
     /// runs on whichever thread did the load while a lock is held, so it must
     /// be quick and must not call back into this control plane.
     ///
@@ -4094,23 +4117,24 @@ impl ControlPlane {
     pub fn watch_rate_card(
         &self,
         chain: &str,
-        callback: impl Fn(&StoredRateCard) + Send + Sync + 'static,
+        callback: impl Fn(&StoredRateCard) -> RateCardDelivery + Send + Sync + 'static,
     ) {
         let mut watches = self
             .rate_card_watches
             .lock()
             .expect("control plane mutex poisoned");
-        let current = self.rate_card(chain);
-        if let Some(card) = &current {
-            callback(card);
-        }
+        let last_delivered = self
+            .rate_card(chain)
+            .filter(|card| callback(card) == RateCardDelivery::Settled);
         watches.push(RateCardWatch {
             chain: chain.to_string(),
-            last_delivered: current,
+            last_delivered,
             callback: Box::new(callback),
         });
     }
 
+    /// Offers each watcher its chain's card unless it already settled that
+    /// card. Cheap when nothing is deferred: one map read per watcher.
     fn notify_rate_card_watches(&self) {
         let mut watches = self
             .rate_card_watches
@@ -4120,8 +4144,9 @@ impl ControlPlane {
             let Some(card) = self.rate_card(&watch.chain) else {
                 continue;
             };
-            if watch.last_delivered.as_ref() != Some(&card) {
-                (watch.callback)(&card);
+            if watch.last_delivered.as_ref() != Some(&card)
+                && (watch.callback)(&card) == RateCardDelivery::Settled
+            {
                 watch.last_delivered = Some(card);
             }
         }
@@ -4256,6 +4281,7 @@ impl ControlPlane {
             self.credential_keys.as_ref(),
             &self.credential_warnings,
             loaded,
+            generation,
         )
     }
 
@@ -4267,10 +4293,12 @@ impl ControlPlane {
         credential_keys: Option<&CredentialKeys>,
         warnings: &CredentialWarnings,
         mut loaded: StoredControlPlane,
+        generation: Option<u64>,
     ) -> ControlPlaneSnapshot {
         let rows = std::mem::take(&mut loaded.tenant_credentials);
         let mut snapshot = Self::merge(bootstrap_keys, loaded);
         snapshot.tenant_credentials = decrypt_credentials(credential_keys, warnings, rows);
+        snapshot.generation = generation;
         snapshot
     }
 
@@ -4411,6 +4439,7 @@ impl ControlPlane {
             key_policies,
             key_tenants,
             tenant_credentials: HashMap::new(),
+            generation: None,
         }
     }
 }
@@ -4577,6 +4606,7 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         key_policies: HashMap::new(),
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
+        generation: None,
     })))
 }
 
@@ -9114,6 +9144,38 @@ mod tests {
             chain: chain.to_string(),
             version: format!("version-{marker}"),
             card_json: format!(r#"{{"marker":"{marker}"}}"#),
+        }
+    }
+
+    /// A watcher that defers a card is offered it again on a poll that finds
+    /// the store unchanged, and is not offered it after it settles. Without
+    /// the retry, a card refused once (dated ahead of this replica's clock)
+    /// would stay refused until some unrelated write bumped the generation.
+    #[test]
+    fn a_deferred_rate_card_is_offered_again_on_each_poll_until_it_settles() {
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        cp.put_rate_card(&rate_card("chain-a", "ahead")).unwrap();
+        let offers = Arc::new(Mutex::new(0_u32));
+        let seen = Arc::clone(&offers);
+        cp.watch_rate_card("chain-a", move |_| {
+            let mut offers = seen.lock().unwrap();
+            *offers += 1;
+            if *offers < 3 {
+                RateCardDelivery::Deferred
+            } else {
+                RateCardDelivery::Settled
+            }
+        });
+        assert_eq!(*offers.lock().unwrap(), 1, "offered once at registration");
+
+        for expected in [2, 3, 3, 3] {
+            assert!(!cp.poll_once().unwrap(), "the store did not change");
+            assert_eq!(*offers.lock().unwrap(), expected);
         }
     }
 
