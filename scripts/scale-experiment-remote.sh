@@ -162,13 +162,25 @@ admin: 127.0.0.1:$admin
 providers:
   mock:
     base_url: http://$MOCK_ADDR
-    protocol: http2
+$UPSTREAM_PROTOCOL_LINE
 routes:
   - model: "*"
     provider: mock
 $auth
 YAML
 }
+
+# How the proxy dials the mock; s7 runs both. PROXY_BIN lets s7 profile a
+# build with frame pointers without changing the binary the other scenarios
+# measure.
+UPSTREAM_PROTOCOL="${UPSTREAM_PROTOCOL:-http2}"
+PROXY_BIN="${PROXY_BIN:-$BIN/llm-proxy}"
+upstream_protocol_line() {
+    UPSTREAM_PROTOCOL_LINE=""
+    [[ "$UPSTREAM_PROTOCOL" == http2 ]] && UPSTREAM_PROTOCOL_LINE="    protocol: http2"
+    return 0
+}
+upstream_protocol_line
 
 # start_replicas DIR COUNT STORE: sets LISTEN[i], ADMIN[i], PROXY_PID[i].
 LISTEN=() ADMIN=() PROXY_PID=()
@@ -178,8 +190,8 @@ start_replicas() {
     for ((i = 0; i < count; i++)); do
         LISTEN[i]="$(free_port)"; ADMIN[i]="$(free_port)"
         write_config "$dir/config-r$((i + 1)).yaml" "${LISTEN[i]}" "${ADMIN[i]}" "$store"
-        "$BIN/llm-proxy" --config "$dir/config-r$((i + 1)).yaml" --mode validate >/dev/null
-        taskset -c "${CORES_PROXY[i]}" "$BIN/llm-proxy" --config "$dir/config-r$((i + 1)).yaml" \
+        "$PROXY_BIN" --config "$dir/config-r$((i + 1)).yaml" --mode validate >/dev/null
+        taskset -c "${CORES_PROXY[i]}" "$PROXY_BIN" --config "$dir/config-r$((i + 1)).yaml" \
             --concurrency "$PROXY_WORKERS" --service-node "scale-r$((i + 1))" \
             >"$dir/proxy-r$((i + 1)).log" 2>&1 &
         PROXY_PID[i]=$!
@@ -502,6 +514,48 @@ PY
 s5() { s4b s5 faults; }
 s5b() { s4b s5b faults persist; }
 
+# S7: where the proxy-added latency goes, at a rate the proxy serves without
+# queueing (S7_RATE, default 1k rps). For each upstream protocol: 70 s of
+# open-loop non-streaming load; 20 s in, a 10 s loopback packet capture of
+# both hops (headers only), then 15 s of on-CPU perf samples of the proxy
+# with call graphs. Point PROXY_BIN at a build with frame pointers
+# (RUSTFLAGS="-C force-frame-pointers=yes") or the stacks are one frame
+# deep. On-CPU samples cannot show a socket waiting on Nagle or a delayed
+# ACK; the packet capture is what shows that.
+s7() {
+    local d="$OUT/s7" rate="${S7_RATE:-1000}" proto lg mock_port
+    mkdir -p "$d"
+    for proto in http2 http1; do
+        echo "=== S7 latency attribution: ${rate} rps, upstream $proto ==="
+        UPSTREAM_PROTOCOL="$proto"; upstream_protocol_line
+        mkdir -p "$d/$proto"
+        start_mock "$d/$proto" --tokens 16 --ttft-ms 5 --inter-token-ms 0
+        mock_port="${MOCK_ADDR##*:}"
+        start_replicas "$d/$proto" 1 none
+        scrape_all "$d/$proto" before
+        local baseline=()
+        [[ "$proto" == http1 ]] && baseline=(--baseline-target "http://$MOCK_ADDR")
+        loadgen --target "http://127.0.0.1:${LISTEN[0]}" "${baseline[@]}" \
+            --endpoint chat --model mock-model --no-stream --rate "$rate" \
+            --downstream-mode h1-pool --downstream-h1-pool-size 256 \
+            --duration 70 --warmup 5 --out "$d/$proto/loadgen.json" >"$d/$proto/loadgen.txt" 2>&1 &
+        lg=$!; LOADGEN_PIDS+=("$lg"); PIDS+=("$lg")
+        sleep 20
+        timeout 10 tcpdump -i lo -nn -s 160 -w "$d/$proto/hops.pcap" \
+            "tcp port $mock_port or tcp port ${LISTEN[0]}" >/dev/null 2>&1 || true
+        perf record -F 499 -g -p "${PROXY_PID[0]}" -o "$d/$proto/perf.data" -- sleep 15 \
+            >/dev/null 2>&1 || echo "perf record failed" >&2
+        wait_loadgens
+        scrape_all "$d/$proto" after
+        perf report -i "$d/$proto/perf.data" --stdio --no-children --percent-limit 0.5 \
+            >"$d/$proto/perf-report.txt" 2>/dev/null || true
+        perf script -i "$d/$proto/perf.data" 2>/dev/null | gzip >"$d/$proto/perf-script.txt.gz" || true
+        echo "mock port $mock_port, proxy listen ${LISTEN[0]}" >"$d/$proto/ports.txt"
+        stop_all
+    done
+    UPSTREAM_PROTOCOL=http2; upstream_protocol_line
+}
+
 s6() {
     local d="$OUT/s6"; mkdir -p "$d"
     local rate="${S6_RATE:-150}" i
@@ -526,9 +580,9 @@ s6() {
 
 for s in $SCENARIOS; do
     case "$s" in
-        all) manifest; s0; s1; s2; s3; s4a; s4b; s5; s5b; s6 ;;
-        s0|s1|s2|s3|s4a|s4b|s5|s5b|s6) "$s" ;;
-        *) echo "unknown scenario: $s (s0 s1 s2 s3 s4a s4b s5 s5b s6 all)" >&2; exit 2 ;;
+        all) manifest; s0; s1; s2; s3; s4a; s4b; s5; s5b; s6; s7 ;;
+        s0|s1|s2|s3|s4a|s4b|s5|s5b|s6|s7) "$s" ;;
+        *) echo "unknown scenario: $s (s0 s1 s2 s3 s4a s4b s5 s5b s6 s7 all)" >&2; exit 2 ;;
     esac
 done
 echo "results: $OUT"
