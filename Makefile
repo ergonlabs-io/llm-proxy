@@ -43,6 +43,10 @@ capture-agent-qualify: capture-qualification-build ## Qualify eight concurrent m
 capture-qualification-check: ## Check qualification reporting without starting test servers
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_capture_qualification.py
 
+.PHONY: lab-ab
+lab-ab: ## Latency lab A/B on a Linux host: make lab-ab BASE=main CAND=HEAD LAB_HOST=root@IP [PATCH=f]
+	scripts/latency-lab.sh ab --base $(or $(BASE),main) --cand $(or $(CAND),HEAD) $(if $(PATCH),--cand-patch $(PATCH))
+
 .PHONY: redb-retention-build
 redb-retention-build: ## Build production encrypted redb retention qualification
 	cargo build --release -p proxy-capture-spool --example redb_retention

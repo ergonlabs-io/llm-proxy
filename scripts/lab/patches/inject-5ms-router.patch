@@ -1,0 +1,10 @@
+Validation only: never merge. Adds a fixed 5 ms wait at the start of the
+router terminal, so an A/B against the unpatched revision must report about
++5 ms on every latency metric and no change in inter-token delay.
+
+--- a/crates/proxy-http/src/router.rs
++++ b/crates/proxy-http/src/router.rs
+@@ -463,2 +463,3 @@
+     async fn route_and_forward(&mut self, dcb: &mut dyn DecoderCallbacks) -> HttpResponseParts {
++        tokio::time::sleep(Duration::from_millis(5)).await;
+         // S2.8: the filter manager already resolved (and cached) the route
