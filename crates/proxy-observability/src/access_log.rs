@@ -726,10 +726,40 @@ pub struct LogContext<'a> {
 /// limited to the output `String` and any truncated header values.
 pub fn render(fmt: &FormatString, ctx: &LogContext<'_>) -> String {
     let mut out = String::new();
-    for op in &fmt.0 {
-        render_op(op, ctx, &mut out);
-    }
+    render_into(fmt, ctx, &mut out);
     out
+}
+
+/// [`render`], appending to `out`, so a caller that renders many format
+/// strings per line (`json_format`) can reuse one buffer.
+pub fn render_into(fmt: &FormatString, ctx: &LogContext<'_>, out: &mut String) {
+    for op in &fmt.0 {
+        render_op(op, ctx, out);
+    }
+}
+
+/// `%START_TIME%` in [`DEFAULT_START_TIME_FORMAT`], without chrono's strftime,
+/// which parses the pattern again on every call. Returns `false`, and the
+/// caller falls back to chrono, where the output could differ: a year outside
+/// 0 to 9999 (chrono's `%Y` adds a sign) or a leap second (`%S` renders 60).
+fn write_default_start_time(dt: &chrono::DateTime<chrono::Utc>, out: &mut String) -> bool {
+    use chrono::{Datelike as _, Timelike as _};
+    if !(0..=9999).contains(&dt.year()) || dt.nanosecond() >= 1_000_000_000 {
+        return false;
+    }
+    // `%.3f` truncates to milliseconds.
+    let millis = dt.nanosecond() / 1_000_000;
+    let _ = write!(
+        out,
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    );
+    true
 }
 
 fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
@@ -738,7 +768,9 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::StartTime(fmt) => {
             let dt: chrono::DateTime<chrono::Utc> = ctx.start_time.into();
             let pattern = fmt.as_deref().unwrap_or(DEFAULT_START_TIME_FORMAT);
-            let _ = write!(out, "{}", dt.format(pattern));
+            if pattern != DEFAULT_START_TIME_FORMAT || !write_default_start_time(&dt, out) {
+                let _ = write!(out, "{}", dt.format(pattern));
+            }
         }
         FormatOp::Req(spec) => render_req(ctx, spec, out),
         FormatOp::Resp(spec) => render_resp(ctx, spec, out),
@@ -1399,6 +1431,33 @@ mod tests {
         assert_eq!(default, "1970-01-01T00:00:00.000Z");
         let custom = render(&parse("%START_TIME(%s)%"), &c);
         assert_eq!(custom, "0");
+    }
+
+    /// The hand-written default `%START_TIME%` must match chrono's strftime
+    /// byte for byte, including zero padding and millisecond truncation.
+    #[test]
+    fn default_start_time_fast_path_matches_chrono() {
+        let empty = http::HeaderMap::new();
+        let fmt = parse("%START_TIME%");
+        let secs: [u64; 6] = [
+            0,
+            59,
+            951_782_400,
+            1_700_000_000,
+            4_102_444_799,
+            253_402_300_799,
+        ];
+        let nanos: [u32; 5] = [0, 999_999, 1_000_000, 123_456_789, 999_999_999];
+        for s in secs {
+            for n in nanos {
+                let at = std::time::UNIX_EPOCH + std::time::Duration::new(s, n);
+                let mut c = ctx(&empty, &empty, &empty, &[]);
+                c.start_time = at;
+                let dt: chrono::DateTime<chrono::Utc> = at.into();
+                let chrono = dt.format(DEFAULT_START_TIME_FORMAT).to_string();
+                assert_eq!(render(&fmt, &c), chrono, "{s}s {n}ns");
+            }
+        }
     }
 
     // -------------------------------------------------- request pseudo-headers --

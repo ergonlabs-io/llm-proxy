@@ -208,7 +208,7 @@ impl FileSink {
         let file = open_append(&path)?;
         Ok(Self {
             path,
-            writer: Mutex::new(BufWriter::new(file)),
+            writer: Mutex::new(BufWriter::with_capacity(WAKE_BYTES, file)),
             limiter: RateLimiter::new(),
         })
     }
@@ -244,7 +244,7 @@ impl AccessLogWriter for FileSink {
         // before we drop it — best effort, matches `write_line`'s "never
         // fail the caller" contract by simply not propagating this error.
         let _ = w.flush();
-        *w = BufWriter::new(file);
+        *w = BufWriter::with_capacity(WAKE_BYTES, file);
         Ok(())
     }
 }
@@ -260,6 +260,18 @@ const QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// writer thread. Bounded so a destination stuck in a kernel write cannot
 /// hang shutdown or a SIGUSR1 handler forever.
 const CONTROL_WAIT: Duration = Duration::from_secs(5);
+
+/// The writer thread drains and flushes at least this often. Between ticks a
+/// producer wakes it only once [`WAKE_BYTES`] are waiting, so a request does
+/// not pay a futex wake, and the writer a `write(2)` and flush, per line.
+/// Envoy batches file access logs the same way (`file_flush_interval_msec`
+/// and a minimum flush size). Explicit `flush()`, `reopen()` and shutdown
+/// still act at once.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Queued line bytes at which a producer wakes the writer before the next
+/// [`FLUSH_INTERVAL`] tick, so a burst cannot fill the queue between ticks.
+const WAKE_BYTES: usize = 64 * 1024;
 
 /// One unit of work for the writer thread. Lines and control messages share
 /// one FIFO so a `flush`/`reopen` is ordered after every line queued before
@@ -283,6 +295,12 @@ struct QueueState {
     /// control request fails fast instead of waiting for an ack that never
     /// comes.
     exited: bool,
+    /// A `Flush` or `Reopen` is queued, so the writer must not sleep out its
+    /// tick before serving it.
+    has_control: bool,
+    /// The writer is waiting on an empty queue with no timeout, so the next
+    /// line must wake it.
+    parked: bool,
 }
 
 struct QueueShared {
@@ -398,6 +416,7 @@ impl QueueShared {
             return false;
         }
         st.items.push_back(item);
+        st.has_control = true;
         drop(st);
         self.wake.notify_one();
         true
@@ -407,7 +426,9 @@ impl QueueShared {
 /// Makes any [`AccessLogWriter`] non-blocking for the caller.
 ///
 /// `write_line` copies the line into a bounded queue. A dedicated thread drains
-/// it, so a stalled pipe or slow disk never blocks a request worker.
+/// it every [`FLUSH_INTERVAL`], or sooner once [`WAKE_BYTES`] are waiting, so
+/// a stalled pipe or slow disk never blocks a request worker and a healthy
+/// destination costs a request no syscall.
 ///
 /// Drop policy is fail-open and loud. When the queue is full the NEW line is
 /// dropped and counted, and a rate-limited warning names the destination. The
@@ -470,14 +491,28 @@ fn writer_loop(shared: &QueueShared, inner: &dyn AccessLogWriter) {
         // never blocked behind inner-sink I/O.
         let batch = {
             let mut st = shared.state.lock().unwrap();
-            while st.items.is_empty() && !st.closed {
-                st = shared.wake.wait(st).unwrap();
+            while !st.closed && !st.has_control && st.line_bytes < WAKE_BYTES {
+                if st.items.is_empty() {
+                    // Idle: the next line wakes us (see `parked`).
+                    st.parked = true;
+                    st = shared.wake.wait(st).unwrap();
+                    st.parked = false;
+                } else {
+                    // Lines are waiting: let more join them for one tick.
+                    // Producers do not wake us per line, so this is where
+                    // the batching happens. A control item, the byte
+                    // threshold or shutdown cuts the tick short.
+                    st = shared.wake.wait_timeout(st, FLUSH_INTERVAL).unwrap().0;
+                    break;
+                }
             }
+            // Only shutdown leaves the loop above with nothing queued.
             if st.items.is_empty() {
                 st.exited = true;
                 return;
             }
             st.line_bytes = 0;
+            st.has_control = false;
             std::mem::take(&mut st.items)
         };
         let mut dirty = false;
@@ -522,10 +557,17 @@ impl AccessLogWriter for QueuedSink {
             }
             return;
         }
+        let before = st.line_bytes;
         st.line_bytes += line.len();
         st.items.push_back(Item::Line(line.to_string()));
+        // Wake the writer for the first line after idle and once per
+        // crossing of the threshold, not per line: otherwise its own tick
+        // picks the line up.
+        let wake = st.parked || (before < WAKE_BYTES && st.line_bytes >= WAKE_BYTES);
         drop(st);
-        self.shared.wake.notify_one();
+        if wake {
+            self.shared.wake.notify_one();
+        }
     }
 
     fn flush(&self) {
@@ -797,6 +839,64 @@ mod tests {
             open,
             lines,
         )
+    }
+
+    /// Inner sink that records lines and counts flushes.
+    #[derive(Default)]
+    struct CountingSink {
+        lines: Mutex<Vec<String>>,
+        flushes: AtomicU64,
+    }
+
+    impl AccessLogWriter for CountingSink {
+        fn write_line(&self, line: &str) {
+            self.lines.lock().unwrap().push(line.to_string());
+        }
+        fn flush(&self) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        fn reopen(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Polls until `inner` has `n` lines, without calling `flush()`: the
+    /// writer's own wake-up and tick must deliver them.
+    fn await_lines(inner: &CountingSink, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while inner.lines.lock().unwrap().len() < n {
+            assert!(
+                Instant::now() < deadline,
+                "lines never reached the inner sink"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn an_idle_writer_delivers_a_single_line_without_flush() {
+        let inner = Arc::new(CountingSink::default());
+        let sink = QueuedSink::new("counting", inner.clone()).unwrap();
+        // Twice, so the second line meets a writer that has gone idle again.
+        sink.write_line("one\n");
+        await_lines(&inner, 1);
+        sink.write_line("two\n");
+        await_lines(&inner, 2);
+        assert_eq!(*inner.lines.lock().unwrap(), ["one\n", "two\n"]);
+    }
+
+    #[test]
+    fn queued_lines_share_a_flush_rather_than_paying_one_each() {
+        let inner = Arc::new(CountingSink::default());
+        let sink = QueuedSink::new("counting", inner.clone()).unwrap();
+        for i in 0..100 {
+            sink.write_line(&format!("line {i}\n"));
+        }
+        await_lines(&inner, 100);
+        // One flush per line would need every write to land after the
+        // writer's previous batch, a 100 ms stall each time.
+        let flushes = inner.flushes.load(Ordering::Relaxed);
+        assert!(flushes < 100, "{flushes} flushes for 100 lines");
     }
 
     #[test]

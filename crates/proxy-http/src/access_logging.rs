@@ -7,6 +7,7 @@
 //! response stream ends.
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -19,7 +20,7 @@ use http::HeaderMap;
 use hyper::body::{Body, Frame};
 
 use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, ComparisonOp};
-use proxy_observability::access_log::{render, FormatOp, FormatString, LlmTokens, LogContext};
+use proxy_observability::access_log::{render_into, FormatOp, FormatString, LlmTokens, LogContext};
 use proxy_observability::records::{
     RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
 };
@@ -97,7 +98,11 @@ impl AccessLoggerRuntime {
 
     fn render_line(&self, ctx: &LogContext<'_>) -> String {
         match &self.format {
-            AccessLogFormat::Text(fmt) => render(fmt, ctx),
+            AccessLogFormat::Text(fmt) => {
+                let mut out = String::with_capacity(LINE_CAPACITY);
+                render_into(fmt, ctx, &mut out);
+                out
+            }
             AccessLogFormat::Json(fields) => render_json(fields, ctx),
         }
     }
@@ -126,8 +131,12 @@ impl AccessLoggerRuntime {
 /// the operator exists to carry the provider's JSON object as sent, so it is
 /// embedded as a JSON value (`null` when absent), not as an escaped string.
 /// Combined with any other text the field is an ordinary string.
+///
+/// Each value renders straight into the line and is escaped only when it
+/// holds a byte that needs it, so the common field costs no allocation.
 fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> String {
-    let mut out = String::from("{");
+    let mut out = String::with_capacity(LINE_CAPACITY);
+    out.push('{');
     for (i, (key, fmt)) in fields.iter().enumerate() {
         if i > 0 {
             out.push(',');
@@ -140,7 +149,16 @@ fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> Strin
             out.push_str(ctx.llm_upstream_usage.unwrap_or("null"));
         } else {
             out.push('"');
-            json_escape_into(&render(fmt, ctx), &mut out);
+            let start = out.len();
+            render_into(fmt, ctx, &mut out);
+            if out.as_bytes()[start..]
+                .iter()
+                .copied()
+                .any(needs_json_escape)
+            {
+                let raw = out.split_off(start);
+                json_escape_into(&raw, &mut out);
+            }
             out.push('"');
         }
     }
@@ -148,18 +166,35 @@ fn render_json(fields: &[(String, FormatString)], ctx: &LogContext<'_>) -> Strin
     out
 }
 
+/// Room for a default dialect line (about 1.2 KB in JSON) in one allocation.
+const LINE_CAPACITY: usize = 2048;
+
+fn needs_json_escape(b: u8) -> bool {
+    b == b'"' || b == b'\\' || b < 0x20
+}
+
+/// Copies the runs between escapes whole rather than char by char. Every byte
+/// that needs escaping is ASCII, so the run boundaries are char boundaries.
 fn json_escape_into(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let mut run = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if !needs_json_escape(b) {
+            continue;
+        }
+        out.push_str(&s[run..i]);
+        run = i + 1;
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b => {
+                let _ = write!(out, "\\u{b:04x}");
+            }
         }
     }
+    out.push_str(&s[run..]);
 }
 
 /// A snapshot of everything the access-log formatter needs from a request
@@ -1386,25 +1421,14 @@ mod tests {
 
     /// A json_format field made only of `%LLM_UPSTREAM_USAGE%` embeds the
     /// provider's object as JSON; mixed with text it stays a string.
-    #[test]
-    fn json_format_embeds_upstream_usage_as_a_json_value() {
+    /// A `LogContext` with every optional field absent.
+    fn bare_log_ctx(empty: &HeaderMap) -> proxy_observability::access_log::LogContext<'_> {
         use proxy_observability::access_log::LogContext;
-        let fields = vec![
-            (
-                "usage".to_owned(),
-                parse_format("%LLM_UPSTREAM_USAGE%").unwrap(),
-            ),
-            (
-                "text".to_owned(),
-                parse_format("u=%LLM_UPSTREAM_USAGE%").unwrap(),
-            ),
-        ];
-        let empty = HeaderMap::new();
-        let mut ctx = LogContext {
+        LogContext {
             start_time: SystemTime::UNIX_EPOCH,
-            request_headers: &empty,
-            response_headers: &empty,
-            response_trailers: &empty,
+            request_headers: empty,
+            response_headers: empty,
+            response_trailers: empty,
             protocol: None,
             response_code: Some(200),
             response_flags: &[],
@@ -1429,7 +1453,7 @@ mod tests {
             llm_selected_model: None,
             llm_served_model: None,
             llm_upstream_id: None,
-            llm_upstream_usage: Some(USAGE),
+            llm_upstream_usage: None,
             llm_usage_completeness: None,
             llm_cost_kind: None,
             llm_rate_card_version: None,
@@ -1438,7 +1462,44 @@ mod tests {
             request_authority: None,
             request_scheme: None,
             time_points: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn json_values_and_keys_escape_exactly_what_json_requires() {
+        let fields = vec![
+            (
+                "plain".to_owned(),
+                parse_format("id=%LLM_UPSTREAM_ID%").unwrap(),
+            ),
+            ("k\"ey".to_owned(), parse_format("%PROTOCOL%").unwrap()),
+        ];
+        let empty = HeaderMap::new();
+        let mut ctx = bare_log_ctx(&empty);
+        // Every escape class, plus DEL and a multi-byte char, which pass through.
+        ctx.llm_upstream_id = Some("a\"b\\c\nd\re\tf\u{1}g\u{7f}h\u{e9}");
+        ctx.protocol = Some("HTTP/1.1");
+        assert_eq!(
+            render_json(&fields, &ctx),
+            "{\"plain\":\"id=a\\\"b\\\\c\\nd\\re\\tf\\u0001g\u{7f}h\u{e9}\",\"k\\\"ey\":\"HTTP/1.1\"}\n"
+        );
+    }
+
+    #[test]
+    fn json_format_embeds_upstream_usage_as_a_json_value() {
+        let fields = vec![
+            (
+                "usage".to_owned(),
+                parse_format("%LLM_UPSTREAM_USAGE%").unwrap(),
+            ),
+            (
+                "text".to_owned(),
+                parse_format("u=%LLM_UPSTREAM_USAGE%").unwrap(),
+            ),
+        ];
+        let empty = HeaderMap::new();
+        let mut ctx = bare_log_ctx(&empty);
+        ctx.llm_upstream_usage = Some(USAGE);
         let parsed: serde_json::Value = serde_json::from_str(&render_json(&fields, &ctx)).unwrap();
         assert_eq!(parsed["usage"]["prompt_tokens"], 7);
         assert_eq!(parsed["text"], format!("u={USAGE}"));
