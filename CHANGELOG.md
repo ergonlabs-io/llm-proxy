@@ -11,6 +11,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- Request records and the `%LLM_USER_ID%` access-log operator now name the
+  authenticated user. A virtual key is its user, so the value is the key id.
+  A JWT names a user only when `subject_claim` is set; the value is then the
+  issuer- and tenant-scoped subject, the same string as the key id. Without a
+  subject claim the value stays null. A `user` field in the request body is
+  never used. No metric carries the user as a label.
+
 ## [0.4.1] - 2026-10-17
 
 ### Removed

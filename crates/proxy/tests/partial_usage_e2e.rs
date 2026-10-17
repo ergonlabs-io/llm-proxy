@@ -14,6 +14,9 @@
 //! record, the JSON access log (completeness and response flag), the tenant's
 //! spend, and the tenant's token window (`GET /v1/usage`).
 //!
+//! The same harness, a minted key writing request records, also pins which
+//! user a record names.
+//!
 //! Rust note: same harness shape as `tests/tenant_enforcement_e2e.rs` (std
 //! threads, ephemeral ports, a `Drop` that kills the proxy, every wait bounded).
 
@@ -295,6 +298,37 @@ fn assert_cut_charged_once(proxy: &Proxy, key: &str, flag: &str) {
         input + output,
         "the cut stream's estimate moves the token window once"
     );
+}
+
+/// The record and the access log name the user bound to the presented key
+/// (the key is the user), even when the body's `user` field names someone
+/// else: that field is the caller's to write. No metric carries either value
+/// as a label (AGENTS.md "Policy Domains").
+#[test]
+fn the_record_names_the_keys_user_not_the_bodys_user_field() {
+    let dir = scratch_dir("identity");
+    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let key = mint_key(&proxy);
+
+    let body = format!(
+        r#"{{"model":"{MODEL}","stream":true,"user":"someone-else","messages":[{{"role":"user","content":"clean"}}]}}"#
+    );
+    let response = post_to_end(proxy.listen, &key, &body);
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+
+    let record = proxy.wait_for_records(1).remove(0);
+    assert_eq!(record["user_id"], "minted-1", "{record}");
+    let line = proxy.wait_for_chat_log_lines(1).remove(0);
+    assert_eq!(line["llm_user_id"], "minted-1", "{line}");
+
+    let metrics = http_get(proxy.admin, "/stats/prometheus", None);
+    assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+    for user in ["minted-1", "someone-else"] {
+        assert!(
+            !metrics.contains(user),
+            "{user} reached a metric:\n{metrics}"
+        );
+    }
 }
 
 // ------------------------------------------------------------------ helpers --

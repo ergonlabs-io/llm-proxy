@@ -384,6 +384,10 @@ impl Authenticator for JwtAuthenticator {
             }
         };
 
+        // The subject, scoped by issuer and tenant so two issuers' `sub`
+        // values cannot collide, is both the key id and the user. Without a
+        // subject claim the key id is the signing key's `kid`, which names
+        // no user.
         let key_id = match &self.subject_claim {
             Some(claim) => match data
                 .claims
@@ -401,10 +405,15 @@ impl Authenticator for JwtAuthenticator {
             },
             None => KeyId::new(kid.to_string()),
         };
+        let user_id = self
+            .subject_claim
+            .is_some()
+            .then(|| key_id.as_str().to_owned());
         AuthOutcome::Authenticated(Principal {
             tenant: TenantId::new(tenant),
             // See the module doc's "`Principal::key_id` for a JWT" section.
             key_id,
+            user_id,
             policy: Arc::new(TenantPolicy::default()),
             // JWT principals stay in platform mode; see ADR-0007. This path
             // reads the JWKS snapshot, not the control-plane snapshot, and
@@ -688,6 +697,8 @@ GdGIML90cFtpXr13uutgIg==
             AuthOutcome::Authenticated(principal) => {
                 assert_eq!(principal.tenant.as_str(), "tenant-a");
                 assert_eq!(principal.key_id.as_str(), "key-1");
+                // A `kid` names the signing key, shared by every caller.
+                assert_eq!(principal.user_id, None);
             }
             other => panic!(
                 "expected Authenticated; Rejected={} NoCredential={}",
@@ -695,6 +706,42 @@ GdGIML90cFtpXr13uutgIg==
                 matches!(other, AuthOutcome::NoCredential)
             ),
         }
+    }
+
+    // --- 2a: with a subject claim, the user is the issuer- and tenant-scoped
+    // subject, so two callers sharing a signing key are two users.
+    #[test]
+    fn a_configured_subject_claim_names_the_user() {
+        let key = shared_test_key();
+        let config = JwtValidationConfig {
+            issuer: Some("https://idp.example".to_string()),
+            subject_claim: Some("sub".to_string()),
+            ..default_config()
+        };
+        let auth = authenticator_with_key(key, "key-1", config);
+        let user_of = |sub: &str| {
+            let token = build_jwt(
+                key,
+                &header_json("key-1"),
+                claims(&[
+                    ("sub", serde_json::Value::String(sub.to_string())),
+                    ("iss", "https://idp.example".into()),
+                ])
+                .as_bytes(),
+            );
+            match auth.authenticate(&headers_with_bearer(&token)) {
+                AuthOutcome::Authenticated(principal) => principal.user_id,
+                _ => panic!("expected Authenticated for subject {sub}"),
+            }
+        };
+        assert_eq!(
+            user_of("alice").as_deref(),
+            Some("jwt:https://idp.example:tenant-a:alice")
+        );
+        assert_eq!(
+            user_of("bob").as_deref(),
+            Some("jwt:https://idp.example:tenant-a:bob")
+        );
     }
 
     // --- 3: a DIFFERENT tenant claim name is honored -- proves the claim is
@@ -1134,6 +1181,7 @@ GdGIML90cFtpXr13uutgIg==
                 AuthOutcome::Authenticated(Principal {
                     tenant: TenantId::new("should-never-be-reached"),
                     key_id: KeyId::new("should-never-be-reached"),
+                    user_id: None,
                     policy: Arc::new(TenantPolicy::default()),
                     tenant_credentials: None,
                     policy_generation: None,

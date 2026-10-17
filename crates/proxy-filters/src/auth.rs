@@ -226,6 +226,12 @@ pub struct Principal {
     pub tenant: TenantId,
     /// WHICH credential authenticated -- see [`KeyId`]'s doc.
     pub key_id: KeyId,
+    /// The authenticated user, or `None` when the credential names no user.
+    /// A virtual key is its user (owner decision 2026-10-14, one key per
+    /// user), so this is the key id; a JWT names a user only through its
+    /// configured subject claim. Always set by the authenticator, never from
+    /// the request body, whose `user` field the caller controls.
+    pub user_id: Option<String>,
     /// Model allow-lists and budgets. An
     /// `Arc` so the hot path clones a pointer, and so a future policy change
     /// is a snapshot swap rather than a per-request lookup.
@@ -247,6 +253,7 @@ impl fmt::Debug for Principal {
         f.debug_struct("Principal")
             .field("tenant", &self.tenant)
             .field("key_id", &self.key_id)
+            .field("user_id", &self.user_id)
             .field("policy", &self.policy)
             .finish()
     }
@@ -770,6 +777,7 @@ impl Authenticator for VirtualKeyAuthenticator {
             Some(record) => AuthOutcome::Authenticated(Principal {
                 tenant: record.tenant.clone(),
                 key_id: record.key_id.clone(),
+                user_id: Some(record.key_id.as_str().to_owned()),
                 policy: Arc::new(TenantPolicy::default()),
                 tenant_credentials: snapshot.tenant_credentials.get(&record.tenant).cloned(),
                 policy_generation: snapshot.generation,

@@ -133,6 +133,11 @@ pub struct AuthInfo {
     /// revoking one leaked key must not revoke the whole account, and an
     /// audit trail needs to name the key.
     pub key_id: Option<String>,
+    /// The authenticated user (`Principal::user_id`): the virtual key's id,
+    /// or a JWT's scoped subject. `None` when the credential names no user.
+    /// Never read from the request body. Not a metric label: user ids are
+    /// unbounded (AGENTS.md "Policy Domains").
+    pub user_id: Option<String>,
     /// The control-plane `policy_generation` of the snapshot that verified
     /// the credential, so a request record names the policy it was admitted
     /// under. `None` when the authenticator does not read that snapshot (JWT)

@@ -1338,6 +1338,7 @@ impl HttpFilter for AuthFilterInstance {
                     info.auth = AuthInfo {
                         tenant: Some(principal.tenant.as_str().to_string()),
                         key_id: Some(principal.key_id.as_str().to_string()),
+                        user_id: principal.user_id.clone(),
                         policy_generation: principal.policy_generation,
                     };
                     // Hand-off of the set the key was verified against, so the
@@ -2197,7 +2198,7 @@ mod tests {
     }
 
     // 11: a valid key -> Continue, no local reply, stream_info().auth carries
-    // tenant AND key_id.
+    // tenant, key_id and user.
     #[test]
     fn a_valid_key_continues_and_sets_stream_info_auth() {
         let mut filter =
@@ -2212,6 +2213,8 @@ mod tests {
         let info = cb.stream_info.borrow();
         assert_eq!(info.auth.tenant.as_deref(), Some("tenant-a"));
         assert_eq!(info.auth.key_id.as_deref(), Some("key-1"));
+        // The virtual key is the user identity (one key per user).
+        assert_eq!(info.auth.user_id.as_deref(), Some("key-1"));
     }
 
     // 11a: the request is stamped with the policy generation of the snapshot
@@ -2524,6 +2527,7 @@ mod tests {
             AuthOutcome::Authenticated(crate::auth::Principal {
                 tenant: TenantId::new("should-never-be-reached"),
                 key_id: KeyId::new("should-never-be-reached"),
+                user_id: None,
                 policy: Arc::new(Default::default()),
                 tenant_credentials: None,
                 policy_generation: None,

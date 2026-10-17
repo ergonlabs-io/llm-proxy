@@ -560,7 +560,7 @@ impl LoggingBody {
             llm_upstream,
             llm_completeness,
             trace,
-            tenant,
+            (tenant, user_id),
             response_code_details,
             usage_attribution,
             attempts,
@@ -619,7 +619,7 @@ impl LoggingBody {
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
                 // time below -- see this destructuring's own doc above.
-                info.auth.tenant.clone(),
+                (info.auth.tenant.clone(), info.auth.user_id.clone()),
                 // `%RESPONSE_CODE_DETAILS%` -- cloned out alongside
                 // everything else `LogContext` borrows, same reasoning as
                 // this destructure's own doc above.
@@ -671,10 +671,11 @@ impl LoggingBody {
                     .as_deref()
                     .map(proxy_observability::records::bounded_field)
                     .unwrap_or_else(|| "default".to_owned()),
-                // AuthInfo deliberately exposes tenant and credential only.
-                // A body-supplied user_id is untrusted, so leave this null
-                // until authentication publishes an authenticated principal.
-                user_id: None,
+                // The authenticated user only. A body `user` field is
+                // caller-controlled and never reaches this.
+                user_id: user_id
+                    .as_deref()
+                    .map(proxy_observability::records::bounded_field),
                 key_id: usage_attribution
                     .0
                     .as_deref()
@@ -845,6 +846,9 @@ impl LoggingBody {
                         .0
                         .as_ref()
                         .is_none_or(|k| k.len() <= MAX_PRINCIPAL_ID_BYTES)
+                    && user_id
+                        .as_ref()
+                        .is_none_or(|u| u.len() <= MAX_PRINCIPAL_ID_BYTES)
                 {
                     let _ = permit.submit(record);
                 } else if let Some(lease) = &lease {
@@ -993,7 +997,7 @@ impl LoggingBody {
                 .borrow()
                 .credential_source
                 .map(CredentialSource::as_str),
-            llm_user_id: None,
+            llm_user_id: user_id.as_deref(),
             llm_requested_model: requested_model.as_deref(),
             llm_resolved_model: usage_attribution.2.as_deref(),
             llm_selected_model: usage_attribution.1.as_deref(),
@@ -1666,12 +1670,18 @@ mod tests {
     async fn metadata_identity_uses_auth_and_never_usage_dialect() {
         let capture = Arc::new(CaptureSink::default());
         let mut ctx = flags_ctx(&capture);
+        ctx.loggers = Rc::new(vec![AccessLoggerRuntime {
+            sink: capture.clone() as Arc<dyn AccessLogWriter>,
+            format: AccessLogFormat::Text(parse_format("%LLM_USER_ID%").unwrap()),
+            filter: None,
+        }]);
         let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
         ctx.request_record_sink = Some(Arc::new(sink));
         {
             let mut info = ctx.stream_info.borrow_mut();
             info.auth.tenant = Some("authenticated-tenant".into());
             info.auth.key_id = Some("k".repeat(4096));
+            info.auth.user_id = Some("authenticated-user".into());
             info.llm.system = Some(crate::stream_info::GenAiSystem::OpenAi);
             info.upstream_usage_dialect = Some(proxy_config::ir::UsageDialect::OpenAi);
             info.set_response_flag(ResponseFlag::NoRouteFound);
@@ -1689,7 +1699,8 @@ mod tests {
         let record = records.try_recv().unwrap();
         assert_eq!(record.tenant_id, "authenticated-tenant");
         assert_eq!(record.key_id.unwrap().len(), 512);
-        assert!(record.user_id.is_none());
+        assert_eq!(record.user_id.as_deref(), Some("authenticated-user"));
+        assert_eq!(*capture.0.lock().unwrap(), ["authenticated-user"]);
         assert!(record.selected_provider.is_none());
         assert!(record.usage.is_none());
         assert!(record.cost.is_none());

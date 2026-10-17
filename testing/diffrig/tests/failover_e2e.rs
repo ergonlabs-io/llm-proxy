@@ -604,9 +604,9 @@ async fn authenticated_streaming_fallback_charges_the_key_at_the_standby_price()
     assert_eq!(
         line,
         format!(
-            "provider:standby 2 4 16000000000 {CLIENT_KEY_ID} tenant-a - gpt-4o-mini standby-upstream-model {card} 200"
+            "provider:standby 2 4 16000000000 {CLIENT_KEY_ID} tenant-a {CLIENT_KEY_ID} gpt-4o-mini standby-upstream-model {card} 200"
         ),
-        "selected cluster, terminal token usage, and immutable list cost"
+        "selected cluster, terminal token usage, immutable list cost, and the key as the user"
     );
 
     drop(proxy);
