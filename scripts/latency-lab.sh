@@ -50,7 +50,12 @@ build_rev() {
         echo "$label"; return
     fi
     echo "build $label: shipping $rev${patch:+ + $(basename "$patch")}" >&2
-    git archive --format=tar "$sha" | rsh "rm -rf $REMOTE/src/$label && mkdir -p $REMOTE/src/$label && tar -x -C $REMOTE/src/$label"
+    # `tar -m` stamps every file with the time of extraction. git archive
+    # stamps them with the commit time instead, and cargo, sharing one
+    # target dir across revisions, decides freshness by mtime: a revision
+    # committed before the last build ran would be taken as already built,
+    # and its arm would silently run the previous binary.
+    git archive --format=tar "$sha" | rsh "rm -rf $REMOTE/src/$label && mkdir -p $REMOTE/src/$label && tar -xm -C $REMOTE/src/$label"
     if [[ -n "$patch" ]]; then
         rsh "cd $REMOTE/src/$label && patch -p1 --forward --quiet" <"$patch"
     fi
@@ -90,6 +95,14 @@ cmd_ab() {
     local base_label cand_label run_id out
     base_label="$(build_rev "$base")"
     cand_label="$(build_rev "$cand" "$patch")"
+    # Two different revisions must not produce one binary; if they do, the
+    # build cache served a stale build and the A/B would compare a build
+    # with itself. (A revision whose change cannot reach the binary, such as
+    # a docs-only commit, trips this too; compare against its parent instead.)
+    if [[ "$base_label" != "$cand_label" ]] &&
+        rsh "cmp -s $REMOTE/bin/$base_label/llm-proxy $REMOTE/bin/$cand_label/llm-proxy"; then
+        die "$base_label and $cand_label built the same llm-proxy binary; delete $REMOTE/bin/$cand_label on the host and rerun"
+    fi
     run_id="$(date -u +%Y%m%dT%H%M%SZ)-$base_label..$cand_label"
     out="$REPO_ROOT/target/lab/$run_id"
 
