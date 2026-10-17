@@ -11,7 +11,8 @@
 # (taskset) so a replica has a fixed, reportable budget:
 #
 #   cores 0-3, 4-7, 8-11   proxy replicas 1..3 (--concurrency 4 each)
-#   cores 12-13            mock-upstream, redis-server
+#   core 12                mock-upstream
+#   core 13                redis-server (its own core, so S3 prices Redis alone)
 #   cores 14-15            loadgen
 #
 # Every port is ephemeral (AGENTS.md "Running The Product"); S1 is the one
@@ -30,7 +31,8 @@ mkdir -p "$OUT"
 
 # Core layout. Override on a smaller host, e.g. CORES_PROXY="0-1 2-3 4-5".
 read -r -a CORES_PROXY <<<"${CORES_PROXY:-0-3 4-7 8-11}"
-CORES_UPSTREAM="${CORES_UPSTREAM:-12-13}"
+CORES_UPSTREAM="${CORES_UPSTREAM:-12}"
+CORES_REDIS="${CORES_REDIS:-13}"
 CORES_LOADGEN="${CORES_LOADGEN:-14-15}"
 PROXY_WORKERS="${PROXY_WORKERS:-4}"
 
@@ -117,15 +119,24 @@ start_mock() {
     echo "mock never announced an address:" >&2; cat "$dir/mock.log" >&2; exit 1
 }
 
-# start_redis DIR: sets REDIS_PORT, REDIS_PID.
-start_redis() {
-    local dir="$1"
-    REDIS_PORT="$(free_port)"
-    taskset -c "$CORES_UPSTREAM" redis-server --port "$REDIS_PORT" --bind 127.0.0.1 \
-        --save '' --appendonly no --protected-mode yes --logfile "$dir/redis.log" \
-        --dir "$dir" --pidfile "$dir/redis.pid" --daemonize no >/dev/null 2>&1 &
+# start_redis DIR [persist]: sets REDIS_PORT, REDIS_PID. With "persist" the
+# AOF lives in DIR, so restart_redis brings the keys back (S5b); without it a
+# restart comes back empty (S5, which is how an empty store revokes every key).
+REDIS_PERSIST=""
+redis_server() { # redis_server DIR LOGNAME
+    local persist=(--save '' --appendonly no)
+    [[ -n "$REDIS_PERSIST" ]] && persist=(--save '' --appendonly yes --appendfsync everysec)
+    taskset -c "$CORES_REDIS" redis-server --port "$REDIS_PORT" --bind 127.0.0.1 \
+        "${persist[@]}" --protected-mode yes --logfile "$1/$2" \
+        --dir "$1" --daemonize no >/dev/null 2>&1 &
     REDIS_PID=$!
     PIDS+=("$REDIS_PID")
+}
+start_redis() {
+    local dir="$1"
+    REDIS_PERSIST="${2:-}"
+    REDIS_PORT="$(free_port)"
+    redis_server "$dir" redis.log
     for _ in $(seq 1 50); do
         redis-cli -p "$REDIS_PORT" ping >/dev/null 2>&1 && return 0
         sleep 0.1
@@ -232,8 +243,8 @@ scrape_all() { # scrape_all DIR TAG
 }
 
 # Background samplers for a scenario: host, per-process, and (for S4b/S5)
-# per-replica downstream_cx_active every 500 ms. Raw samples are kept so the
-# verdict can be recomputed.
+# per-replica open streams every 500 ms. Raw samples are kept so the verdict
+# can be recomputed.
 start_samplers() {
     local dir="$1" pids
     vmstat 1 >"$dir/vmstat.txt" 2>&1 & PIDS+=($!)
@@ -242,20 +253,26 @@ start_samplers() {
         pidstat -r -u -h -p "$pids" 1 >"$dir/pidstat.txt" 2>&1 & PIDS+=($!)
     fi
 }
-start_cx_sampler() {
+# The proxy exports no in-flight gauge (an earlier version of this sampler
+# read `downstream_cx_active` from /stats, which does not exist, and saw 0
+# for a whole run). So count established TCP connections on each replica's
+# listener instead. S4b/S5 drive `--downstream-mode short`: an admitted
+# stream holds exactly one connection for its life, and a refused one holds
+# it only until the 429 is written, so the count can overstate in-flight
+# streams but never understate them.
+start_stream_sampler() {
     local dir="$1"
     (
         while true; do
             line="$(date +%s.%N)"
-            for a in "${ADMIN[@]}"; do
-                v="$(curl -fsS --max-time 1 "http://127.0.0.1:$a/stats" 2>/dev/null \
-                    | awk -F': ' '/downstream_cx_active/{ if ($2+0 > m) m = $2+0 } END { print m+0 }')"
+            for p in "${LISTEN[@]}"; do
+                v="$(ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l)"
                 line="$line ${v:-NA}"
             done
             echo "$line"
             sleep 0.5
         done
-    ) >"$dir/cx_active.txt" 2>&1 &
+    ) >"$dir/streams_active.txt" 2>&1 &
     PIDS+=($!)
 }
 
@@ -392,16 +409,16 @@ PY
 
 s4b() {
     local d="$OUT/${1:-s4b}"; mkdir -p "$d"
-    local faults="${2:-}"
-    echo "=== ${1:-S4b} fleet stream ceiling: concurrent_streams=$S4_STREAMS, offered 2x ==="
+    local faults="${2:-}" persist="${3:-}"
+    echo "=== ${1:-S4b} fleet stream ceiling: concurrent_streams=$S4_STREAMS, offered 2x ${faults:+(faults, redis restart ${persist:-empty})} ==="
     start_mock "$d" --tokens "$TOKENS" --ttft-ms "$TTFT_MS" --inter-token-ms "$INTER_TOKEN_MS"
-    start_redis "$d"
+    start_redis "$d" "$persist"
     start_replicas "$d" 3 shared
     mint_tenant_key 0
     admin 0 PUT /tenants/t1/limits '{"limits":{"concurrent_streams":'"$S4_STREAMS"'}}' >/dev/null
     wait_policy_converged
     start_samplers "$d"
-    start_cx_sampler "$d"
+    start_stream_sampler "$d"
     scrape_all "$d" before
     # Offered fleet concurrency 2C, by Little's law: rate x stream time.
     local per_replica_rps i duration=180
@@ -422,38 +439,68 @@ s4b() {
         kill "$REDIS_PID"
         sleep 30
         echo "$(date +%s.%N) redis up" | tee -a "$d/events.txt"
-        taskset -c "$CORES_UPSTREAM" redis-server --port "$REDIS_PORT" --bind 127.0.0.1 \
-            --save '' --appendonly no --logfile "$d/redis-2.log" --dir "$d" --daemonize no >/dev/null 2>&1 &
-        PIDS+=($!)
+        redis_server "$d" redis-2.log
     fi
     wait_loadgens
     scrape_all "$d" after
-    python3 - "$d" "$S4_STREAMS" "$per_replica_rps" "$INTRINSIC_S" <<'PY' | tee "$d/verdict.txt"
-import json, sys, glob
-d, c, per, t = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
-rows = []
-for line in open(f"{d}/cx_active.txt"):
+    python3 - "$d" "$S4_STREAMS" "$per_replica_rps" "$INTRINSIC_S" "$duration" "$faults" <<'PY' | tee "$d/verdict.txt"
+import json, os, sys, glob
+d, c, per, t, dur, faults = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+samples = []   # (epoch seconds, fleet open streams)
+for line in open(f"{d}/streams_active.txt"):
     parts = line.split()
     if len(parts) > 1:
-        rows.append(sum(int(v) for v in parts[1:] if v != "NA"))
-# Skip the first 15 s of samples (ramp) for the steady-state view.
-steady = rows[30:] if len(rows) > 30 else rows
+        samples.append((float(parts[0]), sum(int(v) for v in parts[1:] if v != "NA")))
+if not samples or max(v for _, v in samples) == 0:
+    print("INVALID: the stream sampler saw no open streams; it is broken, not the limit")
+    sys.exit(0)
+start = samples[0][0]
+# Steady state: after the 15 s ramp and before the last stream-time.
+steady = [v for ts, v in samples if start + 15 <= ts <= start + dur - t]
+events = {}
+if os.path.exists(f"{d}/events.txt"):
+    for line in open(f"{d}/events.txt"):
+        ts, what = line.split(" ", 1)
+        events[what.strip()] = float(ts)
 reports = [json.load(open(f)) for f in sorted(glob.glob(f"{d}/r*.json"))]
 ok = sum(r["result"]["success"] for r in reports)
-refused = sum(r["result"]["http_errors"].get("429", 0) for r in reports)
-other = sum(v for r in reports for k, v in r["result"]["http_errors"].items() if k != "429")
+counted_secs = dur - 10
+mean_total_s = sum(r["result"]["success"] * r["result"]["total_from_send_us"]["p50"] for r in reports) / max(ok, 1) / 1e6
+errors = {}
+for r in reports:
+    for k, v in r["result"]["http_errors"].items():
+        errors[k] = errors.get(k, 0) + v
+transport = sum(r["result"]["transport_errors"] for r in reports)
 bound = c + 2 * per * 1.0   # (N-1) replicas x one 1 s lease publish interval
-print(f"peak_fleet_cx_active={max(rows, default=0)} steady_max={max(steady, default=0)} "
+print(f"fleet open streams: peak={max(v for _, v in samples)} steady_max={max(steady, default=0)} "
       f"ceiling={c} bound={bound:.0f}")
-print(f"admitted={ok} refused_429={refused} other_http_errors={other}")
-print("note: cx_active counts a refused stream's connection for an instant, so it overcounts")
-print("PASS" if max(steady, default=0) <= bound and other == 0 else "FAIL")
+print(f"little's law mean in flight ~= {ok * mean_total_s / counted_secs:.0f} "
+      f"(admitted {ok} x p50 {mean_total_s:.2f} s / {counted_secs} s)")
+print(f"http_errors={errors} transport_errors={transport}")
+print("note: a refused stream's connection is counted for an instant, so open streams overstate")
+verdict = max(steady, default=0) <= bound
+unexpected = {k: v for k, v in errors.items() if k != "429"}
+if faults:
+    up = events.get("redis up")
+    if up is not None:
+        # Recovery: one policy poll bound (60 s) after Redis returns, the
+        # ceiling holds again and no key is refused.
+        after = [v for ts, v in samples if up + 60 <= ts <= start + dur - t]
+        print(f"after redis up +60 s: steady_max={max(after, default=0)} samples={len(after)}")
+        verdict = verdict and max(after, default=0) <= bound
+    # Transport errors are expected from the killed replica's own loadgen.
+print("PASS" if verdict and not unexpected else f"FAIL unexpected={unexpected}")
 PY
     grep -c -i 'warn' "$d"/proxy-r*.log >"$d/warn-counts.txt" || true
     stop_all; unset REDIS_PORT
 }
 
+# S5: Redis returns EMPTY (no persistence). Reproduces the empty-store finding
+# in internal-docs/capacity/2026-10-16-digitalocean-scale.md; expect 401s
+# until that is fixed. S5b: Redis returns with its AOF, which is the case the
+# plan's "limits enforced again after Redis returns" criterion means.
 s5() { s4b s5 faults; }
+s5b() { s4b s5b faults persist; }
 
 s6() {
     local d="$OUT/s6"; mkdir -p "$d"
@@ -479,9 +526,9 @@ s6() {
 
 for s in $SCENARIOS; do
     case "$s" in
-        all) manifest; s0; s1; s2; s3; s4a; s4b; s5; s6 ;;
-        s0|s1|s2|s3|s4a|s4b|s5|s6) "$s" ;;
-        *) echo "unknown scenario: $s (s0 s1 s2 s3 s4a s4b s5 s6 all)" >&2; exit 2 ;;
+        all) manifest; s0; s1; s2; s3; s4a; s4b; s5; s5b; s6 ;;
+        s0|s1|s2|s3|s4a|s4b|s5|s5b|s6) "$s" ;;
+        *) echo "unknown scenario: $s (s0 s1 s2 s3 s4a s4b s5 s5b s6 all)" >&2; exit 2 ;;
     esac
 done
 echo "results: $OUT"
