@@ -168,6 +168,12 @@ impl HttpConnPool for ConnectPool {
                 let tcp = tokio::net::TcpStream::connect(addr)
                     .await
                     .map_err(classify_connect_error)?;
+                // Envoy sets `TCP_NODELAY` on every upstream connection. Without it, Nagle holds a small request
+                // write until the upstream's delayed ACK arrives. A failure is logged and the connection is still
+                // used, matching the dial in `proxy-core`'s `tcp_proxy`.
+                if let Err(err) = tcp.set_nodelay(true) {
+                    tracing::debug!(%addr, error = %err, "failed to set TCP_NODELAY on upstream socket");
+                }
                 let io = transport
                     .wrap(tcp, &server_name)
                     .await
@@ -245,6 +251,48 @@ mod tests {
         let mut buf = [0u8; 1];
         accepted.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, *b"x");
+    }
+
+    /// Records whether the dialled socket had `TCP_NODELAY` when the pool handed it to the transport, then passes
+    /// it through as plaintext.
+    struct NodelayProbe(std::sync::Mutex<Option<bool>>);
+
+    impl UpstreamTransportSocket for NodelayProbe {
+        fn wrap(
+            &self,
+            io: tokio::net::TcpStream,
+            _server_name: &str,
+        ) -> BoxFuture<'static, std::io::Result<crate::BoxedUpstreamIo>> {
+            *self.0.lock().unwrap() = Some(io.nodelay().unwrap());
+            Box::pin(async move { Ok(Box::new(io) as crate::BoxedUpstreamIo) })
+        }
+    }
+
+    #[tokio::test]
+    async fn new_stream_sets_nodelay_on_the_dialled_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probe = Arc::new(NodelayProbe(std::sync::Mutex::new(None)));
+        let pool = ConnectPool::new(
+            addr,
+            probe.clone(),
+            addr.ip().to_string(),
+            AMPLE_TIMEOUT,
+            CircuitBreakerState::default(),
+        );
+
+        let _stream = pool.new_stream().await.expect("connect should succeed");
+        let (accepted, _client_addr) = listener.accept().await.unwrap();
+
+        assert!(
+            !accepted.nodelay().unwrap(),
+            "kernel default must be Nagle on"
+        );
+        assert_eq!(
+            *probe.0.lock().unwrap(),
+            Some(true),
+            "upstream socket must have TCP_NODELAY"
+        );
     }
 
     #[tokio::test]

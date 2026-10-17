@@ -677,7 +677,7 @@ fn spawn_accept_loop(
         let mut hcm_cache = Rc::new(initial_hcm);
         loop {
             let (stream, peer) = tokio::select! {
-                accepted = tcp_listener.accept() => match accepted {
+                accepted = accept_downstream(&tcp_listener, &name) => match accepted {
                     Ok(pair) => pair,
                     Err(err) => {
                         tracing::warn!(listener = %name, error = %err, "accept() failed");
@@ -795,6 +795,21 @@ fn warn_h2_header_timeout_not_enforced_once(listener: &str) {
     WARNED.call_once(|| {
         tracing::warn!(%listener, "request_headers_timeout is not enforced on HTTP/2 connections; it applies to HTTP/1 only (internal-docs/envoy-divergences.md)");
     });
+}
+
+/// Accept one downstream connection and set `TCP_NODELAY` on it, as Envoy does on every accepted
+/// socket. Without it, Nagle holds a small response write until the client's delayed ACK arrives,
+/// which adds tens of milliseconds per request. Failing to set the option is logged and the
+/// connection is still served, matching the upstream dial in `tcp_proxy`.
+async fn accept_downstream(
+    tcp_listener: &TcpListener,
+    listener: &ListenerName,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let (stream, peer) = tcp_listener.accept().await?;
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::debug!(%listener, %peer, error = %err, "failed to set TCP_NODELAY on downstream socket");
+    }
+    Ok((stream, peer))
 }
 
 /// Pause after a failed `accept()`, so a persistent error such as fd exhaustion does not spin.
@@ -1770,6 +1785,33 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         drop(l);
         port
+    }
+
+    /// The accept loop's accept sets `TCP_NODELAY`, so a small response write is not held for the
+    /// client's delayed ACK. The client side of the same connection is left at the kernel default,
+    /// which shows the option is not on by default here.
+    #[test]
+    fn accept_downstream_sets_nodelay() {
+        run_local(async {
+            let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let name = ListenerName::from("nodelay");
+            let (accepted, _peer) =
+                tokio::time::timeout(Duration::from_secs(5), accept_downstream(&listener, &name))
+                    .await
+                    .expect("accept should resolve promptly")
+                    .unwrap();
+            assert!(
+                !client.nodelay().unwrap(),
+                "kernel default must be Nagle on"
+            );
+            assert!(
+                accepted.nodelay().unwrap(),
+                "accepted socket must have TCP_NODELAY"
+            );
+        });
     }
 
     /// A connected loopback `TcpStream` pair, for testing [`peek_for_h2_preface`] and
