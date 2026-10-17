@@ -251,6 +251,12 @@ fn a_stored_card_wins_over_a_different_configured_card_and_is_logged_once() {
         1,
         "logged once, not once per worker: {lines:?}"
     );
+    assert!(
+        capture
+            .rendered_at_or_above(tracing::Level::WARN)
+            .is_empty(),
+        "a difference at boot is expected after any PUT, so it does not warn"
+    );
 }
 
 #[test]
@@ -361,8 +367,24 @@ fn with_a_store_a_reload_never_replaces_the_stored_card() {
     let published = r.publish_json(&card_json("published", 50)).unwrap();
 
     let changed = card_json("changed", 60);
-    apply(&r, Some(&changed), Some(&cp)).unwrap();
+    let (capture, guard) = Capture::start();
+    for _ in 0..3 {
+        apply(&r, Some(&changed), Some(&cp)).unwrap();
+    }
+    drop(guard);
     assert_eq!(active(&r), Some(published.rate_card_version.clone()));
+    let warnings = capture.rendered_at_or_above(tracing::Level::WARN);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "once per reload, not per worker: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("reloaded pricing was not applied")
+            && warnings[0].contains("PUT /pricing"),
+        "the warning says the edit had no effect and names the fix: {}",
+        warnings[0]
+    );
     assert_eq!(
         cp.rate_card(CHAIN).unwrap().version,
         published.rate_card_version

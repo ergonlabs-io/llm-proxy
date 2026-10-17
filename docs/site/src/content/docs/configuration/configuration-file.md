@@ -642,8 +642,10 @@ With a store, the store holds the rate card and wins:
 - At start, `pricing` seeds a store that has no rate card for the chain. If the
   store already has one, the stored rate card stays in force, and the proxy logs
   once that `pricing` differs from it.
-- A `SIGHUP` reload never replaces a stored rate card. It logs once when the
-  changed `pricing` differs from it.
+- A `SIGHUP` reload never replaces a stored rate card. When the reload changed
+  `pricing` and it differs from the stored rate card, the proxy logs one
+  warning that the change was not applied. Use `PUT /pricing` to replace a
+  stored rate card.
 - `PUT /pricing` writes the store. It does not install the rate card itself.
   The receiving replica installs the rate card that the store's watcher
   delivers right after the write. With `auth.store: shared`, every other

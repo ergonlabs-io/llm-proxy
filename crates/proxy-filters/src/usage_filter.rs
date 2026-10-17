@@ -297,7 +297,7 @@ impl PricingRegistry {
         state.configured = Some(card);
         let newly_linked = self.link(&mut state, store);
         if changed || newly_linked {
-            self.reconcile(&state, first, field_path)?;
+            self.reconcile(&state, first, changed && !first, field_path)?;
         }
         Ok(())
     }
@@ -313,7 +313,7 @@ impl PricingRegistry {
         let mut state = self.config.lock().expect("pricing config lock poisoned");
         let newly_linked = self.link(&mut state, Some(Arc::clone(store)));
         if newly_linked && state.configured.is_some() {
-            self.reconcile(&state, false, field_path)?;
+            self.reconcile(&state, false, false, field_path)?;
         }
         Ok(())
     }
@@ -343,10 +343,13 @@ impl PricingRegistry {
     }
 
     /// Settles which card is in force after configuration was applied.
+    /// `reloaded` is true when a reload changed the configured card, so an
+    /// operator expected a new price.
     fn reconcile(
         &self,
         state: &ConfigState,
         first: bool,
+        reloaded: bool,
         field_path: &str,
     ) -> Result<(), ConfigError> {
         let configured = state.configured.as_ref().and_then(Option::as_ref);
@@ -362,6 +365,20 @@ impl PricingRegistry {
                 // restart would quietly undo a card an operator published.
                 let active = self.snapshot();
                 match (&active, configured) {
+                    // A reload that changed `pricing` had no effect, which the
+                    // operator did not expect, so it warns. At boot the
+                    // difference is normal after any PUT and stays at info,
+                    // or every restart of every replica would warn.
+                    (Some(active), Some(configured)) if active != configured && reloaded => {
+                        tracing::warn!(
+                            chain = %self.chain,
+                            stored_version = %stored.version,
+                            configured_version = %configured.list.version(),
+                            "the reloaded pricing was not applied: the rate card in the \
+                             control-plane store stays in force; publish with PUT /pricing to \
+                             replace it"
+                        )
+                    }
                     (Some(active), Some(configured)) if active != configured => tracing::info!(
                         chain = %self.chain,
                         stored_version = %stored.version,
