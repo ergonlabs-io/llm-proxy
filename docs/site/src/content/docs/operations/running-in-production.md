@@ -368,7 +368,9 @@ again. Keys in the bootstrap `virtual_keys` list are not stored in Redis, so
 they continue to authenticate.
 
 The proxy cannot tell a lost store from an operator who removed every tenant
-and key, so it does not refuse the empty state. It makes the transition loud.
+and key, so it does not refuse the empty state. Keeping the old copy would
+continue to accept keys that the store no longer has. Thus the replica fails
+closed and makes the transition loud.
 When a load finds no tenants and no keys after the previous load found some,
 the replica logs one `error` line:
 `control-plane store is now EMPTY after holding tenants or keys`. The line has

@@ -3499,7 +3499,9 @@ impl ControlPlane {
     ///
     /// AGENTS.md "Fail-open controls": the replica adopts the empty state,
     /// which fails closed (every virtual key the store held now gets 401),
-    /// but at INFO it was indistinguishable from a quiet store. A shared
+    /// but at INFO it was indistinguishable from a quiet store. Adopting
+    /// rather than keeping the last-good snapshot is deliberate; see ADR-0006
+    /// addendum 2026-10-16. A shared
     /// Redis restarted without persistence, or flushed, looks exactly like
     /// this: its generation stamp also reads back as 0. One line per
     /// transition, not per poll: once this load is recorded as empty, the
