@@ -184,6 +184,7 @@ async fn start_probed(
             lifecycle: None,
             credential_probe: probe,
             capture_agent: None,
+            ledger: None,
         },
     )
     .await

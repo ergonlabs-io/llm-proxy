@@ -31,11 +31,26 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   seconds. The ledger needs `--service-node`, which becomes every entry's
   `instance_id`; each start opens a later `epoch`, and `seq` is gapless per
   epoch. A crash loses at most the last group-commit interval. Committed
-  entries are never evicted, and there is no read or acknowledgement API yet,
-  so size `max_disk_bytes` accordingly. A reload that changes the ledger is
-  refused. New counters: `llmproxy_ledger_rejected_total`,
+  entries are never evicted; only an acknowledgement frees space. A reload
+  that changes the ledger is refused. New counters: `llmproxy_ledger_rejected_total`,
   `llmproxy_ledger_unledgered_total`, `llmproxy_ledger_entries_committed_total`,
   `llmproxy_ledger_entries_lost_total`.
+- Billing ledger delivery (ADR-0009 decisions 7 and 8). `GET
+  /ledger/entries?after=<cursor>&limit=<1..=1000>` returns committed entries
+  only, in order, each with its `cursor`, `instance_id`, `epoch` and `seq`.
+  `POST /ledger/ack?through=<cursor>` removes every entry up to the cursor
+  from the spool. Both need the admin bearer token and refuse unknown or
+  malformed parameters with 400. The cursor is the spool's position: unlike
+  `seq` it keeps increasing across restarts. Delivery is at least once, so
+  deduplicate on `event_id`. When the spool is at `max_disk_bytes`, an
+  acknowledgement frees space, the entries held at the cap are written, and
+  requests are admitted again without a restart; the answer's `admitting`
+  is `false` while the held entries still do not fit, so keep pulling and
+  acknowledging. New reconciliation counters:
+  `llmproxy_spend_charged_micro_usd_total` (micro-USD the spend filter
+  charged) and `llmproxy_ledger_spend_written_micro_usd_total` (micro-USD of
+  spend charges in committed entries). They are equal unless entries were
+  lost (`llmproxy_ledger_entries_lost_total`) or served under `admit`.
 
 ### Fixed
 

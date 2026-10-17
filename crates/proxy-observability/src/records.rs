@@ -654,45 +654,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn record() -> RequestRecord {
-        RequestRecord {
-            schema_version: SCHEMA_VERSION,
-            event_id: "e".into(),
-            request_id: "r".into(),
-            instance_id: "i".into(),
-            started_at: "2026-10-01T00:00:00Z".into(),
-            finished_at: "2026-10-01T00:00:01Z".into(),
-            tenant_id: "default".into(),
-            user_id: None,
-            key_id: None,
-            trace_id: None,
-            routing_revision: None,
-            policy_generation: None,
-            capture_policy_version: None,
-            method: "POST".into(),
-            route: "/v1/chat/completions".into(),
-            requested_model: None,
-            resolved_model: None,
-            selected_cluster: None,
-            selected_provider: None,
-            selected_model: None,
-            upstream_response_id: None,
-            upstream_usage: None,
-            status: Some(200),
-            termination: Termination::Complete,
-            error_category: None,
-            response_flags: vec![],
-            duration_ms: 1,
-            time_to_first_byte_ms: None,
-            bytes_request: 0,
-            bytes_response: 0,
-            usage: None,
-            cost: None,
-            attempt_count: 0,
-            physical_attempt_count: 0,
-            attempts: vec![],
-            attempts_truncated: false,
-            credential_source: None,
-        }
+        crate::ledger::testing::record("e")
     }
 
     /// Provider usage text survives a record's JSON round trip byte for byte

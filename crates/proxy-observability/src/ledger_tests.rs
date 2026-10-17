@@ -4,7 +4,7 @@
 //! requests are served, in `proxy-core`'s `listener_ledger_tests.rs`.
 
 use crate::ledger::testing::{TempLedger, TempLedgerDir};
-use crate::ledger::{Ledger, LedgerTicket, OnUnavailable, Unavailable};
+use crate::ledger::{Ledger, LedgerQueryError, LedgerTicket, OnUnavailable, Unavailable};
 use crate::records::{tests::record, LedgerCharge, RequestRecord};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -64,7 +64,11 @@ fn concurrent_appends_are_numbered_without_gaps_or_repeats() {
     events.dedup();
     assert_eq!(events.len(), THREADS * PER_THREAD);
     assert!(entries.iter().all(|e| e.instance_id == "test-instance"));
-    assert_eq!(ledger.ledger.reserved(), 0, "committed entries give their slots back");
+    assert_eq!(
+        ledger.ledger.reserved(),
+        0,
+        "committed entries give their slots back"
+    );
 }
 
 /// A writer stuck before its next write does not slow admission or the
@@ -240,4 +244,296 @@ fn a_readable_key_file_is_refused_naming_the_field() {
     };
     assert!(error.starts_with("encryption_key_file: "), "{error}");
     assert!(error.contains("ledger.key"), "{error}");
+}
+
+// ------------------------------------------------- reads and acknowledgement --
+
+/// Reads and acknowledgements are answered by the writer; this bounds the
+/// wait like the admin API does.
+const ASK: Duration = Duration::from_secs(10);
+
+/// Poll until `n` entries are committed; returns the page.
+fn committed(ledger: &Ledger, n: usize) -> crate::ledger::LedgerPage {
+    for _ in 0..1000 {
+        let page = ledger.read_committed(0, 1000, ASK).expect("read");
+        if page.entries.len() >= n {
+            return page;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("{n} entries were never committed");
+}
+
+fn spend_charge(micro_usd: u64) -> LedgerCharge {
+    LedgerCharge {
+        charged_micro_usd: micro_usd,
+        charged_scopes: vec![crate::records::ChargedScope {
+            scope: crate::records::ChargeScope::Tenant,
+            id: "t1".into(),
+            period: "2026-10".into(),
+        }],
+        rate_card_version: Some("v1".into()),
+    }
+}
+
+/// A read returns only what is committed: an entry the writer holds in an
+/// open group is not returned while the group is open. Pages run in cursor
+/// order across a restart, where `seq` starts again at 0 but the cursor keeps
+/// rising, which is why the cursor and not `seq` is what reads take.
+#[test]
+fn a_read_returns_committed_entries_only_in_cursor_order_across_epochs() {
+    let dir = TempLedgerDir::new();
+    let mut config = dir.config(8, OnUnavailable::Reject);
+    config.group_commit_max_entries = 2;
+    config.group_commit_interval = Duration::from_secs(60);
+    let mut ledger = TempLedger::open_with(dir, config);
+
+    reserve(&ledger.ledger).append(numbered(0), LedgerCharge::default());
+    let open_group = ledger.ledger.read_committed(0, 1000, ASK).expect("read");
+    assert!(
+        open_group.entries.is_empty(),
+        "an uncommitted entry was returned: {open_group:?}"
+    );
+    assert_eq!(open_group.committed_through, 0);
+
+    reserve(&ledger.ledger).append(numbered(1), LedgerCharge::default());
+    let first = committed(&ledger.ledger, 2);
+    ledger.restart();
+    for i in 2..4 {
+        reserve(&ledger.ledger).append(numbered(i), LedgerCharge::default());
+    }
+    let page = committed(&ledger.ledger, 4);
+    let shape: Vec<(u64, u64, u64)> = page
+        .entries
+        .iter()
+        .map(|e| (e.cursor, e.entry.epoch, e.entry.seq))
+        .collect();
+    let (old, new) = (first.entries[0].entry.epoch, page.entries[2].entry.epoch);
+    assert!(new > old);
+    assert_eq!(shape, [(1, old, 0), (2, old, 1), (3, new, 0), (4, new, 1)]);
+    assert_eq!(page.committed_through, 4);
+    assert!(page
+        .entries
+        .iter()
+        .all(|e| e.entry.instance_id == "test-instance"));
+
+    let after = ledger.ledger.read_committed(2, 1, ASK).expect("read");
+    assert_eq!(
+        after.entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        [3],
+        "after is exclusive and limit bounds the page"
+    );
+}
+
+/// An acknowledgement removes entries through its cursor from the spool, not
+/// just from later reads: a reopened spool no longer holds them. A cursor
+/// past the last committed entry is refused and changes nothing.
+#[test]
+fn an_acknowledgement_reclaims_entries_through_its_cursor() {
+    let mut ledger = TempLedger::open(8, OnUnavailable::Reject);
+    for i in 0..5 {
+        reserve(&ledger.ledger).append(numbered(i), LedgerCharge::default());
+    }
+    let page = committed(&ledger.ledger, 5);
+    let through = page.entries[2].cursor;
+
+    assert_eq!(
+        ledger.ledger.acknowledge(99, ASK),
+        Err(LedgerQueryError::BeyondCommitted {
+            through: 99,
+            committed_through: 5
+        })
+    );
+    let ack = ledger.ledger.acknowledge(through, ASK).expect("ack");
+    assert_eq!(ack.acknowledged_through, through);
+    assert!(ack.admitting);
+
+    let rest = ledger.ledger.read_committed(0, 1000, ASK).expect("read");
+    assert_eq!(
+        rest.entries
+            .iter()
+            .map(|e| e.entry.record.event_id.as_str())
+            .collect::<Vec<_>>(),
+        ["event-3", "event-4"]
+    );
+    let kept: Vec<String> = ledger
+        .entries()
+        .into_iter()
+        .map(|e| e.record.event_id)
+        .collect();
+    assert_eq!(kept, ["event-3", "event-4"], "acknowledged rows are gone");
+}
+
+/// The disk-cap hold is released by an acknowledgement, without a restart:
+/// under `reject` admission is refused with `disk_full`, the entries handed
+/// over at the cap are held, and once space is acknowledged they are written
+/// in order, `seq` continues with no gap (numbers given back by a refused
+/// write are reused), and the next request is admitted again.
+#[test]
+fn an_acknowledgement_at_the_disk_cap_resumes_admission_and_writes_held_entries() {
+    let dir = TempLedgerDir::new();
+    let mut config = dir.config(64, OnUnavailable::Reject);
+    config.max_disk_bytes = proxy_capture_spool::MIN_DISK_BYTES;
+    config.group_commit_max_entries = 8;
+    let mut ledger = TempLedger::open_with(dir, config);
+    let padding = "x".repeat(16 * 1024);
+    let padded = |i: usize| {
+        let mut rec = numbered(i);
+        rec.route = padding.clone();
+        rec
+    };
+    // Slots taken while there is room, used only after the cap is reached.
+    let held: Vec<_> = (0..3).map(|_| reserve(&ledger.ledger)).collect();
+    let mut appended = 0;
+    let mut refusal = None;
+    for _ in 0..20_000 {
+        match ledger.ledger.admit() {
+            Ok(LedgerTicket::Reserved(r)) => {
+                r.append(padded(appended), LedgerCharge::default());
+                appended += 1;
+            }
+            Ok(LedgerTicket::Unledgered(_)) => unreachable!("reject mode"),
+            Err(Unavailable::QueueFull) => std::thread::sleep(Duration::from_millis(1)),
+            Err(other) => {
+                refusal = Some(other);
+                break;
+            }
+        }
+    }
+    assert_eq!(refusal, Some(Unavailable::DiskFull));
+    for r in held {
+        r.append(padded(appended), LedgerCharge::default());
+        appended += 1;
+    }
+    assert_eq!(
+        ledger.ledger.admit().err(),
+        Some(Unavailable::DiskFull),
+        "still at the cap before the acknowledgement"
+    );
+
+    // A consumer pulls and acknowledges page by page. The slots held at the
+    // cap can hold more entries than one acknowledgement frees room for, so
+    // the writer re-enters the cap until the consumer has caught up; every
+    // acknowledgement must still make progress.
+    let mut pulled = Vec::new();
+    let mut last_ack = 0;
+    loop {
+        let page = ledger
+            .ledger
+            .read_committed(last_ack, 1000, ASK)
+            .expect("reads work at the cap");
+        let Some(through) = page.entries.last().map(|e| e.cursor) else {
+            panic!("at the cap with nothing committed to acknowledge");
+        };
+        pulled.extend(page.entries.into_iter().map(|e| e.entry));
+        let ack = ledger.ledger.acknowledge(through, ASK).expect("ack");
+        assert!(ack.acknowledged_through > last_ack, "an ack made progress");
+        last_ack = ack.acknowledged_through;
+        if ack.admitting {
+            break;
+        }
+        assert_eq!(ledger.ledger.admit().err(), Some(Unavailable::DiskFull));
+    }
+    reserve(&ledger.ledger).append(padded(appended), LedgerCharge::default());
+    appended += 1;
+
+    pulled.extend(ledger.entries());
+    let scrape = ledger.scrape();
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"shutdown\"}"
+        ),
+        0,
+        "nothing stayed held"
+    );
+    assert_eq!(
+        counter(&scrape, "envoy_llmproxy_ledger_entries_committed_total"),
+        appended as u64
+    );
+    let seqs: Vec<u64> = pulled.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        seqs,
+        (0..appended as u64).collect::<Vec<_>>(),
+        "seq has no gap across the cap: numbers a refused write gave back are reused"
+    );
+    let events: Vec<String> = pulled.iter().map(|e| e.record.event_id.clone()).collect();
+    let expected: Vec<String> = (0..appended).map(|i| format!("event-{i}")).collect();
+    assert_eq!(
+        events, expected,
+        "held entries are written in arrival order"
+    );
+}
+
+/// The ledger side of reconciliation (ADR-0009 decision 7) counts the spend
+/// charges of committed entries; a list price on an unbudgeted route is in
+/// the entry but is not a spend charge.
+#[test]
+fn the_spend_written_counter_sums_committed_spend_charges_only() {
+    let mut ledger = TempLedger::open(8, OnUnavailable::Reject);
+    for i in 0..3 {
+        reserve(&ledger.ledger).append(numbered(i), spend_charge(7));
+    }
+    for i in 3..5 {
+        let list_price = LedgerCharge {
+            charged_micro_usd: 5,
+            ..LedgerCharge::default()
+        };
+        reserve(&ledger.ledger).append(numbered(i), list_price);
+    }
+    assert_eq!(ledger.entries().len(), 5);
+    assert_eq!(
+        counter(
+            &ledger.scrape(),
+            "envoy_llmproxy_ledger_spend_written_micro_usd_total"
+        ),
+        21
+    );
+}
+
+/// A batch the spool refuses at the cap was numbered but never written, so
+/// its numbers are given back. The first acknowledgement's retry is refused
+/// again part way through the held entries; the second writes them all, in
+/// arrival order, and `seq` has no gap.
+#[test]
+fn a_batch_refused_at_the_cap_gives_its_seq_numbers_back() {
+    const HELD: usize = 6;
+    let hooks = crate::ledger::writer_test_hooks::install();
+    // The batch that meets the cap, then the first batch the retry writes.
+    hooks.refuse_appends(2);
+    let dir = TempLedgerDir::new();
+    let mut config = dir.config(HELD + 1, OnUnavailable::Reject);
+    config.group_commit_max_entries = 2;
+    let mut ledger = TempLedger::open_with(dir, config);
+    let slots: Vec<_> = (0..HELD).map(|_| reserve(&ledger.ledger)).collect();
+    for (i, slot) in slots.into_iter().enumerate() {
+        slot.append(numbered(i), LedgerCharge::default());
+    }
+    let refused = (0..1000)
+        .find_map(|_| match ledger.ledger.admit() {
+            Err(reason) => Some(reason),
+            Ok(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                None
+            }
+        })
+        .expect("the refused append reaches admission");
+    assert_eq!(refused, Unavailable::DiskFull);
+    // Nothing is committed, so there is nothing to acknowledge; each
+    // acknowledgement still retries the held writes. The channel is FIFO, so
+    // every entry above reaches the writer before the acknowledgement does.
+    let first = ledger.ledger.acknowledge(0, ASK).expect("ack");
+    assert!(!first.admitting, "the retry was refused again");
+    let second = ledger.ledger.acknowledge(0, ASK).expect("ack");
+    assert!(second.admitting);
+    reserve(&ledger.ledger).append(numbered(HELD), LedgerCharge::default());
+    let shape: Vec<(u64, String)> = ledger
+        .entries()
+        .into_iter()
+        .map(|e| (e.seq, e.record.event_id))
+        .collect();
+    let expected: Vec<(u64, String)> = (0..=HELD)
+        .map(|i| (i as u64, format!("event-{i}")))
+        .collect();
+    assert_eq!(shape, expected);
 }

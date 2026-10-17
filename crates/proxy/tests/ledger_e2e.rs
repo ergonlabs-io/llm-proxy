@@ -1,8 +1,11 @@
 //! The billing ledger (ADR-0009) in the real binary: a dialect `ledger`
 //! block opens the writer at boot, served requests reach the encrypted spool,
 //! shutdown commits what is queued, a restart opens a later epoch, and the
-//! things that must stop the proxy do. Admission and the writer themselves
-//! are tested in `proxy-core` and `proxy-observability`.
+//! things that must stop the proxy do. Consumers pull and acknowledge entries
+//! over the admin API, and the two reconciliation counters (ADR-0009 decision
+//! 7) agree, or differ by exactly what `admit` served unledgered. Admission
+//! and the writer themselves are tested in `proxy-core` and
+//! `proxy-observability`; the admin endpoints' contract in `proxy-admin`.
 
 use proxy_observability::ledger::testing::{committed_entries, TempLedgerDir};
 use proxy_observability::ledger::{LedgerConfig, OnUnavailable};
@@ -16,6 +19,10 @@ const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const NODE: &str = "ledger-e2e-node";
+const ADMIN_TOKEN: &str = "ledger-e2e-admin-token";
+/// The mock's usage (6 input, 4 output tokens) at the prices in
+/// `billing_config`: 6 * 1000 + 4 * 2000 nanodollars, 14 micro-USD.
+const CHARGE_MICRO_USD: u64 = 14;
 
 #[test]
 fn served_requests_are_committed_and_a_restart_opens_a_later_epoch() {
@@ -94,7 +101,173 @@ fn a_reload_that_changes_the_ledger_is_refused() {
     assert_eq!(committed_entries(&ledger, NODE).len(), 1);
 }
 
+/// Under load with nothing lost, every micro-USD charged to spend is in a
+/// committed entry: the two counters are equal. A consumer pulls every entry
+/// over the admin API and acknowledges them, after which none is returned.
+#[test]
+fn spend_and_ledger_counters_agree_and_entries_are_pulled_and_acknowledged() {
+    const THREADS: usize = 4;
+    const PER_THREAD: usize = 5;
+    const TOTAL: u64 = (THREADS * PER_THREAD) as u64;
+    let dir = TempLedgerDir::new();
+    let ledger = dir.config(1024, OnUnavailable::Reject);
+    let config = billing_config(&ledger, mock_upstream(), "reject", 1024);
+    let proxy = Proxy::start(dir.root.path(), &config, Some(NODE));
+    let key = proxy.mint_key();
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..PER_THREAD {
+                    let response = proxy.chat_as(Some(&key));
+                    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                }
+            });
+        }
+    });
+    let scrape = proxy
+        .scrape_until(|s| counter(s, "envoy_llmproxy_ledger_entries_committed_total") == TOTAL);
+    let charged = counter(&scrape, "envoy_llmproxy_spend_charged_micro_usd_total");
+    assert_eq!(
+        charged,
+        TOTAL * CHARGE_MICRO_USD,
+        "every request was charged"
+    );
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_spend_written_micro_usd_total"
+        ),
+        charged
+    );
+
+    let page = proxy.admin_json("GET", "/ledger/entries?limit=1000");
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len() as u64, TOTAL);
+    assert!(entries.iter().all(|e| e["instance_id"] == NODE
+        && e["charged_micro_usd"] == CHARGE_MICRO_USD
+        && !e["charged_scopes"].as_array().unwrap().is_empty()));
+    let through = page["next_after"].as_u64().unwrap();
+    let ack = proxy.admin_json("POST", &format!("/ledger/ack?through={through}"));
+    assert_eq!(ack["acknowledged_through"], through);
+    let after = proxy.admin_json("GET", "/ledger/entries");
+    assert_eq!(after["entries"].as_array().unwrap().len(), 0, "{after}");
+}
+
+/// Under `admit`, a request with no slot is served unledgered. Its charge is
+/// in the spend counter and not in the ledger, so the two counters differ by
+/// exactly the charges of the unledgered requests.
+#[test]
+fn under_admit_the_counters_differ_by_exactly_the_unledgered_charges() {
+    const THREADS: usize = 6;
+    const PER_THREAD: usize = 3;
+    const TOTAL: u64 = (THREADS * PER_THREAD) as u64;
+    let dir = TempLedgerDir::new();
+    let ledger = dir.config(1, OnUnavailable::Admit);
+    // One slot and a slow upstream, so concurrent requests find none.
+    let upstream = mock_upstream_with_delay(Duration::from_millis(100));
+    let config = billing_config(&ledger, upstream, "admit", 1);
+    let proxy = Proxy::start(dir.root.path(), &config, Some(NODE));
+    let key = proxy.mint_key();
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..PER_THREAD {
+                    let response = proxy.chat_as(Some(&key));
+                    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+                }
+            });
+        }
+    });
+    let scrape = proxy.scrape_until(|s| {
+        counter(s, "envoy_llmproxy_ledger_entries_committed_total") + unledgered(s) == TOTAL
+    });
+    let unledgered = unledgered(&scrape);
+    assert!(
+        unledgered > 0,
+        "no request found every slot held:\n{scrape}"
+    );
+    let charged = counter(&scrape, "envoy_llmproxy_spend_charged_micro_usd_total");
+    let written = counter(
+        &scrape,
+        "envoy_llmproxy_ledger_spend_written_micro_usd_total",
+    );
+    assert_eq!(charged, TOTAL * CHARGE_MICRO_USD);
+    assert_eq!(charged - written, unledgered * CHARGE_MICRO_USD);
+}
+
 // ------------------------------------------------------------------ helpers --
+
+/// A ledger, an admin listener, an `auth` block (so the spend filter charges
+/// every keyed request) and a price for the mock's model.
+fn billing_config(
+    ledger: &LedgerConfig,
+    upstream: SocketAddr,
+    on_unavailable: &str,
+    max_reservations: usize,
+) -> String {
+    format!(
+        r#"version: 0
+listen: 127.0.0.1:{listen}
+admin: 127.0.0.1:{admin}
+providers:
+  openai:
+    type: openai
+    base_url: http://{upstream}
+    api_key: sk-upstream-provider-key
+routes:
+  - {{ model: "*", provider: openai }}
+auth:
+  hmac_secret: "ledger-e2e-hmac-secret"
+pricing:
+  price_list:
+    version: ledger-e2e
+    effective_from: "2026-01-01T00:00:00Z"
+    entries:
+      - provider_type: openai
+        model: gpt-4o
+        tier_mode: whole_request
+        tiers:
+          - input_nanodollars_per_token: 1000
+            cached_input_nanodollars_per_token: 1000
+            cache_write_nanodollars_per_token: 1000
+            output_nanodollars_per_token: 2000
+ledger:
+  directory: {directory}
+  encryption_key_file: {key}
+  encryption_key_id: {key_id}
+  max_disk_bytes: {disk}
+  max_reservations: {max_reservations}
+  group_commit_interval: 10ms
+  on_unavailable: {on_unavailable}
+"#,
+        listen = free_port(),
+        admin = free_port(),
+        directory = ledger.directory.display(),
+        key = ledger.encryption_key.file.display(),
+        key_id = ledger.encryption_key.id,
+        disk = ledger.max_disk_bytes,
+    )
+}
+
+/// A counter's value in a Prometheus scrape: the line `series value`.
+fn counter(scrape: &str, series: &str) -> u64 {
+    scrape
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(series))
+        .and_then(|l| l.split_whitespace().last())
+        .unwrap_or_else(|| panic!("no series {series} in:\n{scrape}"))
+        .parse()
+        .unwrap()
+}
+
+/// `llmproxy_ledger_unledgered_total`, summed over its reasons.
+fn unledgered(scrape: &str) -> u64 {
+    scrape
+        .lines()
+        .filter(|l| l.starts_with("envoy_llmproxy_ledger_unledgered_total{"))
+        .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
+        .sum()
+}
 
 fn config_text(ledger: &LedgerConfig, upstream: SocketAddr, extra: &str) -> String {
     format!(
@@ -128,6 +301,7 @@ ledger:
 struct Proxy {
     child: Child,
     listen: SocketAddr,
+    admin: Option<SocketAddr>,
     stderr: std::path::PathBuf,
 }
 
@@ -140,6 +314,7 @@ impl Proxy {
         command
             .args(["--config", path.to_str().unwrap(), "--concurrency", "1"])
             .args(["--drain-time-s", "1"])
+            .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&stderr).unwrap());
         if let Some(node) = node {
@@ -149,26 +324,34 @@ impl Proxy {
     }
 
     fn start(dir: &Path, config: &str, node: Option<&str>) -> Proxy {
-        let listen: u16 = config
-            .split("listen: 127.0.0.1:")
-            .nth(1)
-            .and_then(|r| r.lines().next())
-            .and_then(|p| p.trim().parse().ok())
-            .unwrap();
+        let port = |marker: &str| -> Option<SocketAddr> {
+            let port: u16 = config
+                .split(marker)
+                .nth(1)?
+                .lines()
+                .next()?
+                .trim()
+                .parse()
+                .ok()?;
+            Some(SocketAddr::from(([127, 0, 0, 1], port)))
+        };
         let (child, stderr) = Self::spawn(dir, config, node);
         let proxy = Proxy {
             child,
-            listen: SocketAddr::from(([127, 0, 0, 1], listen)),
+            listen: port("listen: 127.0.0.1:").unwrap(),
+            admin: port("admin: 127.0.0.1:"),
             stderr,
         };
         let deadline = Instant::now() + STARTUP_TIMEOUT;
-        while TcpStream::connect(proxy.listen).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "proxy did not start:\n{}",
-                proxy.log()
-            );
-            std::thread::sleep(Duration::from_millis(20));
+        for addr in proxy.admin.into_iter().chain([proxy.listen]) {
+            while TcpStream::connect(addr).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "proxy did not start:\n{}",
+                    proxy.log()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
         proxy
     }
@@ -235,23 +418,69 @@ impl Proxy {
     }
 
     fn chat(&self) -> String {
+        self.chat_as(None)
+    }
+
+    fn chat_as(&self, key: Option<&str>) -> String {
         let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
-        let mut stream = TcpStream::connect(self.listen).unwrap();
-        stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
-        stream
-            .write_all(
-                format!(
-                    "POST /v1/chat/completions HTTP/1.1\r\nHost: proxy.local\r\n\
-                     Content-Type: application/json\r\nContent-Length: {}\r\n\
-                     Connection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
-        String::from_utf8_lossy(&response).into_owned()
+        http(self.listen, "POST", "/v1/chat/completions", key, body)
+    }
+
+    fn admin(&self) -> SocketAddr {
+        self.admin.expect("this test configured an admin listener")
+    }
+
+    /// `POST /keys` for tenant `t1`, granted every model; returns the
+    /// plaintext key.
+    fn mint_key(&self) -> String {
+        let response = http(
+            self.admin(),
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            r#"{"tenant":"t1","key_id":"ledger-e2e-key"}"#,
+        );
+        assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+        let key = json_body(&response)["key"].as_str().unwrap().to_owned();
+        let tenant = http(
+            self.admin(),
+            "POST",
+            "/tenants",
+            Some(ADMIN_TOKEN),
+            r#"{"tenant":"t1"}"#,
+        );
+        assert!(tenant.starts_with("HTTP/1.1 2"), "{tenant}");
+        let policy = http(
+            self.admin(),
+            "PUT",
+            "/tenants/t1/policy",
+            Some(ADMIN_TOKEN),
+            r#"{"access":"all"}"#,
+        );
+        assert!(policy.starts_with("HTTP/1.1 204"), "{policy}");
+        key
+    }
+
+    /// A bearer-gated admin call that must answer 200; its JSON body.
+    fn admin_json(&self, method: &str, path: &str) -> serde_json::Value {
+        let response = http(self.admin(), method, path, Some(ADMIN_TOKEN), "");
+        assert!(response.starts_with("HTTP/1.1 200"), "{path}:\n{response}");
+        json_body(&response)
+    }
+
+    /// Poll `/stats/prometheus` until `done` holds; the entries commit
+    /// asynchronously, within a group-commit interval.
+    fn scrape_until(&self, done: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        loop {
+            let response = http(self.admin(), "GET", "/stats/prometheus", None, "");
+            let scrape = response.split_once("\r\n\r\n").unwrap().1.to_owned();
+            if done(&scrape) {
+                return scrape;
+            }
+            assert!(Instant::now() < deadline, "never settled:\n{scrape}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -262,6 +491,34 @@ impl Drop for Proxy {
     }
 }
 
+/// One HTTP/1.1 request with `Connection: close`; the raw response.
+fn http(addr: SocketAddr, method: &str, path: &str, bearer: Option<&str>, body: &str) -> String {
+    let auth = bearer
+        .map(|b| format!("Authorization: Bearer {b}\r\n"))
+        .unwrap_or_default();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n{auth}\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+fn json_body(response: &str) -> serde_json::Value {
+    let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -270,8 +527,13 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// An OpenAI-shaped upstream on a std thread that answers every request.
 fn mock_upstream() -> SocketAddr {
+    mock_upstream_with_delay(Duration::ZERO)
+}
+
+/// An OpenAI-shaped upstream on a std thread that answers every request,
+/// each after `delay`.
+fn mock_upstream_with_delay(delay: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -303,6 +565,7 @@ fn mock_upstream() -> SocketAddr {
                         Ok(n) => have += n,
                     }
                 }
+                std::thread::sleep(delay);
                 let body = r#"{"id":"x","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}"#;
                 let _ = stream.write_all(
                     format!(
