@@ -58,7 +58,7 @@ positive receipt. Dropping the handle never commits pending payloads.
 `seal` is a durability flush equivalent to `commit`; a database has no segment
 to close. Keep the agent's group commit and blocking I/O isolation. The writer
 takes the first queued record, adds whatever else is already queued (at most
-eight, the pending-record cap), and commits as soon as nothing more is
+eight, the agent's pending-record cap), and commits as soon as nothing more is
 immediately available. It never lingers for a fuller batch: each connection
 withholds its next record until its receipt arrives, so with fewer than eight
 producers a batch cannot fill and a linger would charge every record its full
@@ -79,10 +79,21 @@ costs the next commit at most that 2 ms once. The 50 ms bound caps collection
 time overall.
 
 Only a provably pre-publication admission rejection may return per-record `Full`
-or `RecordTooLarge`. Backend growth, write, resize, transaction, or sync failures
-poison the handle and return a storage failure, even when caused by the disk
-ceiling. Never translate the prototype's backend `Full` directly into the agent's
-definitive `Outcome::Full`. The agent returns unavailable, with no positive receipt;
+or `RecordTooLarge`. Backend write, resize, transaction, or sync failures poison
+the handle and return a storage failure.
+
+The disk ceiling is the exception, because it is a condition that clears
+(ADR-0009 decision 6). The backend records that it refused growth at the ceiling.
+redb latches every backend error, so the spool closes that database, reopens it
+from its last commit, re-authenticates it, and returns `Full` without poisoning.
+The refusal precedes redb's commit point, so the recovered state must equal the
+handle's; any difference poisons. Records of a refused commit stay pending. Further
+appends and commits return `Full` without touching storage until an
+acknowledgement commits; a commit then publishes the pending records. The reopen
+costs one recovery scan per refusal. An acknowledgement at the ceiling is itself
+a transaction; if it is refused, nothing changes and a shorter prefix can be
+acknowledged. Never translate a top-level `Full` into the agent's definitive
+`Outcome::Full`. The agent returns unavailable, with no positive receipt;
 the producer retains unknown durability after a possibly sent attempt. Reopen
 may recover either atomic outcome, including data whose receipt was lost.
 
@@ -110,7 +121,7 @@ record and database byte counts in that same reviewed interface increment.
 
 Add a bounded database cache setting with a proposed 4 MiB default and 16 MiB
 maximum. Cache size is not a total-process memory ceiling. Account separately
-for at most eight pending encrypted payloads, caller-owned serialization,
+for at most `max_pending_records` pending encrypted payloads, caller-owned serialization,
 encryption/decryption scratch, transaction allocations, keys, and replay output.
 Before release, measure maximum valid 512 KiB records and simultaneous scratch
 owners; report RSS and fail qualification if the declared agent budget is exceeded.

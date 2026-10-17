@@ -1,17 +1,51 @@
 //! Safe positional I/O with a hard logical file-length ceiling.
 use redb::StorageBackend;
-use std::{fs::File, io, os::unix::fs::FileExt, sync::Arc};
+use std::{
+    fs::File,
+    io,
+    os::unix::fs::FileExt,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+/// The database's length ceiling, shared with the spool so it can tell a refusal
+/// at the ceiling apart from a genuine I/O failure: redb reports both as the same
+/// latched I/O error.
+#[derive(Debug)]
+pub(crate) struct Quota {
+    limit: AtomicU64,
+    refused: AtomicBool,
+}
+impl Quota {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit: AtomicU64::new(limit),
+            refused: AtomicBool::new(false),
+        }
+    }
+    /// Sets the ceiling for the next transaction and clears any earlier refusal.
+    pub fn arm(&self, limit: u64) {
+        self.limit.store(limit, Ordering::Relaxed);
+        self.refused.store(false, Ordering::Relaxed);
+    }
+    pub fn refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Backend {
     pub file: Arc<File>,
-    pub cap: u64,
+    pub quota: Arc<Quota>,
     #[cfg(test)]
     pub hooks: Arc<crate::testing::Hooks>,
 }
 impl Backend {
     fn bound(&self, length: u64) -> io::Result<()> {
-        if length > self.cap {
+        if length > self.quota.limit.load(Ordering::Relaxed) {
+            self.quota.refused.store(true, Ordering::Relaxed);
             return Err(io::Error::other("spool database disk quota exhausted"));
         }
         Ok(())

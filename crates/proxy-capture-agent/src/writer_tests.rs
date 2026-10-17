@@ -69,6 +69,7 @@ fn open_spool(directory: &Path) -> MetadataSpool {
         max_record_bytes: 4096,
         max_disk_bytes: 4 * 1_048_576,
         cache_bytes: 4 * 1024 * 1024,
+        max_pending_records: 8,
     };
     let key = EncryptionKey::new("key", [37; 32]).unwrap();
     MetadataSpool::open(config, key, Vec::new()).unwrap()
