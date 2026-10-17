@@ -11,6 +11,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking (Envoy mode):** the `pricing` field of `llmproxy.spend_limit`
+  (`ClusterPricing`, `ModelPrice`). A config that still sets it fails to
+  load, naming the field. Move the prices to the rate card: `pricing_json`
+  on `llmproxy.filters.v0.Usage`, or `PUT /pricing`. The `--config` dialect
+  never set this field and is not affected.
+
 ### Added
 
 - The `%COMMON_DURATION(START:END[:PRECISION])%` access-log operator, as in
@@ -32,6 +40,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- The rate card is the only price source for spend budgets. The spend
+  filter no longer falls back to its own per-cluster price table, so every
+  charge comes from one card, which replicas sharing a store also share.
+- `PUT /pricing` with a `persistent` store now says that the card survives a
+  restart but that other replicas do not read it. Only `auth.store: shared`
+  shares a rate card across replicas; the docs and schema now say so, and the
+  per-replica store warning names the rate card.
+- A `SIGHUP` reload that changes `pricing` while a store holds a different
+  card now logs a warning that the change was not applied (it was `info`).
 - Access logs cost less CPU: about 0.11 ms less per non-streaming request
   with the `llmproxy` dialect's default JSON log, which now costs about
   0.06 ms (it was 0.15 ms). The rendered lines do not change. The log

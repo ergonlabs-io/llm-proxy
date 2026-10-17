@@ -112,18 +112,12 @@ static_resources:
               '@type': type.llmproxy.dev/llmproxy.filters.v0.SpendLimit
               legacy_tenant_budget_cutover: START_KEYS_FRESH
               flush_interval_seconds: 1
-              pricing:
-              - cluster: openai
-                models:
-                - model: gpt-test
-                  input_per_million: '1000000.00'
-                  output_per_million: '1000000.00'
-                  cached_per_million: '0.00'
-                  cache_creation_per_million: '0.00'
           - name: llmproxy.usage
             typed_config:
               '@type': type.llmproxy.dev/llmproxy.filters.v0.Usage
               dialect: openai
+              # $1 per token in and out, so 1 token costs 1,000,000 micro-USD.
+              pricing_json: '{"price_list":{"effective_from":"2026-01-01T00:00:00Z","entries":[{"provider_type":"openai","model":"gpt-test","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":1000000000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":1000000000}]}]},"providers":{"openai":"openai"}}'
           - name: envoy.filters.http.router
             typed_config:
               '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

@@ -36,8 +36,7 @@ use crate::auth::{KeyId, TenantId};
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::spend::{
-    self, parse_micro_usd, Charge, MicroUsd, ModelPrices, OnReconciliationExpired, Period,
-    PriceTable, ReconciliationPolicy, SpendAccumulator,
+    self, Charge, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy, SpendAccumulator,
 };
 use crate::usage::TokenUsage;
 use crate::usage_filter::PricingRegistry;
@@ -57,87 +56,6 @@ fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigEr
         field_path: field_path.into(),
         reason: reason.into(),
     }
-}
-
-/// Reads `typed_config.pricing` (a repeated `ClusterPricing`) into a
-/// [`PriceTable`]. An absent or empty `pricing` list parses successfully
-/// into an EMPTY table -- every `(cluster, model)` pair costs zero, which is
-/// legal (see [`PriceTable::cost_of`]'s "unpriced" semantic), not an error.
-/// A malformed ENTRY (empty `cluster`, empty `model`, or a price string
-/// [`parse_micro_usd`] rejects) is a hard `Err` naming its own dotted path,
-/// per AGENTS.md invariant 1.
-fn parse_pricing(config: &DynamicMessage) -> Result<PriceTable, ConfigError> {
-    let mut table = PriceTable::new();
-
-    let pricing: Vec<prost_reflect::Value> = config
-        .get_field_by_name("pricing")
-        .and_then(|v| v.as_list().map(<[_]>::to_vec))
-        .unwrap_or_default();
-
-    for (i, entry) in pricing.iter().enumerate() {
-        let cluster_msg = entry
-            .as_message()
-            .ok_or_else(|| invalid(format!("typed_config.pricing[{i}]"), "must be a message"))?;
-
-        let cluster = cluster_msg
-            .get_field_by_name("cluster")
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default();
-        if cluster.is_empty() {
-            return Err(invalid(
-                format!("typed_config.pricing[{i}].cluster"),
-                "must not be empty",
-            ));
-        }
-
-        let models: Vec<prost_reflect::Value> = cluster_msg
-            .get_field_by_name("models")
-            .and_then(|v| v.as_list().map(<[_]>::to_vec))
-            .unwrap_or_default();
-
-        for (j, model_entry) in models.iter().enumerate() {
-            let model_msg = model_entry.as_message().ok_or_else(|| {
-                invalid(
-                    format!("typed_config.pricing[{i}].models[{j}]"),
-                    "must be a message",
-                )
-            })?;
-
-            let model = model_msg
-                .get_field_by_name("model")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default();
-            if model.is_empty() {
-                return Err(invalid(
-                    format!("typed_config.pricing[{i}].models[{j}].model"),
-                    "must not be empty",
-                ));
-            }
-
-            let parse_rate = |field: &str| -> Result<crate::spend::MicroUsd, ConfigError> {
-                let raw = model_msg
-                    .get_field_by_name(field)
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                parse_micro_usd(&raw).map_err(|e| {
-                    invalid(
-                        format!("typed_config.pricing[{i}].models[{j}].{field}"),
-                        e.to_string(),
-                    )
-                })
-            };
-
-            let prices = ModelPrices {
-                input_per_million: parse_rate("input_per_million")?,
-                output_per_million: parse_rate("output_per_million")?,
-                cached_per_million: parse_rate("cached_per_million")?,
-                cache_creation_per_million: parse_rate("cache_creation_per_million")?,
-            };
-            table.insert(cluster.clone(), model, prices);
-        }
-    }
-
-    Ok(table)
 }
 
 /// Reads `typed_config.default_period` (a `Period` enum) -- `PERIOD_UNSPECIFIED`
@@ -262,7 +180,6 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let price_table = Arc::new(parse_pricing(config)?);
         let default_period = parse_default_period(config)?;
         let flush_interval = parse_flush_interval(config);
         let reconciliation = parse_reconciliation(config)?;
@@ -406,7 +323,6 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
             .store(cutover == 1, Ordering::Relaxed);
 
         Ok(Box::new(SpendLimitInstanceFactory {
-            price_table,
             pricing_registry,
             accumulator: Arc::clone(&shared.accumulator),
             usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
@@ -481,7 +397,6 @@ impl SharedSpendLimitState {
 }
 
 struct SpendLimitInstanceFactory {
-    price_table: Arc<PriceTable>,
     pricing_registry: Arc<PricingRegistry>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
@@ -495,7 +410,6 @@ struct SpendLimitInstanceFactory {
 impl FilterInstanceFactory for SpendLimitInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(SpendLimitFilterInstance {
-            price_table: Arc::clone(&self.price_table),
             pricing_snapshot: self.pricing_registry.snapshot_context(),
             accumulator: Arc::clone(&self.accumulator),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
@@ -631,17 +545,16 @@ impl UnpricedWarner {
             reason = %reason(),
             "spend_limit: a request under a dollar budget was charged $0 because no price \
              applies to it, so the budget did not count it. Add the model to the rate card \
-             (PUT /pricing) or to this filter's `pricing` list. Logged once per model."
+             (PUT /pricing). Logged once per model."
         );
     }
 }
 
 /// Per-stream instance. Plain fields, no `Rc`/`RefCell` (never leaves the
-/// worker thread that owns the stream) -- `price_table`/`accumulator`/
+/// worker thread that owns the stream) -- `accumulator`/
 /// `usage_missing_warner`/`snapshot` are the cross-thread-shared pieces, each
 /// an `Arc` clone, not shared interior state of this struct itself.
 struct SpendLimitFilterInstance {
-    price_table: Arc<PriceTable>,
     pricing_snapshot: Option<crate::usage_filter::PricingContext>,
     accumulator: Arc<SpendAccumulator>,
     usage_missing_warner: Arc<UsageMissingWarner>,
@@ -732,10 +645,8 @@ impl SpendLimitFilterInstance {
             served_model.as_deref(),
             &usage,
         )
-        .map(|micros| Charge::Priced(MicroUsd::from_micros(micros)))
-        .unwrap_or_else(|| {
-            self.price_table
-                .cost_of(cluster.as_deref(), model.as_deref(), &usage)
+        .map_or(Charge::Unpriced, |micros| {
+            Charge::Priced(MicroUsd::from_micros(micros))
         });
 
         // A configured dollar budget just counted this request as $0 because
@@ -1158,59 +1069,8 @@ mod tests {
             .expect("SpendLimit is compiled into proxy-api")
     }
 
-    fn cluster_pricing_desc() -> prost_reflect::MessageDescriptor {
-        proxy_api::descriptor_pool()
-            .get_message_by_name("llmproxy.filters.v0.ClusterPricing")
-            .expect("ClusterPricing is compiled into proxy-api")
-    }
-
-    fn model_price_desc() -> prost_reflect::MessageDescriptor {
-        proxy_api::descriptor_pool()
-            .get_message_by_name("llmproxy.filters.v0.ModelPrice")
-            .expect("ModelPrice is compiled into proxy-api")
-    }
-
-    fn model_price(model: &str, rate: &str) -> DynamicMessage {
-        let mut m = DynamicMessage::new(model_price_desc());
-        m.set_field_by_name("model", prost_reflect::Value::String(model.to_string()));
-        for field in [
-            "input_per_million",
-            "output_per_million",
-            "cached_per_million",
-            "cache_creation_per_million",
-        ] {
-            m.set_field_by_name(field, prost_reflect::Value::String(rate.to_string()));
-        }
-        m
-    }
-
-    fn cluster_pricing(cluster: &str, models: Vec<DynamicMessage>) -> DynamicMessage {
-        let mut m = DynamicMessage::new(cluster_pricing_desc());
-        m.set_field_by_name("cluster", prost_reflect::Value::String(cluster.to_string()));
-        m.set_field_by_name(
-            "models",
-            prost_reflect::Value::List(
-                models
-                    .into_iter()
-                    .map(prost_reflect::Value::Message)
-                    .collect(),
-            ),
-        );
-        m
-    }
-
-    fn spend_limit_config(pricing: Vec<DynamicMessage>) -> DynamicMessage {
-        let mut m = DynamicMessage::new(spend_limit_desc());
-        m.set_field_by_name(
-            "pricing",
-            prost_reflect::Value::List(
-                pricing
-                    .into_iter()
-                    .map(prost_reflect::Value::Message)
-                    .collect(),
-            ),
-        );
-        m
+    fn spend_limit_config() -> DynamicMessage {
+        DynamicMessage::new(spend_limit_desc())
     }
 
     #[test]
@@ -1224,92 +1084,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_pricing_parses_to_an_all_unpriced_table() {
-        let table = parse_pricing(&spend_limit_config(vec![])).expect("valid config");
-        let usage = TokenUsage {
-            input_tokens: 1_000_000,
-            ..Default::default()
-        };
-        assert_eq!(
-            table.cost_of(Some("any-cluster"), Some("any-model"), &usage),
-            Charge::Unpriced
-        );
-    }
-
-    #[test]
-    fn pricing_parses_into_a_working_price_table() {
-        let table = parse_pricing(&spend_limit_config(vec![cluster_pricing(
-            "cluster-a",
-            vec![model_price("m", "2.00")],
-        )]))
-        .expect("valid config");
-        let usage = TokenUsage {
-            input_tokens: 1_000_000,
-            ..Default::default()
-        };
-        assert_eq!(
-            table.cost_of(Some("cluster-a"), Some("m"), &usage),
-            Charge::Priced(MicroUsd::from_micros(2_000_000))
-        );
-    }
-
-    #[test]
-    fn empty_cluster_name_is_rejected() {
-        let mut msg = DynamicMessage::new(cluster_pricing_desc());
-        msg.set_field_by_name("cluster", prost_reflect::Value::String(String::new()));
-        let err = parse_pricing(&spend_limit_config(vec![msg])).expect_err("must be rejected");
-        match err {
-            ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.pricing[0].cluster");
-            }
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn empty_model_name_is_rejected() {
-        let mut price = DynamicMessage::new(model_price_desc());
-        price.set_field_by_name("model", prost_reflect::Value::String(String::new()));
-        let err = parse_pricing(&spend_limit_config(vec![cluster_pricing(
-            "cluster-a",
-            vec![price],
-        )]))
-        .expect_err("must be rejected");
-        match err {
-            ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(field_path, "typed_config.pricing[0].models[0].model");
-            }
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn an_invalid_rate_string_is_rejected_with_its_dotted_path() {
-        let err = parse_pricing(&spend_limit_config(vec![cluster_pricing(
-            "cluster-a",
-            vec![model_price("m", "not-a-number")],
-        )]))
-        .expect_err("must be rejected");
-        match err {
-            ConfigError::InvalidValue { field_path, .. } => {
-                assert_eq!(
-                    field_path,
-                    "typed_config.pricing[0].models[0].input_per_million"
-                );
-            }
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn unspecified_default_period_means_monthly() {
-        let period = parse_default_period(&spend_limit_config(vec![])).expect("valid");
+        let period = parse_default_period(&spend_limit_config()).expect("valid");
         assert_eq!(period, Period::Monthly);
     }
 
     #[test]
     fn explicit_daily_default_period_parses() {
-        let mut msg = spend_limit_config(vec![]);
+        let mut msg = spend_limit_config();
         msg.set_field_by_name("default_period", prost_reflect::Value::EnumNumber(1));
         assert_eq!(parse_default_period(&msg).expect("valid"), Period::Daily);
     }
@@ -1317,14 +1099,14 @@ mod tests {
     #[test]
     fn zero_flush_interval_means_the_five_second_default() {
         assert_eq!(
-            parse_flush_interval(&spend_limit_config(vec![])),
+            parse_flush_interval(&spend_limit_config()),
             Duration::from_secs(5)
         );
     }
 
     #[test]
     fn a_configured_flush_interval_is_honored() {
-        let mut msg = spend_limit_config(vec![]);
+        let mut msg = spend_limit_config();
         msg.set_field_by_name("flush_interval_seconds", prost_reflect::Value::U32(30));
         assert_eq!(parse_flush_interval(&msg), Duration::from_secs(30));
     }
@@ -1333,14 +1115,14 @@ mod tests {
 
     #[test]
     fn zero_reconciliation_bound_means_the_stated_default() {
-        let policy = parse_reconciliation(&spend_limit_config(vec![])).expect("valid config");
+        let policy = parse_reconciliation(&spend_limit_config()).expect("valid config");
         assert_eq!(policy.bound, spend::DEFAULT_RECONCILIATION_BOUND);
         assert_eq!(policy.on_expired, OnReconciliationExpired::Allow);
     }
 
     #[test]
     fn a_configured_reconciliation_bound_is_honored() {
-        let mut msg = spend_limit_config(vec![]);
+        let mut msg = spend_limit_config();
         msg.set_field_by_name(
             "reconciliation_bound_seconds",
             prost_reflect::Value::U32(120),
@@ -1354,14 +1136,14 @@ mod tests {
     /// implemented, not a load error.
     #[test]
     fn explicit_allow_and_unset_are_the_same_policy() {
-        let mut msg = spend_limit_config(vec![]);
+        let mut msg = spend_limit_config();
         msg.set_field_by_name(
             "on_reconciliation_expired",
             prost_reflect::Value::EnumNumber(1),
         );
         assert_eq!(
             parse_reconciliation(&msg).expect("ALLOW is implemented"),
-            parse_reconciliation(&spend_limit_config(vec![])).expect("unset means ALLOW"),
+            parse_reconciliation(&spend_limit_config()).expect("unset means ALLOW"),
         );
     }
 
@@ -1376,7 +1158,7 @@ mod tests {
     #[test]
     fn declared_but_unimplemented_expiry_behaviours_are_rejected_at_load() {
         for value in [2, 3] {
-            let mut msg = spend_limit_config(vec![]);
+            let mut msg = spend_limit_config();
             msg.set_field_by_name(
                 "on_reconciliation_expired",
                 prost_reflect::Value::EnumNumber(value),
@@ -1590,7 +1372,7 @@ mod tests {
     /// shape. [`Self::new_instance`] is this harness's
     /// `FilterInstanceFactory::create_filter` stand-in: a FRESH
     /// `SpendLimitFilterInstance` per call, sharing the same accumulator/
-    /// price table/snapshot. This split matters because
+    /// rate card/snapshot. This split matters because
     /// `SpendLimitFilterInstance::recorded` is a per-STREAM guard (see its
     /// doc) -- reusing one instance across what a test means as several
     /// separate "requests" would leak that guard across them and silently
@@ -1598,7 +1380,6 @@ mod tests {
     /// exactly the trap `token_limit_filter::tests::run_request_inner`'s own
     /// doc warns about.
     struct FilterHarness {
-        price_table: Arc<PriceTable>,
         accumulator: Arc<SpendAccumulator>,
         usage_missing_warner: Arc<UsageMissingWarner>,
         unpriced_warner: Arc<UnpricedWarner>,
@@ -1609,7 +1390,6 @@ mod tests {
     impl FilterHarness {
         fn new_instance(&self) -> SpendLimitFilterInstance {
             SpendLimitFilterInstance {
-                price_table: Arc::clone(&self.price_table),
                 accumulator: Arc::clone(&self.accumulator),
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
                 unpriced_warner: Arc::clone(&self.unpriced_warner),
@@ -1626,14 +1406,94 @@ mod tests {
         }
     }
 
-    /// A harness wired to `control_plane`'s snapshot, a fresh `PriceTable`,
-    /// and a fresh accumulator with the given `default_period` -- everything
+    /// Prices per `(cluster, model)`, in micro-dollars per million input
+    /// tokens, published as the chain's rate card. Each cluster is its own
+    /// provider type, so one model can cost differently per cluster, which
+    /// is what keeps a fallback from being billed at the primary's rate
+    /// (AGENTS.md invariant 6).
+    #[derive(Clone, Default)]
+    struct Card {
+        entries: Vec<(String, String, u64)>,
+    }
+
+    impl Card {
+        fn insert(&mut self, cluster: &str, model: &str, input_per_million_micros: u64) {
+            self.entries.push((
+                cluster.to_owned(),
+                model.to_owned(),
+                input_per_million_micros,
+            ));
+        }
+
+        /// The wire document, or `None` for an empty card: the chain then has
+        /// no rate card and every request is unpriced.
+        fn json(&self) -> Option<String> {
+            if self.entries.is_empty() {
+                return None;
+            }
+            let entries: Vec<serde_json::Value> = self
+                .entries
+                .iter()
+                .map(|(cluster, model, per_million)| {
+                    serde_json::json!({
+                        "provider_type": cluster,
+                        "model": model,
+                        "tier_mode": "whole_request",
+                        "tiers": [{
+                            "input_nanodollars_per_token": per_million / 1000,
+                            "cached_input_nanodollars_per_token": 0,
+                            "cache_write_nanodollars_per_token": 0,
+                            "output_nanodollars_per_token": 0
+                        }]
+                    })
+                })
+                .collect();
+            let providers: serde_json::Map<String, serde_json::Value> = self
+                .entries
+                .iter()
+                .map(|(cluster, _, _)| (cluster.clone(), cluster.clone().into()))
+                .collect();
+            Some(
+                serde_json::json!({
+                    "price_list": {
+                        "effective_from": "2026-01-01T00:00:00Z",
+                        "entries": entries
+                    },
+                    "providers": providers
+                })
+                .to_string(),
+            )
+        }
+    }
+
+    fn harness(
+        control_plane: &Arc<ControlPlane>,
+        card: Card,
+        accumulator: Arc<SpendAccumulator>,
+    ) -> FilterHarness {
+        let pricing_registry = Arc::new(PricingRegistry::new("test-chain"));
+        if let Some(json) = card.json() {
+            pricing_registry
+                .publish_json(&json)
+                .expect("the test card is valid");
+        }
+        FilterHarness {
+            accumulator,
+            usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            unpriced_warner: Arc::new(UnpricedWarner::new("test-chain".to_string())),
+            pricing_registry,
+            snapshot: control_plane.handle(),
+        }
+    }
+
+    /// A harness wired to `control_plane`'s snapshot, `card` as the chain's
+    /// rate card, and a fresh accumulator with the given `default_period` -- everything
     /// a decode+encode cycle needs, with no background flusher thread (tests
     /// drive `flush_now`/`current_total` directly where they need to, exactly
     /// like `spend.rs`'s own accumulator tests).
     fn filter_with(
         control_plane: &Arc<ControlPlane>,
-        price_table: PriceTable,
+        card: Card,
         default_period: Period,
     ) -> FilterHarness {
         let store: Arc<dyn ControlPlaneStore> = Arc::new(InMemoryControlPlaneStore::default());
@@ -1643,14 +1503,7 @@ mod tests {
             default_period,
             "test-node".to_string(),
         ));
-        FilterHarness {
-            price_table: Arc::new(price_table),
-            accumulator,
-            usage_missing_warner: Arc::new(UsageMissingWarner::new()),
-            unpriced_warner: Arc::new(UnpricedWarner::new("test-chain".to_string())),
-            pricing_registry: Arc::new(PricingRegistry::new("test-chain")),
-            snapshot: control_plane.handle(),
-        }
+        harness(control_plane, card, accumulator)
     }
 
     /// `filter_with`, but with a reconciliation bound of ZERO, so the
@@ -1661,7 +1514,7 @@ mod tests {
     /// `<=`, so a zero bound is still reconciled at age exactly zero.
     fn stale_filter_with(
         control_plane: &Arc<ControlPlane>,
-        price_table: PriceTable,
+        card: Card,
         default_period: Period,
     ) -> FilterHarness {
         let store: Arc<dyn ControlPlaneStore> = Arc::new(InMemoryControlPlaneStore::default());
@@ -1678,14 +1531,7 @@ mod tests {
         while accumulator.reconciliation_age(chrono::Utc::now()) == Duration::ZERO {
             std::hint::spin_loop();
         }
-        FilterHarness {
-            price_table: Arc::new(price_table),
-            accumulator,
-            usage_missing_warner: Arc::new(UsageMissingWarner::new()),
-            unpriced_warner: Arc::new(UnpricedWarner::new("test-chain".to_string())),
-            pricing_registry: Arc::new(PricingRegistry::new("test-chain")),
-            snapshot: control_plane.handle(),
-        }
+        harness(control_plane, card, accumulator)
     }
 
     /// Drives one full request/response cycle against a FRESH
@@ -1772,15 +1618,8 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "first",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "first", 1_000_000);
         filter_with(&cp, table, Period::Monthly)
     }
 
@@ -1832,7 +1671,7 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let harness = stale_filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = stale_filter_with(&cp, Card::default(), Period::Monthly);
 
         let (reply, _cb) = run_request(&harness, "tenant-a", None, Some(10));
 
@@ -1857,7 +1696,7 @@ mod tests {
     #[test]
     fn an_unbudgeted_request_admitted_while_stale_is_not_counted() {
         let cp = control_plane_with(&[]);
-        let harness = stale_filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = stale_filter_with(&cp, Card::default(), Period::Monthly);
 
         let (reply, _cb) = run_request(&harness, "tenant-no-budget", None, Some(10));
 
@@ -1885,7 +1724,7 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let harness = stale_filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = stale_filter_with(&cp, Card::default(), Period::Monthly);
 
         let (reply, _cb) = run_request(&harness, "tenant-a", None, Some(10));
 
@@ -1920,7 +1759,7 @@ mod tests {
     #[test]
     fn an_unpriced_model_under_a_budget_warns_once_per_model() {
         let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
 
         let (capture, guard) = crate::control::log_capture::Capture::start();
         for _ in 0..3 {
@@ -1964,7 +1803,7 @@ mod tests {
     #[test]
     fn an_unpriced_model_without_a_budget_stays_silent() {
         let cp = control_plane_with(&[]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
 
         let (capture, guard) = crate::control::log_capture::Capture::start();
         run_request(
@@ -1989,15 +1828,8 @@ mod tests {
     #[test]
     fn a_priced_request_neither_warns_nor_touches_the_suppression_state() {
         let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "priced",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "priced", 1_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
 
         let (capture, guard) = crate::control::log_capture::Capture::start();
@@ -2017,7 +1849,7 @@ mod tests {
     #[test]
     fn the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary() {
         let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let extra = 20;
 
         let (capture, guard) = crate::control::log_capture::Capture::start();
@@ -2066,7 +1898,7 @@ mod tests {
                 ..dollar_budget()
             },
         )]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
@@ -2100,7 +1932,7 @@ mod tests {
     #[test]
     fn a_published_card_ends_the_warning_for_the_models_it_prices() {
         let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         harness
             .pricing_registry
             .publish_json(
@@ -2136,7 +1968,7 @@ mod tests {
             ]},"providers":{"cluster-a":"openai"}}"#;
         let charged_for = |served: Option<&str>| {
             let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
-            let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+            let harness = filter_with(&cp, Card::default(), Period::Monthly);
             harness.pricing_registry.publish_json(card).unwrap();
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
@@ -2163,38 +1995,20 @@ mod tests {
         );
     }
 
-    /// With both a rate card and the legacy `pricing` table, the card prices
-    /// every model it lists and the table prices only the rest, so a stale
-    /// table entry never overrides the card that replicas share.
-    ///
-    /// Mutation: try `price_table.cost_of` before the registry, or drop the
-    /// table fallback.
+    /// One model priced differently on two clusters charges each request at
+    /// the rate of the cluster actually dialled, never the model's alone, so
+    /// a fallback is not billed at the primary's rate (AGENTS.md invariant 6).
     #[test]
-    fn the_card_wins_over_the_legacy_table_which_prices_only_the_rest() {
+    fn the_same_model_on_two_clusters_charges_the_dialled_clusters_rate() {
         let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
-        let mut table = PriceTable::new();
-        for model in ["gpt-5", "gpt-6"] {
-            table.insert(
-                "cluster-a",
-                model,
-                ModelPrices {
-                    input_per_million: MicroUsd::from_micros(3_000_000),
-                    ..Default::default()
-                },
-            );
-        }
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
+        table.insert("cluster-b", "m", 2_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
-        harness
-            .pricing_registry
-            .publish_json(
-                r#"{"price_list":{"effective_from":"2026-01-01T00:00:00Z","entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":1000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":1000}]}]},"providers":{"cluster-a":"openai"}}"#,
-            )
-            .unwrap();
-
-        run_request(&harness, "tenant-a", Some(("cluster-a", "gpt-5")), Some(10));
-        assert_eq!(spent(&harness), 10, "the card's 1 micro per token, not 3");
-        run_request(&harness, "tenant-a", Some(("cluster-a", "gpt-6")), Some(10));
-        assert_eq!(spent(&harness), 40, "the card lacks gpt-6: the table's 3");
+        run_request(&harness, "tenant-a", Some(("cluster-b", "m")), Some(10));
+        assert_eq!(spent(&harness), 20, "cluster-b's 2 micro-dollars per token");
+        run_request(&harness, "tenant-a", Some(("cluster-a", "m")), Some(10));
+        assert_eq!(spent(&harness), 30, "then cluster-a's 1");
     }
 
     // --- no tenant / no budget: admitted -----------------------------------
@@ -2202,7 +2016,7 @@ mod tests {
     #[test]
     fn no_authenticated_tenant_is_admitted_and_nothing_is_recorded() {
         let cp = control_plane_with(&[]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let mut filter = harness.new_instance();
 
         let mut cb = TestCallbacks::new();
@@ -2224,7 +2038,7 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.stream_info.borrow_mut().auth.tenant = Some("tenant-a".into());
@@ -2243,15 +2057,8 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
         let mut first = harness.new_instance();
         let mut second = harness.new_instance();
@@ -2294,23 +2101,9 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "first",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
-        table.insert(
-            "cluster-b",
-            "second",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(2_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "first", 1_000_000);
+        table.insert("cluster-b", "second", 2_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
         assert!(
             run_request(&harness, "tenant-a", Some(("cluster-a", "first")), Some(1))
@@ -2359,15 +2152,8 @@ mod tests {
         .unwrap();
         let second = KeyId::new("second-key");
         cp.mint_key(&tenant, &second).unwrap();
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
         assert!(
             run_request(&harness, "tenant-a", Some(("cluster-a", "m")), Some(2))
@@ -2425,15 +2211,8 @@ mod tests {
     #[test]
     fn tenant_reports_track_priced_and_unpriced_requests_without_a_budget() {
         let cp = control_plane_with(&[]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
         run_request(&harness, "tenant-a", Some(("cluster-a", "m")), Some(2));
         run_request(&harness, "tenant-a", Some(("unknown", "m")), Some(3));
@@ -2462,7 +2241,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let (reply, _) = run_request(&harness, "tenant-a", None, None);
         assert_eq!(reply.unwrap().0, StatusCode::TOO_MANY_REQUESTS);
         assert!(run_request(&harness, "other-tenant", None, None)
@@ -2482,7 +2261,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         for missing_key in [false, true] {
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
@@ -2516,7 +2295,7 @@ mod tests {
                     Ok(cp.clone() as Arc<dyn std::any::Any + Send + Sync>)
                 })
                 .unwrap();
-            let mut config = spend_limit_config(vec![]);
+            let mut config = spend_limit_config();
             let error = SpendLimitFilterFactory
                 .create(&config, &ctx)
                 .err()
@@ -2566,7 +2345,7 @@ mod tests {
             })
             .expect("registering the control plane must succeed");
 
-        let config = spend_limit_config(vec![]);
+        let config = spend_limit_config();
         SpendLimitFilterFactory
             .create(&config, &ctx)
             .expect("create must succeed with a ControlPlane registered");
@@ -2645,7 +2424,7 @@ mod tests {
             .unwrap();
 
         let (capture, guard) = crate::control::log_capture::Capture::start();
-        let built = SpendLimitFilterFactory.create(&spend_limit_config(vec![]), &ctx);
+        let built = SpendLimitFilterFactory.create(&spend_limit_config(), &ctx);
         drop(guard);
 
         assert!(built.is_ok(), "a prefetch failure is not a config error");
@@ -2665,15 +2444,8 @@ mod tests {
     #[test]
     fn a_tenant_with_no_configured_budget_is_admitted_unlimited() {
         let cp = control_plane_with(&[]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let filter = filter_with(&cp, table, Period::Monthly);
 
         // A huge usage that would exhaust virtually any real budget -- an
@@ -2700,15 +2472,8 @@ mod tests {
             },
         )]);
 
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let filter = filter_with(&cp, table, Period::Monthly);
 
         // 9,000,000 input tokens at $1/million = $9 = 9,000,000 micros --
@@ -2770,7 +2535,7 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let mut filter = harness.new_instance();
 
         let mut cb = TestCallbacks::new();
@@ -2803,7 +2568,7 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
         let mut filter = harness.new_instance();
 
         let mut cb = TestCallbacks::new();
@@ -2831,7 +2596,7 @@ mod tests {
             },
         )]);
         // An EMPTY price table -- every (cluster, model) is unpriced.
-        let filter = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let filter = filter_with(&cp, Card::default(), Period::Monthly);
 
         for _ in 0..5 {
             let (reply, _cb) = run_request(
@@ -2869,15 +2634,8 @@ mod tests {
             .expect("tenant creation must succeed");
         cp.mint_key(&tenant, &key_id)
             .expect("key mint must succeed");
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let filter = filter_with(&cp, table, Period::Monthly);
 
         // Before any budget is set: unlimited.
@@ -2928,15 +2686,8 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let filter = filter_with(&cp, table, Period::Monthly);
 
         // Exhaust today's budget.
@@ -3030,7 +2781,7 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let filter = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let filter = filter_with(&cp, Card::default(), Period::Monthly);
 
         let capture = Arc::new(WarnCapture::new());
         let guard = tracing::subscriber::set_default(capture.clone());
@@ -3053,7 +2804,7 @@ mod tests {
     #[test]
     fn missing_usage_on_an_unbudgeted_tenant_stays_silent() {
         let cp = control_plane_with(&[]);
-        let filter = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let filter = filter_with(&cp, Card::default(), Period::Monthly);
 
         let capture = Arc::new(WarnCapture::new());
         let guard = tracing::subscriber::set_default(capture.clone());
@@ -3091,7 +2842,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
 
         // Platform mode: no tenant credentials on StreamInfo.
         let mut filter = harness.new_instance();
@@ -3133,7 +2884,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+        let harness = filter_with(&cp, Card::default(), Period::Monthly);
 
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
@@ -3184,15 +2935,8 @@ mod tests {
             }),
         )
         .unwrap();
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
 
         let run = |harness: &FilterHarness, mode: CredentialSource| {
             let mut filter = harness.new_instance();
@@ -3267,15 +3011,8 @@ mod tests {
                 credential_source: CredentialSource::Platform,
             },
         )]);
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                ..Default::default()
-            },
-        );
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
         let harness = filter_with(&cp, table, Period::Monthly);
 
         let mut filter = harness.new_instance();
@@ -3332,7 +3069,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            let harness = filter_with(&cp, PriceTable::new(), Period::Monthly);
+            let harness = filter_with(&cp, Card::default(), Period::Monthly);
 
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
@@ -3384,7 +3121,7 @@ mod tests {
             .unwrap();
 
         assert!(SpendLimitFilterFactory
-            .create(&spend_limit_config(vec![]), &ctx)
+            .create(&spend_limit_config(), &ctx)
             .is_ok());
 
         assert_eq!(rendered_age(&registry, "ingress", Seam::Spend), Some(0));

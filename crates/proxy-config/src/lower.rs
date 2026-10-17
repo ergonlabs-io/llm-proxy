@@ -613,21 +613,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // this is the forward-compat guard that rejects a future proto field
         // until a reader is deliberately added.
         "llmproxy.filters.v0.SpendLimit" => &[
-            "pricing",
             "default_period",
             "flush_interval_seconds",
             "reconciliation_bound_seconds",
             "on_reconciliation_expired",
             "recovery_journal_path",
             "legacy_tenant_budget_cutover",
-        ],
-        "llmproxy.filters.v0.ClusterPricing" => &["cluster", "models"],
-        "llmproxy.filters.v0.ModelPrice" => &[
-            "model",
-            "input_per_million",
-            "output_per_million",
-            "cached_per_million",
-            "cache_creation_per_million",
         ],
         "llmproxy.filters.v0.TokenLimit" => &["max_tokens", "fill_rate", "rules"],
         "llmproxy.filters.v0.LimitRule" => &[

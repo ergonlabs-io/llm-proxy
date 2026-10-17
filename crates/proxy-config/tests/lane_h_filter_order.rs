@@ -105,7 +105,7 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         LEGACY_BODY_REWRITE => "\n                      default_value: true\n                      runtime_key: openai",
         MODEL_AUTHZ => "\n                      policies: []",
         MODEL_RESOLVER => "\n                      rules: { default_model: fast }",
-        SPEND_LIMIT => "\n                      pricing: []",
+        SPEND_LIMIT => "\n                      default_period: MONTHLY",
         other => panic!("unexpected type url {other}"),
     };
     format!(
@@ -360,6 +360,34 @@ fn model_authz_before_body_rewrite_is_rejected_because_the_authz_filter_would_se
     assert!(
         reason.contains("no model"),
         "the reason must say what actually goes wrong: {reason}"
+    );
+}
+
+// --- removed fields --------------------------------------------------
+
+/// `SpendLimit.pricing` was removed: the chain's rate card prices every
+/// request. A config that still sets it fails at load naming the field, and
+/// never loads with its prices silently ignored (AGENTS.md invariant 1).
+#[test]
+fn a_spend_limit_that_still_sets_pricing_is_rejected_naming_the_field() {
+    let auth = filter_entry("llmproxy.auth", AUTH);
+    let entries = format!(
+        r#"{auth}                  - name: llmproxy.spend_limit
+                    typed_config:
+                      "@type": {SPEND_LIMIT}
+                      pricing:
+                      - cluster: provider-a
+                        models:
+                        - model: m
+                          input_per_million: "1.00"
+"#
+    );
+    let err = snapshot_with_filters(&entries)
+        .expect_err("a removed field must be a load error, not silently ignored");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("http_filters[1].typed_config.pricing"),
+        "the error must name the removed field by its dotted path: {rendered}"
     );
 }
 

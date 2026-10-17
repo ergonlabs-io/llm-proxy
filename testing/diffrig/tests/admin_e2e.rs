@@ -147,23 +147,12 @@ static_resources:
               # that unless the filter sets the cutover, because the next start
               # would otherwise refuse the stored budget.
               legacy_tenant_budget_cutover: START_KEYS_FRESH
-              pricing:
-              - cluster: provider:p1
-                models:
-                - model: {MODEL_ALLOWED}
-                  input_per_million: "500000.00"
-                  output_per_million: "500000.00"
-                  cached_per_million: "0.00"
-                  cache_creation_per_million: "0.00"
-                - model: {MODEL_DENIED}
-                  input_per_million: "500000.00"
-                  output_per_million: "500000.00"
-                  cached_per_million: "0.00"
-                  cache_creation_per_million: "0.00"
           - name: llmproxy.usage
             typed_config:
-              '@type': type.llmproxy.dev/envoy.config.core.v3.DataSource
-              inline_string: openai
+              '@type': type.llmproxy.dev/llmproxy.filters.v0.Usage
+              dialect: openai
+              # $0.50 per token in and out on provider:p1.
+              pricing_json: '{{"price_list":{{"effective_from":"2026-01-01T00:00:00Z","entries":[{{"provider_type":"p1","model":"{MODEL_ALLOWED}","tier_mode":"whole_request","tiers":[{{"input_nanodollars_per_token":500000000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":500000000}}]}},{{"provider_type":"p1","model":"{MODEL_DENIED}","tier_mode":"whole_request","tiers":[{{"input_nanodollars_per_token":500000000,"cached_input_nanodollars_per_token":0,"cache_write_nanodollars_per_token":0,"output_nanodollars_per_token":500000000}}]}}]}},"providers":{{"provider:p1":"p1"}}}}'
           - name: envoy.filters.http.router
             typed_config:
               '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -195,8 +184,8 @@ static_resources:
                     default_value: true
                     runtime_key: openai
                   llmproxy.usage:
-                    '@type': type.llmproxy.dev/envoy.config.core.v3.DataSource
-                    inline_string: openai
+                    '@type': type.llmproxy.dev/llmproxy.filters.v0.Usage
+                    dialect: openai
           stat_prefix: llmproxy
     name: llmproxy_listener
 "#

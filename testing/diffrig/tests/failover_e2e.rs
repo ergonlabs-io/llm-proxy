@@ -223,41 +223,6 @@ async fn spawn_billing_suite(
         .expect("lower billing config")
         .bootstrap;
 
-    let filters = bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
-        ["typed_config"]["http_filters"]
-        .as_array_mut()
-        .expect("lowered HTTP filter list");
-    // `auth` already made the dialect emit `llmproxy.spend_limit`. Give that
-    // filter its own per-cluster prices; inserting a second one would charge
-    // every request twice.
-    let spend = filters
-        .iter_mut()
-        .find(|filter| filter["name"] == "llmproxy.spend_limit")
-        .expect("the dialect emits spend_limit when auth is configured");
-    spend["typed_config"]["pricing"] = json!(
-        [
-            {
-                "cluster": "provider:openai",
-                "models": [{
-                    "model": "gpt-4o-mini",
-                    "input_per_million": "1000000.00",
-                    "output_per_million": "1000000.00",
-                    "cached_per_million": "0.00",
-                    "cache_creation_per_million": "0.00"
-                }]
-            },
-            {
-                "cluster": "provider:standby",
-                "models": [{
-                    "model": "gpt-4o-mini",
-                    "input_per_million": "2000000.00",
-                    "output_per_million": "3000000.00",
-                    "cached_per_million": "0.00",
-                    "cache_creation_per_million": "0.00"
-                }]
-            }
-                ]
-    );
     bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
         ["typed_config"]["access_log"][0]["typed_config"]["log_format"] = json!({
         "text_format": "%UPSTREAM_CLUSTER% %LLM_INPUT_TOKENS% %LLM_OUTPUT_TOKENS% %LLM_LIST_COST% %LLM_KEY_ID% %LLM_TENANT% %LLM_USER_ID% %LLM_REQUESTED_MODEL% %LLM_SELECTED_MODEL% %LLM_RATE_CARD_VERSION% %RESPONSE_CODE%\n"

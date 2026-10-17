@@ -74,7 +74,7 @@ and did not is worse than no limit at all.
  │  auth      virtual keys (HMAC-SHA256, constant time)     │
  │  model     per-tenant model allow-lists                  │
  │  limits    per-tenant token budgets, windowed            │
- │  spend     currency budgets from a price table           │
+ │  spend     currency budgets from the rate card           │
  │  usage     token accounting, streaming and not           │
  │                                                          │
  └──────────────────────┬───────────────────────────────────┘
@@ -286,8 +286,7 @@ a changed configured rate card applies from the first new connection.
 dollar budget. The proxy does not refuse the request. It logs one warning for
 each chain and model, with the reason, and stops logging that model. It names at
 most 256 models per chain, then logs one summary line. A model has no price when
-the rate card has no entry for it and the `pricing` list of `llmproxy.spend_limit`
-has none either. `PUT /pricing` replaces the whole rate card, so a model that is
+the rate card has no entry for it. `PUT /pricing` replaces the whole rate card, so a model that is
 missing from the new rate card has no price. The access log shows `-` for
 `%LLM_LIST_COST%` when the rate card has no price. `GET /keys/{id}/spend` counts
 these requests in `unpriced_requests`.

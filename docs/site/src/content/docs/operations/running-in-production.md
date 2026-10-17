@@ -81,17 +81,16 @@ http_filters:
   - name: llmproxy.spend_limit
     typed_config:
       "@type": type.llmproxy.dev/llmproxy.filters.v0.SpendLimit
-      pricing:
-        - cluster: openai-primary
-          models:
-            - model: gpt-5
-              input_per_million: "2.50"
-              output_per_million: "10.00"
-              cached_per_million: "1.25"
-              cache_creation_per_million: "3.75"
       recovery_journal_path: /var/lib/llmproxy/spend-recovery.redb
       flush_interval_seconds: 5
       reconciliation_bound_seconds: 60
+  # The rate card prices every request that spend_limit charges. With a
+  # shared store it seeds the store once; PUT /pricing replaces it.
+  - name: llmproxy.usage
+    typed_config:
+      "@type": type.llmproxy.dev/llmproxy.filters.v0.Usage
+      dialect: openai
+      pricing_json: '{"price_list":{"effective_from":"2026-01-01T00:00:00Z","entries":[{"provider_type":"openai","model":"gpt-5","tier_mode":"whole_request","tiers":[{"input_nanodollars_per_token":2500,"cached_input_nanodollars_per_token":1250,"cache_write_nanodollars_per_token":3750,"output_nanodollars_per_token":10000}]}]},"providers":{"openai-primary":"openai"}}'
   - name: envoy.filters.http.router
     typed_config:
       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -469,9 +468,8 @@ are keyed by its node ID.
   `%LLM_RATE_CARD_VERSION%` values in the access logs. The version covers the
   prices and the cluster-to-provider map.
 
-  `PUT /pricing` does not change the `pricing` list of `llmproxy.spend_limit`.
-  The spend filter uses that list only for a request that the rate card does not
-  price. A request that neither prices, under a dollar budget, adds $0 to the
+  The rate card is the only price source for `llmproxy.spend_limit`. A request
+  that the rate card does not price, under a dollar budget, adds $0 to the
   budget and logs one warning per chain and model. The fields and the limits of
   `PUT /pricing` are in
   [`pricing`](../../configuration/configuration-file/#pricing-pricing).

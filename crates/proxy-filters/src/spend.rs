@@ -1,12 +1,11 @@
-//! Pure request-cost calculations used by the spend filter.
+//! Spend accounting for the spend filter: money, periods, and the
+//! accumulator that reconciles with the store.
 //!
-//! Prices are keyed by the dialled `(cluster, model)` because fallback
-//! clusters may charge differently (AGENTS.md invariant 6). Integer
-//! micro-dollars avoid floating-point drift; four token buckets are priced
-//! independently and rounded once per request. Missing prices remain
-//! distinguishable from configured zero rates so gaps can be reported while
-//! metering stays fail-open (AGENTS.md "Fail-open controls"). Model matching
-//! is exact to keep billing independent of config order.
+//! Cost comes from the chain's rate card (`crate::pricing`), which prices the
+//! dialled cluster (AGENTS.md invariant 6). Integer micro-dollars avoid
+//! floating-point drift. An unpriced request stays distinguishable from a
+//! configured zero rate so gaps can be reported while metering stays
+//! fail-open (AGENTS.md "Fail-open controls").
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -23,7 +22,6 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::control::{ControlPlaneStore, SpendDelta, StoreError};
 use crate::reconciliation_age::{ReconciliationAgeGauge, Seam};
-use crate::usage::TokenUsage;
 use proxy_http::tenant_credentials::CredentialSource;
 
 /// An amount of money in integer micro-dollars (1e-6 USD). See the module
@@ -44,8 +42,8 @@ pub struct MicroUsd(u64);
 
 impl MicroUsd {
     /// Construct directly from an already-computed micro-dollar amount.
-    /// Public mainly for tests and for [`ModelPrices`] literals; production
-    /// callers get a `MicroUsd` from [`parse_micro_usd`] or [`Charge`].
+    /// Public mainly for tests; production callers get a `MicroUsd` from
+    /// [`parse_micro_usd`] or [`Charge`].
     pub const fn from_micros(micros: u64) -> Self {
         MicroUsd(micros)
     }
@@ -157,16 +155,6 @@ pub fn parse_micro_usd(s: &str) -> Result<MicroUsd, ParsePriceError> {
         .ok_or(ParsePriceError::Overflow)
 }
 
-/// One `(cluster, model)` pair's four independent per-1,000,000-token rates.
-/// See the module doc's "Four buckets" section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ModelPrices {
-    pub input_per_million: MicroUsd,
-    pub output_per_million: MicroUsd,
-    pub cached_per_million: MicroUsd,
-    pub cache_creation_per_million: MicroUsd,
-}
-
 /// What one request cost, distinguishing "this rate is configured and
 /// happens to be zero" from "no rate is configured at all". See the module
 /// doc's "An unpriced ... costs ZERO" section for why collapsing these two
@@ -183,123 +171,13 @@ pub enum Charge {
     Unpriced,
 }
 
-/// The parsed `(cluster, model)` price lookup.
-///
-/// Rust note: `by_cluster` is a `HashMap<String, HashMap<String,
-/// ModelPrices>>` -- nested, not a single `HashMap<(String, String),
-/// ModelPrices>`. [`PriceTable::cost_of`] is meant to run on every priced
-/// request once wired into a filter (the hot path), and a flat
-/// tuple-keyed map cannot be looked up by two borrowed `&str`s without
-/// allocating a fresh owned `(String, String)` first -- a tuple's `Borrow`
-/// impl does not let two owned `String`s be matched against two `&str`s the
-/// way `HashMap<String, _>::get(&str)` can. Nesting looks up both levels by
-/// `&str` with zero allocation, and it happens to mirror the actual config
-/// shape one level deeper than the wire format collapses it: `ClusterPricing`
-/// already groups a cluster's `ModelPrice`s together in `spend.proto`.
-#[derive(Debug, Clone, Default)]
-pub struct PriceTable {
-    by_cluster: HashMap<String, HashMap<String, ModelPrices>>,
-}
-
-impl PriceTable {
-    /// An empty table: every `(cluster, model)` pair is unpriced.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Configures `prices` for `(cluster, model)`, overwriting any price
-    /// previously set for the same pair.
-    pub fn insert(
-        &mut self,
-        cluster: impl Into<String>,
-        model: impl Into<String>,
-        prices: ModelPrices,
-    ) {
-        self.by_cluster
-            .entry(cluster.into())
-            .or_default()
-            .insert(model.into(), prices);
-    }
-
-    /// What one request cost, given the cluster it was actually dialled
-    /// against and its extracted model name.
-    ///
-    /// `cluster`/`model` are `Option<&str>` because either can be genuinely
-    /// absent (a request refused before reaching an upstream has no dialled
-    /// cluster; a request with no extractable model has no model) -- either
-    /// `None` is [`Charge::Unpriced`], never an error. See the module doc's
-    /// "Keyed on (cluster, model)" section for why BOTH must match a
-    /// configured entry: this is what keeps a fallback's cost from being
-    /// billed at the primary's rate.
-    pub fn cost_of(
-        &self,
-        cluster: Option<&str>,
-        model: Option<&str>,
-        usage: &TokenUsage,
-    ) -> Charge {
-        let (Some(cluster), Some(model)) = (cluster, model) else {
-            return Charge::Unpriced;
-        };
-        let Some(prices) = self
-            .by_cluster
-            .get(cluster)
-            .and_then(|models| models.get(model))
-        else {
-            return Charge::Unpriced;
-        };
-
-        // Every bucket contributes its EXACT numerator; the sum is rounded
-        // once, at the end. Rounding each bucket first would round up to four
-        // times per request -- see the module doc's "Rounding" section for the
-        // worked example of why that is a real overcharge on small requests,
-        // not a theoretical one.
-        let numerator = bucket_numerator(prices.input_per_million, usage.input_tokens)
-            + bucket_numerator(prices.output_per_million, usage.output_tokens)
-            + bucket_numerator(prices.cached_per_million, usage.cached_tokens)
-            + bucket_numerator(
-                prices.cache_creation_per_million,
-                usage.cache_creation_tokens,
-            );
-        Charge::Priced(MicroUsd(round_once(numerator)))
-    }
-}
-
-/// `tokens` priced at `rate_per_million` micro-dollars per 1,000,000 tokens,
-/// as an EXACT un-rounded numerator over 1,000,000. Rounding happens once,
-/// in [`round_once`], after all four buckets are summed -- see the module
-/// doc's "Rounding" section for why not per bucket.
-///
-/// Rust note: the multiply happens in `u128`, not `u64`. `rate_per_million`
-/// and `tokens` are each already-validated `u64`s, and their product can
-/// exceed `u64::MAX` before the division by 1,000,000 brings it back down
-/// (the worst case, `u64::MAX * u64::MAX`, still fits in a `u128` -- it is
-/// about `2^128 - 2^65`, under `u128::MAX = 2^128 - 1`). Multiplying in `u64`
-/// first and dividing after would be the classic "overflow the numerator of
-/// an otherwise-in-range division" bug. The final `.min(u64::MAX as u128)` is
-/// a saturate for the pathological case where even the rounded RESULT still
-/// does not fit in a `u64` (an unrealistic rate/usage combination) -- this is
-/// a billing path, so an overflow here must be a can't-happen, never a panic
-/// or a silent wraparound.
-fn bucket_numerator(rate_per_million: MicroUsd, tokens: u64) -> u128 {
-    u128::from(rate_per_million.as_micros()) * u128::from(tokens)
-}
-
-/// Sums the four buckets' exact numerators and rounds ONCE, half-up, to whole
-/// micro-dollars. See the module doc's "Rounding" section.
-fn round_once(numerator: u128) -> u64 {
-    // Round-half-up via "add half the divisor before flooring" -- the
-    // standard integer trick, valid here because the operand is non-negative.
-    let rounded = (numerator + 500_000) / 1_000_000;
-    rounded.min(u128::from(u64::MAX)) as u64
-}
-
 // ============================================================================
 // Periods, the accumulator, and the flusher.
 // ============================================================================
 //
-// [`PriceTable`] above answers "what did this request cost"; everything
-// below answers "how much has this tenant spent this period, and when does
-// the durable store find out".
+// Everything below answers "how much has this tenant spent this period, and
+// when does the durable store find out". The rate card answers "what did this
+// request cost" (`crate::pricing`).
 //
 // # Rollover happens on RECORD, never on the flush tick -- a correctness
 // property, not an optimization
@@ -2248,15 +2126,6 @@ impl Drop for SpendAccumulator {
 pub(crate) mod tests {
     use super::*;
 
-    fn usage(input: u64, cached: u64, cache_creation: u64, output: u64) -> TokenUsage {
-        TokenUsage {
-            input_tokens: input,
-            cached_tokens: cached,
-            cache_creation_tokens: cache_creation,
-            output_tokens: output,
-        }
-    }
-
     // --- parse_micro_usd ---------------------------------------------------
 
     #[test]
@@ -2326,235 +2195,6 @@ pub(crate) mod tests {
         assert_eq!(
             parse_micro_usd("99999999999999999999"),
             Err(ParsePriceError::Overflow)
-        );
-    }
-
-    // --- PriceTable::cost_of ------------------------------------------------
-
-    /// The rule-6 centerpiece: the SAME model priced differently on two
-    /// clusters must charge each cluster's own rate, keyed on the cluster the
-    /// request was actually dialled against -- never the model alone. This is
-    /// the exact hazard AGENTS.md invariant 6 names for credentials and
-    /// `host_rewrite_literal`, restated for money: a lookup that ignored the
-    /// cluster would bill a request the fallback served at the primary's
-    /// rate.
-    #[test]
-    fn same_model_priced_differently_on_two_clusters_charges_the_dialled_clusters_own_rate() {
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "shared-model",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(10_000_000),
-                output_per_million: MicroUsd::from_micros(0),
-                cached_per_million: MicroUsd::from_micros(0),
-                cache_creation_per_million: MicroUsd::from_micros(0),
-            },
-        );
-        table.insert(
-            "cluster-b",
-            "shared-model",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(1_000_000),
-                output_per_million: MicroUsd::from_micros(0),
-                cached_per_million: MicroUsd::from_micros(0),
-                cache_creation_per_million: MicroUsd::from_micros(0),
-            },
-        );
-        let u = usage(1_000_000, 0, 0, 0);
-
-        assert_eq!(
-            table.cost_of(Some("cluster-a"), Some("shared-model"), &u),
-            Charge::Priced(MicroUsd::from_micros(10_000_000)),
-            "cluster-a's own rate must apply when cluster-a was dialled"
-        );
-        assert_eq!(
-            table.cost_of(Some("cluster-b"), Some("shared-model"), &u),
-            Charge::Priced(MicroUsd::from_micros(1_000_000)),
-            "cluster-b's own (cheaper) rate must apply when cluster-b was dialled, \
-             even though cluster-a prices the identical model name"
-        );
-    }
-
-    #[test]
-    fn unpriced_cluster_is_distinct_from_a_configured_zero_rate() {
-        let mut table = PriceTable::new();
-        table.insert("priced-cluster", "m", ModelPrices::default());
-        let u = usage(1_000_000, 0, 0, 0);
-
-        assert_eq!(
-            table.cost_of(Some("priced-cluster"), Some("m"), &u),
-            Charge::Priced(MicroUsd::from_micros(0)),
-            "an explicitly configured all-zero price is Priced(0), not Unpriced"
-        );
-        assert_eq!(
-            table.cost_of(Some("unknown-cluster"), Some("m"), &u),
-            Charge::Unpriced
-        );
-    }
-
-    #[test]
-    fn unpriced_model_on_a_known_cluster_is_unpriced() {
-        let mut table = PriceTable::new();
-        table.insert("cluster-a", "priced-model", ModelPrices::default());
-        let u = usage(1_000_000, 0, 0, 0);
-
-        assert_eq!(
-            table.cost_of(Some("cluster-a"), Some("unpriced-model"), &u),
-            Charge::Unpriced
-        );
-    }
-
-    #[test]
-    fn none_cluster_is_unpriced() {
-        let mut table = PriceTable::new();
-        table.insert("cluster-a", "m", ModelPrices::default());
-        let u = usage(1_000_000, 0, 0, 0);
-
-        assert_eq!(table.cost_of(None, Some("m"), &u), Charge::Unpriced);
-    }
-
-    #[test]
-    fn none_model_is_unpriced() {
-        let mut table = PriceTable::new();
-        table.insert("cluster-a", "m", ModelPrices::default());
-        let u = usage(1_000_000, 0, 0, 0);
-
-        assert_eq!(table.cost_of(Some("cluster-a"), None, &u), Charge::Unpriced);
-    }
-
-    /// All four buckets charged at their own configured rate -- a usage with
-    /// tokens in every bucket must not let any bucket "leak" into another's
-    /// rate (in particular, cached tokens must not be billed at the input
-    /// rate, the specific overcharge the module doc calls out).
-    #[test]
-    fn all_four_buckets_are_charged_at_their_own_independent_rate() {
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(4_000_000),
-                cached_per_million: MicroUsd::from_micros(1_000_000),
-                cache_creation_per_million: MicroUsd::from_micros(2_000_000),
-                output_per_million: MicroUsd::from_micros(8_000_000),
-            },
-        );
-        // 1,000,000 tokens in each bucket -> each bucket's cost is exactly
-        // its own per-million rate.
-        let u = usage(1_000_000, 1_000_000, 1_000_000, 1_000_000);
-
-        let Charge::Priced(cost) = table.cost_of(Some("cluster-a"), Some("m"), &u) else {
-            panic!("expected a priced charge");
-        };
-        assert_eq!(
-            cost,
-            MicroUsd::from_micros(4_000_000 + 1_000_000 + 2_000_000 + 8_000_000)
-        );
-    }
-
-    #[test]
-    fn a_usage_with_only_cached_tokens_is_not_charged_the_input_rate() {
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(100_000_000),
-                cached_per_million: MicroUsd::from_micros(1_000_000),
-                cache_creation_per_million: MicroUsd::from_micros(0),
-                output_per_million: MicroUsd::from_micros(0),
-            },
-        );
-        let u = usage(0, 1_000_000, 0, 0);
-
-        assert_eq!(
-            table.cost_of(Some("cluster-a"), Some("m"), &u),
-            Charge::Priced(MicroUsd::from_micros(1_000_000)),
-            "only cached tokens were used, so the cheap cached rate must apply, \
-             not the far higher input rate"
-        );
-    }
-
-    #[test]
-    fn a_large_realistic_usage_computes_exactly_without_overflow() {
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "big-model",
-            ModelPrices {
-                input_per_million: MicroUsd::from_micros(2_500_000), // $2.50
-                output_per_million: MicroUsd::from_micros(10_000_000), // $10.00
-                cached_per_million: MicroUsd::from_micros(250_000),  // $0.25
-                cache_creation_per_million: MicroUsd::from_micros(3_125_000), // $3.125
-            },
-        );
-        // 50 million input, 2 million output, 10 million cached, 1 million
-        // cache-creation tokens -- a large but realistic single-request
-        // usage (well within a day's aggregate for a busy tenant).
-        let u = usage(50_000_000, 10_000_000, 1_000_000, 2_000_000);
-
-        let expected = 50 * 2_500_000 + 2 * 10_000_000 + 10 * 250_000 + 3_125_000;
-        assert_eq!(
-            table.cost_of(Some("cluster-a"), Some("big-model"), &u),
-            Charge::Priced(MicroUsd::from_micros(expected))
-        );
-    }
-
-    #[test]
-    fn rounding_is_half_up_rather_than_truncating() {
-        // 1 micro-dollar per million tokens, 500,000 tokens -> exactly half a
-        // micro-dollar -> rounds up to 1, not down to 0.
-        assert_eq!(
-            round_once(bucket_numerator(MicroUsd::from_micros(1), 500_000)),
-            1
-        );
-        // 1 micro-dollar per million tokens, 499,999 tokens -> just under
-        // half -> rounds down to 0.
-        assert_eq!(
-            round_once(bucket_numerator(MicroUsd::from_micros(1), 499_999)),
-            0
-        );
-    }
-
-    #[test]
-    fn rounding_does_not_overflow_at_u64_extremes() {
-        // The worst-case product (u64::MAX * u64::MAX) must not panic and
-        // must saturate rather than wrap.
-        let result = round_once(bucket_numerator(MicroUsd::from_micros(u64::MAX), u64::MAX));
-        assert_eq!(result, u64::MAX);
-    }
-
-    /// Rounding happens ONCE over the summed buckets, never per bucket --
-    /// the module doc's worked example, as an executable assertion.
-    ///
-    /// Four buckets each costing exactly 0.6 micro-dollars total 2.4, which
-    /// rounds to 2. Rounding each bucket first would round each 0.6 up to 1
-    /// and charge 4 -- double, on exactly the kind of small request that
-    /// dominates real traffic.
-    #[test]
-    fn four_sub_micro_buckets_are_rounded_once_not_four_times() {
-        // 600_000 micro-dollars per million tokens * 1 token = 0.6
-        // micro-dollars per bucket, in each of the four buckets.
-        let rate = parse_micro_usd("0.600000").expect("a valid rate");
-        let mut table = PriceTable::new();
-        table.insert(
-            "cluster-a",
-            "m",
-            ModelPrices {
-                input_per_million: rate,
-                output_per_million: rate,
-                cached_per_million: rate,
-                cache_creation_per_million: rate,
-            },
-        );
-
-        assert_eq!(
-            table.cost_of(Some("cluster-a"), Some("m"), &usage(1, 1, 1, 1)),
-            Charge::Priced(MicroUsd::from_micros(2)),
-            "four 0.6-micro-dollar buckets are 2.4 in total and must round ONCE to 2 -- \
-             a result of 4 means each bucket was rounded up separately, which doubles \
-             the charge on small requests"
         );
     }
 

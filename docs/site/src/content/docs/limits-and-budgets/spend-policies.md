@@ -21,18 +21,17 @@ budgets cannot fire.
 
 Missing budget means unlimited; an explicit zero denies the first request.
 Charges use integer micro-dollars and the rate card for the provider actually
-dialled, including after fallback. A request that neither the rate card nor the
-`pricing` list of `llmproxy.spend_limit` prices adds $0 to every budget. The
+dialled, including after fallback. A request that the rate card does not price
+adds $0 to every budget. The
 spend reports count these requests in `unpriced_requests`.
 
 When a budget applies to such a request, the proxy logs one warning for each
 filter chain and model. The warning names the chain, the model, the cluster,
-and the reason. It also tells you to add the model to the rate card or to the
-`pricing` list. A request with no applicable budget logs nothing. The proxy
+and the reason. It also tells you to add the model to the rate card. A request with no applicable budget logs nothing. The proxy
 remembers at most 256 model names for each chain. After that it logs one
 summary line and names no more models. The request still adds $0 and still
 counts in `unpriced_requests`
-(`crates/proxy-filters/src/spend_limit_filter.rs:678-747`; tests
+(`crates/proxy-filters/src/spend_limit_filter.rs`; tests
 `an_unpriced_model_without_a_budget_stays_silent` and
 `the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary`).
 

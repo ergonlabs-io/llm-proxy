@@ -1,31 +1,30 @@
-// The price table for the spend-budget filter.
+// The spend-budget filter's configuration.
 //
 // Vendored for its own sake, same reasoning as `auth.proto` and
-// `model_authz.proto`: a price table is a REPEATED STRUCTURED record
-// (cluster, model, four independent per-bucket rates), which no existing
-// compiled Envoy message shapes, and it feeds a subsystem whose entire job is
-// to be right about money -- not something to carry as an unvalidated JSON
-// blob inside a borrowed field.
+// `model_authz.proto`. Prices are not configured here: the filter charges
+// from the chain's rate card (`llmproxy.filters.v0.Usage.pricing_json`, or
+// `PUT /pricing`), which the control-plane store shares across replicas.
 
 syntax = "proto3";
 
 package llmproxy.filters.v0;
 
-// The configured price table for the spend-budget filter (`llmproxy.spend_limit`).
+// The spend-budget filter (`llmproxy.spend_limit`).
 //
-// This message answers "what did this request cost" (`pricing`) and "what
-// reporting period does an unbudgeted tenant's spend accrue into"
-// (`default_period`). It deliberately does NOT carry the ceiling itself --
+// This message answers "what reporting period does an unbudgeted tenant's
+// spend accrue into" (`default_period`) and how spend reconciles with the
+// store. Cost comes from the chain's rate card. It deliberately does NOT carry the ceiling itself --
 // see this message's "Where the ceiling lives" note below -- and by 3c-ii it
 // also does not accumulate spend or enforce anything; 3c-iii-b is the filter
 // that reads this config, resolves the shared `SpendAccumulator` singleton,
 // and does both.
 message SpendLimit {
-  // The configured per-cluster price lists. An entry for a cluster that is
-  // never actually dialled by a request is simply never charged -- see
-  // `ClusterPricing.cluster`'s doc for why cluster names are not
-  // cross-checked against the snapshot at load.
-  repeated ClusterPricing pricing = 1;
+  // Was a per-cluster price table. Removed: one rate card prices every
+  // request, so replicas sharing a store cannot charge differently and each
+  // charge names its card version. A config that still sets `pricing` is a
+  // strict-mode load error.
+  reserved 1;
+  reserved "pricing";
 
   // The reporting period a tenant's spend accrues into when that tenant has
   // NO configured `TenantBudget` -- see `proxy_filters::spend::TenantBudget`
@@ -134,8 +133,7 @@ enum Period {
 // Where the ceiling itself lives, and why not here
 //
 // A tenant's spend CEILING (`TenantBudget` -- `max_micros` + its own
-// `period`) is deliberately NOT a field on `SpendLimit`, unlike the price
-// table above. It lives in the control plane
+// `period`) is deliberately NOT a field on `SpendLimit`. It lives in the control plane
 // (`proxy_filters::control::ControlPlane`, beside `ModelAccess`) and is set
 // through the admin API (`PUT /chains/{stat_prefix}/tenants/{id}/budget`),
 // the same seam the per-tenant model allow-lists use.
@@ -152,87 +150,8 @@ enum Period {
 //   effect on the next request with no reload" property that the admin write
 //   API and `ControlPlaneSnapshot` republish path exist to deliver. Bootstrap
 //   config is the wrong tool for a value that is expected to change while
-//   the process is running; prices, by contrast, are close to static
-//   deployment facts, which is why they DO belong in `typed_config`.
+//   the process is running.
 
-// One cluster's price list.
-//
-// AGENTS.md invariant 6 ("anything that varies per provider belongs on the
-// cluster, never on the route") has another instance here, beyond credentials
-// and `host_rewrite_literal`: pricing. The same model
-// name can be served by two clusters at two different rates -- `gpt-4o`
-// direct versus through a discounted secondary, say -- and a route only picks
-// an *aggregate*; the cluster is the *member* that actually gets dialled. A
-// price keyed on model alone (or, worse, attached to a `RouteEntry`) would
-// bill the primary's rate for a request the fallback actually served. That is
-// not a rounding error -- it is silently wrong billing, and it would only
-// show up when a failover happened.
-//
-// So pricing here is keyed on `cluster`, and the filter resolves it (in a
-// later increment) against `StreamInfo::upstream_cluster` -- the cluster the
-// router actually dialled, never the route's intended target. Nothing here
-// forces this field to name a cluster that exists in `static_resources`; a
-// typo'd or stale name is simply never matched at cost time, which is the
-// same "absent price is zero" semantic as an unpriced model (see
-// `ModelPrice`'s doc), not a separate failure mode to detect in this
-// increment.
-message ClusterPricing {
-  // Required, non-empty. The cluster name this price list applies to -- must
-  // match a `StreamInfo::upstream_cluster` value to ever be charged.
-  string cluster = 1;
-
-  // This cluster's per-model prices. A model absent from this list costs
-  // zero on this cluster -- see `ModelPrice`'s doc.
-  repeated ModelPrice models = 2;
-}
-
-// One model's per-token-bucket prices, on one cluster.
-message ModelPrice {
-  // Required, non-empty. Matched EXACTLY against the request's resolved
-  // model name -- deliberately unlike `model_authz.proto`'s `OnlyModels`,
-  // which allows one trailing `*` glob. A glob here would let one pattern
-  // match two models priced differently (`gpt-4*` matching both `gpt-4o` and
-  // `gpt-4-turbo` at, say, different rates), which would make the charged
-  // rate depend on iteration order over this list -- an unreproducible wrong
-  // answer in the one subsystem that must never produce one. So: exact match
-  // only, and a model this filter has never heard of is unpriced (zero), not
-  // an error -- see the semantics below.
-  string model = 1;
-
-  // The four fields below are decimal strings (e.g. `"2.50"`), not `double`.
-  // Money in binary floating point does not round-trip -- `0.1 + 0.2` is
-  // already not exactly `0.3` in IEEE 754 -- and a spend ceiling compared
-  // against a value that drifted through repeated float arithmetic is an
-  // unreproducible wrong answer, in the one subsystem whose entire job is to
-  // be right about money. Each string is parsed EXACTLY ONCE, at config load,
-  // into an integer number of micro-dollars (1e-6 USD); every operation after
-  // that point is integer arithmetic. See `proxy_filters::spend` for the
-  // parser and its documented rejection rules (more than six decimal places,
-  // a sign, non-numeric input, overflow).
-  //
-  // All four buckets are priced independently because providers price them
-  // independently: a cache-read token is typically billed at a steep
-  // discount off the base input rate, and a cache-write token at a premium
-  // over it. Charging cached tokens at the input rate -- collapsing the four
-  // buckets into two -- overcharges heavily on cache-heavy workloads, which
-  // is exactly the workload a proxy like this attracts. Each field is
-  // REQUIRED to be an explicit, valid decimal string -- an unset (empty)
-  // field is rejected by `parse_micro_usd`, not silently treated as a
-  // `"0.00"` rate, so a `ModelPrice` entry that forgot a bucket fails loudly
-  // at config load rather than quietly undercharging that bucket forever.
-  // To price a bucket at zero deliberately, write `"0.00"` for it. This is
-  // unrelated to a `ModelPrice`/`ClusterPricing` entry being absent
-  // entirely, which is the distinct "unpriced" semantic described above.
-
-  // Price per 1,000,000 standard (non-cached) input tokens.
-  string input_per_million = 2;
-  // Price per 1,000,000 output/completion tokens.
-  string output_per_million = 3;
-  // Price per 1,000,000 cache-READ input tokens.
-  string cached_per_million = 4;
-  // Price per 1,000,000 cache-WRITE input tokens.
-  string cache_creation_per_million = 5;
-}
 
 // Existing aggregate tenant history cannot establish per-key charges.
 enum LegacyTenantBudgetCutover {
