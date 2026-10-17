@@ -84,22 +84,36 @@ fn extract_unknown_field(message: &str) -> Option<String> {
 
 /// Replace `${VAR}` with the environment value; `$${` escapes a literal `${`.
 /// A missing variable is an error naming the variable — never an empty string.
+///
+/// References inside YAML comments are left alone, so a commented-out example
+/// such as `# api_key: ${OPENAI_API_KEY}` does not demand the variable.
+/// Interpolation stays textual (rather than walking parsed scalars) because
+/// `{ api_key: ${KEY} }` is not valid YAML until the reference is replaced,
+/// and because a substituted value keeps its YAML type (`port: ${PORT}`).
 fn interpolate_env(
     text: &str,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, ConfigError> {
+    let comment = comment_mask(text);
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(pos) = rest.find("${") {
-        if rest[..pos].ends_with('$') {
-            // `$${` -> literal `${`
-            out.push_str(&rest[..pos - 1]);
-            out.push_str("${");
-            rest = &rest[pos + 2..];
+    let mut first_unset: Option<&str> = None;
+    let mut offset = 0;
+    while let Some(found) = text[offset..].find("${") {
+        let pos = offset + found;
+        if comment[pos] {
+            out.push_str(&text[offset..pos + 2]);
+            offset = pos + 2;
             continue;
         }
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + 2..];
+        if text[offset..pos].ends_with('$') {
+            // `$${` -> literal `${`
+            out.push_str(&text[offset..pos - 1]);
+            out.push_str("${");
+            offset = pos + 2;
+            continue;
+        }
+        out.push_str(&text[offset..pos]);
+        let after = &text[pos + 2..];
         let end = after.find('}').ok_or_else(|| {
             ConfigError::Parse("unterminated `${` environment reference".to_string())
         })?;
@@ -109,16 +123,171 @@ fn interpolate_env(
                 "`${{{name}}}` is not a valid environment variable reference"
             )));
         }
-        let value = env(name).ok_or_else(|| {
-            ConfigError::Parse(format!(
-                "environment variable `{name}` is not set (referenced as ${{{name}}})"
-            ))
-        })?;
-        out.push_str(&value);
-        rest = &after[end + 1..];
+        match env(name) {
+            Some(value) => out.push_str(&value),
+            None if first_unset.is_none() => {
+                first_unset = Some(name);
+                out.push_str(UNSET_MARKER);
+            }
+            // Only the first unset variable is reported; keep the text
+            // parseable so that one can be located.
+            None => out.push_str("unset"),
+        }
+        offset = pos + 2 + end + 1;
     }
-    out.push_str(rest);
-    Ok(out)
+    out.push_str(&text[offset..]);
+    match first_unset {
+        None => Ok(out),
+        Some(name) => {
+            let reason =
+                format!("environment variable `{name}` is not set (referenced as ${{{name}}})");
+            Err(match locate_marker(&out) {
+                Some(field_path) => ConfigError::InvalidValue { field_path, reason },
+                None => ConfigError::Parse(reason),
+            })
+        }
+    }
+}
+
+/// Stands in for the first unset variable so the YAML can be parsed to find
+/// the field that referenced it. Valid in plain, quoted, and flow scalars.
+const UNSET_MARKER: &str = "__llmproxy_unset_env__";
+
+/// Dotted path of the scalar holding [`UNSET_MARKER`], in the same form as
+/// deserialization errors (`providers.openai.api_key`, `routes[0].provider`).
+/// `None` when the text does not parse or the marker sits in a mapping key.
+fn locate_marker(text: &str) -> Option<String> {
+    fn walk(value: &serde_yaml::Value, path: &str) -> Option<String> {
+        match value {
+            serde_yaml::Value::String(s) if s.contains(UNSET_MARKER) => Some(if path.is_empty() {
+                "<root>".to_string()
+            } else {
+                path.to_string()
+            }),
+            serde_yaml::Value::Mapping(map) => map.iter().find_map(|(key, value)| {
+                let key = key.as_str()?;
+                let path = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                walk(value, &path)
+            }),
+            serde_yaml::Value::Sequence(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(i, item)| walk(item, &format!("{path}[{i}]"))),
+            serde_yaml::Value::Tagged(tagged) => walk(&tagged.value, path),
+            _ => None,
+        }
+    }
+    walk(&serde_yaml::from_str(text).ok()?, "")
+}
+
+/// Marks every byte of `text` that is inside a YAML comment.
+///
+/// This is a scan, not a parser, so its mistakes must fall on the loud side:
+/// text wrongly taken as a value gets interpolated (an unset variable still
+/// fails the load), while text wrongly taken as a comment would leave a
+/// literal `${VAR}` in a value. Hence a quote opens a string after any
+/// non-alphanumeric byte, and a block scalar runs while lines are indented
+/// past the line that introduced it.
+fn comment_mask(text: &str) -> Vec<bool> {
+    enum State {
+        Normal,
+        Comment,
+        Single,
+        Double,
+        /// Block scalar (`|` or `>`) introduced on a line with this indent.
+        Block(usize),
+    }
+    let bytes = text.as_bytes();
+    let mut mask = vec![false; bytes.len()];
+    let mut state = State::Normal;
+    let mut line_start = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if line_start {
+            line_start = false;
+            if let State::Block(parent) = state {
+                let indent = bytes[i..].iter().take_while(|&&c| c == b' ').count();
+                let rest = &bytes[i + indent..];
+                let blank = rest.first().is_none_or(|&c| c == b'\n' || c == b'\r');
+                if blank || indent > parent {
+                    // Block content is literal text: skip the whole line.
+                    let len = rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len());
+                    i += indent + len;
+                    continue;
+                }
+                state = State::Normal;
+            }
+        }
+        let prev = if i == 0 { b'\n' } else { bytes[i - 1] };
+        match state {
+            State::Comment => mask[i] = true,
+            State::Single if b == b'\'' => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 1; // `''` is an escaped quote
+                } else {
+                    state = State::Normal;
+                }
+            }
+            State::Double if b == b'\\' => i += 1,
+            State::Double if b == b'"' => state = State::Normal,
+            State::Single | State::Double | State::Block(_) => {}
+            State::Normal => match b {
+                b'#' if prev.is_ascii_whitespace() => {
+                    state = State::Comment;
+                    mask[i] = true;
+                }
+                b'\'' if !prev.is_ascii_alphanumeric() => state = State::Single,
+                b'"' if !prev.is_ascii_alphanumeric() => state = State::Double,
+                b'|' | b'>'
+                    if prev.is_ascii_whitespace() && starts_block_scalar(&bytes[i + 1..]) =>
+                {
+                    let line = bytes[..i]
+                        .iter()
+                        .rposition(|&c| c == b'\n')
+                        .map_or(0, |p| p + 1);
+                    let indent = bytes[line..].iter().take_while(|&&c| c == b' ').count();
+                    state = State::Block(indent);
+                    // The header line may still end in a comment.
+                    let header = &bytes[i + 1..];
+                    let len = header
+                        .iter()
+                        .position(|&c| c == b'\n')
+                        .unwrap_or(header.len());
+                    if let Some(hash) = header[..len].iter().position(|&c| c == b'#') {
+                        mask[i + 1 + hash..i + 1 + len].fill(true);
+                    }
+                    i += len;
+                }
+                _ => {}
+            },
+        }
+        if bytes.get(i) == Some(&b'\n') {
+            line_start = true;
+            if let State::Comment = state {
+                mask[i] = false;
+                state = State::Normal;
+            }
+        }
+        i += 1;
+    }
+    mask
+}
+
+/// Whether the bytes after a `|` or `>` complete a block scalar header:
+/// optional chomping/indentation indicators, then end of line or a comment.
+fn starts_block_scalar(after: &[u8]) -> bool {
+    let rest = after
+        .iter()
+        .skip_while(|&&c| c == b'+' || c == b'-' || c.is_ascii_digit())
+        .skip_while(|&&c| c == b' ' || c == b'\t')
+        .copied()
+        .next();
+    matches!(rest, None | Some(b'\n' | b'\r' | b'#'))
 }
 
 fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {

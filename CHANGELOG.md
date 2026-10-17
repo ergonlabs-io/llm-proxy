@@ -37,6 +37,17 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `llmproxy_ledger_unledgered_total`, `llmproxy_ledger_entries_committed_total`,
   `llmproxy_ledger_entries_lost_total`.
 
+### Fixed
+
+- The `--config` dialect no longer expands `${VAR}` references inside YAML
+  comments. Before, a commented-out line such as
+  `# api_key: ${OPENAI_API_KEY}` failed the load when the variable was unset.
+  A `#` inside a quoted string or a block scalar is text, not a comment, so a
+  reference after it is still expanded. An unset variable in a value still
+  fails the load, and the error now names the field, for example
+  `providers.openai.api_key`. The `llm-proxy init` starter config uses
+  `${VAR}` placeholders in its commented provider examples.
+
 ### Internal
 
 - The billing-ledger entry (ADR-0009) is built at stream end for every request
