@@ -121,25 +121,25 @@ providers:
 
   # OpenAI
   # openai:
-  #   api_key: replace-with-OPENAI_API_KEY
+  #   api_key: ${{OPENAI_API_KEY}}
 
   # Anthropic
   # anthropic:
-  #   api_key: replace-with-ANTHROPIC_API_KEY
+  #   api_key: ${{ANTHROPIC_API_KEY}}
 
   # OpenRouter (all OpenRouter model IDs)
   # openrouter:
   #   type: openrouter
-  #   api_key: replace-with-OPENROUTER_API_KEY
+  #   api_key: ${{OPENROUTER_API_KEY}}
 
   # SpaceX AI / xAI (OpenAI-compatible)
   # spacexai:
   #   type: openai-compatible
   #   base_url: https://api.x.ai
-  #   api_key: replace-with-XAI_API_KEY
+  #   api_key: ${{XAI_API_KEY}}
 
-# To serve every model from another provider, uncomment it above, set its key
-# and name it here.
+# To serve every model from another provider, uncomment it above, export the
+# environment variable its api_key names, and name the provider here.
 routes:
   - model: "*"
     provider: ollama
@@ -159,7 +159,11 @@ mod tests {
     #[test]
     fn starter_config_parses_as_dialect_config() {
         let text = starter_config(&"a".repeat(64));
-        proxy_simple_config::parse_simple_config(&text).expect("starter must parse");
+        // A fresh install has none of the commented-out providers' variables
+        // set; their `${VAR}` placeholders must not fail the load.
+        assert!(text.contains("#   api_key: ${OPENAI_API_KEY}"));
+        proxy_simple_config::parse_simple_config_with_env(&text, &|_| None)
+            .expect("starter must parse with no environment");
     }
 
     #[test]

@@ -630,20 +630,108 @@ routes:
 }
 
 #[test]
-fn missing_env_var_names_the_variable() {
+fn missing_env_var_names_the_variable_and_its_path() {
     let err = parse(
         r#"
 version: 0
 providers:
-  openai: { api_key: ${DEFINITELY_NOT_SET_VAR} }
+  openai: { api_key: ${OPENAI_API_KEY} }
+  anthropic:
+    api_key: ${DEFINITELY_NOT_SET_VAR}
 routes:
   - { model: "*", provider: openai }
 "#,
     )
     .expect_err("missing env var must fail");
-    assert!(
-        err.to_string().contains("DEFINITELY_NOT_SET_VAR"),
-        "got: {err}"
+    match &err {
+        ConfigError::InvalidValue { field_path, reason } => {
+            assert_eq!(field_path, "providers.anthropic.api_key");
+            assert!(reason.contains("DEFINITELY_NOT_SET_VAR"), "got: {err}");
+        }
+        other => panic!("expected InvalidValue with a path, got: {other:?}"),
+    }
+}
+
+/// A commented-out provider example must not demand its variable: the starter
+/// config ships `# api_key: ${OPENAI_API_KEY}` lines.
+#[test]
+fn env_references_in_comments_are_ignored() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} } # or ${DEFINITELY_NOT_SET_VAR}
+  # spare:
+  #   api_key: ${DEFINITELY_NOT_SET_VAR}
+  #   note: ${not a valid reference
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("commented-out references must not be interpolated");
+    assert_eq!(
+        config.providers["openai"].api_key.as_deref(),
+        Some("sk-test-openai")
+    );
+}
+
+/// `#` inside a quoted string or a block scalar is text, not a comment, so a
+/// reference after it is still interpolated and still fails when unset.
+#[test]
+fn hash_inside_a_value_does_not_start_a_comment() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: "a #${OPENAI_API_KEY}" }
+  anthropic: { api_key: 'it''s #${ANTHROPIC_API_KEY}' }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("quoted values must parse");
+    assert_eq!(
+        config.providers["openai"].api_key.as_deref(),
+        Some("a #sk-test-openai")
+    );
+    assert_eq!(
+        config.providers["anthropic"].api_key.as_deref(),
+        Some("it's #sk-test-anthropic")
+    );
+
+    for value in [
+        r#""a # ${DEFINITELY_NOT_SET_VAR}""#,
+        "|\n      a # ${DEFINITELY_NOT_SET_VAR}",
+    ] {
+        let err = parse(&format!(
+            "version: 0\nproviders:\n  openai:\n    api_key: {value}\n\
+             routes:\n  - {{ model: \"*\", provider: openai }}\n"
+        ))
+        .expect_err("a reference inside a value must be interpolated");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field_path, .. }
+                if field_path == "providers.openai.api_key"),
+            "{value}: got {err:?}"
+        );
+    }
+}
+
+/// `$${` is a literal `${`: the variable it names is neither read nor required.
+#[test]
+fn escaped_env_reference_is_a_literal() {
+    let config = parse(
+        r#"
+version: 0
+providers:
+  openai: { api_key: "x$${DEFINITELY_NOT_SET_VAR}" }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect("an escaped reference must not demand its variable");
+    assert_eq!(
+        config.providers["openai"].api_key.as_deref(),
+        Some("x${DEFINITELY_NOT_SET_VAR}")
     );
 }
 
