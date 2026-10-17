@@ -68,7 +68,6 @@ llm_usage_completeness="%LLM_USAGE_COMPLETENESS%" llm_cost_kind="%LLM_COST_KIND%
 llm_upstream_id="%LLM_UPSTREAM_ID%"
 timing_us="ds_rx=%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%
 pre_upstream=%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%
-us_connect=%COMMON_DURATION(US_CX_BEG:US_CX_END:us)%
 us_tx=%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%
 us_wait=%COMMON_DURATION(US_TX_END:US_RX_BEG:us)%
 resp_head=%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)%
@@ -80,7 +79,9 @@ wrapped for reading. The key, tenant, user, model, provider, rate-card, and
 cost fields come before `timing_us`. The JSON format carries the same fields.
 
 `timing_us` divides the request into phases, in microseconds. See
-[Request phases](#request-phases).
+[Request phases](#request-phases). The phases have no upstream connect time.
+On a connection that is used again, that value is from an earlier request. A
+connect that the request did make is part of `pre_upstream`.
 
 For a request that fails to connect to its provider, `%RESPONSE_FLAGS%` is `UF`. See "Response
 flags" below. A dash in `llm_tokens="-/-/-/-/-"` is not a zero. A dash means
@@ -130,7 +131,7 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `llm_usage_completeness`, `llm_cost_kind` | `%LLM_USAGE_COMPLETENESS%`, `%LLM_COST_KIND%` |
 | `llm_upstream_id` | `%LLM_UPSTREAM_ID%` |
 | `llm_upstream_usage` | `%LLM_UPSTREAM_USAGE%`, embedded as a JSON object |
-| `ds_rx_us`, `pre_upstream_us`, `us_connect_us`, `us_tx_us`, `us_wait_us`, `resp_head_us`, `ds_tx_us` | The `%COMMON_DURATION%` phases of `timing_us` in the text format. See [Request phases](#request-phases). |
+| `ds_rx_us`, `pre_upstream_us`, `us_tx_us`, `us_wait_us`, `resp_head_us`, `ds_tx_us` | The `%COMMON_DURATION%` phases of `timing_us` in the text format. See [Request phases](#request-phases). |
 | `llm_served_model` | `%LLM_SERVED_MODEL%`: the `model` the provider's response says it served, which can be a dated snapshot of the selected model or a different model. The cost is computed at this model when the rate card lists it for the provider; otherwise at the selected model. `-` when the response named none. |
 
 The text format uses the same names without the `llm_` prefix for `key_id`,

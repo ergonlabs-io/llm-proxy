@@ -22,10 +22,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   Envoy. A name that is not a standard point is a config error; Envoy
   accepts it as a custom point (`internal-docs/envoy-divergences.md` #35).
 - The `llmproxy` dialect's default access-log lines now carry the request
-  phases, in microseconds: `timing_us="ds_rx=... pre_upstream=...
-  us_connect=... us_tx=... us_wait=... resp_head=... ds_tx=..."` in the text
-  format, and `ds_rx_us` ... `ds_tx_us` in the JSON format. `us_wait` is the
-  provider's time to response headers. See "Request phases" in the access-log
+  phases, in microseconds: `timing_us="ds_rx=... pre_upstream=... us_tx=...
+  us_wait=... resp_head=... ds_tx=..."` in the text format, and `ds_rx_us`
+  ... `ds_tx_us` in the JSON format. `us_wait` is the provider's time to
+  response headers. A new upstream connect is part of `pre_upstream`; there is
+  no separate connect phase, because a reused connection repeats the connect
+  time of the request that opened it. See "Request phases" in the access-log
   docs.
 
 ### Changed

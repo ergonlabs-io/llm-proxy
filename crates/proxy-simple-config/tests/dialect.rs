@@ -784,13 +784,13 @@ observability:
 
 /// The dialect has no custom format, so its default formats are the only way
 /// a dialect user gets the per-phase `%COMMON_DURATION%` breakdown. Each phase
-/// is checked by name and operator, in both formats.
+/// is checked by name and operator, in both formats. No phase reads the
+/// `US_CX_*` points: a reused connection repeats them from an earlier request.
 #[test]
 fn default_access_log_formats_carry_the_request_phase_timings() {
-    const PHASES: [(&str, &str); 7] = [
+    const PHASES: [(&str, &str); 6] = [
         ("ds_rx", "%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%"),
         ("pre_upstream", "%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%"),
-        ("us_connect", "%COMMON_DURATION(US_CX_BEG:US_CX_END:us)%"),
         ("us_tx", "%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%"),
         ("us_wait", "%COMMON_DURATION(US_TX_END:US_RX_BEG:us)%"),
         ("resp_head", "%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)%"),
@@ -812,6 +812,11 @@ observability:
         let lowered = proxy_simple_config::lower(&config).expect("must lower");
         let log_format =
             &hcm_typed_config(&lowered.bootstrap)["access_log"][0]["typed_config"]["log_format"];
+        let rendered = log_format.to_string();
+        assert!(
+            !rendered.contains("US_CX_"),
+            "{format} format must not carry a connect phase, got {rendered}"
+        );
         for (phase, operator) in PHASES {
             if format == "json" {
                 assert_eq!(log_format["json_format"][format!("{phase}_us")], operator);

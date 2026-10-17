@@ -440,12 +440,17 @@ observability:
     for key in [
         "ds_rx_us",
         "pre_upstream_us",
-        "us_connect_us",
         "us_tx_us",
         "resp_head_us",
         "ds_tx_us",
     ] {
         assert!(micros(key).is_some(), "{key} must render in {record}");
     }
+    // A reused connection repeats an earlier connect, so the default line
+    // carries no connect phase (see `TIMING_PHASES` in the dialect's lower).
+    assert!(
+        record.get("us_connect_us").is_none(),
+        "the default line must not carry a connect phase: {record}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

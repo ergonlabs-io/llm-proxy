@@ -24,6 +24,13 @@ CORES_PROXY="${CORES_PROXY:-0-3}"
 CORES_UPSTREAM="${CORES_UPSTREAM:-4}"
 CORES_LOADGEN="${CORES_LOADGEN:-6-7}"
 PROXY_WORKERS="${PROXY_WORKERS:-4}"
+# ACCESS_LOG=json|text turns on the dialect's default access log, written to
+# access.log in each logging arm's directory (scripts/lab/phases.py reads
+# it). ACCESS_LOG_ARMS picks the arms that log: the default, cand only,
+# prices the log itself; "base cand" logs both, for a phase breakdown.
+ACCESS_LOG="${ACCESS_LOG:-}"
+ACCESS_LOG_ARMS="${ACCESS_LOG_ARMS:-cand}"
+case "$ACCESS_LOG" in ""|json|text) ;; *) echo "ACCESS_LOG must be json or text" >&2; exit 2 ;; esac
 mkdir -p "$OUT"
 ulimit -n 65535 || true
 
@@ -78,11 +85,17 @@ start_mock() {
     echo "mock never announced an address" >&2; cat "$1/mock.log" >&2; exit 1
 }
 
-# start_proxy BIN_DIR DIR: sets LISTEN, PROXY_PID.
+# start_proxy BIN_DIR DIR ARM: sets LISTEN, PROXY_PID.
 start_proxy() {
-    local bin="$1" dir="$2" admin proto=""
+    local bin="$1" dir="$2" arm="$3" admin proto="" log=""
     LISTEN="$(free_port)"; admin="$(free_port)"
     [[ "$UPSTREAM" == http2 ]] && proto="    protocol: http2"
+    if [[ -n "$ACCESS_LOG" && " $ACCESS_LOG_ARMS " == *" $arm "* ]]; then
+        log="observability:
+  access_logs:
+    output: $dir/access.log
+    format: $ACCESS_LOG"
+    fi
     cat >"$dir/config.yaml" <<YAML
 version: 0
 listen: 127.0.0.1:$LISTEN
@@ -94,6 +107,7 @@ $proto
 routes:
   - model: "*"
     provider: mock
+$log
 YAML
     taskset -c "$CORES_PROXY" "$bin/llm-proxy" --config "$dir/config.yaml" \
         --concurrency "$PROXY_WORKERS" >"$dir/proxy.log" 2>&1 &
@@ -121,7 +135,7 @@ run_arm() { # run_arm SCENARIO ARM BIN_DIR ROUND
     local d="$OUT/$1/$2-r$4"
     mkdir -p "$d"
     start_mock "$d"
-    start_proxy "$3" "$d"
+    start_proxy "$3" "$d" "$2"
     local t0 t1 rss_idle
     rss_idle="$(status_kb "$PROXY_PID" VmRSS)"
     t0="$(cpu_ticks "$PROXY_PID")"
@@ -141,6 +155,7 @@ JSON
     echo "cand: $(cat "$CAND/REVISION" 2>/dev/null || echo "$CAND")"
     echo "rounds: $ROUNDS  duration: ${DURATION}s  warmup: ${WARMUP}s  upstream: $UPSTREAM"
     echo "cores: proxy $CORES_PROXY (workers $PROXY_WORKERS), mock $CORES_UPSTREAM, loadgen $CORES_LOADGEN"
+    echo "access log: ${ACCESS_LOG:-off}${ACCESS_LOG:+ (arms: $ACCESS_LOG_ARMS)}"
     echo "kernel: $(uname -r)  nproc: $(nproc)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
 } | tee "$OUT/manifest.txt"

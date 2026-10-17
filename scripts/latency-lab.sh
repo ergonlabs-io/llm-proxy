@@ -7,9 +7,11 @@
 #
 # `ab` builds both revisions on a Linux host, runs them alternately with
 # scripts/lab/ab-remote.sh, copies the results to target/lab/<run>/ and
-# prints the comparison (scripts/lab/ab_compare.py). REV is anything
-# `git rev-parse` takes; uncommitted changes are never shipped, so commit
-# first or pass --cand-patch. The same REV for both arms is the self-A/B that
+# prints the comparison (scripts/lab/ab_compare.py). ACCESS_LOG=json|text
+# turns on an access log (see ab-remote.sh), and then scripts/lab/phases.py
+# also prints the per-phase breakdown. REV is anything `git rev-parse` takes;
+# uncommitted changes are never shipped, so commit first or pass
+# --cand-patch. The same REV for both arms is the self-A/B that
 # validates the instrument: it must report no change.
 #
 # Builds are cached on the host by revision (and patch), in one shared target
@@ -74,6 +76,9 @@ build_rev() {
 cmd_compare() {
     local dir="$1"
     python3 "$REPO_ROOT/scripts/lab/ab_compare.py" "$dir" --json "$dir/result.json" | tee "$dir/summary.txt"
+    if compgen -G "$dir/*/*/access.log" >/dev/null; then
+        python3 "$REPO_ROOT/scripts/lab/phases.py" "$dir" --json "$dir/phases.json" | tee "$dir/phases.txt"
+    fi
 }
 
 cmd_ab() {
@@ -111,6 +116,7 @@ cmd_ab() {
     # Detached, so a dropped ssh session does not kill the run.
     rsh "cd $REMOTE && (ROUNDS=$rounds SCENARIOS='$scenarios' ${DURATION:+DURATION=$DURATION} \
          ${UPSTREAM:+UPSTREAM=$UPSTREAM} ${CORES_PROXY:+CORES_PROXY=$CORES_PROXY} \
+         ${ACCESS_LOG:+ACCESS_LOG=$ACCESS_LOG} ${ACCESS_LOG_ARMS:+ACCESS_LOG_ARMS='$ACCESS_LOG_ARMS'} \
          nohup bash scripts/ab-remote.sh $REMOTE/bin/$base_label $REMOTE/bin/$cand_label \
          $REMOTE/runs/$run_id >$REMOTE/runs/$run_id/runner.log 2>&1 </dev/null & echo \$! >$REMOTE/runs/$run_id/pid)"
     echo "run $run_id: started on $HOST; log at $REMOTE/runs/$run_id/runner.log"

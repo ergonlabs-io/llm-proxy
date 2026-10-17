@@ -143,7 +143,6 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "llm_upstream_id=\"%LLM_UPSTREAM_ID%\" ",
     "timing_us=\"ds_rx=%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)% ",
     "pre_upstream=%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)% ",
-    "us_connect=%COMMON_DURATION(US_CX_BEG:US_CX_END:us)% ",
     "us_tx=%COMMON_DURATION(US_TX_BEG:US_TX_END:us)% ",
     "us_wait=%COMMON_DURATION(US_TX_END:US_RX_BEG:us)% ",
     "resp_head=%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)% ",
@@ -156,9 +155,6 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
 /// - `ds_rx`: reading the client's request.
 /// - `pre_upstream`: the filter chain, routing and, for a new connection, the
 ///   upstream connect.
-/// - `us_connect`: the upstream TCP connect. A reused connection repeats the
-///   value from when it was dialed (Envoy semantics); it is not a cost this
-///   request paid.
 /// - `us_tx`: handing the request to the upstream codec.
 /// - `us_wait`: the provider's time to response headers.
 /// - `resp_head`: the response head's way back through the encode filters.
@@ -166,10 +162,14 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
 ///
 /// A phase whose points the request never reached renders `-`, for example
 /// every upstream phase of a local reply.
-const TIMING_PHASES: [(&str, &str); 7] = [
+///
+/// There is no `US_CX_BEG:US_CX_END` phase. A request on a reused connection
+/// repeats the connect points from when that connection was dialed (Envoy
+/// semantics), so on most requests such a phase shows a cost the request
+/// never paid. A connect this request did pay is inside `pre_upstream`.
+const TIMING_PHASES: [(&str, &str); 6] = [
     ("ds_rx", "%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%"),
     ("pre_upstream", "%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%"),
-    ("us_connect", "%COMMON_DURATION(US_CX_BEG:US_CX_END:us)%"),
     ("us_tx", "%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%"),
     ("us_wait", "%COMMON_DURATION(US_TX_END:US_RX_BEG:us)%"),
     ("resp_head", "%COMMON_DURATION(US_RX_BEG:DS_TX_BEG:us)%"),
