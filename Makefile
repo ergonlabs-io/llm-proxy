@@ -435,3 +435,35 @@ ui-build: ## Build the admin UI into admin-ui/dist/ for /ui serving
 .PHONY: ui-dev
 ui-dev: ## Run the admin UI dev server on http://localhost:5173 (VITE_ADMIN_URL overrides the API origin)
 	cd admin-ui && npm run dev
+
+# ------------------------------------------------------------------- fuzzing --
+# cargo-fuzz targets for the hand-written parsers that read client- or
+# provider-controlled bytes (fuzz/). fuzz/ is its own workspace, so nothing
+# here touches `make tq` or `make ci`. Needs a nightly toolchain and
+# `cargo install cargo-fuzz`.
+#
+# Each target runs for FUZZ_SECONDS. A crash leaves its input under
+# fuzz/artifacts/<target>/; minimize it with
+#   cargo +nightly fuzz tmin <target> <artifact>
+# then add the minimized input as a regression test in the owning crate.
+
+FUZZ_TARGETS := usage_extract body_prefix_scan dialect_config
+FUZZ_SECONDS ?= 300
+
+.PHONY: fuzz-build
+fuzz-build: ## Build every fuzz target (nightly + cargo-fuzz)
+	cargo +nightly fuzz build
+
+.PHONY: fuzz
+fuzz: ## Run every fuzz target for FUZZ_SECONDS each (default 300)
+	@fuzz/seed.sh
+	@for t in $(FUZZ_TARGETS); do \
+	  echo "== $$t ($(FUZZ_SECONDS)s)"; \
+	  cargo +nightly fuzz run $$t -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	done
+
+.PHONY: fuzz-one
+fuzz-one: ## Run one fuzz target, e.g. make fuzz-one TARGET=usage_extract FUZZ_SECONDS=600
+	@test -n "$(TARGET)" || { echo "set TARGET to one of: $(FUZZ_TARGETS)"; exit 1; }
+	@fuzz/seed.sh
+	cargo +nightly fuzz run $(TARGET) -- -max_total_time=$(FUZZ_SECONDS)

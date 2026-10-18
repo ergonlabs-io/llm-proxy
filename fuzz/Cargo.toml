@@ -1,0 +1,48 @@
+# Fuzz targets for the hand-written parsers that read client- or
+# provider-controlled bytes (WP-29). Run with `make fuzz` or `make fuzz-one`.
+#
+# Deliberately NOT a member of the root workspace: cargo-fuzz needs nightly
+# and sanitizer flags, so keeping it out leaves `make tq` and `make ci` on
+# stable untouched. The empty `[workspace]` table below makes this its own
+# workspace root, so cargo does not try to attach it to the parent.
+[package]
+name = "llm-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+proxy-filters = { path = "../crates/proxy-filters" }
+proxy-simple-config = { path = "../crates/proxy-simple-config" }
+serde_json = "1"
+
+# Same lint as the root workspace (AGENTS.md invariant 3).
+[lints.rust]
+unsafe_code = "deny"
+
+[[bin]]
+name = "usage_extract"
+path = "fuzz_targets/usage_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body_prefix_scan"
+path = "fuzz_targets/body_prefix_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dialect_config"
+path = "fuzz_targets/dialect_config.rs"
+test = false
+doc = false
+bench = false
