@@ -3,7 +3,7 @@ title: Config reload
 summary: SIGHUP re-reads the config file a running proxy booted with and
   publishes a new snapshot. A config that fails to parse or validate leaves
   the proxy serving the previous snapshot and logs the full error.
-last_updated: 2026-10-13
+last_updated: 2026-10-17
 related:
   - ../configuration/configuration-file/
   - ../observability/metrics-and-stats/
@@ -19,6 +19,28 @@ only happens when something sends the signal:
 ```sh
 kill -HUP <pid>
 ```
+
+## Reload restrictions
+
+A bootstrap with `dynamic_resources` ignores `SIGHUP` and logs a warning.
+Apply dynamic changes through its configured xDS source. The proxy also
+ignores reload signals while draining or shutting down.
+
+Some settings require a restart:
+
+- The auth control-plane store and policy poll interval are fixed at startup.
+- Changing `ledger` or `observability.traces` rejects the entire reload and
+  retains the previous snapshot. Their writers and destinations are opened
+  at startup.
+
+Validate the edited file before signalling the running process:
+
+```sh
+llm-proxy --config llmproxy.yaml --mode validate
+```
+
+For a shared store, include the replica's `--service-node` flag when validating.
+For an Envoy bootstrap, use `-c bootstrap.yaml` instead of `--config`.
 
 ## The safety property comes first
 

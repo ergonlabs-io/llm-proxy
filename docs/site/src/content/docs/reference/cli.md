@@ -2,7 +2,7 @@
 title: CLI reference
 summary: Every llm-proxy flag documented on this site, verified against
   --help and the real argument parser.
-last_updated: 2026-10-13
+last_updated: 2026-10-17
 related:
   - ../getting-started/quickstart/
   - ../operations/draining-and-shutdown/
@@ -23,6 +23,7 @@ subset this site's other pages rely on.
 |---|---|
 | `serve` | Runs the proxy: binds every listener and serves traffic until `SIGTERM`/`SIGINT`. |
 | `validate` | Loads and checks the config, prints a one-line summary, and exits — binds no listener. |
+| `translate` | Prints the Envoy bootstrap generated from a `--config` file, then exits. |
 | `keygen` | Generates a virtual key and its digest for `auth.keys[]`. Needs no config at all. |
 
 A config is required for `serve` and `validate`. Pass either `--config
@@ -37,13 +38,21 @@ llm-proxy --config llmproxy.yaml --mode validate
 configuration 'llmproxy.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
 ```
 
-**A fourth mode, `--mode translate`, exists in the binary's own `--help`
-output but is intentionally not documented on this page.** It prints a
-lowered form of the config in a different, more verbose format than this
-site's configuration reference covers. Describing what that output actually
-is, without going further than this site's current scope, was not possible
-without either naming what it is or writing around it — so it is left out
-here entirely rather than described vaguely.
+## `--mode translate`
+
+Inspect how the compact dialect lowers to Envoy resources:
+
+```sh
+llm-proxy --config llmproxy.yaml --mode translate > bootstrap.yaml
+```
+
+Translation requires `--config`; `-c` already takes an Envoy bootstrap.
+Provider keys, the auth HMAC secret, and the store URL are redacted as
+`[REDACTED]` by default. `--reveal-secrets` includes their configured values;
+protect that output as a secret. Redacted output is for inspection and needs
+real credentials before use as a serving bootstrap. Use `--mode validate`
+to check the configuration for serving; translation does not require the
+shared store's `--service-node` identity.
 
 ## `--mode keygen`
 

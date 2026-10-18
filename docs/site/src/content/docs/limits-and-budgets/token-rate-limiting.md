@@ -3,7 +3,7 @@ title: Token rate limiting
 summary: How the token limiter buckets and enforces a budget, and the
   `GET /v1/usage` endpoint an authenticated caller uses to read its own
   current standing.
-last_updated: 2026-10-15
+last_updated: 2026-10-17
 related:
   - ../authentication/virtual-keys/
   - ../configuration/configuration-file/
@@ -161,7 +161,7 @@ has spent 2,200 of its 100,000 tokens on a route named `chat`, 43 seconds
 into the current window, gets this body:
 
 ```json
-{"routes":[{"limit":100000.0,"remaining":97800.0,"reset_after_seconds":43,"route":"chat","used":2200.0}],"tenant":"acme","window":"fixed"}
+{"routes":[{"limit":100000.0,"remaining":97800.0,"reset_after_seconds":17,"route":"chat","used":2200.0}],"tenant":"acme","window":"fixed"}
 ```
 
 The key order above is exact, not illustrative — it comes from `serde_json`'s

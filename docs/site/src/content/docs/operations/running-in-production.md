@@ -2,9 +2,9 @@
 title: Running in production
 summary: What changes when you run more than one replica — which state is
   shared, which stays local, the propagation and staleness bounds for each,
-  and what the store does when it cannot be reached. Configuring a shared
-  store is Envoy-mode only today; the `llmproxy` dialect has no field for it.
-last_updated: 2026-10-16
+  and what the store does when it cannot be reached. Both configuration
+  dialects support a shared store.
+last_updated: 2026-10-17
 related:
   - ../authentication/virtual-keys/
   - ../limits-and-budgets/token-rate-limiting/
@@ -26,16 +26,28 @@ unreachable. It is normative for `llmproxy.auth`'s `store: shared` and
 (`internal-docs/adr/0006-shared-state-tiers.md`, ADR-0006, is the design
 record this page follows).
 
-**This is reachable only from Envoy-mode `typed_config` today.** The
-`llmproxy` dialect schema (`schema/llmproxy-v0.schema.json`) has no `store`,
-`shared`, or `service_node` field anywhere in it — a dialect config always
-runs single-replica identity and budget state, however many processes you
-start. Do not confuse this with the dialect's `limits:` block
-(`tokens_per_minute`), which is a separate mechanism (`BudgetStore`, not
-`ControlPlaneStore`) with no shared implementation at all; see
-[Token rate limiting](../../limits-and-budgets/token-rate-limiting/). Everything
-below is about `llmproxy.auth` and `llmproxy.spend_limit`, configured through
-a hand-written bootstrap.
+Both configuration dialects support `auth.store`. In the `llmproxy` dialect,
+configure Redis and give each replica a unique, stable node ID:
+
+```yaml
+auth:
+  hmac_secret: ${LLMPROXY_AUTH_SECRET}
+  store:
+    shared:
+      url_file: /run/secrets/redis-url
+      namespace: llmproxy-production
+```
+
+This fragment belongs inside a complete configuration with providers and routes.
+Start it with `llm-proxy --config llmproxy.yaml --service-node replica-a`.
+Use the same namespace and HMAC secret across replicas; give each replica its
+own node ID. Without that ID, a dialect configuration using a shared store
+fails validation. The bootstrap equivalent is shown below.
+
+Token and request windows also use the store selected by `auth.store`.
+With `shared`, they reconcile fleet totals about once a second; concurrent
+streams use expiring leases. See
+[Token rate limiting](../../limits-and-budgets/token-rate-limiting/).
 
 ## Four kinds of state, four different rules
 
@@ -145,8 +157,8 @@ their keys cannot collide.
 
 ## Node identity: `service_node`
 
-Every replica needs a distinct identity, and today the only place to set one
-is the CLI flag, at process start:
+Every replica needs a distinct identity. Set it with the CLI flag, or with
+`node.id` in an Envoy bootstrap:
 
 ```sh
 llm-proxy --mode serve -c bootstrap.yaml --service-node replica-a
@@ -262,11 +274,10 @@ authenticate on another replica for up to 60 seconds at the default
 interval.** Revocation does not tear down a request already in flight either
 way — it is a request-start decision, same as Envoy's own auth model.
 
-A replica whose poll keeps failing does not silently keep going: it keeps
-serving its last-known-good snapshot and logs a warning naming the snapshot
-age and the bound once it is exceeded (`control.rs`'s `run_policy_poller`,
-lines 2013–2029), suppressed to at most once per ten intervals so the
-warning itself does not become the incident.
+A replica whose poll keeps failing logs warnings and retains its last-known-good
+snapshot. Virtual-key authentication refuses requests once that snapshot exceeds
+the staleness bound; see [Authentication during a store outage](#authentication-during-a-store-outage).
+The 60-second propagation bound above assumes successful store reads.
 
 ## Redis connections and the policy load log
 
@@ -299,7 +310,17 @@ The line carries counts and lengths only. It never carries row content (test
 whole policy state, so `duration_ms` grows with the state. Use this line to
 size a large deployment.
 
-## Store outage: fails open, loudly
+## Authentication during a store outage
+
+Virtual-key authentication keeps serving the last policy snapshot only until
+its staleness bound expires. It then returns `503` with `auth_policy_stale`
+until the store can be read again. The dialect's `auth.max_policy_staleness`
+defaults to `4m`; bootstrap mode uses `max_policy_staleness_seconds`, defaulting
+to five policy-poll intervals. Monitor
+`envoy_llmproxy_policy_snapshot_age_seconds`. This bounds how long a revoked
+key can keep authenticating during a store outage.
+
+## Store outage: spend keeps enforcing last-known totals
 
 If a replica cannot reconcile with the shared store for longer than
 `reconciliation_bound_seconds` (default **60 seconds**, measured from
@@ -426,10 +447,10 @@ are keyed by its node ID.
   merely a backlog note (`crates/proxy-filters/src/control.rs`, lines
   195–211). If you need historical spend, export it from access logs; the
   admin `/spend` endpoint only ever answers "right now, this window."
-- **Token rate limiting (`limits:`, `tokens_per_minute`) is a separate
-  subsystem and has no shared implementation at all.** It runs on
-  `BudgetStore`, not `ControlPlaneStore`, and only an in-process
-  implementation exists — this is unaffected by everything above. See
+- **Token and request limits count locally unless `auth.store` is shared.**
+  With a shared store, both configured `limits:` and tenant/key rate limits
+  reconcile through Redis. Admission uses last-known totals plus local counts,
+  so the fleet can exceed a ceiling between reconciles. See
   [Token rate limiting](../../limits-and-budgets/token-rate-limiting/).
 - **The rate card is shared only through `auth.store: shared`.** With an `auth`
   store, the rate card is stored per chain and `PUT /pricing` writes it there.

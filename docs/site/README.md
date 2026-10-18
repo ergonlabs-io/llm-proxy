@@ -1,9 +1,10 @@
 # llm-proxy docs site
 
-Astro + Starlight, generated from the `starlight` template. This directory is
-infrastructure only; content pages live under `src/content/docs/` and are
-maintained separately (see `docs/user/` for the source material that will
-eventually populate it).
+Astro + Starlight. User documentation lives under `src/content/docs/`.
+The configuration field reference is generated from the normative dialect
+schema with `make config-reference`; edit the schema rather than its generated
+page. Hand-written guides should be checked against the implementation and
+schema when behavior changes.
 
 ## Commands
 
@@ -30,9 +31,9 @@ Or from this directory directly:
   why the site uses Astro/Starlight rather than a Rust-native doc generator.
 - **Pagefind** search is Starlight's default and needs no extra setup; it
   indexes at build time into `dist/pagefind/`.
-- The sidebar spine (nine sections) is specified but commented out in
-  `astro.config.mjs` until each section has at least one real page — an
-  uncommented group pointing at a page that doesn't exist fails the build.
+- Active sidebar sections and page slugs live in `astro.config.mjs`. Add a
+  page there when it should appear in navigation. Commented entries describe
+  pages that have not been added yet.
 
 Check out [Starlight's docs](https://starlight.astro.build/) or
 [the Astro documentation](https://docs.astro.build) for more.
