@@ -50,7 +50,7 @@ use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use tokio::sync::oneshot;
 
 use crate::auth::TenantId;
-use crate::control::{ControlPlaneStore, StoreError};
+use crate::control::{unix_now_secs, ControlPlaneStore, ObjectOwner, StoreError};
 
 /// Most owners [`ObjectOwners`] caches. Past it the cache is cleared and
 /// refilled from the store, so a long-lived replica cannot grow it without
@@ -368,6 +368,7 @@ enum Job {
     Claim {
         id: String,
         tenant: TenantId,
+        ttl: Option<Duration>,
     },
     Lookup {
         ids: Vec<String>,
@@ -398,18 +399,20 @@ impl Warn {
 }
 
 struct Shared {
-    cache: Mutex<HashMap<String, TenantId>>,
+    /// Owners with their expiry, so a cached owner stops counting when its
+    /// store row does (ADR-0013 §6).
+    cache: Mutex<HashMap<String, ObjectOwner>>,
     claim_failed: Warn,
     claim_conflict: Warn,
 }
 
 impl Shared {
-    fn remember(&self, id: String, tenant: TenantId) {
+    fn remember(&self, id: String, owner: ObjectOwner) {
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= CACHE_CAP && !cache.contains_key(&id) {
             cache.clear();
         }
-        cache.insert(id, tenant);
+        cache.insert(id, owner);
     }
 }
 
@@ -456,10 +459,11 @@ impl ObjectOwners {
             .cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let now = unix_now_secs();
         let mut unknown = Vec::new();
         for id in ids {
-            match cache.get(id) {
-                Some(owner) if owner.as_str() == tenant => {}
+            match cache.get(id).filter(|owner| owner.is_live(now)) {
+                Some(owner) if owner.tenant.as_str() == tenant => {}
                 Some(_) => return Cached::NotOwned,
                 None => {
                     if !unknown.contains(id) {
@@ -489,12 +493,13 @@ impl ObjectOwners {
         answer
     }
 
-    /// Records `tenant` as the owner of `id`: in the cache at once, so the
-    /// next request on this replica sees it, and in the store on the owners
-    /// thread. An owner already cached is kept; the store's answer then
-    /// settles it.
-    pub fn record(&self, id: String, tenant: TenantId) {
+    /// Records `tenant` as the owner of `id`, for `ttl` or for good: in the
+    /// cache at once, so the next request on this replica sees it, and in
+    /// the store on the owners thread. A live owner already cached is kept;
+    /// the store's answer then settles it.
+    pub fn record(&self, id: String, tenant: TenantId, ttl: Option<Duration>) {
         {
+            let now = unix_now_secs();
             let mut cache = self
                 .shared
                 .cache
@@ -503,9 +508,11 @@ impl ObjectOwners {
             if cache.len() >= CACHE_CAP && !cache.contains_key(&id) {
                 cache.clear();
             }
-            cache.entry(id.clone()).or_insert_with(|| tenant.clone());
+            if !cache.get(&id).is_some_and(|owner| owner.is_live(now)) {
+                cache.insert(id.clone(), ObjectOwner::new(tenant.clone(), ttl, now));
+            }
         }
-        if self.jobs.try_send(Job::Claim { id, tenant }).is_err() {
+        if self.jobs.try_send(Job::Claim { id, tenant, ttl }).is_err() {
             self.queue_full.emit(|suppressed| {
                 tracing::warn!(
                     suppressed,
@@ -521,13 +528,13 @@ impl ObjectOwners {
 fn run(shared: &Shared, store: &dyn ControlPlaneStore, inbox: &mpsc::Receiver<Job>) {
     while let Ok(job) = inbox.recv() {
         match job {
-            Job::Claim { id, tenant } => match store.claim_object(&id, &tenant) {
+            Job::Claim { id, tenant, ttl } => match store.claim_object(&id, &tenant, ttl) {
                 Ok(owner) => {
-                    if owner != tenant {
+                    if owner.tenant != tenant && owner.is_live(unix_now_secs()) {
                         shared.claim_conflict.emit(|suppressed| {
                             tracing::warn!(
                                 creator = tenant.as_str(),
-                                owner = owner.as_str(),
+                                owner = owner.tenant.as_str(),
                                 suppressed,
                                 "llmproxy.object_ownership: a provider returned an object id \
                                  another tenant already owns; the existing owner is kept and \
@@ -552,8 +559,9 @@ fn run(shared: &Shared, store: &dyn ControlPlaneStore, inbox: &mpsc::Receiver<Jo
                     .into_iter()
                     .map(|id| match store.object_owner(&id) {
                         Ok(Some(owner)) => {
-                            shared.remember(id, owner.clone());
-                            Ok(Some(owner))
+                            let tenant = owner.tenant.clone();
+                            shared.remember(id, owner);
+                            Ok(Some(tenant))
                         }
                         Ok(None) => Ok(None),
                         // An id the store could never hold has no owner.
@@ -699,7 +707,7 @@ mod tests {
     fn a_recorded_owner_is_cached_at_once_and_reaches_the_store() {
         let store = Arc::new(InMemoryControlPlaneStore::default());
         let owners = ObjectOwners::new(store.clone());
-        owners.record("file-1".into(), TenantId::new("a"));
+        owners.record("file-1".into(), TenantId::new("a"), None);
         assert_eq!(owners.check_cached("a", &["file-1".into()]), Cached::Owned);
         assert_eq!(
             owners.check_cached("b", &["file-1".into()]),
@@ -711,7 +719,7 @@ mod tests {
         let answer = wait(owners.lookup(vec!["file-1".into()])).unwrap();
         assert_eq!(answer, vec![Some(TenantId::new("a"))]);
         assert_eq!(
-            store.object_owner("file-1").unwrap(),
+            store.object_owner("file-1").unwrap().map(|o| o.tenant),
             Some(TenantId::new("a"))
         );
     }
@@ -719,7 +727,9 @@ mod tests {
     #[test]
     fn another_replicas_owner_is_read_from_the_store_and_cached() {
         let store = Arc::new(InMemoryControlPlaneStore::default());
-        store.claim_object("file-9", &TenantId::new("a")).unwrap();
+        store
+            .claim_object("file-9", &TenantId::new("a"), None)
+            .unwrap();
         let owners = ObjectOwners::new(store);
         assert_eq!(
             owners.check_cached("a", &["file-9".into(), "file-x".into()]),
@@ -735,14 +745,40 @@ mod tests {
         );
     }
 
+    /// A cached owner stops counting when its row expires: the next request
+    /// reads the store, which has no live owner either, so the object is
+    /// refused rather than served from the cache.
+    #[test]
+    fn an_expired_cached_owner_is_unknown_not_owned() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let owners = ObjectOwners::new(store);
+        owners.record("resp-1".into(), TenantId::new("a"), Some(Duration::ZERO));
+        assert_eq!(
+            owners.check_cached("a", &["resp-1".into()]),
+            Cached::Unknown(vec!["resp-1".into()])
+        );
+        assert_eq!(
+            wait(owners.lookup(vec!["resp-1".into()])).unwrap(),
+            vec![None]
+        );
+        owners.record(
+            "resp-2".into(),
+            TenantId::new("a"),
+            Some(Duration::from_secs(3600)),
+        );
+        assert_eq!(owners.check_cached("a", &["resp-2".into()]), Cached::Owned);
+    }
+
     /// A claim the store settles for an earlier owner corrects this
     /// replica's cache: the store wins.
     #[test]
     fn the_stores_earlier_owner_wins_over_a_local_record() {
         let store = Arc::new(InMemoryControlPlaneStore::default());
-        store.claim_object("file-1", &TenantId::new("a")).unwrap();
+        store
+            .claim_object("file-1", &TenantId::new("a"), None)
+            .unwrap();
         let owners = ObjectOwners::new(store);
-        owners.record("file-1".into(), TenantId::new("b"));
+        owners.record("file-1".into(), TenantId::new("b"), None);
         let answer = wait(owners.lookup(vec!["file-1".into()])).unwrap();
         assert_eq!(answer, vec![Some(TenantId::new("a"))]);
         assert_eq!(

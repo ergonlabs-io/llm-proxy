@@ -14,7 +14,7 @@
 //! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
 //! {ns}:rate_cards                           HASH chain (the usage filter's stat_prefix) -> encode_json(EncodedRateCardRow)
 //! {ns}:trace_export                         HASH tenant -> encode_trace_export_row() (opted-in tenants only)
-//! {ns}:object_owners                        HASH object id -> encode_object_owner_row(tenant)
+//! {ns}:object_owner:<object id>            STRING encode_object_owner_row(owner), EXAT its expiry if it has one
 //! {ns}:generation                           STRING, INCR
 //! {ns}:spend:{<prefix>|<tenant>|<period>}   STRING, micros
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
@@ -53,7 +53,9 @@ use redis::{Client, Connection, Script};
 
 use crate::auth::{KeyId, TenantId};
 use crate::control::decode_tenant_credential_row;
-use crate::control::{check_object_id, decode_object_owner_row, encode_object_owner_row};
+use crate::control::{
+    check_object_id, decode_object_owner_row, encode_object_owner_row, ObjectOwner,
+};
 use crate::control::{
     decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
     EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
@@ -736,8 +738,10 @@ impl RedisControlPlaneStore {
         format!("{}:limits", self.namespace)
     }
 
-    fn object_owners_key(&self) -> String {
-        format!("{}:object_owners", self.namespace)
+    /// One key per object rather than a hash, so a row with an expiry is
+    /// removed by Redis itself (`EXAT`) and expired rows never accumulate.
+    fn object_owner_key(&self, object_id: &str) -> String {
+        format!("{}:object_owner:{object_id}", self.namespace)
     }
 
     fn trace_export_key(&self) -> String {
@@ -1409,35 +1413,46 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         Ok(written == 1)
     }
 
-    /// `HSETNX` then `HGET` in one `MULTI`/`EXEC`: the set never overwrites,
-    /// and the read in the same transaction returns whichever claim won.
-    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+    /// `SET NX` then `GET` in one `MULTI`/`EXEC`: the set never overwrites
+    /// a live row, and the read in the same transaction returns whichever
+    /// claim won. Redis removes an expired row itself, so a claim after the
+    /// expiry finds no key and sets a new one.
+    fn claim_object(
+        &self,
+        object_id: &str,
+        tenant: &TenantId,
+        ttl: Option<Duration>,
+    ) -> Result<ObjectOwner, StoreError> {
         check_object_id(object_id)?;
-        let key = self.object_owners_key();
-        let row = encode_object_owner_row(tenant);
-        let (owner,): (Vec<u8>,) = self.with_connection(Lane::Objects, |conn| {
-            redis::pipe()
-                .atomic()
-                .cmd("HSETNX")
-                .arg(&key)
-                .arg(object_id)
-                .arg(&row)
-                .ignore()
-                .cmd("HGET")
-                .arg(&key)
-                .arg(object_id)
-                .query(conn)
+        let key = self.object_owner_key(object_id);
+        let now = crate::control::unix_now_secs();
+        let claim = ObjectOwner::new(tenant.clone(), ttl, now);
+        let row = encode_object_owner_row(&claim);
+        let (owner,): (Option<Vec<u8>>,) = self.with_connection(Lane::Objects, |conn| {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            let set = pipe.cmd("SET").arg(&key).arg(&row).arg("NX");
+            if let Some(at) = claim.expires_at {
+                set.arg("EXAT").arg(at);
+            }
+            set.ignore().cmd("GET").arg(&key).query(conn)
         })?;
-        decode_object_owner_row(&owner)
+        // No key to read back: this claim's own row, set with an expiry
+        // already reached, which Redis removed at once.
+        owner.map_or(Ok(claim), |row| decode_object_owner_row(&row))
     }
 
-    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+    fn object_owner(&self, object_id: &str) -> Result<Option<ObjectOwner>, StoreError> {
         check_object_id(object_id)?;
-        let key = self.object_owners_key();
+        let key = self.object_owner_key(object_id);
         let row: Option<Vec<u8>> = self.with_connection(Lane::Objects, |conn| {
-            redis::cmd("HGET").arg(&key).arg(object_id).query(conn)
+            redis::cmd("GET").arg(&key).query(conn)
         })?;
-        row.map(|row| decode_object_owner_row(&row)).transpose()
+        let now = crate::control::unix_now_secs();
+        Ok(row
+            .map(|row| decode_object_owner_row(&row))
+            .transpose()?
+            .filter(|owner| owner.is_live(now)))
     }
 
     /// Redis is the shared store: it is meant to outlive any replica.
@@ -2327,10 +2342,24 @@ mod tests {
         .unwrap();
         let (a, b) = (TenantId::new("a"), TenantId::new("b"));
         let before = store.policy_generation().unwrap();
+        let tenant = |owner: Option<ObjectOwner>| owner.map(|o| o.tenant);
         assert_eq!(store.object_owner("file-1").unwrap(), None);
-        assert_eq!(store.claim_object("file-1", &a).unwrap(), a);
-        assert_eq!(other.claim_object("file-1", &b).unwrap(), a);
-        assert_eq!(other.object_owner("file-1").unwrap(), Some(a));
+        assert_eq!(store.claim_object("file-1", &a, None).unwrap().tenant, a);
+        assert_eq!(other.claim_object("file-1", &b, None).unwrap().tenant, a);
+        assert_eq!(
+            tenant(other.object_owner("file-1").unwrap()),
+            Some(a.clone())
+        );
+        // A row whose time to live has run out is gone, and a new claim wins.
+        let zero = Some(Duration::ZERO);
+        store.claim_object("resp-1", &a, zero).unwrap();
+        assert_eq!(other.object_owner("resp-1").unwrap(), None);
+        assert_eq!(other.claim_object("resp-1", &b, None).unwrap().tenant, b);
+        // A live row with an expiry is kept, and its expiry is read back.
+        let day = Some(Duration::from_secs(86_400));
+        let claimed = store.claim_object("resp-2", &a, day).unwrap();
+        assert!(claimed.expires_at.is_some());
+        assert_eq!(other.claim_object("resp-2", &b, None).unwrap(), claimed);
         assert_eq!(store.policy_generation().unwrap(), before);
     }
 

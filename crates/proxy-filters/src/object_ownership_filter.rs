@@ -298,7 +298,7 @@ impl ObjectOwnershipFilter {
             self.warn_unrecorded("has no top-level string `id`");
         }
         for id in owned.created.into_iter().chain(owned.files) {
-            self.owners.record(id, TenantId::new(tenant.clone()));
+            self.owners.record(id, TenantId::new(tenant.clone()), None);
         }
     }
 

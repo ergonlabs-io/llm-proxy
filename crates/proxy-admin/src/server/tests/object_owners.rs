@@ -82,7 +82,11 @@ async fn an_unowned_object_is_assigned_once_and_never_reassigned() {
     let (status, body) = assign(addr, "tenant-a", "file-legacy").await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert_eq!(
-        control_plane.store().object_owner("file-legacy").unwrap(),
+        control_plane
+            .store()
+            .object_owner("file-legacy")
+            .unwrap()
+            .map(|o| o.tenant),
         Some(TenantId::new("tenant-a"))
     );
     let (status, body) = assign(addr, "tenant-a", "file-legacy").await;
@@ -101,6 +105,10 @@ async fn an_unowned_object_is_assigned_once_and_never_reassigned() {
     };
     let (status, body) = read("tenant-a", "file-legacy").await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(r#""expires_at":null"#),
+        "an assignment never expires: {body}"
+    );
     // Another tenant's object and an unknown one read the same.
     let (other, other_body) = read("tenant-b", "file-legacy").await;
     let (unknown, unknown_body) = read("tenant-b", "file-unknown").await;
@@ -112,9 +120,36 @@ async fn an_unowned_object_is_assigned_once_and_never_reassigned() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body.contains("object_owned"), "{body}");
     assert_eq!(
-        control_plane.store().object_owner("file-legacy").unwrap(),
+        control_plane
+            .store()
+            .object_owner("file-legacy")
+            .unwrap()
+            .map(|o| o.tenant),
         Some(TenantId::new("tenant-a")),
         "the first owner is kept"
+    );
+}
+
+/// An owner row past its expiry is no owner: the object is assignable
+/// again, to any tenant, and the assignment does not expire (ADR-0013 §6).
+#[tokio::test]
+async fn an_object_whose_owner_expired_is_assignable_and_the_assignment_is_permanent() {
+    let (_server, addr, control_plane) = server(true).await;
+    create_tenant(addr, "tenant-a").await;
+    control_plane
+        .store()
+        .claim_object(
+            "resp-old",
+            &TenantId::new("tenant-b"),
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+    let (status, body) = assign(addr, "tenant-a", "resp-old").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let owner = control_plane.store().object_owner("resp-old").unwrap();
+    assert_eq!(
+        owner.map(|o| (o.tenant, o.expires_at)),
+        Some((TenantId::new("tenant-a"), None))
     );
 }
 

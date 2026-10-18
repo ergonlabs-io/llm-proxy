@@ -337,7 +337,10 @@ fn pass(shared: &Shared, gate: Gate) -> bool {
 const OBJECT_OWNER: &str = "owner-a";
 
 fn owner_row() -> Vec<u8> {
-    crate::control::encode_object_owner_row(&TenantId::new(OBJECT_OWNER))
+    crate::control::encode_object_owner_row(&crate::control::ObjectOwner {
+        tenant: TenantId::new(OBJECT_OWNER),
+        expires_at: None,
+    })
 }
 
 /// The canned reply to one command, or `None` to hang up instead.
@@ -364,9 +367,9 @@ fn answer(
                     return None;
                 }
                 shared.rows.exec_reply()
-            } else if commands == ["HSETNX", "HGET"] {
+            } else if commands == ["SET", "GET"] {
                 // `claim_object`: the set, then the owner row it reads back.
-                let mut out = b"*2\r\n:1\r\n".to_vec();
+                let mut out = b"*2\r\n+OK\r\n".to_vec();
                 bulk(&mut out, &owner_row());
                 out
             } else {
@@ -403,6 +406,11 @@ fn answer(
             format!(":{reply}\r\n").into_bytes()
         }
         "EVALSHA" => b":1\r\n".to_vec(),
+        "GET" if mentions(":object_owner:") => {
+            let mut out = Vec::new();
+            bulk(&mut out, &owner_row());
+            out
+        }
         "GET" if mentions(":generation") => bulk_number(GENERATION),
         "GET" if mentions(":win:") => {
             if !pass(shared, Gate::WindowRead) {
@@ -411,11 +419,6 @@ fn answer(
             bulk_number(STORED_SPEND)
         }
         "GET" => bulk_number(STORED_SPEND),
-        "HGET" if mentions(":object_owners") => {
-            let mut out = Vec::new();
-            bulk(&mut out, &owner_row());
-            out
-        }
         "HGET" => bulk_number(LAST_SEQ),
         "SET" | "CLIENT" => b"+OK\r\n".to_vec(),
         // `SCRIPT LOAD` answers the script's hash; the store ignores it.
@@ -882,11 +885,11 @@ fn object_ownership_calls_run_on_their_own_connection_past_a_stuck_load() {
 
     let owner = TenantId::new(OBJECT_OWNER);
     let claimed = store_call("claim_object behind a stuck load", &store, |s| {
-        s.claim_object("file-1", &TenantId::new("someone-else"))
+        s.claim_object("file-1", &TenantId::new("someone-else"), None)
     })
     .expect("claim_object");
     assert_eq!(
-        claimed, owner,
+        claimed.tenant, owner,
         "the claim returns the owner the store holds"
     );
     let objects = fake.last_conn();
@@ -898,7 +901,7 @@ fn object_ownership_calls_run_on_their_own_connection_past_a_stuck_load() {
         s.object_owner("file-1")
     })
     .expect("object_owner");
-    assert_eq!(read, Some(owner));
+    assert_eq!(read.map(|o| o.tenant), Some(owner));
     assert_eq!(fake.last_conn(), objects);
 
     fake.release(Gate::PolicyLoad);

@@ -564,26 +564,38 @@ pub trait ControlPlaneStore: Send + Sync {
     // does not return them and writing one bumps no generation, because a
     // row per created object would make every replica reload the whole store
     // on every create. The data plane writes them, off the worker, as the
-    // provider answers a create. Rows are never removed: deleting a tenant
-    // leaves its rows, so a tenant id must not be reused for another
-    // customer while its objects exist at the provider.
+    // provider answers a create. A row claimed with a time to live expires
+    // (ADR-0013 §6); any other row is never removed: deleting a tenant leaves
+    // its rows, so a tenant id must not be reused for another customer while
+    // its objects exist at the provider.
 
     /// Records `tenant` as the owner of `object_id` unless the object
-    /// already has one, and returns the owner the store holds afterwards.
-    /// Never overwrites: a claim by a second tenant returns the first.
+    /// already has a live owner, and returns the owner the store holds
+    /// afterwards. Never overwrites or extends a live row: a claim by a
+    /// second tenant returns the first. A row past its expiry is absent, so a
+    /// claim replaces it. With `ttl` the new row expires that long from now
+    /// (whole seconds); without, it never does. The row returned may already
+    /// be past its expiry (a zero `ttl`, or replicas whose clocks disagree),
+    /// so a caller checks [`ObjectOwner::is_live`].
     ///
     /// The default refuses, so a store without ownership rows fails closed:
     /// an object whose owner cannot be recorded stays unreachable.
-    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
-        let _ = (object_id, tenant);
+    fn claim_object(
+        &self,
+        object_id: &str,
+        tenant: &TenantId,
+        ttl: Option<Duration>,
+    ) -> Result<ObjectOwner, StoreError> {
+        let _ = (object_id, tenant, ttl);
         Err(StoreError::Unavailable(
             "object ownership is not supported by this store".into(),
         ))
     }
 
-    /// The tenant that owns `object_id`, or `None` when none has claimed it.
-    /// The default refuses, for the reason [`Self::claim_object`]'s does.
-    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+    /// The live owner of `object_id`, or `None` when none has claimed it or
+    /// its row has expired. The default refuses, for the reason
+    /// [`Self::claim_object`]'s does.
+    fn object_owner(&self, object_id: &str) -> Result<Option<ObjectOwner>, StoreError> {
         let _ = object_id;
         Err(StoreError::Unavailable(
             "object ownership is not supported by this store".into(),
@@ -883,7 +895,7 @@ pub struct WindowDelta<'a> {
 pub const WINDOW_ROW_GRACE_SECS: u64 = 300;
 
 /// Unix seconds now; `0` if the clock is before the epoch.
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -953,8 +965,11 @@ struct InMemoryState {
     rate_cards: HashMap<String, StoredRateCard>,
     // Tenants opted in to trace export (ADR-0008 decision 2).
     trace_export: HashSet<TenantId>,
-    // Object id -> owning tenant. Not tier 2: no generation bump.
-    object_owners: HashMap<String, TenantId>,
+    // Object id -> owner. Not tier 2: no generation bump.
+    object_owners: HashMap<String, ObjectOwner>,
+    // (expires_at, object id) of every row that expires, so a claim can
+    // remove expired rows without scanning them all.
+    object_expiry: std::collections::BTreeSet<(u64, String)>,
     // Keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
@@ -1006,6 +1021,7 @@ impl InMemoryControlPlaneStore {
                 rate_cards: HashMap::new(),
                 trace_export: HashSet::new(),
                 object_owners: HashMap::new(),
+                object_expiry: std::collections::BTreeSet::new(),
                 spend: HashMap::new(),
                 spend_seq: HashMap::new(),
                 windows: HashMap::new(),
@@ -1306,26 +1322,64 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         Ok(true)
     }
 
-    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+    fn claim_object(
+        &self,
+        object_id: &str,
+        tenant: &TenantId,
+        ttl: Option<Duration>,
+    ) -> Result<ObjectOwner, StoreError> {
         check_object_id(object_id)?;
+        let now = unix_now_secs();
         let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        let state = &mut *state;
+        // Remove a bounded number of expired rows, so they cannot pile up.
+        let expired: Vec<(u64, String)> = state
+            .object_expiry
+            .iter()
+            .take_while(|(at, _)| *at <= now)
+            .take(OBJECT_SWEEP_PER_CLAIM)
+            .cloned()
+            .collect();
+        for entry in expired {
+            state.object_expiry.remove(&entry);
+            if state
+                .object_owners
+                .get(&entry.1)
+                .is_some_and(|row| row.expires_at == Some(entry.0))
+            {
+                state.object_owners.remove(&entry.1);
+            }
+        }
+        if let Some(owner) = state.object_owners.get(object_id) {
+            if owner.is_live(now) {
+                return Ok(owner.clone());
+            }
+        }
+        let owner = ObjectOwner::new(tenant.clone(), ttl, now);
+        if let Some(at) = owner.expires_at {
+            state.object_expiry.insert((at, object_id.to_string()));
+        }
+        state
+            .object_owners
+            .insert(object_id.to_string(), owner.clone());
+        Ok(owner)
+    }
+
+    fn object_owner(&self, object_id: &str) -> Result<Option<ObjectOwner>, StoreError> {
+        check_object_id(object_id)?;
+        let now = unix_now_secs();
+        let state = self
             .state
             .lock()
             .expect("control-plane store mutex poisoned");
         Ok(state
             .object_owners
-            .entry(object_id.to_string())
-            .or_insert_with(|| tenant.clone())
-            .clone())
-    }
-
-    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
-        check_object_id(object_id)?;
-        let state = self
-            .state
-            .lock()
-            .expect("control-plane store mutex poisoned");
-        Ok(state.object_owners.get(object_id).cloned())
+            .get(object_id)
+            .filter(|owner| owner.is_live(now))
+            .cloned())
     }
 
     // Rust note: an explicit override rather than the trait default, so the
@@ -1541,6 +1595,9 @@ const TENANT_CREDENTIALS_TABLE: TableDefinition<(&str, &str), &[u8]> =
 const RATE_CARDS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("rate_cards");
 // Object id -> `encode_object_owner_row`. Not tier 2: no generation bump.
 const OBJECT_OWNERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("object_owners");
+// (expires_at, object id) of every owner row that expires, in expiry order,
+// so a claim removes expired rows without scanning the owners table.
+const OBJECT_EXPIRY_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("object_expiry");
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -1802,28 +1859,60 @@ pub(crate) fn check_object_id(object_id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// An object-ownership row, the same JSON in redb and Redis.
+/// Most expired owner rows one claim removes. Claims outnumber expiries in
+/// steady state, so a small bound keeps up without making one claim slow.
+const OBJECT_SWEEP_PER_CLAIM: usize = 16;
+
+/// An object's owner, as the store holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectOwner {
+    pub tenant: TenantId,
+    /// Unix seconds at which the row stops counting; `None` never expires.
+    pub expires_at: Option<u64>,
+}
+
+impl ObjectOwner {
+    /// A row claimed at `now` (Unix seconds) that lives for `ttl`.
+    pub fn new(tenant: TenantId, ttl: Option<Duration>, now: u64) -> Self {
+        ObjectOwner {
+            tenant,
+            expires_at: ttl.map(|ttl| now.saturating_add(ttl.as_secs())),
+        }
+    }
+
+    /// Whether the row still counts at `now` (Unix seconds).
+    pub fn is_live(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|at| now < at)
+    }
+}
+
+/// An object-ownership row, the same JSON in redb and Redis. A row without
+/// `expires_at` never expires.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodedObjectOwner {
     schema_version: u32,
     tenant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
 }
 
-pub(crate) fn encode_object_owner_row(tenant: &TenantId) -> Vec<u8> {
+pub(crate) fn encode_object_owner_row(owner: &ObjectOwner) -> Vec<u8> {
     encode_json(&EncodedObjectOwner {
         schema_version: OBJECT_OWNER_SCHEMA_VERSION,
-        tenant: tenant.as_str().to_string(),
+        tenant: owner.tenant.as_str().to_string(),
+        expires_at: owner.expires_at,
     })
 }
 
-/// The owner a stored row names. A row this build cannot read is an error,
-/// not "no owner": an unreadable row must not let the object be claimed by,
-/// or opened to, someone else.
-pub(crate) fn decode_object_owner_row(value: &[u8]) -> Result<TenantId, StoreError> {
+/// The owner a stored row names, expired or not. A row this build cannot
+/// read is an error, not "no owner": an unreadable row must not let the
+/// object be claimed by, or opened to, someone else.
+pub(crate) fn decode_object_owner_row(value: &[u8]) -> Result<ObjectOwner, StoreError> {
     match serde_json::from_slice::<EncodedObjectOwner>(value) {
-        Ok(row) if row.schema_version == OBJECT_OWNER_SCHEMA_VERSION => {
-            Ok(TenantId::new(row.tenant))
-        }
+        Ok(row) if row.schema_version == OBJECT_OWNER_SCHEMA_VERSION => Ok(ObjectOwner {
+            tenant: TenantId::new(row.tenant),
+            expires_at: row.expires_at,
+        }),
         Ok(row) => Err(StoreError::Unavailable(format!(
             "object owner row has unsupported schema version {}",
             row.schema_version
@@ -2192,6 +2281,7 @@ impl RedbControlPlaneStore {
             .map_err(store_err)?;
         txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
         txn.open_table(OBJECT_OWNERS_TABLE).map_err(store_err)?;
+        txn.open_table(OBJECT_EXPIRY_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(WINDOWS_TABLE).map_err(store_err)?;
@@ -2734,25 +2824,61 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Ok(true)
     }
 
-    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+    fn claim_object(
+        &self,
+        object_id: &str,
+        tenant: &TenantId,
+        ttl: Option<Duration>,
+    ) -> Result<ObjectOwner, StoreError> {
         check_object_id(object_id)?;
+        let now = unix_now_secs();
         // redb serializes write transactions, so the read and the insert
         // below cannot interleave with another claim.
         let txn = self.db.begin_write().map_err(store_err)?;
         let owner = {
             let mut table = txn.open_table(OBJECT_OWNERS_TABLE).map_err(store_err)?;
+            let mut expiry = txn.open_table(OBJECT_EXPIRY_TABLE).map_err(store_err)?;
+            // Remove a bounded number of expired rows, so they cannot pile
+            // up. An index entry whose row was replaced since is dropped
+            // without touching the row.
+            let mut expired = Vec::new();
+            for entry in expiry
+                .range::<(u64, &str)>(..(now.saturating_add(1), ""))
+                .map_err(store_err)?
+                .take(OBJECT_SWEEP_PER_CLAIM)
+            {
+                let (key, _) = entry.map_err(store_err)?;
+                let (at, id) = key.value();
+                expired.push((at, id.to_string()));
+            }
+            for (at, id) in expired {
+                expiry.remove((at, id.as_str())).map_err(store_err)?;
+                let current = table
+                    .get(id.as_str())
+                    .map_err(store_err)?
+                    .map(|row| decode_object_owner_row(row.value()));
+                if let Some(Ok(row)) = current {
+                    if row.expires_at == Some(at) {
+                        table.remove(id.as_str()).map_err(store_err)?;
+                    }
+                }
+            }
             let existing = table
                 .get(object_id)
                 .map_err(store_err)?
                 .map(|row| decode_object_owner_row(row.value()))
                 .transpose()?;
             match existing {
-                Some(owner) => owner,
-                None => {
+                Some(owner) if owner.is_live(now) => owner,
+                _ => {
+                    let owner = ObjectOwner::new(tenant.clone(), ttl, now);
                     table
-                        .insert(object_id, encode_object_owner_row(tenant).as_slice())
+                        .insert(object_id, encode_object_owner_row(&owner).as_slice())
                         .map_err(store_err)?;
-                    tenant.clone()
+                    if let Some(at) = owner.expires_at {
+                        expiry.insert((at, object_id), ()).map_err(store_err)?;
+                    }
+                    owner
                 }
             }
         };
@@ -2760,15 +2886,17 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Ok(owner)
     }
 
-    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+    fn object_owner(&self, object_id: &str) -> Result<Option<ObjectOwner>, StoreError> {
         check_object_id(object_id)?;
+        let now = unix_now_secs();
         let txn = self.db.begin_read().map_err(store_err)?;
         let table = txn.open_table(OBJECT_OWNERS_TABLE).map_err(store_err)?;
-        table
+        Ok(table
             .get(object_id)
             .map_err(store_err)?
             .map(|row| decode_object_owner_row(row.value()))
-            .transpose()
+            .transpose()?
+            .filter(|owner| owner.is_live(now)))
     }
 
     fn is_durable(&self) -> bool {
@@ -5064,10 +5192,15 @@ impl ControlPlaneStore for SharedMemoryStore {
     fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
         self.inner.set_trace_export(tenant, enabled)
     }
-    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
-        self.inner.claim_object(object_id, tenant)
+    fn claim_object(
+        &self,
+        object_id: &str,
+        tenant: &TenantId,
+        ttl: Option<Duration>,
+    ) -> Result<ObjectOwner, StoreError> {
+        self.inner.claim_object(object_id, tenant, ttl)
     }
-    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+    fn object_owner(&self, object_id: &str) -> Result<Option<ObjectOwner>, StoreError> {
         self.inner.object_owner(object_id)
     }
     fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
@@ -7290,29 +7423,23 @@ mod tests {
     #[test]
     fn the_first_object_claim_wins_survives_a_reopen_and_bumps_no_generation() {
         let path = temp_db_path("object-owners");
-        type Open = Box<dyn Fn() -> Box<dyn ControlPlaneStore>>;
-        let stores: Vec<(&str, Open)> = vec![
-            ("in_memory", {
-                let (store, _) = SharedMemoryStore::new();
-                Box::new(move || Box::new(store.handle()))
-            }),
-            ("redb", {
-                let path = path.clone();
-                Box::new(move || Box::new(RedbControlPlaneStore::open(&path).unwrap()))
-            }),
-        ];
-        for (name, open) in stores {
+        for (name, open) in object_stores(&path) {
             let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+            let tenant = |owner: Option<ObjectOwner>| owner.map(|o| o.tenant);
             let before = open().policy_generation().unwrap();
             assert_eq!(open().object_owner("file-1").unwrap(), None, "{name}");
-            assert_eq!(open().claim_object("file-1", &a).unwrap(), a, "{name}");
             assert_eq!(
-                open().claim_object("file-1", &b).unwrap(),
+                open().claim_object("file-1", &a, None).unwrap().tenant,
+                a,
+                "{name}"
+            );
+            assert_eq!(
+                open().claim_object("file-1", &b, None).unwrap().tenant,
                 a,
                 "{name}: a second claim must return the first owner"
             );
             assert_eq!(
-                open().object_owner("file-1").unwrap(),
+                tenant(open().object_owner("file-1").unwrap()),
                 Some(a.clone()),
                 "{name}"
             );
@@ -7321,7 +7448,7 @@ mod tests {
             for bad in ["", &"x".repeat(MAX_OBJECT_ID_BYTES + 1)] {
                 assert!(
                     matches!(
-                        open().claim_object(bad, &a),
+                        open().claim_object(bad, &a, None),
                         Err(StoreError::InvalidInput(_))
                     ),
                     "{name}"
@@ -7329,6 +7456,110 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    type OpenStore = Box<dyn Fn() -> Box<dyn ControlPlaneStore>>;
+
+    /// The in-memory store, and a redb file at `path`, each reopened per call.
+    fn object_stores(path: &std::path::Path) -> Vec<(&'static str, OpenStore)> {
+        let path = path.to_path_buf();
+        vec![
+            ("in_memory", {
+                let (store, _) = SharedMemoryStore::new();
+                Box::new(move || Box::new(store.handle()))
+            }),
+            (
+                "redb",
+                Box::new(move || Box::new(RedbControlPlaneStore::open(&path).unwrap())),
+            ),
+        ]
+    }
+
+    /// A row past its time to live is absent, and the next claim replaces
+    /// it; a live row with a time to live is kept, with its expiry, and not
+    /// extended by a later claim. A zero time to live is a row that has
+    /// already expired, which makes this deterministic.
+    #[test]
+    fn an_expired_object_owner_is_absent_and_replaced_by_the_next_claim() {
+        let path = temp_db_path("object-owner-expiry");
+        let zero = Some(Duration::ZERO);
+        let day = Some(Duration::from_secs(86_400));
+        for (name, open) in object_stores(&path) {
+            let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+            let claimed = open().claim_object("resp-1", &a, zero).unwrap();
+            assert!(!claimed.is_live(unix_now_secs()), "{name}");
+            assert_eq!(open().object_owner("resp-1").unwrap(), None, "{name}");
+            let replaced = open().claim_object("resp-1", &b, None).unwrap();
+            assert_eq!(
+                (replaced.tenant, replaced.expires_at),
+                (b.clone(), None),
+                "{name}"
+            );
+
+            let kept = open().claim_object("resp-2", &a, day).unwrap();
+            let at = kept.expires_at.expect("a row claimed with a ttl expires");
+            assert!(at >= unix_now_secs() + 86_000, "{name}: {at}");
+            assert_eq!(
+                open().claim_object("resp-2", &b, day).unwrap(),
+                kept,
+                "{name}"
+            );
+            assert_eq!(
+                open().claim_object("resp-2", &a, None).unwrap(),
+                kept,
+                "{name}"
+            );
+            assert_eq!(open().object_owner("resp-2").unwrap(), Some(kept), "{name}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Expired rows are removed by later claims, a bounded number per claim,
+    /// so rows with a time to live cannot pile up. A row an expiry entry no
+    /// longer describes (replaced since) is left alone.
+    #[test]
+    fn claims_remove_expired_object_owner_rows() {
+        let store = RedbControlPlaneStore::in_memory();
+        let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+        let count = |store: &RedbControlPlaneStore| {
+            use redb::ReadableTableMetadata;
+            let txn = store.db.begin_read().unwrap();
+            let owners = txn.open_table(OBJECT_OWNERS_TABLE).unwrap().len().unwrap();
+            let expiry = txn.open_table(OBJECT_EXPIRY_TABLE).unwrap().len().unwrap();
+            (owners, expiry)
+        };
+        let expired = OBJECT_SWEEP_PER_CLAIM as u64 + 4;
+        for i in 0..expired {
+            store
+                .claim_object(&format!("old-{i}"), &a, Some(Duration::ZERO))
+                .unwrap();
+        }
+        // Each claim above swept the rows before it, so at most the last
+        // one is left; replace it with a permanent row, which its stale
+        // expiry entry must not remove.
+        let last = format!("old-{}", expired - 1);
+        store.claim_object(&last, &b, None).unwrap();
+        store.claim_object("fresh", &a, None).unwrap();
+        assert_eq!(count(&store), (2, 0), "only the permanent rows remain");
+        assert_eq!(
+            store.object_owner(&last).unwrap().map(|o| o.tenant),
+            Some(b)
+        );
+
+        let memory = InMemoryControlPlaneStore::default();
+        for i in 0..expired {
+            memory
+                .claim_object(&format!("old-{i}"), &a, Some(Duration::ZERO))
+                .unwrap();
+        }
+        memory.claim_object("fresh", &a, None).unwrap();
+        let state = memory.state.lock().unwrap();
+        assert_eq!(
+            state.object_owners.len(),
+            1,
+            "only the permanent row remains"
+        );
+        assert!(state.object_expiry.is_empty());
     }
 
     /// An owner row this build cannot read is an error, never "no owner":
@@ -7349,7 +7580,10 @@ mod tests {
         }
         for id in ["garbled", "future"] {
             assert!(store.object_owner(id).is_err(), "{id}");
-            assert!(store.claim_object(id, &TenantId::new("b")).is_err(), "{id}");
+            assert!(
+                store.claim_object(id, &TenantId::new("b"), None).is_err(),
+                "{id}"
+            );
         }
     }
 

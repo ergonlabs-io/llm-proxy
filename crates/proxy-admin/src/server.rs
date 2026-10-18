@@ -1883,7 +1883,9 @@ fn object_ownership_enforced(
 /// no tenant owns (created before ownership was recorded, or outside the
 /// proxy) to the tenant, so its requests stop being refused. No body. 204
 /// when the tenant owns the object afterwards, including when it already
-/// did; 409 when another tenant owns it, since an owner is never replaced.
+/// did; 409 when another tenant owns it, since a live owner is never
+/// replaced. An owner row past its expiry is no owner, so such an object is
+/// assignable again; an assignment never expires (ADR-0013 §6).
 fn handle_assign_object(
     factory_state: &SharedFactoryState,
     stat_prefix: Option<&str>,
@@ -1906,8 +1908,13 @@ fn handle_assign_object(
         Ok(false) => return tenant_not_found(),
         Err(err) => return store_error_response(ENDPOINT, err),
     }
-    match control_plane.store().claim_object(object_id, &tenant_id) {
-        Ok(owner) if owner == tenant_id => {
+    // An admin assignment never expires (ADR-0013 §6). A live row the tenant
+    // already holds is kept as it is, expiry included.
+    match control_plane
+        .store()
+        .claim_object(object_id, &tenant_id, None)
+    {
+        Ok(owner) if owner.tenant == tenant_id => {
             tracing::info!(
                 endpoint = ENDPOINT,
                 tenant,
@@ -1930,7 +1937,8 @@ fn handle_assign_object(
 /// none does, without saying which. The store is read directly, so a 200 also
 /// says the owner survives a restart with a durable store, and every replica
 /// sees it with a shared one; a create's owner is written just after its
-/// response, so this is how to confirm it has landed.
+/// response, so this is how to confirm it has landed. `expires_at` is the
+/// row's expiry in Unix seconds, or null when it never expires.
 fn handle_get_object(
     control_plane: &ControlPlane,
     tenant: &str,
@@ -1940,9 +1948,14 @@ fn handle_get_object(
         return bad_request("tenant must not be empty");
     }
     match control_plane.store().object_owner(object_id) {
-        Ok(Some(owner)) if owner.as_str() == tenant => json(
+        Ok(Some(owner)) if owner.tenant.as_str() == tenant => json(
             StatusCode::OK,
-            &serde_json::json!({ "tenant": tenant, "object_id": object_id, "owned": true }),
+            &serde_json::json!({
+                "tenant": tenant,
+                "object_id": object_id,
+                "owned": true,
+                "expires_at": owner.expires_at,
+            }),
         ),
         Ok(_) | Err(StoreError::InvalidInput(_)) => error_json(
             StatusCode::NOT_FOUND,
