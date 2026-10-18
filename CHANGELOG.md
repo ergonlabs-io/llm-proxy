@@ -28,6 +28,21 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `404` for an unknown model.
   Retrievals of stored objects, such as `GET /v1/batches/{id}` and
   `GET /v1/responses/{id}`, are refused under a budget or limit too.
+- Tenants can no longer reach each other's provider files and batches
+  (ADR-0012). Every tenant uses the proxy's one provider account, so file and
+  batch IDs share one namespace; before, tenant B could get, read, cancel and
+  delete tenant A's file or batch, and list both. The new
+  `llmproxy.object_ownership` filter records the tenant that created each
+  object in `auth.store` and answers `404` before dialling when a request
+  names an object, by path or by a `*_file_id` body member, that the caller's
+  tenant does not own or that no tenant owns. Listing `/v1/files`,
+  `/v1/batches` and `/v1/messages/batches` is refused. If the store cannot
+  answer for an owner the proxy has not cached, the request gets `503`
+  (`object_owner_unavailable`). The dialect turns it on with `auth`;
+  `auth.enforce.object_ownership: false` turns it off with a load warning.
+  **Upgrade note:** objects created before this release have no owner and
+  get `404` until assigned with `PUT /tenants/{id}/objects/{object_id}`, and
+  with `auth.store: in_memory` owners are lost on restart.
 - The `--config` access-log formats gain `response_code_details`
   (`%RESPONSE_CODE_DETAILS%`), so a local refusal says why.
 
