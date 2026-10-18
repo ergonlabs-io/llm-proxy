@@ -333,6 +333,13 @@ fn pass(shared: &Shared, gate: Gate) -> bool {
     true
 }
 
+/// The owner row the fake answers every object-ownership read with.
+const OBJECT_OWNER: &str = "owner-a";
+
+fn owner_row() -> Vec<u8> {
+    crate::control::encode_object_owner_row(&TenantId::new(OBJECT_OWNER))
+}
+
 /// The canned reply to one command, or `None` to hang up instead.
 fn answer(
     shared: &Shared,
@@ -357,6 +364,11 @@ fn answer(
                     return None;
                 }
                 shared.rows.exec_reply()
+            } else if commands == ["HSETNX", "HGET"] {
+                // `claim_object`: the set, then the owner row it reads back.
+                let mut out = b"*2\r\n:1\r\n".to_vec();
+                bulk(&mut out, &owner_row());
+                out
             } else {
                 // An admin write: one canned integer per queued command.
                 let mut out = format!("*{}\r\n", commands.len()).into_bytes();
@@ -399,6 +411,11 @@ fn answer(
             bulk_number(STORED_SPEND)
         }
         "GET" => bulk_number(STORED_SPEND),
+        "HGET" if mentions(":object_owners") => {
+            let mut out = Vec::new();
+            bulk(&mut out, &owner_row());
+            out
+        }
         "HGET" => bulk_number(LAST_SEQ),
         "SET" | "CLIENT" => b"+OK\r\n".to_vec(),
         // `SCRIPT LOAD` answers the script's hash; the store ignores it.
@@ -844,6 +861,51 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
         2,
         "one connection per lane, opened on first use and never replaced"
     );
+}
+
+/// Object-ownership calls ride their own connection, so a request naming
+/// an uncached object cannot queue behind a policy load, and a load cannot
+/// queue behind object traffic.
+#[test]
+fn object_ownership_calls_run_on_their_own_connection_past_a_stuck_load() {
+    let fake = FakeRedis::start();
+    let store = Arc::new(fake.store());
+    assert!(store.policy_generation().is_ok());
+    let control = fake.last_conn();
+
+    fake.hold(Gate::PolicyLoad);
+    let stuck_load = thread::spawn({
+        let store = Arc::clone(&store);
+        move || store.load()
+    });
+    fake.wait_until_parked(Gate::PolicyLoad);
+
+    let owner = TenantId::new(OBJECT_OWNER);
+    let claimed = store_call("claim_object behind a stuck load", &store, |s| {
+        s.claim_object("file-1", &TenantId::new("someone-else"))
+    })
+    .expect("claim_object");
+    assert_eq!(
+        claimed, owner,
+        "the claim returns the owner the store holds"
+    );
+    let objects = fake.last_conn();
+    assert_ne!(
+        objects, control,
+        "object calls shared the control connection"
+    );
+    let read = store_call("object_owner behind a stuck load", &store, |s| {
+        s.object_owner("file-1")
+    })
+    .expect("object_owner");
+    assert_eq!(read, Some(owner));
+    assert_eq!(fake.last_conn(), objects);
+
+    fake.release(Gate::PolicyLoad);
+    stuck_load
+        .join()
+        .expect("load thread")
+        .expect("the released load completes");
 }
 
 #[test]
