@@ -12,6 +12,12 @@
 //! auth control-plane store so persisted budgets and spend survive restarts;
 //! unreadable applicable usage warns and records zero rather than denying a
 //! completed request (AGENTS.md "Fail-open controls").
+//!
+//! A budget that binds a request refuses it with 403 `endpoint_not_metered`
+//! when its endpoint cannot be counted (images, audio, batches, files and
+//! every unknown path; ADR-0010 decision 1, [`crate::unmetered`]). Free
+//! endpoints (`GET .../models`, `GET .../usage`,
+//! `POST .../messages/count_tokens`) pass without a missing-usage warning.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +30,7 @@ use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
+use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders,
@@ -40,6 +47,7 @@ use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::spend::{
     self, Charge, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy, SpendAccumulator,
 };
+use crate::unmetered::{self, RefusalCounter};
 use crate::usage::TokenUsage;
 use crate::usage_filter::PricingRegistry;
 
@@ -273,6 +281,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
             .shared
             .get("", crate::usage_filter::STATS_REGISTRY_KEY)
             .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok());
+        let stats_registry_for_refusals = stats_registry.clone();
         let shared = ctx
             .get_or_try_init(TYPE_URL, || {
                 let mut accumulator = SpendAccumulator::with_reconciliation(
@@ -329,6 +338,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
             pricing_registry,
             accumulator: Arc::clone(&shared.accumulator),
             charged: shared.charged.clone(),
+            unmetered: stats_registry_for_refusals.map(|r| Arc::new(RefusalCounter::new(r))),
             usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
             unpriced_warner: Arc::clone(&shared.unpriced_warner),
             snapshot: control_plane.handle(),
@@ -435,6 +445,7 @@ struct SpendLimitInstanceFactory {
     pricing_registry: Arc<PricingRegistry>,
     accumulator: Arc<SpendAccumulator>,
     charged: Option<Arc<SpendChargedCounter>>,
+    unmetered: Option<Arc<RefusalCounter>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     unpriced_warner: Arc<UnpricedWarner>,
     /// One handle per (filter config, listener), shared by every per-stream
@@ -449,9 +460,11 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             pricing_snapshot: self.pricing_registry.snapshot_context(),
             accumulator: Arc::clone(&self.accumulator),
             charged: self.charged.clone(),
+            unmetered: self.unmetered.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             unpriced_warner: Arc::clone(&self.unpriced_warner),
             snapshot: Arc::clone(&self.snapshot),
+            endpoint: Endpoint::Unmetered,
             key_id: None,
             tenant: None,
             period: None,
@@ -596,9 +609,13 @@ struct SpendLimitFilterInstance {
     accumulator: Arc<SpendAccumulator>,
     /// `None` only where no stats registry exists (unit tests).
     charged: Option<Arc<SpendChargedCounter>>,
+    /// `None` only where no stats registry exists (unit tests).
+    unmetered: Option<Arc<RefusalCounter>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     unpriced_warner: Arc<UnpricedWarner>,
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
+    /// The request's endpoint class, set at admission.
+    endpoint: Endpoint,
     /// Authenticated key and its reporting period, captured at admission.
     key_id: Option<KeyId>,
     period: Option<Period>,
@@ -660,7 +677,10 @@ impl SpendLimitFilterInstance {
         };
 
         let Some(usage) = usage else {
-            if self.budget_applies {
+            // Silence is not a metering gap when nothing could be billed: a
+            // free endpoint costs nothing, and a request that reached no
+            // provider (a synthetic 404, a local reply) spent nothing.
+            if self.budget_applies && self.endpoint != Endpoint::Free && cluster.is_some() {
                 self.usage_missing_warner
                     .warn_if_due(&key_id, Instant::now());
             }
@@ -785,9 +805,10 @@ impl HttpFilter for SpendLimitFilterInstance {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        _headers: &mut RequestHeaders,
+        headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
+        self.endpoint = Endpoint::classify(&headers.method, headers.uri.path());
         // Rust note: `stream_info()` hands back a `RefMut` guard that must
         // not be held across another call on `cb` -- cloning the
         // `Option<String>` out and letting the guard drop at the end of this
@@ -866,6 +887,23 @@ impl HttpFilter for SpendLimitFilterInstance {
         self.budget_applies = key_budget.is_some() || tenant_budget.is_some();
         self.key_budget_scope = key_budget_configured.map(|b| b.credential_source);
         self.tenant_budget_scope = tenant_budget_configured.map(|b| b.credential_source);
+        // A budget that binds this request must be able to count it, or the
+        // request would be charged $0 (ADR-0010 decision 1). Refused before
+        // the ceiling check: the request is uncountable whatever the spend.
+        if self.budget_applies
+            && self.endpoint != Endpoint::Free
+            && !unmetered::metered_under_spend(self.endpoint)
+        {
+            // Nothing was dialled, so there is nothing to record.
+            self.recorded = true;
+            unmetered::refuse(
+                cb,
+                self.endpoint,
+                unmetered::Control::Spend,
+                self.unmetered.as_deref(),
+            );
+            return FilterHeadersStatus::Continue;
+        }
         let now = Utc::now();
         let ceilings = [
             key_budget.map(|budget| {
@@ -1467,10 +1505,12 @@ mod tests {
             SpendLimitFilterInstance {
                 accumulator: Arc::clone(&self.accumulator),
                 charged: None,
+                unmetered: None,
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
                 unpriced_warner: Arc::clone(&self.unpriced_warner),
                 pricing_snapshot: self.pricing_registry.snapshot_context(),
                 snapshot: Arc::clone(&self.snapshot),
+                endpoint: Endpoint::Unmetered,
                 key_id: None,
                 tenant: None,
                 period: None,

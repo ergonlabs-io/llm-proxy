@@ -1215,6 +1215,16 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+    /// ADR-0010 decision 1: requests a spend budget or token limit refused
+    /// because the proxy cannot count their endpoint. `endpoint` is the
+    /// classifier's closed label set; `control` is `spend` or `token_limit`.
+    pub const UNMETERED_ENDPOINT_REFUSED: Instrument = Instrument {
+        name: "llmproxy_unmetered_endpoint_refused_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["endpoint", "control"],
+        buckets: None,
+    };
     /// ADR-0009 decision 7, the other side: micro-USD of spend charges in
     /// committed ledger entries (entries with charged scopes). Equal to
     /// [`SPEND_CHARGED`] unless entries were lost or served under `admit`.

@@ -15,6 +15,7 @@ use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
 
+use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, PerRouteConfig,
@@ -1537,17 +1538,11 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
 /// parser even behind a cluster whose dialect is Anthropic: that parser would
 /// look for `input_tokens` and meter nothing.
 fn dialect_for_request(method: &Method, path: &str) -> Option<Dialect> {
-    if method != Method::POST {
-        return None;
-    }
-    if path.ends_with("/responses") {
-        Some(Dialect::OpenAiResponses)
-    } else if path.ends_with("/messages") {
-        Some(Dialect::Anthropic)
-    } else if path.ends_with("/embeddings") {
-        Some(Dialect::OpenAi)
-    } else {
-        None
+    match Endpoint::classify(method, path) {
+        Endpoint::Responses => Some(Dialect::OpenAiResponses),
+        Endpoint::Messages => Some(Dialect::Anthropic),
+        Endpoint::Embeddings => Some(Dialect::OpenAi),
+        _ => None,
     }
 }
 

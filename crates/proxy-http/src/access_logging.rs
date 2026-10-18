@@ -30,6 +30,7 @@ use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
 use proxy_observability::ResponseFlag;
 
+use crate::endpoint::Endpoint;
 use crate::handler::{BodyError, StreamBody};
 use crate::router::idle::{IdleTimeoutError, MaxStreamDurationError};
 use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
@@ -256,17 +257,14 @@ pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestS
 /// for OpenAI's Responses API: semconv v1.27 only standardizes `chat`,
 /// `text_completion` and `embeddings`, and calling Responses "chat" would be a
 /// false label.
-fn gen_ai_operation(path: &str) -> Option<&'static str> {
-    if path.ends_with("/chat/completions") || path.ends_with("/messages") {
-        Some("chat")
-    } else if path.ends_with("/completions") {
-        Some("text_completion")
-    } else if path.ends_with("/responses") {
-        Some("responses")
-    } else if path.ends_with("/embeddings") {
-        Some("embeddings")
-    } else {
-        None
+fn gen_ai_operation(method: &str, path: &str) -> Option<&'static str> {
+    let method = http::Method::from_bytes(method.as_bytes()).ok()?;
+    match Endpoint::classify(&method, path) {
+        Endpoint::ChatCompletions | Endpoint::Messages => Some("chat"),
+        Endpoint::Completions => Some("text_completion"),
+        Endpoint::Responses => Some("responses"),
+        Endpoint::Embeddings => Some("embeddings"),
+        _ => None,
     }
 }
 
@@ -988,7 +986,7 @@ impl LoggingBody {
         if response_flags.is_empty() && (200..300).contains(&ctx.response_code) {
             if let (Some(latency_stats), Some(operation), Some(model), Some(system)) = (
                 ctx.latency_stats.as_ref(),
-                gen_ai_operation(&ctx.request.path),
+                gen_ai_operation(&ctx.request.method, &ctx.request.path),
                 requested_model.as_deref(),
                 llm_system,
             ) {
@@ -2313,6 +2311,7 @@ mod tests {
         let control = proxy_observability::stats::StatsControl::new(1);
         let registry = control.registry();
         let mut ctx = flags_ctx(&capture);
+        ctx.request.method = "POST".to_string();
         ctx.request.path = "/v1/chat/completions".to_string();
         ctx.start_instant = Instant::now() - std::time::Duration::from_secs(1);
         ctx.latency_stats = Some(Arc::new(GenAiLatencyStats::new(
@@ -2657,8 +2656,11 @@ mod tests {
             ("/v1/responses", Some("responses")),
             ("/v1/embeddings", Some("embeddings")),
             ("/v1/models", None),
+            ("/v1/messages/batches", None),
         ] {
-            assert_eq!(gen_ai_operation(path), expected, "{path}");
+            assert_eq!(gen_ai_operation("POST", path), expected, "{path}");
         }
+        // Listing stored completions is not a generation.
+        assert_eq!(gen_ai_operation("GET", "/v1/chat/completions"), None);
     }
 }
