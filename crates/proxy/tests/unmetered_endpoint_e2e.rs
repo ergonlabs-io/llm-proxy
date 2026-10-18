@@ -388,7 +388,9 @@ providers:
 routes:
 {routes}auth:
   hmac_secret: "{HMAC_SECRET}"
-  enforce: {{ model_policy: false }}
+  # Metering is under test, not tenant object ownership (ADR-0012), which
+  # would answer 404 for these fixtures' unowned batch and file IDs first.
+  enforce: {{ model_policy: false, object_ownership: false }}
 observability:
   access_logs: {{ output: "{log}", format: json }}
 {extra}"#,
