@@ -76,7 +76,10 @@ fn a_ledger_missing_a_required_field_names_its_dialect_path() {
             .map(|l| format!("{l}\n"))
             .collect();
         let error = load(&ledger).unwrap_err();
-        assert!(error.contains(&format!("ledger.{field}")), "{field}: {error}");
+        assert!(
+            error.contains(&format!("ledger.{field}")),
+            "{field}: {error}"
+        );
     }
     let error = load(&format!("{REQUIRED}  on_unavailable: drop\n")).unwrap_err();
     assert!(error.contains("on_unavailable"), "{error}");
