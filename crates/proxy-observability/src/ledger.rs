@@ -162,7 +162,23 @@ pub struct LedgerPage {
     pub entries: Vec<CommittedEntry>,
     /// The cursor of the last committed entry; 0 when none was ever committed.
     pub committed_through: u64,
+    /// This instance's recent epochs, oldest first; the last is the running
+    /// one, which is not closed yet.
+    pub epochs: Vec<EpochStatus>,
 }
+
+/// Whether an epoch ended with every entry handed to its writer committed.
+/// An earlier epoch that is not `closed` crashed, or stopped with entries it
+/// never committed, so entries may be missing from its end, where `seq`
+/// cannot show the gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EpochStatus {
+    pub epoch: u64,
+    pub closed: bool,
+}
+
+/// Epochs remembered in the spool's application row, newest last.
+const MAX_EPOCH_HISTORY: usize = 64;
 
 /// The result of an acknowledgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +452,7 @@ struct LedgerStats {
     committed: Handle,
     lost: [Handle; 3],
     spend_written: Handle,
+    unclean_epochs: Handle,
 }
 
 impl LedgerStats {
@@ -451,7 +468,12 @@ impl LedgerStats {
             lost: ["writer_failed", "oversize", "shutdown"]
                 .map(|r| control.resolve(&instruments::LEDGER_LOST, &[("reason", r)])),
             spend_written: control.resolve(&instruments::LEDGER_SPEND_WRITTEN, &[]),
+            unclean_epochs: control.resolve(&instruments::LEDGER_UNCLEAN_EPOCHS, &[]),
         }
+    }
+
+    fn unclean_epoch(&self) {
+        self.registry.incr(WorkerId(0), self.unclean_epochs, 1);
     }
 
     fn index(reason: Unavailable) -> usize {
@@ -562,7 +584,7 @@ mod writer {
             path: config.directory.clone(),
             source,
         };
-        let spool = MetadataSpool::open(
+        let mut spool = MetadataSpool::open(
             SpoolConfig {
                 directory: config.directory.clone(),
                 node_id: instance_id.to_owned(),
@@ -575,7 +597,37 @@ mod writer {
             previous,
         )
         .map_err(spool_error)?;
-        let epoch = next_epoch(&spool).map_err(spool_error)?;
+        let stats = LedgerStats::resolve(stats);
+        let mut epochs = epoch_history(&spool);
+        if let Some(previous) = epochs.last().filter(|e| !e.closed) {
+            stats.unclean_epoch();
+            tracing::error!(
+                instance_id,
+                epoch = previous.epoch,
+                "billing ledger: the previous epoch did not close; it crashed or stopped with \
+                 uncommitted entries, so entries may be missing from its end"
+            );
+        }
+        let after_history = epochs.last().map_or(0, |e| e.epoch.saturating_add(1));
+        let epoch = next_epoch(&spool).map_err(spool_error)?.max(after_history);
+        epochs.push(EpochStatus {
+            epoch,
+            closed: false,
+        });
+        if epochs.len() > MAX_EPOCH_HISTORY {
+            epochs.drain(..epochs.len() - MAX_EPOCH_HISTORY);
+        }
+        match spool.set_application_state(&encode_history(&epochs)) {
+            Ok(()) => {}
+            // A start at the disk cap: the ledger still serves, but this
+            // epoch's end cannot be judged after a restart.
+            Err(SpoolError::Full) => tracing::error!(
+                epoch,
+                "billing ledger spool is at its disk cap and cannot record this epoch; \
+                 a crash in it will not be detected after restart"
+            ),
+            Err(error) => return Err(spool_error(error)),
+        }
         let (sender, receiver) = mpsc::channel();
         let ledger = Arc::new(Ledger {
             sender,
@@ -585,7 +637,7 @@ mod writer {
             on_unavailable: config.on_unavailable,
             stopping: AtomicBool::new(false),
             last_unledgered_warn_secs: AtomicU64::new(0),
-            stats: LedgerStats::resolve(stats),
+            stats,
         });
         let (done_tx, done) = mpsc::channel();
         let writer = Writer {
@@ -600,6 +652,7 @@ mod writer {
             uncommitted: 0,
             uncommitted_spend: 0,
             backlog: VecDeque::new(),
+            epochs,
             #[cfg(test)]
             hooks: test_hooks::current(),
         };
@@ -667,6 +720,31 @@ mod writer {
         EncryptionKey::new(key.id.clone(), raw).map_err(|_| fail("invalid key id"))
     }
 
+    /// The epochs recorded in the spool's application row. Unreadable means
+    /// none: the row is authenticated, so only a format change gets here.
+    fn epoch_history(spool: &MetadataSpool) -> Vec<EpochStatus> {
+        #[derive(serde::Deserialize)]
+        struct History {
+            epochs: Vec<EpochStatus>,
+        }
+        spool.application_state().map_or_else(Vec::new, |bytes| {
+            serde_json::from_slice::<History>(bytes).map_or_else(
+                |_| {
+                    tracing::warn!(
+                        "billing ledger epoch history does not decode; starting a new one"
+                    );
+                    Vec::new()
+                },
+                |h| h.epochs,
+            )
+        })
+    }
+
+    fn encode_history(epochs: &[EpochStatus]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "epochs": epochs }))
+            .expect("epoch history serializes")
+    }
+
     /// Wall-clock milliseconds, but always past the epoch of the last
     /// unacknowledged entry, so a clock step back cannot repeat an epoch
     /// while that entry is still in the spool.
@@ -707,6 +785,8 @@ mod writer {
         uncommitted_spend: u64,
         /// Received while the spool is at its cap: numbered when appended.
         backlog: VecDeque<LedgerEntry>,
+        /// Recent epochs, this one last; marked closed at a clean stop.
+        epochs: Vec<EpochStatus>,
         #[cfg(test)]
         hooks: Arc<test_hooks::Hooks>,
     }
@@ -776,6 +856,30 @@ mod writer {
                     entries = lost,
                     "billing ledger stopped at its disk cap with uncommitted entries; they are lost"
                 );
+                // Not closed: the next start reports this epoch's end as
+                // incomplete, after this process's counters are gone.
+                return;
+            }
+            self.close_epoch();
+        }
+
+        /// Record that this epoch ended with every entry committed. Refused
+        /// at the cap, the next start reports it unclean: a false alarm, never
+        /// a missed one.
+        fn close_epoch(&mut self) {
+            if let Some(current) = self.epochs.last_mut() {
+                current.closed = true;
+            }
+            if let Err(error) = self
+                .spool
+                .set_application_state(&encode_history(&self.epochs))
+            {
+                tracing::warn!(
+                    %error,
+                    epoch = self.epoch,
+                    "billing ledger could not record a clean close; the next start reports \
+                     this epoch unclean"
+                );
             }
         }
 
@@ -829,6 +933,7 @@ mod writer {
             Ok(Ok(LedgerPage {
                 entries,
                 committed_through: stats.durable_through_sequence,
+                epochs: self.epochs.clone(),
             }))
         }
 

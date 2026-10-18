@@ -211,10 +211,36 @@ fn at_the_disk_cap_admission_is_refused_and_committed_entries_are_kept() {
             "envoy_llmproxy_ledger_rejected_total{reason=\"disk_full\"}"
         ) >= 1
     );
+
+    // The batch that met the cap was never committed, so the stop lost
+    // entries and the epoch did not close. This process's counters are gone
+    // after a restart; the next start reports the epoch from the spool.
+    assert!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"shutdown\"}"
+        ) > 0
+    );
+    ledger.restart();
+    assert_eq!(
+        counter(
+            &ledger.scrape(),
+            "envoy_llmproxy_ledger_unclean_epochs_total"
+        ),
+        1
+    );
+    let epochs = ledger.ledger.read_committed(0, 1, ASK).unwrap().epochs;
+    assert_eq!(epochs.len(), 2);
+    assert_eq!(epochs[0].epoch, entries[0].epoch);
+    assert!(
+        !epochs[0].closed,
+        "an epoch that lost entries is not closed"
+    );
 }
 
 /// A restart opens a new epoch, past the last one in the spool, and starts
 /// `seq` again at 0; the previous epoch's committed entries are still there.
+/// A clean stop closes its epoch, so the next start reports nothing unclean.
 #[test]
 fn a_restart_opens_a_later_epoch_and_keeps_committed_entries() {
     let mut ledger = TempLedger::open(4, OnUnavailable::Reject);
@@ -222,6 +248,17 @@ fn a_restart_opens_a_later_epoch_and_keeps_committed_entries() {
         reserve(&ledger.ledger).append(numbered(i), LedgerCharge::default());
     }
     ledger.restart();
+    assert_eq!(
+        counter(
+            &ledger.scrape(),
+            "envoy_llmproxy_ledger_unclean_epochs_total"
+        ),
+        0
+    );
+    let epochs = ledger.ledger.read_committed(0, 1, ASK).unwrap().epochs;
+    assert_eq!(epochs.len(), 2);
+    assert!(epochs[0].closed, "a clean stop closes its epoch");
+    assert!(!epochs[1].closed, "the running epoch is not closed yet");
     reserve(&ledger.ledger).append(numbered(2), LedgerCharge::default());
     let entries = ledger.entries();
     let shape: Vec<(u64, u64)> = entries.iter().map(|e| (e.epoch, e.seq)).collect();
@@ -229,6 +266,10 @@ fn a_restart_opens_a_later_epoch_and_keeps_committed_entries() {
     let (old, new) = (shape[0].0, shape[2].0);
     assert!(new > old, "epoch {new} follows {old}");
     assert_eq!(shape, [(old, 0), (old, 1), (new, 0)]);
+    assert_eq!(
+        epochs.iter().map(|e| e.epoch).collect::<Vec<_>>(),
+        [old, new]
+    );
 }
 
 /// The key file must be a private 32-byte file; the error names the config

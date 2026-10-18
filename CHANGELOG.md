@@ -79,6 +79,18 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   charged) and `llmproxy_ledger_spend_written_micro_usd_total` (micro-USD of
   spend charges in committed entries). They are equal unless entries were
   lost (`llmproxy_ledger_entries_lost_total`) or served under `admit`.
+- Billing ledger hardening (ADR-0009 hardening addendum). An
+  acknowledgement of any committed range succeeds at `max_disk_bytes`: the
+  spool keeps a reserve for acknowledgements and frees a large range in
+  parts, so a consumer no longer retries shorter prefixes on `507`. A start
+  that finds the previous epoch did not close (a crash, or a stop with
+  uncommitted entries) logs an error and counts it in the new
+  `llmproxy_ledger_unclean_epochs_total`, and `GET /ledger/entries` returns
+  `epochs` with a `closed` flag for the last 64 epochs. Under
+  `on_unavailable: reject` the ledger's 503 is now answered just before
+  dialling, after every filter: a request without a valid key gets 401, not
+  503, and only requests that would have been dialled count in
+  `llmproxy_ledger_rejected_total`.
 - User guide for the billing ledger: `limits-and-budgets/billing-ledger` in the
   docs site, and `examples/llmproxy-ledger.yaml`.
 

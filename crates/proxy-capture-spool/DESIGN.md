@@ -51,6 +51,13 @@ acknowledgement reserve ("Append, commit, and failures"). A database written
 before the reserve existed has no such table; opening it creates the table and
 writes the reserve when it fits.
 
+A fourth, optional table, `application`, holds at most one row that the caller
+owns: an envelope of kind 2, sequence 0, encrypted and authenticated like a
+record and bound to the node. Acknowledgement never deletes it. Recovery
+decrypts it, and a key rotation rewraps it with the state, so it opens after the
+old key is retired. The billing ledger keeps its epoch history there. A binary
+older than these tables rejects a database that has them.
+
 ## Append, commit, and failures
 
 Preserve bounded `append`, `append_batch`, `commit`, and durable receipt semantics.

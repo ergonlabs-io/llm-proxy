@@ -28,6 +28,9 @@ the database has closed. Existing directories/files require owner-only permissio
   genuine backend confirmation. One Immediate transaction advances the backend
   acknowledgement watermark, deletes covered rows, and updates inventory.
   The LOCAL-SPOOL-ONLY agent never calls it. No unacknowledged data is evicted.
+- `application_state` and `set_application_state` read and replace one
+  encrypted row the caller owns, at most `max_record_bytes`, kept across
+  acknowledgements and rewrapped on key rotation.
 - `stats` reports sequence watermarks, pending/retained record counts, database
   and aggregate logical file bytes, quarantine bytes, poisoned state, and
   whether the acknowledgement reserve is held.

@@ -51,6 +51,21 @@ type qa13Page struct {
 	Entries          []qa13Entry `json:"entries"`
 	NextAfter        uint64      `json:"next_after"`
 	CommittedThrough uint64      `json:"committed_through"`
+	Epochs           []qa13Epoch `json:"epochs"`
+}
+
+type qa13Epoch struct {
+	Epoch  uint64 `json:"epoch"`
+	Closed bool   `json:"closed"`
+}
+
+// epochs returns the ledger's recent epochs as the read API reports them,
+// oldest first; the last is the running one.
+func (p *qa13Proxy) epochs() []qa13Epoch {
+	p.t.Helper()
+	var page qa13Page
+	p.adminCall("GET", "/ledger/entries?after=0&limit=1", &page)
+	return page.Epochs
 }
 
 type qa13Ack struct {
@@ -286,7 +301,10 @@ func (p *qa13Proxy) waitMetric(name, label string, want uint64) {
 // after the restart (a read returns only committed entries, and committed
 // means durable), it is returned again because it was never acknowledged
 // (at-least-once), the killed epoch is a gapless prefix from seq 0, and the
-// restart opens a later epoch. One acknowledgement then removes both epochs.
+// restart opens a later epoch. `seq` cannot show entries lost from the end
+// of the killed epoch, so the restart reports that epoch as not closed, in
+// the read API, a counter and the log. One acknowledgement then removes both
+// epochs, and after a clean stop the next start reports nothing unclean.
 func TestQA13_LedgerSurvivesSigkillAndRedeliversUntilAcked(t *testing.T) {
 	start := qa13Setup(t, "reject", 64*1024*1024)
 	p := start()
@@ -338,6 +356,15 @@ func TestQA13_LedgerSurvivesSigkillAndRedeliversUntilAcked(t *testing.T) {
 	servedBeforeKill := uint64(served.Load())
 
 	p = start()
+	if got := p.metric("llmproxy_ledger_unclean_epochs_total", ""); got != 1 {
+		t.Fatalf("llmproxy_ledger_unclean_epochs_total = %d after SIGKILL, want 1", got)
+	}
+	if !strings.Contains(p.proc.Log(), "the previous epoch did not close") {
+		t.Fatalf("no unclean-epoch error in the log:\n%s", p.proc.Log())
+	}
+	if e := p.epochs(); len(e) != 2 || e[0] != (qa13Epoch{Epoch: epoch, Closed: false}) || e[1].Closed {
+		t.Fatalf("epochs after SIGKILL of %d: %+v", epoch, e)
+	}
 	after, _ := p.readAll()
 	present := map[string]bool{}
 	var killed []qa13Entry
@@ -377,6 +404,18 @@ func TestQA13_LedgerSurvivesSigkillAndRedeliversUntilAcked(t *testing.T) {
 	}
 	if rest, _ := p.readAll(); len(rest) != 0 {
 		t.Fatalf("%d entries returned after acknowledging through the last cursor", len(rest))
+	}
+
+	// A clean stop closes its epoch, even with every entry acknowledged.
+	p.proc.Signal(syscall.SIGTERM)
+	p.proc.Wait(10 * time.Second)
+	p = start()
+	if got := p.metric("llmproxy_ledger_unclean_epochs_total", ""); got != 0 {
+		t.Fatalf("llmproxy_ledger_unclean_epochs_total = %d after a clean stop, want 0", got)
+	}
+	e := p.epochs()
+	if len(e) != 3 || e[0].Closed || e[1] != (qa13Epoch{Epoch: last.Epoch, Closed: true}) || e[2].Closed {
+		t.Fatalf("epochs after a clean stop of %d: %+v", last.Epoch, e)
 	}
 }
 

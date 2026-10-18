@@ -35,6 +35,10 @@ pub const MIN_DISK_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_PENDING_RECORDS: usize = 4096;
 const RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
 const STATE: TableDefinition<u64, &[u8]> = TableDefinition::new("state");
+/// One encrypted row the caller owns, kept across acknowledgements.
+const APPLICATION: TableDefinition<u64, &[u8]> = TableDefinition::new("application");
+/// Envelope kind of the application row; 0 is state and 1 is a record.
+const APPLICATION_KIND: u8 = 2;
 /// One row of reserved pages that only an acknowledgement may spend.
 const HEADROOM: TableDefinition<u64, &[u8]> = TableDefinition::new("headroom");
 /// Headroom bounds. An acknowledgement copy-on-writes the B-tree pages it
@@ -205,6 +209,8 @@ pub struct MetadataSpool {
     /// acknowledgement is refused at the ceiling; restored before admissions
     /// resume, so every acknowledgement finds it.
     headroom: bool,
+    /// The application row's plaintext and the key that sealed it.
+    application: Option<(Vec<u8>, String)>,
     config: SpoolConfig,
     keys: BTreeMap<String, EncryptionKey>,
     active_id: String,
@@ -358,6 +364,7 @@ impl MetadataSpool {
             database_cap,
             at_cap: false,
             headroom: false,
+            application: None,
             config,
             keys,
             active_id,
@@ -388,6 +395,11 @@ impl MetadataSpool {
                 spool.publish(&spool.state, &[], None)?;
                 #[cfg(test)]
                 spool.hooks.trip(Fault::RewrapAfterCommit)?;
+            }
+            if let Some((bytes, key)) = spool.application.clone() {
+                if key != spool.active_id {
+                    spool.set_application_state(&bytes)?;
+                }
             }
             // A fresh spool, or one opened at its ceiling after the reserve was
             // spent: admissions wait until the reserve is back.
@@ -661,6 +673,41 @@ impl MetadataSpool {
         })();
         self.settle(result)
     }
+    /// The caller's application row, if one was ever written. It is
+    /// encrypted and authenticated like a record, bound to this node, and
+    /// never deleted by an acknowledgement.
+    pub fn application_state(&self) -> Option<&[u8]> {
+        self.application.as_ref().map(|(bytes, _)| bytes.as_slice())
+    }
+    /// Replaces the application row in one Immediate transaction. It is at
+    /// most `max_record_bytes`. `Full` at the ceiling, like any write.
+    pub fn set_application_state(&mut self, bytes: &[u8]) -> Result<()> {
+        self.healthy()?;
+        if bytes.len() > self.config.max_record_bytes {
+            return Err(Error::RecordTooLarge);
+        }
+        self.quota.arm(self.database_cap);
+        let result = (|| {
+            let envelope = format::encrypt(
+                self.active_key(),
+                &self.config.node_id,
+                APPLICATION_KIND,
+                0,
+                bytes,
+            )?;
+            let mut tx = self.db()?.begin_write().map_err(storage_error)?;
+            tx.set_durability(Durability::Immediate)
+                .map_err(storage_error)?;
+            tx.open_table(APPLICATION)
+                .map_err(storage_error)?
+                .insert(0, envelope.as_slice())
+                .map_err(storage_error)?;
+            tx.commit().map_err(storage_error)
+        })();
+        self.settle(result)?;
+        self.application = Some((bytes.to_vec(), self.active_id.clone()));
+        Ok(())
+    }
     fn headroom_bytes(&self) -> usize {
         (self.database_cap / 32).clamp(MIN_HEADROOM_BYTES, MAX_HEADROOM_BYTES) as usize
     }
@@ -835,10 +882,12 @@ impl MetadataSpool {
         let tx = self.db()?.begin_read().map_err(storage_error)?;
         let mut table_count = 0;
         let mut has_headroom = false;
+        let mut has_application = false;
         for table in tx.list_tables().map_err(storage_error)? {
             match table.name() {
                 "records" | "state" => table_count += 1,
                 "headroom" => has_headroom = true,
+                "application" => has_application = true,
                 _ => return Err(Error::Corrupt),
             }
         }
@@ -910,7 +959,32 @@ impl MetadataSpool {
         }
         self.state = state;
         self.hash = hash;
+        let application = if has_application {
+            let table = tx.open_table(APPLICATION).map_err(storage_error)?;
+            if table.len().map_err(storage_error)? > 1 {
+                return Err(Error::Corrupt);
+            }
+            match table.get(0).map_err(storage_error)? {
+                None => None,
+                Some(envelope) => {
+                    let key =
+                        format::key_id(envelope.value(), self.config.max_record_bytes)?.to_owned();
+                    let plain = format::decrypt(
+                        &self.keys,
+                        &self.config.node_id,
+                        APPLICATION_KIND,
+                        0,
+                        envelope.value(),
+                        self.config.max_record_bytes,
+                    )?;
+                    Some((plain, key))
+                }
+            }
+        } else {
+            None
+        };
         self.headroom = headroom;
+        self.application = application;
         Ok(state_key)
     }
 }

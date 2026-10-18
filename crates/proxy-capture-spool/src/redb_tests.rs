@@ -739,6 +739,33 @@ fn full_acknowledgement_retires_old_record_keys() {
     assert!(payloads(&recovered).is_empty());
 }
 
+/// The application row is the caller's durable state outside the record
+/// stream: it survives a reopen and acknowledging every record, and a key
+/// rotation rewraps it, so it opens once the old key is retired.
+#[test]
+fn application_state_survives_acknowledgement_reopen_and_key_rotation() {
+    let temp = TempDir::new().unwrap();
+    let config = test_config(&temp);
+    let mut spool = open(config.clone());
+    assert_eq!(spool.application_state(), None);
+    spool.set_application_state(b"first").unwrap();
+    spool.set_application_state(b"epoch 7 open").unwrap();
+    spool.append(PAYLOAD).unwrap();
+    spool.commit().unwrap();
+    spool.acknowledge(1).unwrap();
+    assert!(matches!(
+        spool.set_application_state(&vec![0; config.max_record_bytes + 1]),
+        Err(Error::RecordTooLarge)
+    ));
+    drop(spool);
+
+    let rotated = MetadataSpool::open(config.clone(), alternate_key(), [key()]).unwrap();
+    assert_eq!(rotated.application_state(), Some(&b"epoch 7 open"[..]));
+    drop(rotated);
+    let retired = MetadataSpool::open(config, alternate_key(), []).unwrap();
+    assert_eq!(retired.application_state(), Some(&b"epoch 7 open"[..]));
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_entries_are_rejected_by_strict_inventory() {
