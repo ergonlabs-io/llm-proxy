@@ -257,6 +257,18 @@ impl UpstreamTiming {
     }
 }
 
+/// A request's trace-export capture while it runs (ADR-0008), with the
+/// request facts the exporter needs. Lives on the stream so the filter
+/// manager can admit it after the decode chain and `LoggingBody` can feed and
+/// finish it.
+#[derive(Debug)]
+pub(crate) struct TraceTee {
+    pub(crate) capture: proxy_observability::traces::capture::TraceCapture,
+    pub(crate) path: String,
+    pub(crate) request_content_type: Option<String>,
+    pub(crate) request_content_encoding: Option<String>,
+}
+
 /// Per-request state consumed by access logging and stats.
 #[derive(Debug)]
 pub struct StreamInfo {
@@ -388,6 +400,8 @@ pub struct StreamInfo {
     /// the last one dispatched, or the hedge that won. `None` when no attempt
     /// was made.
     pub(crate) upstream_timing: Option<Rc<UpstreamTiming>>,
+    /// Trace capture of an opted-in request; `None` otherwise.
+    pub(crate) trace_tee: Option<TraceTee>,
 }
 
 impl Default for StreamInfo {
@@ -427,6 +441,7 @@ impl Default for StreamInfo {
             on_upgrade: None,
             downstream_timing: TimePoints::default(),
             upstream_timing: None,
+            trace_tee: None,
         }
     }
 }

@@ -2999,6 +2999,7 @@ async fn start_admin(
             credential_probe: runtime.credential_probe,
             capture_agent: runtime.capture_agent,
             ledger: runtime.ledger,
+            trace_gate: None,
         },
     )
     .await

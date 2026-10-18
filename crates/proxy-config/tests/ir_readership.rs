@@ -56,11 +56,14 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "traces",
-        kind: EntryKind::ReadOutsideRuntimeCrates,
-        reason: "Trace export (ADR-0008): crates/proxy/src/main.rs refuses to start \
-                 when it is set (no exporter exists yet) and `reload` refuses a \
-                 reload that changes it. `proxy` is control-side and outside \
-                 RUNTIME_CRATES; replace this entry when the exporter reads it.",
+        kind: EntryKind::KnownInertNameCollision,
+        reason: "Trace export (ADR-0008). Read on the control side only: \
+                 crates/proxy/src/main.rs refuses to start when it is set (no \
+                 exporter exists yet) and `reload` refuses a reload that changes it. \
+                 Recorded as a NAME COLLISION: proxy-http's `FilterChainHandler` and \
+                 `ChainCtx` gained unrelated `traces` fields (the per-handler \
+                 `TraceAdmission`), so the name scan reads as covered while no \
+                 runtime crate reads `ConfigSnapshot.traces`.",
     },
     // --- ADS fields whose readers are outside the runtime scan.
     AllowlistEntry {

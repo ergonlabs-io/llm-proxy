@@ -453,6 +453,11 @@ impl CaptureSupervisor {
         self.shared.changes.send_replace(next);
         Ok(self.status())
     }
+    /// The packed `(generation << 1) | disabled` emergency gate. Trace export
+    /// honours it too: a disable here also stops body capture.
+    pub fn gate_value(&self) -> u64 {
+        self.shared.gate.load(Ordering::Acquire)
+    }
     pub fn stop_admissions(&self) {
         self.shared.closed.store(true, Ordering::Release);
     }

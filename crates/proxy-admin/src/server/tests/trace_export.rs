@@ -138,3 +138,85 @@ async fn refused_writes_record_no_consent() {
     assert!(response.contains("tenant_id_too_long"), "{response}");
     assert!(handle.load().trace_export.is_empty());
 }
+
+async fn start_with_gate(
+    gate: Option<Arc<proxy_observability::traces::gate::TraceGate>>,
+) -> AdminServer {
+    crate::server::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        AdminRuntime {
+            config: SnapshotHandles::new().register(snapshot_with_secret()),
+            registry: None,
+            started_at: Instant::now(),
+            factory_state: Arc::new(SharedFactoryState::default()),
+            admin_token: Some(ADMIN_TOKEN.to_string()),
+            readiness: None,
+            cluster_state: None,
+            ui: None,
+            lifecycle: None,
+            credential_probe: None,
+            capture_agent: None,
+            ledger: None,
+            trace_gate: gate,
+        },
+    )
+    .await
+    .expect("admin server bind")
+}
+
+/// The emergency switch over HTTP: gated, a compare-and-set on the
+/// generation (a stale writer gets 409 and changes nothing), the answer says
+/// whether a disable will survive a restart, and with no trace export the
+/// endpoint is 404 rather than a switch that controls nothing.
+#[tokio::test]
+async fn the_capture_gate_is_a_gated_compare_and_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(proxy_observability::traces::gate::TraceGate::open(
+        dir.path(),
+    ));
+    let server = start_with_gate(Some(Arc::clone(&gate))).await;
+    let addr = server.local_addr();
+    let disable = r#"{"disabled":true,"expected_generation":0}"#;
+
+    let (status, _, _) = request(addr, "POST", "/traces/capture", None, disable).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!gate.status().disabled);
+
+    let (status, _, body) =
+        request(addr, "POST", "/traces/capture", Some(ADMIN_TOKEN), disable).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let answer: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(answer["disabled"], true);
+    assert_eq!(answer["generation"], 1);
+    assert_eq!(answer["persisted"], true);
+    assert!(gate.status().disabled);
+
+    let (status, _, body) = request(
+        addr,
+        "POST",
+        "/traces/capture",
+        Some(ADMIN_TOKEN),
+        r#"{"disabled":false,"expected_generation":0}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(gate.status().disabled, "a stale writer changes nothing");
+
+    let (status, _, body) = request(addr, "GET", "/traces/capture", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"disabled": true, "generation": 1})
+    );
+
+    let none = start_with_gate(None).await;
+    let (status, _, _) = request(
+        none.local_addr(),
+        "POST",
+        "/traces/capture",
+        Some(ADMIN_TOKEN),
+        disable,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

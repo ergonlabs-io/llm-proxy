@@ -640,6 +640,7 @@ async fn start_full_with_readiness(
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -671,6 +672,7 @@ async fn start_with_cluster_state(
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -1277,6 +1279,7 @@ async fn start_lifecycle(
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -3254,6 +3257,7 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await

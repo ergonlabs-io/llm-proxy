@@ -117,6 +117,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     // user identity and charges, so both are bearer-gated.
     "/ledger/entries?after=<cursor>&limit=<1..=1000> (bearer-gated page of committed entries)",
     "/ledger/ack?through=<cursor> (bearer-gated POST that removes entries through the cursor)",
+    // Trace export's emergency switch (ADR-0008 decision 2). Both gated.
+    "/traces/capture (bearer-gated GET status; POST {disabled, expected_generation})",
 ];
 
 /// Hard cap on a write request's body. No legitimate admin write is large (the biggest, a `PUT .../policy`,
@@ -237,6 +239,9 @@ pub struct AdminRuntime {
     /// The billing ledger behind `/ledger/*` (ADR-0009 decision 8). `None`
     /// makes those endpoints answer 404 after the bearer gate.
     pub ledger: Option<Arc<Ledger>>,
+    /// Trace export's emergency gate behind `/traces/capture`. `None` makes
+    /// that endpoint answer 404 after the bearer gate.
+    pub trace_gate: Option<Arc<proxy_observability::traces::gate::TraceGate>>,
 }
 
 /// One static file served under `/ui/`.
@@ -578,6 +583,7 @@ async fn handle(
     match req.uri().path() {
         "/ledger/entries" => return handle_ledger_entries(&req, runtime, peer).await,
         "/ledger/ack" => return handle_ledger_ack(req, runtime, peer).await,
+        "/traces/capture" => return handle_traces_capture(req, runtime, peer).await,
         _ => {}
     }
     let method = req.method().clone();
@@ -1500,6 +1506,75 @@ fn capture_error(error: InspectError) -> Response<Full<Bytes>> {
         status,
         &serde_json::json!({ "error": format!("{hint} ({error})") }),
     )
+}
+
+const TRACES_NOT_CONFIGURED: &str = "no trace export is configured for this proxy; \
+     /traces/capture needs observability.traces (node.metadata[\"io.llmproxy.traces\"] in Envoy mode)";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTraceCaptureRequest {
+    disabled: bool,
+    expected_generation: u64,
+}
+
+/// `GET /traces/capture` reports the emergency gate; `POST` closes or opens
+/// it with a compare-and-set on its generation (ADR-0008 decision 2). A
+/// disable always takes effect, and the answer's `persisted` says whether it
+/// will survive a restart.
+async fn handle_traces_capture(
+    req: Request<Incoming>,
+    runtime: &AdminRuntime,
+    peer: &GatePeer,
+) -> Response<Full<Bytes>> {
+    if req.method() != Method::GET && req.method() != Method::POST {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "/traces/capture accepts GET and POST",
+        );
+    }
+    if let Some(refusal) = admin_gate(
+        req.uri().path(),
+        runtime.admin_token.as_deref(),
+        req.headers(),
+        peer,
+    ) {
+        return refusal;
+    }
+    let Some(gate) = runtime.trace_gate.clone() else {
+        return text(StatusCode::NOT_FOUND, TRACES_NOT_CONFIGURED);
+    };
+    if req.method() == Method::GET {
+        return json(StatusCode::OK, &gate.status());
+    }
+    let body = match read_limited_body(req.into_body(), MAX_ADMIN_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let request: SetTraceCaptureRequest = match parse_json_body(&body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    use proxy_observability::traces::gate::GateError;
+    match gate.set_disabled(request.disabled, request.expected_generation) {
+        Ok(change) => {
+            tracing::warn!(
+                disabled = change.status.disabled,
+                generation = change.status.generation,
+                persisted = change.persisted,
+                "admin: trace capture gate changed"
+            );
+            json(StatusCode::OK, &change)
+        }
+        Err(GateError::Stale { current }) => json(
+            StatusCode::CONFLICT,
+            &serde_json::json!({"error": "stale_generation", "generation": current}),
+        ),
+        Err(error @ GateError::Exhausted) => text(StatusCode::CONFLICT, &error.to_string()),
+        Err(error @ GateError::Marker { .. }) => {
+            text(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+        }
+    }
 }
 
 /// How long a ledger read or acknowledgement waits for the writer thread,

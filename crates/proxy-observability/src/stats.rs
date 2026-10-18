@@ -1049,6 +1049,38 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+    /// Trace export (ADR-0008): captures handed to the exporter.
+    pub const TRACE_CAPTURED: Instrument = Instrument {
+        name: "llmproxy_trace_captured_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Whole traces lost, by finite reason.
+    pub const TRACE_DROPPED: Instrument = Instrument {
+        name: "llmproxy_trace_dropped_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Body bytes retained by captures in flight or queued.
+    pub const TRACE_MEMORY_BYTES: Instrument = Instrument {
+        name: "llmproxy_trace_memory_bytes",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "By",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Captures in flight or queued.
+    pub const TRACE_SLOTS: Instrument = Instrument {
+        name: "llmproxy_trace_slots",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{trace}",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// Entries handed to the writer that were never committed.
     pub const LEDGER_LOST: Instrument = Instrument {
         name: "llmproxy_ledger_entries_lost_total",

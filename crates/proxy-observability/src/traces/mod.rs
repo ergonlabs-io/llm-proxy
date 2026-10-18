@@ -2,7 +2,9 @@
 //! design in `internal-docs/trace-export-design.md`). Not billing: nothing
 //! reads traces back to enforce or charge.
 
+pub mod capture;
 pub mod config;
+pub mod gate;
 
 /// Longest `tenant=<encoded id>` directory name a tenant may have to opt in.
 /// Segment file names sit under it and must stay below `NAME_MAX` (255).
