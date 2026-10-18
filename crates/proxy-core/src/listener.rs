@@ -115,6 +115,11 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::model_resolver_filter::ModelResolverFilterFactory,
         ));
+        // Tenant ownership of provider object IDs (files, batches). Must come
+        // AFTER `llmproxy.auth` (enforced by `check_lane_h_filter_order`).
+        registry.register(Arc::new(
+            proxy_filters::object_ownership_filter::ObjectOwnershipFilterFactory,
+        ));
         // Per-tenant spend-budget enforcement: decode-check and encode-record, like
         // `llmproxy.token_limit`. Must come AFTER `llmproxy.auth` and BEFORE `llmproxy.usage`
         // (enforced by `check_lane_h_filter_order`). Registering it enables nothing; only a listener

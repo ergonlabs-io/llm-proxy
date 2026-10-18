@@ -87,6 +87,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}/budget",
     "/tenants/{id}/limits",
     "/tenants/{id}/trace_export",
+    "/tenants/{id}/objects/{object_id}",
     "/tenants/{id}/provider_credentials",
     "/tenants/{id}/provider_credentials/{provider}",
     // A READ, but gated like a write -- see
@@ -104,6 +105,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}/budget",
     "/chains/{stat_prefix}/tenants/{id}/limits",
     "/chains/{stat_prefix}/tenants/{id}/trace_export",
+    "/chains/{stat_prefix}/tenants/{id}/objects/{object_id}",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider}",
     "/chains/{stat_prefix}/tenants/{id}/spend",
@@ -730,6 +732,13 @@ async fn handle(
         WriteRoute::TenantTraceExportGet(id) | WriteRoute::ScopedTenantTraceExportGet(_, id) => {
             handle_get_trace_export(&control_plane, id)
         }
+        WriteRoute::TenantObject(id, object) | WriteRoute::ScopedTenantObject(_, id, object) => {
+            handle_assign_object(factory_state, stat_prefix_opt, &control_plane, id, object)
+        }
+        WriteRoute::TenantObjectGet(id, object)
+        | WriteRoute::ScopedTenantObjectGet(_, id, object) => {
+            handle_get_object(&control_plane, id, object)
+        }
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
             handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
         }
@@ -837,6 +846,12 @@ enum WriteRoute<'a> {
     TenantTraceExportGet(&'a str),
     ScopedTenantTraceExport(&'a str, &'a str),
     ScopedTenantTraceExportGet(&'a str, &'a str),
+    /// `PUT /tenants/{id}/objects/{object_id}`: assigns a provider object no
+    /// tenant owns yet to the tenant. `GET` reads whether it owns one.
+    TenantObject(&'a str, &'a str),
+    TenantObjectGet(&'a str, &'a str),
+    ScopedTenantObject(&'a str, &'a str, &'a str),
+    ScopedTenantObjectGet(&'a str, &'a str, &'a str),
     /// `GET /keys` -- the gated list read. Distinct from [`Self::Keys`]
     /// (POST, mint) so a GET is never answered with a 405 and a POST never
     /// with a listing.
@@ -905,6 +920,8 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::TenantTraceExportGet(_) | WriteRoute::ScopedTenantTraceExportGet(..) => {
                 Method::GET
             }
+            WriteRoute::TenantObject(..) | WriteRoute::ScopedTenantObject(..) => Method::PUT,
+            WriteRoute::TenantObjectGet(..) | WriteRoute::ScopedTenantObjectGet(..) => Method::GET,
             WriteRoute::TenantBudget(_) | WriteRoute::TenantLimits(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::TenantCredentials(_) | WriteRoute::ScopedTenantCredentials(..) => {
@@ -959,6 +976,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantLimits(_)
             | WriteRoute::TenantTraceExport(_)
             | WriteRoute::TenantTraceExportGet(_)
+            | WriteRoute::TenantObject(..)
+            | WriteRoute::TenantObjectGet(..)
             | WriteRoute::TenantSpend(_)
             | WriteRoute::TenantCredentials(_)
             | WriteRoute::TenantCredentialPut(..)
@@ -980,6 +999,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenantLimits(s, _)
             | WriteRoute::ScopedTenantTraceExport(s, _)
             | WriteRoute::ScopedTenantTraceExportGet(s, _)
+            | WriteRoute::ScopedTenantObject(s, ..)
+            | WriteRoute::ScopedTenantObjectGet(s, ..)
             | WriteRoute::ScopedTenantSpend(s, _)
             | WriteRoute::ScopedTenantCredentials(s, _)
             | WriteRoute::ScopedTenantCredentialPut(s, ..)
@@ -1022,6 +1043,10 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
             Some(WriteRoute::TenantTraceExportGet(id))
         }
         ["tenants", id, "trace_export"] => Some(WriteRoute::TenantTraceExport(id)),
+        ["tenants", id, "objects", object] if *method == Method::GET => {
+            Some(WriteRoute::TenantObjectGet(id, object))
+        }
+        ["tenants", id, "objects", object] => Some(WriteRoute::TenantObject(id, object)),
         // A GET, gated like a write -- see `WriteRoute`'s doc.
         ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
         ["tenants", id, "provider_credentials"] => Some(WriteRoute::TenantCredentials(id)),
@@ -1085,6 +1110,12 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "tenants", id, "trace_export"] => {
             Some(WriteRoute::ScopedTenantTraceExport(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "objects", object] if *method == Method::GET => {
+            Some(WriteRoute::ScopedTenantObjectGet(stat_prefix, id, object))
+        }
+        ["chains", stat_prefix, "tenants", id, "objects", object] => {
+            Some(WriteRoute::ScopedTenantObject(stat_prefix, id, object))
         }
         ["chains", stat_prefix, "tenants", id, "spend"] => {
             Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
@@ -1832,6 +1863,93 @@ fn model_authz_enforced(factory_state: &SharedFactoryState, stat_prefix: Option<
         Some(name) => factory_state.get_by_name(name, type_url).is_some(),
         // `Err` means several chains registered it, so it is enforced somewhere.
         None => !matches!(factory_state.get_across_scopes(type_url), Ok(None)),
+    }
+}
+
+/// Whether the addressed chain (scoped) or any chain (unscoped) runs
+/// `llmproxy.object_ownership`, which registers its owners under its type URL.
+fn object_ownership_enforced(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+) -> bool {
+    let type_url = proxy_filters::object_ownership_filter::TYPE_URL;
+    match stat_prefix {
+        Some(name) => factory_state.get_by_name(name, type_url).is_some(),
+        None => !matches!(factory_state.get_across_scopes(type_url), Ok(None)),
+    }
+}
+
+/// `PUT /tenants/{id}/objects/{object_id}`: assigns a provider object that
+/// no tenant owns (created before ownership was recorded, or outside the
+/// proxy) to the tenant, so its requests stop being refused. No body. 204
+/// when the tenant owns the object afterwards, including when it already
+/// did; 409 when another tenant owns it, since an owner is never replaced.
+fn handle_assign_object(
+    factory_state: &SharedFactoryState,
+    stat_prefix: Option<&str>,
+    control_plane: &ControlPlane,
+    tenant: &str,
+    object_id: &str,
+) -> Response<Full<Bytes>> {
+    const ENDPOINT: &str = "/tenants/{id}/objects/{object_id}";
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    if !object_ownership_enforced(factory_state, stat_prefix) {
+        return not_enforced(
+            "no listener chain runs llmproxy.object_ownership; the owner would not be enforced",
+        );
+    }
+    let tenant_id = TenantId::new(tenant);
+    match tenant_exists(control_plane, &tenant_id) {
+        Ok(true) => {}
+        Ok(false) => return tenant_not_found(),
+        Err(err) => return store_error_response(ENDPOINT, err),
+    }
+    match control_plane.store().claim_object(object_id, &tenant_id) {
+        Ok(owner) if owner == tenant_id => {
+            tracing::info!(
+                endpoint = ENDPOINT,
+                tenant,
+                object_id,
+                "admin: assigned a provider object to a tenant"
+            );
+            no_content()
+        }
+        Ok(_) => error_json(
+            StatusCode::CONFLICT,
+            "object_owned",
+            "another tenant owns this object; an owner is never replaced",
+        ),
+        Err(err) => store_error_response(ENDPOINT, err),
+    }
+}
+
+/// `GET /tenants/{id}/objects/{object_id}`: whether the store records the
+/// tenant as the object's owner. 200 when it does; 404 when another tenant or
+/// none does, without saying which. The store is read directly, so a 200 also
+/// says the owner survives a restart with a durable store, and every replica
+/// sees it with a shared one; a create's owner is written just after its
+/// response, so this is how to confirm it has landed.
+fn handle_get_object(
+    control_plane: &ControlPlane,
+    tenant: &str,
+    object_id: &str,
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    match control_plane.store().object_owner(object_id) {
+        Ok(Some(owner)) if owner.as_str() == tenant => json(
+            StatusCode::OK,
+            &serde_json::json!({ "tenant": tenant, "object_id": object_id, "owned": true }),
+        ),
+        Ok(_) | Err(StoreError::InvalidInput(_)) => error_json(
+            StatusCode::NOT_FOUND,
+            "object_not_owned",
+            "the tenant does not own this object",
+        ),
+        Err(err) => store_error_response("/tenants/{id}/objects/{object_id}", err),
     }
 }
 

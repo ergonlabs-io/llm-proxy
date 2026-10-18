@@ -21,6 +21,9 @@
 //! - [`model_authz`] and [`model_authz_filter`] enforce per-tenant model
 //!   allow-lists; the filter must run after `llmproxy.auth` (needs the
 //!   tenant) and `llmproxy.body_rewrite` (needs the model).
+//! - [`object_ownership`] and [`object_ownership_filter`] keep each tenant to
+//!   the provider objects (files, batches) it created; the filter must run
+//!   after `llmproxy.auth` (needs the tenant and the store).
 //! - [`control`] and [`control_redis`] hold the `ControlPlaneStore` trait, its
 //!   in-memory, redb and Redis implementations, and the published
 //!   `ControlPlaneSnapshot` the authenticators read.
@@ -41,6 +44,8 @@ pub mod local_ratelimit;
 pub mod model_authz;
 pub mod model_authz_filter;
 pub mod model_resolver_filter;
+pub mod object_ownership;
+pub mod object_ownership_filter;
 pub mod pricing;
 pub mod reconciliation_age;
 pub mod spend;

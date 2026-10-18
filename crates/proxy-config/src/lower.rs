@@ -646,6 +646,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "llmproxy.filters.v0.ModelResolver" => &["rules"],
         "llmproxy.filters.v0.StaticModelRules" => &["default_model", "tenants"],
         "llmproxy.filters.v0.TenantModelRule" => &["tenant", "model"],
+        "llmproxy.filters.v0.ObjectOwnership" => &["collections"],
         // One-release compatibility for the old borrowed body-rewrite type.
         "envoy.config.core.v3.RuntimeFeatureFlag" => &["default_value", "runtime_key"],
         // The Redis-backed shared store. `url` is an
@@ -2335,6 +2336,8 @@ pub const LEGACY_BODY_REWRITE_FILTER_TYPE: &str =
     "type.llmproxy.dev/envoy.config.core.v3.RuntimeFeatureFlag";
 pub const MODEL_AUTHZ_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 pub const MODEL_RESOLVER_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelResolver";
+pub const OBJECT_OWNERSHIP_FILTER_TYPE: &str =
+    "type.llmproxy.dev/llmproxy.filters.v0.ObjectOwnership";
 pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
 
 /// Rejects llmproxy filter chains whose order silently disables a filter.
@@ -2483,6 +2486,15 @@ fn check_lane_h_filter_order(
              StreamInfo::requested_model, and decode callbacks run in config order; with \
              this order reversed the authz filter would see no model and refuse every \
              request",
+        ),
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
+            OBJECT_OWNERSHIP_FILTER_TYPE,
+            "llmproxy.object_ownership",
+            "the object-ownership filter checks the tenant the auth filter resolves, and \
+             decode callbacks run in config order; with this order reversed it would see no \
+             tenant and refuse every request that names a file or batch",
         ),
         (
             AUTH_FILTER_TYPE,

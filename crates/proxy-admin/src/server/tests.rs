@@ -3486,6 +3486,7 @@ mod capture_spool;
 mod credentials;
 mod ledger;
 mod limits;
+mod object_owners;
 mod pricing;
 mod tenant_budget_cutover;
 mod trace_export;

@@ -455,6 +455,11 @@ pub struct AuthEnforce {
     /// (`PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits`).
     #[serde(default = "default_true")]
     pub limits: bool,
+    /// Keep provider files and batches to the tenant that created them
+    /// (`llmproxy.object_ownership`). Every tenant reaches a provider through
+    /// one provider account, so the provider cannot tell them apart.
+    #[serde(default = "default_true")]
+    pub object_ownership: bool,
     /// What a tenant with no stored model policy may use. Absent means
     /// `deny`. Only meaningful with `model_policy: true`; set alongside
     /// `model_policy: false` it is a load error, since nothing would read it.
@@ -484,6 +489,7 @@ impl Default for AuthEnforce {
             model_policy: true,
             spend: true,
             limits: true,
+            object_ownership: true,
             tenants_without_policy: None,
         }
     }

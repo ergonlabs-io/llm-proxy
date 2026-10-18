@@ -1,0 +1,27 @@
+// Tenant ownership of provider objects for the llm-proxy data plane.
+//
+// Vendored for its own sake: no compiled Envoy message shapes a list of
+// object collections.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures the object ownership filter (`llmproxy.object_ownership`).
+//
+// A provider issues object IDs (files, batches) in one namespace per provider
+// account, and every tenant reaches the provider through the proxy's account.
+// This filter records the tenant that created each object and refuses, with
+// 404 and before the upstream is dialled, any request that names an object
+// the caller's tenant does not own. An object no tenant owns is refused the
+// same way. Listing a collection is refused. It requires `llmproxy.auth`
+// earlier in the same chain.
+message ObjectOwnership {
+  // Required, at least one. Path of each object collection, for example
+  // `/v1/files`. A POST to the path creates an object; the response's
+  // top-level `id` is recorded as owned by the caller. `<path>/<id>` and
+  // anything below it name that object. Each must start with `/`, must not
+  // end with `/`, and must not contain `*`, `?`, `%`, an empty segment, or a
+  // `.` or `..` segment.
+  repeated string collections = 1;
+}

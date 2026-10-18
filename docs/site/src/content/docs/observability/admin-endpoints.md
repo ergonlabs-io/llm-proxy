@@ -182,6 +182,8 @@ model and examples.
 | `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
 | `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Trace export](../trace-export/). |
+| `/tenants/{id}/objects/{object_id}` | PUT | `204` | Assigns a provider file or batch that no tenant owns to the tenant. No body. `204` also when the tenant already owns it. `409` `object_owned` when another tenant owns it: an owner is never replaced. `404` for an unknown tenant. `409` `not_enforced` when no chain runs `llmproxy.object_ownership`. See "Object ownership". |
+| `/tenants/{id}/objects/{object_id}` | GET | `200` | Reads whether the store records the tenant as the owner. The answer is `{"tenant": "...", "object_id": "...", "owned": true}`. Any other case gives `404` `object_not_owned`, and the answer does not say whether another tenant owns the object. |
 | `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. See [Trace export](../trace-export/). |
 
 The mint answer is the only time the proxy returns the key text. The store
@@ -193,6 +195,35 @@ tenant budget use the same body shape (`handle_set_key_budget`,
 `handle_set_budget`). See
 [Spend policies](../../limits-and-budgets/spend-policies/) for periods, the
 spend response, and how the proxy counts spend.
+
+## Object ownership
+
+`auth.enforce.object_ownership` keeps provider files and batches to the tenant
+that created them. See [Configuration reference](../../configuration/reference/#authenforce).
+The proxy records the owner of each object that a tenant creates. It refuses
+a request for an object that the tenant does not own, or that no tenant owns.
+An object created outside the proxy, or before the proxy recorded owners, has
+no owner. Assign it with the admin API:
+
+```sh
+curl -X PUT http://$ADMIN_ADDR/tenants/acme/objects/file-abc123 \
+  -H "authorization: Bearer $ADMIN_TOKEN"
+```
+
+The scoped forms are `PUT` and `GET /chains/{stat_prefix}/tenants/{id}/objects/{object_id}`.
+Both methods need the admin bearer token, like the other tenant writes.
+The `GET` reads the store, not the cache of one replica.
+It shows whether the owner survives a restart (`persistent` store) and
+whether every replica sees it (`shared` store).
+
+The proxy writes the owner to the store just after it sends the create
+response. If the process stops in that instant, the object has no owner. Assign
+it with the `PUT`.
+
+Known limit: without a model in the body, `llmproxy.model_authz` refuses
+multipart file uploads and bodyless `GET` requests to these endpoints with
+`403`. This is a separate work item. Assign objects that were created outside
+the proxy with the `PUT`.
 
 ## Key model policy
 
