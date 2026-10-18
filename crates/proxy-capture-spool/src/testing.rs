@@ -37,8 +37,19 @@ pub(crate) struct Hooks {
 struct Control {
     fail: Option<Fault>,
     pause: Option<(Fault, PathBuf)>,
+    refused_acknowledgements: usize,
 }
 impl Hooks {
+    /// The next `n` acknowledgement transactions hit the disk ceiling.
+    pub fn refuse_acknowledgements(&self, n: usize) {
+        self.control.lock().unwrap().refused_acknowledgements = n;
+    }
+    pub fn take_refused_acknowledgement(&self) -> bool {
+        let mut control = self.control.lock().unwrap();
+        let refuse = control.refused_acknowledgements > 0;
+        control.refused_acknowledgements = control.refused_acknowledgements.saturating_sub(1);
+        refuse
+    }
     pub fn fail(&self, at: Fault) {
         self.control.lock().unwrap().fail = Some(at);
     }

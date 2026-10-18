@@ -535,7 +535,10 @@ fn counter(scrape: &str, series: &str) -> u64 {
 
 /// With every slot held by a request in flight, `reject` (the default)
 /// answers a local 503 that names the reason, counts it, and dials nothing.
-/// A request dropped mid-flight gives its slot back.
+/// The refusal is answered where the request would be dialled, so a request
+/// the filters refuse gets their answer: a wrong key is 401, a request over
+/// its rate limit is 429, and neither counts as a ledger rejection. A
+/// request dropped mid-flight gives its slot back.
 #[test]
 fn with_every_slot_held_a_request_is_refused_503_and_never_dialled() {
     run(async {
@@ -543,6 +546,20 @@ fn with_every_slot_held_a_request_is_refused_503_and_never_dialled() {
         let key = chain.mint("key-a");
         let held = chain.hold_a_slot(&key).await;
         let dialled = chain.dialled();
+
+        assert_eq!(chain.send("not-a-key", "priced-model", false).await, 401);
+        // The first limited request passes the limit and meets the ledger;
+        // the second is over the limit, which answers before the ledger.
+        assert_eq!(chain.send(&key, "limited-model", false).await, 503);
+        assert_eq!(chain.send(&key, "limited-model", false).await, 429);
+        assert_eq!(
+            counter(
+                &chain.ledger.scrape(),
+                "envoy_llmproxy_ledger_rejected_total{reason=\"queue_full\"}"
+            ),
+            1,
+            "only the request that would have been dialled is a ledger rejection"
+        );
 
         let (status, body) = chain.send_for_body(&key, "priced-model", false).await;
         assert_eq!(status, 503);
@@ -553,7 +570,7 @@ fn with_every_slot_held_a_request_is_refused_503_and_never_dialled() {
                 &chain.ledger.scrape(),
                 "envoy_llmproxy_ledger_rejected_total{reason=\"queue_full\"}"
             ),
-            1
+            2
         );
 
         held.abort();

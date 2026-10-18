@@ -1646,6 +1646,7 @@ async fn handle_ledger_entries(
                     "entries": entries,
                     "next_after": next_after,
                     "committed_through": page.committed_through,
+                    "epochs": page.epochs,
                 }),
             )
         }

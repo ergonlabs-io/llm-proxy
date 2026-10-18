@@ -1184,6 +1184,15 @@ pub mod instruments {
         attribute_keys: &["reason"],
         buckets: None,
     };
+    /// Starts that found the previous epoch not closed: it crashed, or it
+    /// stopped with entries it never committed, so its tail may be missing.
+    pub const LEDGER_UNCLEAN_EPOCHS: Instrument = Instrument {
+        name: "llmproxy_ledger_unclean_epochs_total",
+        kind: InstrumentKind::Counter,
+        unit: "{epoch}",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// ADR-0009 decision 7, one side: micro-USD the spend filter added to
     /// spend counters, once per request that charged at least one scope.
     pub const SPEND_CHARGED: Instrument = Instrument {

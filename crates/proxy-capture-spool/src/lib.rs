@@ -35,6 +35,19 @@ pub const MIN_DISK_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_PENDING_RECORDS: usize = 4096;
 const RECORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("records");
 const STATE: TableDefinition<u64, &[u8]> = TableDefinition::new("state");
+/// One encrypted row the caller owns, kept across acknowledgements.
+const APPLICATION: TableDefinition<u64, &[u8]> = TableDefinition::new("application");
+/// Envelope kind of the application row; 0 is state and 1 is a record.
+const APPLICATION_KIND: u8 = 2;
+/// One row of reserved pages that only an acknowledgement may spend.
+const HEADROOM: TableDefinition<u64, &[u8]> = TableDefinition::new("headroom");
+/// Headroom bounds. An acknowledgement copy-on-writes the B-tree pages it
+/// touches and records every page it frees, and redb grows a database file by
+/// doubling it, so at the ceiling only pages already inside the file are
+/// usable. The reserve is sized to the ceiling so it scales with what a full
+/// acknowledgement has to free.
+const MIN_HEADROOM_BYTES: u64 = 64 * 1024;
+const MAX_HEADROOM_BYTES: u64 = 4 * 1024 * 1024;
 const DATABASE: &str = "capture.redb";
 const QUARANTINE: &str = "capture.redb.bad";
 
@@ -174,6 +187,9 @@ pub struct SpoolStats {
     pub disk_bytes: u64,
     pub quarantine_bytes: u64,
     pub poisoned: bool,
+    /// Whether the acknowledgement reserve is held. Admissions run only while
+    /// it is.
+    pub headroom_reserved: bool,
 }
 
 /// Single-writer synchronous library. Never call from request workers.
@@ -189,6 +205,12 @@ pub struct MetadataSpool {
     /// Set when a transaction was refused at the ceiling; admissions are refused
     /// without touching storage until an acknowledgement commits.
     at_cap: bool,
+    /// The acknowledgement reserve is in the database. Spent only when an
+    /// acknowledgement is refused at the ceiling; restored before admissions
+    /// resume, so every acknowledgement finds it.
+    headroom: bool,
+    /// The application row's plaintext and the key that sealed it.
+    application: Option<(Vec<u8>, String)>,
     config: SpoolConfig,
     keys: BTreeMap<String, EncryptionKey>,
     active_id: String,
@@ -341,6 +363,8 @@ impl MetadataSpool {
             quota,
             database_cap,
             at_cap: false,
+            headroom: false,
+            application: None,
             config,
             keys,
             active_id,
@@ -372,6 +396,14 @@ impl MetadataSpool {
                 #[cfg(test)]
                 spool.hooks.trip(Fault::RewrapAfterCommit)?;
             }
+            if let Some((bytes, key)) = spool.application.clone() {
+                if key != spool.active_id {
+                    spool.set_application_state(&bytes)?;
+                }
+            }
+            // A fresh spool, or one opened at its ceiling after the reserve was
+            // spent: admissions wait until the reserve is back.
+            spool.restore_headroom()?;
             // Repeat after recovery so a valid initialization lost before directory
             // sync cannot admit new payloads until publication is durable.
             sync_directory(&spool.config.directory)?;
@@ -562,8 +594,12 @@ impl MetadataSpool {
     /// The local-only capture agent never invokes this API.
     ///
     /// Deletes the covered rows; redb reuses their pages, which is how a spool at
-    /// its ceiling accepts appends again. `Full` means even this transaction did
-    /// not fit: nothing changed, and a shorter prefix frees fewer pages to record.
+    /// its ceiling accepts appends again. Refused at the ceiling, it spends the
+    /// headroom reserve and acknowledges in committed prefixes, each freeing
+    /// pages for the next, so any committed range can be acknowledged at the
+    /// ceiling. Admissions resume only once the reserve is restored. `Full`
+    /// means even a one-record prefix did not fit; `stats` then shows how far
+    /// the watermark moved.
     pub fn acknowledge(&mut self, through_sequence: u64) -> Result<()> {
         self.healthy()?;
         if through_sequence > self.state.durable {
@@ -572,7 +608,35 @@ impl MetadataSpool {
         if through_sequence <= self.state.acknowledged {
             return Ok(());
         }
+        let result = match self.acknowledge_prefix(through_sequence) {
+            Err(Error::Full) => self.acknowledge_at_ceiling(through_sequence),
+            other => other,
+        };
+        result?;
+        self.restore_headroom()
+    }
+    /// The first attempt was refused. Spend the reserve, then halve the
+    /// prefix on each refusal and double it on each success.
+    fn acknowledge_at_ceiling(&mut self, through_sequence: u64) -> Result<()> {
+        self.release_headroom()?;
+        let mut step = ((through_sequence - self.state.acknowledged) / 2).max(1);
+        while self.state.acknowledged < through_sequence {
+            let target = through_sequence.min(self.state.acknowledged.saturating_add(step));
+            match self.acknowledge_prefix(target) {
+                Ok(()) => step = step.saturating_mul(2),
+                Err(Error::Full) if step > 1 => step /= 2,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    /// One transaction deleting the rows through `through_sequence`.
+    fn acknowledge_prefix(&mut self, through_sequence: u64) -> Result<()> {
         self.quota.arm(self.database_cap);
+        #[cfg(test)]
+        if self.hooks.take_refused_acknowledgement() {
+            self.quota.arm(0);
+        }
         let result = (|| {
             let mut hash = format::inventory_hash();
             let mut count = 0u64;
@@ -605,10 +669,89 @@ impl MetadataSpool {
             self.hooks.trip(Fault::AcknowledgeAfterCommit)?;
             self.state = state;
             self.hash = hash;
-            self.at_cap = false;
             Ok(())
         })();
         self.settle(result)
+    }
+    /// The caller's application row, if one was ever written. It is
+    /// encrypted and authenticated like a record, bound to this node, and
+    /// never deleted by an acknowledgement.
+    pub fn application_state(&self) -> Option<&[u8]> {
+        self.application.as_ref().map(|(bytes, _)| bytes.as_slice())
+    }
+    /// Replaces the application row in one Immediate transaction. It is at
+    /// most `max_record_bytes`. `Full` at the ceiling, like any write.
+    pub fn set_application_state(&mut self, bytes: &[u8]) -> Result<()> {
+        self.healthy()?;
+        if bytes.len() > self.config.max_record_bytes {
+            return Err(Error::RecordTooLarge);
+        }
+        self.quota.arm(self.database_cap);
+        let result = (|| {
+            let envelope = format::encrypt(
+                self.active_key(),
+                &self.config.node_id,
+                APPLICATION_KIND,
+                0,
+                bytes,
+            )?;
+            let mut tx = self.db()?.begin_write().map_err(storage_error)?;
+            tx.set_durability(Durability::Immediate)
+                .map_err(storage_error)?;
+            tx.open_table(APPLICATION)
+                .map_err(storage_error)?
+                .insert(0, envelope.as_slice())
+                .map_err(storage_error)?;
+            tx.commit().map_err(storage_error)
+        })();
+        self.settle(result)?;
+        self.application = Some((bytes.to_vec(), self.active_id.clone()));
+        Ok(())
+    }
+    fn headroom_bytes(&self) -> usize {
+        (self.database_cap / 32).clamp(MIN_HEADROOM_BYTES, MAX_HEADROOM_BYTES) as usize
+    }
+    /// Frees the reserve in its own transaction. Deleting one large row
+    /// rewrites a single leaf, so it fits where the acknowledgement did not.
+    fn release_headroom(&mut self) -> Result<()> {
+        if !self.headroom {
+            return Ok(());
+        }
+        self.quota.arm(self.database_cap);
+        let result = self.write_headroom(None);
+        self.settle(result)?;
+        self.headroom = false;
+        Ok(())
+    }
+    /// Puts the reserve back and reopens admissions. If it does not fit yet,
+    /// admissions stay refused and the next acknowledgement frees more.
+    fn restore_headroom(&mut self) -> Result<()> {
+        if !self.headroom {
+            self.quota.arm(self.database_cap);
+            let zeros = vec![0u8; self.headroom_bytes()];
+            let result = self.write_headroom(Some(&zeros));
+            match self.settle(result) {
+                Ok(()) => self.headroom = true,
+                Err(Error::Full) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        self.at_cap = false;
+        Ok(())
+    }
+    fn write_headroom(&self, reserve: Option<&[u8]>) -> Result<()> {
+        let mut tx = self.db()?.begin_write().map_err(storage_error)?;
+        tx.set_durability(Durability::Immediate)
+            .map_err(storage_error)?;
+        {
+            let mut table = tx.open_table(HEADROOM).map_err(storage_error)?;
+            match reserve {
+                Some(bytes) => table.insert(0, bytes).map(drop),
+                None => table.remove(0).map(drop),
+            }
+            .map_err(storage_error)?;
+        }
+        tx.commit().map_err(storage_error)
     }
     pub fn stats(&self) -> Result<SpoolStats> {
         let inventory = inventory(&self.config.directory)?;
@@ -622,6 +765,7 @@ impl MetadataSpool {
             disk_bytes: inventory.bytes,
             quarantine_bytes: inventory.quarantine_bytes,
             poisoned: self.poisoned.get(),
+            headroom_reserved: self.headroom,
         })
     }
     fn active_key(&self) -> &EncryptionKey {
@@ -737,12 +881,24 @@ impl MetadataSpool {
     fn recover(&mut self) -> Result<String> {
         let tx = self.db()?.begin_read().map_err(storage_error)?;
         let mut table_count = 0;
+        let mut has_headroom = false;
+        let mut has_application = false;
         for table in tx.list_tables().map_err(storage_error)? {
-            if !matches!(table.name(), "records" | "state") {
-                return Err(Error::Corrupt);
+            match table.name() {
+                "records" | "state" => table_count += 1,
+                "headroom" => has_headroom = true,
+                "application" => has_application = true,
+                _ => return Err(Error::Corrupt),
             }
-            table_count += 1;
         }
+        // The reserve is unauthenticated filler: its only state is presence.
+        let headroom = has_headroom
+            && match tx.open_table(HEADROOM).map_err(storage_error)?.len() {
+                Ok(0) => false,
+                Ok(1) => true,
+                Ok(_) => return Err(Error::Corrupt),
+                Err(error) => return Err(storage_error(error)),
+            };
         if table_count != 2
             || tx
                 .list_multimap_tables()
@@ -803,6 +959,32 @@ impl MetadataSpool {
         }
         self.state = state;
         self.hash = hash;
+        let application = if has_application {
+            let table = tx.open_table(APPLICATION).map_err(storage_error)?;
+            if table.len().map_err(storage_error)? > 1 {
+                return Err(Error::Corrupt);
+            }
+            match table.get(0).map_err(storage_error)? {
+                None => None,
+                Some(envelope) => {
+                    let key =
+                        format::key_id(envelope.value(), self.config.max_record_bytes)?.to_owned();
+                    let plain = format::decrypt(
+                        &self.keys,
+                        &self.config.node_id,
+                        APPLICATION_KIND,
+                        0,
+                        envelope.value(),
+                        self.config.max_record_bytes,
+                    )?;
+                    Some((plain, key))
+                }
+            }
+        } else {
+            None
+        };
+        self.headroom = headroom;
+        self.application = application;
         Ok(state_key)
     }
 }
