@@ -33,6 +33,17 @@ const AUTH_FILTER_NAME: &str = "llmproxy.auth";
 /// `tests/auth.rs`. Same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`].
 const MODEL_AUTHZ_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 
+/// Must equal `proxy_filters::object_ownership_filter::TYPE_URL`; pinned by
+/// `tests/auth_enforce.rs`.
+const OBJECT_OWNERSHIP_FILTER_TYPE_URL: &str =
+    "type.llmproxy.dev/llmproxy.filters.v0.ObjectOwnership";
+
+/// The provider object collections `auth` protects. These are endpoint
+/// shapes, not providers: a POST to the path returns an object with a
+/// top-level `id`, and `<path>/<id>` names that object. OpenAI and Anthropic
+/// files share the first; the batch endpoints differ by path only.
+const OBJECT_COLLECTIONS: [&str; 3] = ["/v1/files", "/v1/batches", "/v1/messages/batches"];
+
 /// Must equal `proxy_filters::spend_limit_filter::TYPE_URL`; pinned by
 /// `tests/auth.rs`.
 const SPEND_LIMIT_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
@@ -542,6 +553,15 @@ fn warn_unenforced_tenant_controls(config: &SimpleConfig, warnings: &mut Vec<Con
             "auth.enforce.limits",
             "tenant and key rate limits are NOT enforced: llmproxy.token_limit is omitted, so \
              the admin API refuses PUT /tenants/{id}/limits and PUT /keys/{id}/limits",
+        ));
+    }
+    if !auth.enforce.object_ownership {
+        warnings.push(warning(
+            "auth.enforce.object_ownership",
+            "provider files and batches are NOT kept to their tenant: \
+             llmproxy.object_ownership is omitted, so any tenant that knows another tenant's \
+             file or batch ID can read, cancel or delete it, and listing them returns every \
+             tenant's",
         ));
     }
     if !auth.enforce.spend {
@@ -1601,6 +1621,15 @@ fn allows_tenants_without_policy(config: &SimpleConfig) -> bool {
 /// `llmproxy.token_limit` for tenant and key limits.
 fn enforces_tenant_limits(config: &SimpleConfig) -> bool {
     config.auth.as_ref().is_some_and(|auth| auth.enforce.limits)
+}
+
+/// `auth` is set and `auth.enforce.object_ownership` is on: the chain
+/// carries `llmproxy.object_ownership`.
+fn enforces_object_ownership(config: &SimpleConfig) -> bool {
+    config
+        .auth
+        .as_ref()
+        .is_some_and(|auth| auth.enforce.object_ownership)
 }
 
 /// `auth` is set and `auth.enforce.spend` is on: the chain carries
@@ -3052,6 +3081,17 @@ fn lower_listener(
         // be refused before the body-peek filter parses it, and the token
         // limiter must see `StreamInfo::auth.tenant` already written).
         http_filters.push(auth_filter);
+    }
+    if enforces_object_ownership(config) {
+        // After auth (reads the tenant and its control-plane store); before
+        // anything that reads the body, so a refused request is not parsed.
+        http_filters.push(json!({
+            "name": "llmproxy.object_ownership",
+            "typed_config": {
+                "@type": OBJECT_OWNERSHIP_FILTER_TYPE_URL,
+                "collections": OBJECT_COLLECTIONS,
+            },
+        }));
     }
     if needs_body_rewrite_filter(config) {
         // Decode-path filter, so it must precede the router in config order --

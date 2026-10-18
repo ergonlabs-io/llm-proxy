@@ -14,6 +14,7 @@
 //! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
 //! {ns}:rate_cards                           HASH chain (the usage filter's stat_prefix) -> encode_json(EncodedRateCardRow)
 //! {ns}:trace_export                         HASH tenant -> encode_trace_export_row() (opted-in tenants only)
+//! {ns}:object_owners                        HASH object id -> encode_object_owner_row(tenant)
 //! {ns}:generation                           STRING, INCR
 //! {ns}:spend:{<prefix>|<tenant>|<period>}   STRING, micros
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
@@ -52,6 +53,7 @@ use redis::{Client, Connection, Script};
 
 use crate::auth::{KeyId, TenantId};
 use crate::control::decode_tenant_credential_row;
+use crate::control::{check_object_id, decode_object_owner_row, encode_object_owner_row};
 use crate::control::{
     decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
     EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
@@ -174,7 +176,7 @@ impl LoadStats {
     }
 }
 
-/// Which of the store's two connections a call runs on. Every trait method
+/// Which of the store's connections a call runs on. Every trait method
 /// names one, so a slow call can only ever queue behind calls of its own kind.
 ///
 /// Rust note: a closed `enum` rather than, say, a `HashMap` of connections
@@ -195,6 +197,10 @@ enum Lane {
     /// own connection, so a long spend flush cannot hold a publish past the
     /// lease TTL and expire this replica's live leases.
     Lease,
+    /// Object ownership: a claim per provider create and a read per request
+    /// naming an object this replica has not cached. Its own connection, so
+    /// object traffic cannot delay a revocation pickup on [`Lane::Control`].
+    Objects,
 }
 
 /// [`ControlPlaneStore::add_spend`]'s Lua script. ADR-0006 §2 decides that
@@ -573,7 +579,7 @@ fn unescape_component(escaped: &str) -> Option<String> {
 /// it. What a lane buys is that a slow or long CALL on one cannot delay calls
 /// on the other, and that an error on one (which drops that lane's
 /// connection, see [`Self::with_connection`]) leaves the other's connection
-/// alone. The cost is that a replica holds up to two Redis connections.
+/// alone. The cost is that a replica holds one Redis connection per lane.
 pub struct RedisControlPlaneStore {
     client: Client,
     /// The [`Lane::Control`] connection, opened on first use.
@@ -582,6 +588,8 @@ pub struct RedisControlPlaneStore {
     spend_conn: Mutex<Option<Connection>>,
     /// The [`Lane::Lease`] connection, opened on first use.
     lease_conn: Mutex<Option<Connection>>,
+    /// The [`Lane::Objects`] connection, opened on first use.
+    objects_conn: Mutex<Option<Connection>>,
     /// Connect, read, and write timeout of both lanes: [`IO_TIMEOUT`] in
     /// production. A field rather than the constant read in place so the
     /// lane tests can hold a call in flight far longer than that without
@@ -636,6 +644,7 @@ impl RedisControlPlaneStore {
             control_conn: Mutex::new(None),
             spend_conn: Mutex::new(None),
             lease_conn: Mutex::new(None),
+            objects_conn: Mutex::new(None),
             io_timeout: IO_TIMEOUT,
             namespace: namespace.into(),
             add_spend_script: Script::new(ADD_SPEND_LUA),
@@ -677,6 +686,7 @@ impl RedisControlPlaneStore {
             Lane::Control => &self.control_conn,
             Lane::Spend => &self.spend_conn,
             Lane::Lease => &self.lease_conn,
+            Lane::Objects => &self.objects_conn,
         };
         let mut guard = slot
             .lock()
@@ -724,6 +734,10 @@ impl RedisControlPlaneStore {
 
     fn limits_key(&self) -> String {
         format!("{}:limits", self.namespace)
+    }
+
+    fn object_owners_key(&self) -> String {
+        format!("{}:object_owners", self.namespace)
     }
 
     fn trace_export_key(&self) -> String {
@@ -1393,6 +1407,37 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .invoke::<i64>(conn)
         })?;
         Ok(written == 1)
+    }
+
+    /// `HSETNX` then `HGET` in one `MULTI`/`EXEC`: the set never overwrites,
+    /// and the read in the same transaction returns whichever claim won.
+    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+        check_object_id(object_id)?;
+        let key = self.object_owners_key();
+        let row = encode_object_owner_row(tenant);
+        let (owner,): (Vec<u8>,) = self.with_connection(Lane::Objects, |conn| {
+            redis::pipe()
+                .atomic()
+                .cmd("HSETNX")
+                .arg(&key)
+                .arg(object_id)
+                .arg(&row)
+                .ignore()
+                .cmd("HGET")
+                .arg(&key)
+                .arg(object_id)
+                .query(conn)
+        })?;
+        decode_object_owner_row(&owner)
+    }
+
+    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+        check_object_id(object_id)?;
+        let key = self.object_owners_key();
+        let row: Option<Vec<u8>> = self.with_connection(Lane::Objects, |conn| {
+            redis::cmd("HGET").arg(&key).arg(object_id).query(conn)
+        })?;
+        row.map(|row| decode_object_owner_row(&row)).transpose()
     }
 
     /// Redis is the shared store: it is meant to outlive any replica.
@@ -2267,6 +2312,26 @@ mod tests {
             0,
             "a NotFound revoke wrote nothing and must not bump the generation"
         );
+    }
+
+    /// Against a real Redis: the first claim wins, a second store handle
+    /// (another replica) reads it, and no claim bumps the generation.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_the_first_object_claim_wins_and_another_replica_reads_it() {
+        let store = test_store("object-owners");
+        let other = RedisControlPlaneStore::open_with_namespace(
+            &std::env::var("LLM_PROXY_TEST_REDIS").unwrap(),
+            store.namespace.clone(),
+        )
+        .unwrap();
+        let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+        let before = store.policy_generation().unwrap();
+        assert_eq!(store.object_owner("file-1").unwrap(), None);
+        assert_eq!(store.claim_object("file-1", &a).unwrap(), a);
+        assert_eq!(other.claim_object("file-1", &b).unwrap(), a);
+        assert_eq!(other.object_owner("file-1").unwrap(), Some(a));
+        assert_eq!(store.policy_generation().unwrap(), before);
     }
 
     /// The opt-in row, its removal and the tenant-delete cascade each bump

@@ -11,8 +11,8 @@ use proxy_config::lower::{
     LEGACY_BODY_REWRITE_FILTER_TYPE as LEGACY_BODY_REWRITE,
     LEGACY_TOKEN_LIMIT_FILTER_TYPE as LEGACY_TOKEN_LIMIT, LEGACY_USAGE_FILTER_TYPE as LEGACY_USAGE,
     MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, MODEL_RESOLVER_FILTER_TYPE as MODEL_RESOLVER,
-    SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT, TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT,
-    USAGE_FILTER_TYPE as USAGE,
+    OBJECT_OWNERSHIP_FILTER_TYPE as OBJECT_OWNERSHIP, SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT,
+    TOKEN_LIMIT_FILTER_TYPE as TOKEN_LIMIT, USAGE_FILTER_TYPE as USAGE,
 };
 
 /// The config crate duplicates filter type URLs to avoid a production
@@ -82,6 +82,13 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          stops firing"
     );
     assert_eq!(
+        OBJECT_OWNERSHIP,
+        proxy_filters::object_ownership_filter::TYPE_URL,
+        "the object_ownership filter's type URL changed; update \
+         `OBJECT_OWNERSHIP_FILTER_TYPE` in proxy-config/src/lower.rs or its ordering rule \
+         silently stops firing"
+    );
+    assert_eq!(
         SPEND_LIMIT,
         proxy_filters::spend_limit_filter::TYPE_URL,
         "the spend_limit filter's type URL changed; update `SPEND_LIMIT_FILTER_TYPE` in \
@@ -106,6 +113,7 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         MODEL_AUTHZ => "\n                      policies: []",
         MODEL_RESOLVER => "\n                      rules: { default_model: fast }",
         SPEND_LIMIT => "\n                      default_period: MONTHLY",
+        OBJECT_OWNERSHIP => "\n                      collections: [\"/v1/files\"]",
         other => panic!("unexpected type url {other}"),
     };
     format!(
@@ -536,6 +544,33 @@ fn a_chain_satisfying_one_rule_is_still_rejected_for_violating_the_other() {
     assert!(
         reason.contains("llmproxy.auth"),
         "the auth rule must still fire: {reason}"
+    );
+}
+
+// --- object_ownership: after auth --------------------------------------------
+
+#[test]
+fn object_ownership_after_auth_is_accepted() {
+    chain(&[
+        ("llmproxy.auth", AUTH),
+        ("llmproxy.object_ownership", OBJECT_OWNERSHIP),
+    ])
+    .expect("auth, object_ownership is the correct order");
+}
+
+#[test]
+fn object_ownership_before_auth_is_rejected_because_it_would_see_no_tenant() {
+    let (field_path, reason) = expect_invalid(chain(&[
+        ("llmproxy.object_ownership", OBJECT_OWNERSHIP),
+        ("llmproxy.auth", AUTH),
+    ]));
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
+    assert!(
+        reason.contains("llmproxy.auth") && reason.contains("llmproxy.object_ownership"),
+        "the reason must name both filters: {reason}"
     );
 }
 
