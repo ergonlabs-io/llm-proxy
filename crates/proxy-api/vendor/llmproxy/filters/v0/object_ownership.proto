@@ -17,11 +17,74 @@ package llmproxy.filters.v0;
 // same way. Listing a collection is refused. It requires `llmproxy.auth`
 // earlier in the same chain.
 message ObjectOwnership {
-  // Required, at least one. Path of each object collection, for example
-  // `/v1/files`. A POST to the path creates an object; the response's
-  // top-level `id` is recorded as owned by the caller. `<path>/<id>` and
-  // anything below it name that object. Each must start with `/`, must not
-  // end with `/`, and must not contain `*`, `?`, `%`, an empty segment, or a
-  // `.` or `..` segment.
+  // Object collections given by path alone, each with the defaults of
+  // `ObjectCollection`: no endpoints, every create recorded, owners never expire.
+  // `<path>/<id>` and anything below it name that object. Each must start
+  // with `/`, must not end with `/`, and must not contain `*`, `?`, `%`, an
+  // empty segment, or a `.` or `..` segment. `collections` and `collection`
+  // together need at least one entry, and no path may appear twice.
   repeated string collections = 1;
+
+  // Object collections with options. Same path rules as `collections`.
+  repeated ObjectCollection collection = 2;
+
+  // JSON request-body members that name an object, checked at any depth: the
+  // caller's tenant must own every object they name. An entry is a member
+  // name (`previous_response_id`) or `*` followed by a suffix (`*_file_id`
+  // matches every name ending in `_file_id`). A matching member's string
+  // value is a reference, and so is each string in its array value and the
+  // string `id` of its object value. Unset means `file_id`, `*_file_id`,
+  // `file_ids` and `*_file_ids`.
+  repeated string reference_members = 3;
+
+  // Members of a successful JSON response, to a create or to a request
+  // naming an object the caller owns, whose objects the caller now owns:
+  // a batch's `output_file_id`, a completed upload's `file.id`. An entry is
+  // a top-level member, by name or `*` suffix pattern as in
+  // `reference_members`, optionally followed by `.` and the name of a member
+  // of its object value. A string value is an ID, and so is each string in
+  // an array value. These owners never expire. Unset means `file_id`,
+  // `*_file_id`, `file_ids` and `*_file_ids`.
+  repeated string owned_members = 4;
+
+  // Request-body members whose values are caller data, not references: the
+  // filter does not look inside them, so a caller's own field that happens
+  // to share a reference member's name is not refused. Exact names only.
+  // Unset means none.
+  repeated string opaque_members = 5;
+}
+
+// One object collection. A POST to `path` creates an object: the response's
+// top-level `id`, or for a `text/event-stream` response the ID in its first
+// event, is recorded as owned by the caller.
+message ObjectCollection {
+  // When a create is recorded. The zero value is `ALWAYS`.
+  enum Record {
+    ALWAYS = 0;
+    // Only when the request's top-level `record_member` is `true`.
+    RECORD_IF_TRUE = 1;
+    // Unless the request's top-level `record_member` is `false`.
+    RECORD_UNLESS_FALSE = 2;
+  }
+
+  // Required. Same rules as `ObjectOwnership.collections`.
+  string path = 1;
+
+  // Segments directly under `path` that are endpoints, not object IDs, for
+  // example `runs` under `/v1/threads`. A POST to `<path>/<endpoint>` is a
+  // create like a POST to `path`; any other request to it names no object.
+  // Matched without regard to case. Each must be one non-empty segment.
+  repeated string endpoints = 2;
+
+  // See `Record`. A number outside it is a load error.
+  Record record = 3;
+
+  // The top-level request member `record` reads. Required with
+  // `RECORD_IF_TRUE` and `RECORD_UNLESS_FALSE`, and a load error otherwise.
+  string record_member = 4;
+
+  // How long a created object's owner is kept, in seconds. After that the
+  // object is refused to every tenant until the admin API assigns it again.
+  // 0 (unset) keeps the owner until removed.
+  uint64 owner_ttl_seconds = 5;
 }

@@ -1,15 +1,16 @@
 //! `llmproxy.object_ownership`: refuses a request that names a provider
-//! object (a file or batch ID) the caller's tenant does not own, before the
-//! upstream is dialled, and records the owner of every object a tenant
-//! creates. What names an object, and where owners live, is in
-//! [`crate::object_ownership`]'s module doc.
+//! object the caller's tenant does not own, before the upstream is dialled,
+//! and records the owner of every object a tenant creates. What names an
+//! object, and where owners live, is in [`crate::object_ownership`]'s module
+//! doc.
 //!
 //! # Decisions
 //!
 //! - A path naming an object: the caller's tenant must own it.
-//! - A collection's own path: a POST creates. Any other method lists the
-//!   provider account every tenant shares, so it is refused.
-//! - A JSON request body that references files: the tenant must own every
+//! - A collection's own path, or an endpoint under it: a POST creates. Any
+//!   other method on the collection lists the provider account every tenant
+//!   shares, so it is refused; on an endpoint it names no object.
+//! - A JSON request body that references objects: the tenant must own every
 //!   one. A body that could spell a reference but does not parse is refused
 //!   with 400, since the provider's parser may still accept it.
 //! - No authenticated tenant on any of these: refused.
@@ -24,11 +25,15 @@
 //! # Recording
 //!
 //! A 2xx JSON response to a create records its top-level `id` for the
-//! caller's tenant. A 2xx JSON response to a create or to an owned object
-//! also records the files its top-level reference members name. The
-//! response is never held: it streams through, and the owner enters this
-//! replica's cache as the body ends, before the stream completes. The store
-//! write follows on the owners thread.
+//! caller's tenant, for the collection's owner TTL; a `text/event-stream`
+//! response records the ID its first event names, as soon as that event has
+//! arrived. A create is recorded only when the collection's record rule
+//! says so (`store: true`, for example). A 2xx JSON response to a create or
+//! to an owned object also records the objects its owned members name, for
+//! good. The response is never held: it streams through, and the owner
+//! enters this replica's cache as the body ends (or the first event does),
+//! before the stream completes. The store write follows on the owners
+//! thread.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,8 +53,8 @@ use crate::auth::TenantId;
 use crate::auth_filter;
 use crate::control::ControlPlane;
 use crate::object_ownership::{
-    file_references, owned_by_response, BodyReferences, Cached, Collections, LookupAnswer,
-    ObjectOwners, PathTarget,
+    created_in_first_event, records, BodyReferences, Cached, Collection, FirstEvent, LookupAnswer,
+    MemberPattern, ObjectOwners, OwnedMember, PathTarget, Record, Rules, MAX_FIRST_EVENT_BYTES,
 };
 
 /// Type URL this filter is registered under.
@@ -73,10 +78,9 @@ fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigEr
     }
 }
 
-/// Reads `typed_config.collections`.
-pub fn parse_config(config: &DynamicMessage) -> Result<Collections, ConfigError> {
-    let paths: Vec<String> = config
-        .get_field_by_name("collections")
+fn strings(config: &DynamicMessage, field: &str) -> Vec<String> {
+    config
+        .get_field_by_name(field)
         .and_then(|v| {
             v.as_list().map(|items| {
                 items
@@ -85,14 +89,107 @@ pub fn parse_config(config: &DynamicMessage) -> Result<Collections, ConfigError>
                     .collect()
             })
         })
+        .unwrap_or_default()
+}
+
+fn parse_collection(item: &DynamicMessage, at: &str) -> Result<Collection, ConfigError> {
+    let path = item
+        .get_field_by_name("path")
+        .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
-    Collections::parse(&paths).map_err(|(i, reason)| {
-        if paths.is_empty() {
-            invalid("typed_config.collections", reason)
-        } else {
-            invalid(format!("typed_config.collections[{i}]"), reason)
+    let member = item
+        .get_field_by_name("record_member")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let number = item
+        .get_field_by_name("record")
+        .and_then(|v| v.as_enum_number())
+        .unwrap_or(0);
+    let record =
+        match (number, member.is_empty()) {
+            (0, true) => Record::Always,
+            (1, false) => Record::IfTrue(member),
+            (2, false) => Record::UnlessFalse(member),
+            (0, false) => {
+                return Err(invalid(
+                    format!("{at}.record_member"),
+                    "is only read by RECORD_IF_TRUE and RECORD_UNLESS_FALSE",
+                ))
+            }
+            (1 | 2, true) => {
+                return Err(invalid(
+                    format!("{at}.record_member"),
+                    "is required by RECORD_IF_TRUE and RECORD_UNLESS_FALSE",
+                ))
+            }
+            (other, _) => return Err(invalid(
+                format!("{at}.record"),
+                format!(
+                    "unknown value {other}; expected ALWAYS, RECORD_IF_TRUE or RECORD_UNLESS_FALSE"
+                ),
+            )),
+        };
+    let ttl = item
+        .get_field_by_name("owner_ttl_seconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let ttl = (ttl > 0).then(|| Duration::from_secs(ttl));
+    Collection::new(&path, &strings(item, "endpoints"), record, ttl)
+        .map_err(|reason| invalid(at, reason))
+}
+
+/// Reads `typed_config`. Every error names the offending field.
+pub fn parse_config(config: &DynamicMessage) -> Result<Rules, ConfigError> {
+    let mut collections = Vec::new();
+    for (i, path) in strings(config, "collections").iter().enumerate() {
+        collections.push(
+            Collection::new(path, &[], Record::Always, None)
+                .map_err(|reason| invalid(format!("typed_config.collections[{i}]"), reason))?,
+        );
+    }
+    let detailed = config
+        .get_field_by_name("collection")
+        .and_then(|v| {
+            v.as_list().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_message().cloned())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    for (i, item) in detailed.iter().enumerate() {
+        collections.push(parse_collection(
+            item,
+            &format!("typed_config.collection[{i}]"),
+        )?);
+    }
+    let mut references = Vec::new();
+    for (i, name) in strings(config, "reference_members").iter().enumerate() {
+        references.push(
+            MemberPattern::parse(name).map_err(|reason| {
+                invalid(format!("typed_config.reference_members[{i}]"), reason)
+            })?,
+        );
+    }
+    let mut owned = Vec::new();
+    for (i, path) in strings(config, "owned_members").iter().enumerate() {
+        owned.push(
+            OwnedMember::parse(path)
+                .map_err(|reason| invalid(format!("typed_config.owned_members[{i}]"), reason))?,
+        );
+    }
+    let opaque = strings(config, "opaque_members");
+    for (i, name) in opaque.iter().enumerate() {
+        if name.is_empty() || name.contains(['*', '.']) {
+            return Err(invalid(
+                format!("typed_config.opaque_members[{i}]"),
+                format!("{name:?} must be a member name, without '*' or '.'"),
+            ));
         }
-    })
+    }
+    Rules::new(collections, references, owned, opaque)
+        .map_err(|reason| invalid("typed_config", reason))
 }
 
 /// [`HttpFilterFactory`] for [`TYPE_URL`].
@@ -114,7 +211,7 @@ impl HttpFilterFactory for ObjectOwnershipFilterFactory {
         config: &DynamicMessage,
         ctx: &FactoryContext,
     ) -> Result<Box<dyn FilterInstanceFactory>, ConfigError> {
-        let collections = Arc::new(parse_config(config)?);
+        let rules = Arc::new(parse_config(config)?);
         // Owners live in the store the auth filter's `ControlPlane` holds,
         // so this filter needs `llmproxy.auth` earlier in the same chain.
         let control_plane = ctx
@@ -141,27 +238,25 @@ impl HttpFilterFactory for ObjectOwnershipFilterFactory {
             })?
             .downcast::<ObjectOwners>()
             .map_err(|_| invalid("typed_config", "object ownership state type collision"))?;
-        Ok(Box::new(ObjectOwnershipInstanceFactory {
-            owners,
-            collections,
-        }))
+        Ok(Box::new(ObjectOwnershipInstanceFactory { owners, rules }))
     }
 }
 
 struct ObjectOwnershipInstanceFactory {
     owners: Arc<ObjectOwners>,
-    collections: Arc<Collections>,
+    rules: Arc<Rules>,
 }
 
 impl FilterInstanceFactory for ObjectOwnershipInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(ObjectOwnershipFilter {
             owners: Arc::clone(&self.owners),
-            collections: Arc::clone(&self.collections),
+            rules: Arc::clone(&self.rules),
             started: false,
             tenant: None,
             target: PathTarget::None,
-            create: false,
+            create: None,
+            record: false,
             path_owned: false,
             body_done: false,
             lookup: Lookup::Idle,
@@ -191,23 +286,26 @@ enum Step {
 }
 
 /// A response body being read for owners.
-#[derive(Default)]
-struct Capture {
-    buf: BytesMut,
-    overflowed: bool,
+enum Capture {
+    /// A JSON body, read whole.
+    Json { buf: BytesMut, overflowed: bool },
+    /// An event stream, read until its first event names the created ID.
+    Events(BytesMut),
 }
 
 /// Per-stream instance.
 struct ObjectOwnershipFilter {
     owners: Arc<ObjectOwners>,
-    collections: Arc<Collections>,
+    rules: Arc<Rules>,
     /// `decode_headers` has classified the request. It is called again after
     /// a held lookup, and must not classify twice.
     started: bool,
     tenant: Option<String>,
     target: PathTarget,
-    /// A POST to a collection.
-    create: bool,
+    /// A POST to a collection or an endpoint under it: the collection.
+    create: Option<usize>,
+    /// The create is recorded, by its collection's record rule.
+    record: bool,
     /// The path names an object the tenant owns.
     path_owned: bool,
     /// The request body has been checked.
@@ -272,33 +370,73 @@ impl ObjectOwnershipFilter {
         }
     }
 
+    /// The owner TTL of the collection a create is in.
+    fn created_ttl(&self) -> Option<Duration> {
+        self.create
+            .and_then(|index| self.rules.collection(index).owner_ttl)
+    }
+
+    fn record(&self, id: String, ttl: Option<Duration>) {
+        if let Some(tenant) = &self.tenant {
+            self.owners.record(id, TenantId::new(tenant.clone()), ttl);
+        }
+    }
+
     /// Records what a finished 2xx response says the tenant owns.
     fn finish_response(&mut self) {
-        let Some(capture) = self.response.take() else {
-            return;
-        };
-        let Some(tenant) = self.tenant.clone() else {
-            return;
-        };
-        let owned = if capture.overflowed {
-            None
-        } else {
-            owned_by_response(&capture.buf, self.create)
-        };
-        let owned = match owned {
-            Some(owned) => owned,
-            None => {
-                if self.create {
-                    self.warn_unrecorded("is not a JSON object within the size limit");
-                }
-                return;
+        match self.response.take() {
+            None => {}
+            Some(Capture::Events(_)) => {
+                self.warn_unrecorded("event stream ended before an event named the created ID")
             }
-        };
-        if self.create && owned.created.is_none() {
-            self.warn_unrecorded("has no top-level string `id`");
+            Some(Capture::Json { buf, overflowed }) => {
+                let created = self.create.is_some();
+                let owned = if overflowed {
+                    None
+                } else {
+                    self.rules.owned_by_response(&buf, created)
+                };
+                let Some(owned) = owned else {
+                    if created {
+                        self.warn_unrecorded("not a JSON object within the size limit");
+                    }
+                    return;
+                };
+                if created && owned.created.is_none() {
+                    self.warn_unrecorded("no top-level string `id`");
+                }
+                if let Some(id) = owned.created {
+                    self.record(id, self.created_ttl());
+                }
+                for id in owned.files {
+                    self.record(id, None);
+                }
+            }
         }
-        for id in owned.created.into_iter().chain(owned.files) {
-            self.owners.record(id, TenantId::new(tenant.clone()), None);
+    }
+
+    /// Reads the created ID from an event stream's first event, recording it
+    /// as soon as it arrives.
+    fn read_events(&mut self, data: &[u8]) {
+        let Some(Capture::Events(buf)) = &mut self.response else {
+            return;
+        };
+        let room = MAX_FIRST_EVENT_BYTES.saturating_sub(buf.len());
+        buf.extend_from_slice(&data[..data.len().min(room)]);
+        match created_in_first_event(buf) {
+            FirstEvent::Found(id) => {
+                self.response = None;
+                self.record(id, self.created_ttl());
+            }
+            FirstEvent::NotFound(why) => {
+                self.response = None;
+                self.warn_unrecorded(why);
+            }
+            FirstEvent::NeedMore if room < data.len() => {
+                self.response = None;
+                self.warn_unrecorded("event stream named no created ID within the size limit");
+            }
+            FirstEvent::NeedMore => {}
         }
     }
 
@@ -307,8 +445,9 @@ impl ObjectOwnershipFilter {
             tracing::warn!(
                 why,
                 suppressed,
-                "llmproxy.object_ownership: a create succeeded but its response {why}, so no \
-                 owner was recorded and the object is refused to every tenant"
+                "llmproxy.object_ownership: a create succeeded but its response did not say \
+                 what it created ({why}), so no owner was recorded and the object is refused to \
+                 every tenant"
             );
         });
     }
@@ -346,18 +485,25 @@ impl HttpFilter for ObjectOwnershipFilter {
             // Rust note: clone out of the `RefMut` guard so it is dropped
             // before the `send_local_reply` calls below.
             self.tenant = cb.stream_info().auth.tenant.clone();
-            self.target = self.collections.classify(headers.uri.path());
+            self.target = self.rules.classify(headers.uri.path());
+            let post = headers.method == Method::POST;
             match self.target {
                 PathTarget::None => return FilterHeadersStatus::Continue,
+                PathTarget::Endpoint(_) if !post => {
+                    self.target = PathTarget::None;
+                    return FilterHeadersStatus::Continue;
+                }
                 _ if self.tenant.is_none() => {
                     deny(cb);
                     return FilterHeadersStatus::Continue;
                 }
-                PathTarget::Collection if headers.method == Method::POST => {
-                    self.create = true;
+                PathTarget::Collection(index) | PathTarget::Endpoint(index) if post => {
+                    self.create = Some(index);
+                    // Without a body; `decode_data` decides again with one.
+                    self.record = records(&self.rules.collection(index).record, None);
                     return FilterHeadersStatus::Continue;
                 }
-                PathTarget::Collection => {
+                PathTarget::Collection(_) | PathTarget::Endpoint(_) => {
                     deny(cb);
                     return FilterHeadersStatus::Continue;
                 }
@@ -394,14 +540,17 @@ impl HttpFilter for ObjectOwnershipFilter {
         if self.body_done {
             return FilterDataStatus::Continue;
         }
-        let ids = match file_references(data) {
+        if let Some(index) = self.create {
+            self.record = records(&self.rules.collection(index).record, Some(data));
+        }
+        let ids = match self.rules.references(data) {
             BodyReferences::None => Vec::new(),
             BodyReferences::Ids(ids) => ids,
             BodyReferences::Unparseable => {
                 self.body_done = true;
                 cb.send_local_reply(
                     StatusCode::BAD_REQUEST,
-                    r#"{"error":{"message":"request body references a file but is not valid JSON"}}"#,
+                    r#"{"error":{"message":"request body references an object but is not valid JSON"}}"#,
                     Some(json_content_type()),
                     UNPARSEABLE_DETAILS,
                 );
@@ -427,8 +576,26 @@ impl HttpFilter for ObjectOwnershipFilter {
         headers: &mut ResponseHeaders,
         end_stream: bool,
     ) -> FilterHeadersStatus {
-        if (self.create || self.path_owned) && headers.status.is_success() {
-            self.response = Some(Capture::default());
+        let created = self.create.is_some() && self.record;
+        if (created || self.path_owned) && headers.status.is_success() {
+            let events = headers
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("text/event-stream")
+                });
+            self.response = match (events, created) {
+                (true, true) => Some(Capture::Events(BytesMut::new())),
+                // An owned object's event stream names nothing to record.
+                (true, false) => None,
+                (false, _) => Some(Capture::Json {
+                    buf: BytesMut::new(),
+                    overflowed: false,
+                }),
+            };
         }
         if end_stream {
             self.finish_response();
@@ -442,13 +609,17 @@ impl HttpFilter for ObjectOwnershipFilter {
         data: &mut Bytes,
         end_stream: bool,
     ) -> FilterDataStatus {
-        if let Some(capture) = &mut self.response {
-            if capture.buf.len() + data.len() > MAX_RESPONSE_BYTES {
-                capture.overflowed = true;
-                capture.buf.clear();
-            } else if !capture.overflowed {
-                capture.buf.extend_from_slice(data);
+        match &mut self.response {
+            Some(Capture::Json { buf, overflowed }) => {
+                if buf.len() + data.len() > MAX_RESPONSE_BYTES {
+                    *overflowed = true;
+                    buf.clear();
+                } else if !*overflowed {
+                    buf.extend_from_slice(data);
+                }
             }
+            Some(Capture::Events(_)) => self.read_events(data),
+            None => {}
         }
         if end_stream {
             self.finish_response();
@@ -488,5 +659,91 @@ impl HttpFilter for ObjectOwnershipFilter {
             };
             self.lookup = Lookup::Answered(answer);
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(json: serde_json::Value) -> DynamicMessage {
+        let desc = proxy_api::descriptor_pool()
+            .get_message_by_name("llmproxy.filters.v0.ObjectOwnership")
+            .expect("ObjectOwnership resolves");
+        DynamicMessage::deserialize(desc, json).expect("proto JSON")
+    }
+
+    fn rejected(json: serde_json::Value) -> String {
+        match parse_config(&config(json.clone())) {
+            Err(ConfigError::InvalidValue { field_path, .. }) => field_path,
+            other => panic!("{json}: {other:?}"),
+        }
+    }
+
+    /// Strict config: every malformed field fails the load with its dotted
+    /// path (AGENTS.md invariant 1), and a valid one parses.
+    #[test]
+    fn malformed_fields_fail_with_their_path() {
+        use serde_json::json;
+        let ok = json!({
+            "collections": ["/v1/files"],
+            "collection": [{
+                "path": "/v1/chat/completions",
+                "record": "RECORD_IF_TRUE",
+                "record_member": "store",
+                "owner_ttl_seconds": 60,
+            }],
+            "reference_members": ["*_file_id", "conversation"],
+            "owned_members": ["file.id"],
+            "opaque_members": ["metadata"],
+        });
+        let rules = parse_config(&config(ok)).expect("valid");
+        assert_eq!(
+            rules.collection(1).owner_ttl,
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            rules.collection(1).record,
+            Record::IfTrue("store".into())
+        );
+
+        for (json, path) in [
+            (json!({}), "typed_config"),
+            (json!({"collections": ["files"]}), "typed_config.collections[0]"),
+            (
+                json!({"collection": [{"path": "/v1/a", "endpoints": ["x/y"]}]}),
+                "typed_config.collection[0]",
+            ),
+            (
+                json!({"collection": [{"path": "/v1/a", "record": "RECORD_IF_TRUE"}]}),
+                "typed_config.collection[0].record_member",
+            ),
+            (
+                json!({"collection": [{"path": "/v1/a", "record_member": "store"}]}),
+                "typed_config.collection[0].record_member",
+            ),
+            (
+                json!({"collection": [{"path": "/v1/a", "record": 7, "record_member": "s"}]}),
+                "typed_config.collection[0].record",
+            ),
+            (
+                json!({"collections": ["/v1/a"], "reference_members": ["a.b"]}),
+                "typed_config.reference_members[0]",
+            ),
+            (
+                json!({"collections": ["/v1/a"], "owned_members": ["a.b.c"]}),
+                "typed_config.owned_members[0]",
+            ),
+            (
+                json!({"collections": ["/v1/a"], "opaque_members": ["*meta"]}),
+                "typed_config.opaque_members[0]",
+            ),
+            (
+                json!({"collections": ["/v1/a"], "collection": [{"path": "/v1/a"}]}),
+                "typed_config",
+            ),
+        ] {
+            assert_eq!(rejected(json.clone()), path, "{json}");
+        }
     }
 }

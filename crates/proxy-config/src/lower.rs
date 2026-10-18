@@ -646,7 +646,20 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "llmproxy.filters.v0.ModelResolver" => &["rules"],
         "llmproxy.filters.v0.StaticModelRules" => &["default_model", "tenants"],
         "llmproxy.filters.v0.TenantModelRule" => &["tenant", "model"],
-        "llmproxy.filters.v0.ObjectOwnership" => &["collections"],
+        "llmproxy.filters.v0.ObjectOwnership" => &[
+            "collections",
+            "collection",
+            "reference_members",
+            "owned_members",
+            "opaque_members",
+        ],
+        "llmproxy.filters.v0.ObjectCollection" => &[
+            "path",
+            "endpoints",
+            "record",
+            "record_member",
+            "owner_ttl_seconds",
+        ],
         // One-release compatibility for the old borrowed body-rewrite type.
         "envoy.config.core.v3.RuntimeFeatureFlag" => &["default_value", "runtime_key"],
         // The Redis-backed shared store. `url` is an
