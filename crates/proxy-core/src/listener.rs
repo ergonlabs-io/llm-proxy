@@ -23,7 +23,7 @@ use proxy_config::ir::{
     NetworkFilterSpec, SnapshotVersion,
 };
 use proxy_config::ConfigSnapshot;
-use proxy_http::codec::{serve_http1, serve_http2, Http1Options};
+use proxy_http::codec::{serve_http1, serve_http2, Http1Options, RequestHeadLimits};
 use proxy_http::filter::{
     FactoryContext, FilterRegistry, SharedFactoryState, TerminalFilterInstanceFactory,
 };
@@ -983,11 +983,18 @@ async fn serve_connection(conn: ServeConnection) {
 
     // The configured `codec_type` for `matched`'s terminal filter. A `tcp_proxy` chain has no codec,
     // so `Auto` is inert there: the `(false, _)` arm reads it only for `TerminalFilter::Http`.
-    let (codec_type, request_headers_timeout) = match matched.filters.last() {
-        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
-            (hcm.codec_type, hcm.request_headers_timeout)
+    let (codec_type, request_headers_timeout, request_head_limits) = match matched.filters.last() {
+        Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => (
+            hcm.codec_type,
+            hcm.request_headers_timeout,
+            RequestHeadLimits {
+                max_bytes: hcm.max_request_headers_kb as usize * 1024,
+                max_headers: hcm.max_headers_count as usize,
+            },
+        ),
+        Some(NetworkFilterSpec::TcpProxy(_)) | None => {
+            (CodecType::Auto, None, RequestHeadLimits::default())
         }
-        Some(NetworkFilterSpec::TcpProxy(_)) | None => (CodecType::Auto, None),
     };
 
     let factory = matched
@@ -1038,6 +1045,7 @@ async fn serve_connection(conn: ServeConnection) {
                             downstream,
                             codec,
                             request_headers_timeout,
+                            request_head_limits,
                         },
                     )
                     .await;
@@ -1080,6 +1088,7 @@ async fn serve_connection(conn: ServeConnection) {
                     downstream,
                     codec,
                     request_headers_timeout,
+                    request_head_limits,
                 },
             )
             .await
@@ -1469,6 +1478,9 @@ struct RunTerminalFilterCtx<'a> {
     /// The matched HCM's `request_headers_timeout`. Enforced for HTTP/1 only, because hyper's h2 server
     /// exposes no per-stream header progress (internal-docs/envoy-divergences.md).
     request_headers_timeout: Option<Duration>,
+    /// The matched HCM's `max_request_headers_kb` and `max_headers_count`. Enforced for HTTP/1 only;
+    /// hyper's h2 defaults apply on HTTP/2 (internal-docs/envoy-divergences.md).
+    request_head_limits: RequestHeadLimits,
 }
 
 /// Dispatch to the matched chain's terminal L4 filter. The `TcpProxy` and `Http` paths register the
@@ -1489,6 +1501,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
         downstream,
         codec,
         request_headers_timeout,
+        request_head_limits,
     } = ctx;
     let peer = downstream.remote;
     match filter {
@@ -1547,6 +1560,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
                     let options = Http1Options {
                         keep_alive: true,
                         header_read_timeout: request_headers_timeout,
+                        request_head_limits,
                     };
                     if let Err(err) =
                         serve_http1(stream, handler, options, shutdown_fut, downstream).await
@@ -2026,6 +2040,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -2106,6 +2122,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -3046,6 +3064,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -4157,6 +4177,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -4185,6 +4207,7 @@ mod tests {
                         Http1Options {
                             keep_alive: false,
                             header_read_timeout: None,
+                            request_head_limits: Default::default(),
                         },
                         std::future::pending(),
                         DownstreamInfo::loopback(),

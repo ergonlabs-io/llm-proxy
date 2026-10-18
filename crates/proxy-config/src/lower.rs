@@ -780,6 +780,8 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "request_timeout",
             // Stream-lifetime bounds; see `convert_hcm`.
             "stream_idle_timeout",
+            // Request head size limit; see `convert_hcm`.
+            "max_request_headers_kb",
             "common_http_protocol_options",
             // Listed so a config setting it gets
             // `convert_hcm`'s specific "not implemented, see the dialect"
@@ -794,10 +796,13 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // RDS has the same ADS-only ConfigSource rule as EDS/SDS. The typed
         // converter performs its per-specifier refusal so all members pass
         // through this surface layer first.
-        // Only the stream lifetime is mapped. The connection-level fields on
-        // this message (`idle_timeout`, `max_connection_duration`, ...) stay
-        // rejected by the surface walk until something reads them.
-        "envoy.config.core.v3.HttpProtocolOptions" => &["max_stream_duration"],
+        // Only the stream lifetime and the request header count are mapped.
+        // The connection-level fields on this message (`idle_timeout`,
+        // `max_connection_duration`, ...) stay rejected by the surface walk
+        // until something reads them. The cluster-side protocol options do
+        // not reach this message, so `max_headers_count` here is always the
+        // HCM's downstream request limit.
+        "envoy.config.core.v3.HttpProtocolOptions" => &["max_stream_duration", "max_headers_count"],
         "envoy.extensions.filters.network.http_connection_manager.v3.Rds" => {
             &["config_source", "route_config_name"]
         }
@@ -2265,7 +2270,37 @@ fn convert_hcm(
                 .and_then(|o| o.max_stream_duration.as_ref()),
             &format!("{path}.common_http_protocol_options.max_stream_duration"),
         )?,
+        max_request_headers_kb: convert_max_request_headers_kb(
+            hcm.max_request_headers_kb,
+            &format!("{path}.max_request_headers_kb"),
+        )?,
+        max_headers_count: convert_max_headers_count(
+            hcm.common_http_protocol_options
+                .as_ref()
+                .and_then(|o| o.max_headers_count),
+            &format!("{path}.common_http_protocol_options.max_headers_count"),
+        )?,
     })
+}
+
+/// HCM `max_request_headers_kb`. Unset is Envoy's documented default of
+/// 60 KiB; the proto bounds it to `(0, 8192]`.
+fn convert_max_request_headers_kb(v: Option<u32>, path: &str) -> Result<u32, ConfigError> {
+    match v {
+        None => Ok(60),
+        Some(kb @ 1..=8192) => Ok(kb),
+        Some(kb) => Err(invalid(path, format!("must be in 1..=8192 KiB, got {kb}"))),
+    }
+}
+
+/// `common_http_protocol_options.max_headers_count`. Unset is Envoy's
+/// documented default of 100; the proto requires at least 1.
+fn convert_max_headers_count(v: Option<u32>, path: &str) -> Result<u32, ConfigError> {
+    match v {
+        None => Ok(100),
+        Some(0) => Err(invalid(path, "must be at least 1")),
+        Some(n) => Ok(n),
+    }
 }
 
 /// S10: lower an HCM's `upgrade_configs`. `upgrade_type` is required and

@@ -3161,8 +3161,16 @@ fn lower_listener(
     // fall back to Envoy's own 5 minute default, not to the dialect's.
     hcm["typed_config"]["stream_idle_timeout"] = json!(stream_idle_timeout.to_string());
     if let Some(max) = max_stream_duration {
-        hcm["typed_config"]["common_http_protocol_options"] =
-            json!({ "max_stream_duration": max.to_string() });
+        hcm["typed_config"]["common_http_protocol_options"]["max_stream_duration"] =
+            json!(max.to_string());
+    }
+    // Unset is left out, so Envoy's own defaults (60 KiB, 100) apply.
+    let spec = listener_spec(config);
+    if let Some(kb) = spec.and_then(|s| s.max_request_headers_kb) {
+        hcm["typed_config"]["max_request_headers_kb"] = json!(kb);
+    }
+    if let Some(count) = spec.and_then(|s| s.max_request_headers_count) {
+        hcm["typed_config"]["common_http_protocol_options"]["max_headers_count"] = json!(count);
     }
     if let Some(access_log) = access_log {
         hcm["typed_config"]["access_log"] = json!([access_log]);

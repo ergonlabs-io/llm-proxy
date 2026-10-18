@@ -23,8 +23,7 @@ use crate::handler::{
     StreamHandler, UpgradeTunnel,
 };
 
-/// Per-connection h1 options. Room to grow (header/body size limits) as
-/// later chunks need them.
+/// Per-connection h1 options.
 pub struct Http1Options {
     /// Forwarded straight to `hyper::server::conn::http1::Builder::keep_alive`
     /// (spike finding (d): this is a per-connection knob, exactly what drain
@@ -41,7 +40,46 @@ pub struct Http1Options {
     /// connection without a 408. Both are recorded in
     /// `internal-docs/envoy-divergences.md`.
     pub header_read_timeout: Option<std::time::Duration>,
+    /// Downstream only: the request head limits. Over either gets `431` and
+    /// the request never reaches the handler.
+    pub request_head_limits: RequestHeadLimits,
 }
+
+/// HCM `max_request_headers_kb` and `common_http_protocol_options.
+/// max_headers_count`, as the h1 codec enforces them. [`Default`] is Envoy's
+/// default: 60 KiB and 100 headers.
+///
+/// Envoy's parser counts the raw head: request line, header lines and the
+/// blank line. hyper hands over a parsed head, so the size check measures the
+/// head as it would be written canonically (`name: value` with one space and
+/// CRLF line ends). That equals the raw size for a conventionally formatted
+/// request and differs only by optional whitespace around values
+/// (`internal-docs/envoy-divergences.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestHeadLimits {
+    /// The largest request head accepted, in bytes.
+    pub max_bytes: usize,
+    /// The most header lines a request head may carry.
+    pub max_headers: usize,
+}
+
+impl Default for RequestHeadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 60 * 1024,
+            max_headers: 100,
+        }
+    }
+}
+
+/// How far past [`RequestHeadLimits::max_bytes`] hyper's read buffer may grow
+/// while a head is still incomplete. hyper's own buffer check depends on how
+/// the head arrives in reads, so it cannot enforce an exact limit; it only
+/// bounds memory, and must never refuse a head the exact check would pass.
+/// A head that is still incomplete holds fewer bytes than its raw size, so
+/// any slack keeps hyper from refusing a head at the limit. One initial read
+/// buffer (8 KiB, also hyper's minimum `max_buf_size`) is enough.
+const HEAD_BUFFER_SLACK: usize = 8 * 1024;
 
 /// Connection-level codec failures -- distinct from a per-request handler
 /// error (a handler is expected to turn its own failures into an HTTP
@@ -82,16 +120,29 @@ where
     // each invocation gets its own duplicate rather than a shared borrow.
     let tunnels = UpgradeTunnels::default();
     let service_tunnels = tunnels.clone();
+    let limits = options.request_head_limits;
     let service = service_fn(move |req: Request<Incoming>| {
         let handler = handler.clone();
         let tunnels = service_tunnels.clone();
         async move {
+            // Checked before `serve_one`, so an oversized head never reaches
+            // a filter or the upstream. Envoy treats it as a protocol error
+            // and closes the connection.
+            if request_head_len(&req) > limits.max_bytes {
+                return Ok(closing_response(
+                    http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                ));
+            }
             Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream, &tunnels).await)
         }
     });
 
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.keep_alive(options.keep_alive);
+    // hyper answers `431` itself for more headers than this, before the
+    // service runs. Its count matches Envoy's: header lines, Host included.
+    builder.max_headers(limits.max_headers);
+    builder.max_buf_size(limits.max_bytes + HEAD_BUFFER_SLACK);
     // hyper only runs `header_read_timeout` when a `Timer` is installed, and
     // with a timer installed it defaults the timeout to 30s. Setting the
     // value explicitly on every connection, `None` included, keeps Envoy's
@@ -916,7 +967,7 @@ async fn serve_one(
     if req.headers().contains_key(http::header::TRANSFER_ENCODING)
         && req.headers().contains_key(http::header::CONTENT_LENGTH)
     {
-        return framing_error_response();
+        return closing_response(http::StatusCode::BAD_REQUEST);
     }
 
     let (parts, incoming) = req.into_parts();
@@ -1247,14 +1298,39 @@ where
 /// The codec-level `400` for a request whose framing is ambiguous.
 /// `connection: close` makes hyper close the connection after writing it,
 /// so no byte of the unread body is parsed as a next request.
-fn framing_error_response() -> Response<StreamBody> {
+/// An empty local reply that closes the connection, for a request the codec
+/// refuses before the handler sees it.
+fn closing_response(status: http::StatusCode) -> Response<StreamBody> {
     let body = local_boxed(http_body_util::Empty::<bytes::Bytes>::new().map_err(|e| match e {}));
     Response::builder()
-        .status(http::StatusCode::BAD_REQUEST)
+        .status(status)
         .header(http::header::CONNECTION, "close")
         .header(http::header::CONTENT_LENGTH, "0")
         .body(body)
         .expect("static status and headers are valid")
+}
+
+/// The size of `req`'s head written canonically: request line, one
+/// `name: value` line per header, and the blank line. See
+/// [`RequestHeadLimits`] for how this relates to the raw bytes.
+fn request_head_len<B>(req: &Request<B>) -> usize {
+    const CRLF: usize = 2;
+    // `HTTP/1.1` and `HTTP/1.0` are both 8 bytes.
+    const VERSION: usize = 8;
+    let uri = req.uri();
+    // An origin-form target is exactly its path and query. The other forms
+    // (absolute, authority, `*`) are rare enough to pay for a render.
+    let target = match (uri.scheme(), uri.path_and_query()) {
+        (None, Some(pq)) => pq.as_str().len(),
+        _ => uri.to_string().len(),
+    };
+    let request_line = req.method().as_str().len() + 1 + target + 1 + VERSION + CRLF;
+    let headers: usize = req
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + 2 + value.len() + CRLF)
+        .sum();
+    request_line + headers + CRLF
 }
 
 /// Convert [`HttpResponseParts`] into a `hyper::Response<StreamBody>`. Split

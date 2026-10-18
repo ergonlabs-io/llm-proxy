@@ -620,6 +620,16 @@ pub struct HttpConnectionManagerConfig {
     /// byte, however active it is. `None` (unset or `0s`) disables it, which
     /// is Envoy's default.
     pub max_stream_duration: Option<std::time::Duration>,
+    /// HCM `max_request_headers_kb`: the largest request head accepted, in
+    /// KiB. Envoy counts the raw head (request line, header lines and the
+    /// blank line), so lowering turns unset into Envoy's default of 60. Over
+    /// it gets `431`. Enforced on HTTP/1 only
+    /// (`internal-docs/envoy-divergences.md`).
+    pub max_request_headers_kb: u32,
+    /// HCM `common_http_protocol_options.max_headers_count`: the most request
+    /// header lines accepted. Lowering turns unset into Envoy's default of
+    /// 100. Over it gets `431`. Enforced on HTTP/1 only.
+    pub max_headers_count: u32,
 }
 
 impl ListenerConfig {

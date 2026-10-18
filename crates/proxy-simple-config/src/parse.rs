@@ -498,6 +498,25 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                 reason: "must be greater than 0".to_string(),
             });
         }
+        if let Listen::Full(spec) = listen {
+            // The same bounds the HCM proto puts on the fields these lower to,
+            // checked here so the error names the dialect path.
+            if let Some(kb) = spec
+                .max_request_headers_kb
+                .filter(|kb| !(1..=8192).contains(kb))
+            {
+                return Err(ConfigError::InvalidValue {
+                    field_path: "listen.max_request_headers_kb".to_string(),
+                    reason: format!("must be in 1..=8192, got {kb}"),
+                });
+            }
+            if spec.max_request_headers_count == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field_path: "listen.max_request_headers_count".to_string(),
+                    reason: "must be greater than 0".to_string(),
+                });
+            }
+        }
     }
     if let Some(admin) = &config.admin {
         parse_host_port(admin, "admin")?;

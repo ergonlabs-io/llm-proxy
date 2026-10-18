@@ -132,6 +132,7 @@ async fn spawn_tls_http_upstream(
                     Http1Options {
                         keep_alive: false,
                         header_read_timeout: None,
+                        request_head_limits: Default::default(),
                     },
                     std::future::pending(),
                     DownstreamInfo::loopback(),
