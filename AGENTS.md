@@ -56,11 +56,10 @@ citations when you rename one.
 8. Shared interfaces are frozen early: the IR in `ir.rs`, the filter traits,
    and other cross-crate trait signatures. Do not change them unilaterally in
    a feature change; propose the change and land it as its own commit.
-9. The reference is Envoy v1.38 / xDS v3. Pin the release tag in `proxy-api`
-   and the same image digest in the differential rig. Nobody upgrades Envoy
-   inside a feature change.
-10. When Envoy documentation and Envoy behavior disagree, behavior wins. Pin it
-    as a differential-rig fixture and record the departure in
+9. The reference is Envoy v1.38 / xDS v3. Pin the release tag in `proxy-api`.
+   Nobody upgrades Envoy inside a feature change.
+10. When Envoy documentation and Envoy behavior disagree, behavior wins. Pin
+    the behavior with a test in our own suite and record the departure in
     `internal-docs/envoy-divergences.md`.
 
 ## Comments
