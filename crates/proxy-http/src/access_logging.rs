@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
@@ -1250,6 +1251,18 @@ impl Body for LoggingBody {
     }
 }
 
+/// Set once the process has decided to stop its workers with requests still in
+/// flight (the drain deadline, or a second termination signal). From then on a
+/// body dropped before end-of-stream was cut by this proxy, not by the client.
+static PROCESS_CUT: AtomicBool = AtomicBool::new(false);
+
+/// Marks every response body dropped from now on as cut by this process
+/// (ADR-0011 decision 1). Call before stopping the workers; there is no reset,
+/// because the process exits after it.
+pub fn mark_process_cut() {
+    PROCESS_CUT.store(true, Ordering::SeqCst);
+}
+
 impl Drop for LoggingBody {
     fn drop(&mut self) {
         // Covers the abandoned-stream case: a disconnecting client, or an
@@ -1260,11 +1273,17 @@ impl Drop for LoggingBody {
         // errored, it was simply given up on. That's a downstream
         // termination from the operator's point of view (the far end went
         // away without us ever seeing why), same as Envoy's DC.
-        if self.ctx.is_some() {
-            self.record_failure(
-                ResponseFlag::DownstreamConnectionTermination,
-                &"response body dropped before end-of-stream",
-            );
+        //
+        // Envoy flags both sides' closes `DC` and tells them apart in the
+        // response code details (ADR-0011 decision 1).
+        if let Some(ctx) = &self.ctx {
+            let details = if PROCESS_CUT.load(Ordering::SeqCst) {
+                "downstream_local_disconnect"
+            } else {
+                "downstream_remote_disconnect"
+            };
+            ctx.stream_info.borrow_mut().response_code_details = Some(details.to_string());
+            self.record_failure(ResponseFlag::DownstreamConnectionTermination, &details);
         }
         // `finish` is idempotent (`ctx.take()`), so this is a no-op if
         // `poll_frame` already logged.

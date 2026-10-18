@@ -1546,6 +1546,9 @@ async fn run_serve(
 
     // Stopping the workers drops every connection still open: this is the
     // deadline cut (or the fast exit). Workers that already drained exit at once.
+    // Marked first, so a stream cut here is recorded as cut by this process
+    // (ADR-0011 decision 1).
+    proxy_http::access_logging::mark_process_cut();
     publisher.shutdown();
     publisher.join_async().await;
 

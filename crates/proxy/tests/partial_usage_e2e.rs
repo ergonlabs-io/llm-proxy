@@ -110,6 +110,11 @@ fn an_abandoned_stream_is_recorded_partial_estimated_and_charged() {
         "{partial}"
     );
     assert!(partial["upstream_usage"].is_null(), "{partial}");
+    // The client left: the remote side closed, unlike a drain-deadline cut.
+    assert_eq!(
+        partial["error_category"], "downstream_remote_disconnect",
+        "{partial}"
+    );
 
     // 4 bytes per token, rounded up, from the request size and the frames the
     // proxy had streamed. The client read two frames; the proxy may have
@@ -218,8 +223,8 @@ fn a_timeout_mid_stream_is_recorded_partial_and_charged_once() {
 /// record, and metadata delivery is flushed after that, so the record reaches
 /// the records file before exit as a partial estimate. A shutdown that exited
 /// without stopping the workers would leave the request unrecorded and
-/// unbilled. The cut is reported as `downstream_disconnect` / `DC`: the record
-/// cannot yet tell a drain cut from a client hang-up.
+/// unbilled. The cut is `downstream_disconnect` / `DC`, as Envoy flags either
+/// side's close, with details `downstream_local_disconnect` (ADR-0011).
 #[test]
 fn a_stream_cut_at_the_drain_deadline_is_recorded_partial_before_exit() {
     let dir = scratch_dir("drain");
@@ -261,6 +266,11 @@ fn a_stream_cut_at_the_drain_deadline_is_recorded_partial_before_exit() {
     assert_eq!(
         record["response_flags"],
         serde_json::json!(["DC"]),
+        "{record}"
+    );
+    // Envoy's flag for either side's close; the details say this side cut it.
+    assert_eq!(
+        record["error_category"], "downstream_local_disconnect",
         "{record}"
     );
     assert_eq!(record["usage"]["completeness"], "partial", "{record}");

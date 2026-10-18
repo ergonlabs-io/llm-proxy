@@ -41,7 +41,7 @@ The record type is `RequestRecord` in
 | `tenant_id`, `user_id`, `key_id` | Identify who made the request. `user_id` and `key_id` can be `null`. |
 | `requested_model` | The model name the client sent. |
 | `selected_provider`, `selected_model` | The provider and model the proxy dialled. |
-| `status`, `termination`, `error_category` | How the request ended. |
+| `status`, `termination`, `error_category` | How the request ended. `error_category` is the Envoy response code details. A stream whose downstream connection closed is `termination: downstream_disconnect` with flag `DC`, and `error_category` says which side closed it: `downstream_remote_disconnect` when the client left, `downstream_local_disconnect` when the proxy cut it at shutdown (the end of `--drain-time-s`, or a second termination signal). |
 | `usage`, `cost` | Token counts and cost. Both can be `null`. |
 | `usage.completeness`, `usage.provenance` | `complete` for a finished response. `partial` for a stream cut off before the provider's final usage: the counts are then the provider's figures where they arrived and estimates (4 bytes per token) for the rest. `provenance` is `provider`, or `estimate` when any count was estimated; `usage.input_estimated` and `usage.output_estimated` say which. |
 | `cost.kind` | `list` for a rate-card price of provider-reported usage, `estimate` when it prices estimated usage. A partial record is charged to spend and token limits at this estimate. |
