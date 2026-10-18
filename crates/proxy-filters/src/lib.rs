@@ -53,6 +53,7 @@ pub mod spend_limit_filter;
 pub mod tenant_credential_crypto;
 pub mod token_limit;
 pub mod token_limit_filter;
+pub mod token_usage;
 mod unmetered;
 pub mod usage;
 pub mod usage_filter;
