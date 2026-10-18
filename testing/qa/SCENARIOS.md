@@ -19,7 +19,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-10 | TTFT and TPOT reach the access log with sane values        | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
 | QA-11 | Redis tenant-to-key cutover and persisted spend after SIGKILL | passing — requires `QA_REDIS_ADDR` |
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
-| QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17; approved via WP-108 (owner) |
+| QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17 (`qa13_billing_ledger_test.go`); approved through the billing-ledger backlog acceptance (owner, 2026-10-17) |
 | QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
@@ -489,7 +489,7 @@ does not claim synchronous per-request durability.
 
 ## QA-13 — Billing ledger across a crash and at its disk cap
 
-Approved through WP-108's acceptance (ADR-0009). `qa13_billing_ledger_test.go`
+Approved through the billing ledger's acceptance (ADR-0009). `qa13_billing_ledger_test.go`
 drives a dialect config with a `ledger` block, `--service-node`, an admin
 listener and a Go mock OpenAI upstream, through the listener and the admin API
 only. No external service is needed.
