@@ -1454,9 +1454,9 @@ mod tests {
     use bytes::Bytes;
     use http::{HeaderValue, Method, Uri};
     use proxy_config::ir::RouteEntry;
+    use proxy_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
     use proxy_http::filter::{BufferedBody, EncoderCallbacks, HeaderMutationFn, PerRouteConfig};
     use proxy_http::stream_info::StreamInfo;
-    use proxy_http::tenant_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
 
     use crate::control::test_snapshot_handle;
     use proxy_http::filter::SharedFactoryState;

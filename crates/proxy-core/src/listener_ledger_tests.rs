@@ -15,11 +15,11 @@ use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 use proxy_http::{
     filter::RequestHeaders,
     handler::{local_boxed, DownstreamInfo, HttpRequestParts},
-    tenant_credentials::CredentialSource,
 };
 use proxy_observability::ledger::testing::TempLedger;
 use proxy_observability::ledger::OnUnavailable;
 use proxy_observability::records::ChargeScope;
+use proxy_observability::records::CredentialSource;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;

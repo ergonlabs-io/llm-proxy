@@ -32,6 +32,7 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_core::lifecycle::LifecycleState;
 use proxy_core::WorkerConfigHandle;
+use proxy_credentials::CredentialSource;
 use proxy_filters::auth::{KeyId, TenantId};
 use proxy_filters::control::{ControlPlane, CredentialStoreError, LimitPolicy, StoreError};
 use proxy_filters::model_authz::{ModelAccess, ModelPattern};
@@ -43,7 +44,6 @@ use proxy_http::credential_probe::{
     CredentialProbeOutcome, CredentialProbeRequest, TenantCredentialProbe,
 };
 use proxy_http::filter::SharedFactoryState;
-use proxy_http::tenant_credentials::CredentialSource;
 use proxy_observability::capture_transport::{
     query_spool_records, query_spool_stats, AgentTransportConfig, InspectError,
 };

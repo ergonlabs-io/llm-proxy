@@ -1,7 +1,7 @@
 //! `credential_source` on budget writes and reads: the admin API chooses a
 //! budget's scope (ADR-0007 decision 8), and every budget rendering reports it.
 
-use proxy_http::tenant_credentials::CredentialSource;
+use proxy_credentials::CredentialSource;
 
 use super::*;
 

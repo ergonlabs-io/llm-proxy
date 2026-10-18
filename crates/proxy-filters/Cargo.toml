@@ -11,6 +11,7 @@ license.workspace = true
 arc-swap = { workspace = true }
 # The control plane: stores, snapshot, accumulators and identity types.
 proxy-control = { workspace = true }
+proxy-credentials = { workspace = true }
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
 # `ResponseFlag` (`%RESPONSE_FLAGS%`) -- `token_limit_filter` sets `RL`

@@ -6,9 +6,9 @@
 //! to the router through `StreamInfo::tenant_credentials`. The router never
 //! reads the snapshot or the store.
 //!
-//! These types live in `proxy-http`, not next to the store in
-//! `proxy-filters`, because `proxy-filters` depends on `proxy-http`: the
-//! router can only name types from this crate or below.
+//! These types have their own crate because the router (`proxy-http`) and
+//! the store (`proxy-control`) both name them, and neither of those crates
+//! may depend on the other.
 
 use std::collections::HashMap;
 use std::sync::Arc;

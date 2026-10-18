@@ -53,7 +53,7 @@ use http::header::AUTHORIZATION;
 use http::HeaderMap;
 
 use crate::control::ControlPlaneSnapshot;
-use proxy_http::tenant_credentials::TenantCredentialSet;
+use proxy_credentials::TenantCredentialSet;
 
 /// Scheme prefix this authenticator recognizes on the `authorization`
 /// header. Anything else (no header, a different scheme, a bare token) is
@@ -920,7 +920,7 @@ mod tests {
     use http::HeaderValue;
 
     use crate::control::test_snapshot_handle;
-    use proxy_http::tenant_credentials::{TenantCredential, TenantSecret};
+    use proxy_credentials::{TenantCredential, TenantSecret};
 
     fn headers_with_authorization(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

@@ -48,7 +48,7 @@ pub(crate) struct ProviderCredentials<'a> {
     /// it. Written last, over whatever the operator credential set.
     tenant: Option<(
         &'a proxy_config::ir::TenantCredentialSlot,
-        &'a crate::tenant_credentials::TenantSecret,
+        &'a proxy_credentials::TenantSecret,
     )>,
 }
 
@@ -81,7 +81,7 @@ impl<'a> ProviderCredentials<'a> {
     pub(crate) fn with_tenant(
         mut self,
         slot: &'a proxy_config::ir::TenantCredentialSlot,
-        secret: &'a crate::tenant_credentials::TenantSecret,
+        secret: &'a proxy_credentials::TenantSecret,
     ) -> Self {
         self.tenant = Some((slot, secret));
         self

@@ -22,7 +22,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::control::{ControlPlaneStore, SpendDelta, StoreError};
 use crate::reconciliation_age::{ReconciliationAgeGauge, Seam};
-use proxy_http::tenant_credentials::CredentialSource;
+use proxy_credentials::CredentialSource;
 
 /// An amount of money in integer micro-dollars (1e-6 USD). See the module
 /// doc's "Money is integer, never `f64`" section for why.

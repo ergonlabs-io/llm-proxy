@@ -16,6 +16,8 @@ license.workspace = true
 arc-swap = { workspace = true }
 # `window_usage` reads the route table to resolve window rules.
 proxy-config = { workspace = true }
+# The BYOK types the snapshot carries; the router reads the same types.
+proxy-credentials = { workspace = true }
 # The BYOK types in `proxy_http::tenant_credentials`, which the router also
 # reads.
 proxy-http = { workspace = true }

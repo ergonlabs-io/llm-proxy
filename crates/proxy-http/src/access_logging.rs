@@ -35,7 +35,7 @@ use crate::handler::{BodyError, StreamBody};
 use crate::router::idle::{IdleTimeoutError, MaxStreamDurationError};
 use crate::stat_handles::{GenAiLatencyStats, GenAiTokenStats};
 use crate::stream_info::StreamInfo;
-use crate::tenant_credentials::CredentialSource;
+use proxy_credentials::CredentialSource;
 
 /// One configured logger, resolved at HCM-bind time (mirrors
 /// `proxy-core::listener::build_listener_hcm`'s own "compiled once, rebuilt

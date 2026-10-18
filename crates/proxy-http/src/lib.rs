@@ -35,7 +35,6 @@ pub mod route;
 pub mod router;
 pub mod stat_handles;
 pub mod stream_info;
-pub mod tenant_credentials;
 pub mod upstream_pool;
 
 pub use codec::{serve_http1, CodecError, Http1Options};

@@ -48,12 +48,10 @@ use crate::handler::{
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{apply_prefix_rewrite, select_cluster};
 use crate::stat_handles::RouterStats;
-use crate::tenant_credentials::{
-    CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret,
-};
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
+use proxy_credentials::{CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret};
 
 /// A hedge sends a second request before the first has finished, so it is
 /// restricted to HTTP's safe methods. Idempotency alone is insufficient:

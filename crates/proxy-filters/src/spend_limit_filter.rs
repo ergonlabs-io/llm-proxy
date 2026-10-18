@@ -30,6 +30,7 @@ use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
+use proxy_credentials::CredentialSource;
 use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
@@ -37,7 +38,6 @@ use proxy_http::filter::{
     ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::LlmSpendCharge;
-use proxy_http::tenant_credentials::CredentialSource;
 use proxy_observability::records::{ChargeScope, ChargedScope};
 use proxy_observability::ResponseFlag;
 
@@ -1168,7 +1168,7 @@ mod tests {
     use proxy_http::stream_info::StreamInfo;
     use proxy_http::LlmTokenUsage;
 
-    use proxy_http::tenant_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
+    use proxy_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
 
     use crate::auth::{HmacSecret, KeySet};
     use crate::control::ControlPlane;

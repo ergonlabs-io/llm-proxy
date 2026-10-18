@@ -24,7 +24,7 @@ use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 use crate::tenant_credential_crypto::{
     self as credential_crypto, CryptoError, KeyRing, TenantSecret,
 };
-use proxy_http::tenant_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
+use proxy_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
 use zeroize::Zeroizing;
 // Spend owns period-key and calendar-alignment logic; this module only stores
 // and retrieves the resulting keys.
@@ -913,8 +913,7 @@ pub struct ControlPlaneSnapshot {
     /// entry is in platform mode. A row that failed to decrypt is present as
     /// `TenantCredential::Unusable`, never absent, so that tenant fails
     /// closed.
-    pub tenant_credentials:
-        HashMap<TenantId, Arc<proxy_http::tenant_credentials::TenantCredentialSet>>,
+    pub tenant_credentials: HashMap<TenantId, Arc<proxy_credentials::TenantCredentialSet>>,
     /// The store's `policy_generation`, read before the load this snapshot
     /// was built from, so it can lag the data by one write but never lead
     /// it. `None` when that read failed. Request records carry it.

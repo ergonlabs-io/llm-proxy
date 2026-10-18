@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+proxy-credentials = { workspace = true }
 proxy-config = { workspace = true }
 proxy-core = { workspace = true }
 proxy-observability = { workspace = true }

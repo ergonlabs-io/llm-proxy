@@ -1605,7 +1605,7 @@ mod tests {
             Some(&crate::spend::TenantBudget {
                 max_micros: crate::spend::MicroUsd::from_micros(1_000_000),
                 period: crate::spend::Period::Daily,
-                credential_source: proxy_http::tenant_credentials::CredentialSource::Platform,
+                credential_source: proxy_credentials::CredentialSource::Platform,
             }),
         )
         .unwrap();

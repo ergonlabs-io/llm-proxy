@@ -89,6 +89,7 @@ LAYERS = {
     "proxy-capture-spool": 0,
     "proxy-observability": 1,
     "proxy-config": 2,
+    "proxy-credentials": 2,
     "proxy-simple-config": 3,
     "proxy-xds": 3,
     "proxy-cluster": 3,
