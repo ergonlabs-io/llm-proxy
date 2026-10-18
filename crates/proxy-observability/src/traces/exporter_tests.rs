@@ -444,5 +444,10 @@ fn a_persisted_disable_closes_the_gate_at_start() {
     let running = start(&config(dir.path()));
     assert!(!running.admission.gate_open());
     assert!(running.admission.admit(REQUEST).is_none());
-    let _ = running.stop();
+    let stats = running.stop();
+    let text = crate::stats::prometheus_render::render(&stats.registry());
+    assert!(
+        text.contains("envoy_llmproxy_trace_capture_disabled 1"),
+        "the closed gate is visible: {text}"
+    );
 }

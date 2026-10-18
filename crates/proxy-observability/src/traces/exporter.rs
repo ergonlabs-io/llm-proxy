@@ -41,6 +41,7 @@ struct ExporterStats {
     expired: [Handle; 2],
     disk: Handle,
     up: Handle,
+    disabled: Handle,
 }
 
 /// Indexes into `ExporterStats::lost`, in its label order.
@@ -68,6 +69,7 @@ impl ExporterStats {
                 .map(|r| control.resolve(&instruments::TRACE_SEGMENTS_EXPIRED, &[("reason", r)])),
             disk: control.resolve(&instruments::TRACE_DISK_BYTES, &[]),
             up: control.resolve(&instruments::TRACE_EXPORTER_UP, &[]),
+            disabled: control.resolve(&instruments::TRACE_CAPTURE_DISABLED, &[]),
         }
     }
 
@@ -165,6 +167,7 @@ impl TraceExporter {
             admission,
             stats,
             disk_last: 0,
+            disabled_last: 0,
             write_warn: Warn { last: None },
             lru_warn: Warn { last: None },
             retry_open_after: None,
@@ -224,6 +227,7 @@ struct Exporter {
     admission: Arc<TraceAdmission>,
     stats: ExporterStats,
     disk_last: i64,
+    disabled_last: i64,
     write_warn: Warn,
     lru_warn: Warn,
     /// After a failed segment, new segments open at most once a second.
@@ -234,6 +238,7 @@ impl Exporter {
     fn run(&mut self, traces: mpsc::Receiver<Box<CapturedTrace>>, stop: Arc<AtomicBool>) {
         let mut up = 0;
         self.stats.set(self.stats.up, &mut up, 1);
+        self.publish_gate();
         let mut next_tick = Instant::now() + TICK;
         loop {
             if stop.load(Ordering::Acquire) {
@@ -265,6 +270,7 @@ impl Exporter {
     }
 
     fn tick(&mut self) {
+        self.publish_gate();
         let mut sealed = Vec::new();
         let mut failed = 0;
         self.store.seal_due(
@@ -412,6 +418,13 @@ impl Exporter {
             }
         }
         self.publish_disk();
+    }
+
+    fn publish_gate(&mut self) {
+        let value = i64::from(!self.admission.gate_open());
+        let mut last = self.disabled_last;
+        self.stats.set(self.stats.disabled, &mut last, value);
+        self.disabled_last = last;
     }
 
     fn publish_disk(&mut self) {

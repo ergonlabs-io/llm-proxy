@@ -19,6 +19,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-10 | TTFT and TPOT reach the access log with sane values        | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
 | QA-11 | Redis tenant-to-key cutover and persisted spend after SIGKILL | passing — requires `QA_REDIS_ADDR` |
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
+| QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -484,3 +485,16 @@ and denies further requests. A second clean restart must retain $12 without
 duplication. The test bounds calls, supervises processes, and removes its own
 namespace. Charges accrued after the last checkpoint remain volatile; this
 does not claim synchronous per-request durability.
+
+### QA-14: trace export captures an opted-in tenant only
+
+**Property.** With `observability.traces` writing to a directory and two
+tenants created over the admin API, only the tenant that opted in through
+`PUT /tenants/{id}/trace_export` gets a trace. The line carries the request
+body the client sent and the streamed response reassembled into one chat
+completion, with a `complete` capture state; the other tenant produces no
+line. Segments are sealed by SIGTERM and read as gzip JSON lines.
+
+**Why black box.** The Rust tests drive the tee, the exporter and the binary
+separately; this one checks the documented surface end to end: the dialect
+block, the admin opt-in, the on-disk layout and the line a consumer reads.

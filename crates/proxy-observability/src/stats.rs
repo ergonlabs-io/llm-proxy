@@ -1129,6 +1129,16 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+    /// 1 while the trace emergency switch (or the capture supervisor's gate)
+    /// is closed, 0 while capture is allowed. Published on the exporter's
+    /// tick.
+    pub const TRACE_CAPTURE_DISABLED: Instrument = Instrument {
+        name: "llmproxy_trace_capture_disabled",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "1",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// 1 while the exporter thread runs, 0 once it has stopped.
     pub const TRACE_EXPORTER_UP: Instrument = Instrument {
         name: "llmproxy_trace_exporter_up",

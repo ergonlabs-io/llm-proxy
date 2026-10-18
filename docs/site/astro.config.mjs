@@ -98,6 +98,7 @@ export default defineConfig({
 						{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
 						{ label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
 						{ label: 'Request capture', slug: 'observability/request-capture' },
+						{ label: 'Trace export', slug: 'observability/trace-export' },
 					],
 				},
 				{
