@@ -1891,9 +1891,11 @@ name = "proxy"
 version = "0.4.1"
 dependencies = [
  "base64",
+ "bytes",
  "clap",
  "controlplane",
  "flate2",
+ "h2",
  "http",
  "prost",
  "prost-types",

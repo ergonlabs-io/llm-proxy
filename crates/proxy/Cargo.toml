@@ -45,6 +45,11 @@ base64 = { workspace = true }
 # tests/keygen.rs's end-to-end proof builds a real
 # `HeaderMap` to hand a `VirtualKeyAuthenticator`.
 http = { workspace = true }
+# tests/h2_head_limits_e2e.rs drives the downstream HTTP/2 codec with a raw
+# h2 client, which sends exactly the header list it is given and surfaces the
+# RST_STREAM reason a hyper client hides.
+h2 = "0.4"
+bytes = { workspace = true }
 # tests/stats_e2e.rs's `gen_ai.client.token.usage` case needs a real upstream
 # that returns OpenAI-shaped usage -- `mockupstream`'s `mock-upstream` binary
 # does that, but it lives in a sibling workspace crate, and Cargo's binary
