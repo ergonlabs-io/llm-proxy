@@ -1340,6 +1340,7 @@ impl HttpFilter for AuthFilterInstance {
                         key_id: Some(principal.key_id.as_str().to_string()),
                         user_id: principal.user_id.clone(),
                         policy_generation: principal.policy_generation,
+                        trace_export: principal.trace_export,
                     };
                     // Hand-off of the set the key was verified against, so the
                     // router never reads the snapshot itself. A request keeps
@@ -2301,6 +2302,7 @@ mod tests {
                 Arc::new(set),
             )]),
             generation: None,
+            trace_export: std::collections::HashSet::new(),
         };
         let handle = Arc::new(arc_swap::ArcSwap::new(Arc::new(snapshot)));
         let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
@@ -2531,6 +2533,7 @@ mod tests {
                 policy: Arc::new(Default::default()),
                 tenant_credentials: None,
                 policy_generation: None,
+                trace_export: false,
             })
         }
     }

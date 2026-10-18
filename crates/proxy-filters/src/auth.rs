@@ -44,7 +44,7 @@
 //! HMAC secret out of logs while retaining tenant and key identifiers for
 //! audits. New fields require an explicit disclosure decision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -246,6 +246,11 @@ pub struct Principal {
     /// (see `ControlPlaneSnapshot::generation`). `None` for authenticators
     /// that do not read the control-plane snapshot.
     pub policy_generation: Option<u64>,
+    /// Whether the tenant opted in to trace export (ADR-0008 decision 2),
+    /// read from the same snapshot that verified the credential, so the
+    /// request keeps the consent it was admitted with. `false` when the
+    /// snapshot has no opt-in row for the tenant.
+    pub trace_export: bool,
 }
 
 impl fmt::Debug for Principal {
@@ -706,6 +711,7 @@ impl VirtualKeyAuthenticator {
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
             generation: None,
+            trace_export: HashSet::new(),
         })));
         VirtualKeyAuthenticator {
             secret,
@@ -781,6 +787,7 @@ impl Authenticator for VirtualKeyAuthenticator {
                 policy: Arc::new(TenantPolicy::default()),
                 tenant_credentials: snapshot.tenant_credentials.get(&record.tenant).cloned(),
                 policy_generation: snapshot.generation,
+                trace_export: false,
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
@@ -933,6 +940,7 @@ mod tests {
             key_tenants: HashMap::new(),
             tenant_credentials: HashMap::from([(TenantId::new("tenant-t"), Arc::new(set))]),
             generation: None,
+            trace_export: HashSet::new(),
         })))
     }
 

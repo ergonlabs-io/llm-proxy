@@ -30,5 +30,8 @@ pub mod stats;
 /// Our own span model plus W3C `traceparent`
 /// parsing. Pure library, not wired into the request path yet.
 pub mod trace;
+/// Trace export (ADR-0008): request and response bodies of opted-in
+/// tenants, off the worker, into compressed segments.
+pub mod traces;
 
 pub use flags::ResponseFlag;

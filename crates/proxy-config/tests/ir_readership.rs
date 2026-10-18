@@ -53,6 +53,14 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
+        field_name: "traces",
+        kind: EntryKind::KnownInert,
+        reason: "Trace export (ADR-0008): the field lands before its consumers. \
+                 crates/proxy/src/main.rs will refuse a config that sets it until \
+                 the exporter exists; remove this entry when a reader lands.",
+    },
     // --- ADS fields whose readers are outside the runtime scan.
     AllowlistEntry {
         struct_name: "AdsConfig",

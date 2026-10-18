@@ -182,6 +182,10 @@ pub struct StoredControlPlane {
     /// [`decode_rate_card_row`] for why a price must not hold up a
     /// revocation). A store without rate card support returns an empty list.
     pub rate_cards: Vec<StoredRateCard>,
+    /// Tenants that opted in to trace export (ADR-0008 decision 2). A tenant
+    /// without a row is not opted in. A store without opt-in support returns
+    /// an empty set and refuses writes.
+    pub trace_export: HashSet<TenantId>,
 }
 
 /// Optional per-process rate ceilings. An absent field sets no ceiling at
@@ -502,6 +506,21 @@ pub trait ControlPlaneStore: Send + Sync {
         let _ = card;
         Err(StoreError::Unavailable(
             "rate cards are not supported by this store".into(),
+        ))
+    }
+
+    /// Records whether `tenant` opted in to trace export (ADR-0008
+    /// decision 2) and bumps the generation in the same write; `false`
+    /// removes the row. Deleting a tenant must delete its row in the same
+    /// write.
+    ///
+    /// The default refuses the write, so a store without opt-in support
+    /// fails closed: a tenant cannot be recorded as consenting where the
+    /// row would not survive a rebuild.
+    fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
+        let _ = (tenant, enabled);
+        Err(StoreError::Unavailable(
+            "trace export opt-in is not supported by this store".into(),
         ))
     }
 
@@ -854,6 +873,9 @@ pub struct ControlPlaneSnapshot {
     /// was built from, so it can lag the data by one write but never lead
     /// it. `None` when that read failed. Request records carry it.
     pub generation: Option<u64>,
+    /// Tenants opted in to trace export (ADR-0008 decision 2). The auth
+    /// filter copies membership onto the request at admission.
+    pub trace_export: HashSet<TenantId>,
 }
 
 /// In-memory [`ControlPlaneStore`]. Backed by a `Mutex` because the trait's write methods
@@ -1011,6 +1033,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             limits: state.limits.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
             rate_cards: state.rate_cards.values().cloned().collect(),
+            trace_export: HashSet::new(),
         })
     }
 
@@ -2169,6 +2192,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             limits,
             tenant_credentials,
             rate_cards,
+            trace_export: HashSet::new(),
         })
     }
 
@@ -4440,6 +4464,7 @@ impl ControlPlane {
             key_tenants,
             tenant_credentials: HashMap::new(),
             generation: None,
+            trace_export: HashSet::new(),
         }
     }
 }
@@ -4607,6 +4632,7 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
         key_tenants: HashMap::new(),
         tenant_credentials: HashMap::new(),
         generation: None,
+        trace_export: HashSet::new(),
     })))
 }
 

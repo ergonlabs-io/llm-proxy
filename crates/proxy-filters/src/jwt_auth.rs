@@ -420,6 +420,7 @@ impl Authenticator for JwtAuthenticator {
             // must not add a second load to reach tenant credentials.
             tenant_credentials: None,
             policy_generation: None,
+            trace_export: false,
         })
     }
 }
@@ -1185,6 +1186,7 @@ GdGIML90cFtpXr13uutgIg==
                     policy: Arc::new(TenantPolicy::default()),
                     tenant_credentials: None,
                     policy_generation: None,
+                    trace_export: false,
                 })
             }
         }

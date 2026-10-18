@@ -166,6 +166,9 @@ pub struct AuthInfo {
     /// under. `None` when the authenticator does not read that snapshot (JWT)
     /// or the store's stamp could not be read.
     pub policy_generation: Option<u64>,
+    /// The tenant's trace-export opt-in (ADR-0008 decision 2), pinned by the
+    /// auth filter at admission. `false` (the default) captures nothing.
+    pub trace_export: bool,
 }
 
 /// Physical upstream attempt snapshots. A new entry is created at dispatch,

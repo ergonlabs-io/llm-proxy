@@ -38,7 +38,7 @@
 //! Tenant credential fields join escaped tenant and provider names with `|`;
 //! values contain ciphertext only and are never decrypted here (ADR-0007).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1064,6 +1064,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             limits,
             tenant_credentials,
             rate_cards,
+            trace_export: HashSet::new(),
         })
     }
 

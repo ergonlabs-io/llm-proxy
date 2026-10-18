@@ -380,6 +380,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         end_user_capture: None,
         end_user_capture_configured: false,
         ledger: None,
+        traces: None,
         // This fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
         ads: None,
@@ -543,6 +544,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         end_user_capture: None,
         end_user_capture_configured: false,
         ledger: None,
+        traces: None,
         ads: None,
         max_downstream_connections: None,
         version: SnapshotVersion(1),
