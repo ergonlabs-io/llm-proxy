@@ -81,6 +81,21 @@ fn control(path: &std::path::Path, command: serde_json::Value) -> serde_json::Va
     serde_json::from_slice(&response).unwrap()
 }
 
+fn keepalive_connect(port: u16) -> TcpStream {
+    let stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+}
+
 fn keepalive_get(stream: &mut TcpStream, path: &str) {
     write!(stream, "GET {path} HTTP/1.1\r\nHost: test.local\r\n\r\n").unwrap();
     // Read exactly one response; never consume bytes from a later response.
@@ -162,7 +177,7 @@ static_resources:
 }
 
 #[test]
-fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
+fn declarative_capture_reload_and_emergency_gate_on_keepalive() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = temp.path().join("agent.sock");
@@ -225,17 +240,7 @@ fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
             && TcpStream::connect(("127.0.0.1", listener)).is_ok()
             && TcpStream::connect(("127.0.0.1", admin)).is_ok()
     });
-    let mut downstream = TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], listener)),
-        Duration::from_secs(2),
-    )
-    .unwrap();
-    downstream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    downstream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    let mut downstream = keepalive_connect(listener);
     keepalive_get(&mut downstream, "/first");
     wait(|| get(admin, "/stats/prometheus").contains("envoy_llmproxy_metadata_durable 1\n"));
 
@@ -257,6 +262,11 @@ fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
             .count()
             == 1
     });
+    // A reload closes HTTP connections accepted under the replaced snapshot
+    // (envoy-divergences.md, row 38), so the client reconnects. The emergency
+    // gate below publishes no snapshot and is exercised on one kept-alive
+    // connection.
+    downstream = keepalive_connect(listener);
     keepalive_get(&mut downstream, "/second");
     wait(|| get(admin, "/stats/prometheus").contains("envoy_llmproxy_metadata_durable 2\n"));
 
@@ -295,6 +305,7 @@ fn declarative_capture_reload_and_emergency_gate_on_existing_keepalive() {
             .count()
             == 2
     });
+    downstream = keepalive_connect(listener);
     let status = control(&control_socket, serde_json::json!({"command":"Status"}));
     assert_eq!(status["disabled"], true);
     assert_eq!(status["generation"], disabled_generation);
