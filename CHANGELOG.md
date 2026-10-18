@@ -13,6 +13,17 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- Minted Vertex access tokens: `providers.<name>.oauth2_jwt_bearer` (Envoy
+  mode: `scheme: oauth2-jwt-bearer` in `io.llmproxy.provider_auth`) makes the
+  provider cluster mint its OAuth2 access token with the JWT-bearer grant
+  (RFC 7523) from an RSA service-account key, and mint the next one
+  `refresh_before` (default 5m) its expiry. Workers never call the token
+  endpoint. The key file is read and checked at every load; a bad key is a
+  load error naming its path, and `SIGHUP` rotates it. With no unexpired
+  token, a request gets a local `503 provider token unavailable`, is not
+  failed over, and is counted in `llmproxy_provider_credential_requests_total`.
+  Failed mints retry with backoff and keep the last token until it expires.
+  The configured `access_token` modes are unchanged.
 - Request records and the `%LLM_USER_ID%` access-log operator now name the
   authenticated user. A virtual key is its user, so the value is the key id.
   A JWT names a user only when `subject_claim` is set; the value is then the

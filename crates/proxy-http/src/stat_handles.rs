@@ -284,6 +284,17 @@ impl RouterStats {
         record_tenant_credential_request(&self.registry, self.worker, provider, outcome);
     }
 
+    /// Counts one request refused because `cluster`'s minted token was
+    /// missing or expired.
+    pub fn record_provider_credential(&self, cluster: &str, outcome: &'static str) {
+        proxy_observability::stats::record_provider_credential_request(
+            &self.registry,
+            self.worker,
+            cluster,
+            outcome,
+        );
+    }
+
     /// Records one upstream attempt dispatched to `cluster` -- see
     /// `router.rs`'s attempt loop for exactly what "dispatched" means (past
     /// the S5 circuit breaker and host selection, i.e. an attempt that is

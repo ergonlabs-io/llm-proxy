@@ -334,6 +334,9 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     let mut clusters = Vec::new();
     for (name, provider) in &config.providers {
         clusters.push(lower_provider(config, name, provider, &mut warnings)?);
+        if let Some(oauth2) = &provider.oauth2_jwt_bearer {
+            clusters.push(lower_token_cluster(name, oauth2)?);
+        }
     }
 
     let mut routes = Vec::new();
@@ -764,15 +767,15 @@ fn provider_upstream(name: &str, provider: &Provider) -> Result<ProviderUpstream
     Ok(ProviderUpstream { host, port, tls })
 }
 
-fn lower_provider(
-    config: &SimpleConfig,
-    name: &str,
-    provider: &Provider,
-    warnings: &mut Vec<ConfigWarning>,
-) -> Result<Value, ConfigError> {
-    let up = provider_upstream(name, provider)?;
-    let cluster_name = format!("provider:{name}");
-
+/// One upstream cluster for `up`: STATIC for an IP, LOGICAL_DNS for a name,
+/// and for `https` a TLS transport that verifies the chain (against `ca_file`
+/// or the platform roots) and the host name.
+fn endpoint_cluster(
+    cluster_name: &str,
+    up: &ProviderUpstream,
+    ca_file: Option<&str>,
+    connect_timeout: SimpleDuration,
+) -> Value {
     // IP endpoints can be STATIC; hostnames resolve via LOGICAL_DNS (one
     // address at a time — the right shape for big API hostnames).
     let discovery = if up.host.parse::<std::net::IpAddr>().is_ok() {
@@ -780,9 +783,6 @@ fn lower_provider(
     } else {
         "LOGICAL_DNS"
     };
-    let connect_timeout = provider
-        .connect_timeout
-        .unwrap_or(SimpleDuration(std::time::Duration::from_secs(5)));
 
     let mut cluster = json!({
         "name": cluster_name,
@@ -823,7 +823,7 @@ fn lower_provider(
         // genuine upstream parity for users porting real Envoy configs),
         // but the dialect is our own opinionated surface, so it can afford
         // to be strict here.
-        let mut validation_context = if let Some(ca_file) = &provider.ca_file {
+        let mut validation_context = if let Some(ca_file) = ca_file {
             json!({ "trusted_ca": { "filename": ca_file } })
         } else {
             json!({ "system_root_certs": {} })
@@ -840,7 +840,28 @@ fn lower_provider(
             "name": "envoy.transport_sockets.tls",
             "typed_config": tls_config,
         });
-    } else if provider.ca_file.is_some() {
+    }
+    cluster
+}
+
+fn lower_provider(
+    config: &SimpleConfig,
+    name: &str,
+    provider: &Provider,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<Value, ConfigError> {
+    let up = provider_upstream(name, provider)?;
+    let cluster_name = format!("provider:{name}");
+
+    let mut cluster = endpoint_cluster(
+        &cluster_name,
+        &up,
+        provider.ca_file.as_deref(),
+        provider
+            .connect_timeout
+            .unwrap_or(SimpleDuration(std::time::Duration::from_secs(5))),
+    );
+    if !up.tls && provider.ca_file.is_some() {
         warnings.push(warning(
             format!("providers.{name}.ca_file"),
             "ca_file is ignored for plaintext (http://) providers",
@@ -941,15 +962,20 @@ fn lower_provider(
     let mut path_template = None;
     match provider_type {
         ProviderType::Vertex => {
-            let access_token = provider_secret(
-                name,
-                "access_token",
-                provider.access_token.as_ref(),
-                provider.access_token_file.as_ref(),
-                warnings,
-            )?;
-            provider_auth["scheme"] = json!("vertex-oauth2");
-            provider_auth["access_token"] = json!(access_token);
+            if let Some(oauth2) = &provider.oauth2_jwt_bearer {
+                provider_auth["scheme"] = json!("oauth2-jwt-bearer");
+                provider_auth["oauth2_jwt_bearer"] = lower_oauth2_jwt_bearer(name, oauth2)?;
+            } else {
+                let access_token = provider_secret(
+                    name,
+                    "access_token",
+                    provider.access_token.as_ref(),
+                    provider.access_token_file.as_ref(),
+                    warnings,
+                )?;
+                provider_auth["scheme"] = json!("vertex-oauth2");
+                provider_auth["access_token"] = json!(access_token);
+            }
             path_template = Some(json!({
                 "scheme": "vertex",
                 "project": provider.project.as_deref().expect("validated: Vertex project"),
@@ -1037,6 +1063,81 @@ fn lower_provider(
     }
 
     Ok(cluster)
+}
+
+/// The cluster a provider's token endpoint is dialled through. Named apart
+/// from `provider:` clusters so no provider name can collide with it.
+fn token_cluster_name(provider_name: &str) -> String {
+    format!("oauth2-token:{provider_name}")
+}
+
+/// The token endpoint's cluster, with the same verified TLS a provider gets.
+fn lower_token_cluster(
+    provider_name: &str,
+    oauth2: &OAuth2JwtBearerDef,
+) -> Result<Value, ConfigError> {
+    let url = crate::parse::parse_token_url(
+        &oauth2.token_url,
+        &format!("providers.{provider_name}.oauth2_jwt_bearer.token_url"),
+    )?;
+    let up = ProviderUpstream {
+        host: url.host,
+        port: url.port,
+        tls: url.tls,
+    };
+    Ok(endpoint_cluster(
+        &token_cluster_name(provider_name),
+        &up,
+        oauth2.ca_file.as_deref(),
+        SimpleDuration(std::time::Duration::from_secs(5)),
+    ))
+}
+
+/// The `oauth2_jwt_bearer` metadata block. The key file is read and checked
+/// here so a bad key names its dialect path; the bootstrap carries only the
+/// path, and Envoy-mode lowering reads it again.
+fn lower_oauth2_jwt_bearer(
+    provider_name: &str,
+    oauth2: &OAuth2JwtBearerDef,
+) -> Result<Value, ConfigError> {
+    let key_path = &oauth2.private_key_file;
+    let field_path = format!("providers.{provider_name}.oauth2_jwt_bearer.private_key_file");
+    let pem = std::fs::read_to_string(key_path).map_err(|e| ConfigError::InvalidValue {
+        field_path: field_path.clone(),
+        reason: format!("cannot read `{key_path}`: {e}"),
+    })?;
+    proxy_config::ir::RsaSigningKey::from_pkcs8_pem(&pem).map_err(|reason| {
+        ConfigError::InvalidValue {
+            field_path,
+            reason: format!("`{key_path}` {reason}"),
+        }
+    })?;
+    let mut block = json!({
+        "token_cluster": token_cluster_name(provider_name),
+        "token_url": oauth2.token_url,
+        "issuer": oauth2.issuer,
+        "private_key_file": key_path,
+        "scopes": oauth2.scopes,
+    });
+    for (field, value) in [
+        ("subject", &oauth2.subject),
+        ("key_id", &oauth2.key_id),
+        ("audience", &oauth2.audience),
+    ] {
+        if let Some(value) = value {
+            block[field] = json!(value);
+        }
+    }
+    for (field, value) in [
+        ("assertion_lifetime_seconds", oauth2.assertion_lifetime),
+        ("refresh_before_seconds", oauth2.refresh_before),
+        ("request_timeout_seconds", oauth2.timeout),
+    ] {
+        if let Some(SimpleDuration(duration)) = value {
+            block[field] = json!(duration.as_secs());
+        }
+    }
+    Ok(block)
 }
 
 /// Read one provider secret during config compilation. Runtime requests only

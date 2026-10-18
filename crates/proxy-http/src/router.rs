@@ -33,7 +33,9 @@ use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus, T
 use proxy_observability::ResponseFlag;
 
 use crate::codec::UpstreamCodecError;
-use crate::credential_provider::{CredentialProvider, ProviderCredentials};
+use crate::credential_provider::{
+    CredentialProvider, CredentialProviderError, ProviderCredentials,
+};
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -802,7 +804,8 @@ impl RouterHandler {
         let mut provider_credentials = ProviderCredentials::new(
             attempt_entry.provider_runtime(),
             attempt_entry.request_headers_to_add(),
-        );
+        )
+        .with_minted(attempt_entry.minted_credential());
         let source = match &credentials {
             AttemptCredentials::Platform => CredentialSource::Platform,
             AttemptCredentials::Tenant(slot, secret) => {
@@ -814,13 +817,9 @@ impl RouterHandler {
             .apply(&mut attempt_head, &self.captured_body)
             .await
         {
-            tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
             dcb.stream_info()
                 .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
-            return local_reply(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "provider credential failure",
-            );
+            return credential_failure_reply(attempt_cluster, attempt_entry, &err, &self.stats);
         }
         dcb.stream_info().credential_source = Some(source);
         if let AttemptCredentials::Tenant(slot, _) = &credentials {
@@ -1693,7 +1692,8 @@ impl RouterHandler {
                 let mut provider_credentials = ProviderCredentials::new(
                     attempt_entry.provider_runtime(),
                     attempt_entry.request_headers_to_add(),
-                );
+                )
+                .with_minted(attempt_entry.minted_credential());
                 let source = match &credentials {
                     AttemptCredentials::Platform => CredentialSource::Platform,
                     AttemptCredentials::Tenant(slot, secret) => {
@@ -1705,12 +1705,13 @@ impl RouterHandler {
                     .apply(&mut attempt_head, &attempt_body_bytes)
                     .await
                 {
-                    tracing::warn!(cluster = %attempt_cluster, error = %err, "provider credential application failed");
                     dcb.stream_info()
                         .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
-                    return local_reply(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "provider credential failure",
+                    return credential_failure_reply(
+                        attempt_cluster,
+                        attempt_entry,
+                        &err,
+                        &self.stats,
                     );
                 }
                 dcb.stream_info().credential_source = Some(source);
@@ -3398,6 +3399,41 @@ fn codec_error_reply(
     };
     dcb.stream_info().set_response_flag(flag);
     local_reply(status, "upstream connection failure")
+}
+
+/// The local reply for a credential that could not be applied. Both cases fail closed with a 503 and are not
+/// retried or failed over: credentials are applied after host selection, and an aggregate skips a member only
+/// when it yields no host (ADR-0005, amendment 2026-10-17).
+fn credential_failure_reply(
+    cluster: &str,
+    entry: &dyn ClusterEntry,
+    err: &CredentialProviderError,
+    stats: &RouterStats,
+) -> HttpResponseParts {
+    match err {
+        CredentialProviderError::TokenUnavailable => {
+            stats.record_provider_credential(cluster, instruments::PROVIDER_CREDENTIAL_UNAVAILABLE);
+            // Every request to the provider fails this way until a mint lands, so warn once a minute.
+            if let Some(suppressed) = entry.minted_credential().and_then(|m| m.note_refusal()) {
+                tracing::warn!(
+                    cluster,
+                    suppressed,
+                    "no unexpired OAuth2 token is published for this provider; refusing the request"
+                );
+            }
+            local_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider token unavailable",
+            )
+        }
+        CredentialProviderError::Failed => {
+            tracing::warn!(cluster, error = %err, "provider credential application failed");
+            local_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "provider credential failure",
+            )
+        }
+    }
 }
 
 fn local_reply(status: StatusCode, msg: &str) -> HttpResponseParts {

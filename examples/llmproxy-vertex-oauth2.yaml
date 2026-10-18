@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy in front of Claude on Vertex AI, with the access token minted and
+# refreshed by the proxy (the OAuth2 JWT-bearer grant, RFC 7523).
+#
+# Google access tokens expire after about an hour, so a static
+# `access_token` needs an outside refresher. Here the proxy signs a JWT with
+# the service account's key and exchanges it at Google's token endpoint before
+# each token expires. The token URL and scope below are Google's values for
+# Vertex AI; the proxy itself holds no provider values.
+#
+# The key: a Google service-account key file is JSON. Extract the PEM key and
+# the two identifiers it pairs with:
+#   jq -r .private_key      key.json > /etc/llm-proxy/vertex-sa.pem
+#   jq -r .client_email     key.json   # -> issuer
+#   jq -r .private_key_id   key.json   # -> key_id
+#
+# Run:       llm-proxy --config llmproxy-vertex-oauth2.yaml
+# Rotate:    replace the key file, then send SIGHUP.
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  vertex:
+    type: vertex
+    base_url: https://us-central1-aiplatform.googleapis.com
+    project: my-project
+    location: us-central1
+    publisher: anthropic
+    oauth2_jwt_bearer:
+      token_url: https://oauth2.googleapis.com/token
+      issuer: llm-proxy@my-project.iam.gserviceaccount.com
+      key_id: 0123456789abcdef0123456789abcdef01234567
+      private_key_file: /etc/llm-proxy/vertex-sa.pem
+      scopes:
+        - https://www.googleapis.com/auth/cloud-platform
+
+routes:
+  - model: "claude-*"
+    provider: vertex
+
+models:
+  claude-sonnet:
+    providers:
+      - { provider: vertex, model: claude-sonnet-4-5, dialect: anthropic }

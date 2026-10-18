@@ -6,8 +6,8 @@ use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
 use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
-    is_valid_provider_name, Listen, ListenerSpec, ModelProviderRef, Provider, ProviderModelRef,
-    ProviderType, SimpleConfig, RESERVED_KEYS,
+    is_valid_provider_name, Listen, ListenerSpec, ModelProviderRef, OAuth2JwtBearerDef, Provider,
+    ProviderModelRef, ProviderType, SimpleConfig, SimpleDuration, RESERVED_KEYS,
 };
 
 /// Parse dialect YAML from a file.
@@ -643,6 +643,7 @@ fn validate_provider_specific_fields(
         ("publisher", provider.publisher.is_some()),
         ("access_token", provider.access_token.is_some()),
         ("access_token_file", provider.access_token_file.is_some()),
+        ("oauth2_jwt_bearer", provider.oauth2_jwt_bearer.is_some()),
     ];
     let bedrock_fields = [
         ("region", provider.region.is_some()),
@@ -721,14 +722,123 @@ fn validate_vertex_provider(name: &str, provider: &Provider) -> Result<(), Confi
             });
         }
     }
+    if let Some(oauth2) = &provider.oauth2_jwt_bearer {
+        if provider.access_token.is_some() || provider.access_token_file.is_some() {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.oauth2_jwt_bearer"),
+                reason: "set either oauth2_jwt_bearer or a configured access token \
+                         (access_token, access_token_file), not both"
+                    .into(),
+            });
+        }
+        return validate_oauth2_jwt_bearer(&format!("{path}.oauth2_jwt_bearer"), oauth2);
+    }
     validate_exactly_one_source(
         &path,
         "access_token",
         provider.access_token.as_deref(),
         "access_token_file",
         provider.access_token_file.as_deref(),
-        "vertex OAuth access token",
+        "vertex OAuth access token (or oauth2_jwt_bearer)",
     )
+}
+
+/// Checks `oauth2_jwt_bearer` before lowering. The key file itself is read
+/// and checked when the config is lowered, like every other credential file.
+fn validate_oauth2_jwt_bearer(path: &str, def: &OAuth2JwtBearerDef) -> Result<(), ConfigError> {
+    let invalid = |field: &str, reason: &str| ConfigError::InvalidValue {
+        field_path: format!("{path}.{field}"),
+        reason: reason.to_string(),
+    };
+    let tls = parse_token_url(&def.token_url, &format!("{path}.token_url"))?.tls;
+    if def.ca_file.is_some() && !tls {
+        return Err(invalid("ca_file", "is only valid for an https token_url"));
+    }
+    for (field, value) in [
+        ("issuer", Some(def.issuer.as_str())),
+        ("subject", def.subject.as_deref()),
+        ("key_id", def.key_id.as_deref()),
+        ("audience", def.audience.as_deref()),
+        ("private_key_file", Some(def.private_key_file.as_str())),
+        ("ca_file", def.ca_file.as_deref()),
+    ] {
+        if value == Some("") {
+            return Err(invalid(field, "must not be empty"));
+        }
+    }
+    if def.scopes.is_empty() {
+        return Err(invalid("scopes", "must list at least one scope"));
+    }
+    for (i, scope) in def.scopes.iter().enumerate() {
+        if scope.is_empty() || scope.chars().any(char::is_whitespace) {
+            return Err(invalid(
+                &format!("scopes[{i}]"),
+                "must be a non-empty scope without spaces",
+            ));
+        }
+    }
+    for (field, value) in [
+        ("assertion_lifetime", def.assertion_lifetime),
+        ("refresh_before", def.refresh_before),
+        ("timeout", def.timeout),
+    ] {
+        if let Some(SimpleDuration(duration)) = value {
+            if duration.subsec_nanos() != 0
+                || duration.as_secs() == 0
+                || duration.as_secs() > 86_400
+            {
+                return Err(invalid(
+                    field,
+                    "must be a whole number of seconds from 1s to 24h",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A parsed `token_url`: plain `http` is accepted only to a loopback host,
+/// because the request carries a signed assertion that anyone who reads it
+/// can exchange for a token.
+pub(crate) struct TokenUrl {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) tls: bool,
+}
+
+pub(crate) fn parse_token_url(url: &str, path: &str) -> Result<TokenUrl, ConfigError> {
+    let invalid = |reason: String| ConfigError::InvalidValue {
+        field_path: path.to_string(),
+        reason,
+    };
+    let (tls, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err(invalid(format!(
+            "`{url}` must start with https:// (or http:// to a loopback host)"
+        )));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(invalid(format!("`{url}` must name a host")));
+    }
+    let (host, port) = if authority.contains(':') || authority.starts_with('[') {
+        parse_host_port(authority, path)?
+    } else {
+        (authority.to_string(), if tls { 443 } else { 80 })
+    };
+    let loopback = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !tls && !loopback {
+        return Err(invalid(format!(
+            "`{url}` must use https; plain http is accepted only to a loopback host"
+        )));
+    }
+    Ok(TokenUrl { host, port, tls })
 }
 
 fn validate_bedrock_provider(name: &str, provider: &Provider) -> Result<(), ConfigError> {

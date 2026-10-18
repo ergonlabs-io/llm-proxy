@@ -96,8 +96,9 @@ One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit
 | `project` | string; minimum length 1 | no | none | Google Cloud project ID for Vertex AI. Required for `vertex`; rejected for other provider types. |
 | `location` | string; minimum length 1 | no | none | Google Cloud location for Vertex AI. Required for `vertex`; rejected for other provider types. |
 | `publisher` | string; minimum length 1 | no | none | Vertex AI publisher, such as `google` or `anthropic`. Required for `vertex`; rejected for other provider types. |
-| `access_token` | string; minimum length 1 | no | none | OAuth access token for Vertex AI. Exactly one of `access_token` / `access_token_file` is required for `vertex`. |
-| `access_token_file` | string; minimum length 1 | no | none | Read the Vertex OAuth access token from this file. Exactly one of `access_token` / `access_token_file` is required for `vertex`. |
+| `access_token` | string; minimum length 1 | no | none | OAuth access token for Vertex AI, applied as is and never refreshed. Exactly one of `access_token` / `access_token_file` / `oauth2_jwt_bearer` is required for `vertex`. |
+| `access_token_file` | string; minimum length 1 | no | none | Read the Vertex OAuth access token from this file. Exactly one of `access_token` / `access_token_file` / `oauth2_jwt_bearer` is required for `vertex`. |
+| `oauth2_jwt_bearer` | [object](#providersnameoauth2_jwt_bearer) | no | none | Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503. Valid only for `vertex`. |
 | `region` | string; minimum length 1 | no | none | AWS region for Amazon Bedrock. Required for `bedrock`; rejected for other provider types. |
 | `access_key_id` | string; minimum length 1 | no | none | AWS access key ID for Bedrock SigV4. Exactly one of `access_key_id` / `access_key_id_file` is required for `bedrock`. |
 | `access_key_id_file` | string; minimum length 1 | no | none | Read the AWS access key ID from this file. Exactly one of `access_key_id` / `access_key_id_file` is required for `bedrock`. |
@@ -120,8 +121,8 @@ Rules:
 - `api_key` and `api_key_file` are not both set.
 - When `type` is `azure-openai`: `base_url`, `deployment`, `api_version` must be set.
 - When `type` is not `azure-openai`: None of `deployment`, `api_version` is set.
-- When `type` is `vertex`: `base_url`, `project`, `location`, `publisher` must be set. Set exactly one of `access_token`, `access_token_file`. None of `region`, `access_key_id`, `access_key_id_file`, `secret_access_key`, `secret_access_key_file`, `session_token`, `session_token_file`, `api_key`, `api_key_file` is set.
-- When `type` is not `vertex`: None of `project`, `location`, `publisher`, `access_token`, `access_token_file` is set.
+- When `type` is `vertex`: `base_url`, `project`, `location`, `publisher` must be set. Exactly one of these holds: `access_token` is set and none of `access_token_file`, `oauth2_jwt_bearer` is set; or `access_token_file` is set and none of `access_token`, `oauth2_jwt_bearer` is set; or `oauth2_jwt_bearer` is set and none of `access_token`, `access_token_file` is set. None of `region`, `access_key_id`, `access_key_id_file`, `secret_access_key`, `secret_access_key_file`, `session_token`, `session_token_file`, `api_key`, `api_key_file` is set.
+- When `type` is not `vertex`: None of `project`, `location`, `publisher`, `access_token`, `access_token_file`, `oauth2_jwt_bearer` is set.
 - When `type` is `bedrock`: `base_url`, `region` must be set. None of `project`, `location`, `publisher`, `access_token`, `access_token_file`, `session_token` with `session_token_file`, `api_key`, `api_key_file` is set. Set exactly one of `access_key_id`, `access_key_id_file`. Set exactly one of `secret_access_key`, `secret_access_key_file`.
 - When `type` is not `bedrock`: None of `region`, `access_key_id`, `access_key_id_file`, `secret_access_key`, `secret_access_key_file`, `session_token`, `session_token_file` is set.
 
@@ -295,6 +296,26 @@ Which tenant controls the proxy enforces when `auth` is set. Each defaults to `t
 | `spend` | boolean | no | `true` | Enforce per-tenant and per-key spend budgets (`llmproxy.spend_limit`). Cost comes from the `pricing` rate card. |
 | `limits` | boolean | no | `true` | Enforce tenant and key rate limits set through the admin API (`PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits`): tokens per minute, requests per minute and concurrent streams. A key only narrows its tenant: a request must pass both. With `auth.store: shared` the counters and concurrent streams are shared by every replica; with another store each replica counts alone, so N replicas admit up to N times a limit. With `false` and no `limits` entry, `llmproxy.token_limit` is omitted; a `limits` entry still adds it, and it then enforces these limits too. |
 | `tenants_without_policy` | one of `deny`, `allow` | no | `deny` | What an authenticated tenant with no stored model policy may use. `deny` (the default) refuses every model with 403 until `PUT /tenants/{id}/policy` grants some; the first refusal per tenant is logged. `allow` grants every model and logs a load-time warning. A load error with `model_policy: false`, which omits the filter that reads it. |
+
+Any other field is a load error.
+
+## `providers.<name>.oauth2_jwt_bearer`
+
+Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503. Valid only for `vertex`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `token_url` | string; pattern `^https?://[^/?#@]+` | yes | none | Token endpoint. Must be `https`; plain `http` is accepted only to a loopback host. |
+| `issuer` | string; minimum length 1 | yes | none | JWT `iss`, for example a service account's email address. |
+| `subject` | string; minimum length 1 | no | none | JWT `sub`, when the grant impersonates another principal. |
+| `key_id` | string; minimum length 1 | no | none | JWT header `kid`. |
+| `private_key_file` | string; minimum length 1 | yes | none | RSA private key, PKCS#8 PEM (`BEGIN PRIVATE KEY`). Read and checked at every load; a bad key is a load error. |
+| `scopes` | array of string; minimum items 1 | yes | none | Scopes, joined with spaces into the JWT `scope` claim. |
+| `audience` | string; minimum length 1 | no | none | JWT `aud`. Defaults to `token_url`. |
+| `assertion_lifetime` | [Duration](#duration) | no | none | `exp - iat` of each assertion, whole seconds from 1s to 24h. Default `1h`. |
+| `refresh_before` | [Duration](#duration) | no | none | Mint the next token this long before the current one expires, whole seconds from 1s to 24h. Default `5m`. |
+| `timeout` | [Duration](#duration) | no | none | Bounds one token request, connect included, whole seconds from 1s to 24h. Default `10s`. |
+| `ca_file` | string; minimum length 1 | no | none | PEM bundle that verifies an `https` token endpoint instead of the platform roots. |
 
 Any other field is a load error.
 
@@ -485,7 +506,7 @@ Type: string; pattern `^[0-9]+(ms|s|m|h)$`.
 
 A duration: integer plus unit — `ms` (milliseconds), `s` (seconds), `m` (minutes), or `h` (hours).
 
-Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.tracing.export_deadline`.
+Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `providers.<name>.oauth2_jwt_bearer.assertion_lifetime`, `providers.<name>.oauth2_jwt_bearer.refresh_before`, `providers.<name>.oauth2_jwt_bearer.timeout`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.tracing.export_deadline`.
 
 Examples: `500ms`, `30s`, `5m`, `1h`.
 

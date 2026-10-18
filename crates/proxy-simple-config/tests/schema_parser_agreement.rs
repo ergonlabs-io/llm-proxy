@@ -104,6 +104,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "RequestFields",
             parser_fields::<RequestFields>,
         ),
+        (
+            "#/$defs/Provider/properties/oauth2_jwt_bearer",
+            "OAuth2JwtBearerDef",
+            parser_fields::<OAuth2JwtBearerDef>,
+        ),
         ("#/$defs/ModelDef", "ModelDef", parser_fields::<ModelDef>),
         (
             "#/$defs/ModelProvider",

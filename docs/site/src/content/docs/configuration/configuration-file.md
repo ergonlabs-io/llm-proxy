@@ -85,7 +85,7 @@ provider types also needs a `base_url`, because none has a default.
 | `vertex` | `project` | yes | The Google Cloud project ID. |
 | `vertex` | `location` | yes | The Google Cloud location. |
 | `vertex` | `publisher` | yes | The Vertex publisher, for example `google` or `anthropic`. |
-| `vertex` | `access_token` or `access_token_file` | exactly one | An OAuth access token. The proxy sends it as `Authorization: Bearer <token>` and replaces any `Authorization` header from the client. |
+| `vertex` | `access_token`, `access_token_file`, or `oauth2_jwt_bearer` | exactly one | The OAuth access token. A configured token is sent as is. `oauth2_jwt_bearer` makes the proxy mint and refresh the token (see below). The proxy sends it as `Authorization: Bearer <token>` and replaces any `Authorization` header from the client. |
 | `bedrock` | `region` | yes | The AWS region. |
 | `bedrock` | `access_key_id` or `access_key_id_file` | exactly one | The AWS access key ID. |
 | `bedrock` | `secret_access_key` or `secret_access_key_file` | exactly one | The AWS secret access key. |
@@ -101,10 +101,10 @@ token adds the `x-amz-security-token` header.
 
 Rules for these types:
 
-- The token and the AWS keys are static values. The proxy reads them when it
-  loads the configuration. It does not mint or refresh them. A `*_file` field
-  is read once at startup and again on a `SIGHUP` reload, and the load emits a
-  warning that says so.
+- `access_token`, `access_token_file` and the AWS keys are static values. The
+  proxy reads them when it loads the configuration. It does not mint or
+  refresh them. A `*_file` field is read once at startup and again on a
+  `SIGHUP` reload, and the load emits a warning that says so.
 - A `vertex` or `bedrock` provider serves more than one wire format. A
   `routes[].provider` reference cannot say which one. Add a `models` entry
   for the provider in the object form, and set `dialect` there.
@@ -122,6 +122,83 @@ The tests are `vertex_and_bedrock_runtime_settings_survive_ir_lowering`,
 `crates/proxy-simple-config/tests/dialect.rs`, plus
 `bedrock_signature_uses_final_body_and_required_headers` and
 `vertex_credential_replaces_any_client_authorization` in `credential_provider.rs`.
+
+### Minted Vertex tokens (`oauth2_jwt_bearer`)
+
+A Google access token expires after about one hour, so a configured
+`access_token` needs something outside the proxy to replace it.
+`oauth2_jwt_bearer` removes that need. The proxy signs a JWT with a service
+account's private key, exchanges it at the token endpoint (the OAuth2
+JWT-bearer grant, RFC 7523), and mints the next token before the current one
+expires. Request workers never call the token endpoint.
+
+```yaml
+providers:
+  vertex:
+    type: vertex
+    base_url: https://us-central1-aiplatform.googleapis.com
+    project: my-project
+    location: us-central1
+    publisher: anthropic
+    oauth2_jwt_bearer:
+      token_url: https://oauth2.googleapis.com/token
+      issuer: llm-proxy@my-project.iam.gserviceaccount.com
+      key_id: 0123456789abcdef            # the key's private_key_id
+      private_key_file: /etc/llm-proxy/vertex-sa.pem
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+```
+
+The token URL and the scope are Google's values for Vertex AI. The proxy holds
+no provider values; another JWT-bearer token endpoint works with its own.
+
+| Field | Required | Default | What it does |
+|---|---|---|---|
+| `token_url` | yes | none | The token endpoint. It must use `https`. Plain `http` is accepted only to a loopback host. |
+| `issuer` | yes | none | The JWT `iss` claim: for Google, the service account's `client_email`. |
+| `subject` | no | none | The JWT `sub` claim, to act as another principal. |
+| `key_id` | no | none | The JWT header `kid`: for Google, the key's `private_key_id`. |
+| `private_key_file` | yes | none | The RSA private key, PKCS#8 PEM (`BEGIN PRIVATE KEY`). |
+| `scopes` | yes | none | The scopes, joined with spaces into the `scope` claim. |
+| `audience` | no | `token_url` | The JWT `aud` claim. |
+| `assertion_lifetime` | no | `1h` | The time from `iat` to `exp` in each signed JWT. |
+| `refresh_before` | no | `5m` | How long before a token expires the proxy mints the next one. |
+| `timeout` | no | `10s` | The limit for one token request, connect included. |
+| `ca_file` | no | platform roots | A PEM bundle that verifies an `https` token endpoint. |
+
+A Google service-account key file is JSON. To get the PEM key, run
+`jq -r .private_key key.json > vertex-sa.pem`. The `client_email` and
+`private_key_id` fields of the same file give `issuer` and `key_id`.
+
+How it behaves:
+
+- The key file is read and checked at every load. A missing file, a file that
+  is not a PKCS#8 RSA key, or a key shorter than 2048 bits is a load error that
+  names `providers.<name>.oauth2_jwt_bearer.private_key_file`. A `SIGHUP`
+  reload reads it again, so you rotate a key by replacing the file and sending
+  `SIGHUP`.
+- The proxy mints the first token while it loads the configuration, before
+  the new configuration serves traffic. A failed mint does not stop the load.
+- When a mint fails, the proxy retries after 1 s, doubling to 60 s. The last
+  token stays in use until it expires.
+- A request to a provider that has no unexpired token gets a local `503` with
+  the body `provider token unavailable`. The request does not go to the
+  provider, and it does not fall back to the next provider in the model's
+  list. The counter `llmproxy_provider_credential_requests_total` (labels
+  `cluster`, `outcome="unavailable"`) counts these refusals.
+- Failed mints and refused requests each log a warning at most once a minute,
+  with a count of the warnings left out. The log never contains the key, the
+  signed JWT, or the token.
+- The proxy reaches the token endpoint through a generated cluster named
+  `oauth2-token:<provider>`. For `https`, that cluster verifies the
+  certificate chain and the host name.
+
+Proof: the Envoy-mode lowering `convert_oauth2_jwt_bearer` in
+`crates/proxy-config/src/lower.rs`, and `MintedCredential` in
+`crates/proxy-cluster/src/minted_credential.rs`. The tests are in
+`crates/proxy-cluster/tests/minted_credential.rs`,
+`crates/proxy-config/tests/oauth2_jwt_bearer.rs`,
+`crates/proxy-simple-config/tests/oauth2_jwt_bearer.rs`, and
+`crates/proxy/tests/oauth2_token_e2e.rs`.
 
 ### Request field policy
 

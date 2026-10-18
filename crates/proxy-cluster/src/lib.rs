@@ -17,6 +17,7 @@ pub mod health_check;
 pub mod host_set;
 pub mod load_balancer;
 pub mod manager;
+pub mod minted_credential;
 pub mod outlier;
 pub mod pool;
 pub mod resolver;
@@ -558,6 +559,13 @@ pub trait ClusterEntry: Send + Sync {
 
     /// Provider-specific credential and model path behavior for this cluster.
     fn provider_runtime(&self) -> Option<&proxy_config::ir::ProviderRuntimeConfig>;
+
+    /// The cluster-owned token cell behind an `OAuth2JwtBearer` credential, or `None` for every other
+    /// credential. Workers read it without blocking; only the cluster's refresher writes it (ADR-0005,
+    /// amendment 2026-10-17).
+    fn minted_credential(&self) -> Option<&minted_credential::MintedCredential> {
+        None
+    }
 
     /// Which usage dialect the provider behind this cluster speaks. Returns
     /// `None` for ordinary clusters that never set the llmproxy usage metadata.

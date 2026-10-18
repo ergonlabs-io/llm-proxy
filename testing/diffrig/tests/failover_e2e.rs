@@ -614,3 +614,279 @@ async fn authenticated_streaming_fallback_charges_the_key_at_the_standby_price()
     standby.shutdown().await;
     drop(scratch);
 }
+
+// ------------------------------------------------- reload during a retry --
+
+const STANDBY_V2_KEY: &str = "key-replacement";
+const STANDBY_V1_TEXT: &str = "standby generation one";
+const STANDBY_V2_TEXT: &str = "standby generation two";
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The fallback chain with the standby's endpoint, key and upstream model
+/// passed in, so a reload can replace all three at once.
+fn reload_config(
+    listener_port: u16,
+    primary_port: u16,
+    standby_port: u16,
+    standby_key: &str,
+    standby_model: &str,
+) -> String {
+    format!(
+        r#"
+version: 0
+listen: "127.0.0.1:{listener_port}"
+providers:
+  primary:
+    base_url: "http://127.0.0.1:{primary_port}"
+    api_key: "{PRIMARY_KEY}"
+  standby:
+    base_url: "http://127.0.0.1:{standby_port}"
+    api_key: "{standby_key}"
+routes:
+  - model: "gpt-*"
+    provider: primary
+    fallbacks: [standby]
+models:
+  gpt-4o-mini:
+    providers:
+      - {{ provider: primary, model: primary-upstream-model }}
+      - {{ provider: standby, model: {standby_model} }}
+"#
+    )
+}
+
+fn standby_generation(key: &str, text: &str) -> OpenAiConfig {
+    OpenAiConfig {
+        require_api_key: Some(key.to_string()),
+        response_text: text.to_string(),
+        ..standby_config()
+    }
+}
+
+/// A primary that answers 429 to every request, but holds the first one
+/// until the test releases it. That parks one request between its primary
+/// attempt and its failover for as long as the test needs.
+struct GatedPrimary {
+    addr: SocketAddr,
+    arrived: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl GatedPrimary {
+    async fn spawn() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gated primary");
+        let addr = listener.local_addr().expect("gated primary addr");
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (arrived_task, release_task) = (Arc::clone(&arrived), Arc::clone(&release));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let (arrived, release, seen) = (
+                    Arc::clone(&arrived_task),
+                    Arc::clone(&release_task),
+                    Arc::clone(&seen),
+                );
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let (arrived, release, seen) = (
+                                Arc::clone(&arrived),
+                                Arc::clone(&release),
+                                Arc::clone(&seen),
+                            );
+                            async move {
+                                use http_body_util::BodyExt;
+                                let _ = req.into_body().collect().await;
+                                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    // `notify_one` stores a permit, so neither side
+                                    // can miss the other's signal.
+                                    arrived.notify_one();
+                                    release.notified().await;
+                                }
+                                let body =
+                                    r#"{"error":{"message":"rate limited","type":"rate_limit"}}"#;
+                                Ok::<_, std::convert::Infallible>(
+                                    hyper::Response::builder()
+                                        .status(429)
+                                        .header("content-type", "application/json")
+                                        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                        .expect("static 429 response"),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self {
+            addr,
+            arrived,
+            release,
+            task,
+        }
+    }
+}
+
+impl Drop for GatedPrimary {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn carries_bearer(headers: &[(String, String)], key: &str) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("authorization") && value == &format!("Bearer {key}")
+    })
+}
+
+fn mentions(headers: &[(String, String)], key: &str) -> bool {
+    headers.iter().any(|(_, value)| value.contains(key))
+}
+
+/// A SIGHUP that replaces the standby's endpoint, key and upstream model
+/// while a request sits between its primary attempt and its failover. The
+/// request fails over within the routing generation its connection was built
+/// with: the old standby, with the old standby's key and model, and nothing
+/// from the new generation. Mixing generations would send the new key to the
+/// old endpoint, or the old key or model to the new one.
+///
+/// The order is fixed by signals, not sleeps: the request is parked at the
+/// primary before the reload, and is released only after a fresh request has
+/// been served by the new standby. That fresh request is the negative
+/// control: it proves the new generation was live while the parked request
+/// retried, so the old-generation answer is not a reload that never applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_during_failover_keeps_the_retry_on_its_own_generation() {
+    let primary = GatedPrimary::spawn().await;
+    let standby_v1 = OpenAiUpstream::spawn(standby_generation(STANDBY_KEY, STANDBY_V1_TEXT))
+        .await
+        .expect("spawn first standby");
+    let standby_v2 = OpenAiUpstream::spawn(standby_generation(STANDBY_V2_KEY, STANDBY_V2_TEXT))
+        .await
+        .expect("spawn second standby");
+
+    let scratch = ScratchDir::new("failover-reload");
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let config_path = scratch.write(
+        "llmproxy.yaml",
+        &reload_config(
+            listener_port,
+            primary.addr.port(),
+            standby_v1.addr().port(),
+            STANDBY_KEY,
+            "standby-upstream-model",
+        ),
+    );
+    let mut proxy = ProxyProcess::spawn(
+        &resolve_llm_proxy_bin(),
+        &config_path,
+        &scratch.path().join("proxy.log"),
+    );
+    proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
+
+    let parked = tokio::spawn(send_chat_request(listener_addr));
+    tokio::time::timeout(CLIENT_TIMEOUT, primary.arrived.notified())
+        .await
+        .expect("the first request never reached the primary");
+
+    scratch.write(
+        "llmproxy.yaml",
+        &reload_config(
+            listener_port,
+            primary.addr.port(),
+            standby_v2.addr().port(),
+            STANDBY_V2_KEY,
+            "standby-upstream-model-v2",
+        ),
+    );
+    proxy.sighup();
+    proxy.wait_for_log("SIGHUP: config reload succeeded", RELOAD_TIMEOUT);
+
+    // Workers pick up a published snapshot asynchronously, so a connection
+    // opened right after the log line may still be built on the old one.
+    let deadline = std::time::Instant::now() + RELOAD_TIMEOUT;
+    loop {
+        let res = send_chat_request(listener_addr).await;
+        assert_eq!(res.status, 200, "fresh request: {}", res.body);
+        if res.body.contains(STANDBY_V2_TEXT) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no fresh connection reached the new standby after the reload"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !parked.is_finished(),
+        "the parked request must still be waiting on the primary"
+    );
+    let v1_before = standby_v1.log.requests().len();
+    let v2_before = standby_v2.log.requests().len();
+
+    primary.release.notify_one();
+    let res = tokio::time::timeout(CLIENT_TIMEOUT, parked)
+        .await
+        .expect("the parked request never completed")
+        .expect("parked request task");
+
+    assert_eq!(res.status, 200, "parked request: {}", res.body);
+    let parsed: Value = serde_json::from_str(&res.body).expect("valid json");
+    assert_eq!(
+        parsed["choices"][0]["message"]["content"], STANDBY_V1_TEXT,
+        "the retry must fail over to its own generation's standby"
+    );
+    assert_eq!(
+        standby_v2.log.requests().len(),
+        v2_before,
+        "the retry must not dial the new generation's standby"
+    );
+    let v1_requests = standby_v1.log.requests();
+    assert_eq!(v1_requests.len(), v1_before + 1, "one failover attempt");
+    let received = &v1_requests.last().unwrap().headers;
+    assert!(
+        carries_bearer(received, STANDBY_KEY),
+        "old standby must get its own key: {received:?}"
+    );
+    assert!(
+        !mentions(received, STANDBY_V2_KEY) && !mentions(received, PRIMARY_KEY),
+        "no other key may reach the old standby: {received:?}"
+    );
+    assert_eq!(
+        standby_v1.bodies.bodies().last().unwrap()["model"],
+        "standby-upstream-model",
+        "the retry must use its own generation's upstream model"
+    );
+    for request in standby_v2.log.requests() {
+        assert!(
+            !mentions(&request.headers, STANDBY_KEY),
+            "the old standby's key reached the new standby: {:?}",
+            request.headers
+        );
+    }
+    assert!(standby_v2
+        .bodies
+        .bodies()
+        .iter()
+        .all(|body| body["model"] == "standby-upstream-model-v2"));
+
+    drop(proxy);
+    drop(primary);
+    standby_v1.shutdown().await;
+    standby_v2.shutdown().await;
+    drop(scratch);
+}

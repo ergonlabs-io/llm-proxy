@@ -4427,6 +4427,26 @@ fn validate_cluster_graph(
             .clusters
             .get(&c.name)
             .expect("build_snapshot just inserted every sr.clusters entry by this same name");
+        // A minted credential's token endpoint is dialled through a named cluster; one that names nothing
+        // would refuse every request to this provider at runtime.
+        if let Some(ProviderCredential::OAuth2JwtBearer(oauth2)) = ir
+            .provider_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.credential.as_ref())
+        {
+            let path = format!(
+                "static_resources.clusters[{i}].metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"].oauth2_jwt_bearer.token_cluster"
+            );
+            if oauth2.token_cluster == c.name {
+                return Err(invalid(&path, "a cluster cannot be its own token cluster"));
+            }
+            if !snapshot.clusters.contains_key(&oauth2.token_cluster) {
+                return Err(invalid(
+                    &path,
+                    format!("unknown cluster `{}`", oauth2.token_cluster),
+                ));
+            }
+        }
         let ClusterKind::Aggregate { members } = &ir.kind else {
             continue;
         };
@@ -4515,6 +4535,7 @@ fn convert_provider_auth_metadata(
                 "headers"
                     | "scheme"
                     | "access_token"
+                    | "oauth2_jwt_bearer"
                     | "region"
                     | "access_key_id"
                     | "secret_access_key"
@@ -4586,6 +4607,159 @@ fn provider_auth_string_field(
     }
 }
 
+/// Defaults for an `oauth2_jwt_bearer` block. They are generic, not any
+/// provider's values: an hour-long assertion, a refresh five minutes before
+/// expiry, and a ten-second token request.
+const OAUTH2_DEFAULT_ASSERTION_LIFETIME_SECONDS: u64 = 3600;
+const OAUTH2_DEFAULT_REFRESH_BEFORE_SECONDS: u64 = 300;
+const OAUTH2_DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 10;
+
+/// Lower `oauth2_jwt_bearer` under `io.llmproxy.provider_auth` for the
+/// `oauth2-jwt-bearer` scheme (ADR-0005, amendment 2026-10-17). The key file
+/// is read and checked here, so a bad key is a load error (or a NACK) naming
+/// `private_key_file`. Every reload re-reads it.
+fn convert_oauth2_jwt_bearer(
+    auth: &prost_types::Struct,
+    auth_path: &str,
+) -> Result<OAuth2JwtBearer, ConfigError> {
+    use prost_types::value::Kind;
+    let path = format!("{auth_path}.oauth2_jwt_bearer");
+    let fields = match auth
+        .fields
+        .get("oauth2_jwt_bearer")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(Kind::StructValue(fields)) => fields,
+        Some(_) => return Err(invalid(&path, "must be an object")),
+        None => {
+            return Err(invalid(
+                &path,
+                "is required for the oauth2-jwt-bearer scheme",
+            ))
+        }
+    };
+    const ALLOWED: &[&str] = &[
+        "token_cluster",
+        "token_url",
+        "issuer",
+        "subject",
+        "key_id",
+        "private_key_file",
+        "scopes",
+        "audience",
+        "assertion_lifetime_seconds",
+        "refresh_before_seconds",
+        "request_timeout_seconds",
+    ];
+    let mut unknown: Vec<&String> = fields
+        .fields
+        .keys()
+        .filter(|key| !ALLOWED.contains(&key.as_str()))
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{path}.{key}"),
+            "unsupported oauth2_jwt_bearer field",
+        ));
+    }
+    let required = |name: &str| -> Result<String, ConfigError> {
+        let value = provider_auth_string_field(fields, name, &path)?;
+        if value.is_empty() {
+            return Err(invalid(format!("{path}.{name}"), "must not be empty"));
+        }
+        Ok(value)
+    };
+    let optional = |name: &str| -> Result<Option<String>, ConfigError> {
+        match fields.fields.get(name) {
+            None => Ok(None),
+            Some(_) => required(name).map(Some),
+        }
+    };
+    let seconds = |name: &str, default: u64| -> Result<std::time::Duration, ConfigError> {
+        let value = match fields.fields.get(name).and_then(|v| v.kind.as_ref()) {
+            None => default,
+            Some(Kind::NumberValue(n)) if n.fract() == 0.0 && *n >= 1.0 && *n <= 86_400.0 => {
+                *n as u64
+            }
+            Some(_) => {
+                return Err(invalid(
+                    format!("{path}.{name}"),
+                    "must be a whole number of seconds from 1 to 86400",
+                ))
+            }
+        };
+        Ok(std::time::Duration::from_secs(value))
+    };
+
+    let token_url = required("token_url")?;
+    match token_url.parse::<http::Uri>() {
+        Ok(uri)
+            if matches!(uri.scheme_str(), Some("http" | "https"))
+                && uri.host().is_some_and(|h| !h.is_empty()) => {}
+        _ => {
+            return Err(invalid(
+                format!("{path}.token_url"),
+                "must be an absolute http or https URL",
+            ))
+        }
+    }
+    let key_path = required("private_key_file")?;
+    let pem = std::fs::read_to_string(&key_path).map_err(|e| {
+        invalid(
+            format!("{path}.private_key_file"),
+            format!("cannot read `{key_path}`: {e}"),
+        )
+    })?;
+    let private_key = RsaSigningKey::from_pkcs8_pem(&pem).map_err(|reason| {
+        invalid(
+            format!("{path}.private_key_file"),
+            format!("`{key_path}` {reason}"),
+        )
+    })?;
+    let scopes_path = format!("{path}.scopes");
+    let scopes = match fields.fields.get("scopes").and_then(|v| v.kind.as_ref()) {
+        Some(Kind::ListValue(list)) if !list.values.is_empty() => list
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| match value.kind.as_ref() {
+                Some(Kind::StringValue(scope)) if !scope.is_empty() && !scope.contains(' ') => {
+                    Ok(scope.clone())
+                }
+                _ => Err(invalid(
+                    format!("{scopes_path}[{i}]"),
+                    "must be a non-empty string without spaces",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => return Err(invalid(&scopes_path, "is required")),
+        Some(_) => return Err(invalid(&scopes_path, "must be a non-empty list")),
+    };
+    Ok(OAuth2JwtBearer {
+        token_cluster: required("token_cluster")?,
+        audience: optional("audience")?.unwrap_or_else(|| token_url.clone()),
+        token_url,
+        issuer: required("issuer")?,
+        subject: optional("subject")?,
+        key_id: optional("key_id")?,
+        private_key,
+        scopes,
+        assertion_lifetime: seconds(
+            "assertion_lifetime_seconds",
+            OAUTH2_DEFAULT_ASSERTION_LIFETIME_SECONDS,
+        )?,
+        refresh_before: seconds(
+            "refresh_before_seconds",
+            OAUTH2_DEFAULT_REFRESH_BEFORE_SECONDS,
+        )?,
+        request_timeout: seconds(
+            "request_timeout_seconds",
+            OAUTH2_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        )?,
+    })
+}
+
 /// Lower the llmproxy-only provider credential and URL-template metadata.
 /// These values have no Envoy proto equivalent, so this parser is the strict
 /// boundary that keeps them from disappearing inside `google.protobuf.Struct`.
@@ -4611,12 +4785,14 @@ fn convert_provider_runtime_metadata(
             // ADR-0007 decision 1: a tenant slot is a header API-key shape, so
             // it cannot sit beside an OAuth2 or SigV4 credential. Checked before
             // the generic allow-list so the error names the actual conflict.
-            if matches!(scheme, Some("vertex-oauth2") | Some("bedrock-sigv4"))
-                && auth.fields.contains_key("tenant_credential")
+            if matches!(
+                scheme,
+                Some("vertex-oauth2") | Some("oauth2-jwt-bearer") | Some("bedrock-sigv4")
+            ) && auth.fields.contains_key("tenant_credential")
             {
                 return Err(unsupported(
                     format!("{auth_path}.tenant_credential"),
-                    "a tenant credential cannot be combined with a vertex-oauth2 or bedrock-sigv4 credential; only header API-key clusters can carry one",
+                    "a tenant credential cannot be combined with a vertex-oauth2, oauth2-jwt-bearer or bedrock-sigv4 credential; only header API-key clusters can carry one",
                 ));
             }
             let allowed = match scheme {
@@ -4630,6 +4806,13 @@ fn convert_provider_runtime_metadata(
                     "headers",
                     "scheme",
                     "access_token",
+                    "models",
+                    "request_field_policy",
+                ][..],
+                Some("oauth2-jwt-bearer") => &[
+                    "headers",
+                    "scheme",
+                    "oauth2_jwt_bearer",
                     "models",
                     "request_field_policy",
                 ][..],
@@ -4662,6 +4845,9 @@ fn convert_provider_runtime_metadata(
                 Some("vertex-oauth2") => Ok(Some(ProviderCredential::VertexOAuth2 {
                     access_token: provider_auth_string_field(auth, "access_token", &auth_path)?,
                 })),
+                Some("oauth2-jwt-bearer") => Ok(Some(ProviderCredential::OAuth2JwtBearer(
+                    convert_oauth2_jwt_bearer(auth, &auth_path)?,
+                ))),
                 Some("bedrock-sigv4") => Ok(Some(ProviderCredential::BedrockSigV4 {
                     region: provider_auth_string_field(auth, "region", &auth_path)?,
                     access_key_id: provider_auth_string_field(auth, "access_key_id", &auth_path)?,
