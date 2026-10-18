@@ -428,6 +428,21 @@ impl LoggingBody {
         }
     }
 
+    /// Whether the response's own framing allows no further body bytes. hyper
+    /// drops such a body without polling it once the head is written, so
+    /// `poll_frame` never sees its end: a `Content-Length` already met
+    /// (including `Content-Length: 0`), a status that carries no body (1xx,
+    /// `204`, `304`), or the reply to a `HEAD`. Envoy logs these exchanges
+    /// with no response flag, so `Drop` must not read them as `DC`.
+    fn framing_complete(&self) -> bool {
+        let Some(ctx) = &self.ctx else {
+            return false;
+        };
+        self.remaining_content_length == Some(0)
+            || matches!(ctx.response_code, 100..=199 | 204 | 304)
+            || ctx.request.method == "HEAD"
+    }
+
     /// `DS_TX_END`: the last response byte went to the downstream codec. Only
     /// a clean end sets it; a failed or abandoned stream never sent its last
     /// byte, so the point stays unset and renders `-`, as in Envoy.
@@ -1281,18 +1296,26 @@ impl Drop for LoggingBody {
         // completion -- i.e. the stream never cleanly ended and never
         // errored, it was simply given up on. That's a downstream
         // termination from the operator's point of view (the far end went
-        // away without us ever seeing why), same as Envoy's DC.
+        // away without us ever seeing why), same as Envoy's DC. The exception
+        // is a body hyper never polls because its framing is already
+        // complete (see `framing_complete`): that is a clean end.
         //
         // Envoy flags both sides' closes `DC` and tells them apart in the
         // response code details (ADR-0011 decision 1).
-        if let Some(ctx) = &self.ctx {
-            let details = if PROCESS_CUT.load(Ordering::SeqCst) {
-                "downstream_local_disconnect"
+        if self.ctx.is_some() {
+            if self.framing_complete() {
+                self.mark_tx_end();
             } else {
-                "downstream_remote_disconnect"
-            };
-            ctx.stream_info.borrow_mut().response_code_details = Some(details.to_string());
-            self.record_failure(ResponseFlag::DownstreamConnectionTermination, &details);
+                let details = if PROCESS_CUT.load(Ordering::SeqCst) {
+                    "downstream_local_disconnect"
+                } else {
+                    "downstream_remote_disconnect"
+                };
+                if let Some(ctx) = &self.ctx {
+                    ctx.stream_info.borrow_mut().response_code_details = Some(details.to_string());
+                }
+                self.record_failure(ResponseFlag::DownstreamConnectionTermination, &details);
+            }
         }
         // `finish` is idempotent (`ctx.take()`), so this is a no-op if
         // `poll_frame` already logged.
