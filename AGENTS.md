@@ -195,6 +195,14 @@ writing, changing, reviewing, or sweeping tests.
 - For concurrent lanes, use separate git worktrees and separate
   `CARGO_TARGET_DIR` values. Resuming an interrupted agent may not restore its
   worktree; check `git status` in the primary tree before writing there.
+- Each worktree's `target/` grows to 13-29 GB, and a full disk fails every lane
+  at once and can damage the primary tree's build cache. Once a worktree's
+  branch is merged into `main` and the worktree has no uncommitted changes,
+  delete its `target/` (`command rm -rf <worktree>/target`); check both with
+  `git merge-base --is-ancestor` and `git status --short` first. Never delete
+  `target/` in a worktree whose session is still building. Do not share one
+  `CARGO_TARGET_DIR` across lanes: the e2e tests and the QA harness run the
+  binary from it, so one lane would test another lane's build.
 - Re-run verification after all concurrent edits settle. Treat results gathered
   while another lane writes or runs the product as suspect.
 - Commit each verified-green increment before stacking more work. Uncommitted
