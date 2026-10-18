@@ -398,6 +398,11 @@ fn the_record_names_the_keys_user_not_the_bodys_user_field() {
 
     let metrics = http_get(proxy.admin, "/stats/prometheus", None);
     assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+    // The dialect's one HCM exports the in-flight gauge under its prefix.
+    assert!(
+        metrics.contains("envoy_downstream_rq_active{scope=\"llmproxy\"} "),
+        "{metrics}"
+    );
     for user in ["minted-1", "someone-else"] {
         assert!(
             !metrics.contains(user),

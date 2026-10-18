@@ -47,6 +47,7 @@ becomes `envoy_llm_client_token_usage`.
 | `downstream_cx_total` | counter | `listener` | Each connection that the listener accepts and admits. | `listener.<listener>.downstream_cx_total` |
 | `downstream_global_cx_overflow` | counter | `listener` | Each connection that the proxy closes at accept because the global connection limit is reached. It is not in `downstream_cx_total`. | `listener.<listener>.downstream_global_cx_overflow` |
 | `downstream_cx_transport_socket_connect_timeout` | counter | `listener` | Each accepted connection that the proxy closes because the TLS handshake missed `transport_socket_connect_timeout`. | `listener.<listener>.downstream_cx_transport_socket_connect_timeout` |
+| `downstream_rq_active` | gauge | `scope` (the HCM `stat_prefix`) | Requests in flight now: from the moment a request reaches the HTTP connection manager until its response body is written out or cut. A streaming response counts for its whole stream. An upgraded (WebSocket) stream stops counting when the `101` response is sent. The value starts at 0 in each process. | `http.<scope>.downstream_rq_active` |
 | `llm.client.token.usage` | counter | `provider`, `type`, `tenant` | Tokens from the provider's own usage report. `type` is `input`, `output`, `cached`, or `cache_creation`. | Not shown |
 | `gen_ai.server.time_to_first_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.system` | Time from the request to the first response body byte. 16 bucket boundaries from 0.001 to 10. | Not shown |
 | `gen_ai.server.time_per_output_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.system` | Mean time for each output token after the first token. 13 bucket boundaries from 0.01 to 2.5. | Not shown |
@@ -227,6 +228,7 @@ series keeps it
 | `llmproxy_tenant_credential_requests_total` | `provider` | 256 | `provider="-cardinality-overflow-"` |
 | `llmproxy_provider_credential_requests_total` | `cluster` | 256 | `cluster="-cardinality-overflow-"` |
 | `ext_authz` | `scope` | 1,024 | `scope="overflow"` |
+| `downstream_rq_active` | `scope` | 1,024 | `scope="overflow"` |
 
 (Constants: `stats.rs:639` and `:806`; `stat_handles.rs:702`;
 `ext_authz.rs:45`.)
