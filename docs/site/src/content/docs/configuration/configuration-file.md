@@ -308,6 +308,7 @@ present at all.
 | `tenant_credentials` | `AuthTenantCredentials` | required when any `providers` entry sets `tenant_credentials: true`; otherwise no | absent | The key ring that seals tenant provider credentials at rest. Absent means the proxy cannot seal or open them. Requires a durable store, `store.persistent` or `store.shared`: with `store` absent or `in_memory`, this block is a load error at `auth.tenant_credentials`. See the table below. |
 
 | `max_policy_staleness` | duration | no | `4m` | How old the replica's copy of keys, revocations, and policies may get when the store cannot be read. Whole seconds, at least `96s`. Past it, every `Bearer llmp_...` request gets `503` with response-code detail `auth_policy_stale` until a poll succeeds. Any other value is a load error at `auth.max_policy_staleness`. See "Policy staleness" below. |
+| `stored_output_owner_ttl` | duration | no | `720h` | How long the proxy keeps the owner of a stored response or a stored chat completion. After this time the proxy refuses the object to every tenant, the creator included, until `PUT /tenants/{id}/objects/{object_id}` assigns it again. Set it to at least the provider retention. Whole seconds, at least `1s`. A load error with `enforce.object_ownership: false`. |
 | `enforce` | `AuthEnforce` | no | all `true` | Which tenant controls the proxy enforces. See "`auth.enforce`" below. |
 
 `store.persistent.path` is an embedded `redb` file, created if missing; an empty
@@ -398,6 +399,11 @@ proxy logs the first refusal for each tenant once at warn, with the tenant and
 the fix. Set a policy with `PUT /tenants/{id}/policy`. The body
 `{"access":"all"}` grants every model. To grant every model to tenants without
 a policy, set `auth.enforce.tenants_without_policy: allow`.
+
+> **Warning:** Fine-tuned models are not protected by object ownership. Every
+> tenant reaches the provider through one provider account. A tenant with
+> `access: all`, or with a `*` grant, can use the fine-tuned models of every
+> tenant. Grant each fine-tuned model name to the tenants that own it.
 
 ### Policy staleness
 

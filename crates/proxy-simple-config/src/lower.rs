@@ -8,6 +8,7 @@
 //! mode. Accepted but unenforced features produce warnings.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use proxy_config::{ConfigError, ConfigWarning, LoadedBootstrap};
 use serde_json::{json, Value};
@@ -38,11 +39,88 @@ const MODEL_AUTHZ_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0
 const OBJECT_OWNERSHIP_FILTER_TYPE_URL: &str =
     "type.llmproxy.dev/llmproxy.filters.v0.ObjectOwnership";
 
-/// The provider object collections `auth` protects. These are endpoint
-/// shapes, not providers: a POST to the path returns an object with a
-/// top-level `id`, and `<path>/<id>` names that object. OpenAI and Anthropic
-/// files share the first; the batch endpoints differ by path only.
-const OBJECT_COLLECTIONS: [&str; 3] = ["/v1/files", "/v1/batches", "/v1/messages/batches"];
+/// The provider object collections `auth` protects, recorded on every
+/// create and kept until removed (ADR-0013 §4). These are endpoint shapes,
+/// not providers: a POST to the path returns an object with a top-level
+/// `id`, and `<path>/<id>` names that object.
+const OBJECT_COLLECTIONS: [&str; 8] = [
+    "/v1/files",
+    "/v1/batches",
+    "/v1/messages/batches",
+    "/v1/uploads",
+    "/v1/vector_stores",
+    "/v1/assistants",
+    "/v1/containers",
+    "/v1/conversations",
+];
+
+/// Request-body members that name a provider object (ADR-0013 §3).
+const OBJECT_REFERENCE_MEMBERS: [&str; 12] = [
+    "file_id",
+    "*_file_id",
+    "file_ids",
+    "*_file_ids",
+    "training_file",
+    "validation_file",
+    "previous_response_id",
+    "vector_store_ids",
+    "assistant_id",
+    "thread_id",
+    "container",
+    "conversation",
+];
+
+/// Response members that name objects created for the caller (ADR-0013 §2):
+/// a batch's files, a completed upload's file, a fine-tuning job's result
+/// files, and the thread `POST /v1/threads/runs` creates.
+const OBJECT_OWNED_MEMBERS: [&str; 7] = [
+    "file_id",
+    "*_file_id",
+    "file_ids",
+    "*_file_ids",
+    "file.id",
+    "result_files",
+    "thread_id",
+];
+
+/// Request members that hold the caller's own data, which may share a
+/// reference member's name without naming an object.
+const OBJECT_OPAQUE_MEMBERS: [&str; 1] = ["metadata"];
+
+/// Default `auth.stored_output_owner_ttl`: 30 days.
+const DEFAULT_STORED_OUTPUT_OWNER_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// The `llmproxy.object_ownership` typed config the dialect lowers to.
+/// Stored responses and stored chat completions are created by inference
+/// requests, so their owners expire (ADR-0013 §6) and are recorded only when
+/// the request asks the provider to store them.
+fn object_ownership_config(owner_ttl: Duration) -> serde_json::Value {
+    let ttl = owner_ttl.as_secs();
+    json!({
+        "@type": OBJECT_OWNERSHIP_FILTER_TYPE_URL,
+        "collections": OBJECT_COLLECTIONS,
+        "collection": [
+            {
+                "path": "/v1/responses",
+                "endpoints": ["input_tokens"],
+                "record": "RECORD_UNLESS_FALSE",
+                "record_member": "store",
+                "owner_ttl_seconds": ttl,
+            },
+            {
+                "path": "/v1/chat/completions",
+                "record": "RECORD_IF_TRUE",
+                "record_member": "store",
+                "owner_ttl_seconds": ttl,
+            },
+            { "path": "/v1/threads", "endpoints": ["runs"] },
+            { "path": "/v1/fine_tuning/jobs" },
+        ],
+        "reference_members": OBJECT_REFERENCE_MEMBERS,
+        "owned_members": OBJECT_OWNED_MEMBERS,
+        "opaque_members": OBJECT_OPAQUE_MEMBERS,
+    })
+}
 
 /// Must equal `proxy_filters::spend_limit_filter::TYPE_URL`; pinned by
 /// `tests/auth.rs`.
@@ -2347,6 +2425,23 @@ fn lower_auth(
         }
     }
 
+    if let Some(SimpleDuration(ttl)) = auth.stored_output_owner_ttl {
+        if !auth.enforce.object_ownership {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth.stored_output_owner_ttl".to_string(),
+                reason: "has no effect with `enforce.object_ownership: false`, which omits the \
+                         filter that reads it; remove one of the two"
+                    .to_string(),
+            });
+        }
+        if ttl.subsec_nanos() != 0 || ttl < Duration::from_secs(1) {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth.stored_output_owner_ttl".to_string(),
+                reason: "must be whole seconds and at least 1s".to_string(),
+            });
+        }
+    }
+
     if !auth.enforce.model_policy && auth.enforce.tenants_without_policy.is_some() {
         return Err(ConfigError::InvalidValue {
             field_path: "auth.enforce.tenants_without_policy".to_string(),
@@ -3085,12 +3180,17 @@ fn lower_listener(
     if enforces_object_ownership(config) {
         // After auth (reads the tenant and its control-plane store); before
         // anything that reads the body, so a refused request is not parsed.
+        let owner_ttl = config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.stored_output_owner_ttl)
+            .map_or(
+                Duration::from_secs(DEFAULT_STORED_OUTPUT_OWNER_TTL_SECS),
+                |SimpleDuration(ttl)| ttl,
+            );
         http_filters.push(json!({
             "name": "llmproxy.object_ownership",
-            "typed_config": {
-                "@type": OBJECT_OWNERSHIP_FILTER_TYPE_URL,
-                "collections": OBJECT_COLLECTIONS,
-            },
+            "typed_config": object_ownership_config(owner_ttl),
         }));
     }
     if needs_body_rewrite_filter(config) {

@@ -381,8 +381,8 @@ for configuration, migration, key lifecycle, and concurrent admission limits.
 `llmproxy.object_ownership` does not follow the rule above. If the store
 cannot answer an owner lookup, the request gets `503` and the proxy logs a
 warning with repeats suppressed. Owners are rows in `auth.store`. With
-`in_memory` they are lost on restart, and the proxy then refuses those files
-and batches as unknown. Use `persistent` or `shared`, or assign the objects
+`in_memory` they are lost on restart, and the proxy then refuses those objects
+as unknown. Use `persistent` or `shared`, or assign the objects
 again with `PUT /tenants/{id}/objects/{object_id}`.
 
 ## The shared store needs persistence

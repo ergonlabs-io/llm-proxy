@@ -240,6 +240,70 @@ fn enforce_object_ownership_false_omits_the_filter_and_warns() {
     lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts it");
 }
 
+/// The owner TTL of the two stored-output collections (ADR-0013 §6): 30
+/// days by default, `auth.stored_output_owner_ttl` when set, and no other
+/// collection's owners expire. The strict loader and the real filter
+/// factory accept the lowered config.
+#[test]
+fn stored_output_owner_ttl_lowers_onto_responses_and_chat_completions() {
+    let ttls = |extra: &str| {
+        let text = with_auth(extra, PRICING);
+        let lowered = lower(&parse(&text).expect("must parse")).expect("must lower");
+        lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts it");
+        let filters = lowered.bootstrap["static_resources"]["listeners"][0]["filter_chains"][0]
+            ["filters"][0]["typed_config"]["http_filters"]
+            .as_array()
+            .expect("http_filters")
+            .clone();
+        let ownership = filters
+            .iter()
+            .find(|f| f["name"] == "llmproxy.object_ownership")
+            .expect("object_ownership in the chain")["typed_config"]
+            .clone();
+        ownership["collection"]
+            .as_array()
+            .expect("collection")
+            .iter()
+            .map(|c| {
+                (
+                    c["path"].as_str().unwrap().to_string(),
+                    c["owner_ttl_seconds"].as_u64(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let month = Some(30 * 24 * 3600);
+    let want = |ttl: Option<u64>| {
+        vec![
+            ("/v1/responses".to_string(), ttl),
+            ("/v1/chat/completions".to_string(), ttl),
+            ("/v1/threads".to_string(), None),
+            ("/v1/fine_tuning/jobs".to_string(), None),
+        ]
+    };
+    assert_eq!(ttls(""), want(month));
+    assert_eq!(
+        ttls("  stored_output_owner_ttl: 48h\n"),
+        want(Some(48 * 3600))
+    );
+
+    for (extra, why) in [
+        ("  stored_output_owner_ttl: 500ms\n", "whole seconds"),
+        ("  stored_output_owner_ttl: 0s\n", "at least 1s"),
+        (
+            "  stored_output_owner_ttl: 1h\n  enforce: { object_ownership: false }\n",
+            "no effect",
+        ),
+    ] {
+        let err = lower(&parse(&with_auth(extra, PRICING)).unwrap()).expect_err(extra);
+        let ConfigError::InvalidValue { field_path, reason } = err else {
+            panic!("{extra}: {err:?}");
+        };
+        assert_eq!(field_path, "auth.stored_output_owner_ttl", "{extra}");
+        assert!(reason.contains(why), "{extra}: {reason}");
+    }
+}
+
 #[test]
 fn enforce_spend_false_omits_spend_limit_and_warns() {
     let text = with_auth("  enforce: { spend: false }\n", PRICING);

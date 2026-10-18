@@ -52,6 +52,11 @@ with `model_policy: false` is a load error at
 `llmproxy.filters.v0.ModelAuthz.tenants_without_policy`: `DENY` (0, default)
 or `ALLOW` (1).
 
+> **Warning:** Fine-tuned models are not protected by object ownership. Every
+> tenant reaches the provider through one provider account. A tenant with
+> `{"access":"all"}`, or with a `*` grant, can use the fine-tuned models of
+> every tenant. Grant each fine-tuned model name to the tenants that own it.
+
 `TenantPolicy` carries a per-tenant model allow-list and spend ceiling
 (`crates/proxy-control/src/auth.rs:226-251`, the `model_access` and `budget`
 fields). A tenant with no spend ceiling is unlimited. Two more `llmproxy.*` filters

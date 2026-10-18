@@ -443,6 +443,11 @@ pub struct Auth {
     /// 4m (5 x the 48 s policy poll). Whole seconds, at least 96s.
     #[serde(default)]
     pub max_policy_staleness: Option<SimpleDuration>,
+    /// How long the owner of a stored response or stored chat completion is
+    /// kept (ADR-0013 §6). Absent means 720h (30 days). Whole seconds, at
+    /// least 1s. Only meaningful with `enforce.object_ownership: true`.
+    #[serde(default)]
+    pub stored_output_owner_ttl: Option<SimpleDuration>,
 }
 
 /// `auth.enforce`: opt-out switches for the controls that read the admin
@@ -463,7 +468,9 @@ pub struct AuthEnforce {
     /// (`PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits`).
     #[serde(default = "default_true")]
     pub limits: bool,
-    /// Keep provider files and batches to the tenant that created them
+    /// Keep provider objects (files, batches, responses, stored chat
+    /// completions, uploads, vector stores, fine-tuning jobs, assistants,
+    /// threads, containers, conversations) to the tenant that created them
     /// (`llmproxy.object_ownership`). Every tenant reaches a provider through
     /// one provider account, so the provider cannot tell them apart.
     #[serde(default = "default_true")]
