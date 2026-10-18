@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-18
+
 ### Added
 
 - Minted Vertex access tokens: `providers.<name>.oauth2_jwt_bearer` (Envoy
