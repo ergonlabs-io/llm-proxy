@@ -38,16 +38,37 @@ The record type is `RequestRecord` in
 | Field | Meaning |
 |---|---|
 | `request_id`, `event_id`, `instance_id` | Identify the request, the record, and the proxy instance. |
-| `tenant_id`, `user_id`, `key_id` | Identify who made the request. `user_id` and `key_id` can be `null`. |
+| `record_seq` | The record's number within its `instance_id`: 1, 2, 3, and so on, in the order the delivery path wrote the records. A gap means a record that was numbered but not delivered. Absent in records from builds before ADR-0011. |
+| `tenant_id`, `user_id`, `key_id` | Identify who made the request. `user_id` and `key_id` can be `null`. `tenant_id` is `default` when the request had no tenant (no auth configured, or a credential that names none), and `unauthenticated` when the auth filter refused it; `error_category` then gives the reason, for example `auth_unknown_key`. Both names are reserved. |
 | `requested_model` | The model name the client sent. |
 | `selected_provider`, `selected_model` | The provider and model the proxy dialled. |
-| `status`, `termination`, `error_category` | How the request ended. |
+| `status`, `termination`, `error_category` | How the request ended. `error_category` is the Envoy response code details. A stream whose downstream connection closed is `termination: downstream_disconnect` with flag `DC`, and `error_category` says which side closed it: `downstream_remote_disconnect` when the client left, `downstream_local_disconnect` when the proxy cut it at shutdown (the end of `--drain-time-s`, or a second termination signal). |
 | `usage`, `cost` | Token counts and cost. Both can be `null`. |
 | `usage.completeness`, `usage.provenance` | `complete` for a finished response. `partial` for a stream cut off before the provider's final usage: the counts are then the provider's figures where they arrived and estimates (4 bytes per token) for the rest. `provenance` is `provider`, or `estimate` when any count was estimated; `usage.input_estimated` and `usage.output_estimated` say which. |
 | `cost.kind` | `list` for a rate-card price of provider-reported usage, `estimate` when it prices estimated usage. A partial record is charged to spend and token limits at this estimate. |
 | `upstream_response_id` | The provider's own id for the response, bounded to 256 bytes. `null` when absent. |
 | `upstream_usage` | The provider's `usage` object exactly as sent, embedded as JSON (the last one, for a stream). Evidence only: cost never comes from it. `null` when absent or over 4096 bytes. |
 | `attempts`, `attempts_truncated` | One summary for each provider attempt. Excess attempts are cut and flagged. |
+
+## Checking that no record was lost
+
+Each `instance_id` is one proxy process. When metadata delivery stops, the
+proxy logs one line with `event="metadata_delivery_summary"`. The line has
+`instance_id`, `last_record_seq`, `accepted`, `written`, `failed`, `unwritten`,
+the admission drops (`dropped_capacity`, `dropped_oversize`, `dropped_invalid`,
+`dropped_closed`), and `timed_out`. The level is `WARN` when a record was lost
+or the flush timed out, and `INFO` otherwise.
+
+To reconcile, for each `instance_id`:
+
+1. Expect records with `record_seq` from 1 to `last_record_seq`, with no gaps.
+2. Expect a summary line with nothing lost.
+3. If there is no summary line, the process was killed (for example `SIGKILL`
+   after a container stop timeout). The records after the last `record_seq`
+   that arrived are unknown.
+
+Give the proxy a stop timeout longer than `--drain-time-s`, so that it can
+drain and write the summary.
 
 ## Ways to deliver records
 

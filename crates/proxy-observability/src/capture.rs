@@ -630,6 +630,10 @@ async fn run_delivery(
     let mut pending: VecDeque<Box<Event>> = VecDeque::new();
     let mut closed = false;
     let mut watch_open = true;
+    // This path's own numbering for its own `instance_id` (ADR-0011
+    // decision 2). Stamped once on receipt, so a retried event keeps its
+    // number and `event_id` deduplicates it.
+    let mut seq = 0u64;
     loop {
         if owner
             .upgrade()
@@ -725,7 +729,11 @@ async fn run_delivery(
             }
             received = rx.recv(), if !closed => {
                 match received {
-                    Some(Some(event)) => pending.push_back(event),
+                    Some(Some(mut event)) => {
+                        seq += 1;
+                        event.record.record_seq = Some(seq);
+                        pending.push_back(event);
+                    }
                     Some(None) => rx.close(),
                     None => closed = true,
                 }

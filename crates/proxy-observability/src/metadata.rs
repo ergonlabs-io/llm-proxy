@@ -20,10 +20,14 @@ pub struct MetadataDelivery {
     counters: Arc<DropCounters>,
     written: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
+    instance_id: String,
+    last_seq: Arc<AtomicU64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DeliverySummary {
+    /// The `instance_id` every record from this process carries.
+    pub instance_id: String,
     pub written: u64,
     pub failed: u64,
     /// Accepted records not written or failed at the shutdown snapshot.
@@ -31,6 +35,58 @@ pub struct DeliverySummary {
     pub unwritten: u64,
     pub admission: crate::records::DropCounterSnapshot,
     pub timed_out: bool,
+    /// The highest `record_seq` the writer stamped; 0 when it wrote nothing.
+    pub last_record_seq: u64,
+}
+
+impl DeliverySummary {
+    /// Whether any record was refused, failed, or left unwritten, or the flush
+    /// ran out of time.
+    pub fn lost_records(&self) -> bool {
+        let a = &self.admission;
+        self.timed_out
+            || self.failed > 0
+            || self.unwritten > 0
+            || a.capacity_exceeded > 0
+            || a.oversize > 0
+            || a.invalid > 0
+            || a.closed > 0
+    }
+
+    /// The one line per process a metering consumer reconciles against
+    /// (ADR-0011 decision 2): records `1..=last_record_seq` of `instance_id`
+    /// should all have arrived. WARN when anything was lost, INFO otherwise
+    /// (AGENTS.md "Fail-open controls"). `context` says why delivery stopped.
+    pub fn log(&self, context: &str) {
+        macro_rules! emit {
+            ($level:ident, $message:literal) => {
+                tracing::$level!(
+                    event = "metadata_delivery_summary",
+                    context,
+                    instance_id = %self.instance_id,
+                    last_record_seq = self.last_record_seq,
+                    accepted = self.admission.accepted,
+                    written = self.written,
+                    failed = self.failed,
+                    unwritten = self.unwritten,
+                    dropped_capacity = self.admission.capacity_exceeded,
+                    dropped_oversize = self.admission.oversize,
+                    dropped_invalid = self.admission.invalid,
+                    dropped_closed = self.admission.closed,
+                    timed_out = self.timed_out,
+                    $message
+                )
+            };
+        }
+        if self.lost_records() {
+            emit!(warn, "metadata delivery stopped with request records lost");
+        } else {
+            emit!(
+                info,
+                "metadata delivery stopped; file writes do not imply durability"
+            );
+        }
+    }
 }
 
 impl MetadataDelivery {
@@ -120,16 +176,26 @@ impl MetadataDelivery {
         let failed = Arc::new(AtomicU64::new(0));
         let thread_written = written.clone();
         let thread_failed = failed.clone();
+        let last_seq = Arc::new(AtomicU64::new(0));
+        let thread_last_seq = last_seq.clone();
+        let summary_instance_id = instance_id.clone();
         let (done_tx, done) = oneshot::channel();
         std::thread::Builder::new()
             .name("llmproxy-metadata".into())
             .spawn(move || {
                 let mut write_failed = false;
+                let mut seq = 0u64;
                 while let Some(mut record) = receiver.blocking_recv() {
                     if let Some(stats) = &stats {
                         stats.record_dequeued();
                     }
                     record.instance_id.clone_from(&instance_id);
+                    // Numbered here, on the one writer thread, so records
+                    // arrive in order and a gap means a write was lost
+                    // (ADR-0011 decision 2).
+                    seq += 1;
+                    record.record_seq = Some(seq);
+                    thread_last_seq.store(seq, Ordering::Relaxed);
                     let result = serde_json::to_vec(&record)
                         .map_err(io::Error::other)
                         .and_then(|mut data| {
@@ -177,6 +243,8 @@ impl MetadataDelivery {
                 counters,
                 written,
                 failed,
+                instance_id: summary_instance_id,
+                last_seq,
             },
         ))
     }
@@ -189,6 +257,8 @@ impl MetadataDelivery {
         let written = self.written.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
         DeliverySummary {
+            instance_id: self.instance_id,
+            last_record_seq: self.last_seq.load(Ordering::Relaxed),
             written,
             failed,
             admission: self.counters.snapshot(),
@@ -227,13 +297,28 @@ mod tests {
             MetadataDelivery::start_writer(Writer(bytes.clone()), 2, "instance".into(), None)
                 .unwrap();
         assert_eq!(sink.submit(record()), SubmitResult::Accepted);
+        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
         drop(sink);
         let summary = delivery.shutdown(Duration::from_secs(2)).await;
         assert!(!summary.timed_out);
-        assert_eq!(summary.written, 1);
+        assert_eq!(summary.written, 2);
         assert_eq!(summary.unwritten, 0);
-        let value: serde_json::Value = serde_json::from_slice(&bytes.lock().unwrap()).unwrap();
-        assert_eq!(value["instance_id"], "instance");
+        assert!(!summary.lost_records());
+        // The summary names the instance and the last number, so a consumer
+        // can check that records 1..=last all arrived (ADR-0011 decision 2).
+        assert_eq!(summary.instance_id, "instance");
+        assert_eq!(summary.last_record_seq, 2);
+        let written = bytes.lock().unwrap().clone();
+        let values: Vec<serde_json::Value> = written
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        for (value, seq) in values.iter().zip(1..) {
+            assert_eq!(value["instance_id"], "instance");
+            assert_eq!(value["record_seq"], seq);
+        }
     }
 
     #[tokio::test]
@@ -252,6 +337,7 @@ mod tests {
         assert_eq!(sink.submit(record()), SubmitResult::Accepted);
         let summary = delivery.shutdown(Duration::from_secs(2)).await;
         assert_eq!(summary.failed, 1);
+        assert!(summary.lost_records(), "a failed write is a loss to report");
         assert_eq!(sink.submit(record()), SubmitResult::Closed);
     }
 

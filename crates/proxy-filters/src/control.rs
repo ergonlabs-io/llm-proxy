@@ -49,6 +49,19 @@ fn reject_control_characters(field: &str, id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Request records give `default` and `unauthenticated` their own meanings
+/// (ADR-0011 decision 3); a tenant under either name would be
+/// indistinguishable from them. Tenants that already exist are untouched.
+fn reject_reserved_tenant(tenant: &TenantId) -> Result<(), StoreError> {
+    if proxy_observability::records::RESERVED_TENANT_IDS.contains(&tenant.as_str()) {
+        return Err(StoreError::InvalidInput(format!(
+            "tenant `{}` is reserved for request records",
+            tenant.as_str()
+        )));
+    }
+    Ok(())
+}
+
 /// Persisted admin-write shape. Rebuild converts rows to the digest-keyed
 /// [`KeySet`] before publishing; request workers never see `StoredKey`.
 #[derive(Clone)]
@@ -3876,6 +3889,7 @@ impl ControlPlane {
             .map_err(StoreError::InvalidInput)?;
         reject_control_characters("tenant", tenant.as_str())?;
         reject_control_characters("key_id", key_id.as_str())?;
+        reject_reserved_tenant(tenant)?;
         let snapshot = self.published.load();
         if let Some(owner) = snapshot.key_tenants.get(key_id) {
             if owner != tenant {
@@ -3920,6 +3934,7 @@ impl ControlPlane {
     /// Creates `tenant`, then republishes.
     pub fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
         reject_control_characters("tenant", tenant.as_str())?;
+        reject_reserved_tenant(tenant)?;
         self.store.create_tenant(tenant)?;
         self.rebuild();
         Ok(())

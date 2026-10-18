@@ -537,6 +537,7 @@ bounded_test!(
             .replay(0, 8, 8 * proxy_capture_protocol::MAX_RECORD_BYTES)
             .unwrap();
         assert_eq!(replay.len(), 8);
+        let mut seqs = Vec::new();
         for mut expected in expected {
             let stored = replay
                 .iter()
@@ -547,8 +548,13 @@ bounded_test!(
             expected
                 .capture_policy_version
                 .clone_from(&stored.capture_policy_version);
+            // Delivery numbers each record (ADR-0011 decision 2).
+            seqs.push(stored.record_seq.expect("delivery stamps record_seq"));
+            expected.record_seq = stored.record_seq;
             assert_eq!(stored, expected);
         }
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=8).collect::<Vec<u64>>());
     }
 );
 

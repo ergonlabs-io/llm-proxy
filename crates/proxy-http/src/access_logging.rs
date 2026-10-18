@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
@@ -582,7 +583,7 @@ impl LoggingBody {
             llm_upstream,
             llm_completeness,
             trace,
-            (tenant, user_id),
+            (tenant, user_id, auth_denied),
             response_code_details,
             usage_attribution,
             attempts,
@@ -641,7 +642,11 @@ impl LoggingBody {
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
                 // time below -- see this destructuring's own doc above.
-                (info.auth.tenant.clone(), info.auth.user_id.clone()),
+                (
+                    info.auth.tenant.clone(),
+                    info.auth.user_id.clone(),
+                    info.auth.denied,
+                ),
                 // `%RESPONSE_CODE_DETAILS%` -- cloned out alongside
                 // everything else `LogContext` borrows, same reasoning as
                 // this destructure's own doc above.
@@ -703,10 +708,13 @@ impl LoggingBody {
                 instance_id: "proxy".to_owned(),
                 started_at: format_system_time(ctx.start_time),
                 finished_at: format_system_time(SystemTime::now()),
-                tenant_id: tenant
-                    .as_deref()
-                    .map(proxy_observability::records::bounded_field)
-                    .unwrap_or_else(|| "default".to_owned()),
+                // `default` is a request with no tenant; a request the auth
+                // filter refused has no identity at all (ADR-0011 decision 3).
+                tenant_id: match (tenant.as_deref(), auth_denied) {
+                    (Some(tenant), _) => proxy_observability::records::bounded_field(tenant),
+                    (None, true) => proxy_observability::records::UNAUTHENTICATED_TENANT.to_owned(),
+                    (None, false) => proxy_observability::records::DEFAULT_TENANT.to_owned(),
+                },
                 // The authenticated user only. A body `user` field is
                 // caller-controlled and never reaches this.
                 user_id: user_id
@@ -812,6 +820,8 @@ impl LoggingBody {
                 // The router overwrites this on every attempt, so it holds the
                 // final (selected) attempt's source.
                 credential_source: ctx.stream_info.borrow().credential_source,
+                // Stamped by the delivery path that writes the record.
+                record_seq: None,
                 attempts: attempts
                     .into_iter()
                     .map(|attempt| proxy_observability::records::AttemptRecord {
@@ -1250,6 +1260,18 @@ impl Body for LoggingBody {
     }
 }
 
+/// Set once the process has decided to stop its workers with requests still in
+/// flight (the drain deadline, or a second termination signal). From then on a
+/// body dropped before end-of-stream was cut by this proxy, not by the client.
+static PROCESS_CUT: AtomicBool = AtomicBool::new(false);
+
+/// Marks every response body dropped from now on as cut by this process
+/// (ADR-0011 decision 1). Call before stopping the workers; there is no reset,
+/// because the process exits after it.
+pub fn mark_process_cut() {
+    PROCESS_CUT.store(true, Ordering::SeqCst);
+}
+
 impl Drop for LoggingBody {
     fn drop(&mut self) {
         // Covers the abandoned-stream case: a disconnecting client, or an
@@ -1260,11 +1282,17 @@ impl Drop for LoggingBody {
         // errored, it was simply given up on. That's a downstream
         // termination from the operator's point of view (the far end went
         // away without us ever seeing why), same as Envoy's DC.
-        if self.ctx.is_some() {
-            self.record_failure(
-                ResponseFlag::DownstreamConnectionTermination,
-                &"response body dropped before end-of-stream",
-            );
+        //
+        // Envoy flags both sides' closes `DC` and tells them apart in the
+        // response code details (ADR-0011 decision 1).
+        if let Some(ctx) = &self.ctx {
+            let details = if PROCESS_CUT.load(Ordering::SeqCst) {
+                "downstream_local_disconnect"
+            } else {
+                "downstream_remote_disconnect"
+            };
+            ctx.stream_info.borrow_mut().response_code_details = Some(details.to_string());
+            self.record_failure(ResponseFlag::DownstreamConnectionTermination, &details);
         }
         // `finish` is idempotent (`ctx.take()`), so this is a no-op if
         // `poll_frame` already logged.

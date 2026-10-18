@@ -1908,6 +1908,60 @@ async fn post_and_delete_tenants_are_reflected_in_the_snapshot() {
     );
 }
 
+/// Request records give `default` and `unauthenticated` their own meanings
+/// (ADR-0011 decision 3), so neither can be created as a tenant or own a key.
+/// An ordinary name on the same server still works, so the refusal is about
+/// the name.
+#[tokio::test]
+async fn reserved_tenant_names_are_refused_for_tenants_and_keys() {
+    let (factory_state, _handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    for name in ["default", "unauthenticated"] {
+        let (status, _headers, body) = request(
+            addr,
+            "POST",
+            "/tenants",
+            Some(ADMIN_TOKEN),
+            &format!(r#"{{"tenant":"{name}"}}"#),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "POST /tenants {name}: {body}"
+        );
+        assert!(body.contains("reserved"), "{body}");
+
+        let (status, _headers, body) = request(
+            addr,
+            "POST",
+            "/keys",
+            Some(ADMIN_TOKEN),
+            &format!(r#"{{"tenant":"{name}","key_id":"k-{name}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "POST /keys {name}: {body}");
+        assert!(body.contains("reserved"), "{body}");
+    }
+
+    let (status, _headers, body) = request(
+        addr,
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"tenant-x","key_id":"k-x"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 /// `PUT /tenants/{id}/policy` with both `"all"` and `{"only": [...]}`, plus
 /// the load-bearing case: an EMPTY `only: []` must stay `Only(vec![])`, not
 /// collapse to `All` -- see `ModelAccess`'s own doc for why that would be a

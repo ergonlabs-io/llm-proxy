@@ -21,6 +21,19 @@ pub const MAX_ATTEMPTS: u16 = 64;
 /// outcome is reachable.
 pub const MAX_PRINCIPAL_ID_BYTES: usize = 128;
 
+/// The tenant id on the record of a request that carried no tenant
+/// (AGENTS.md "Policy Domains"): a deployment without auth, or a credential
+/// that names none.
+pub const DEFAULT_TENANT: &str = "default";
+
+/// The tenant id on the record of a request the auth filter refused, so no
+/// identity was established (ADR-0011 decision 3).
+pub const UNAUTHENTICATED_TENANT: &str = "unauthenticated";
+
+/// Tenant ids a record gives a meaning of its own. No tenant may be created
+/// or keyed under one, or its records could not be told from those.
+pub const RESERVED_TENANT_IDS: [&str; 2] = [DEFAULT_TENANT, UNAUTHENTICATED_TENANT];
+
 /// Copy bounded metadata into independent storage. Caller-controlled paths
 /// and models cannot pin an arbitrarily large String allocation in a queue.
 pub fn bounded_field(value: &str) -> String {
@@ -243,6 +256,12 @@ pub struct RequestRecord {
     /// the credential step.
     #[serde(default)]
     pub credential_source: Option<CredentialSource>,
+    /// This record's number within its `instance_id`, 1-based, stamped by the
+    /// delivery path that writes it (ADR-0011 decision 2). A gap means a record
+    /// numbered but not delivered. `None` until delivery stamps it; absent in
+    /// records from older builds.
+    #[serde(default)]
+    pub record_seq: Option<u64>,
 }
 
 impl RequestRecord {
