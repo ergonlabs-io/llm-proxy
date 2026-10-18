@@ -136,6 +136,59 @@ fn hcm_negative_timeouts_are_rejected_with_path() {
     }
 }
 
+// --------------------------------------------------- request head limits --
+
+#[test]
+fn request_head_limits_unset_lower_to_envoy_defaults() {
+    let s = lower(&http_yaml("", "")).expect("lowers");
+    let hcm = hcm_of(&s);
+    assert_eq!(hcm.max_request_headers_kb, 60);
+    assert_eq!(hcm.max_headers_count, 100);
+}
+
+#[test]
+fn request_head_limits_are_accepted_and_lowered() {
+    let s = lower(&http_yaml(
+        "",
+        "                max_request_headers_kb: 96\n\
+         \x20               common_http_protocol_options:\n\
+         \x20                 max_headers_count: 40",
+    ))
+    .expect("a config setting both limits loads");
+    let hcm = hcm_of(&s);
+    assert_eq!(hcm.max_request_headers_kb, 96);
+    assert_eq!(hcm.max_headers_count, 40);
+}
+
+#[test]
+fn request_head_limits_out_of_range_are_rejected_with_path() {
+    let hcm = "static_resources.listeners[0].filter_chains[0].filters[0].typed_config";
+    for (extra, field) in [
+        (
+            "                max_request_headers_kb: 0",
+            "max_request_headers_kb",
+        ),
+        (
+            "                max_request_headers_kb: 8193",
+            "max_request_headers_kb",
+        ),
+        (
+            "                common_http_protocol_options:\n                  max_headers_count: 0",
+            "common_http_protocol_options.max_headers_count",
+        ),
+    ] {
+        let err = lower(&http_yaml("", extra)).expect_err(extra);
+        assert_eq!(err_path(err), format!("{hcm}.{field}"), "{extra}");
+    }
+    // The upper bound itself is valid.
+    let s = lower(&http_yaml(
+        "",
+        "                max_request_headers_kb: 8192",
+    ))
+    .expect("lowers");
+    assert_eq!(hcm_of(&s).max_request_headers_kb, 8192);
+}
+
 // -------------------------------------------------- ignore_global_conn_limit --
 
 #[test]

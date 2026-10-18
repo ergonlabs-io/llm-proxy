@@ -54,6 +54,20 @@ struct AllowlistEntry {
 
 const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
+        struct_name: "HttpConnectionManagerConfig",
+        field_name: "max_request_headers_kb",
+        kind: EntryKind::KnownInert,
+        reason: "Lowered with Envoy's 60 KiB default; the HTTP/1 codec does not \
+                 enforce it yet.",
+    },
+    AllowlistEntry {
+        struct_name: "HttpConnectionManagerConfig",
+        field_name: "max_headers_count",
+        kind: EntryKind::KnownInert,
+        reason: "Lowered with Envoy's default of 100; the HTTP/1 codec does not \
+                 enforce it yet.",
+    },
+    AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "traces",
         kind: EntryKind::KnownInertNameCollision,

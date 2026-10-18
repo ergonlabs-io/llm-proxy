@@ -313,6 +313,8 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         request_timeout: None,
         stream_idle_timeout: None,
         max_stream_duration: None,
+        max_request_headers_kb: 60,
+        max_headers_count: 100,
     };
 
     let listener = ListenerConfig {
@@ -512,6 +514,8 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         request_timeout: None,
         stream_idle_timeout: None,
         max_stream_duration: None,
+        max_request_headers_kb: 60,
+        max_headers_count: 100,
     };
     let listener = ListenerConfig {
         name: "listener_0".to_string(),

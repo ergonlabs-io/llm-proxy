@@ -2026,6 +2026,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -2106,6 +2108,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -3046,6 +3050,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
@@ -4157,6 +4163,8 @@ mod tests {
             request_timeout: None,
             stream_idle_timeout: None,
             max_stream_duration: None,
+            max_request_headers_kb: 60,
+            max_headers_count: 100,
         })
     }
 
