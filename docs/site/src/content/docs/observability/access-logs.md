@@ -66,6 +66,7 @@ llm_list_cost_nanodollars="%LLM_LIST_COST%"
 llm_credential_source="%LLM_CREDENTIAL_SOURCE%" llm_served_model="%LLM_SERVED_MODEL%"
 llm_usage_completeness="%LLM_USAGE_COMPLETENESS%" llm_cost_kind="%LLM_COST_KIND%"
 llm_upstream_id="%LLM_UPSTREAM_ID%"
+response_code_details="%RESPONSE_CODE_DETAILS%"
 timing_us="ds_rx=%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)%
 pre_upstream=%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)%
 us_tx=%COMMON_DURATION(US_TX_BEG:US_TX_END:us)%
@@ -115,6 +116,7 @@ The fixed JSON format of the `llmproxy` config file has these keys
 | `protocol` | `%PROTOCOL%` |
 | `response_code` | `%RESPONSE_CODE%` |
 | `response_flags` | `%RESPONSE_FLAGS%` |
+| `response_code_details` | `%RESPONSE_CODE_DETAILS%`: why the proxy ended the request itself, for example `endpoint_not_metered` or `spend_budget_exceeded` |
 | `bytes_received`, `bytes_sent` | `%BYTES_RECEIVED%`, `%BYTES_SENT%` |
 | `duration_ms` | `%DURATION%` |
 | `request_id` | `%REQ(X-REQUEST-ID)%` |

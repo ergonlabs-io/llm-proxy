@@ -46,6 +46,44 @@ on every provider of a route a price. Then watch the warning and the
 `unpriced_requests` count in the spend reports, and treat a non-zero value as
 unbilled traffic.
 
+## Endpoints a budget cannot count
+
+The proxy can count the cost of five endpoints: chat completions,
+completions, Responses, Messages and embeddings. It cannot count the cost of
+other endpoints, such as images, audio, batches and files. A budget that
+applies to a request for one of these endpoints refuses it with
+`403` and the response-code detail `endpoint_not_metered`. The request does
+not reach the provider. Before this, such a request was served and charged
+$0.
+
+- The proxy finds the endpoint from the request method and path, before any
+  path rewrite. It compares whole path segments, so
+  `POST /v1/messages/batches` is not a Messages request.
+- Every path that the proxy does not know is refused in the same way. An
+  endpoint that a provider adds later is refused under a budget until the
+  proxy can count it.
+- Three endpoints cost nothing and always pass: `GET .../models`,
+  `GET .../usage` and `POST .../messages/count_tokens`. Their responses carry
+  no usage, and the proxy does not log a missing-usage warning for them.
+  Nor does it log one for a request that reached no provider, such as the
+  synthetic `404` for an unknown model: nothing was spent.
+- There is no exception for a request that matches no route. The proxy reads
+  the model from the body after it chooses a first route, so a request can
+  match no route at first and reach a provider later.
+- A request that no budget applies to is not refused and logs nothing.
+- A budget applies only when its credential scope matches the request
+  (`credential_source`). A refused request adds nothing to any budget.
+
+Each refusal increments
+`llmproxy_unmetered_endpoint_refused_total{endpoint, control}`. `control` is
+`spend` for a budget and `token_limit` for a token limit (see
+[Token rate limiting](../token-rate-limiting/#endpoints-a-token-limit-cannot-count)).
+`endpoint` is one of `image_generation`, `image_edit`, `speech`,
+`transcription`, `translation` and `unmetered` (every other path). The access
+log shows the detail in `%RESPONSE_CODE_DETAILS%` (`response_code_details` in
+the `--config` formats). Tests: `crates/proxy/tests/unmetered_endpoint_e2e.rs`.
+The design, and the phases that will meter images and audio, are in ADR-0010.
+
 ## Cut streams and estimated charges
 
 A response stream that ends early is still charged, once. The client can

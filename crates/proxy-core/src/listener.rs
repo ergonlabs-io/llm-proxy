@@ -5183,7 +5183,9 @@ static_resources:
                     .expect("connect should succeed");
                 stream
                     .write_all(
-                        b"GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-e2e\r\nConnection: close\r\n\r\n",
+                        // A token limit admits only endpoints whose tokens it can count
+                        // (ADR-0010 decision 1), so this is chat, not `GET /`.
+                        b"POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-e2e\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     )
                     .await
                     .unwrap();
