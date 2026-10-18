@@ -42,6 +42,11 @@
 //! `"inspect": true`, and 501 when the agent predates inspection. The stats answer is cached for 5 s, single-flight,
 //! errors included. Records are never cached.
 //!
+//! Billing ledger (ADR-0009 decision 8), both gated like spend: `GET /ledger/entries?after=&limit=` returns
+//! committed entries by cursor, and `POST /ledger/ack?through=` removes them from the spool, which also clears a
+//! disk-cap hold. Both are answered by the ledger's writer thread and waited on from a blocking pool thread, never a
+//! request worker. Without a ledger both answer 404.
+//!
 //! Everything else 404s, naming the endpoints that exist. `/quitquitquit`, `/logging`, and `/listeners` (Envoy admin
 //! endpoints) are not part of this API.
 //!

@@ -637,6 +637,7 @@ async fn start_full_with_readiness(
             lifecycle: None,
             credential_probe: None,
             capture_agent: None,
+            ledger: None,
         },
     )
     .await
@@ -667,6 +668,7 @@ async fn start_with_cluster_state(
             lifecycle: None,
             credential_probe: None,
             capture_agent: None,
+            ledger: None,
         },
     )
     .await
@@ -1272,6 +1274,7 @@ async fn start_lifecycle(
             lifecycle: Some(Arc::clone(&state)),
             credential_probe: None,
             capture_agent: None,
+            ledger: None,
         },
     )
     .await
@@ -3248,6 +3251,7 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             lifecycle: None,
             credential_probe: None,
             capture_agent: None,
+            ledger: None,
         },
     )
     .await
@@ -3420,6 +3424,7 @@ mod admin_rate_limit;
 mod budget_scope;
 mod capture_spool;
 mod credentials;
+mod ledger;
 mod limits;
 mod pricing;
 mod tenant_budget_cutover;

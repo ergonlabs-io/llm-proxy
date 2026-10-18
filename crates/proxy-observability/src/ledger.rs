@@ -15,6 +15,11 @@
 //! commit: a batch is committed when it reaches `group_commit_max_entries` or
 //! `group_commit_interval` after its first entry. Committed entries are never
 //! evicted; they leave the spool only by acknowledgement.
+//!
+//! The spool is single-writer, so reads and acknowledgements for the admin
+//! API (ADR-0009 decision 8) travel to the writer thread on the same channel
+//! as entries and are answered there. They block their caller, never a
+//! worker: the admin server runs them off the data plane.
 
 use crate::records::{LedgerCharge, LedgerEntry, RequestRecord, LEDGER_SCHEMA_VERSION};
 use crate::stats::{instruments, Handle, Registry, StatsControl, WorkerId};
@@ -109,9 +114,85 @@ struct Pending {
     charge: LedgerCharge,
 }
 
+/// What the writer thread receives: entries from workers, queries from the
+/// admin API.
+// Entries are nearly every message; boxing one would add an allocation per
+// request to spare the rare query a few hundred bytes of channel slot.
+#[allow(clippy::large_enum_variant)]
+enum Message {
+    Entry(Pending),
+    Read {
+        after: u64,
+        limit: usize,
+        reply: mpsc::SyncSender<Result<LedgerPage, LedgerQueryError>>,
+    },
+    Acknowledge {
+        through: u64,
+        reply: mpsc::SyncSender<Result<Acknowledged, LedgerQueryError>>,
+    },
+}
+
+/// The most entries one read returns.
+pub const MAX_PAGE_ENTRIES: usize = 1000;
+/// The most payload bytes one read decrypts. Above [`MAX_ENTRY_BYTES`], so a
+/// page always makes progress.
+const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// One committed entry and its position in this instance's spool.
+///
+/// `cursor` is what `after` and `through` take. It is not `seq`: `seq`
+/// restarts at 0 in every epoch, and entries of an earlier epoch can still be
+/// unacknowledged, so only the spool's position orders every entry the
+/// ledger holds. It increases across restarts and never repeats.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommittedEntry {
+    pub cursor: u64,
+    pub entry: LedgerEntry,
+}
+
+/// One page of committed entries, in cursor order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LedgerPage {
+    pub entries: Vec<CommittedEntry>,
+    /// The cursor of the last committed entry; 0 when none was ever committed.
+    pub committed_through: u64,
+}
+
+/// The result of an acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acknowledged {
+    /// Every entry at or below this cursor is gone from the spool.
+    pub acknowledged_through: u64,
+    /// False while the spool is still at its disk cap after the
+    /// acknowledgement freed what it could.
+    pub admitting: bool,
+}
+
+/// Why a read or an acknowledgement got no answer. Fixed phrases: none
+/// carries entry contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LedgerQueryError {
+    #[error("the billing ledger writer has stopped")]
+    Stopped,
+    #[error("the billing ledger writer did not answer in time")]
+    Timeout,
+    #[error("through {through} is past the last committed entry ({committed_through})")]
+    BeyondCommitted {
+        through: u64,
+        committed_through: u64,
+    },
+    #[error(
+        "the ledger spool is at its disk cap and cannot record this acknowledgement; \
+         acknowledge a shorter prefix first"
+    )]
+    AcknowledgementFull,
+    #[error("the billing ledger spool could not be read")]
+    Storage,
+}
+
 /// The shared admission handle. One per process, shared by every worker.
 pub struct Ledger {
-    sender: mpsc::Sender<Pending>,
+    sender: mpsc::Sender<Message>,
     reserved: AtomicUsize,
     capacity: usize,
     state: AtomicU8,
@@ -198,6 +279,51 @@ impl Ledger {
         self.reserved.load(Ordering::Acquire)
     }
 
+    /// Up to `limit` committed entries with a cursor above `after`, in cursor
+    /// order. Entries handed over but not yet committed are never returned.
+    /// Blocks until the writer answers or `deadline` passes; never call it
+    /// from a request worker.
+    pub fn read_committed(
+        &self,
+        after: u64,
+        limit: usize,
+        deadline: Duration,
+    ) -> Result<LedgerPage, LedgerQueryError> {
+        let limit = limit.clamp(1, MAX_PAGE_ENTRIES);
+        self.ask(deadline, |reply| Message::Read {
+            after,
+            limit,
+            reply,
+        })
+    }
+
+    /// Remove every committed entry with a cursor at or below `through`. The
+    /// space freed clears a disk-cap hold: entries held at the cap are
+    /// written, and admission resumes without a restart. Blocks like
+    /// [`Self::read_committed`].
+    pub fn acknowledge(
+        &self,
+        through: u64,
+        deadline: Duration,
+    ) -> Result<Acknowledged, LedgerQueryError> {
+        self.ask(deadline, |reply| Message::Acknowledge { through, reply })
+    }
+
+    fn ask<T>(
+        &self,
+        deadline: Duration,
+        message: impl FnOnce(mpsc::SyncSender<Result<T, LedgerQueryError>>) -> Message,
+    ) -> Result<T, LedgerQueryError> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.sender
+            .send(message(reply))
+            .map_err(|_| LedgerQueryError::Stopped)?;
+        answer.recv_timeout(deadline).map_err(|e| match e {
+            mpsc::RecvTimeoutError::Timeout => LedgerQueryError::Timeout,
+            mpsc::RecvTimeoutError::Disconnected => LedgerQueryError::Stopped,
+        })?
+    }
+
     fn should_warn_unledgered(&self) -> bool {
         let now = unix_secs();
         let last = self.last_unledgered_warn_secs.load(Ordering::Relaxed);
@@ -216,7 +342,12 @@ impl LedgerReservation {
     pub fn append(mut self, record: RequestRecord, charge: LedgerCharge) {
         // From here the writer owns the slot and releases it on commit.
         self.armed = false;
-        if self.ledger.sender.send(Pending { record, charge }).is_err() {
+        if self
+            .ledger
+            .sender
+            .send(Message::Entry(Pending { record, charge }))
+            .is_err()
+        {
             // The writer has exited; this entry has nowhere to go.
             self.ledger.stats.lost(LostReason::WriterFailed, 1);
             self.ledger.release(1);
@@ -270,6 +401,7 @@ struct LedgerStats {
     unledgered: [Handle; 3],
     committed: Handle,
     lost: [Handle; 3],
+    spend_written: Handle,
 }
 
 impl LedgerStats {
@@ -284,6 +416,7 @@ impl LedgerStats {
             committed: control.resolve(&instruments::LEDGER_COMMITTED, &[]),
             lost: ["writer_failed", "oversize", "shutdown"]
                 .map(|r| control.resolve(&instruments::LEDGER_LOST, &[("reason", r)])),
+            spend_written: control.resolve(&instruments::LEDGER_SPEND_WRITTEN, &[]),
         }
     }
 
@@ -301,9 +434,11 @@ impl LedgerStats {
             .incr(WorkerId(0), self.unledgered[Self::index(reason)], 1);
     }
 
-    fn committed(&self, entries: usize) {
+    fn committed(&self, entries: usize, spend_micro_usd: u64) {
         self.registry
             .incr(WorkerId(0), self.committed, entries as u64);
+        self.registry
+            .incr(WorkerId(0), self.spend_written, spend_micro_usd);
     }
 
     fn lost(&self, reason: LostReason, entries: usize) {
@@ -429,6 +564,7 @@ mod writer {
             max_batch: config.group_commit_max_entries,
             interval: config.group_commit_interval,
             uncommitted: 0,
+            uncommitted_spend: 0,
             backlog: VecDeque::new(),
             #[cfg(test)]
             hooks: test_hooks::current(),
@@ -524,7 +660,7 @@ mod writer {
 
     struct Writer {
         ledger: Arc<Ledger>,
-        receiver: mpsc::Receiver<Pending>,
+        receiver: mpsc::Receiver<Message>,
         spool: MetadataSpool,
         instance_id: String,
         epoch: u64,
@@ -533,6 +669,8 @@ mod writer {
         interval: Duration,
         /// Appended to the spool, not yet committed. Their slots are held.
         uncommitted: usize,
+        /// Their spend charges, counted written once they commit.
+        uncommitted_spend: u64,
         /// Received while the spool is at its cap: numbered when appended.
         backlog: VecDeque<LedgerEntry>,
         #[cfg(test)]
@@ -544,7 +682,13 @@ mod writer {
             let mut batch = Vec::with_capacity(self.max_batch);
             while !self.ledger.stopping.load(Ordering::Acquire) {
                 let first = match self.receiver.recv_timeout(IDLE_POLL) {
-                    Ok(pending) => pending,
+                    Ok(Message::Entry(pending)) => pending,
+                    Ok(query) => {
+                        if let Err(error) = self.answer(query) {
+                            return self.fail(error, batch);
+                        }
+                        continue;
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
@@ -555,7 +699,14 @@ mod writer {
                         break;
                     };
                     match self.receiver.recv_timeout(wait) {
-                        Ok(pending) => batch.push(self.entry(pending)),
+                        Ok(Message::Entry(pending)) => batch.push(self.entry(pending)),
+                        // Answered at once, before this batch commits: a
+                        // read sees only what is already committed.
+                        Ok(query) => {
+                            if let Err(error) = self.answer(query) {
+                                return self.fail(error, batch);
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -564,10 +715,15 @@ mod writer {
                 }
             }
             // Stopping: workers can no longer append, so drain what is queued.
+            // Queries are dropped unanswered; their callers see `Stopped`.
             loop {
                 batch.extend(
                     self.receiver
                         .try_iter()
+                        .filter_map(|m| match m {
+                            Message::Entry(pending) => Some(pending),
+                            _ => None,
+                        })
                         .take(self.max_batch)
                         .map(|p| self.entry(p))
                         .collect::<Vec<_>>(),
@@ -587,6 +743,124 @@ mod writer {
                     "billing ledger stopped at its disk cap with uncommitted entries; they are lost"
                 );
             }
+        }
+
+        /// Answer one admin query. `Err` is a storage failure the writer
+        /// cannot continue past; the caller then sees `Stopped`.
+        fn answer(&mut self, query: Message) -> Result<(), SpoolError> {
+            match query {
+                Message::Entry(_) => unreachable!("entries are batched, not answered"),
+                Message::Read {
+                    after,
+                    limit,
+                    reply,
+                } => {
+                    let page = self.read(after, limit)?;
+                    let _ = reply.send(page);
+                }
+                Message::Acknowledge { through, reply } => {
+                    let outcome = self.acknowledge(through)?;
+                    let _ = reply.send(outcome);
+                }
+            }
+            Ok(())
+        }
+
+        fn read(
+            &self,
+            after: u64,
+            limit: usize,
+        ) -> Result<Result<LedgerPage, LedgerQueryError>, SpoolError> {
+            let Ok(stats) = self.spool.stats() else {
+                // A directory listing failed; the spool itself is unharmed.
+                return Ok(Err(LedgerQueryError::Storage));
+            };
+            // The spool replays durable records only: what a refused commit
+            // keeps pending is not returned.
+            let records = self.spool.replay(after, limit, MAX_PAGE_BYTES)?;
+            let mut entries = Vec::with_capacity(records.len());
+            for record in records {
+                let Ok(entry) = serde_json::from_slice(&record.payload) else {
+                    tracing::error!(
+                        cursor = record.sequence,
+                        "billing ledger entry does not decode; reads cannot pass it"
+                    );
+                    return Ok(Err(LedgerQueryError::Storage));
+                };
+                entries.push(CommittedEntry {
+                    cursor: record.sequence,
+                    entry,
+                });
+            }
+            Ok(Ok(LedgerPage {
+                entries,
+                committed_through: stats.durable_through_sequence,
+            }))
+        }
+
+        fn acknowledge(
+            &mut self,
+            through: u64,
+        ) -> Result<Result<Acknowledged, LedgerQueryError>, SpoolError> {
+            match self.spool.acknowledge(through) {
+                Ok(()) => {}
+                Err(SpoolError::InvalidAcknowledgement) => {
+                    let committed_through =
+                        self.spool.stats().map_or(0, |s| s.durable_through_sequence);
+                    return Ok(Err(LedgerQueryError::BeyondCommitted {
+                        through,
+                        committed_through,
+                    }));
+                }
+                // Nothing changed; a shorter prefix may fit.
+                Err(SpoolError::Full) => return Ok(Err(LedgerQueryError::AcknowledgementFull)),
+                Err(error) => return Err(error),
+            }
+            if self.ledger.state.load(Ordering::Acquire) == DISK_FULL {
+                self.resume_after_cap()?;
+            }
+            let acknowledged_through = self
+                .spool
+                .stats()
+                .map_or(through, |s| s.acknowledged_through_sequence);
+            Ok(Ok(Acknowledged {
+                acknowledged_through,
+                admitting: self.ledger.state.load(Ordering::Acquire) == HEALTHY,
+            }))
+        }
+
+        /// An acknowledgement freed space: commit what a refused commit left
+        /// pending, then write the held entries in arrival order, then let
+        /// admission resume. If the space runs out again part way, the rest
+        /// stays held and the cap is re-entered.
+        fn resume_after_cap(&mut self) -> Result<(), SpoolError> {
+            if self.uncommitted > 0 && !self.commit()? {
+                return Ok(());
+            }
+            self.ledger.state.store(HEALTHY, Ordering::Release);
+            tracing::info!(
+                held = self.backlog.len(),
+                "billing ledger spool has space again after an acknowledgement; admissions resume"
+            );
+            while !self.backlog.is_empty() {
+                let take = self.backlog.len().min(self.max_batch);
+                let mut batch: Vec<_> = self.backlog.drain(..take).collect();
+                // Refused at the cap, `write` holds the batch in the backlog,
+                // which is empty here, so it stays ahead of the entries that
+                // arrived after it.
+                let rest = std::mem::take(&mut self.backlog);
+                let result = self.write(&mut batch);
+                self.backlog.extend(rest);
+                if let Err(error) = result {
+                    // Counted lost with the backlog by `fail`.
+                    self.backlog.extend(batch);
+                    return Err(error);
+                }
+                if self.ledger.state.load(Ordering::Acquire) != HEALTHY {
+                    break;
+                }
+            }
+            Ok(())
         }
 
         /// The entry as received; `seq` is set when it is appended.
@@ -620,6 +894,7 @@ mod writer {
             let first_seq = self.next_seq;
             let mut payloads = Vec::with_capacity(batch.len());
             let mut oversize = 0;
+            let mut spend = 0u64;
             batch.retain_mut(|entry| {
                 entry.seq = self.next_seq;
                 let bytes = serde_json::to_vec(&*entry).expect("ledger entries serialize");
@@ -628,6 +903,12 @@ mod writer {
                     return false;
                 }
                 self.next_seq += 1;
+                // Only a charge the spend filter made is a spend charge
+                // (ADR-0009 decision 7); a list price on an unbudgeted route
+                // is not.
+                if !entry.charged_scopes.is_empty() {
+                    spend = spend.saturating_add(entry.charged_micro_usd);
+                }
                 payloads.push(bytes);
                 true
             });
@@ -641,12 +922,21 @@ mod writer {
                 );
             }
             let views: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-            match self.spool.append_batch(&views) {
+            #[cfg(test)]
+            let appended = if self.hooks.take_refused_append() {
+                Err(SpoolError::Full)
+            } else {
+                self.spool.append_batch(&views)
+            };
+            #[cfg(not(test))]
+            let appended = self.spool.append_batch(&views);
+            match appended {
                 Ok(results) => {
                     if let Some(Err(error)) = results.into_iter().find(Result::is_err) {
                         return Err(error);
                     }
                     self.uncommitted += payloads.len();
+                    self.uncommitted_spend = self.uncommitted_spend.saturating_add(spend);
                     batch.clear();
                 }
                 Err(SpoolError::Full) => {
@@ -658,17 +948,25 @@ mod writer {
                 }
                 Err(error) => return Err(error),
             }
+            self.commit().map(|_| ())
+        }
+
+        /// Commit what is appended. `Ok(false)`: refused at the disk cap; the
+        /// records stay pending in the spool, slots held.
+        fn commit(&mut self) -> Result<bool, SpoolError> {
             match self.spool.commit() {
                 Ok(_) => {
-                    self.ledger.stats.committed(self.uncommitted);
+                    self.ledger
+                        .stats
+                        .committed(self.uncommitted, self.uncommitted_spend);
                     self.ledger.release(self.uncommitted);
                     self.uncommitted = 0;
-                    Ok(())
+                    self.uncommitted_spend = 0;
+                    Ok(true)
                 }
-                // The records stay pending in the spool, slots held.
                 Err(SpoolError::Full) => {
                     self.at_cap();
-                    Ok(())
+                    Ok(false)
                 }
                 Err(error) => Err(error),
             }
@@ -687,7 +985,11 @@ mod writer {
         /// give its slots back, then exit, which closes the channel.
         fn fail(self, error: SpoolError, batch: Vec<LedgerEntry>) {
             self.ledger.state.store(FAILED, Ordering::Release);
-            let queued = self.receiver.try_iter().count();
+            let queued = self
+                .receiver
+                .try_iter()
+                .filter(|m| matches!(m, Message::Entry(_)))
+                .count();
             let lost = batch.len() + self.backlog.len() + self.uncommitted + queued;
             self.ledger.stats.lost(LostReason::WriterFailed, lost);
             self.ledger.release(lost);
@@ -700,8 +1002,11 @@ mod writer {
     }
 
     /// Test-only control over the writer, in the spirit of the spool's own
-    /// fault hooks: a stall that holds the writer before its next write, and
-    /// a storage failure on its next write.
+    /// fault hooks: a stall that holds the writer before its next write, a
+    /// storage failure on its next write, and refusals at the disk cap of
+    /// its next appends. The spool refuses an append at the cap only when its
+    /// small reservation transaction is the one that crosses the cap, which
+    /// no entry size makes deterministic.
     #[cfg(test)]
     pub(crate) mod test_hooks {
         use super::SpoolError;
@@ -712,6 +1017,7 @@ mod writer {
             stalled: Mutex<bool>,
             resumed: Condvar,
             fail_next: Mutex<bool>,
+            refuse_appends: Mutex<usize>,
         }
 
         impl Hooks {
@@ -724,6 +1030,16 @@ mod writer {
             }
             pub(crate) fn fail_next_write(&self) {
                 *self.fail_next.lock().unwrap() = true;
+            }
+            /// Refuse the next `n` appends at the disk cap.
+            pub(crate) fn refuse_appends(&self, n: usize) {
+                *self.refuse_appends.lock().unwrap() = n;
+            }
+            pub(super) fn take_refused_append(&self) -> bool {
+                let mut left = self.refuse_appends.lock().unwrap();
+                let refuse = *left > 0;
+                *left = left.saturating_sub(1);
+                refuse
             }
             pub(super) fn before_write(&self) -> Result<(), SpoolError> {
                 let mut stalled = self.stalled.lock().unwrap();
@@ -872,6 +1188,50 @@ pub mod testing {
             if let Some(writer) = self.writer.take() {
                 writer.shutdown(Duration::from_secs(10));
             }
+        }
+    }
+
+    /// A completed request's record, as an entry carries it.
+    pub fn record(event_id: &str) -> RequestRecord {
+        use crate::records::{Termination, SCHEMA_VERSION};
+        RequestRecord {
+            schema_version: SCHEMA_VERSION,
+            event_id: event_id.into(),
+            request_id: "r".into(),
+            instance_id: "i".into(),
+            started_at: "2026-10-01T00:00:00Z".into(),
+            finished_at: "2026-10-01T00:00:01Z".into(),
+            tenant_id: "default".into(),
+            user_id: None,
+            key_id: None,
+            trace_id: None,
+            routing_revision: None,
+            policy_generation: None,
+            capture_policy_version: None,
+            method: "POST".into(),
+            route: "/v1/chat/completions".into(),
+            requested_model: None,
+            resolved_model: None,
+            selected_cluster: None,
+            selected_provider: None,
+            selected_model: None,
+            upstream_response_id: None,
+            upstream_usage: None,
+            status: Some(200),
+            termination: Termination::Complete,
+            error_category: None,
+            response_flags: vec![],
+            duration_ms: 1,
+            time_to_first_byte_ms: None,
+            bytes_request: 0,
+            bytes_response: 0,
+            usage: None,
+            cost: None,
+            attempt_count: 0,
+            physical_attempt_count: 0,
+            attempts: vec![],
+            attempts_truncated: false,
+            credential_source: None,
         }
     }
 

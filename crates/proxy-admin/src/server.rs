@@ -47,6 +47,8 @@ use proxy_http::tenant_credentials::CredentialSource;
 use proxy_observability::capture_transport::{
     query_spool_records, query_spool_stats, AgentTransportConfig, InspectError,
 };
+use proxy_observability::ledger::{Ledger, LedgerQueryError, MAX_PAGE_ENTRIES};
+use proxy_observability::records::LedgerEntry;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -109,6 +111,10 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     // records are end-user metadata, so that read is bearer-gated like spend.
     "/capture/spool/stats (spool counters of the capture agent)",
     "/capture/spool/records?after=<sequence>&limit=<1..=100> (bearer-gated page of stored records)",
+    // The billing ledger (ADR-0009 decision 8). Entries carry tenant and
+    // user identity and charges, so both are bearer-gated.
+    "/ledger/entries?after=<cursor>&limit=<1..=1000> (bearer-gated page of committed entries)",
+    "/ledger/ack?through=<cursor> (bearer-gated POST that removes entries through the cursor)",
 ];
 
 /// Hard cap on a write request's body. No legitimate admin write is large (the biggest, a `PUT .../policy`,
@@ -226,6 +232,9 @@ pub struct AdminRuntime {
     /// a provider that returns `None`, makes those endpoints answer 404 with
     /// a hint, the same honesty rule as the unwired `/stats`.
     pub capture_agent: Option<CaptureAgentProvider>,
+    /// The billing ledger behind `/ledger/*` (ADR-0009 decision 8). `None`
+    /// makes those endpoints answer 404 after the bearer gate.
+    pub ledger: Option<Arc<Ledger>>,
 }
 
 /// One static file served under `/ui/`.
@@ -563,6 +572,11 @@ async fn handle(
     // not read. The other literal-path reads above are ungated. ----
     if req.uri().path() == "/capture/spool/records" {
         return handle_capture_records(&req, runtime, peer).await;
+    }
+    match req.uri().path() {
+        "/ledger/entries" => return handle_ledger_entries(&req, runtime, peer).await,
+        "/ledger/ack" => return handle_ledger_ack(req, runtime, peer).await,
+        _ => {}
     }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -1452,6 +1466,194 @@ fn capture_error(error: InspectError) -> Response<Full<Bytes>> {
         status,
         &serde_json::json!({ "error": format!("{hint} ({error})") }),
     )
+}
+
+/// How long a ledger read or acknowledgement waits for the writer thread,
+/// which answers between group commits.
+const LEDGER_QUERY_DEADLINE: Duration = Duration::from_secs(5);
+
+const LEDGER_NOT_CONFIGURED: &str = "no billing ledger is configured for this proxy; /ledger/* \
+     needs a `ledger` block (node.metadata[\"io.llmproxy.ledger\"] in Envoy mode)";
+
+/// One entry as `GET /ledger/entries` renders it: the entry's own fields
+/// (`instance_id`, `epoch`, `seq`, the charge, the record) plus the `cursor`
+/// that `after` and `through` take.
+#[derive(serde::Serialize)]
+struct LedgerItem<'a> {
+    cursor: u64,
+    #[serde(flatten)]
+    entry: &'a LedgerEntry,
+}
+
+/// `GET /ledger/entries?after=&limit=`: committed entries above `after`, in
+/// cursor order (ADR-0009 decision 8). Gated like the spend read.
+async fn handle_ledger_entries(
+    req: &Request<Incoming>,
+    runtime: &AdminRuntime,
+    peer: &GatePeer,
+) -> Response<Full<Bytes>> {
+    if req.method() != Method::GET {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "/ledger/entries only accepts GET",
+        );
+    }
+    if let Some(refusal) = admin_gate(
+        req.uri().path(),
+        runtime.admin_token.as_deref(),
+        req.headers(),
+        peer,
+    ) {
+        return refusal;
+    }
+    let (after, limit) = match parse_ledger_entries_query(req.uri().query()) {
+        Ok(parsed) => parsed,
+        Err(message) => return bad_request(message),
+    };
+    let Some(ledger) = runtime.ledger.clone() else {
+        return text(StatusCode::NOT_FOUND, LEDGER_NOT_CONFIGURED);
+    };
+    // The writer thread answers; the wait blocks a pool thread, never this
+    // runtime's workers or the data plane.
+    let page = tokio::task::spawn_blocking(move || {
+        ledger.read_committed(after, limit, LEDGER_QUERY_DEADLINE)
+    })
+    .await;
+    match page {
+        // Entry contents go to the authorized caller only, never to a log.
+        Ok(Ok(page)) => {
+            let next_after = page.entries.last().map_or(after, |e| e.cursor);
+            let entries: Vec<LedgerItem<'_>> = page
+                .entries
+                .iter()
+                .map(|e| LedgerItem {
+                    cursor: e.cursor,
+                    entry: &e.entry,
+                })
+                .collect();
+            json(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "entries": entries,
+                    "next_after": next_after,
+                    "committed_through": page.committed_through,
+                }),
+            )
+        }
+        Ok(Err(error)) => ledger_error(error),
+        Err(_) => ledger_error(LedgerQueryError::Stopped),
+    }
+}
+
+/// `POST /ledger/ack?through=<cursor>`: the spool removes every entry at or
+/// below `through`. Space it frees clears a disk-cap hold, so admission
+/// resumes without a restart.
+async fn handle_ledger_ack(
+    req: Request<Incoming>,
+    runtime: &AdminRuntime,
+    peer: &GatePeer,
+) -> Response<Full<Bytes>> {
+    if req.method() != Method::POST {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "/ledger/ack only accepts POST",
+        );
+    }
+    if let Some(refusal) = admin_gate(
+        req.uri().path(),
+        runtime.admin_token.as_deref(),
+        req.headers(),
+        peer,
+    ) {
+        return refusal;
+    }
+    let through = match parse_ledger_ack_query(req.uri().query()) {
+        Ok(through) => through,
+        Err(message) => return bad_request(message),
+    };
+    match read_limited_body(req.into_body(), MAX_ADMIN_BODY_BYTES).await {
+        Ok(body) if body.is_empty() => {}
+        Ok(_) => {
+            return bad_request("/ledger/ack takes no body; pass through as a query parameter")
+        }
+        Err(response) => return response,
+    }
+    let Some(ledger) = runtime.ledger.clone() else {
+        return text(StatusCode::NOT_FOUND, LEDGER_NOT_CONFIGURED);
+    };
+    let outcome =
+        tokio::task::spawn_blocking(move || ledger.acknowledge(through, LEDGER_QUERY_DEADLINE))
+            .await;
+    match outcome {
+        Ok(Ok(ack)) => json(
+            StatusCode::OK,
+            &serde_json::json!({
+                "acknowledged_through": ack.acknowledged_through,
+                "admitting": ack.admitting,
+            }),
+        ),
+        Ok(Err(error)) => ledger_error(error),
+        Err(_) => ledger_error(LedgerQueryError::Stopped),
+    }
+}
+
+/// `after` (default 0) and `limit` (1..=1000, default 100). Unknown, repeated
+/// or malformed parameters are a 400, not ignored.
+fn parse_ledger_entries_query(query: Option<&str>) -> Result<(u64, usize), &'static str> {
+    let (mut after, mut limit) = (None, None);
+    for param in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let (name, value) = param.split_once('=').unwrap_or((param, ""));
+        match name {
+            "after" if after.is_none() => {
+                after = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "after must be an unsigned integer cursor")?,
+                );
+            }
+            "limit" if limit.is_none() => {
+                limit = Some(
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=MAX_PAGE_ENTRIES).contains(n))
+                        .ok_or("limit must be an integer from 1 to 1000")?,
+                );
+            }
+            _ => return Err("unsupported or repeated query parameter; use after and limit"),
+        }
+    }
+    Ok((after.unwrap_or(0), limit.unwrap_or(100)))
+}
+
+/// `through`, required, exactly once.
+fn parse_ledger_ack_query(query: Option<&str>) -> Result<u64, &'static str> {
+    let mut through = None;
+    for param in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        let (name, value) = param.split_once('=').unwrap_or((param, ""));
+        match name {
+            "through" if through.is_none() => {
+                through = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "through must be an unsigned integer cursor")?,
+                );
+            }
+            _ => return Err("unsupported or repeated query parameter; use through"),
+        }
+    }
+    through.ok_or("through is required: the cursor of the last entry to acknowledge")
+}
+
+fn ledger_error(error: LedgerQueryError) -> Response<Full<Bytes>> {
+    let status = match error {
+        LedgerQueryError::BeyondCommitted { .. } => StatusCode::CONFLICT,
+        LedgerQueryError::AcknowledgementFull => StatusCode::INSUFFICIENT_STORAGE,
+        LedgerQueryError::Stopped | LedgerQueryError::Timeout | LedgerQueryError::Storage => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    json(status, &serde_json::json!({ "error": error.to_string() }))
 }
 
 /// Extracts the bearer credential from `Authorization: Bearer <token>`.

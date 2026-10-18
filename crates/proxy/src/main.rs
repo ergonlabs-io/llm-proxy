@@ -1201,6 +1201,7 @@ async fn run_serve(
             )),
             lifecycle: lifecycle.clone(),
             capture_agent: Some(capture_endpoint.clone()),
+            ledger: ledger.clone(),
         },
     )
     .await
@@ -2928,6 +2929,7 @@ struct AdminStartRuntime<'a> {
     credential_probe: Option<Arc<dyn proxy_http::credential_probe::TenantCredentialProbe>>,
     lifecycle: Arc<LifecycleState>,
     capture_agent: Option<proxy_admin::CaptureAgentProvider>,
+    ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
 }
 
 async fn start_admin(
@@ -2972,6 +2974,7 @@ async fn start_admin(
             lifecycle: Some(runtime.lifecycle),
             credential_probe: runtime.credential_probe,
             capture_agent: runtime.capture_agent,
+            ledger: runtime.ledger,
         },
     )
     .await
@@ -3383,6 +3386,7 @@ mod tests {
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
                 capture_agent: None,
+                ledger: None,
             },
         )
         .await
@@ -3415,6 +3419,7 @@ mod tests {
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
                 capture_agent: None,
+                ledger: None,
             },
         )
         .await
@@ -3452,6 +3457,7 @@ mod tests {
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
                 capture_agent: None,
+                ledger: None,
             },
         )
         .await

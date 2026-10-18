@@ -311,6 +311,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
                     accumulator,
+                    charged: stats_registry.map(|r| Arc::new(SpendChargedCounter::new(r))),
                     usage_missing_warner: Arc::new(UsageMissingWarner::new()),
                     unpriced_warner: Arc::new(UnpricedWarner::new(ctx.stat_prefix.clone())),
                     legacy_tenant_budget_cutover: AtomicBool::new(cutover == 1),
@@ -327,10 +328,40 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         Ok(Box::new(SpendLimitInstanceFactory {
             pricing_registry,
             accumulator: Arc::clone(&shared.accumulator),
+            charged: shared.charged.clone(),
             usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
             unpriced_warner: Arc::clone(&shared.unpriced_warner),
             snapshot: control_plane.handle(),
         }))
+    }
+}
+
+/// `llmproxy_spend_charged_micro_usd_total`: one series per process, which
+/// every chain's spend filter adds to.
+struct SpendChargedCounter {
+    registry: Arc<proxy_observability::stats::Registry>,
+    handle: proxy_observability::stats::Handle,
+}
+
+impl SpendChargedCounter {
+    fn new(registry: Arc<proxy_observability::stats::Registry>) -> Self {
+        // No attributes, so the cap is never reached; `resolve_capped` is
+        // how a filter without the control-side `StatsControl` resolves.
+        let handle = registry.resolve_capped(
+            &proxy_observability::stats::instruments::SPEND_CHARGED,
+            &[],
+            1,
+            &[],
+        );
+        Self { registry, handle }
+    }
+
+    fn add(&self, micro_usd: u64) {
+        self.registry.incr(
+            proxy_observability::stats::WorkerId(0),
+            self.handle,
+            micro_usd,
+        );
     }
 }
 
@@ -346,6 +377,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
 /// read from outside this module.
 pub struct SharedSpendLimitState {
     accumulator: Arc<SpendAccumulator>,
+    charged: Option<Arc<SpendChargedCounter>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     unpriced_warner: Arc<UnpricedWarner>,
     /// Whether `typed_config.legacy_tenant_budget_cutover` is set. Without it,
@@ -380,6 +412,7 @@ impl SharedSpendLimitState {
     pub fn for_test(accumulator: Arc<SpendAccumulator>) -> Self {
         SharedSpendLimitState {
             accumulator,
+            charged: None,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             unpriced_warner: Arc::new(UnpricedWarner::new(String::new())),
             legacy_tenant_budget_cutover: AtomicBool::new(true),
@@ -401,6 +434,7 @@ impl SharedSpendLimitState {
 struct SpendLimitInstanceFactory {
     pricing_registry: Arc<PricingRegistry>,
     accumulator: Arc<SpendAccumulator>,
+    charged: Option<Arc<SpendChargedCounter>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     unpriced_warner: Arc<UnpricedWarner>,
     /// One handle per (filter config, listener), shared by every per-stream
@@ -414,6 +448,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
         Box::new(SpendLimitFilterInstance {
             pricing_snapshot: self.pricing_registry.snapshot_context(),
             accumulator: Arc::clone(&self.accumulator),
+            charged: self.charged.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             unpriced_warner: Arc::clone(&self.unpriced_warner),
             snapshot: Arc::clone(&self.snapshot),
@@ -559,6 +594,8 @@ impl UnpricedWarner {
 struct SpendLimitFilterInstance {
     pricing_snapshot: Option<crate::usage_filter::PricingContext>,
     accumulator: Arc<SpendAccumulator>,
+    /// `None` only where no stats registry exists (unit tests).
+    charged: Option<Arc<SpendChargedCounter>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
     unpriced_warner: Arc<UnpricedWarner>,
     snapshot: Arc<ArcSwap<ControlPlaneSnapshot>>,
@@ -728,6 +765,14 @@ impl SpendLimitFilterInstance {
             ),
             Charge::Unpriced => (0, None),
         };
+        // ADR-0009 decision 7: the spend side of ledger reconciliation,
+        // counted where the charge was made, not where the entry is built,
+        // so a charge whose entry never reaches the ledger still shows.
+        if !scopes.is_empty() {
+            if let Some(charged) = &self.charged {
+                charged.add(micro_usd);
+            }
+        }
         cb.stream_info().llm.spend_charge = Some(LlmSpendCharge {
             micro_usd,
             rate_card_version,
@@ -1421,6 +1466,7 @@ mod tests {
         fn new_instance(&self) -> SpendLimitFilterInstance {
             SpendLimitFilterInstance {
                 accumulator: Arc::clone(&self.accumulator),
+                charged: None,
                 usage_missing_warner: Arc::clone(&self.usage_missing_warner),
                 unpriced_warner: Arc::clone(&self.unpriced_warner),
                 pricing_snapshot: self.pricing_registry.snapshot_context(),

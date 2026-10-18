@@ -1047,6 +1047,25 @@ pub mod instruments {
         attribute_keys: &["reason"],
         buckets: None,
     };
+    /// ADR-0009 decision 7, one side: micro-USD the spend filter added to
+    /// spend counters, once per request that charged at least one scope.
+    pub const SPEND_CHARGED: Instrument = Instrument {
+        name: "llmproxy_spend_charged_micro_usd_total",
+        kind: InstrumentKind::Counter,
+        unit: "{micro_usd}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// ADR-0009 decision 7, the other side: micro-USD of spend charges in
+    /// committed ledger entries (entries with charged scopes). Equal to
+    /// [`SPEND_CHARGED`] unless entries were lost or served under `admit`.
+    pub const LEDGER_SPEND_WRITTEN: Instrument = Instrument {
+        name: "llmproxy_ledger_spend_written_micro_usd_total",
+        kind: InstrumentKind::Counter,
+        unit: "{micro_usd}",
+        attribute_keys: &[],
+        buckets: None,
+    };
 
     /// Queue occupancy measured from producer reservation to collector dequeue
     /// observation. `depth / llmproxy_metadata_queue_capacity` estimates queue
