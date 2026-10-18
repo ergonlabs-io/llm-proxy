@@ -714,13 +714,15 @@ impl StreamHandler for FilterChainHandler {
                 crate::headers::set_forwarded_proto(&mut req.head.headers, req.downstream.is_tls);
             }
             // ADR-0009 decision 5: reserve ledger capacity before any filter
-            // runs, so nothing is dialled unledgered unless the operator chose
-            // `on_unavailable: admit`. One atomic increment; it never waits on
-            // the ledger writer. A refused request runs no filter at all.
+            // runs. One atomic increment; it never waits on the ledger
+            // writer. A refusal is recorded on the stream and answered by the
+            // router just before it would dial, so authentication, model
+            // access, budget and rate-limit refusals answer first and nothing
+            // is dialled unledgered unless the operator chose `admit`.
             let (ledger_ticket, ledger_refusal) = match self.ledger.as_ref().map(|l| l.admit()) {
                 None => (None, None),
                 Some(Ok(ticket)) => (Some(ticket), None),
-                Some(Err(reason)) => (None, Some(reason)),
+                Some(Err(refusal)) => (None, Some(refusal)),
             };
             // The one `StreamInfo` for this stream (Envoy's model, module
             // doc): created once here, cloned (cheap `Rc` bump) into `ctx`
@@ -745,6 +747,7 @@ impl StreamHandler for FilterChainHandler {
                 info.client_address = Some(client_address);
                 // `DS_RX_BEG` and `%DURATION%` share one start.
                 info.request_started_at = start_instant;
+                info.ledger_refusal = ledger_refusal;
             }
             if let Some(sink) = &self.request_record_sink {
                 #[cfg(unix)]
@@ -826,10 +829,7 @@ impl StreamHandler for FilterChainHandler {
                 };
                 stream_info.borrow_mut().trace = Some(ctx);
             }
-            let (resp, request_headers_snapshot) = if let Some(reason) = ledger_refusal {
-                let request = Rc::new(RefCell::new(Some(snapshot_request(&req.head))));
-                (ledger_unavailable_reply(&stream_info, reason), request)
-            } else {
+            let (resp, request_headers_snapshot) = {
                 // Rust note: a fresh, `!Send` instance vector per request — filters
                 // may freely hold `Rc`/`RefCell` (ADR-0003).
                 let filters: Vec<Box<dyn HttpFilter>> =
@@ -934,36 +934,6 @@ impl StreamHandler for FilterChainHandler {
                 upgrade: resp.upgrade,
             }
         })
-    }
-}
-
-/// The local 503 for a request refused because no ledger reservation was
-/// available under `on_unavailable: reject` (ADR-0009 decision 5). The
-/// reason is one of a closed set; it is also the counter's label.
-fn ledger_unavailable_reply(
-    stream_info: &Rc<RefCell<StreamInfo>>,
-    reason: proxy_observability::ledger::Unavailable,
-) -> HttpResponseParts {
-    {
-        let mut info = stream_info.borrow_mut();
-        info.is_local_reply = true;
-        info.response_code_details = Some(format!("ledger_unavailable_{}", reason.as_str()));
-    }
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    HttpResponseParts {
-        head: ResponseHeaders {
-            status: http::StatusCode::SERVICE_UNAVAILABLE,
-            headers,
-        },
-        body: bytes_to_seam_body(
-            Bytes::from(format!("billing ledger unavailable: {}\n", reason.as_str())),
-            None,
-        ),
-        upgrade: None,
     }
 }
 

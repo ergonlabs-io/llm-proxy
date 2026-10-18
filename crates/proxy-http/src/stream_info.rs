@@ -362,6 +362,10 @@ pub struct StreamInfo {
     pub selected_model: Option<String>,
     pub attempts: Vec<Rc<RefCell<AttemptInfo>>>,
     pub metadata_enabled: bool,
+    /// No ledger slot under `on_unavailable: reject` (ADR-0009 decision 5).
+    /// Set at admission, before any filter; the router answers it with a
+    /// local 503 only when it would dial, so a filter's own refusal wins.
+    pub ledger_refusal: Option<proxy_observability::ledger::LedgerRefusal>,
     #[cfg(unix)]
     pub metadata_lease: Option<std::sync::Arc<proxy_observability::capture::CaptureLease>>,
     pub metadata_request_id: Option<String>,
@@ -430,6 +434,7 @@ impl Default for StreamInfo {
             selected_model: None,
             attempts: Vec::new(),
             metadata_enabled: false,
+            ledger_refusal: None,
             #[cfg(unix)]
             metadata_lease: None,
             metadata_request_id: None,

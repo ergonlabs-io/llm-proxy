@@ -19,8 +19,13 @@ fn numbered(i: usize) -> RequestRecord {
     r
 }
 
+/// Admission as the router sees it: a refusal is answered, so counted.
+fn admit(ledger: &Arc<Ledger>) -> Result<LedgerTicket, Unavailable> {
+    ledger.admit().map_err(crate::ledger::LedgerRefusal::refuse)
+}
+
 fn reserve(ledger: &Arc<Ledger>) -> crate::ledger::LedgerReservation {
-    match ledger.admit() {
+    match admit(ledger) {
         Ok(LedgerTicket::Reserved(r)) => r,
         Ok(LedgerTicket::Unledgered(_)) => panic!("unledgered"),
         Err(reason) => panic!("refused: {reason:?}"),
@@ -88,7 +93,7 @@ fn a_stalled_writer_never_delays_admission_and_fills_slots_instead() {
             for i in 0..SLOTS {
                 reserve(ledger).append(numbered(i), LedgerCharge::default());
             }
-            done.send(ledger.admit().err()).unwrap();
+            done.send(admit(ledger).err()).unwrap();
         });
         let refusal = finished
             .recv_timeout(NO_WAIT)
@@ -122,7 +127,7 @@ fn a_failed_writer_refuses_admission_and_counts_what_it_loses() {
     let held = reserve(&ledger.ledger);
     reserve(&ledger.ledger).append(numbered(0), LedgerCharge::default());
     let refused = (0..1000)
-        .find_map(|_| match ledger.ledger.admit() {
+        .find_map(|_| match admit(&ledger.ledger) {
             Err(reason) => Some(reason),
             Ok(_) => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -164,7 +169,7 @@ fn at_the_disk_cap_admission_is_refused_and_committed_entries_are_kept() {
     let mut appended = 0;
     let mut refusal = None;
     for _ in 0..20_000 {
-        match ledger.ledger.admit() {
+        match admit(&ledger.ledger) {
             Ok(LedgerTicket::Reserved(r)) => {
                 let mut rec = numbered(appended);
                 rec.route = padding.clone();
@@ -387,7 +392,7 @@ fn an_acknowledgement_at_the_disk_cap_resumes_admission_and_writes_held_entries(
     let mut appended = 0;
     let mut refusal = None;
     for _ in 0..20_000 {
-        match ledger.ledger.admit() {
+        match admit(&ledger.ledger) {
             Ok(LedgerTicket::Reserved(r)) => {
                 r.append(padded(appended), LedgerCharge::default());
                 appended += 1;
@@ -406,7 +411,7 @@ fn an_acknowledgement_at_the_disk_cap_resumes_admission_and_writes_held_entries(
         appended += 1;
     }
     assert_eq!(
-        ledger.ledger.admit().err(),
+        admit(&ledger.ledger).err(),
         Some(Unavailable::DiskFull),
         "still at the cap before the acknowledgement"
     );
@@ -432,7 +437,7 @@ fn an_acknowledgement_at_the_disk_cap_resumes_admission_and_writes_held_entries(
         if ack.admitting {
             break;
         }
-        assert_eq!(ledger.ledger.admit().err(), Some(Unavailable::DiskFull));
+        assert_eq!(admit(&ledger.ledger).err(), Some(Unavailable::DiskFull));
     }
     reserve(&ledger.ledger).append(padded(appended), LedgerCharge::default());
     appended += 1;
@@ -510,7 +515,7 @@ fn a_batch_refused_at_the_cap_gives_its_seq_numbers_back() {
         slot.append(numbered(i), LedgerCharge::default());
     }
     let refused = (0..1000)
-        .find_map(|_| match ledger.ledger.admit() {
+        .find_map(|_| match admit(&ledger.ledger) {
             Err(reason) => Some(reason),
             Ok(_) => {
                 std::thread::sleep(Duration::from_millis(10));

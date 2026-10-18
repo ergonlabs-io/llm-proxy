@@ -225,6 +225,33 @@ pub struct LedgerReservation {
     armed: bool,
 }
 
+/// No slot under `on_unavailable: reject`. Admission runs before any filter,
+/// but the refusal is answered only where the request would be dialled, so
+/// a request that authentication, model access, a budget or a rate limit
+/// refuses gets that answer instead. Counted only when answered.
+pub struct LedgerRefusal {
+    ledger: Arc<Ledger>,
+    reason: Unavailable,
+}
+
+impl std::fmt::Debug for LedgerRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LedgerRefusal").field(&self.reason).finish()
+    }
+}
+
+impl LedgerRefusal {
+    pub fn reason(&self) -> Unavailable {
+        self.reason
+    }
+
+    /// The request is answered with the local 503: count it.
+    pub fn refuse(self) -> Unavailable {
+        self.ledger.stats.rejected(self.reason);
+        self.reason
+    }
+}
+
 /// A request admitted without a slot under `on_unavailable: admit`.
 pub struct Unledgered {
     ledger: Arc<Ledger>,
@@ -233,8 +260,9 @@ pub struct Unledgered {
 
 impl Ledger {
     /// Reserve a slot for one request. `Err` means `on_unavailable: reject`
-    /// refused it, and the caller answers with a local 503.
-    pub fn admit(self: &Arc<Self>) -> Result<LedgerTicket, Unavailable> {
+    /// refused it; the caller answers with a local 503 before dialling and
+    /// calls [`LedgerRefusal::refuse`].
+    pub fn admit(self: &Arc<Self>) -> Result<LedgerTicket, LedgerRefusal> {
         let unavailable = match self.state.load(Ordering::Acquire) {
             FAILED => Some(Unavailable::WriterFailed),
             DISK_FULL => Some(Unavailable::DiskFull),
@@ -247,10 +275,10 @@ impl Ledger {
             }));
         };
         match self.on_unavailable {
-            OnUnavailable::Reject => {
-                self.stats.rejected(reason);
-                Err(reason)
-            }
+            OnUnavailable::Reject => Err(LedgerRefusal {
+                ledger: Arc::clone(self),
+                reason,
+            }),
             OnUnavailable::Admit => Ok(LedgerTicket::Unledgered(Unledgered {
                 ledger: Arc::clone(self),
                 reason,
