@@ -9,6 +9,8 @@ license.workspace = true
 # workers `load()` lock-free -- the same crate `proxy-core::WorkerConfigHandle`
 # and `StatHandles` already use for this exact shape.
 arc-swap = { workspace = true }
+# The control plane: stores, snapshot, accumulators and identity types.
+proxy-control = { workspace = true }
 proxy-config = { workspace = true }
 proxy-http = { workspace = true }
 # `ResponseFlag` (`%RESPONSE_FLAGS%`) -- `token_limit_filter` sets `RL`
@@ -18,27 +20,13 @@ proxy-observability = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 prost-reflect = { workspace = true }
-# Virtual-key authentication (HMAC-SHA256 + constant-time
-# compare). A keyed cryptographic
-# hash, NOT `token_limit_filter::hash_credential`'s FNV-1a.
+# The rate-card digest in `pricing`; the JWT tests also sign with it. Virtual
+# keys (HMAC, generation) live in proxy-control's `auth`.
 ring = { workspace = true }
-# `auth::generate_plaintext_key` -- the single shared
-# virtual-key generator, moved here from `crates/proxy/src/keygen.rs` so
-# `ControlPlane::mint_key` can call it too.
+# JWT segment decoding in `jwt_auth`.
 base64 = { workspace = true }
-# The embedded persistent `ControlPlaneStore` -- see
-# `control.rs`'s `RedbControlPlaneStore`. `serde` (for `Serialize`/
-# `Deserialize` derives on its row types) rides along with it; `serde_json`
-# below was already a dependency and does the actual encoding.
-redb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-thiserror = { workspace = true }
-zeroize = { workspace = true }
-# `RedbControlPlaneStore`'s Redis-backed sibling -- see
-# `control_redis.rs`'s module doc for the key layout and why `add_spend`
-# needs a Lua script rather than a pipeline.
-redis = { workspace = true }
 # Warns loudly (rather than failing closed) when a budget applies to a
 # request but usage could not be read -- see `token_limit_filter`'s module doc.
 tracing = { workspace = true }
@@ -83,6 +71,7 @@ rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
+proxy-control = { workspace = true, features = ["test-support"] }
 proxy-api = { workspace = true }
 # I tests: generates a fresh RSA keypair per test run to
 # sign hand-built JWTs -- never commit a private key,

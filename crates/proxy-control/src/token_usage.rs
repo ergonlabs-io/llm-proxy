@@ -2,6 +2,8 @@
 //! apart from the response scanner in `usage` because the token limiter and the
 //! control plane need the type but not the parser.
 
+use proxy_http::LlmTokenUsage;
+
 /// Tokens consumed by one request/response exchange, split into the buckets
 /// that are **priced differently** so downstream cost accounting can apply a
 /// per-bucket rate.
@@ -46,5 +48,28 @@ impl TokenUsage {
             .saturating_add(self.cached_tokens)
             .saturating_add(self.cache_creation_tokens)
             .saturating_add(self.output_tokens)
+    }
+}
+
+/// Convert a [`TokenUsage`] into the [`LlmTokenUsage`] that `StreamInfo`
+/// carries. All four cost buckets cross the boundary intact — dropping the
+/// cache buckets would leave anything downstream (billing, the token
+/// limiter) unable to compute a correct cost, since the buckets are priced
+/// differently.
+///
+/// Rust note: `From` is the idiomatic "one type converts unambiguously into
+/// another" trait; implementing it here (rather than a free function) lets
+/// callers write `usage.into()` and is what `stream_info.rs`'s doc comment on
+/// `LlmTokenUsage` means by "the usage filter converts at its boundary". It
+/// lives beside `TokenUsage` because Rust's orphan rule allows the impl only
+/// in the crate that defines one of the two types.
+impl From<TokenUsage> for LlmTokenUsage {
+    fn from(usage: TokenUsage) -> Self {
+        LlmTokenUsage {
+            input_tokens: usage.input_tokens,
+            cached_tokens: usage.cached_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            output_tokens: usage.output_tokens,
+        }
     }
 }

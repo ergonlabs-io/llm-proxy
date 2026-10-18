@@ -1,5 +1,5 @@
 //! Pure per-tenant model authorization. HTTP integration and config decoding
-//! live in [`crate::model_authz_filter`].
+//! live in `proxy_filters::model_authz_filter`.
 //!
 //! # Matching rule: exact match, or one trailing `*` glob — no regex
 //!

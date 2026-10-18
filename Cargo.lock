@@ -2049,6 +2049,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-control"
+version = "0.5.0"
+dependencies = [
+ "arc-swap",
+ "base64",
+ "chrono",
+ "http",
+ "proxy-config",
+ "proxy-http",
+ "proxy-observability",
+ "rand",
+ "redb",
+ "redis",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "proxy-core"
 version = "0.5.0"
 dependencies = [
@@ -2101,12 +2124,11 @@ dependencies = [
  "prost-reflect",
  "proxy-api",
  "proxy-config",
+ "proxy-control",
  "proxy-http",
  "proxy-observability",
  "rand",
  "rcgen",
- "redb",
- "redis",
  "regex",
  "ring",
  "rsa",
@@ -2115,11 +2137,9 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tracing",
- "zeroize",
 ]
 
 [[package]]

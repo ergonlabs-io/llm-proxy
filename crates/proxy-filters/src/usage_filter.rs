@@ -928,27 +928,6 @@ impl UsageStats {
     }
 }
 
-/// Convert a [`TokenUsage`] into the [`LlmTokenUsage`] that `StreamInfo`
-/// carries. All four cost buckets cross the boundary intact — dropping the
-/// cache buckets would leave anything downstream (billing, the token
-/// limiter) unable to compute a correct cost, since the buckets are priced
-/// differently.
-///
-/// Rust note: `From` is the idiomatic "one type converts unambiguously into
-/// another" trait; implementing it here (rather than a free function) lets
-/// callers write `usage.into()` and is what `stream_info.rs`'s doc comment on
-/// `LlmTokenUsage` means by "the usage filter converts at its boundary".
-impl From<TokenUsage> for LlmTokenUsage {
-    fn from(usage: TokenUsage) -> Self {
-        LlmTokenUsage {
-            input_tokens: usage.input_tokens,
-            cached_tokens: usage.cached_tokens,
-            cache_creation_tokens: usage.cache_creation_tokens,
-            output_tokens: usage.output_tokens,
-        }
-    }
-}
-
 /// [`HttpFilterFactory`] for [`TYPE_URL`].
 #[derive(Default)]
 pub struct UsageFilterFactory;

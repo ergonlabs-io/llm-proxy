@@ -295,8 +295,8 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_store {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_store {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
@@ -313,19 +313,19 @@ pub(crate) mod test_store {
     /// reports itself shared, as the store it stands in for is. Clones are
     /// handles on one store, as replicas' connections are on one Redis.
     #[derive(Clone, Default)]
-    pub(crate) struct ProbeStore {
+    pub struct ProbeStore {
         inner: Arc<InMemoryControlPlaneStore>,
-        pub(crate) reads: Arc<AtomicUsize>,
-        pub(crate) fail: Arc<AtomicBool>,
+        pub reads: Arc<AtomicUsize>,
+        pub fail: Arc<AtomicBool>,
         held: Arc<(Mutex<bool>, Condvar)>,
     }
 
     impl ProbeStore {
-        pub(crate) fn hold(&self) {
+        pub fn hold(&self) {
             *self.held.0.lock().unwrap() = true;
         }
 
-        pub(crate) fn release(&self) {
+        pub fn release(&self) {
             *self.held.0.lock().unwrap() = false;
             self.held.1.notify_all();
         }

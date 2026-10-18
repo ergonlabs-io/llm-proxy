@@ -460,7 +460,7 @@ mod tests {
 
     // --- the shape of a flush tick, journal side --------------------------
 
-    use crate::spend::tests::ProbeStore;
+    use crate::spend::test_support::ProbeStore;
     use crate::spend::{Charge, MicroUsd};
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 

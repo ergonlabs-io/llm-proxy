@@ -21,7 +21,7 @@
 //! someone who reads the stored [`KeySet`] from checking candidate keys
 //! offline.
 //!
-//! Do **not** reach for [`crate::token_limit_filter::hash_credential`]
+//! Do **not** reach for `proxy_filters::token_limit_filter::hash_credential`
 //! (aliased for readers coming from that module: FNV-1a) for this. It is a
 //! stable, non-cryptographic bucket hash and provides neither preimage
 //! resistance nor secret comparison.
@@ -60,10 +60,10 @@ use proxy_http::tenant_credentials::TenantCredentialSet;
 /// simply not a credential this authenticator understands -- see
 /// [`AuthOutcome::NoCredential`].
 ///
-/// `pub(crate)`, not private: [`crate::jwt_auth::JwtAuthenticator`] parses the same `Bearer ` scheme over the same header --
+/// `pub`, not private: `proxy_filters::jwt_auth::JwtAuthenticator` parses the same `Bearer ` scheme over the same header --
 /// sharing the constant means the two authenticators cannot silently drift
 /// on it.
-pub(crate) const BEARER_PREFIX: &str = "Bearer ";
+pub const BEARER_PREFIX: &str = "Bearer ";
 
 /// Printable prefix every virtual key carries -- greppable in incident response, revocable by prefix
 /// scan, and distinguishable from a provider key pasted into the wrong
@@ -72,11 +72,11 @@ pub(crate) const BEARER_PREFIX: &str = "Bearer ";
 /// key -- this is the OIDC seam, and it is why that case is
 /// `NoCredential`, not `Rejected`.
 ///
-/// `pub(crate)`, not private: [`crate::jwt_auth::JwtAuthenticator`] checks
+/// `pub`, not private: `proxy_filters::jwt_auth::JwtAuthenticator` checks
 /// the SAME prefix (in the opposite direction -- a value that starts with it
 /// is NOT a JWT, see that module's doc) so the two authenticators' notions of
 /// "whose kind is this" cannot silently drift apart.
-pub(crate) const KEY_PREFIX: &str = "llmp_";
+pub const KEY_PREFIX: &str = "llmp_";
 
 /// Rejects a tenant or key id that is empty or longer than
 /// [`proxy_observability::records::MAX_PRINCIPAL_ID_BYTES`]. A free function
@@ -176,7 +176,7 @@ impl fmt::Debug for KeyId {
 /// "No policy configured" and "a configured policy that failed to load" must
 /// **not** produce the same value. A configured policy that fails to load is
 /// a config error with its dotted path (AGENTS.md invariant 1), never `None`
-/// and never `All`. [`crate::model_authz_filter::parse_config`] is the one
+/// and never `All`. `proxy_filters::model_authz_filter::parse_config` is the one
 /// place that loads this struct's `model_access` field from configuration,
 /// and it is careful about exactly this: see that function's doc.
 #[derive(Clone, Default)]
@@ -279,7 +279,7 @@ pub enum AuthError {
     /// that record is marked `revoked`.
     RevokedKey,
 
-    // -- `crate::jwt_auth::JwtAuthenticator`'s
+    // -- `proxy_filters::jwt_auth::JwtAuthenticator`'s
     // rejection reasons. Added here (not on a separate error type) for the
     // same reason `UnknownKey`/`RevokedKey` already share this enum: both
     // authenticators feed the same `AuthOutcome::Rejected`, and the "nothing above [`Authenticator`] changes"
@@ -633,7 +633,7 @@ impl KeySet {
     /// Rust note: `impl Iterator` rather than a named type -- the caller only
     /// ever `for`-loops or `.collect()`s this, so there is nothing gained by
     /// naming the concrete `std::collections::hash_map::Iter` type.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (&[u8], &KeyRecord)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &KeyRecord)> {
         self.entries
             .iter()
             .map(|(digest, record)| (digest.as_slice(), record))

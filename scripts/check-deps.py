@@ -94,7 +94,7 @@ LAYERS = {
     "proxy-cluster": 3,
     "proxy-capture-agent": 3,
     "proxy-http": 4,
-    # 5 is reserved for proxy-control, below the filters.
+    "proxy-control": 5,
     "proxy-filters": 6,
     "proxy-core": 7,
     "proxy-admin": 8,
@@ -122,6 +122,7 @@ PROTO_ALLOWLIST = {
 # backends belong to the control plane, not the HTTP data plane.
 FORBIDDEN_EXTERNAL = {
     "proxy-http": {"redb", "redis"},
+    "proxy-filters": {"redb", "redis"},
 }
 
 LAYER_SECTIONS = ("dependencies", "build-dependencies")

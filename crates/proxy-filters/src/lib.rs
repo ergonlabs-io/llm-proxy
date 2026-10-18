@@ -30,32 +30,35 @@
 //! - [`pricing`] and [`spend`] provide the rate card and spend accumulation;
 //!   [`spend_limit_filter`] enforces per-tenant spend budgets.
 
-pub mod auth;
 pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
-pub mod control;
-pub mod control_redis;
 pub mod cors;
 pub mod ext_authz;
 pub mod jwks_refresh;
 pub mod jwt_auth;
 pub mod local_ratelimit;
-pub mod model_authz;
 pub mod model_authz_filter;
 pub mod model_resolver_filter;
 pub mod object_ownership;
 pub mod object_ownership_filter;
 pub mod pricing;
-pub mod reconciliation_age;
-pub mod spend;
 pub mod spend_limit_filter;
-pub mod tenant_credential_crypto;
-pub mod token_limit;
 pub mod token_limit_filter;
-pub mod token_usage;
 mod unmetered;
 pub mod usage;
 pub mod usage_filter;
-pub mod window_counter;
-pub mod window_usage;
+
+// The control plane lives in proxy-control; these keep
+// `proxy_filters::control::...` and `crate::control::...` paths working.
+pub use proxy_control::auth;
+pub use proxy_control::control;
+pub use proxy_control::control_redis;
+pub use proxy_control::model_authz;
+pub use proxy_control::reconciliation_age;
+pub use proxy_control::spend;
+pub use proxy_control::tenant_credential_crypto;
+pub use proxy_control::token_limit;
+pub use proxy_control::token_usage;
+pub use proxy_control::window_counter;
+pub use proxy_control::window_usage;
