@@ -28,7 +28,10 @@ falls back to the OS default.
    then capture, traces, and metrics. Then it exits `0`. It does not wait for
    the full window.
 6. If connections are still open after `--drain-time-s` (default 600), they
-   are cut and the process exits `0`.
+   are cut and the process exits `0`. The request record of a cut stream has
+   partial, estimated usage, `termination: downstream_disconnect` and
+   `error_category: downstream_local_disconnect`. A client that disconnects
+   gets `error_category: downstream_remote_disconnect` instead.
 
 TCP proxy connections are not closed early. They run until the window ends.
 
