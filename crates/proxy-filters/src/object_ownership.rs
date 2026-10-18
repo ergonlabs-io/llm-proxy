@@ -35,7 +35,9 @@
 //! shared one. The worker never does the I/O: [`ObjectOwners`] keeps a
 //! bounded cache of known owners and hands every store call to its own
 //! thread. A cache miss is a store read the filter waits for; it is never
-//! answered from a guess.
+//! answered from a guess. This is the one request that waits on a store read,
+//! an exception to AGENTS.md "Policy Domains" recorded in ADR-0012, which also
+//! says why owners are not preloaded.
 
 use std::collections::HashMap;
 use std::fmt;

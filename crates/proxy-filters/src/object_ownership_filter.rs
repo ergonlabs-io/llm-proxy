@@ -18,7 +18,8 @@
 //! does, so the response does not reveal that an ID exists. An ID no tenant
 //! owns is refused, never passed (AGENTS.md "Fail-open controls"). When the
 //! store cannot answer, the request gets 503 and a warning with repeats
-//! suppressed: this control fails closed.
+//! suppressed: this control fails closed. A cache miss holds the request on
+//! an off-worker store read (ADR-0012).
 //!
 //! # Recording
 //!
