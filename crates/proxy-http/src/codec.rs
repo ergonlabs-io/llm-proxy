@@ -905,8 +905,32 @@ async fn serve_one(
     let on_upgrade = (request_wants_upgrade(req.headers()) || is_h2_connect)
         .then(|| hyper::upgrade::on(&mut req));
 
+    // RFC 9112 section 6.3: a request with both `Transfer-Encoding` and
+    // `Content-Length` is a smuggling vector. hyper decodes it as chunked but
+    // keeps a `Content-Length` that precedes `Transfer-Encoding`; hop-by-hop
+    // sanitization then strips only `Transfer-Encoding`, so the upstream
+    // would frame the decoded body by the client's stale length. Refuse it
+    // and close, as Envoy does unless `allow_chunked_length` is set. hyper
+    // drops a `Content-Length` that follows `Transfer-Encoding`, so that
+    // order never reaches here (envoy-divergences.md).
+    if req.headers().contains_key(http::header::TRANSFER_ENCODING)
+        && req.headers().contains_key(http::header::CONTENT_LENGTH)
+    {
+        return framing_error_response();
+    }
+
     let (parts, incoming) = req.into_parts();
     let mut headers = parts.headers;
+    // HCM with `proxy_100_continue` false (S2.6): hyper answers
+    // `100 Continue` to the h1 client itself when the body is first polled,
+    // so the expectation is met at this hop. Forwarding it would ask the
+    // upstream to answer it again, and one that does not support it may 417.
+    let expects_continue = headers
+        .get(http::header::EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+    if expects_continue {
+        headers.remove(http::header::EXPECT);
+    }
     // S9 rule 6, request direction, before any filter sees the head (Envoy
     // `mutateRequestHeaders`). hyper has already read `Connection: close`
     // to decide this downstream connection's fate; forwarding it would
@@ -1218,6 +1242,19 @@ where
         up_to_down = b_to_a_bytes,
         "upgrade tunnel closed"
     );
+}
+
+/// The codec-level `400` for a request whose framing is ambiguous.
+/// `connection: close` makes hyper close the connection after writing it,
+/// so no byte of the unread body is parsed as a next request.
+fn framing_error_response() -> Response<StreamBody> {
+    let body = local_boxed(http_body_util::Empty::<bytes::Bytes>::new().map_err(|e| match e {}));
+    Response::builder()
+        .status(http::StatusCode::BAD_REQUEST)
+        .header(http::header::CONNECTION, "close")
+        .header(http::header::CONTENT_LENGTH, "0")
+        .body(body)
+        .expect("static status and headers are valid")
 }
 
 /// Convert [`HttpResponseParts`] into a `hyper::Response<StreamBody>`. Split
