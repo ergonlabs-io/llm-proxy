@@ -412,6 +412,13 @@ static_resources:
             "the post-failure request must encounter closed capture admission: {scrape}"
         );
         assert!(scrape.contains("envoy_llmproxy_metadata_queue_depth 0"));
+        // The exit summary reports the loss loudly (ADR-0011 decision 2).
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status();
+        let summary = summary_line(&rx);
+        assert!(summary.contains("WARN"), "{summary}");
+        assert!(summary.contains("failed=1"), "{summary}");
         drop(child);
         let _ = std::fs::remove_file(&records_path);
         let _ = std::fs::remove_file(&config_path);
@@ -498,6 +505,22 @@ static_resources:
         2,
         "all completed requests must survive graceful shutdown"
     );
+    // Numbered in write order, and the exit summary names the same instance
+    // and last number, with nothing lost (ADR-0011 decision 2).
+    assert_eq!(records[0].record_seq, Some(1));
+    assert_eq!(records[1].record_seq, Some(2));
+    let summary = summary_line(&rx);
+    assert!(summary.contains(" INFO "), "{summary}");
+    for field in [
+        format!("instance_id={}", records[0].instance_id),
+        "last_record_seq=2".to_string(),
+        "written=2".to_string(),
+        "failed=0".to_string(),
+        "unwritten=0".to_string(),
+        "timed_out=false".to_string(),
+    ] {
+        assert!(summary.contains(&field), "{field} missing: {summary}");
+    }
     assert_ne!(records[0].request_id, records[1].request_id);
     for record in &records {
         assert_eq!(record.status, Some(200));
@@ -515,6 +538,44 @@ static_resources:
     }
     let _ = std::fs::remove_file(&records_path);
     let _ = std::fs::remove_file(&config_path);
+}
+
+/// The `metadata_delivery_summary` line from the proxy's stderr, with ANSI
+/// styling removed. Reads until the line arrives or stderr closes (bounded).
+fn summary_line(rx: &mpsc::Receiver<String>) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(line) => {
+                let plain = strip_ansi(&line);
+                if plain.contains("metadata_delivery_summary") {
+                    return plain;
+                }
+                seen.push_str(&plain);
+            }
+            Err(_) => panic!("no metadata_delivery_summary line; stderr:\n{seen}"),
+        }
+    }
+}
+
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI sequence: ESC '[' ... final byte in '@'..='~'.
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) && c != '[' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn chrono_timestamp_is_rfc3339(value: &str) -> bool {

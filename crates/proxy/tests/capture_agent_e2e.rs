@@ -340,7 +340,11 @@ fn declarative_capture_reload_and_emergency_gate_on_keepalive() {
         .iter()
         .map(|record| serde_json::from_slice(&record.payload).unwrap())
         .collect();
-    for (record, version) in records.iter().zip(["first", "second", "third"]) {
+    for ((record, version), seq) in records.iter().zip(["first", "second", "third"]).zip(1..) {
+        // Numbered by capture delivery in arrival order; a disabled request
+        // is never admitted, so it leaves no gap (ADR-0011 decision 2).
+        assert_eq!(record.record_seq, Some(seq), "{record:?}");
+        assert_eq!(record.instance_id, records[0].instance_id);
         let pinned = record.capture_policy_version.as_deref().unwrap();
         assert!(pinned.starts_with(&format!("{version}:")));
         assert_eq!(pinned.rsplit(':').next().unwrap().len(), 64);

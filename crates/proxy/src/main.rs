@@ -1403,11 +1403,10 @@ async fn run_serve(
         publisher.shutdown();
         publisher.join_async().await;
         if let Some(delivery) = metadata_delivery {
-            let summary = delivery.shutdown(Duration::from_secs(5)).await;
-            tracing::warn!(
-                ?summary,
-                "metadata delivery stopped after listener startup failure"
-            );
+            delivery
+                .shutdown(Duration::from_secs(5))
+                .await
+                .log("listener startup failure");
         }
         if let Some(delivery) = capture_delivery {
             let _ = delivery.shutdown(Duration::from_secs(1)).await;
@@ -1653,11 +1652,7 @@ async fn run_serve(
             } else {
                 Duration::from_secs(5)
             };
-            let summary = delivery.shutdown(budget).await;
-            tracing::info!(
-                ?summary,
-                "metadata delivery stopped; file writes do not imply durability"
-            );
+            delivery.shutdown(budget).await.log("shutdown");
         }
 
         // Workers have dropped their senders. Flush remaining traces before taking
