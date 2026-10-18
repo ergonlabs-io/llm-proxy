@@ -560,3 +560,129 @@ async fn an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_c
         })
         .await;
 }
+
+/// Upstream that streams a chunked SSE response: one event, then the rest once
+/// `gate` hands out a permit. `arrived` fires after the first event is written.
+async fn spawn_streaming_upstream() -> (SocketAddr, Arc<Semaphore>, mpsc::UnboundedReceiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    let (arrived_tx, arrived) = mpsc::unbounded_channel();
+    let gate_for_task = gate.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let gate = gate_for_task.clone();
+            let arrived_tx = arrived_tx.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let first = b"data: one\n\n";
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                             Transfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                            first.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let _ = socket.write_all(first).await;
+                let _ = socket.write_all(b"\r\n").await;
+                let _ = arrived_tx.send(());
+                gate.acquire().await.unwrap().forget();
+                let last = b"data: [DONE]\n\n";
+                let _ = socket
+                    .write_all(format!("{:x}\r\n", last.len()).as_bytes())
+                    .await;
+                let _ = socket.write_all(last).await;
+                let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (address, gate, arrived)
+}
+
+/// A drain that starts while a response body is mid-stream must let the stream
+/// finish: the connection stays registered (so `drain_worker` keeps waiting)
+/// and the client receives the final event.
+async fn a_streaming_response_survives_drain_start(request: &'static [u8]) {
+    LocalSet::new()
+        .run_until(async {
+            let (upstream, gate, mut arrived) = spawn_streaming_upstream().await;
+            let port = reserve_port();
+            let worker = start_worker(snapshot_for(&[port], upstream.port(), 1)).await;
+
+            let mut client = TcpStream::connect(addr(port)).await.unwrap();
+            client.write_all(request).await.unwrap();
+            tokio::time::timeout(WAIT, arrived.recv())
+                .await
+                .expect("first event must leave the upstream")
+                .unwrap();
+            // Read until the first event reaches the client: the body is mid-stream.
+            let mut received = Vec::new();
+            let mut buf = [0u8; 4096];
+            tokio::time::timeout(WAIT, async {
+                while !String::from_utf8_lossy(&received).contains("data: one") {
+                    let n = client.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0, "closed before the first event");
+                    received.extend_from_slice(&buf[..n]);
+                }
+            })
+            .await
+            .expect("first event must reach the client");
+
+            worker.start_drain();
+            assert_connect_refused(addr(port)).await;
+            // Held past the point where a drain-start cut would have landed.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(
+                worker.registry.live(),
+                1,
+                "the streaming connection must stay registered"
+            );
+
+            gate.add_permits(1);
+            tokio::time::timeout(WAIT, client.read_to_end(&mut received))
+                .await
+                .expect("connection must end after the stream")
+                .unwrap();
+            let text = String::from_utf8_lossy(&received);
+            assert!(text.contains("data: [DONE]"), "stream was cut: {text}");
+            worker.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_alive_stream_survives_drain_start() {
+    a_streaming_response_survives_drain_start(
+        b"POST /v1 HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    .await;
+}
+
+/// nginx `proxy_pass` without upstream keepalive sends `Connection: close`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_close_stream_survives_drain_start() {
+    a_streaming_response_survives_drain_start(
+        b"POST /v1 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    .await;
+}
+
+/// nginx `proxy_pass` defaults to HTTP/1.0 upstream.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_http10_stream_survives_drain_start() {
+    a_streaming_response_survives_drain_start(
+        b"POST /v1 HTTP/1.0\r\nHost: t\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    .await;
+}
