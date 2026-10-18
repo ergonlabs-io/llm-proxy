@@ -183,6 +183,21 @@
           "description": "The longest a request may live, from receipt to the last response byte, however active the stream is. A cut stream that has already started answering ends without a clean finish. Default: no limit. `0s` also means no limit. Lowers to the HTTP connection manager's `common_http_protocol_options.max_stream_duration`.",
           "$ref": "#/$defs/Duration"
         },
+        "max_request_headers_kb": {
+          "description": "The largest request head accepted, in KiB. The head is the request line, every header line and the blank line that ends them. A larger head gets `431` and the connection is closed. Default: 60 (Envoy's default). Raise it if clients send very large cookies or tokens. Applies to HTTP/1.1 clients only; HTTP/2 clients are not limited by it. Lowers to the HTTP connection manager's `max_request_headers_kb`.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192,
+          "default": 60,
+          "examples": [96]
+        },
+        "max_request_headers_count": {
+          "description": "The most headers a request may carry. A request with more gets `431` and the connection is closed. Default: 100 (Envoy's default). Applies to HTTP/1.1 clients only; HTTP/2 clients are not limited by it. Lowers to the HTTP connection manager's `common_http_protocol_options.max_headers_count`.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 100,
+          "examples": [200]
+        },
         "tls": {
           "description": "Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.",
           "type": "object",

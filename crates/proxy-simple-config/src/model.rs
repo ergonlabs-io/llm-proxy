@@ -224,6 +224,14 @@ pub struct ListenerSpec {
     /// however active it is. Unset means no limit.
     #[serde(default)]
     pub max_stream_duration: Option<SimpleDuration>,
+    /// The largest request head (request line and headers) accepted, in KiB.
+    /// Unset means Envoy's 60; must be in 1..=8192. A larger head gets `431`.
+    #[serde(default)]
+    pub max_request_headers_kb: Option<u32>,
+    /// The most headers a request may carry. Unset means Envoy's 100; must be
+    /// greater than 0. More gets `431`.
+    #[serde(default)]
+    pub max_request_headers_count: Option<u32>,
 }
 
 /// Safe edge-proxy defaults for the admission limits, from Envoy's edge

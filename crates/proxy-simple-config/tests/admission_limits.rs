@@ -164,3 +164,53 @@ fn zero_disables_the_stream_limits() {
     assert_eq!(stream_limits(&snapshot(&text).unwrap()), expected);
     assert_eq!(stream_limits(&snapshot_via_translate(&text)), expected);
 }
+
+/// (max request head KiB, max header count) from the IR.
+fn head_limits(s: &ConfigSnapshot) -> (u32, u32) {
+    let listener = &s.listeners["llmproxy_listener"];
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM");
+    };
+    (hcm.max_request_headers_kb, hcm.max_headers_count)
+}
+
+/// Unlike the timeouts, the dialect keeps Envoy's own head limits.
+#[test]
+fn request_head_limits_default_to_envoys() {
+    let text = config_with_listen(r#""127.0.0.1:8080""#);
+    assert_eq!(head_limits(&snapshot(&text).unwrap()), (60, 100));
+    assert_eq!(head_limits(&snapshot_via_translate(&text)), (60, 100));
+}
+
+/// Set beside `max_stream_duration`, which shares
+/// `common_http_protocol_options`, so neither may overwrite the other.
+#[test]
+fn request_head_limits_overrides_are_honored() {
+    let text = config_with_listen(
+        r#"{ address: "127.0.0.1:8080", max_request_headers_kb: 96, max_request_headers_count: 40, max_stream_duration: 30m }"#,
+    );
+    for s in [snapshot(&text).unwrap(), snapshot_via_translate(&text)] {
+        assert_eq!(head_limits(&s), (96, 40));
+        assert_eq!(stream_limits(&s).1, secs(1800));
+    }
+}
+
+#[test]
+fn request_head_limits_out_of_range_are_rejected_with_path() {
+    for (field, value) in [
+        ("max_request_headers_kb", 0),
+        ("max_request_headers_kb", 8193),
+        ("max_request_headers_count", 0),
+    ] {
+        let text = config_with_listen(&format!(
+            r#"{{ address: "127.0.0.1:8080", {field}: {value} }}"#
+        ));
+        let err = parse_simple_config_with_env(&text, &test_env).unwrap_err();
+        let path = format!("listen.{field}");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field_path, .. } if *field_path == path),
+            "{field}: {value}: got {err}"
+        );
+    }
+}
