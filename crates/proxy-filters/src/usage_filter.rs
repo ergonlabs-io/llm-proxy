@@ -928,6 +928,26 @@ impl UsageStats {
     }
 }
 
+/// Convert a [`TokenUsage`] into the [`LlmTokenUsage`] that `StreamInfo`
+/// carries. All four cost buckets cross the boundary intact — dropping the
+/// cache buckets would leave anything downstream (billing, the token
+/// limiter) unable to compute a correct cost, since the buckets are priced
+/// differently.
+///
+/// A function, not a `From` impl: `TokenUsage` lives in proxy-control and
+/// `LlmTokenUsage` in proxy-http, and Rust's orphan rule allows the impl only
+/// in the crate that defines one of them. Neither crate depends on the other.
+/// This is what `stream_info.rs`'s doc comment on `LlmTokenUsage` means by
+/// "the usage filter converts at its boundary".
+fn llm_token_usage(usage: TokenUsage) -> LlmTokenUsage {
+    LlmTokenUsage {
+        input_tokens: usage.input_tokens,
+        cached_tokens: usage.cached_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
+        output_tokens: usage.output_tokens,
+    }
+}
+
 /// [`HttpFilterFactory`] for [`TYPE_URL`].
 #[derive(Default)]
 pub struct UsageFilterFactory;
@@ -1675,7 +1695,7 @@ impl UsageFilterInstance {
         // `None` must stay `None` here — never write `Some(0, 0)` for a
         // response that reported no usage at all (this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
-        stream_info.llm.usage = usage.map(LlmTokenUsage::from);
+        stream_info.llm.usage = usage.map(llm_token_usage);
         // The card is evaluated only after the terminal usage extractor has
         // seen the complete response. In particular, an SSE stream's partial
         // chunks cannot create a provisional price that later changes.

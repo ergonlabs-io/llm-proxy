@@ -94,12 +94,14 @@ LAYERS = {
     "proxy-xds": 3,
     "proxy-cluster": 3,
     "proxy-capture-agent": 3,
+    # The HTTP data plane and the control plane share a layer, so neither
+    # may depend on the other; proxy-filters joins them.
     "proxy-http": 4,
-    "proxy-control": 5,
-    "proxy-filters": 6,
-    "proxy-core": 7,
-    "proxy-admin": 8,
-    "proxy": 9,
+    "proxy-control": 4,
+    "proxy-filters": 5,
+    "proxy-core": 6,
+    "proxy-admin": 7,
+    "proxy": 8,
 }
 
 # AGENTS.md invariant 2: generated protos stay inside proxy-config and

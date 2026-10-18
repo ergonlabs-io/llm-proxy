@@ -2059,7 +2059,6 @@ dependencies = [
  "http",
  "proxy-config",
  "proxy-credentials",
- "proxy-http",
  "proxy-observability",
  "rand",
  "redb",

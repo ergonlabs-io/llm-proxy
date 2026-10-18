@@ -56,7 +56,7 @@ class LayeringTest(unittest.TestCase):
 
     def test_upward_edge_fails(self):
         self.crate("proxy-http", deps={"proxy-core": "{ workspace = true }"})
-        self.assert_one("proxy-http (L4) [dependencies] proxy-core (L7)")
+        self.assert_one("proxy-http (L4) [dependencies] proxy-core (L6)")
 
     def test_same_layer_edge_fails(self):
         self.crate("proxy-xds")
@@ -75,12 +75,12 @@ class LayeringTest(unittest.TestCase):
             [target.'cfg(unix)'.dependencies]
             proxy-core = { workspace = true }
         """)
-        self.assert_one("proxy-config (L2) [dependencies] proxy-core (L7)")
+        self.assert_one("proxy-config (L2) [dependencies] proxy-core (L6)")
 
     def test_renamed_dependency_is_checked(self):
         self.crate("proxy-http",
                    deps={"core": '{ package = "proxy-core", path = "../proxy-core" }'})
-        self.assert_one("proxy-http (L4) [dependencies] core (L7)")
+        self.assert_one("proxy-http (L4) [dependencies] core (L6)")
 
     def test_upward_dev_dependency_passes(self):
         self.crate("proxy-config", dev={"proxy-core": "{ workspace = true }"})

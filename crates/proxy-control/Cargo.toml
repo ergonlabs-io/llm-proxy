@@ -18,9 +18,6 @@ arc-swap = { workspace = true }
 proxy-config = { workspace = true }
 # The BYOK types the snapshot carries; the router reads the same types.
 proxy-credentials = { workspace = true }
-# The BYOK types in `proxy_http::tenant_credentials`, which the router also
-# reads.
-proxy-http = { workspace = true }
 proxy-observability = { workspace = true }
 http = { workspace = true }
 # Virtual-key authentication (HMAC-SHA256 + constant-time
