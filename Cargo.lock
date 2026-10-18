@@ -1984,6 +1984,7 @@ dependencies = [
  "arc-swap",
  "chrono",
  "futures",
+ "http",
  "proxy-config",
  "rand",
  "serde",
@@ -1997,6 +1998,7 @@ dependencies = [
 name = "proxy-config"
 version = "0.4.1"
 dependencies = [
+ "base64",
  "bytes",
  "http",
  "prost",
@@ -2006,6 +2008,7 @@ dependencies = [
  "proxy-filters",
  "proxy-observability",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "serde_path_to_error",

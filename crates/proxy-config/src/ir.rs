@@ -2182,9 +2182,12 @@ pub enum DataSourceIR {
 /// cluster selected for an upstream attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCredential {
-    /// OAuth2 bearer token published by control-side credential work. The
-    /// request worker never mints or refreshes this value.
+    /// A configured OAuth2 bearer token, applied as is. Nothing refreshes it.
     VertexOAuth2 { access_token: String },
+    /// An OAuth2 access token the cluster mints with the RFC 7523 JWT-bearer
+    /// grant and refreshes before it expires (ADR-0005, amendment 2026-10-17).
+    /// Workers apply the last published token and never mint one.
+    OAuth2JwtBearer(OAuth2JwtBearer),
     /// AWS Signature Version 4 credentials. Signing happens after body and
     /// route transforms, on the final per-attempt request.
     BedrockSigV4 {
@@ -2193,6 +2196,77 @@ pub enum ProviderCredential {
         secret_access_key: String,
         session_token: Option<String>,
     },
+}
+
+/// RFC 7523 JWT-bearer grant settings. Every value is config: the code knows
+/// no provider's token URL or scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuth2JwtBearer {
+    /// Cluster the token endpoint is dialled through, as in Envoy's
+    /// `HttpUri.cluster`.
+    pub token_cluster: String,
+    /// Absolute token endpoint URL. Its authority is the `Host` header and its
+    /// path is the request target.
+    pub token_url: String,
+    /// JWT `iss`, for example a service account's email address.
+    pub issuer: String,
+    /// JWT `sub`, when the grant impersonates another principal.
+    pub subject: Option<String>,
+    /// JWT header `kid`, naming the signing key to the token endpoint.
+    pub key_id: Option<String>,
+    pub private_key: RsaSigningKey,
+    /// Joined with spaces into the JWT `scope` claim.
+    pub scopes: Vec<String>,
+    /// JWT `aud`; the token URL unless configured.
+    pub audience: String,
+    /// `exp - iat` of each assertion.
+    pub assertion_lifetime: std::time::Duration,
+    /// How long before a token's expiry the next one is minted.
+    pub refresh_before: std::time::Duration,
+    /// Bounds one token request, connect included.
+    pub request_timeout: std::time::Duration,
+}
+
+/// An RSA private key in PKCS#8 DER, checked when config is loaded. `Debug`
+/// prints no key material.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RsaSigningKey(Vec<u8>);
+
+impl RsaSigningKey {
+    /// Parses one PKCS#8 PEM private key and checks that it is an RSA key
+    /// `ring` can sign RS256 with (2048 to 8192 bits).
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, String> {
+        use base64::Engine as _;
+        const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
+        const END: &str = "-----END PRIVATE KEY-----";
+        if pem.contains("-----BEGIN RSA PRIVATE KEY-----") {
+            return Err("is a PKCS#1 key (BEGIN RSA PRIVATE KEY); convert it with \
+                 `openssl pkcs8 -topk8 -nocrypt`"
+                .to_string());
+        }
+        let body = pem
+            .split_once(BEGIN)
+            .and_then(|(_, rest)| rest.split_once(END))
+            .map(|(body, _)| body)
+            .ok_or_else(|| format!("contains no `{BEGIN}` block"))?;
+        let base64: String = body.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(base64)
+            .map_err(|e| format!("is not valid PEM: {e}"))?;
+        ring::signature::RsaKeyPair::from_pkcs8(&der)
+            .map_err(|e| format!("is not a usable RSA signing key: {e}"))?;
+        Ok(Self(der))
+    }
+
+    pub fn pkcs8_der(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RsaSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RsaSigningKey(<redacted>)")
+    }
 }
 
 /// One provider-owned logical-to-upstream model mapping. Kept on the cluster

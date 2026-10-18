@@ -23,8 +23,14 @@ pub(crate) trait CredentialProvider {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("provider credential could not be applied")]
-pub(crate) struct CredentialProviderError;
+pub(crate) enum CredentialProviderError {
+    #[error("provider credential could not be applied")]
+    Failed,
+    /// A minted-token cluster has no unexpired token published. Fails closed
+    /// (ADR-0005, amendment 2026-10-17).
+    #[error("no unexpired minted token is published for this provider")]
+    TokenUnavailable,
+}
 
 /// Applies configured static credential headers.
 pub(crate) struct StaticHeaderCredentials<'a> {
@@ -36,6 +42,8 @@ pub(crate) struct StaticHeaderCredentials<'a> {
 pub(crate) struct ProviderCredentials<'a> {
     runtime: Option<&'a proxy_config::ir::ProviderRuntimeConfig>,
     headers: &'a [proxy_config::ir::HeaderMutation],
+    /// The cluster's published token cell, for an `OAuth2JwtBearer` credential.
+    minted: Option<&'a proxy_cluster::minted_credential::MintedCredential>,
     /// Tenant mode (ADR-0007): the cluster's slot and the tenant's secret for
     /// it. Written last, over whatever the operator credential set.
     tenant: Option<(
@@ -52,8 +60,18 @@ impl<'a> ProviderCredentials<'a> {
         Self {
             runtime,
             headers,
+            minted: None,
             tenant: None,
         }
+    }
+
+    /// The selected cluster's token cell; read, never refreshed, here.
+    pub(crate) fn with_minted(
+        mut self,
+        minted: Option<&'a proxy_cluster::minted_credential::MintedCredential>,
+    ) -> Self {
+        self.minted = minted;
+        self
     }
 
     /// Overwrite the slot's header with the tenant's secret after the
@@ -84,8 +102,18 @@ impl CredentialProvider for ProviderCredentials<'_> {
                 None => Ok(()),
                 Some(proxy_config::ir::ProviderCredential::VertexOAuth2 { access_token }) => {
                     let value = format!("Bearer {access_token}");
-                    let value =
-                        http::HeaderValue::from_str(&value).map_err(|_| CredentialProviderError)?;
+                    let value = http::HeaderValue::from_str(&value)
+                        .map_err(|_| CredentialProviderError::Failed)?;
+                    request.headers.insert("authorization", value);
+                    Ok(())
+                }
+                Some(proxy_config::ir::ProviderCredential::OAuth2JwtBearer(_)) => {
+                    // No token, or an expired one: fail closed rather than
+                    // send the request unauthenticated or wait for a mint.
+                    let value = self
+                        .minted
+                        .and_then(|minted| minted.bearer(std::time::Instant::now()))
+                        .ok_or(CredentialProviderError::TokenUnavailable)?;
                     request.headers.insert("authorization", value);
                     Ok(())
                 }
@@ -106,13 +134,13 @@ impl CredentialProvider for ProviderCredentials<'_> {
             applied?;
             if let Some((slot, secret)) = self.tenant {
                 let name = http::HeaderName::from_bytes(slot.header.as_bytes())
-                    .map_err(|_| CredentialProviderError)?;
+                    .map_err(|_| CredentialProviderError::Failed)?;
                 let mut value = http::HeaderValue::from_str(&format!(
                     "{}{}",
                     slot.value_prefix,
                     secret.expose()
                 ))
-                .map_err(|_| CredentialProviderError)?;
+                .map_err(|_| CredentialProviderError::Failed)?;
                 // Prevent credential exposure through HPACK indexing or Debug.
                 value.set_sensitive(true);
                 // ADR-0007 decision 5 and AGENTS.md invariant 6: clear every
@@ -162,25 +190,25 @@ fn sign_bedrock_request_at(
     let payload_hash = hex_digest(body);
     request.headers.insert(
         "x-amz-date",
-        http::HeaderValue::from_str(timestamp).map_err(|_| CredentialProviderError)?,
+        http::HeaderValue::from_str(timestamp).map_err(|_| CredentialProviderError::Failed)?,
     );
     request.headers.insert(
         "x-amz-content-sha256",
-        http::HeaderValue::from_str(&payload_hash).map_err(|_| CredentialProviderError)?,
+        http::HeaderValue::from_str(&payload_hash).map_err(|_| CredentialProviderError::Failed)?,
     );
     if let Some(token) = session_token {
         request.headers.insert(
             "x-amz-security-token",
-            http::HeaderValue::from_str(token).map_err(|_| CredentialProviderError)?,
+            http::HeaderValue::from_str(token).map_err(|_| CredentialProviderError::Failed)?,
         );
     }
 
     let host = request
         .headers
         .get(http::header::HOST)
-        .ok_or(CredentialProviderError)?
+        .ok_or(CredentialProviderError::Failed)?
         .to_str()
-        .map_err(|_| CredentialProviderError)?;
+        .map_err(|_| CredentialProviderError::Failed)?;
     let canonical_uri = if request.uri.path().is_empty() {
         "/"
     } else {
@@ -226,7 +254,7 @@ fn sign_bedrock_request_at(
     );
     request.headers.insert(
         "authorization",
-        http::HeaderValue::from_str(&authorization).map_err(|_| CredentialProviderError)?,
+        http::HeaderValue::from_str(&authorization).map_err(|_| CredentialProviderError::Failed)?,
     );
     Ok(())
 }

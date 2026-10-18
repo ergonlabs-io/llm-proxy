@@ -17,6 +17,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use proxy_config::ir::{
     ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, LbPolicy,
+    ProviderCredential,
 };
 use tokio::task::JoinHandle;
 
@@ -24,6 +25,7 @@ use crate::discovery::{self, RefreshSchedule};
 use crate::health_check::HealthCheckEngine;
 use crate::host_set::{carry_over_health_flags, diff_host_sets, HostSet, HostSetDiff};
 use crate::load_balancer::{self, HostPicker, LbError};
+use crate::minted_credential::MintedCredential;
 use crate::outlier::{OutlierDetector, RequestResult, TracingEventSink};
 use crate::resolver::HostResolver;
 use crate::transport::{
@@ -128,6 +130,9 @@ struct ManagedCluster {
     /// Set by [`ClusterManager::start_dns_refresh`] once the cluster is behind its `Arc`, since the task
     /// holds only a `Weak`. Aborted on `Drop`; the task also ends once its `Weak` stops upgrading.
     dns_refresh_task: Mutex<Option<JoinHandle<()>>>,
+    /// The published token for an `OAuth2JwtBearer` credential, or `None` for every other credential. Only the
+    /// cluster's refresher writes it; workers read it through [`ClusterEntry::minted_credential`].
+    minted: Option<Arc<MintedCredential>>,
 }
 
 impl Drop for ManagedCluster {
@@ -176,6 +181,16 @@ impl ManagedCluster {
         match &config.kind {
             ClusterKind::Endpoints => {
                 let policy = load_balancer::build(config.lb_policy)?;
+                let minted = match config
+                    .provider_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.credential.as_ref())
+                {
+                    Some(ProviderCredential::OAuth2JwtBearer(_)) => {
+                        Some(Arc::new(MintedCredential::new(&config.name)))
+                    }
+                    _ => None,
+                };
                 let transport = transport_builder(&config)?;
                 // Read and map the IR enum before `config` moves into `source`.
                 let upstream_protocol = UpstreamProtocol::from(config.upstream_protocol);
@@ -215,6 +230,7 @@ impl ManagedCluster {
                     outlier_detector,
                     outlier_sweep: Mutex::new(outlier_sweep),
                     dns_refresh_task: Mutex::new(None),
+                    minted,
                 })
             }
             ClusterKind::Aggregate { .. } => {
@@ -247,6 +263,8 @@ impl ManagedCluster {
                     // An aggregate resolves nothing itself; its members
                     // each run their own refresh.
                     dns_refresh_task: Mutex::new(None),
+                    // Credentials live on the member actually dialled (AGENTS.md invariant 6).
+                    minted: None,
                 })
             }
         }
@@ -998,6 +1016,10 @@ impl ClusterEntry for ClusterHandle {
 
     fn provider_runtime(&self) -> Option<&proxy_config::ir::ProviderRuntimeConfig> {
         self.managed.config.provider_runtime.as_ref()
+    }
+
+    fn minted_credential(&self) -> Option<&MintedCredential> {
+        self.managed.minted.as_deref()
     }
 
     fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect> {
