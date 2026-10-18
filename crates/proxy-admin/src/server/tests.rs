@@ -18,17 +18,17 @@ use proxy_config::ir::{
     LbPolicy, ListenerConfig, NetworkFilterSpec, PathMatch, RouteActionIR, RouteEntry,
     RouteMatcher, RouteTable, SnapshotVersion, UpstreamProtocol, VirtualHostIR,
 };
-use proxy_core::lifecycle::LifecycleState;
-use proxy_core::runtime::SnapshotHandles;
-use proxy_filters::auth::{
+use proxy_control::auth::{
     AuthError, AuthOutcome, Authenticator, HmacSecret, KeyId, KeySet, TenantId,
     VirtualKeyAuthenticator,
 };
+use proxy_control::control::{ControlPlane, InMemoryControlPlaneStore};
+use proxy_control::model_authz::ModelAccess;
+use proxy_control::spend::{Charge, MicroUsd, Period};
+use proxy_core::lifecycle::LifecycleState;
+use proxy_core::runtime::SnapshotHandles;
 use proxy_filters::auth_filter;
 use proxy_filters::body_rewrite_filter::MODEL_HEADER_NAME;
-use proxy_filters::control::{ControlPlane, InMemoryControlPlaneStore};
-use proxy_filters::model_authz::ModelAccess;
-use proxy_filters::spend::{Charge, MicroUsd, Period};
 use proxy_http::filter::SharedFactoryState;
 use proxy_observability::stats::{
     instruments, prometheus_render, Registry, StatsControl, WorkerId,
@@ -699,7 +699,7 @@ fn register_control_plane(
     scope: &str,
     stat_prefix: &str,
     hmac_secret: &[u8],
-) -> Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>> {
+) -> Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>> {
     let control_plane = ControlPlane::new(
         Box::new(InMemoryControlPlaneStore::default()),
         HmacSecret::new(hmac_secret),
@@ -721,7 +721,7 @@ fn register_control_plane(
 /// unambiguously; the scoped form resolves it by name).
 fn factory_state_with_control_plane() -> (
     Arc<SharedFactoryState>,
-    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+    Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>>,
 ) {
     let factory_state = Arc::new(SharedFactoryState::default());
     let handle = register_control_plane(
@@ -779,8 +779,8 @@ fn register_spend_accumulator(
     scope: &str,
     stat_prefix: &str,
     default_period: Period,
-) -> Arc<proxy_filters::spend::SpendAccumulator> {
-    let accumulator = Arc::new(proxy_filters::spend::SpendAccumulator::new(
+) -> Arc<proxy_control::spend::SpendAccumulator> {
+    let accumulator = Arc::new(proxy_control::spend::SpendAccumulator::new(
         stat_prefix.to_string(),
         Arc::new(InMemoryControlPlaneStore::default()),
         default_period,
@@ -810,8 +810,8 @@ fn factory_state_with_control_plane_and_spend(
     default_period: Period,
 ) -> (
     Arc<SharedFactoryState>,
-    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
-    Arc<proxy_filters::spend::SpendAccumulator>,
+    Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>>,
+    Arc<proxy_control::spend::SpendAccumulator>,
 ) {
     let (factory_state, handle) = factory_state_with_control_plane();
     let accumulator = register_spend_accumulator(
@@ -838,7 +838,7 @@ const TEST_CHAIN_STAT_PREFIX: &str = "test-chain";
 /// mint/revoke test uses to prove a write actually reached the published
 /// snapshot, the same way `crate::control`'s own tests do.
 fn test_authenticator(
-    handle: Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+    handle: Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>>,
 ) -> VirtualKeyAuthenticator {
     VirtualKeyAuthenticator::new(HmacSecret::new(TEST_HMAC_SECRET), handle)
 }
@@ -1861,7 +1861,7 @@ async fn delete_keys_revokes_and_snapshot_reflects_it() {
 }
 
 /// `POST /tenants` -> 201, `DELETE /tenants/{id}` -> 204. `ControlPlaneSnapshot`
-/// itself carries no tenant list (see `proxy_filters::control`'s own tests
+/// itself carries no tenant list (see `proxy_control::control`'s own tests
 /// for the same limitation, from inside that crate) -- a policy attached to
 /// the tenant is the one per-tenant fact the published snapshot does expose,
 /// so it stands in here as the observable signal that both writes actually
@@ -2017,7 +2017,7 @@ async fn put_policy_all_and_only_are_reflected_and_empty_only_stays_only() {
             .unwrap()
             .model_access,
         Some(ModelAccess::Only(vec![
-            proxy_filters::model_authz::ModelPattern::new("gpt-4*")
+            proxy_control::model_authz::ModelPattern::new("gpt-4*")
         ]))
     );
 
@@ -2295,7 +2295,7 @@ async fn put_budget_and_put_policy_do_not_clobber_each_other() {
     assert_eq!(
         policy.model_access,
         Some(ModelAccess::Only(vec![
-            proxy_filters::model_authz::ModelPattern::new("gpt-4*")
+            proxy_control::model_authz::ModelPattern::new("gpt-4*")
         ])),
         "PUT .../budget must not clobber the tenant's already-set policy"
     );

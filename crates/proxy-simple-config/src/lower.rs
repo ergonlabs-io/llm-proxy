@@ -1949,7 +1949,7 @@ fn provider_headers_to_add(
 /// catch-all" (two rules to remember) into one: sort prefixes by descending
 /// length, and the empty one sorts last for free. See `model_catalog_order`.
 ///
-/// **Shared semantics, not shared code.** `proxy_filters::model_authz::ModelPattern`
+/// **Shared semantics, not shared code.** `proxy_control::model_authz::ModelPattern`
 /// (per-tenant model allow-lists) matches trailing-`*` globs with
 /// the identical rule -- exact, or `prefix*` via `str::starts_with`. This
 /// crate cannot depend on `proxy-filters` in production code (it is a
@@ -2668,7 +2668,7 @@ fn lower_limits(config: &SimpleConfig) -> Result<Option<Value>, ConfigError> {
 }
 
 /// An exact model name, or a name with a single trailing `*`. Mirrors
-/// `proxy_filters::model_authz::ModelPattern::is_valid`, which this crate
+/// `proxy_control::model_authz::ModelPattern::is_valid`, which this crate
 /// cannot call (`proxy-filters` is a dev-dependency only).
 fn is_valid_limit_model_pattern(pattern: &str) -> bool {
     !pattern.is_empty()

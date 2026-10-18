@@ -6,7 +6,7 @@ use super::*;
 async fn server() -> (
     AdminServer,
     SocketAddr,
-    Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+    Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>>,
 ) {
     let (factory_state, handle) = factory_state_with_control_plane();
     let (server, addr) = start_full(

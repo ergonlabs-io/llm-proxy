@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::server::{MAX_ADMIN_BODY_BYTES, MAX_PRICING_BODY_BYTES};
-use proxy_filters::control::RedbControlPlaneStore;
+use proxy_control::control::RedbControlPlaneStore;
 use proxy_filters::usage_filter::UsageFilterFactory;
 use proxy_http::filter::{FactoryContext, HttpFilterFactory};
 

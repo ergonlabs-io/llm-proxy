@@ -134,8 +134,8 @@ impl TenantCredentialProbe for FakeProbe {
 /// Registers a `ControlPlane` that has (`with_kek`) or lacks key-encryption
 /// keys, under the standard test chain.
 fn factory_state_with_credential_plane(with_kek: bool) -> Arc<SharedFactoryState> {
-    use proxy_filters::control::CredentialKeys;
-    use proxy_filters::tenant_credential_crypto::{CredentialKek, KeyRing};
+    use proxy_control::control::CredentialKeys;
+    use proxy_control::tenant_credential_crypto::{CredentialKek, KeyRing};
 
     let keys = with_kek.then(|| {
         let kek = CredentialKek::from_bytes("k1", *b"0123456789abcdef0123456789abcdef").unwrap();

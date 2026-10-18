@@ -30,15 +30,15 @@ use hyper::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use proxy_control::auth::{KeyId, TenantId};
+use proxy_control::control::{ControlPlane, CredentialStoreError, LimitPolicy, StoreError};
+use proxy_control::model_authz::{ModelAccess, ModelPattern};
+use proxy_control::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
+use proxy_control::tenant_credential_crypto::TenantSecret;
 use proxy_core::lifecycle::LifecycleState;
 use proxy_core::WorkerConfigHandle;
 use proxy_credentials::CredentialSource;
-use proxy_filters::auth::{KeyId, TenantId};
-use proxy_filters::control::{ControlPlane, CredentialStoreError, LimitPolicy, StoreError};
-use proxy_filters::model_authz::{ModelAccess, ModelPattern};
-use proxy_filters::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
-use proxy_filters::tenant_credential_crypto::TenantSecret;
 use proxy_filters::usage_filter::{PricingRegistry, PublishError};
 use proxy_http::credential_probe::{
     CredentialProbeOutcome, CredentialProbeRequest, TenantCredentialProbe,
@@ -1800,7 +1800,7 @@ fn ledger_error(error: LedgerQueryError) -> Response<Full<Bytes>> {
 /// Extracts the bearer credential from `Authorization: Bearer <token>`.
 /// `None` for a missing header, a header that isn't valid UTF-8/ASCII, or
 /// any scheme other than exactly `Bearer ` (matching
-/// `proxy_filters::auth`'s own `BEARER_PREFIX` convention).
+/// `proxy_control::auth`'s own `BEARER_PREFIX` convention).
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
     value.strip_prefix("Bearer ").map(str::to_string)
@@ -1810,7 +1810,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 ///
 /// **Not `==`**, which short-circuits on the first differing byte and leaks the length of a matching prefix
 /// through timing. Also not `ring::constant_time::verify_slices_are_equal`: `ring` 0.17 deprecates it with the
-/// note that it makes no side-channel promises. `proxy_filters::auth` reached the same conclusion for the
+/// note that it makes no side-channel promises. `proxy_control::auth` reached the same conclusion for the
 /// data-plane key check.
 ///
 /// `ring::hmac::verify` does apply to a plain comparison. HMAC both values under one random key, and the
@@ -2016,7 +2016,7 @@ fn store_error_response(endpoint: &str, err: StoreError) -> Response<Full<Bytes>
 
 fn read_api_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<(), D::Error> {
     let version = <u32 as serde::Deserialize>::deserialize(de)?;
-    if version == proxy_filters::control::SPEND_SCHEMA_VERSION {
+    if version == proxy_control::control::SPEND_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(serde::de::Error::custom(format!(
@@ -2058,7 +2058,7 @@ struct SetPolicyRequest {
 ///
 /// `{"budget": {"max_usd": "500.00", "period": "monthly"}}` sets a ceiling;
 /// `{"budget": null}` clears it (reverts to unlimited) -- see
-/// [`proxy_filters::spend::TenantBudget`]'s doc for why "unlimited" and "a
+/// [`proxy_control::spend::TenantBudget`]'s doc for why "unlimited" and "a
 /// configured zero" must stay distinguishable. A flat two-shape body (a bare
 /// `{"max_usd": ..., "period": ...}` for set,
 /// vs. some other top-level shape for clear) would need its OWN sentinel to
@@ -2215,7 +2215,7 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
     let count = rendered.len();
     json(
         StatusCode::OK,
-        &serde_json::json!({ "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION, "keys": rendered, "count": count }),
+        &serde_json::json!({ "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION, "keys": rendered, "count": count }),
     )
 }
 
@@ -2261,8 +2261,8 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
         return bad_request("key_id must not be empty");
     }
     // Checked here for a 400 that names the field, and again in `ControlPlane::mint_key` for every other caller.
-    if let Err(reason) = proxy_filters::auth::check_principal_id("tenant", &tenant)
-        .and_then(|()| proxy_filters::auth::check_principal_id("key_id", &key_id))
+    if let Err(reason) = proxy_control::auth::check_principal_id("tenant", &tenant)
+        .and_then(|()| proxy_control::auth::check_principal_id("key_id", &key_id))
     {
         return bad_request(&reason);
     }
@@ -2280,7 +2280,7 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
             json(
                 StatusCode::CREATED,
                 &serde_json::json!({
-                    "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION,
+                    "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
                     "key_id": minted.key_id.as_str(),
                     "tenant": minted.tenant.as_str(),
                     "key": minted.plaintext,
@@ -3159,7 +3159,7 @@ fn handle_get_key_spend_route(
 /// This matches `spend_limit_filter`'s `decode_headers`, so the read reports the period enforcement checks.
 ///
 /// `spend_usd` comes from the integer `total_micros` via [`render_micro_usd`], never an `f64`. See
-/// `proxy_filters::spend`'s module doc.
+/// `proxy_control::spend`'s module doc.
 fn handle_get_spend(
     control_plane: &ControlPlane,
     accumulator: Option<Arc<SpendAccumulator>>,
@@ -3274,7 +3274,7 @@ fn handle_get_key_spend(
     json(
         StatusCode::OK,
         &serde_json::json!({
-            "schema_version": proxy_filters::control::SPEND_SCHEMA_VERSION,
+            "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
             "key_id": key_id.as_str(),
             "tenant": tenant.as_str(),
             "period": period_key.as_str(),
@@ -3302,7 +3302,7 @@ fn handle_get_key_spend(
 }
 
 /// Renders integer micro-dollars as a decimal string, e.g. `1_234` -> `"0.001234"`. Never goes through `f64`:
-/// `proxy_filters::spend` is integer-only by design (see its module doc), and this read must not be the first
+/// `proxy_control::spend` is integer-only by design (see its module doc), and this read must not be the first
 /// place that breaks.
 fn render_micro_usd(micros: u64) -> String {
     format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)

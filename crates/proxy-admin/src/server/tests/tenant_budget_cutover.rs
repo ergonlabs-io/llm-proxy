@@ -6,7 +6,7 @@
 //! crash-loop every replica. The write is refused up front instead.
 
 use super::*;
-use proxy_filters::control::ControlPlaneSnapshot;
+use proxy_control::control::ControlPlaneSnapshot;
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 
 const BUDGET: &str = r#"{"budget":{"max_usd":"5.00","period":"daily"}}"#;
@@ -18,7 +18,7 @@ type Handle = Arc<arc_swap::ArcSwap<ControlPlaneSnapshot>>;
 /// `with_cutover`, registered the way the filter factory registers it.
 fn chain(with_cutover: bool) -> (Arc<SharedFactoryState>, Handle) {
     let (factory_state, handle) = factory_state_with_control_plane();
-    let accumulator = Arc::new(proxy_filters::spend::SpendAccumulator::new(
+    let accumulator = Arc::new(proxy_control::spend::SpendAccumulator::new(
         TEST_CHAIN_STAT_PREFIX.to_string(),
         Arc::new(InMemoryControlPlaneStore::default()),
         Period::Daily,

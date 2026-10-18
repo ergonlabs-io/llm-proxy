@@ -1292,10 +1292,10 @@ fn build_hcm_handler(
         .get_or_try_init(
             context,
             "",
-            proxy_filters::window_usage::ROUTE_NAMES_KEY,
+            proxy_control::window_usage::ROUTE_NAMES_KEY,
             || {
                 Ok(
-                    Arc::new(proxy_filters::window_usage::ChainRouteNames::default())
+                    Arc::new(proxy_control::window_usage::ChainRouteNames::default())
                         as Arc<dyn std::any::Any + Send + Sync>,
                 )
             },
@@ -1304,7 +1304,7 @@ fn build_hcm_handler(
             context: context.to_string(),
             reason: format!("route names: {e}"),
         })?
-        .downcast::<proxy_filters::window_usage::ChainRouteNames>()
+        .downcast::<proxy_control::window_usage::ChainRouteNames>()
         .expect("the route-names singleton is always ChainRouteNames")
         .publish_from(&route_table);
     let mut filters: Vec<ConfiguredHttpFilter> = Vec::with_capacity(hcm.http_filters.len());
@@ -4853,10 +4853,10 @@ static_resources:
         factory_state
             .get(
                 "listener 'l1' filter_chains[0]",
-                proxy_filters::window_usage::ROUTE_NAMES_KEY,
+                proxy_control::window_usage::ROUTE_NAMES_KEY,
             )
             .expect("the chain publishes its route names")
-            .downcast::<proxy_filters::window_usage::ChainRouteNames>()
+            .downcast::<proxy_control::window_usage::ChainRouteNames>()
             .expect("the route-names singleton is always ChainRouteNames")
             .load()
             .as_ref()

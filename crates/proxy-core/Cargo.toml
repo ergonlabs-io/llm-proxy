@@ -15,6 +15,7 @@ hyper-util = { workspace = true }
 proxy-cluster = { workspace = true }
 # The usage/token filter, registered into the shared
 # FilterRegistry below so a `typed_config` can reach it.
+proxy-control = { workspace = true }
 proxy-filters = { workspace = true }
 proxy-xds = { workspace = true }
 arc-swap = { workspace = true }

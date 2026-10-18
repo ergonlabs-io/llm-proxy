@@ -11,7 +11,7 @@ const REJECTED_SCOPE: &str = "scope-SENTINEL-7b2e";
 
 /// The stored scope of `tenant`'s budget, read from the published snapshot.
 fn stored_tenant_scope(
-    handle: &Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+    handle: &Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>>,
     tenant: &str,
 ) -> Option<(MicroUsd, CredentialSource)> {
     handle
@@ -24,7 +24,7 @@ fn stored_tenant_scope(
 
 /// The stored scope of `key_id`'s budget, read from the published snapshot.
 fn stored_key_scope(
-    handle: &Arc<arc_swap::ArcSwap<proxy_filters::control::ControlPlaneSnapshot>>,
+    handle: &Arc<arc_swap::ArcSwap<proxy_control::control::ControlPlaneSnapshot>>,
     key_id: &str,
 ) -> Option<(MicroUsd, CredentialSource)> {
     handle
