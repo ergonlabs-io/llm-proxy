@@ -106,6 +106,7 @@ struct Rows {
     limits: Vec<(String, Vec<u8>)>,
     credentials: Vec<(String, Vec<u8>)>,
     rate_cards: Vec<(String, Vec<u8>)>,
+    trace_export: Vec<(String, Vec<u8>)>,
 }
 
 fn sample_credential() -> StoredTenantCredential {
@@ -152,7 +153,8 @@ fn sample_rate_card(chain: &str) -> StoredRateCard {
 
 impl Rows {
     /// Two tenants, three keys (one revoked), one policy, one budget, one
-    /// sealed credential and four rate card rows (three readable, one not):
+    /// sealed credential, four rate card rows (three readable, one not) and
+    /// five trace-export rows (two opted in, three that are not consent):
     /// a different count for most kinds, so a count reported under the wrong
     /// name cannot pass.
     fn sample() -> Rows {
@@ -203,6 +205,19 @@ impl Rows {
                 // A row no build could read: `load()` skips it and carries on.
                 ("chain-broken".into(), b"not a rate card row".to_vec()),
             ],
+            trace_export: vec![
+                ("tenant-a".into(), crate::control::encode_trace_export_row()),
+                ("tenant-b".into(), crate::control::encode_trace_export_row()),
+                ("tenant-x".into(), b"not an opt-in row".to_vec()),
+                (
+                    "tenant-y".into(),
+                    br#"{"schema_version":2,"enabled":true}"#.to_vec(),
+                ),
+                (
+                    "tenant-z".into(),
+                    br#"{"schema_version":1,"enabled":false}"#.to_vec(),
+                ),
+            ],
         }
     }
 
@@ -218,6 +233,7 @@ impl Rows {
             &self.limits,
             &self.credentials,
             &self.rate_cards,
+            &self.trace_export,
         ]
         .into_iter()
         .flatten()
@@ -226,10 +242,10 @@ impl Rows {
         tenants + hashes
     }
 
-    /// The `EXEC` reply to `load()`'s pipeline: an array of seven replies.
+    /// The `EXEC` reply to `load()`'s pipeline: an array of eight replies.
     fn exec_reply(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        array_len(&mut out, 7);
+        array_len(&mut out, 8);
         array_len(&mut out, self.tenants.len());
         for tenant in &self.tenants {
             bulk(&mut out, tenant.as_bytes());
@@ -242,6 +258,7 @@ impl Rows {
             &self.limits,
             &self.credentials,
             &self.rate_cards,
+            &self.trace_export,
         ] {
             array_len(&mut out, hash.len() * 2);
             for (field, value) in hash {
@@ -924,6 +941,7 @@ fn a_load_exports_its_duration_and_size_as_stats() {
             &rows.limits,
             &rows.credentials,
             &rows.rate_cards,
+            &rows.trace_export,
         ]
         .iter()
         .map(|hash| hash.len())
@@ -960,6 +978,11 @@ fn a_load_logs_its_duration_and_size_and_never_row_content() {
         3,
         "the unreadable rate card row is skipped, not fatal"
     );
+    assert_eq!(
+        loaded.trace_export,
+        HashSet::from([TenantId::new("tenant-a"), TenantId::new("tenant-b")]),
+        "only readable opted-in rows are consent; the others are skipped, not fatal"
+    );
 
     let events = capture.events();
     let load_lines: Vec<_> = events
@@ -980,6 +1003,7 @@ fn a_load_logs_its_duration_and_size_and_never_row_content() {
         ("limits", "1"),
         ("tenant_credentials", "1"),
         ("rate_cards", "4"),
+        ("trace_export", "5"),
     ] {
         assert_eq!(fields[field], want, "{field}");
     }
@@ -1050,7 +1074,7 @@ fn limits_write_and_clear_are_atomic_with_generation() {
 }
 
 #[test]
-fn deleting_a_tenant_includes_its_limits_hash_in_the_atomic_script() {
+fn deleting_a_tenant_includes_its_limits_and_opt_in_hashes_in_the_atomic_script() {
     let fake = FakeRedis::start();
     let store = fake.store();
     let mark = fake.wire_len();
@@ -1063,15 +1087,16 @@ fn deleting_a_tenant_includes_its_limits_hash_in_the_atomic_script() {
     assert_eq!(sent.len(), 1, "one script call: {sent:?}");
     let args = &sent[0].1;
     assert_eq!(args[0], "EVALSHA");
-    assert_eq!(args[2], "6");
+    assert_eq!(args[2], "7");
     assert_eq!(
-        args[3..9],
+        args[3..10],
         [
             "lanes:tenants",
             "lanes:policies",
             "lanes:budgets",
             "lanes:limits",
             "lanes:tenant_credentials",
+            "lanes:trace_export",
             "lanes:generation",
         ]
     );

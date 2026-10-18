@@ -3430,3 +3430,4 @@ mod ledger;
 mod limits;
 mod pricing;
 mod tenant_budget_cutover;
+mod trace_export;

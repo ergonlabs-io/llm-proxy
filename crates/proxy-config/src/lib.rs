@@ -15,6 +15,7 @@ pub mod ir;
 mod ledger;
 pub mod loader;
 pub mod lower;
+mod traces;
 pub mod validate;
 
 pub use error::{

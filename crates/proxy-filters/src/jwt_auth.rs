@@ -212,6 +212,9 @@ pub struct JwtAuthenticator {
     /// static seeds, which never go stale). See
     /// [`JwksSnapshot::is_stale`].
     max_stale: Option<Duration>,
+    /// Where a JWT tenant's trace-export opt-in is read. `None` (no control
+    /// plane, as in tests and static seeds) captures nothing.
+    trace_consent: Option<Arc<crate::auth::TraceConsent>>,
 }
 
 impl JwtAuthenticator {
@@ -224,12 +227,19 @@ impl JwtAuthenticator {
             subject_claim: config.subject_claim,
             expected_issuer: config.issuer,
             max_stale: None,
+            trace_consent: None,
         }
     }
 
     /// Shares a refreshable snapshot (see [`JwksSnapshot`]). `max_stale`
     /// must be `Some` for discovery snapshots so a snapshot whose refreshes
     /// stopped landing is refused rather than served forever.
+    /// Read trace-export consent through `consent` (ADR-0008 decision 2).
+    pub fn with_trace_consent(mut self, consent: Arc<crate::auth::TraceConsent>) -> Self {
+        self.trace_consent = Some(consent);
+        self
+    }
+
     pub fn new_shared(
         snapshot: Arc<ArcSwap<JwksSnapshot>>,
         config: JwtValidationConfig,
@@ -243,6 +253,7 @@ impl JwtAuthenticator {
             subject_claim: config.subject_claim,
             expected_issuer: config.issuer,
             max_stale,
+            trace_consent: None,
         }
     }
 }
@@ -409,8 +420,13 @@ impl Authenticator for JwtAuthenticator {
             .subject_claim
             .is_some()
             .then(|| key_id.as_str().to_owned());
+        let tenant = TenantId::new(tenant);
+        let trace_export = self
+            .trace_consent
+            .as_ref()
+            .is_some_and(|consent| consent.opted_in(&tenant));
         AuthOutcome::Authenticated(Principal {
-            tenant: TenantId::new(tenant),
+            tenant,
             // See the module doc's "`Principal::key_id` for a JWT" section.
             key_id,
             user_id,
@@ -420,7 +436,7 @@ impl Authenticator for JwtAuthenticator {
             // must not add a second load to reach tenant credentials.
             tenant_credentials: None,
             policy_generation: None,
-            trace_export: false,
+            trace_export,
         })
     }
 }
@@ -1247,6 +1263,65 @@ GdGIML90cFtpXr13uutgIg==
                 matches!(other, AuthOutcome::Rejected(_))
             ),
         }
+    }
+
+    /// ADR-0008 decision 2 for JWT tenants: the opt-in is read from the
+    /// control-plane snapshot, and past its staleness bound it is withheld
+    /// (counted), since the snapshot may still list a tenant that opted out
+    /// on another replica. The token stays valid either way.
+    #[test]
+    fn a_jwt_tenants_trace_export_opt_in_is_honoured_only_on_a_fresh_snapshot() {
+        use crate::auth::{HmacSecret, KeySet, TraceConsent};
+        use crate::control::{ControlPlane, InMemoryControlPlaneStore};
+
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::new()),
+            HmacSecret::new(b"s"),
+            KeySet::new(),
+        )
+        .unwrap();
+        cp.create_tenant(&TenantId::new("acme")).unwrap();
+        cp.set_trace_export(&TenantId::new("acme"), true).unwrap();
+        cp.freshness().set_max_staleness(Duration::from_secs(3600));
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let consent = Arc::new(TraceConsent::new(
+            cp.handle(),
+            cp.freshness(),
+            Some(control.registry()),
+        ));
+        let key = shared_test_key();
+        let auth =
+            authenticator_with_key(key, "key-1", default_config()).with_trace_consent(consent);
+        let opted_in = |tenant: &str| {
+            let token = build_jwt(
+                key,
+                &header_json("key-1"),
+                claims(&[("tenant", serde_json::json!(tenant))]).as_bytes(),
+            );
+            match auth.authenticate(&headers_with_bearer(&token)) {
+                AuthOutcome::Authenticated(principal) => principal.trace_export,
+                _ => panic!("a valid token must authenticate"),
+            }
+        };
+        let stale_count = || {
+            proxy_observability::stats::prometheus_render::render(&control.registry())
+                .lines()
+                .find(|l| l.starts_with("envoy_llmproxy_trace_consent_stale_total"))
+                .and_then(|l| l.rsplit(' ').next())
+                .map(str::to_owned)
+        };
+
+        assert!(opted_in("acme"));
+        assert!(!opted_in("other"), "a tenant without a row is not opted in");
+        cp.freshness().set_max_staleness(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(!opted_in("acme"), "a stale snapshot withholds the opt-in");
+        assert!(!opted_in("other"));
+        assert_eq!(
+            stale_count().as_deref(),
+            Some("1"),
+            "only the withheld opt-in counts"
+        );
     }
 
     // --- 23: a discovery snapshot past its staleness bound is Rejected,

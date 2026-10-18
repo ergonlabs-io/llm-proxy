@@ -1004,6 +1004,18 @@ async fn run_serve(
         },
     };
 
+    // Trace export (ADR-0008) is configured but has no exporter yet. Refuse to
+    // start rather than accept a block that records nothing (AGENTS.md
+    // invariant 1). The exporter replaces this block.
+    let running_traces = snapshot.traces.clone();
+    if running_traces.is_some() {
+        eprintln!(
+            "node.metadata[\"io.llmproxy.traces\"] (the dialect's observability.traces): \
+             trace export is not available in this build yet"
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Resolve operational health series even when exporters are disabled.
     // Only configured tracing creates a channel; its sender is owned by workers
     // so joining them closes the channel and triggers the final trace flush.
@@ -1437,6 +1449,7 @@ async fn run_serve(
                         &stat_handle_tables_for_reload,
                         capture_supervisor.as_ref().map(|s|(s,concurrency)),
                         running_ledger.as_ref(),
+                        running_traces.as_ref(),
                     )
                     .await
                     {
@@ -1963,7 +1976,7 @@ async fn apply_ads_snapshot(
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
-// The two boot-scoped inputs (capture, ledger) are each checked against the
+// The boot-scoped inputs (capture, ledger, traces) are each checked against the
 // reloaded snapshot here, where it is loaded; bundling them only for the lint
 // would hide which one refused a reload.
 #[allow(clippy::too_many_arguments)]
@@ -1976,6 +1989,7 @@ async fn reload(
     tables: &StatHandleTables,
     capture: Option<(&proxy_observability::capture::CaptureSupervisor, usize)>,
     running_ledger: Option<&proxy_observability::ledger::LedgerConfig>,
+    running_traces: Option<&proxy_observability::traces::config::TraceExportConfig>,
 ) -> Option<SnapshotVersion> {
     let mut snapshot = match source.load() {
         Ok(snapshot) => snapshot,
@@ -2010,6 +2024,16 @@ async fn reload(
         tracing::error!(
             "SIGHUP: node.metadata[\"io.llmproxy.ledger\"] (the dialect's `ledger`) cannot change \
              on reload; restart the process to apply it. Continuing to serve the previous snapshot"
+        );
+        return None;
+    }
+    // Trace export is boot-scoped like the ledger: its directory lock, codec
+    // and destination are fixed once opened.
+    if snapshot.traces.as_ref() != running_traces {
+        tracing::error!(
+            "SIGHUP: node.metadata[\"io.llmproxy.traces\"] (the dialect's `observability.traces`) \
+             cannot change on reload; restart the process to apply it. Continuing to serve the \
+             previous snapshot"
         );
         return None;
     }

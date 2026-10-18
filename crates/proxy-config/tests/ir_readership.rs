@@ -56,10 +56,11 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "traces",
-        kind: EntryKind::KnownInert,
-        reason: "Trace export (ADR-0008): the field lands before its consumers. \
-                 crates/proxy/src/main.rs will refuse a config that sets it until \
-                 the exporter exists; remove this entry when a reader lands.",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "Trace export (ADR-0008): crates/proxy/src/main.rs refuses to start \
+                 when it is set (no exporter exists yet) and `reload` refuses a \
+                 reload that changes it. `proxy` is control-side and outside \
+                 RUNTIME_CRATES; replace this entry when the exporter reads it.",
     },
     // --- ADS fields whose readers are outside the runtime scan.
     AllowlistEntry {

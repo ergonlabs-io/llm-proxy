@@ -137,6 +137,8 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "Tracing",
             parser_fields::<Tracing>,
         ),
+        ("#/$defs/Traces", "Traces", parser_fields::<Traces>),
+        ("#/$defs/TracesS3", "TracesS3", parser_fields::<TracesS3>),
         ("#/$defs/Pricing", "Pricing", parser_fields::<Pricing>),
         (
             "#/$defs/PriceList",
@@ -195,6 +197,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/Ledger/properties/on_unavailable",
             "LedgerOnUnavailable",
             parser_variants::<LedgerOnUnavailable>,
+        ),
+        (
+            "#/$defs/Traces/properties/codec",
+            "TraceCodec",
+            parser_variants::<TraceCodec>,
         ),
         (
             "#/$defs/Observability/properties/access_logs/properties/format",

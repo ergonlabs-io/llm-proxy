@@ -1252,13 +1252,21 @@ impl HttpFilterFactory for AuthFilterFactory {
             .set_max_staleness(max_policy_staleness);
         // Looked up outside `get_or_try_init`'s closure: that closure runs
         // under the singleton map's lock, which `get` also takes.
-        if let Some(registry) = ctx
+        let stats_registry = ctx
             .shared
             .get("", crate::usage_filter::STATS_REGISTRY_KEY)
-            .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok())
-        {
-            control_plane.export_snapshot_age(registry, &ctx.stat_prefix);
+            .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok());
+        if let Some(registry) = &stats_registry {
+            control_plane.export_snapshot_age(Arc::clone(registry), &ctx.stat_prefix);
         }
+        // JWT principals do not verify against the control-plane snapshot,
+        // so their trace-export opt-in is read through this, from the same
+        // snapshot and under the same staleness bound as virtual keys.
+        let trace_consent = Arc::new(crate::auth::TraceConsent::new(
+            control_plane.handle(),
+            control_plane.freshness(),
+            stats_registry,
+        ));
         let authenticator: Box<dyn Authenticator> = Box::new(
             VirtualKeyAuthenticator::new(HmacSecret::new(&secret_bytes), control_plane.handle())
                 .with_freshness(control_plane.freshness()),
@@ -1273,9 +1281,10 @@ impl HttpFilterFactory for AuthFilterFactory {
         let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
         authenticators.push(authenticator);
         for ((snapshot, max_stale), validation) in jwt_snapshots.into_iter().zip(jwt_validations) {
-            authenticators.push(Box::new(JwtAuthenticator::new_shared(
-                snapshot, validation, max_stale,
-            )));
+            authenticators.push(Box::new(
+                JwtAuthenticator::new_shared(snapshot, validation, max_stale)
+                    .with_trace_consent(Arc::clone(&trace_consent)),
+            ));
         }
         let chain = Arc::new(AuthenticatorChain::new(authenticators));
         Ok(Box::new(AuthFilterInstanceFactory { chain }))
@@ -2257,6 +2266,48 @@ mod tests {
         let second = admit(&mut filter);
         assert_eq!(second, Some(cp.store().policy_generation().unwrap()));
         assert_ne!(first, second, "a policy write must move the stamp");
+    }
+
+    /// ADR-0008 decision 2: the tenant's trace-export opt-in reaches the
+    /// request from the snapshot that verified its key. Only the opted-in
+    /// tenant's request carries it, an opt-out reaches the next request
+    /// without any other write, and a tenant with no row is not opted in.
+    #[test]
+    fn a_tenants_trace_export_opt_in_is_pinned_on_its_requests() {
+        let cp = ControlPlane::new(
+            Box::new(crate::control::InMemoryControlPlaneStore::new()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        let (a, b) = (TenantId::new("tenant-a"), TenantId::new("tenant-b"));
+        cp.create_tenant(&a).unwrap();
+        cp.create_tenant(&b).unwrap();
+        let key_a = cp.mint_key(&a, &KeyId::new("key-a")).unwrap().plaintext;
+        let key_b = cp.mint_key(&b, &KeyId::new("key-b")).unwrap().plaintext;
+        let mut filter = AuthFilterInstance {
+            chain: Arc::new(AuthenticatorChain::new(vec![Box::new(
+                VirtualKeyAuthenticator::new(HmacSecret::new(b"secret"), cp.handle()),
+            )])),
+        };
+        let opted_in = |filter: &mut AuthFilterInstance, key: &str| {
+            let mut cb = TestCallbacks::new(Some(route_named("r1")));
+            let mut head = request_headers(Some(&format!("Bearer {key}")));
+            filter.decode_headers(&mut cb, &mut head, true);
+            assert!(cb.local_reply.is_none());
+            let pinned = cb.stream_info.borrow().auth.trace_export;
+            pinned
+        };
+
+        assert!(!opted_in(&mut filter, &key_a), "no row is not consent");
+        cp.set_trace_export(&a, true).unwrap();
+        assert!(opted_in(&mut filter, &key_a));
+        assert!(!opted_in(&mut filter, &key_b), "consent is per tenant");
+        cp.set_trace_export(&a, false).unwrap();
+        assert!(
+            !opted_in(&mut filter, &key_a),
+            "an opt-out reaches the next request"
+        );
     }
 
     /// One snapshot with a key for `tenant-t` (which holds an `openrouter`

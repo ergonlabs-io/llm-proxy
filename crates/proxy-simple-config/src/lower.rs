@@ -486,6 +486,21 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     if let Some(ledger) = &config.ledger {
         metadata.insert(LEDGER_METADATA_KEY.to_string(), lower_ledger(ledger)?);
     }
+    if let Some(traces) = config
+        .observability
+        .as_ref()
+        .and_then(|o| o.traces.as_ref())
+    {
+        // Dialect-only rule: without `auth` no tenant exists to opt in, so
+        // the block would be inert, and an inert block is a silent accept.
+        if config.auth.is_none() {
+            return Err(ConfigError::InvalidValue {
+                field_path: "observability.traces".to_string(),
+                reason: "requires auth: tenants opt in through tenant policy".to_string(),
+            });
+        }
+        metadata.insert(TRACES_METADATA_KEY.to_string(), lower_traces(traces)?);
+    }
     if !metadata.is_empty() {
         bootstrap["node"] = json!({ "metadata": metadata });
     }
@@ -2742,6 +2757,96 @@ fn lower_ledger(ledger: &crate::model::Ledger) -> Result<Value, ConfigError> {
             crate::model::LedgerOnUnavailable::Admit => "admit",
         };
         out.insert("on_unavailable".into(), json!(mode));
+    }
+    Ok(Value::Object(out))
+}
+
+// ------------------------------------------------------------------ traces --
+
+/// Must equal `proxy_config`'s `TRACES_METADATA_KEY`; `tests/traces.rs`
+/// round-trips the dialect through the real Envoy-mode loader, so a drift
+/// here shows up as a trace block that never reaches the snapshot.
+const TRACES_METADATA_KEY: &str = "io.llmproxy.traces";
+
+/// `observability.traces` -> `Bootstrap.node.metadata["io.llmproxy.traces"]`.
+/// Required fields are checked here so a missing one is reported at
+/// `observability.traces.<field>`; unset optional fields are left out, so the
+/// Envoy-mode reader's defaults apply to both modes. Ranges and cross-field
+/// rules are that reader's to enforce, the same split as `lower_ledger`.
+/// Durations go over as seconds numbers.
+fn lower_traces(traces: &crate::model::Traces) -> Result<Value, ConfigError> {
+    const ROOT: &str = "observability.traces";
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "directory".into(),
+        json!(required_non_empty(
+            traces.directory.as_deref(),
+            "observability.traces.directory"
+        )?),
+    );
+    let max_disk_bytes = traces
+        .max_disk_bytes
+        .ok_or_else(|| ConfigError::InvalidValue {
+            field_path: format!("{ROOT}.max_disk_bytes"),
+            reason: "is required".to_string(),
+        })?;
+    out.insert("max_disk_bytes".into(), json!(max_disk_bytes));
+    if let Some(age) = traces.max_age {
+        out.insert("max_age".into(), json!(age.0.as_secs_f64()));
+    }
+    if let Some(codec) = traces.codec {
+        let codec = match codec {
+            crate::model::TraceCodec::Gzip => "gzip",
+            crate::model::TraceCodec::Zstd => "zstd",
+        };
+        out.insert("codec".into(), json!(codec));
+    }
+    for (key, value) in [
+        ("zstd_window_log", traces.zstd_window_log),
+        ("max_request_body_bytes", traces.max_request_body_bytes),
+        ("max_response_body_bytes", traces.max_response_body_bytes),
+        ("max_memory_bytes", traces.max_memory_bytes),
+        ("max_queued_traces", traces.max_queued_traces),
+        ("segment_max_bytes", traces.segment_max_bytes),
+        ("max_open_segments", traces.max_open_segments),
+    ] {
+        if let Some(n) = value {
+            out.insert(key.into(), json!(n));
+        }
+    }
+    if let Some(age) = traces.segment_max_age {
+        out.insert("segment_max_age".into(), json!(age.0.as_secs_f64()));
+    }
+    if let Some(s3) = &traces.s3 {
+        const S3_ROOT: &str = "observability.traces.s3";
+        let mut dest = serde_json::Map::new();
+        for (key, value) in [
+            ("bucket", s3.bucket.as_deref()),
+            ("region", s3.region.as_deref()),
+            ("access_key_id", s3.access_key_id.as_deref()),
+            ("secret_access_key", s3.secret_access_key.as_deref()),
+        ] {
+            dest.insert(
+                key.into(),
+                json!(required_non_empty(value, &format!("{S3_ROOT}.{key}"))?),
+            );
+        }
+        for (key, value) in [
+            ("endpoint", s3.endpoint.as_deref()),
+            ("prefix", s3.prefix.as_deref()),
+            ("session_token", s3.session_token.as_deref()),
+        ] {
+            if let Some(v) = value {
+                dest.insert(key.into(), json!(v));
+            }
+        }
+        if let Some(b) = s3.path_style {
+            dest.insert("path_style".into(), json!(b));
+        }
+        if let Some(t) = s3.upload_timeout {
+            dest.insert("upload_timeout".into(), json!(t.0.as_secs_f64()));
+        }
+        out.insert("s3".into(), Value::Object(dest));
     }
     Ok(Value::Object(out))
 }

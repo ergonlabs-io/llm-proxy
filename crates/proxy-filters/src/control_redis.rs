@@ -13,6 +13,7 @@
 //! {ns}:limits                               HASH subject -> encode_json(EncodedLimitPolicy)
 //! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
 //! {ns}:rate_cards                           HASH chain (the usage filter's stat_prefix) -> encode_json(EncodedRateCardRow)
+//! {ns}:trace_export                         HASH tenant -> encode_trace_export_row() (opted-in tenants only)
 //! {ns}:generation                           STRING, INCR
 //! {ns}:spend:{<prefix>|<tenant>|<period>}   STRING, micros
 //! {ns}:seq:{<prefix>|<tenant>|<period>}     HASH node_id -> highest accepted seq
@@ -38,7 +39,7 @@
 //! Tenant credential fields join escaped tenant and provider names with `|`;
 //! values contain ciphertext only and are never decrypted here (ADR-0007).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,7 @@ use crate::control::{
     StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, WindowDelta, WindowRow,
     SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
 };
+use crate::control::{decode_trace_export_row, encode_trace_export_row};
 use crate::model_authz::ModelAccess;
 use crate::spend::{PeriodKey, TenantBudget};
 use crate::window_counter::{FleetLeases, LeaseRow, LeaseStore};
@@ -435,7 +437,8 @@ return 1
 /// same atomic write as the rest (the trait requires it). The credential
 /// fields are `<esc(tenant)>|<esc(provider)>`, so the prefix
 /// `<esc(tenant)>|` matches exactly that tenant: an escaped tenant contains
-/// no `|`. `KEYS` = tenants, policies, budgets, limits, credentials, generation.
+/// no `|`. `KEYS` = tenants, policies, budgets, limits, credentials,
+/// trace-export opt-ins, generation.
 /// `ARGV[1]` = tenant, `ARGV[2]` = credential field prefix.
 const DELETE_TENANT_LUA: &str = r#"
 redis.call('SREM', KEYS[1], ARGV[1])
@@ -448,7 +451,8 @@ for _, field in ipairs(redis.call('HKEYS', KEYS[5])) do
     redis.call('HDEL', KEYS[5], field)
   end
 end
-redis.call('INCR', KEYS[6])
+redis.call('HDEL', KEYS[6], ARGV[1])
+redis.call('INCR', KEYS[7])
 return 1
 "#;
 
@@ -722,6 +726,10 @@ impl RedisControlPlaneStore {
         format!("{}:limits", self.namespace)
     }
 
+    fn trace_export_key(&self) -> String {
+        format!("{}:trace_export", self.namespace)
+    }
+
     fn tenant_credentials_key(&self) -> String {
         format!("{}:tenant_credentials", self.namespace)
     }
@@ -887,11 +895,13 @@ type LoadReply = (
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
     HashMap<String, Vec<u8>>,
+    HashMap<String, Vec<u8>>,
 );
 
 impl ControlPlaneStore for RedisControlPlaneStore {
     /// One pipeline: `SMEMBERS tenants`, then `HGETALL` of keys, policies,
-    /// budgets, limits, tenant credentials and rate cards -- run inside `MULTI`/`EXEC`
+    /// budgets, limits, tenant credentials, rate cards and trace-export
+    /// opt-ins -- run inside `MULTI`/`EXEC`
     /// (`.atomic()`) so a rebuild sees one consistent point-in-time snapshot,
     /// the same property `RedbControlPlaneStore::load`'s single read
     /// transaction gives for free. Runs on [`Lane::Control`].
@@ -920,6 +930,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
 
         let credentials_key = self.tenant_credentials_key();
         let rate_cards_key = self.rate_cards_key();
+        let trace_export_key = self.trace_export_key();
 
         let (
             tenants_raw,
@@ -929,6 +940,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             limits_raw,
             credentials_raw,
             rate_cards_raw,
+            trace_export_raw,
         ): LoadReply = self.with_connection(Lane::Control, |conn| {
             redis::pipe()
                 .atomic()
@@ -946,6 +958,8 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .arg(&credentials_key)
                 .cmd("HGETALL")
                 .arg(&rate_cards_key)
+                .cmd("HGETALL")
+                .arg(&trace_export_key)
                 .query(conn)
         })?;
         let fetched = started.elapsed();
@@ -962,7 +976,8 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             + hash_bytes(&budgets_raw)
             + hash_bytes(&limits_raw)
             + hash_bytes(&credentials_raw)
-            + hash_bytes(&rate_cards_raw);
+            + hash_bytes(&rate_cards_raw)
+            + hash_bytes(&trace_export_raw);
         let (n_tenants, n_keys, n_policies, n_budgets, n_limits, n_credentials, n_rate_cards) = (
             tenants_raw.len(),
             keys_raw.len(),
@@ -1028,6 +1043,13 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             .filter_map(|(chain, bytes)| decode_rate_card_row(&chain, &bytes))
             .collect();
 
+        let n_trace_export = trace_export_raw.len();
+        let trace_export = trace_export_raw
+            .into_iter()
+            .filter(|(tenant, bytes)| decode_trace_export_row(tenant, bytes))
+            .map(|(tenant, _)| TenantId::new(tenant))
+            .collect();
+
         let duration = started.elapsed();
         if let Some(stats) = &self.load_stats {
             stats.record(
@@ -1039,7 +1061,8 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     + n_budgets
                     + n_limits
                     + n_credentials
-                    + n_rate_cards,
+                    + n_rate_cards
+                    + n_trace_export,
             );
         }
         tracing::info!(
@@ -1052,6 +1075,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             limits = n_limits,
             tenant_credentials = n_credentials,
             rate_cards = n_rate_cards,
+            trace_export = n_trace_export,
             payload_bytes,
             "loaded control-plane state from redis"
         );
@@ -1064,7 +1088,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             limits,
             tenant_credentials,
             rate_cards,
-            trace_export: HashSet::new(),
+            trace_export,
         })
     }
 
@@ -1106,6 +1130,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .key(self.budgets_key())
                 .key(self.limits_key())
                 .key(self.tenant_credentials_key())
+                .key(self.trace_export_key())
                 .key(self.generation_key())
                 .arg(tenant.as_str())
                 .arg(prefix)
@@ -1309,6 +1334,28 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                     .query::<()>(conn)
             }),
         }
+    }
+
+    fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
+        let key = self.trace_export_key();
+        let generation_key = self.generation_key();
+        self.with_connection(Lane::Control, |conn| {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            if enabled {
+                pipe.cmd("HSET")
+                    .arg(&key)
+                    .arg(tenant.as_str())
+                    .arg(encode_trace_export_row())
+                    .ignore();
+            } else {
+                pipe.cmd("HDEL").arg(&key).arg(tenant.as_str()).ignore();
+            }
+            pipe.cmd("INCR")
+                .arg(&generation_key)
+                .ignore()
+                .query::<()>(conn)
+        })
     }
 
     /// The card and the generation bump are one `MULTI`/`EXEC` on
@@ -2220,6 +2267,34 @@ mod tests {
             0,
             "a NotFound revoke wrote nothing and must not bump the generation"
         );
+    }
+
+    /// The opt-in row, its removal and the tenant-delete cascade each bump
+    /// the generation and land in `load()`, against a real Redis (the fake
+    /// implements no storage).
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_trace_export_opt_in_round_trips_and_goes_with_its_tenant() {
+        let store = test_store("trace-export");
+        let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+        store.create_tenant(&a).unwrap();
+        store.create_tenant(&b).unwrap();
+        let before = store.policy_generation().unwrap();
+        store.set_trace_export(&a, true).unwrap();
+        store.set_trace_export(&b, true).unwrap();
+        assert_eq!(
+            store.load().unwrap().trace_export,
+            std::collections::HashSet::from([a.clone(), b.clone()])
+        );
+        assert_eq!(store.policy_generation().unwrap(), before + 2);
+        store.set_trace_export(&b, false).unwrap();
+        assert_eq!(
+            store.load().unwrap().trace_export,
+            std::collections::HashSet::from([a.clone()])
+        );
+        store.delete_tenant(&a).unwrap();
+        assert!(store.load().unwrap().trace_export.is_empty());
+        assert_eq!(store.policy_generation().unwrap(), before + 4);
     }
 
     #[test]

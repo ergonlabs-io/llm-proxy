@@ -1039,6 +1039,16 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+    /// JWT requests whose tenant opted in to trace export but were not
+    /// captured because the policy snapshot was past its staleness bound
+    /// (ADR-0008 decision 2: an opt-out that cannot propagate fails closed).
+    pub const TRACE_CONSENT_STALE: Instrument = Instrument {
+        name: "llmproxy_trace_consent_stale_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// Entries handed to the writer that were never committed.
     pub const LEDGER_LOST: Instrument = Instrument {
         name: "llmproxy_ledger_entries_lost_total",

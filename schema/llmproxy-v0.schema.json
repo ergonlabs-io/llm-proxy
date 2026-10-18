@@ -811,6 +811,10 @@
             }
           }
         },
+        "traces": {
+          "description": "Trace export: one record per request (headers and bodies, size-capped) for tenants that opt in through tenant policy, written to a local directory as compressed JSON-lines segments and optionally uploaded to S3-compatible storage. Requires the top-level `auth` block, since without tenants nothing can opt in. Boot-scoped: a reload that changes it is refused and the previous configuration keeps serving. Needs a node id unique to this replica (`--service-node`). Omit for no trace export.",
+          "$ref": "#/$defs/Traces"
+        },
         "tracing": {
           "type": "object",
           "description": "OTLP trace export. With this block set, the proxy exports spans to `otlp_endpoint`; omit it to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.",
@@ -905,6 +909,43 @@
         "group_commit_max_entries": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 512, "description": "A group of entries is committed when it reaches this size or `group_commit_interval`, whichever comes first." },
         "group_commit_interval": { "$ref": "#/$defs/Duration", "default": "50ms", "description": "The longest an entry waits to be committed, and so the most a crash can lose. Bounded to 1ms-1s." },
         "on_unavailable": { "enum": ["reject", "admit"], "default": "reject", "description": "What a request gets when no ledger capacity is available. `reject`: a local 503 naming the reason (`queue_full`, `writer_failed` or `disk_full`), counted in `llmproxy_ledger_rejected_total`; no request reaches a provider unledgered, so ledger health becomes availability. `admit`: the request is served without an entry, counted in `llmproxy_ledger_unledgered_total` and warned about at most once every 5 seconds." }
+      }
+    },
+    "Traces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["directory", "max_disk_bytes"],
+      "properties": {
+        "directory": { "type": "string", "minLength": 1, "description": "Absolute path of the segment directory. Created owner-only (0700). One proxy process uses it at a time; a second is refused at startup." },
+        "max_disk_bytes": { "type": "integer", "minimum": 1048576, "maximum": 1125899906842624, "description": "Budget for every segment on disk, open or sealed, uploaded or not. Must be at least 2 x max_open_segments x segment_max_bytes. At the cap the oldest unsent segment is dropped and counted." },
+        "max_age": { "$ref": "#/$defs/Duration", "description": "Directory destination only (rejected with `s3`, whose objects expire by the bucket's lifecycle rules): sealed segments older than this are deleted. Bounded to 10 years." },
+        "codec": { "enum": ["gzip", "zstd"], "default": "gzip", "description": "Segment compression. `gzip` is read by every warehouse loader; `zstd` needs a consumer that reads long-window zstd." },
+        "zstd_window_log": { "type": "integer", "minimum": 20, "maximum": 27, "default": 24, "description": "log2 of the zstd window. Only with `codec: zstd`. max_open_segments x 2^zstd_window_log must not exceed 2 GiB." },
+        "max_request_body_bytes": { "type": "integer", "minimum": 1024, "maximum": 67108864, "default": 1048576, "description": "Per-request cap on the captured request body." },
+        "max_response_body_bytes": { "type": "integer", "minimum": 1024, "maximum": 67108864, "default": 4194304, "description": "Per-request cap on the captured response body." },
+        "max_memory_bytes": { "type": "integer", "minimum": 1048576, "maximum": 1099511627776, "default": 268435456, "description": "Global cap on every retained body byte, in flight and queued. Must be at least max_request_body_bytes + max_response_body_bytes." },
+        "max_queued_traces": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096, "description": "Global cap on captures in flight plus queued." },
+        "segment_max_bytes": { "type": "integer", "minimum": 1048576, "maximum": 1073741824, "default": 67108864, "description": "A segment is sealed when its compressed size reaches this. Must be at least the largest line: both body caps base64-expanded, plus 1 MiB." },
+        "segment_max_age": { "$ref": "#/$defs/Duration", "default": "5m", "description": "A segment is sealed when it is this old. Bounded to 10s-1h." },
+        "max_open_segments": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 64, "description": "Open (tenant, date) segments; the least recently used is sealed beyond this." },
+        "s3": { "$ref": "#/$defs/TracesS3" }
+      }
+    },
+    "TracesS3": {
+      "type": "object",
+      "description": "An S3-compatible upload destination. Sealed segments are uploaded, then deleted locally.",
+      "additionalProperties": false,
+      "required": ["bucket", "region", "access_key_id", "secret_access_key"],
+      "properties": {
+        "bucket": { "type": "string", "minLength": 3, "maxLength": 63, "description": "Bucket name: lowercase letters, digits, `.` and `-`. A name containing `.` requires `path_style: true`." },
+        "region": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Required and never inferred: lowercase letters, digits and `-`." },
+        "endpoint": { "type": "string", "description": "`http://` or `https://` host and optional port, with no path, query or userinfo. Default: `https://s3.<region>.amazonaws.com`. `http` to a non-loopback host is accepted with a startup warning.", "examples": ["https://s3.eu-west-1.amazonaws.com"] },
+        "path_style": { "type": "boolean", "default": false, "description": "Path-style addressing; needed for MinIO and most S3-compatible stores." },
+        "prefix": { "type": "string", "default": "", "description": "Object key prefix: no leading or trailing `/`, no empty, `.` or `..` segments." },
+        "access_key_id": { "type": "string", "minLength": 1, "description": "Static access key id. Use `${ENV}` substitution rather than a literal." },
+        "secret_access_key": { "type": "string", "minLength": 1, "description": "Static secret key. Never logged. Use `${ENV}` substitution rather than a literal." },
+        "session_token": { "type": "string", "description": "Session token for temporary credentials." },
+        "upload_timeout": { "$ref": "#/$defs/Duration", "default": "120s", "description": "Deadline for one upload. Bounded to 1s-1h." }
       }
     },
     "LedgerKey": {

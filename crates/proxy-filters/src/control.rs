@@ -906,6 +906,8 @@ struct InMemoryState {
     // Rate cards keyed by chain (`stat_prefix`): one row per chain, replaced
     // in place by a second put for the same chain.
     rate_cards: HashMap<String, StoredRateCard>,
+    // Tenants opted in to trace export (ADR-0008 decision 2).
+    trace_export: HashSet<TenantId>,
     // Keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
@@ -955,6 +957,7 @@ impl InMemoryControlPlaneStore {
                 limits: HashMap::new(),
                 tenant_credentials: HashMap::new(),
                 rate_cards: HashMap::new(),
+                trace_export: HashSet::new(),
                 spend: HashMap::new(),
                 spend_seq: HashMap::new(),
                 windows: HashMap::new(),
@@ -1033,7 +1036,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             limits: state.limits.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
             rate_cards: state.rate_cards.values().cloned().collect(),
-            trace_export: HashSet::new(),
+            trace_export: state.trace_export.clone(),
         })
     }
 
@@ -1069,6 +1072,9 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         // configuration" rule `set_policy`'s removal already follows.
         state.budgets.remove(tenant);
         state.limits.remove(tenant);
+        // A deleted tenant's consent goes with it: re-creating the id must
+        // not inherit an opt-in someone else gave.
+        state.trace_export.remove(tenant);
         // A deleted tenant takes its credential rows with it too (ADR-0007
         // §2), under this SAME lock acquisition so the single generation
         // bump below covers the whole deletion -- a reader never observes
@@ -1207,6 +1213,20 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             None => {
                 state.limits.remove(subject);
             }
+        }
+        state.generation += 1;
+        Ok(())
+    }
+
+    fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        if enabled {
+            state.trace_export.insert(tenant.clone());
+        } else {
+            state.trace_export.remove(tenant);
         }
         state.generation += 1;
         Ok(())
@@ -1406,6 +1426,9 @@ const POLICIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("polic
 // neither.
 const BUDGETS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("budgets");
 const LIMITS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("limits");
+// Trace-export opt-in rows (ADR-0008 decision 2), one per opted-in tenant;
+// opting out removes the row. Decoded by `decode_trace_export_row`.
+const TRACE_EXPORT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("trace_export");
 // A spend row's key is the 3-part
 // `(stat_prefix, tenant, period)` tuple, not a single `&str` like every
 // table above -- `redb::Key` has a native impl for tuples of `Key` types
@@ -1646,6 +1669,49 @@ pub(crate) struct EncodedLimitPolicy {
     tokens_per_minute: Option<u64>,
     requests_per_minute: Option<u64>,
     concurrent_streams: Option<u32>,
+}
+
+pub(crate) const TRACE_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A tenant's trace-export opt-in row, the same JSON in redb and Redis.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EncodedTraceExport {
+    schema_version: u32,
+    enabled: bool,
+}
+
+pub(crate) fn encode_trace_export_row() -> Vec<u8> {
+    serde_json::to_vec(&EncodedTraceExport {
+        schema_version: TRACE_EXPORT_SCHEMA_VERSION,
+        enabled: true,
+    })
+    .expect("a two-field struct always serializes")
+}
+
+/// Whether a stored opt-in row says the tenant opted in. A row this build
+/// cannot read is not consent: it is ignored with a warning rather than
+/// failing the whole load, so an unreadable opt-in can never hold up a key
+/// revocation, and never captures.
+pub(crate) fn decode_trace_export_row(tenant: &str, value: &[u8]) -> bool {
+    match serde_json::from_slice::<EncodedTraceExport>(value) {
+        Ok(row) if row.schema_version == TRACE_EXPORT_SCHEMA_VERSION => row.enabled,
+        Ok(row) => {
+            tracing::warn!(
+                tenant,
+                schema_version = row.schema_version,
+                "trace export opt-in row has an unsupported schema version; treating the tenant \
+                 as not opted in"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                tenant,
+                "trace export opt-in row does not parse; treating the tenant as not opted in"
+            );
+            false
+        }
+    }
 }
 
 fn read_limits_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
@@ -2001,6 +2067,7 @@ impl RedbControlPlaneStore {
         txn.open_table(POLICIES_TABLE).map_err(store_err)?;
         txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         txn.open_table(LIMITS_TABLE).map_err(store_err)?;
+        txn.open_table(TRACE_EXPORT_TABLE).map_err(store_err)?;
         txn.open_table(TENANT_CREDENTIALS_TABLE)
             .map_err(store_err)?;
         txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
@@ -2155,6 +2222,15 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             }
         }
 
+        let trace_export_table = txn.open_table(TRACE_EXPORT_TABLE).map_err(store_err)?;
+        let mut trace_export = HashSet::new();
+        for entry in trace_export_table.iter().map_err(store_err)? {
+            let (key, value) = entry.map_err(store_err)?;
+            if decode_trace_export_row(key.value(), value.value()) {
+                trace_export.insert(TenantId::new(key.value()));
+            }
+        }
+
         // Credential rows decode through their own fail-closed helper: one
         // row this build cannot fully understand makes the WHOLE load an
         // `Err`, so a half-understood store never becomes a snapshot that
@@ -2192,7 +2268,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             limits,
             tenant_credentials,
             rate_cards,
-            trace_export: HashSet::new(),
+            trace_export,
         })
     }
 
@@ -2233,6 +2309,10 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         {
             let mut limits_table = txn.open_table(LIMITS_TABLE).map_err(store_err)?;
             limits_table.remove(tenant.as_str()).map_err(store_err)?;
+        }
+        {
+            let mut table = txn.open_table(TRACE_EXPORT_TABLE).map_err(store_err)?;
+            table.remove(tenant.as_str()).map_err(store_err)?;
         }
         {
             // A deleted tenant's credential rows go with it (ADR-0007 §2),
@@ -2468,6 +2548,23 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 None => {
                     table.remove(subject.as_str()).map_err(store_err)?;
                 }
+            }
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(TRACE_EXPORT_TABLE).map_err(store_err)?;
+            if enabled {
+                table
+                    .insert(tenant.as_str(), encode_trace_export_row().as_slice())
+                    .map_err(store_err)?;
+            } else {
+                table.remove(tenant.as_str()).map_err(store_err)?;
             }
         }
         Self::bump_generation(&txn)?;
@@ -3922,6 +4019,21 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Records `tenant`'s trace-export opt-in (ADR-0008 decision 2) and
+    /// republishes, so this replica's next request sees it; other replicas
+    /// see it on their next poll.
+    pub fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
+        self.store.set_trace_export(tenant, enabled)?;
+        self.rebuild();
+        Ok(())
+    }
+
+    /// Whether `tenant` is opted in to trace export in the published
+    /// snapshot.
+    pub fn trace_export(&self, tenant: &TenantId) -> bool {
+        self.handle().load().trace_export.contains(tenant)
+    }
+
     /// Sets or clears a tenant's independent rate ceiling and republishes.
     pub fn set_tenant_limits(
         &self,
@@ -4464,7 +4576,7 @@ impl ControlPlane {
             key_tenants,
             tenant_credentials: HashMap::new(),
             generation: None,
-            trace_export: HashSet::new(),
+            trace_export: loaded.trace_export,
         }
     }
 }
@@ -4790,6 +4902,10 @@ impl ControlPlaneStore for SharedMemoryStore {
         limits: Option<&LimitPolicy>,
     ) -> Result<(), StoreError> {
         self.inner.set_limits(subject, limits)
+    }
+
+    fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
+        self.inner.set_trace_export(tenant, enabled)
     }
     fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
         self.check_rate_cards()?;
@@ -6960,6 +7076,93 @@ mod tests {
             assert!(!store.load().unwrap().limits.contains_key(&tenant));
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    /// ADR-0008 decision 2, in both embedded stores: an opt-in is a durable
+    /// row, an opt-out and a tenant delete remove it, and every write bumps
+    /// the generation so other replicas notice.
+    #[test]
+    fn a_trace_export_opt_in_round_trips_and_goes_with_its_tenant() {
+        let path = temp_db_path("trace-export-round-trip");
+        type Open = Box<dyn Fn() -> Box<dyn ControlPlaneStore>>;
+        let stores: Vec<(&str, Open)> = vec![
+            ("in_memory", {
+                let (store, _) = SharedMemoryStore::new();
+                Box::new(move || Box::new(store.handle()))
+            }),
+            // Reopened for every step, so each read is what the file holds.
+            ("redb", {
+                let path = path.clone();
+                Box::new(move || Box::new(RedbControlPlaneStore::open(&path).unwrap()))
+            }),
+        ];
+        for (name, open) in stores {
+            let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+            open().create_tenant(&a).unwrap();
+            open().create_tenant(&b).unwrap();
+            let before = open().policy_generation().unwrap();
+            open().set_trace_export(&a, true).unwrap();
+            open().set_trace_export(&b, true).unwrap();
+            assert_eq!(
+                open().load().unwrap().trace_export,
+                HashSet::from([a.clone(), b.clone()]),
+                "{name}"
+            );
+            open().set_trace_export(&b, false).unwrap();
+            assert_eq!(
+                open().load().unwrap().trace_export,
+                HashSet::from([a.clone()]),
+                "{name}"
+            );
+            open().delete_tenant(&a).unwrap();
+            assert!(open().load().unwrap().trace_export.is_empty(), "{name}");
+            assert_eq!(open().policy_generation().unwrap(), before + 4, "{name}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A row this build cannot read is not consent, and it does not fail the
+    /// load: a key revocation in the same load still has to propagate.
+    #[test]
+    fn an_unreadable_trace_export_row_is_not_consent_and_does_not_fail_the_load() {
+        let store = RedbControlPlaneStore::in_memory();
+        store.create_tenant(&TenantId::new("ok")).unwrap();
+        store.set_trace_export(&TenantId::new("ok"), true).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(TRACE_EXPORT_TABLE).unwrap();
+                table.insert("garbled", b"{".as_slice()).unwrap();
+                table
+                    .insert(
+                        "future",
+                        br#"{"schema_version":2,"enabled":true}"#.as_slice(),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let loaded = store
+            .load()
+            .expect("an unreadable opt-in row is not a load error");
+        assert_eq!(loaded.trace_export, HashSet::from([TenantId::new("ok")]));
+    }
+
+    /// The opt-out path a tenant relies on: a write on one replica reaches
+    /// another replica's snapshot on its next poll, with no other write.
+    #[test]
+    fn an_opt_out_written_on_another_replica_reaches_this_one_on_its_next_poll() {
+        let (store, other_replica) = SharedMemoryStore::new();
+        let tenant = TenantId::new("tenant-a");
+        other_replica.create_tenant(&tenant).unwrap();
+        other_replica.set_trace_export(&tenant, true).unwrap();
+        let cp = ControlPlane::new(Box::new(store), HmacSecret::new(b"s"), KeySet::new()).unwrap();
+        assert!(cp.trace_export(&tenant));
+
+        other_replica.set_trace_export(&tenant, false).unwrap();
+        assert!(cp.trace_export(&tenant), "nothing changes before the poll");
+        assert!(cp.poll_once().unwrap(), "the opt-out moved the generation");
+        assert!(!cp.trace_export(&tenant));
     }
 
     #[test]

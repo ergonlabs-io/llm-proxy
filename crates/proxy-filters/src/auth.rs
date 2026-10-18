@@ -787,10 +787,72 @@ impl Authenticator for VirtualKeyAuthenticator {
                 policy: Arc::new(TenantPolicy::default()),
                 tenant_credentials: snapshot.tenant_credentials.get(&record.tenant).cloned(),
                 policy_generation: snapshot.generation,
-                trace_export: false,
+                trace_export: snapshot.trace_export.contains(&record.tenant),
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
+    }
+}
+
+/// Trace-export consent for authenticators that do not verify against the
+/// control-plane snapshot (JWT). The virtual-key path reads the flag from the
+/// snapshot that verified the key; this reads the same snapshot once, at the
+/// same point in the request, so consent is still pinned at admission.
+///
+/// Past the staleness bound the snapshot may still list a tenant that opted
+/// out elsewhere, so an opt-in is not honoured (fail closed, the rule the
+/// virtual-key path applies by refusing the key). Each opt-in withheld that
+/// way is counted in `llmproxy_trace_consent_stale_total`.
+pub struct TraceConsent {
+    snapshot: Arc<arc_swap::ArcSwap<crate::control::ControlPlaneSnapshot>>,
+    freshness: Arc<crate::control::PolicyFreshness>,
+    stale: Option<(
+        Arc<proxy_observability::stats::Registry>,
+        proxy_observability::stats::Handle,
+    )>,
+}
+
+impl TraceConsent {
+    pub fn new(
+        snapshot: Arc<arc_swap::ArcSwap<crate::control::ControlPlaneSnapshot>>,
+        freshness: Arc<crate::control::PolicyFreshness>,
+        registry: Option<Arc<proxy_observability::stats::Registry>>,
+    ) -> Self {
+        let stale = registry.map(|registry| {
+            // One unlabelled series: the ceiling never folds anything.
+            let handle = registry.resolve_capped(
+                &proxy_observability::stats::instruments::TRACE_CONSENT_STALE,
+                &[],
+                1,
+                &[],
+            );
+            (registry, handle)
+        });
+        TraceConsent {
+            snapshot,
+            freshness,
+            stale,
+        }
+    }
+
+    /// Whether `tenant` opted in, on a fresh snapshot.
+    pub fn opted_in(&self, tenant: &TenantId) -> bool {
+        if !self.snapshot.load().trace_export.contains(tenant) {
+            return false;
+        }
+        if self.freshness.is_expired() {
+            if let Some((registry, handle)) = &self.stale {
+                registry.incr(proxy_observability::stats::WorkerId(0), *handle, 1);
+            }
+            return false;
+        }
+        true
+    }
+}
+
+impl fmt::Debug for TraceConsent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TraceConsent").finish_non_exhaustive()
     }
 }
 
