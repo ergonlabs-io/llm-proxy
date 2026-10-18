@@ -54,7 +54,15 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::oneshot;
 
 use crate::auth::TenantId;
-use crate::control::{unix_now_secs, ControlPlaneStore, ObjectOwner, StoreError};
+use crate::control::{ControlPlaneStore, ObjectOwner, StoreError};
+
+/// Unix seconds now, the clock owner expiries are kept in; `0` if the
+/// clock is before the epoch.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Most owners [`ObjectOwners`] caches. Past it the cache is cleared and
 /// refilled from the store, so a long-lived replica cannot grow it without
