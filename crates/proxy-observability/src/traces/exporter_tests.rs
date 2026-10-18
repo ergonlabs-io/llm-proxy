@@ -401,15 +401,29 @@ fn retention_removes_the_oldest_segments_first() {
         "the newest old segment and the new one remain: {left:?}"
     );
 
-    // Past max_age, every sealed segment goes before the next write.
+    // Past max_age, every sealed segment goes before the next write. The old
+    // segments are aged by their mtime, which the store reads as the seal
+    // time on open; a max_age far above any scheduling delay keeps the
+    // segment sealed at shutdown, then retained in the same pass, young.
+    let max_age = Duration::from_secs(3600);
+    let aged = std::time::SystemTime::now() - 2 * max_age;
+    for rel in &left {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(rel))
+            .unwrap();
+        file.set_modified(aged).unwrap();
+    }
     let mut cfg = config(dir.path());
-    cfg.max_age = Some(Duration::from_millis(1));
-    std::thread::sleep(Duration::from_millis(5));
+    cfg.max_age = Some(max_age);
     let running = start(&cfg);
     running.submit("t5", "e5", br#"{}"#, b"{}", TraceMeta::default());
     let stats = running.stop();
     let text = crate::stats::prometheus_render::render(&stats.registry());
-    assert!(text.contains("envoy_llmproxy_trace_segments_expired_total{reason=\"age\"} 2"));
+    assert!(
+        text.contains("envoy_llmproxy_trace_segments_expired_total{reason=\"age\"} 2"),
+        "{text}"
+    );
     let left: Vec<String> = sealed_lines(dir.path())
         .into_iter()
         .map(|(r, _)| r)
