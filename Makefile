@@ -143,7 +143,7 @@ tq-changed: ## Test only crates you changed, e.g. make tq-changed BASE=main
 .PHONY: tq-redis
 tq-redis: ## Run Redis store tests (requires LLM_PROXY_TEST_REDIS)
 	@test -n "$$LLM_PROXY_TEST_REDIS" || (echo "LLM_PROXY_TEST_REDIS is required"; exit 1)
-	cargo nextest run -p proxy-filters -p proxy --run-ignored all -E 'test(redis)'
+	cargo nextest run -p proxy-control -p proxy-filters -p proxy --run-ignored all -E 'test(redis)'
 
 tq-%: ## Test one crate via nextest, e.g. make tq-proxy-http
 	cargo nextest run -p $*
