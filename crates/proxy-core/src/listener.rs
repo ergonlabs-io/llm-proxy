@@ -796,6 +796,7 @@ fn spawn_accept_loop(
                 stream,
                 peer,
                 listener_name: name.clone(),
+                published: config.subscribe(),
                 snapshot,
                 tls: tls_cache.clone(),
                 hcm: hcm_cache.clone(),
@@ -863,6 +864,9 @@ struct ServeConnection {
     /// The snapshot this connection matched under, held for its lifetime. This is the passive-drain
     /// seam: replaced config stays alive as long as connections accepted under it.
     snapshot: Arc<ConfigSnapshot>,
+    /// The worker's published snapshot version. An HTTP connection closes gracefully once it moves past
+    /// `snapshot.version`; see `run_terminal_filter`.
+    published: watch::Receiver<SnapshotVersion>,
     /// TLS factories built from `snapshot` in the accept loop, before this task was spawned.
     tls: Rc<ListenerTls>,
     /// HTTP filter-chain handlers built from `snapshot`, same cadence as `tls`.
@@ -893,6 +897,7 @@ async fn serve_connection(conn: ServeConnection) {
         peer,
         listener_name: name,
         snapshot,
+        published,
         tls,
         hcm,
         registry,
@@ -1028,6 +1033,7 @@ async fn serve_connection(conn: ServeConnection) {
                             registry: &registry,
                             shutdown,
                             drain,
+                            published,
                             name: &name,
                             downstream,
                             codec,
@@ -1069,6 +1075,7 @@ async fn serve_connection(conn: ServeConnection) {
                     registry: &registry,
                     shutdown,
                     drain,
+                    published,
                     name: &name,
                     downstream,
                     codec,
@@ -1444,6 +1451,8 @@ struct RunTerminalFilterCtx<'a> {
     shutdown: watch::Receiver<bool>,
     /// Starts the HTTP codecs' graceful shutdown. TCP proxy connections ignore it and run until `shutdown`.
     drain: watch::Receiver<DrainState>,
+    /// See [`ServeConnection::published`]. TCP proxy connections ignore it.
+    published: watch::Receiver<SnapshotVersion>,
     name: &'a ListenerName,
     // Rust note: `Copy`, so it threads cheaply. It also serves as `peer` for tracing via `downstream.remote`.
     downstream: DownstreamInfo,
@@ -1468,6 +1477,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
         registry,
         mut shutdown,
         mut drain,
+        mut published,
         name,
         downstream,
         codec,
@@ -1490,6 +1500,22 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
             // (idle keep-alives close, in-flight requests finish, then `Connection: close` or GOAWAY) or
             // the final `shutdown`.
             // Hook: a realtime/WebSocket session would send Close 1001 when `drain_started` resolves.
+            //
+            // A reload starts the same graceful shutdown. This connection's handler, routes and cluster view
+            // (and so its provider credentials) belong to `snapshot`. Without this a kept-alive connection would
+            // keep sending a rotated or revoked provider key until the client closed it. Requests already in
+            // flight finish on their own generation, so a retry never mixes generations
+            // (internal-docs/envoy-divergences.md).
+            let accepted = snapshot.version;
+            let listener = name.clone();
+            let superseded = async move {
+                // `wait_for` checks the current value first, so a publish between the accept loop's `load` and
+                // its `subscribe` is not missed. A dropped sender means the worker is going away: never fires.
+                if published.wait_for(|v| *v != accepted).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                tracing::debug!(listener = %listener, peer = %peer, "config replaced; closing connection after in-flight requests");
+            };
             let shutdown_fut = async move {
                 let shutdown_signal = async {
                     if *shutdown.borrow() {
@@ -1505,6 +1531,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
                 tokio::select! {
                     _ = drain_started(&mut drain) => {}
                     _ = shutdown_signal => {}
+                    _ = superseded => {}
                 }
             };
 

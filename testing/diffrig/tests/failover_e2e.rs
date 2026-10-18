@@ -890,3 +890,210 @@ async fn a_reload_during_failover_keeps_the_retry_on_its_own_generation() {
     standby_v2.shutdown().await;
     drop(scratch);
 }
+
+/// One downstream HTTP/1.1 connection kept open across requests, so a test
+/// can hold a connection accepted before a reload.
+struct KeptAliveConnection {
+    sender: hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    /// Resolves when the connection ends.
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl KeptAliveConnection {
+    async fn open(addr: SocketAddr) -> Self {
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to proxy");
+        let (sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .expect("http1 handshake");
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Self { sender, driver }
+    }
+
+    async fn send_chat(&mut self) -> diffrig::harness::RawResponse {
+        use http_body_util::BodyExt;
+        let request = hyper::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("host", "proxy")
+            .header("content-type", "application/json")
+            .header("x-llmproxy-model", "gpt-4o-mini")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                chat_request_body().to_string(),
+            )))
+            .expect("build request");
+        let exchange = async {
+            let response = self
+                .sender
+                .send_request(request)
+                .await
+                .expect("send request");
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_str().unwrap_or_default().to_string()))
+                .collect();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect body")
+                .to_bytes();
+            diffrig::harness::RawResponse {
+                status,
+                headers,
+                body: String::from_utf8_lossy(&body).to_string(),
+            }
+        };
+        tokio::time::timeout(CLIENT_TIMEOUT, exchange)
+            .await
+            .expect("kept-alive request timed out")
+    }
+}
+
+/// [`reload_config`] with `request_headers_timeout` disabled. That timer also
+/// closes an idle keep-alive connection (envoy-divergences.md, row 16), which
+/// would close the pre-reload connection whether or not the reload did.
+fn keepalive_reload_config(
+    listener_port: u16,
+    primary_port: u16,
+    standby_port: u16,
+    standby_key: &str,
+    standby_model: &str,
+) -> String {
+    let short = format!("listen: \"127.0.0.1:{listener_port}\"");
+    let config = reload_config(
+        listener_port,
+        primary_port,
+        standby_port,
+        standby_key,
+        standby_model,
+    );
+    assert!(
+        config.contains(&short),
+        "reload_config changed its listen line"
+    );
+    config.replace(
+        &short,
+        &format!(
+            "listen: {{ address: \"127.0.0.1:{listener_port}\", request_headers_timeout: 0s }}"
+        ),
+    )
+}
+
+/// A SIGHUP that rotates the standby's key (and replaces its endpoint and
+/// upstream model) while an idle keep-alive connection accepted before the
+/// reload stays open. The proxy must close that connection, so the client's
+/// next request goes out on a new connection with the new key, and the old
+/// key is never sent again. A connection that kept its accept-time generation
+/// would keep using a rotated or revoked provider key for as long as the
+/// client held it open.
+///
+/// The close is awaited before anything else is sent, so no request races
+/// the reload. A request already in flight at the reload finishes on its own
+/// generation; `a_reload_during_failover_keeps_the_retry_on_its_own_generation`
+/// covers that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_closes_kept_alive_connections_so_a_rotated_key_is_not_sent() {
+    let primary = OpenAiUpstream::spawn(primary_config())
+        .await
+        .expect("spawn primary");
+    let standby_v1 = OpenAiUpstream::spawn(standby_generation(STANDBY_KEY, STANDBY_V1_TEXT))
+        .await
+        .expect("spawn first standby");
+    let standby_v2 = OpenAiUpstream::spawn(standby_generation(STANDBY_V2_KEY, STANDBY_V2_TEXT))
+        .await
+        .expect("spawn second standby");
+
+    let scratch = ScratchDir::new("keepalive-reload");
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let config_path = scratch.write(
+        "llmproxy.yaml",
+        &keepalive_reload_config(
+            listener_port,
+            primary.addr().port(),
+            standby_v1.addr().port(),
+            STANDBY_KEY,
+            "standby-upstream-model",
+        ),
+    );
+    let mut proxy = ProxyProcess::spawn(
+        &resolve_llm_proxy_bin(),
+        &config_path,
+        &scratch.path().join("proxy.log"),
+    );
+    proxy.wait_until_ready(listener_addr, READY_TIMEOUT);
+
+    let mut kept = KeptAliveConnection::open(listener_addr).await;
+    let before = kept.send_chat().await;
+    assert_eq!(before.status, 200, "first request: {}", before.body);
+    assert!(before.body.contains(STANDBY_V1_TEXT), "{}", before.body);
+    // The negative control: with no reload the connection stays usable.
+    let again = kept.send_chat().await;
+    assert!(again.body.contains(STANDBY_V1_TEXT), "{}", again.body);
+    let v1_before = standby_v1.log.requests().len();
+
+    scratch.write(
+        "llmproxy.yaml",
+        &keepalive_reload_config(
+            listener_port,
+            primary.addr().port(),
+            standby_v2.addr().port(),
+            STANDBY_V2_KEY,
+            "standby-upstream-model-v2",
+        ),
+    );
+    proxy.sighup();
+    proxy.wait_for_log("SIGHUP: config reload succeeded", RELOAD_TIMEOUT);
+
+    tokio::time::timeout(RELOAD_TIMEOUT, &mut kept.driver)
+        .await
+        .expect("the proxy kept the pre-reload connection open")
+        .expect("connection driver task");
+    assert!(kept.sender.is_closed());
+
+    // The client's next request, on the connection it must now open.
+    let mut reconnected = KeptAliveConnection::open(listener_addr).await;
+    let after = reconnected.send_chat().await;
+
+    assert_eq!(
+        after.status, 200,
+        "request after the reload: {}",
+        after.body
+    );
+    assert!(after.body.contains(STANDBY_V2_TEXT), "{}", after.body);
+    assert_eq!(
+        standby_v1.log.requests().len(),
+        v1_before,
+        "the old standby (old key) was dialled after the reload"
+    );
+    let v2_requests = standby_v2.log.requests();
+    assert_eq!(v2_requests.len(), 1, "one request to the new standby");
+    let received = &v2_requests[0].headers;
+    assert!(
+        carries_bearer(received, STANDBY_V2_KEY),
+        "the new standby must get the rotated key: {received:?}"
+    );
+    assert!(
+        !mentions(received, STANDBY_KEY),
+        "the rotated-out key reached the new standby: {received:?}"
+    );
+    assert_eq!(
+        standby_v2.bodies.bodies()[0]["model"],
+        "standby-upstream-model-v2",
+        "the request after the reload must use the new upstream model"
+    );
+
+    drop(reconnected);
+    drop(proxy);
+    primary.shutdown().await;
+    standby_v1.shutdown().await;
+    standby_v2.shutdown().await;
+    drop(scratch);
+}
