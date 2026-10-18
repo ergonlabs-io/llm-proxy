@@ -1315,6 +1315,7 @@ impl AuthFilterInstance {
     /// module doc's "wire response is identical" section. `details` is the
     /// only thing allowed to vary between callers of this function.
     fn deny(&self, cb: &mut dyn DecoderCallbacks, details: &str) {
+        cb.stream_info().auth.denied = true;
         cb.send_local_reply(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -1426,6 +1427,8 @@ impl HttpFilter for AuthFilterInstance {
             // 401: the store is the problem, not necessarily the credential,
             // and a client should retry rather than discard its key.
             AuthOutcome::Rejected(AuthError::PolicyStale) => {
+                // No identity was established either (ADR-0011 decision 3).
+                cb.stream_info().auth.denied = true;
                 cb.send_local_reply(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "service unavailable",
@@ -2689,6 +2692,7 @@ mod tests {
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         filter.decode_headers(&mut cb, &mut request_headers(Some(&bearer)), true);
         assert!(cb.local_reply.is_none(), "a fresh snapshot admits the key");
+        assert!(!cb.stream_info.borrow().auth.denied);
 
         // Stand in for an outage longer than the bound.
         control_plane
@@ -2697,6 +2701,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         filter.decode_headers(&mut cb, &mut request_headers(Some(&bearer)), true);
+        assert!(
+            cb.stream_info.borrow().auth.denied,
+            "no identity was established, so the record names `unauthenticated`"
+        );
         let reply = cb
             .local_reply
             .expect("a stale snapshot must refuse the key");

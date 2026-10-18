@@ -583,7 +583,7 @@ impl LoggingBody {
             llm_upstream,
             llm_completeness,
             trace,
-            (tenant, user_id),
+            (tenant, user_id, auth_denied),
             response_code_details,
             usage_attribution,
             attempts,
@@ -642,7 +642,11 @@ impl LoggingBody {
                 // The SAME `AuthInfo::tenant` the auth filter wrote,
                 // read here rather than re-borrowing `stream_info` a second
                 // time below -- see this destructuring's own doc above.
-                (info.auth.tenant.clone(), info.auth.user_id.clone()),
+                (
+                    info.auth.tenant.clone(),
+                    info.auth.user_id.clone(),
+                    info.auth.denied,
+                ),
                 // `%RESPONSE_CODE_DETAILS%` -- cloned out alongside
                 // everything else `LogContext` borrows, same reasoning as
                 // this destructure's own doc above.
@@ -704,10 +708,13 @@ impl LoggingBody {
                 instance_id: "proxy".to_owned(),
                 started_at: format_system_time(ctx.start_time),
                 finished_at: format_system_time(SystemTime::now()),
-                tenant_id: tenant
-                    .as_deref()
-                    .map(proxy_observability::records::bounded_field)
-                    .unwrap_or_else(|| "default".to_owned()),
+                // `default` is a request with no tenant; a request the auth
+                // filter refused has no identity at all (ADR-0011 decision 3).
+                tenant_id: match (tenant.as_deref(), auth_denied) {
+                    (Some(tenant), _) => proxy_observability::records::bounded_field(tenant),
+                    (None, true) => proxy_observability::records::UNAUTHENTICATED_TENANT.to_owned(),
+                    (None, false) => proxy_observability::records::DEFAULT_TENANT.to_owned(),
+                },
                 // The authenticated user only. A body `user` field is
                 // caller-controlled and never reaches this.
                 user_id: user_id

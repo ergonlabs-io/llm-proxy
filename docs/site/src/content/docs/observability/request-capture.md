@@ -38,7 +38,7 @@ The record type is `RequestRecord` in
 | Field | Meaning |
 |---|---|
 | `request_id`, `event_id`, `instance_id` | Identify the request, the record, and the proxy instance. |
-| `tenant_id`, `user_id`, `key_id` | Identify who made the request. `user_id` and `key_id` can be `null`. |
+| `tenant_id`, `user_id`, `key_id` | Identify who made the request. `user_id` and `key_id` can be `null`. `tenant_id` is `default` when the request had no tenant (no auth configured, or a credential that names none), and `unauthenticated` when the auth filter refused it; `error_category` then gives the reason, for example `auth_unknown_key`. Both names are reserved. |
 | `requested_model` | The model name the client sent. |
 | `selected_provider`, `selected_model` | The provider and model the proxy dialled. |
 | `status`, `termination`, `error_category` | How the request ended. `error_category` is the Envoy response code details. A stream whose downstream connection closed is `termination: downstream_disconnect` with flag `DC`, and `error_category` says which side closed it: `downstream_remote_disconnect` when the client left, `downstream_local_disconnect` when the proxy cut it at shutdown (the end of `--drain-time-s`, or a second termination signal). |

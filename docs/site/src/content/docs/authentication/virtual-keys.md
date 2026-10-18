@@ -434,6 +434,11 @@ the config entry on every replica that shares the store, and across restarts.
 Revoked key ids are permanent. The next request with any of those keys gets
 `401`.
 
+The tenant names `default` and `unauthenticated` are reserved. `POST /tenants`
+and `POST /keys` refuse them with `400`. Request records use `default` for a
+request without a tenant and `unauthenticated` for a request that the auth
+filter refused, so a tenant with either name could not be told apart from them.
+
 For example, `PUT /tenants/acme/policy` with
 `{"access":{"only":["gpt-*"]},"deny":["gpt-5*"]}` permits the
 `gpt-*` models except those matching `gpt-5*`. Omit `deny` or send `[]` for

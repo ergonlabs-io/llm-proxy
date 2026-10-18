@@ -421,6 +421,39 @@ fn the_record_names_the_keys_user_not_the_bodys_user_field() {
     }
 }
 
+/// A request the auth filter refuses is still recorded, under the reserved
+/// tenant `unauthenticated` rather than `default` (ADR-0011 decision 3), with
+/// the reason in `error_category` and no cost. The admitted request on the
+/// same proxy keeps its key's tenant.
+#[test]
+fn a_refused_credential_is_recorded_under_unauthenticated() {
+    let dir = scratch_dir("unauthenticated");
+    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let key = mint_key(&proxy);
+    let body = chat_body("clean");
+
+    let unknown = post_to_end(proxy.listen, "llmp_not-a-real-key", &body);
+    assert!(unknown.starts_with("HTTP/1.1 401"), "got:\n{unknown}");
+    let missing = http_request("POST", proxy.listen, "/v1/chat/completions", None, &body);
+    assert!(missing.starts_with("HTTP/1.1 401"), "got:\n{missing}");
+    let admitted = post_to_end(proxy.listen, &key, &body);
+    assert!(admitted.starts_with("HTTP/1.1 200"), "got:\n{admitted}");
+
+    let records = proxy.wait_for_records(3);
+    for (record, reason) in records[..2]
+        .iter()
+        .zip(["auth_unknown_key", "auth_no_credential"])
+    {
+        assert_eq!(record["tenant_id"], "unauthenticated", "{record}");
+        assert_eq!(record["error_category"], reason, "{record}");
+        assert_eq!(record["status"], 401, "{record}");
+        assert!(record["cost"].is_null(), "{record}");
+    }
+    assert_eq!(records[2]["tenant_id"], TENANT, "{}", records[2]);
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ------------------------------------------------------------------ helpers --
 
 fn chat_body(marker: &str) -> String {
