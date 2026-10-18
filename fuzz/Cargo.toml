@@ -1,5 +1,5 @@
 # Fuzz targets for the hand-written parsers that read client- or
-# provider-controlled bytes (WP-29). Run with `make fuzz` or `make fuzz-one`.
+# provider-controlled bytes. Run with `make fuzz` or `make fuzz-one`.
 #
 # Deliberately NOT a member of the root workspace: cargo-fuzz needs nightly
 # and sanitizer flags, so keeping it out leaves `make tq` and `make ci` on

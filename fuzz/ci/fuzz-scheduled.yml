@@ -1,4 +1,4 @@
-# PROPOSED scheduled fuzz job (WP-29). Not enabled: GitHub only runs
+# PROPOSED scheduled fuzz job. Not enabled: GitHub only runs
 # workflows under .github/workflows/. To enable, copy this file to
 # .github/workflows/fuzz.yml.
 #
