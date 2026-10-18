@@ -1441,7 +1441,14 @@ fn build_hcm_handler(
     if let Some(t) = runtime.tracing_handles {
         handler = handler.with_tracing(t.sink.clone(), t.sample_ratio);
     }
-    Ok(Rc::new(handler))
+    let active = proxy_http::active_requests::ActiveRequests::new(
+        runtime.router_stats.registry(),
+        runtime.router_stats.worker(),
+        &hcm.stat_prefix,
+    );
+    Ok(Rc::new(
+        proxy_http::active_requests::ActiveRequestHandler::new(Rc::new(handler), active),
+    ))
 }
 
 /// Everything [`run_terminal_filter`] needs beyond `stream`, `filter`, and `snapshot`. Bundled so the

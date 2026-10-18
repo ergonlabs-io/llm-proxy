@@ -1,7 +1,8 @@
 //! A stream cut mid-flight is still metered: the real `llm-proxy` binary in
 //! `--config` mode, a mock upstream that streams SSE, and three ways to cut
 //! the stream after response headers (review C3): the client drops the
-//! connection, the provider resets it, and a stream timer fires. A client
+//! connection, the provider resets it, and a stream timer fires. A fourth cut,
+//! the drain deadline at shutdown, must still be recorded before exit. A client
 //! that leaves before response headers is pinned as a known divergence.
 //!
 //! The request record (`--request-records-file`) must say `completeness:
@@ -211,6 +212,80 @@ fn a_timeout_mid_stream_is_recorded_partial_and_charged_once() {
     }
 }
 
+/// The drain deadline cuts a stream that is still flowing: SIGTERM with a
+/// one-second `--drain-time-s` against a provider that streams for ten.
+/// Stopping the workers drops the stream's response body, which writes the
+/// record, and metadata delivery is flushed after that, so the record reaches
+/// the records file before exit as a partial estimate. A shutdown that exited
+/// without stopping the workers would leave the request unrecorded and
+/// unbilled. The cut is reported as `downstream_disconnect` / `DC`: the record
+/// cannot yet tell a drain cut from a client hang-up.
+#[test]
+fn a_stream_cut_at_the_drain_deadline_is_recorded_partial_before_exit() {
+    let dir = scratch_dir("drain");
+    let mut proxy = Proxy::start_with_args(&dir, NO_TIMERS, &["--drain-time-s", "1"]);
+    let key = mint_key(&proxy);
+    let body = chat_body("abort");
+    let mut stream = read_two_frames(proxy.listen, &key, &body);
+
+    let status = Command::new("kill")
+        .args(["-TERM", &proxy.child.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -TERM failed");
+
+    // The stream ends without the terminating chunk: the deadline cut it.
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    let rest = String::from_utf8_lossy(&rest);
+    assert!(
+        !rest.contains("0\r\n\r\n"),
+        "the stream must be cut, not completed: {rest:?}"
+    );
+    let deadline = Instant::now() + RECORD_TIMEOUT;
+    let exit = loop {
+        if let Some(exit) = proxy.child.try_wait().expect("try_wait") {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "the proxy never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(exit.success(), "a deadline drain exits zero: {exit:?}");
+
+    // The process is gone, so whatever the file holds is final.
+    let records = proxy.wait_for_records(1);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record["upstream_response_id"], "chatcmpl-abort", "{record}");
+    assert_eq!(record["termination"], "downstream_disconnect", "{record}");
+    assert_eq!(
+        record["response_flags"],
+        serde_json::json!(["DC"]),
+        "{record}"
+    );
+    assert_eq!(record["usage"]["completeness"], "partial", "{record}");
+    assert_eq!(record["usage"]["provenance"], "estimate", "{record}");
+    assert_eq!(record["cost"]["kind"], "estimate", "{record}");
+    let input = record["usage"]["input_tokens"].as_u64().unwrap();
+    let output = record["usage"]["output_tokens"].as_u64().unwrap();
+    assert_eq!(
+        input,
+        record["bytes_request"].as_u64().unwrap().div_ceil(4),
+        "{record}"
+    );
+    assert!(
+        output >= 2,
+        "at least the two frames the client read: {record}"
+    );
+    assert_eq!(
+        record["cost"]["amount"],
+        input * INPUT_NANO + output * OUTPUT_NANO,
+        "{record}"
+    );
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Pins `envoy-divergences.md` row 34: a client that hangs up while the
 /// request still waits for response headers drops the filter chain's future,
 /// so no `on_stream_complete`, no access log line, no record and no charge.
@@ -323,6 +398,11 @@ fn the_record_names_the_keys_user_not_the_bodys_user_field() {
 
     let metrics = http_get(proxy.admin, "/stats/prometheus", None);
     assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+    // The dialect's one HCM exports the in-flight gauge under its prefix.
+    assert!(
+        metrics.contains("envoy_downstream_rq_active{scope=\"llmproxy\"} "),
+        "{metrics}"
+    );
     for user in ["minted-1", "someone-else"] {
         assert!(
             !metrics.contains(user),
@@ -425,6 +505,10 @@ struct Proxy {
 
 impl Proxy {
     fn start(dir: &Path, timers: Timers) -> Proxy {
+        Proxy::start_with_args(dir, timers, &[])
+    }
+
+    fn start_with_args(dir: &Path, timers: Timers, extra: &[&str]) -> Proxy {
         let listen = free_port();
         let admin = free_port();
         let upstream = spawn_streaming_upstream();
@@ -445,6 +529,7 @@ impl Proxy {
                 "--request-records-file",
                 records.to_str().expect("utf-8 path"),
             ])
+            .args(extra)
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -597,6 +682,12 @@ fn post_to_end(addr: SocketAddr, key: &str, body: &str) -> String {
 /// Send the request, read until two SSE frames have arrived, then drop the
 /// connection without reading the rest.
 fn abort_after_two_frames(addr: SocketAddr, key: &str, body: &str) {
+    drop(read_two_frames(addr, key, body));
+}
+
+/// Send the request and read until two SSE frames have arrived; the
+/// connection stays open for the caller.
+fn read_two_frames(addr: SocketAddr, key: &str, body: &str) -> TcpStream {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
     stream
@@ -617,7 +708,7 @@ fn abort_after_two_frames(addr: SocketAddr, key: &str, body: &str) {
         "got:\n{}",
         String::from_utf8_lossy(&seen)
     );
-    drop(stream);
+    stream
 }
 
 fn http_get(addr: SocketAddr, path: &str, authorization: Option<&str>) -> String {

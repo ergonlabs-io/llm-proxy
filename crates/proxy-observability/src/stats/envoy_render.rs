@@ -10,6 +10,7 @@
 //! | `upstream_rq` `{cluster, status_class}` | `cluster.<cluster>.upstream_rq_<class>` |
 //! | `upstream_rq` `{cluster}` | `cluster.<cluster>.upstream_rq_total` |
 //! | `upstream_rq_time` `{cluster}` | `cluster.<cluster>.upstream_rq_time` |
+//! | `downstream_rq_active` `{scope}` | `http.<scope>.downstream_rq_active` |
 //! | anything else (e.g. `llm.client.token.usage`) | omitted |
 //!
 //! [`envoy_counter_name`] and [`envoy_histogram_name`] are the only functions
@@ -147,6 +148,11 @@ fn envoy_counter_name(instrument: &Instrument, attrs: &[(String, String)]) -> Op
             Some(format!(
                 "listener.{listener}.downstream_cx_transport_socket_connect_timeout"
             ))
+        }
+        // Envoy's HCM gauge, under the HCM's `stat_prefix`.
+        "downstream_rq_active" => {
+            let scope = attr(attrs, "scope")?;
+            Some(format!("http.{scope}.downstream_rq_active"))
         }
         // Everything else (llm.*, and any future counter this table
         // hasn't been taught about yet) has no Envoy /stats equivalent —

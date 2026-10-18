@@ -716,3 +716,204 @@ static_resources:
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&log_path);
 }
+
+/// Set once by `downstream_rq_active_counts_requests_until_their_response_ends`
+/// to let its held stream finish.
+static RELEASE_HELD_STREAM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A mock upstream for the in-flight gauge. `GET /hold` gets chunked response
+/// headers and one chunk, then nothing until [`RELEASE_HELD_STREAM`] is set,
+/// then the terminating chunk. `GET /silent` never gets an answer. Both waits
+/// are bounded so a failed test cannot leave a thread spinning.
+fn spawn_holding_upstream() -> SocketAddr {
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
+    let addr = listener.local_addr().expect("no local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                if head.starts_with("GET /silent") {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    let _ = stream.read(&mut buf);
+                    return;
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                      6\r\nfirst\n\r\n",
+                );
+                while !RELEASE_HELD_STREAM.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = stream.write_all(b"0\r\n\r\n");
+            });
+        }
+    });
+    addr
+}
+
+/// The `envoy_downstream_rq_active{scope="ingress_http"}` sample, or `None`
+/// when the series is absent.
+fn rq_active(admin: SocketAddr) -> Option<u64> {
+    let response = get(admin, "/stats/prometheus", "localhost");
+    response.lines().find_map(|line| {
+        line.strip_prefix("envoy_downstream_rq_active{scope=\"ingress_http\"} ")
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
+fn wait_rq_active(admin: SocketAddr, expected: u64, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = rq_active(admin);
+        if value == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: downstream_rq_active is {value:?}, expected {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Opens `GET <path>` with `Connection: close` and, when `first_chunk` is
+/// set, reads until the upstream's first chunk has arrived, so the response is
+/// mid-stream.
+fn open_request(addr: SocketAddr, path: &str, first_chunk: bool) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set_read_timeout");
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .expect("write request");
+    if first_chunk {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !String::from_utf8_lossy(&seen).contains("first") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => panic!(
+                    "stream ended before its first chunk: {}",
+                    String::from_utf8_lossy(&seen)
+                ),
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+    stream
+}
+
+/// `downstream_rq_active` counts a request from the moment it reaches the HCM
+/// until its response is over, on every way out: a stream that completes, a
+/// stream the client abandons mid-body, and a request the client abandons
+/// before response headers. Two workers, so the gauge is the sum across
+/// worker shards. The Envoy `/stats` text names the same gauge under
+/// `http.<stat_prefix>`.
+#[test]
+fn downstream_rq_active_counts_requests_until_their_response_ends() {
+    let upstream = spawn_holding_upstream();
+    let listener_port = free_port();
+    let admin_port = free_port();
+    let config_yaml = format!(
+        r#"
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: {admin_port} }}
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: backend }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {ip}, port_value: {port} }}
+"#,
+        ip = upstream.ip(),
+        port = upstream.port(),
+    );
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-stats-e2e-rq-active-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&config_path, config_yaml).expect("write temp config");
+    let _child = ChildGuard(
+        Command::new(BIN)
+            .args(["-c", config_path.to_str().unwrap(), "--concurrency", "2"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn llm-proxy"),
+    );
+    for port in [listener_port, admin_port] {
+        assert!(
+            wait_for_connectable(("127.0.0.1", port), STARTUP_TIMEOUT),
+            "127.0.0.1:{port} did not become connectable"
+        );
+    }
+    let listen = SocketAddr::from(([127, 0, 0, 1], listener_port));
+    let admin = SocketAddr::from(([127, 0, 0, 1], admin_port));
+    wait_rq_active(admin, 0, "idle");
+
+    let mut held = open_request(listen, "/hold", true);
+    let abandoned_mid_body = open_request(listen, "/hold", true);
+    let abandoned_before_headers = open_request(listen, "/silent", false);
+    wait_rq_active(admin, 3, "two streams mid-body and one awaiting headers");
+    let text = get(admin, "/stats", "localhost");
+    assert!(
+        text.contains("http.ingress_http.downstream_rq_active: 3\n"),
+        "{text}"
+    );
+
+    drop(abandoned_before_headers);
+    wait_rq_active(admin, 2, "a client left before response headers");
+    drop(abandoned_mid_body);
+    wait_rq_active(admin, 1, "a client left mid-stream");
+
+    RELEASE_HELD_STREAM.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut rest = Vec::new();
+    let _ = held.read_to_end(&mut rest);
+    assert!(
+        String::from_utf8_lossy(&rest).ends_with("0\r\n\r\n"),
+        "the held stream must complete: {}",
+        String::from_utf8_lossy(&rest)
+    );
+    wait_rq_active(admin, 0, "the held stream completed");
+    let _ = std::fs::remove_file(&config_path);
+}

@@ -275,6 +275,11 @@ impl RouterStats {
         self.registry.clone()
     }
 
+    /// The worker whose shard this handle set records into.
+    pub fn worker(&self) -> WorkerId {
+        self.worker
+    }
+
     /// Counts one tenant-mode credential decision (`applied`, `missing`, or
     /// `unusable`) against `provider`. Called only from the router's
     /// tenant-mode credential steps, so platform-mode requests never reach

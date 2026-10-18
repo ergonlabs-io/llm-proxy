@@ -18,6 +18,7 @@
 //! HTTP filters (AGENTS.md invariant 8).
 
 pub mod access_logging;
+pub mod active_requests;
 mod attempt_logging;
 #[cfg(unix)]
 mod capture_cleanup;

@@ -534,6 +534,19 @@ pub mod instruments {
         buckets: None,
     };
 
+    /// Downstream requests in flight on one HTTP connection manager: counted
+    /// from the moment the request reaches the HCM until its response body
+    /// ends or is dropped, so a streaming response counts for its whole
+    /// stream. Envoy's own HCM gauge of the same name. `scope` is the
+    /// operator-chosen HCM `stat_prefix`, bounded by config.
+    pub const DOWNSTREAM_RQ_ACTIVE: Instrument = Instrument {
+        name: "downstream_rq_active",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{request}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
+
     /// Tokens consumed by a GenAI request/response exchange. **Has no Envoy
     /// equivalent** — Envoy predates LLM gateways — so this renders to
     /// nothing in the `/stats` text output; it exists in
