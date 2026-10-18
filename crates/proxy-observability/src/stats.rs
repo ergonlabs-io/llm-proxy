@@ -1105,6 +1105,22 @@ pub mod instruments {
         attribute_keys: &["reason"],
         buckets: None,
     };
+    /// Segments the store confirmed and that were deleted locally.
+    pub const TRACE_SEGMENTS_UPLOADED: Instrument = Instrument {
+        name: "llmproxy_trace_segments_uploaded_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Failed upload attempts, by finite reason; each is retried.
+    pub const TRACE_UPLOAD_FAILURES: Instrument = Instrument {
+        name: "llmproxy_trace_upload_failures_total",
+        kind: InstrumentKind::Counter,
+        unit: "{attempt}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
     /// Segment bytes on disk, open and sealed.
     pub const TRACE_DISK_BYTES: Instrument = Instrument {
         name: "llmproxy_trace_disk_bytes",

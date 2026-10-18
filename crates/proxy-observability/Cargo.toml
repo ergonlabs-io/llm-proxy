@@ -18,6 +18,15 @@ base64 = { workspace = true }
 # Trace segment codecs, and inflating gzip/deflate bodies off the worker.
 flate2 = { workspace = true }
 zstd = { workspace = true }
+# The S3 trace uploader: its own current-thread runtime, an HTTP/1 client over
+# rustls (ring provider, system roots), streaming segment bodies.
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 # `stats::Registry` publishes its per-handle metadata and
 # shard storage through `ArcSwap<Snapshot>` so resolution can grow the
 # registry under `&self`, surviving a config swap -- the same pattern
@@ -36,7 +45,7 @@ socket2 = { workspace = true }
 # deadline. No runtime/macro feature is added: neither exporter task constructs
 # or spawns a runtime -- `crates/proxy/src/main.rs` spawns both onto the
 # control runtime that is already running.
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "net"] }
 # The OTLP/gRPC trace exporter -- `proxy-api` for the
 # vendored collector/trace/common/resource message types (see its `build.rs`
 # comment on why these cross out of `proxy-api` at all: a hand-rolled

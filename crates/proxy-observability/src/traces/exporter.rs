@@ -10,8 +10,10 @@ use crate::traces::capture::{CapturedTrace, DropReason, PartialReason, TraceAdmi
 use crate::traces::config::TraceExportConfig;
 use crate::traces::reassemble::{self, Body};
 use crate::traces::segment::{OpenError, SealReason, Sealed, SegmentStore, WriteOutcome};
+use crate::traces::uploader::{UploadQueue, Uploader};
 use serde::Serialize;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -42,6 +44,7 @@ struct ExporterStats {
 }
 
 /// Indexes into `ExporterStats::lost`, in its label order.
+const LOST_UPLOAD_BACKLOG: usize = 0;
 const LOST_UNSEALED_AT_START: usize = 1;
 const LOST_WRITE_ERROR: usize = 2;
 
@@ -100,6 +103,13 @@ impl Warn {
 pub struct TraceExporter {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    uploader: Option<Uploader>,
+}
+
+/// The exporter's side of the S3 destination.
+struct Upload {
+    queue: Arc<UploadQueue>,
+    uploaded: mpsc::Receiver<PathBuf>,
 }
 
 impl TraceExporter {
@@ -128,8 +138,27 @@ impl TraceExporter {
                  (llmproxy_trace_segments_lost_total{{reason=\"unsealed_at_start\"}})"
             );
         }
+        let (upload, uploader) = match &config.s3 {
+            None => (None, None),
+            Some(destination) => {
+                let queue = Arc::new(UploadQueue::default());
+                // Segments sealed before a restart are uploaded first.
+                for segment in store.sealed() {
+                    queue.push(segment.clone());
+                }
+                let (uploaded_tx, uploaded) = mpsc::channel();
+                let uploader =
+                    Uploader::spawn(destination, Arc::clone(&queue), uploaded_tx, control)
+                        .map_err(|e| OpenError::Io {
+                            path: "trace-uploader thread".into(),
+                            reason: e.to_string(),
+                        })?;
+                (Some(Upload { queue, uploaded }), Some(uploader))
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let mut state = Exporter {
+            upload,
             config: config.clone(),
             node_id: node_id.to_string(),
             store,
@@ -151,25 +180,33 @@ impl TraceExporter {
         Ok(TraceExporter {
             stop,
             thread: Some(thread),
+            uploader,
         })
     }
 
     /// Drain what is queued within `deadline`, seal every open segment, and
     /// stop. Anything still queued counts as `shutdown`. `true` when the
     /// thread finished in time.
+    /// With an S3 destination, the uploader then gets what is left of
+    /// `deadline` for the upload in flight; unsent segments stay on disk.
     pub fn shutdown(mut self, deadline: Duration) -> bool {
         self.stop.store(true, Ordering::Release);
-        let Some(thread) = self.thread.take() else {
-            return true;
-        };
         let started = Instant::now();
-        while !thread.is_finished() {
-            if started.elapsed() > deadline + TICK {
-                return false;
+        let mut finished = true;
+        if let Some(thread) = self.thread.take() {
+            while !thread.is_finished() {
+                if started.elapsed() > deadline + TICK {
+                    finished = false;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            finished = finished && thread.join().is_ok();
         }
-        thread.join().is_ok()
+        if let Some(uploader) = self.uploader.take() {
+            finished &= uploader.shutdown(deadline.saturating_sub(started.elapsed()));
+        }
+        finished
     }
 }
 
@@ -180,6 +217,7 @@ impl Drop for TraceExporter {
 }
 
 struct Exporter {
+    upload: Option<Upload>,
     config: TraceExportConfig,
     node_id: String,
     store: SegmentStore,
@@ -307,6 +345,9 @@ impl Exporter {
 
     fn after_seals(&mut self, sealed: Vec<(Sealed, SealReason)>) {
         for (segment, reason) in sealed {
+            if let Some(upload) = &self.upload {
+                upload.queue.push(segment.clone());
+            }
             let i = SealReason::ALL.iter().position(|r| *r == reason).unwrap();
             self.stats.incr(self.stats.sealed[i], 1);
             if reason == SealReason::Lru
@@ -323,9 +364,43 @@ impl Exporter {
         self.retain();
     }
 
-    /// Directory retention: age, then total size, oldest first. Counted as
-    /// expiry, not loss: this is the retention the operator configured.
+    /// With S3: forget what was uploaded, then, while over the disk cap,
+    /// drop the oldest segment not yet sent (never the one in flight) and
+    /// count it lost. Otherwise directory retention: age, then total size,
+    /// oldest first, counted as expiry, not loss: that is the retention the
+    /// operator configured.
     fn retain(&mut self) {
+        if let Some(upload) = &self.upload {
+            while let Ok(path) = upload.uploaded.try_recv() {
+                self.store.forget(&path);
+            }
+            while self.store.disk_bytes() > self.config.max_disk_bytes {
+                let mut queue = upload.queue.lock();
+                let in_flight = queue.in_flight.clone();
+                let Some(evicted) = self
+                    .store
+                    .remove_oldest(|s| in_flight.as_deref() == Some(s.path.as_path()))
+                else {
+                    break;
+                };
+                queue.pending.retain(|s| s.path != evicted.path);
+                drop(queue);
+                self.stats.incr(self.stats.lost[LOST_UPLOAD_BACKLOG], 1);
+                if let Some(lines) = evicted.lines {
+                    self.admission
+                        .stats
+                        .dropped(DropReason::UploadBacklog, lines);
+                }
+                if self.write_warn.due() {
+                    tracing::warn!(
+                        "trace upload backlog reached max_disk_bytes; the oldest unsent segment \
+                         was dropped (llmproxy_trace_segments_lost_total{{reason=\"upload_backlog\"}})"
+                    );
+                }
+            }
+            self.publish_disk();
+            return;
+        }
         if let Some(max_age) = self.config.max_age {
             let old = self.store.remove_older_than(max_age);
             self.stats.incr(self.stats.expired[0], old.len() as u64);

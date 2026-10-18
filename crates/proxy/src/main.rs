@@ -2308,12 +2308,6 @@ fn open_traces(
 ) -> Result<OpenedTraces, String> {
     use proxy_observability::traces::{capture, exporter, gate};
     const ROOT: &str = "node.metadata[\"io.llmproxy.traces\"]";
-    if config.s3.is_some() {
-        return Err(format!(
-            "{ROOT}.s3 (the dialect's observability.traces.s3): the S3 destination is not \
-             available in this build yet"
-        ));
-    }
     let gate = Arc::new(gate::TraceGate::open(&config.directory));
     let trace_stats = capture::TraceStats::resolve(stats);
     let (admission, traces) = match capture_supervisor {
