@@ -48,14 +48,18 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
-- **Behavior change:** HTTP/1 request heads are now limited to 60 KiB and 100
-  headers, Envoy's defaults; a larger head gets `431` and closes the
-  connection before any filter runs. Before, only hyper's own limits applied
-  (about 408 KiB and 100 headers). Envoy mode maps HCM `max_request_headers_kb`
-  and `common_http_protocol_options.max_headers_count`, which were refused at
+- **Behavior change:** request heads are now limited to 60 KiB and 100
+  headers, Envoy's defaults. On HTTP/1 a larger head gets `431` and closes
+  the connection before any filter runs; before, only hyper's own limits
+  applied (about 408 KiB and 100 headers). On HTTP/2, as in Envoy, the
+  decoded header list (name plus value per field, pseudo-headers included)
+  is measured and an over-limit stream is reset with `INTERNAL_ERROR` while
+  the connection stays up; before, hyper's 16 KiB default applied and the
+  count was unlimited. Envoy mode maps HCM `max_request_headers_kb` and
+  `common_http_protocol_options.max_headers_count`, which were refused at
   load; the dialect adds `listen.max_request_headers_kb` and
-  `max_request_headers_count`. HTTP/2 keeps hyper's defaults
-  (`internal-docs/envoy-divergences.md`).
+  `max_request_headers_count`. Remaining differences from Envoy are in
+  `internal-docs/envoy-divergences.md`.
 
 ## [0.5.0] - 2026-10-18
 
