@@ -7,6 +7,7 @@ last_updated: 2026-10-16
 related:
   - ../configuration/configuration-file/
   - ../operations/config-reload/
+  - ../limits-and-budgets/billing-ledger/
 ---
 
 # Metrics and `/stats`
@@ -140,6 +141,19 @@ each is on [Request capture](../../observability/request-capture/).
 
 (Definitions: `crates/proxy-observability/src/stats.rs:754-978`. The code that
 writes each series is in the capture crates and is not checked here.)
+
+### Ledger metrics
+
+The billing ledger records six counters. They are in `/stats/prometheus` and
+OTLP only: `llmproxy_ledger_rejected_total` (label `reason`),
+`llmproxy_ledger_unledgered_total` (label `reason`),
+`llmproxy_ledger_entries_committed_total`,
+`llmproxy_ledger_entries_lost_total` (label `reason`),
+`llmproxy_spend_charged_micro_usd_total`, and
+`llmproxy_ledger_spend_written_micro_usd_total`. The meaning of each is on
+[Billing ledger](../../limits-and-budgets/billing-ledger/#metrics).
+(Definitions: `crates/proxy-observability/src/stats.rs`, section "billing
+ledger".)
 
 ### Unknown names
 

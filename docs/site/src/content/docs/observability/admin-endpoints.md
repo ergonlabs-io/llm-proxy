@@ -7,6 +7,7 @@ related:
   - ../authentication/virtual-keys/
   - ../authentication/tenant-provider-credentials/
   - ../limits-and-budgets/spend-policies/
+  - ../limits-and-budgets/billing-ledger/
   - ../operations/draining-and-shutdown/
   - ../observability/metrics-and-stats/
   - ../observability/request-capture/
@@ -64,6 +65,7 @@ the presented token.
 | Admin UI | `GET /ui`, `GET /ui/...` | No |
 | Capture records | `GET /capture/spool/records` | Yes |
 | Spend reads | `GET .../spend` for keys and tenants | Yes |
+| Billing ledger | `GET /ledger/entries`, `POST /ledger/ack` | Yes |
 | Identity reads | `GET /keys`, `GET /tenants/{id}/provider_credentials` | Yes |
 | All writes | `POST`, `PUT`, `DELETE` routes, and the lifecycle commands | Yes |
 
@@ -126,6 +128,17 @@ Without a probe wired in, `/ready` always answers `200 LIVE`
 (`server.rs:557-565`). `/stats` and `/stats/prometheus` answer `404` if no
 stats registry exists. The proxy does not return an empty `200`. See
 [Metrics and /stats](../metrics-and-stats/) for the counters.
+
+## Billing ledger endpoints
+
+Two routes read and acknowledge the billing ledger. Both are gated. Without a
+`ledger` block in the config, both answer `404`. The parameters, the answers,
+and the status codes are on [Billing ledger](../../limits-and-budgets/billing-ledger/#pull-and-acknowledge-entries).
+
+| Route | Method | Answer |
+|---|---|---|
+| `/ledger/entries?after=<cursor>&limit=<1-1000>` | GET | Committed entries above the cursor, `next_after`, and `committed_through` |
+| `/ledger/ack?through=<cursor>` | POST | `acknowledged_through` and `admitting` |
 
 ## Lifecycle commands
 
