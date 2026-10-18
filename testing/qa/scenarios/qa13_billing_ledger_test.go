@@ -65,8 +65,6 @@ type qa13Proxy struct {
 	admin    string
 	client   *http.Client
 	upstream *mocks.OpenAI
-	// ackBackoffs counts acknowledgements refused with 507 by drain.
-	ackBackoffs int
 }
 
 // qa13Setup writes a dialect config with a ledger in a fresh directory and
@@ -193,10 +191,10 @@ func (p *qa13Proxy) readAll() ([]qa13Entry, uint64) {
 
 // drain is the consumer loop: read everything, acknowledge through the last
 // cursor, and repeat until an acknowledgement says admission is open again.
-// At the cap the acknowledgement itself may not fit (507); the documented
-// answer is to acknowledge a shorter prefix, so this halves the prefix until
-// one fits. One acknowledgement can also free less than the entries held at
-// the cap need, so a consumer keeps acknowledging until `admitting` is true.
+// Every acknowledgement covers the whole range read, and at the cap it must
+// still succeed: the spool keeps a reserve for acknowledgements. One
+// acknowledgement can free less than the entries held at the cap need, so a
+// consumer keeps acknowledging until `admitting` is true.
 func (p *qa13Proxy) drain() []qa13Entry {
 	p.t.Helper()
 	var all []qa13Entry
@@ -214,23 +212,12 @@ func (p *qa13Proxy) drain() []qa13Entry {
 			p.t.Fatalf("nothing left to acknowledge and not admitting\n--- proxy log ---\n%s", p.proc.Log())
 		}
 		var ack qa13Ack
-		n := len(entries)
-		for {
-			through := entries[n-1].Cursor
-			status, body := p.adminTry("POST", fmt.Sprintf("/ledger/ack?through=%d", through), &ack)
-			if status == http.StatusOK {
-				if ack.AcknowledgedThrough != through {
-					p.t.Fatalf("ack through=%d answered %+v", through, ack)
-				}
-				acked = through
-				break
-			}
-			if status != http.StatusInsufficientStorage || n == 1 {
-				p.t.Fatalf("ack through=%d: status %d: %s\n--- proxy log ---\n%s", through, status, body, p.proc.Log())
-			}
-			p.ackBackoffs++
-			n /= 2
+		through := entries[len(entries)-1].Cursor
+		status, body := p.adminTry("POST", fmt.Sprintf("/ledger/ack?through=%d", through), &ack)
+		if status != http.StatusOK || ack.AcknowledgedThrough != through {
+			p.t.Fatalf("full-range ack through=%d: status %d: %s\n--- proxy log ---\n%s", through, status, body, p.proc.Log())
 		}
+		acked = through
 		if ack.Admitting {
 			return all
 		}
@@ -479,8 +466,7 @@ func TestQA13_RejectAtDiskCapRecoversAfterAck(t *testing.T) {
 	if lost := p.metric("llmproxy_ledger_entries_lost_total", ""); lost != 0 {
 		t.Fatalf("%d entries lost at the disk cap", lost)
 	}
-	t.Logf("served %d, refused %d at the cap; consumer drained %d; %d acks refused with 507",
-		served, refused, len(entries), p.ackBackoffs)
+	t.Logf("served %d, refused %d at the cap; consumer drained %d", served, refused, len(entries))
 }
 
 // TestQA13_AdmitAtDiskCapServesUnledgered: the fail-open mode at the disk
@@ -509,5 +495,5 @@ func TestQA13_AdmitAtDiskCapServesUnledgered(t *testing.T) {
 	if lost := p.metric("llmproxy_ledger_entries_lost_total", ""); lost != 0 {
 		t.Fatalf("%d entries lost at the disk cap", lost)
 	}
-	t.Logf("served %d; %d unledgered at the cap; %d acks refused with 507", served, unledgered, p.ackBackoffs)
+	t.Logf("served %d; %d unledgered at the cap", served, unledgered)
 }

@@ -558,7 +558,8 @@ fn backend_failures_are_storage_errors_and_keep_the_durable_prefix() {
         Fault::BackendAfterSync,
     ] {
         let temp = TempDir::new().unwrap();
-        let config = test_config(&temp);
+        let mut config = test_config(&temp);
+        config.max_record_bytes = 512 * 1024;
         let mut prefix = open(config.clone());
         prefix.append(b"durable prefix").unwrap();
         prefix.commit().unwrap();
@@ -568,10 +569,16 @@ fn backend_failures_are_storage_errors_and_keep_the_durable_prefix() {
         let mut spool =
             MetadataSpool::open_with_hooks(config.clone(), key(), [], hooks.clone()).unwrap();
         hooks.fail(fault);
-        assert!(matches!(
-            spool.append(b"must not publish"),
-            Err(Error::Io(_)) | Err(Error::Storage(_))
-        ));
+        // Four MiB of records cannot fit the file as opened, so publishing
+        // them reaches every backend step, including growth.
+        let large = vec![0x42; config.max_record_bytes];
+        let result = spool
+            .append_batch(&[large.as_slice(); 8])
+            .and_then(|_| spool.commit());
+        assert!(
+            matches!(result, Err(Error::Io(_)) | Err(Error::Storage(_))),
+            "{fault:?}: {result:?}"
+        );
         assert!(spool.stats().unwrap().poisoned);
         drop(spool);
 
@@ -1282,4 +1289,118 @@ fn encrypted_envelopes_and_debug_do_not_disclose_payloads_or_keys() {
         payload: payload.to_vec(),
     };
     assert!(!format!("{record:?}").contains("private-user"));
+}
+
+/// Commits `batch` records per transaction until the ceiling refuses one, or
+/// until `limit` rows are durable. Returns the last durable sequence.
+fn fill_with_batches(spool: &mut MetadataSpool, payload: &[u8], batch: usize, limit: u64) -> u64 {
+    let payloads = vec![payload; batch];
+    let mut durable = spool.stats().unwrap().durable_through_sequence;
+    while durable < limit {
+        match spool.append_batch(&payloads) {
+            Ok(results) => assert!(results.iter().all(Result::is_ok)),
+            Err(Error::Full) => return durable,
+            Err(error) => panic!("append_batch failed with {error:?}, not Full"),
+        }
+        match spool.commit() {
+            Ok(receipt) => durable = receipt.through_sequence,
+            Err(Error::Full) => return durable,
+            Err(error) => panic!("commit failed with {error:?}, not Full"),
+        }
+    }
+    durable
+}
+
+/// A consumer must always be able to free space: acknowledging everything
+/// committed succeeds at the ceiling in one call, and admissions resume.
+/// Without the reserve, a full acknowledgement of many small rows needs pages
+/// the file does not have, and redb grows a file only by doubling it, so it
+/// was refused.
+#[test]
+fn a_full_acknowledgement_at_the_ceiling_succeeds_and_reopens_admissions() {
+    {
+        let temp = TempDir::new().unwrap();
+        let mut config = test_config(&temp);
+        config.max_record_bytes = 16 * 1024;
+        config.max_disk_bytes = 16 * 1024 * 1024;
+        config.max_pending_records = 512;
+        let payload = [0x5a; 300];
+        // Large batches stop with a batch's worth of free pages left in the
+        // file. Find where they stop on a scratch spool, then fill in large
+        // batches to just short of that and in one-row commits from there,
+        // which packs the file as tightly as a busy ledger's short group
+        // commits do.
+        let reach = {
+            let scratch = TempDir::new().unwrap();
+            let mut scratch_config = config.clone();
+            scratch_config.directory = scratch.path().join("spool");
+            fill_with_batches(&mut open(scratch_config), &payload, 512, u64::MAX)
+        };
+        let mut spool = open(config.clone());
+        assert!(spool.stats().unwrap().headroom_reserved);
+        fill_with_batches(&mut spool, &payload, 512, reach - 256);
+        let durable = fill_with_batches(&mut spool, &payload, 1, u64::MAX);
+        assert!(matches!(spool.append(b"while full"), Err(Error::Full)));
+
+        spool.acknowledge(durable).unwrap();
+        let stats = spool.stats().unwrap();
+        assert_eq!(stats.acknowledged_through_sequence, durable);
+        assert_eq!(stats.retained_records, 0);
+        assert!(stats.headroom_reserved, "reserve not restored");
+        assert!(stats.disk_bytes <= config.max_disk_bytes);
+        // The row refused at the ceiling is still pending and now publishes.
+        let last = spool.append(b"after the ceiling").unwrap().sequence;
+        spool.commit().unwrap();
+        drop(spool);
+        let reopened = open(config);
+        assert!(reopened.stats().unwrap().headroom_reserved);
+        assert_eq!(
+            payloads(&reopened),
+            vec![
+                (durable + 1, payload.to_vec()),
+                (last, b"after the ceiling".to_vec())
+            ]
+        );
+    }
+}
+
+/// The fallback when even the reserve does not make the whole range fit: the
+/// spool halves the prefix on each refusal and still acknowledges all of it.
+/// If not even one row fits, it answers `Full` and keeps admissions closed.
+#[test]
+fn a_refused_acknowledgement_falls_back_to_shorter_prefixes() {
+    let temp = TempDir::new().unwrap();
+    let config = test_config(&temp);
+    let hooks = Arc::new(Hooks::default());
+    let mut spool =
+        MetadataSpool::open_with_hooks(config.clone(), key(), [], hooks.clone()).unwrap();
+    for _ in 0..2 {
+        assert!(spool
+            .append_batch(&[PAYLOAD; 8])
+            .unwrap()
+            .iter()
+            .all(Result::is_ok));
+        spool.commit().unwrap();
+    }
+
+    // The whole range, then 8 and 4 rows are refused; 2 rows fit.
+    hooks.refuse_acknowledgements(3);
+    spool.acknowledge(16).unwrap();
+    let stats = spool.stats().unwrap();
+    assert_eq!(stats.acknowledged_through_sequence, 16);
+    assert_eq!(stats.retained_records, 0);
+    assert!(stats.headroom_reserved);
+    spool.append(b"admitted").unwrap();
+    spool.commit().unwrap();
+
+    hooks.refuse_acknowledgements(usize::MAX);
+    assert!(matches!(spool.acknowledge(17), Err(Error::Full)));
+    let stats = spool.stats().unwrap();
+    assert_eq!(stats.acknowledged_through_sequence, 16);
+    assert!(!stats.poisoned);
+    assert!(matches!(spool.append(b"refused"), Err(Error::Full)));
+    hooks.refuse_acknowledgements(0);
+    spool.acknowledge(17).unwrap();
+    assert!(spool.stats().unwrap().headroom_reserved);
+    spool.append(b"admitted again").unwrap();
 }

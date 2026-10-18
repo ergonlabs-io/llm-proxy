@@ -46,6 +46,11 @@ inventory digest. Hash sequence, envelope length, and envelope bytes with domain
 separation. Authenticate the state schema version; reject unknown schemas.
 Do not rely on redb's unkeyed integrity checks as application authentication.
 
+A third table, `headroom`, holds at most one unencrypted zero-filled row: the
+acknowledgement reserve ("Append, commit, and failures"). A database written
+before the reserve existed has no such table; opening it creates the table and
+writes the reserve when it fits.
+
 ## Append, commit, and failures
 
 Preserve bounded `append`, `append_batch`, `commit`, and durable receipt semantics.
@@ -90,9 +95,22 @@ The refusal precedes redb's commit point, so the recovered state must equal the
 handle's; any difference poisons. Records of a refused commit stay pending. Further
 appends and commits return `Full` without touching storage until an
 acknowledgement commits; a commit then publishes the pending records. The reopen
-costs one recovery scan per refusal. An acknowledgement at the ceiling is itself
-a transaction; if it is refused, nothing changes and a shorter prefix can be
-acknowledged. Never translate a top-level `Full` into the agent's definitive
+costs one recovery scan per refusal.
+
+An acknowledgement at the ceiling is itself a transaction, and it needs pages:
+it copies the B-tree pages it touches and records the pages it frees, and redb
+grows a file only by doubling it, so at the ceiling only pages already inside the
+file are usable. The spool therefore keeps a headroom reserve: one zero-filled
+row in a `headroom` table, sized to 1/32 of the database ceiling within 64 KiB
+to 4 MiB. Admissions run only while the reserve is held. An acknowledgement the
+ceiling refuses deletes the reserve in its own small transaction, then
+acknowledges in committed prefixes, halving the prefix on each refusal and
+doubling it on each success; every committed prefix frees pages for the next. It
+restores the reserve before admissions resume; if the reserve does not fit yet,
+admissions stay refused and the next acknowledgement frees more. `Full` from
+`acknowledge` means even a one-record prefix did not fit; the watermark may have
+moved, and `stats` shows how far. The reserve is unauthenticated filler: recovery
+checks only that the table holds at most one row. Never translate a top-level `Full` into the agent's definitive
 `Outcome::Full`. The agent returns unavailable, with no positive receipt;
 the producer retains unknown durability after a possibly sent attempt. Reopen
 may recover either atomic outcome, including data whose receipt was lost.

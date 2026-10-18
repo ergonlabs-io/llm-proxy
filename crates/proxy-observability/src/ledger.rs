@@ -16,6 +16,12 @@
 //! `group_commit_interval` after its first entry. Committed entries are never
 //! evicted; they leave the spool only by acknowledgement.
 //!
+//! A crash loses every entry not yet committed. With space on disk that is
+//! about one `group_commit_interval` of entries. At the disk cap the writer
+//! holds entries in memory until an acknowledgement frees space, and a crash
+//! loses all of them. Slots are held until commit, so `max_reservations`
+//! bounds the loss in every case.
+//!
 //! The spool is single-writer, so reads and acknowledgements for the admin
 //! API (ADR-0009 decision 8) travel to the writer thread on the same channel
 //! as entries and are answered there. They block their caller, never a
@@ -182,8 +188,8 @@ pub enum LedgerQueryError {
         committed_through: u64,
     },
     #[error(
-        "the ledger spool is at its disk cap and cannot record this acknowledgement; \
-         acknowledge a shorter prefix first"
+        "the ledger spool is at its disk cap and could not record even one entry of \
+         this acknowledgement; retry"
     )]
     AcknowledgementFull,
     #[error("the billing ledger spool could not be read")]
@@ -812,7 +818,9 @@ mod writer {
                         committed_through,
                     }));
                 }
-                // Nothing changed; a shorter prefix may fit.
+                // The spool spends its reserve and acknowledges in prefixes
+                // before it answers this, so even one entry did not fit; a
+                // prefix may have been acknowledged.
                 Err(SpoolError::Full) => return Ok(Err(LedgerQueryError::AcknowledgementFull)),
                 Err(error) => return Err(error),
             }

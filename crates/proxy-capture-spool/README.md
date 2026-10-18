@@ -29,7 +29,8 @@ the database has closed. Existing directories/files require owner-only permissio
   acknowledgement watermark, deletes covered rows, and updates inventory.
   The LOCAL-SPOOL-ONLY agent never calls it. No unacknowledged data is evicted.
 - `stats` reports sequence watermarks, pending/retained record counts, database
-  and aggregate logical file bytes, quarantine bytes, and poisoned state.
+  and aggregate logical file bytes, quarantine bytes, poisoned state, and
+  whether the acknowledgement reserve is held.
 
 Receipts are scoped to this spool/node. Transport binds them to authenticated
 producer and spool identities. Lost receipts and replay can cause duplicates;
@@ -75,8 +76,11 @@ Reaching the disk ceiling does not poison. The refused transaction published
 nothing; the spool reopens its database from the last commit and returns `Full`.
 A refused commit keeps its records pending. Appends and commits return `Full`
 until `acknowledge` commits and its deleted rows free pages; the next `commit`
-then publishes the pending records. An acknowledgement refused at the ceiling
-changes nothing; acknowledge a shorter prefix. No positive receipt is emitted. Recovery
+then publishes the pending records. A headroom reserve (1/32 of the ceiling,
+64 KiB to 4 MiB) is held back from admissions, so any committed range can be
+acknowledged at the ceiling: a refused acknowledgement spends the reserve and
+proceeds in committed prefixes, and admissions resume once the reserve is
+restored (DESIGN.md "Append, commit, and failures"). No positive receipt is emitted. Recovery
 can select either atomic commit outcome; previously durable records must survive.
 Reopen before further mutation. Replay authentication failures also poison handles.
 

@@ -56,8 +56,9 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `llmproxy_ledger_unledgered_total` and warned about at most once every 5
   seconds. The ledger needs `--service-node`, which becomes every entry's
   `instance_id`; each start opens a later `epoch`, and `seq` is gapless per
-  epoch. A crash loses at most the last group-commit interval, plus any
-  entries held in memory while the spool is at its cap. Committed
+  epoch. A crash loses every entry not yet committed: normally about the
+  last group-commit interval, but at the disk cap every entry held in memory,
+  up to `max_reservations`. Committed
   entries are never evicted; only an acknowledgement frees space. A reload
   that changes the ledger is refused. New counters: `llmproxy_ledger_rejected_total`,
   `llmproxy_ledger_unledgered_total`, `llmproxy_ledger_entries_committed_total`,
