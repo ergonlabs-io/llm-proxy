@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy with the billing ledger on: one encrypted entry for every request
+# dialled to a provider. See docs/site/src/content/docs/limits-and-budgets/billing-ledger.md
+#
+# Run (the node id becomes every entry's instance_id; it must be unique per
+# replica and the same after each restart):
+#   export OPENAI_API_KEY=sk-...
+#   export LLMPROXY_ADMIN_TOKEN=$(openssl rand -hex 32)
+#   head -c 32 /dev/urandom > /etc/llm-proxy/ledger.key && chmod 600 /etc/llm-proxy/ledger.key
+#   llm-proxy --config llmproxy-ledger.yaml --service-node proxy-a
+#
+# Pull and acknowledge entries (both calls need the admin token):
+#   curl -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
+#     'http://127.0.0.1:9901/ledger/entries?after=0&limit=100'
+#   curl -X POST -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
+#     'http://127.0.0.1:9901/ledger/ack?through=<next_after from the pull>'
+version: 0
+
+listen: 0.0.0.0:8080
+# The /ledger/* endpoints are on the admin listener. Keep it on loopback.
+admin: 127.0.0.1:9901
+
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+
+routes:
+  - model: "*"
+    provider: openai
+
+ledger:
+  # Created 0700 if absent. One proxy process writes it.
+  directory: /var/lib/llm-proxy/ledger
+  # A 0600 file of exactly 32 raw bytes. A missing key stops startup.
+  encryption_key_file: /etc/llm-proxy/ledger.key
+  encryption_key_id: ledger-2026
+  # Required. At this size new requests follow on_unavailable until a
+  # consumer acknowledges entries (POST /ledger/ack).
+  max_disk_bytes: 10737418240
+  # reject (default): a full or failed ledger answers 503.
+  # admit: serve the request without an entry, count it, and warn.
+  on_unavailable: reject

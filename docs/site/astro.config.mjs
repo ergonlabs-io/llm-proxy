@@ -88,6 +88,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Token rate limiting', slug: 'limits-and-budgets/token-rate-limiting' },
 						{ label: 'Spend policies', slug: 'limits-and-budgets/spend-policies' },
+						{ label: 'Billing ledger', slug: 'limits-and-budgets/billing-ledger' },
 						// { label: 'Tenants', slug: 'limits-and-budgets/tenants' },
 					],
 				},

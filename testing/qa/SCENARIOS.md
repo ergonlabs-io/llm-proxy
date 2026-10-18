@@ -19,6 +19,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-10 | TTFT and TPOT reach the access log with sane values        | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
 | QA-11 | Redis tenant-to-key cutover and persisted spend after SIGKILL | passing — requires `QA_REDIS_ADDR` |
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
+| QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17; approved via WP-108 (owner) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -484,3 +485,42 @@ and denies further requests. A second clean restart must retain $12 without
 duplication. The test bounds calls, supervises processes, and removes its own
 namespace. Charges accrued after the last checkpoint remain volatile; this
 does not claim synchronous per-request durability.
+
+## QA-13 — Billing ledger across a crash and at its disk cap
+
+Approved through WP-108's acceptance (ADR-0009). `qa13_billing_ledger_test.go`
+drives a dialect config with a `ledger` block, `--service-node`, an admin
+listener and a Go mock OpenAI upstream, through the listener and the admin API
+only. No external service is needed.
+
+`crates/proxy/tests/ledger_e2e.rs` already covers, against the same binary, a
+SIGTERM restart opening a later epoch, the startup and reload refusals, one
+read+ack page, and the reconciliation counters (including `admit` with every
+slot held). QA-13 adds what that file never switches on:
+
+- **SIGKILL under load.** Four clients keep sending; a consumer reads (twice,
+  to show reading does not consume) and does not acknowledge; the proxy is
+  killed with requests in flight. After a restart every entry read before the
+  kill is returned again (committed means durable; unacknowledged means
+  redelivered), the killed epoch is gapless from `seq` 0 and no longer than
+  the requests served, and the restart's first entry is `seq` 0 in a later
+  epoch. One acknowledgement through the last cursor then empties the ledger.
+- **`reject` at `max_disk_bytes`.** With a 2 MiB cap, requests continue until
+  one is answered `503` with the body `billing ledger unavailable: disk_full`.
+  A request at the cap never reaches the provider, and
+  `llmproxy_ledger_rejected_total{reason="disk_full"}` counts. The consumer
+  acknowledges until `admitting` is true; the next request is served without a
+  restart, every served request is committed, and none is counted lost.
+- **`admit` at `max_disk_bytes`.** Every request is served and dialled;
+  `llmproxy_ledger_unledgered_total{reason="disk_full"}` rises and the
+  suppressed warning reaches the log. After acknowledgement, committed plus
+  unledgered equals served.
+
+At the cap the acknowledgement itself can be refused with `507` (it needs
+spool space too). The test's consumer then halves the acknowledged prefix, as
+the docs tell a consumer to; the case logs how many acknowledgements were
+refused. A run on 2026-10-17 under load hit it on the first full-range ack.
+
+Entries lost to the crash window (the last `group_commit_interval`) are not
+counted exactly: the client cannot see which served requests had committed.
+The case logs served versus committed for the killed epoch.
