@@ -25,15 +25,21 @@ writes the billing consumer.
 
 ## The guarantee
 
-The ledger gives you two things. An entry is durable within one group-commit
-interval of the request. A loss in a running proxy is counted: see
-[Metrics](#metrics). A loss in a crash is bounded, but the ledger does not
-show it: see [Detect a gap](#detect-a-gap).
+The ledger gives you two things. While the spool has space, an entry is
+durable within one group-commit interval of the request. A loss in a running
+proxy is counted: see [Metrics](#metrics). A loss in a crash is bounded, and
+the next start reports that the epoch did not close, but not how many entries
+it lost: see [Detect a gap](#detect-a-gap).
 
 The ledger does not give you exactly-once delivery across a process crash.
-The proxy commits entries in groups. A crash loses the entries of the last
-`group_commit_interval` (default 50 ms) that were not yet committed. The proxy
-does not hold a response until its entry is on disk, so it cannot do better.
+The proxy commits entries in groups. A crash loses every entry that was not yet
+committed. While the spool has space, that is about the entries of the last
+`group_commit_interval` (default 50 ms). While the spool is at
+`max_disk_bytes`, the proxy holds entries in memory until a consumer
+acknowledges, and a crash loses all of them. The limit in every case is
+`max_reservations` entries, because a slot is held until its entry is
+committed. The proxy does not hold a response until its entry is on disk, so it
+cannot do better.
 Source: `schema/llmproxy-v0.schema.json`, `ledger` description;
 `crates/proxy-observability/src/ledger.rs`, module doc.
 
@@ -41,8 +47,6 @@ Three further rules:
 
 - The proxy never evicts a committed entry. An entry leaves the spool only
   when a consumer acknowledges it (`ledger.rs`, `Writer::acknowledge`).
-- While the disk is full, the proxy holds new entries in memory. A crash then
-  loses those entries too (`ledger.rs`, `Writer::write`, the `backlog`).
 - A clean shutdown commits the entries that were handed to the writer. The
   proxy waits up to 5 seconds, or 1 second on a fast exit (`main.rs:1550`).
   Entries not committed in that time are lost and logged.
@@ -241,13 +245,20 @@ billing ledger unavailable: disk_full
 The word after the colon is the reason. The access log shows
 `ledger_unavailable_<reason>` as the response code details. The proxy counts
 each refusal in `llmproxy_ledger_rejected_total{reason}`
-(`crates/proxy-http/src/filter_manager.rs:927`).
+(`crates/proxy-http/src/router.rs`, `ledger_unavailable_reply`).
+
+The proxy reserves the ledger slot before any filter runs, but it sends the
+`503` only at the point where it would dial a provider. So the filters answer
+first: a request with no valid key gets `401`, and a request over its rate
+limit gets `429`. Only a request that the proxy would dial gets the `503`
+and counts as a rejection. A route that does not dial (a direct response or a
+redirect) answers as usual
+(`crates/proxy-core/src/listener_ledger_tests.rs`,
+`with_every_slot_held_a_request_is_refused_503_and_never_dialled`).
 
 **Warning.** With `reject`, the health of the ledger is the availability of
-the proxy. The proxy checks the ledger before any filter runs. So a full or
-failed ledger refuses every request on the listener, including requests that
-have no valid key (`filter_manager.rs:702-706`, comment "A refused request runs
-no filter at all").
+the proxy. A full or failed ledger refuses every request that would reach a
+provider.
 
 ### admit
 
@@ -320,7 +331,11 @@ The answer has this shape. The values are an example.
     }
   ],
   "next_after": 1,
-  "committed_through": 1
+  "committed_through": 1,
+  "epochs": [
+    { "epoch": 1759990000000, "closed": true },
+    { "epoch": 1760000000000, "closed": false }
+  ]
 }
 ```
 
@@ -328,6 +343,10 @@ The answer has this shape. The values are an example.
 - `next_after` is the cursor of the last entry returned. If the page is empty,
   it equals `after`.
 - `committed_through` is the cursor of the last committed entry.
+- `epochs` lists the last 64 epochs of this instance, oldest first. The last
+  one is the running epoch, so it is not closed. An earlier epoch with
+  `closed: false` crashed, or stopped with entries it did not commit. See
+  [Detect a gap](#detect-a-gap).
 
 ### POST /ledger/ack
 
@@ -359,7 +378,7 @@ every entry with a cursor at or below it. The answer is:
 | `409` | `through` is past the last committed entry. |
 | `429` | The peer sent too many wrong tokens. The answer has `Retry-After`. |
 | `503` | The writer stopped or did not answer in 5 seconds. |
-| `507` | The ack itself does not fit in the full spool. Acknowledge a shorter prefix. |
+| `507` | Not even one entry of the ack fits in the full spool. Retry; part of the range may already be acknowledged. |
 
 The proxy checks the token before the parameters, and the parameters before
 the `404`. A refused ack removes nothing
@@ -375,9 +394,9 @@ Run this loop for each replica:
 1. Call `GET /ledger/entries?after=<cursor>&limit=<n>`. Start with `after=0`.
 2. Store each entry in your system. Skip an entry whose `record.event_id` you
    already have.
-3. Call `POST /ledger/ack?through=<next_after>` after the store commits. At
-   the disk cap, the ack itself can get `507`. Then acknowledge a shorter
-   prefix: use the `cursor` of an earlier entry, for example the middle one.
+3. Call `POST /ledger/ack?through=<next_after>` after the store commits. The
+   ack succeeds at the disk cap too: the spool keeps space in reserve for
+   acknowledgements and frees the range in parts when it must.
 4. Set `cursor` to `next_after`.
 5. Repeat. If `admitting` was `false`, repeat at once.
 
@@ -396,10 +415,24 @@ Within one `(instance_id, epoch)`, `seq` starts at 0 and has no gaps. If
 milliseconds. It is always later than the epoch of the last entry that is not
 yet acknowledged, even if the clock steps back (`ledger.rs`, `next_epoch`).
 
-**Caution.** `seq` cannot show the entries a crash removes from the end of an
-epoch. No later entry in that epoch shows the gap. The counters above reset on
-a restart, so they do not show it either. Plan for a loss of up to one
-`group_commit_interval` of entries at each crash.
+`seq` cannot show the entries a crash removes from the end of an epoch,
+because no later entry in that epoch shows the gap. The `epochs` list shows
+it instead. A clean stop that committed every entry marks its epoch
+`closed: true` in the spool. The next start reads that mark. If the previous
+epoch is not closed, the proxy logs an error ("the previous epoch did not
+close"), adds 1 to `llmproxy_ledger_unclean_epochs_total`, and reports the
+epoch with `closed: false` in `epochs`. The mark is kept when you acknowledge
+every entry, so it does not depend on what the consumer has read
+(`crates/proxy-observability/src/ledger.rs`, `epoch_history`; QA-13
+`TestQA13_LedgerSurvivesSigkillAndRedeliversUntilAcked` proves it with
+`SIGKILL`).
+
+**Caution.** An epoch with `closed: false` may have lost entries from its end,
+but the ledger cannot tell how many: those entries never reached the disk.
+Plan for a loss at each crash of about one `group_commit_interval` of entries,
+or, at the disk cap, of every entry held in memory, up to `max_reservations`.
+A start at the disk cap cannot record its epoch; the proxy logs an error, and
+a crash in that epoch is not detected.
 
 ## One ledger for each replica
 
@@ -423,6 +456,7 @@ counters at start, so an idle ledger shows zeros
 | `llmproxy_ledger_unledgered_total` | `reason`: `queue_full`, `writer_failed`, `disk_full` | Requests served without an entry under `admit`. |
 | `llmproxy_ledger_entries_committed_total` | none | Entries committed to the spool. |
 | `llmproxy_ledger_entries_lost_total` | `reason`: `writer_failed`, `oversize`, `shutdown` | Entries handed to the writer and never committed. |
+| `llmproxy_ledger_unclean_epochs_total` | none | Starts that found the previous epoch not closed. It is 0 or 1 for each process. |
 | `llmproxy_spend_charged_micro_usd_total` | none | Micro-dollars the spend filter charged, once for each request that charged a scope. |
 | `llmproxy_ledger_spend_written_micro_usd_total` | none | Micro-dollars of spend charges in committed entries. |
 
@@ -459,7 +493,7 @@ share an `auth.store`. See
 | `503` with `billing ledger unavailable: writer_failed` | A storage error stopped the writer. | Read the error log, fix the disk, and restart the proxy. |
 | `503` with `billing ledger unavailable: queue_full` | All slots are held. | Raise `max_reservations` or reduce `group_commit_interval`. Restart to apply it. |
 | `409` from `/ledger/ack` | `through` is past `committed_through`. | Use the `next_after` from a `GET`. |
-| `507` from `/ledger/ack` | The spool has no room for the ack record. | Acknowledge a shorter prefix. |
+| `507` from `/ledger/ack` | Not even one entry could be acknowledged. The reserve is meant to prevent this. | Retry. If it repeats, report it with the proxy log. |
 | Proxy does not start with `requires a configured node id` | No `--service-node`. | Pass `--service-node <name>`. |
 
 ## What the ledger is not

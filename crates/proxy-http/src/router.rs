@@ -514,6 +514,20 @@ impl RouterHandler {
             }
         });
 
+        // ADR-0009 decision 5: with no ledger slot under `reject`, a request
+        // that would be dialled gets the local 503 here, after every filter
+        // has had its say and before any upstream is chosen. Routes that do
+        // not dial (no match, direct response, redirect) answer as usual.
+        let forwards = route
+            .as_ref()
+            .is_some_and(|r| matches!(r.action, RouteActionIR::Forward(_)));
+        if forwards {
+            let refusal = dcb.stream_info().ledger_refusal.take();
+            if let Some(refusal) = refusal {
+                return ledger_unavailable_reply(dcb, refusal.refuse());
+            }
+        }
+
         // S10: this request asked for an HTTP
         // upgrade -- `on_upgrade` was moved onto the shared `StreamInfo` by
         // `FilterChainHandler::handle`, right after it was built (see that
@@ -3434,6 +3448,29 @@ fn credential_failure_reply(
             )
         }
     }
+}
+
+/// The local 503 for a request with no ledger reservation under
+/// `on_unavailable: reject` (ADR-0009 decision 5). The reason is one of a
+/// closed set; it is also the counter's label.
+fn ledger_unavailable_reply(
+    dcb: &mut dyn DecoderCallbacks,
+    reason: proxy_observability::ledger::Unavailable,
+) -> HttpResponseParts {
+    {
+        let mut info = dcb.stream_info();
+        info.is_local_reply = true;
+        info.response_code_details = Some(format!("ledger_unavailable_{}", reason.as_str()));
+    }
+    let mut resp = local_reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("billing ledger unavailable: {}\n", reason.as_str()),
+    );
+    resp.head.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    resp
 }
 
 fn local_reply(status: StatusCode, msg: &str) -> HttpResponseParts {
