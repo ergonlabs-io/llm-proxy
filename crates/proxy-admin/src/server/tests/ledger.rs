@@ -27,6 +27,7 @@ async fn start_admin(admin_token: Option<&str>, ledger: Option<&TempLedger>) -> 
             credential_probe: None,
             capture_agent: None,
             ledger: ledger.map(|l| Arc::clone(&l.ledger)),
+            trace_gate: None,
         },
     )
     .await

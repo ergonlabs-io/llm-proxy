@@ -181,6 +181,8 @@ model and examples.
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
 | `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
+| `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Trace export](../trace-export/). |
+| `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. See [Trace export](../trace-export/). |
 
 The mint answer is the only time the proxy returns the key text. The store
 keeps a digest only (`handle_mint_key`, `server.rs:1846`).

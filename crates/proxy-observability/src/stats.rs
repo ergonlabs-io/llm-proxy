@@ -1052,6 +1052,130 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+    /// JWT requests whose tenant opted in to trace export but were not
+    /// captured because the policy snapshot was past its staleness bound
+    /// (ADR-0008 decision 2: an opt-out that cannot propagate fails closed).
+    pub const TRACE_CONSENT_STALE: Instrument = Instrument {
+        name: "llmproxy_trace_consent_stale_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Trace export (ADR-0008): captures handed to the exporter.
+    pub const TRACE_CAPTURED: Instrument = Instrument {
+        name: "llmproxy_trace_captured_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Whole traces lost, by finite reason.
+    pub const TRACE_DROPPED: Instrument = Instrument {
+        name: "llmproxy_trace_dropped_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Lines written, `capture` = `complete` or `partial`.
+    pub const TRACE_WRITTEN: Instrument = Instrument {
+        name: "llmproxy_trace_written_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &["capture"],
+        buckets: None,
+    };
+    /// Each partial reason a written trace carries.
+    pub const TRACE_PARTIAL: Instrument = Instrument {
+        name: "llmproxy_trace_partial_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments sealed, by why.
+    pub const TRACE_SEGMENTS_SEALED: Instrument = Instrument {
+        name: "llmproxy_trace_segments_sealed_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments lost before reaching their destination, by why.
+    pub const TRACE_SEGMENTS_LOST: Instrument = Instrument {
+        name: "llmproxy_trace_segments_lost_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments removed by the directory destination's retention.
+    pub const TRACE_SEGMENTS_EXPIRED: Instrument = Instrument {
+        name: "llmproxy_trace_segments_expired_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments the store confirmed and that were deleted locally.
+    pub const TRACE_SEGMENTS_UPLOADED: Instrument = Instrument {
+        name: "llmproxy_trace_segments_uploaded_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Failed upload attempts, by finite reason; each is retried.
+    pub const TRACE_UPLOAD_FAILURES: Instrument = Instrument {
+        name: "llmproxy_trace_upload_failures_total",
+        kind: InstrumentKind::Counter,
+        unit: "{attempt}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segment bytes on disk, open and sealed.
+    pub const TRACE_DISK_BYTES: Instrument = Instrument {
+        name: "llmproxy_trace_disk_bytes",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "By",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// 1 while the trace emergency switch (or the capture supervisor's gate)
+    /// is closed, 0 while capture is allowed. Published on the exporter's
+    /// tick.
+    pub const TRACE_CAPTURE_DISABLED: Instrument = Instrument {
+        name: "llmproxy_trace_capture_disabled",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "1",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// 1 while the exporter thread runs, 0 once it has stopped.
+    pub const TRACE_EXPORTER_UP: Instrument = Instrument {
+        name: "llmproxy_trace_exporter_up",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "1",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Body bytes retained by captures in flight or queued.
+    pub const TRACE_MEMORY_BYTES: Instrument = Instrument {
+        name: "llmproxy_trace_memory_bytes",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "By",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// Captures in flight or queued.
+    pub const TRACE_SLOTS: Instrument = Instrument {
+        name: "llmproxy_trace_slots",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{trace}",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// Entries handed to the writer that were never committed.
     pub const LEDGER_LOST: Instrument = Instrument {
         name: "llmproxy_ledger_entries_lost_total",

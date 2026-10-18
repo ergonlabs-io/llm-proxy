@@ -837,6 +837,80 @@ pub struct Observability {
     /// export, which says nothing about whether metrics are being collected.
     #[serde(default)]
     pub metrics: Option<Metrics>,
+    /// Trace export (ADR-0008): one captured record per request for tenants
+    /// that opt in through tenant policy. Requires the top-level `auth` block.
+    /// Absent means no trace export.
+    #[serde(default)]
+    pub traces: Option<Traces>,
+}
+
+/// `observability.traces`: lowers to `node.metadata["io.llmproxy.traces"]`,
+/// which owns the defaults and range checks. Required fields are `Option`s so
+/// a missing one is reported at `observability.traces.<field>` rather than as
+/// serde's missing field on the enclosing block.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Traces {
+    #[serde(default)]
+    pub directory: Option<String>,
+    #[serde(default)]
+    pub max_disk_bytes: Option<u64>,
+    /// Directory destination only; rejected together with `s3`.
+    #[serde(default)]
+    pub max_age: Option<SimpleDuration>,
+    /// Unset means `gzip`.
+    #[serde(default)]
+    pub codec: Option<TraceCodec>,
+    #[serde(default)]
+    pub zstd_window_log: Option<u64>,
+    #[serde(default)]
+    pub max_request_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_response_body_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_queued_traces: Option<u64>,
+    #[serde(default)]
+    pub segment_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub segment_max_age: Option<SimpleDuration>,
+    #[serde(default)]
+    pub max_open_segments: Option<u64>,
+    #[serde(default)]
+    pub s3: Option<TracesS3>,
+}
+
+/// `observability.traces.codec`: how sealed segments are compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceCodec {
+    Gzip,
+    Zstd,
+}
+
+/// `observability.traces.s3`: an S3-compatible upload destination.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracesS3 {
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub path_style: Option<bool>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    #[serde(default)]
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub upload_timeout: Option<SimpleDuration>,
 }
 
 /// `observability.tracing`. The top-level `tracing` key is RESERVED and

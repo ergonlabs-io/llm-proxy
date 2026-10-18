@@ -419,6 +419,9 @@ pub struct FilterChainHandler {
     tracing: Option<TracingWiring>,
     request_record_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
+    /// Trace export admission (ADR-0008). `None` costs one branch per
+    /// request; nothing is cloned or copied.
+    traces: Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
 }
 
 /// [`FilterChainHandler::tracing`]'s payload -- bundled rather than two
@@ -462,6 +465,7 @@ impl FilterChainHandler {
             tracing: None,
             request_record_sink: None,
             ledger: None,
+            traces: None,
         }
     }
 
@@ -637,6 +641,16 @@ impl FilterChainHandler {
     /// dials to an upstream gets an entry at stream end.
     pub fn with_ledger(mut self, ledger: Arc<proxy_observability::ledger::Ledger>) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    /// Wires trace export (ADR-0008): requests of opted-in tenants are
+    /// captured as received and as delivered.
+    pub fn with_traces(
+        mut self,
+        traces: Arc<proxy_observability::traces::capture::TraceAdmission>,
+    ) -> Self {
+        self.traces = Some(traces);
         self
     }
 }
@@ -834,7 +848,8 @@ impl StreamHandler for FilterChainHandler {
                         .with_stream_limits(StreamLimits {
                             idle: self.stream_idle_timeout,
                             deadline: self.max_stream_duration.map(|d| start_instant + d),
-                        }),
+                        })
+                        .with_traces(self.traces.clone()),
                     terminal,
                     buffer_limit: self.buffer_limit,
                     request_deadline: self.request_timeout.map(|t| start_instant + t),
@@ -869,6 +884,7 @@ impl StreamHandler for FilterChainHandler {
                 && self.tracing.is_none()
                 && !stream_info.borrow().metadata_enabled
                 && self.ledger.is_none()
+                && stream_info.borrow().trace_tee.is_none()
             {
                 return resp;
             }
@@ -1176,6 +1192,8 @@ struct ChainCtx {
     /// exactly what that future consumer will read.
     #[allow(dead_code)]
     decode_high_watermark: Rc<RefCell<bool>>,
+    /// Trace export admission, when the handler has it (ADR-0008).
+    traces: Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
 }
 
 impl ChainCtx {
@@ -1202,6 +1220,7 @@ impl ChainCtx {
             request_headers_snapshot: Rc::new(RefCell::new(None)),
             decoded_headers_forwarded: false,
             decode_high_watermark: Rc::new(RefCell::new(false)),
+            traces: None,
         }
     }
 
@@ -1228,6 +1247,50 @@ impl ChainCtx {
         self.stream_limits = limits;
         self
     }
+
+    fn with_traces(
+        mut self,
+        traces: Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
+    ) -> Self {
+        self.traces = traces;
+        self
+    }
+}
+
+/// Admits an opted-in request to trace export once the decode chain has run
+/// and the auth filter has pinned the tenant's consent (ADR-0008 decision 2;
+/// design note section 3.1). `original` is the body as received, before any
+/// filter replaced it. A request whose tenant did not opt in is dropped here
+/// silently: nothing was copied for it, and its consent is not a loss.
+fn admit_trace(ctx: &ChainCtx, original: Option<Bytes>, head: &RequestHeaders) {
+    let (Some(traces), Some(original)) = (ctx.traces.as_ref(), original) else {
+        return;
+    };
+    let mut info = ctx.stream_info.borrow_mut();
+    if !info.auth.trace_export {
+        return;
+    }
+    // An upgraded session's bytes bypass the response tee, so the pair could
+    // never be whole (telemetry design section 6.4).
+    if info.on_upgrade.is_some() {
+        traces.count_drop(proxy_observability::traces::capture::DropReason::UnsupportedProtocol);
+        return;
+    }
+    let Some(capture) = traces.admit(&original) else {
+        return;
+    };
+    let header = |name: http::header::HeaderName| {
+        head.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(proxy_observability::records::bounded_field)
+    };
+    info.trace_tee = Some(crate::stream_info::TraceTee {
+        capture,
+        path: proxy_observability::records::bounded_field(head.uri.path()),
+        request_content_type: header(http::header::CONTENT_TYPE),
+        request_content_encoding: header(http::header::CONTENT_ENCODING),
+    });
 }
 
 /// HCM `stream_idle_timeout` and `max_stream_duration` for one stream.
@@ -1535,8 +1598,18 @@ impl FilterManager {
             }
         };
 
+        // Trace export (ADR-0008): keep the body as received across the
+        // decode chain, which may replace it. A reference-count clone, taken
+        // only while export is configured and its gate is open; it is
+        // dropped right after the chain unless the tenant opted in.
+        let trace_original = ctx
+            .traces
+            .as_ref()
+            .filter(|traces| traces.gate_open())
+            .map(|_| body.clone());
+
         // --- decode chain (config order) ---
-        if let Err(status) = drive_decode(
+        let decoded = drive_decode(
             &mut filters,
             &mut ctx,
             buffer_limit,
@@ -1548,8 +1621,11 @@ impl FilterManager {
                 header_end_stream: None,
             },
         )
-        .await
-        {
+        .await;
+        // On every outcome, before any local reply below: a refusal sent by a
+        // filter after auth is the response the tenant's agent received.
+        admit_trace(&ctx, trace_original, &head);
+        if let Err(status) = decoded {
             let reply = LocalReply::new(
                 status,
                 "request rejected by filter chain",
@@ -3670,3 +3746,5 @@ fn synth_response(status: http::StatusCode, message: &str) -> HttpResponseParts 
 mod streaming_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trace_tests;

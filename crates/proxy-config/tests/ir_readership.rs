@@ -53,6 +53,18 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
+        field_name: "traces",
+        kind: EntryKind::KnownInertNameCollision,
+        reason: "Trace export (ADR-0008). Read on the control side only: \
+                 crates/proxy/src/main.rs refuses to start when it is set (no \
+                 exporter exists yet) and `reload` refuses a reload that changes it. \
+                 Recorded as a NAME COLLISION: proxy-http's `FilterChainHandler` and \
+                 `ChainCtx` gained unrelated `traces` fields (the per-handler \
+                 `TraceAdmission`), so the name scan reads as covered while no \
+                 runtime crate reads `ConfigSnapshot.traces`.",
+    },
     // --- ADS fields whose readers are outside the runtime scan.
     AllowlistEntry {
         struct_name: "AdsConfig",

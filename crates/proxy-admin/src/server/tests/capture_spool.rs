@@ -190,6 +190,7 @@ async fn start_admin_with_ttl(
             credential_probe: None,
             capture_agent,
             ledger: None,
+            trace_gate: None,
         },
         stats_ttl,
     )

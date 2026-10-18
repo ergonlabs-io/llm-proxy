@@ -205,6 +205,7 @@ limits:
         tracing_handles: None,
         metadata: None,
         ledger: Some(&ledger.ledger),
+        traces: None,
         factory_state: &shared,
     };
     let listener = snapshot.listeners.values().next().unwrap();

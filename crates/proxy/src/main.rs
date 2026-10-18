@@ -1004,6 +1004,23 @@ async fn run_serve(
         },
     };
 
+    // ADR-0008: trace export, opened before any worker starts. A directory
+    // that cannot be locked or written stops startup rather than accepting a
+    // block that records nothing (AGENTS.md invariant 1).
+    let running_traces = snapshot.traces.clone();
+    let (trace_admission, trace_gate, trace_exporter) = match &snapshot.traces {
+        None => (None, None, None),
+        Some(config) => {
+            match open_traces(config, &node.id, capture_supervisor.clone(), &stats_control) {
+                Ok((admission, gate, exporter)) => (Some(admission), Some(gate), Some(exporter)),
+                Err(message) => {
+                    eprintln!("{message}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
     // Resolve operational health series even when exporters are disabled.
     // Only configured tracing creates a channel; its sender is owned by workers
     // so joining them closes the channel and triggers the final trace flush.
@@ -1202,6 +1219,7 @@ async fn run_serve(
             lifecycle: lifecycle.clone(),
             capture_agent: Some(capture_endpoint.clone()),
             ledger: ledger.clone(),
+            trace_gate: trace_gate.clone(),
         },
     )
     .await
@@ -1314,6 +1332,7 @@ async fn run_serve(
                 tracing_handles.clone(),
                 metadata_sink.clone(),
                 ledger.clone(),
+                trace_admission.clone(),
                 factory_state.clone(),
                 secret_registry.clone(),
             )
@@ -1437,6 +1456,7 @@ async fn run_serve(
                         &stat_handle_tables_for_reload,
                         capture_supervisor.as_ref().map(|s|(s,concurrency)),
                         running_ledger.as_ref(),
+                        running_traces.as_ref(),
                     )
                     .await
                     {
@@ -1563,6 +1583,28 @@ async fn run_serve(
                 budget_ms = budget.as_millis() as u64,
                 "billing ledger writer did not finish before the shutdown budget; entries not yet \
                  committed are lost"
+            );
+        }
+    }
+
+    // Workers are gone, so nothing more is handed over: write what is queued
+    // and seal every open segment, bounded like the ledger.
+    if let Some(exporter) = trace_exporter {
+        let budget = if fast_exit {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(5)
+        };
+        let finished = tokio::task::spawn_blocking(move || exporter.shutdown(budget))
+            .await
+            .unwrap_or(false);
+        if finished {
+            tracing::info!("trace exporter wrote its queue and sealed its segments");
+        } else {
+            tracing::error!(
+                budget_ms = budget.as_millis() as u64,
+                "trace exporter did not finish before the shutdown budget; open segments are \
+                 removed at the next start and counted lost"
             );
         }
     }
@@ -1963,7 +2005,7 @@ async fn apply_ads_snapshot(
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
-// The two boot-scoped inputs (capture, ledger) are each checked against the
+// The boot-scoped inputs (capture, ledger, traces) are each checked against the
 // reloaded snapshot here, where it is loaded; bundling them only for the lint
 // would hide which one refused a reload.
 #[allow(clippy::too_many_arguments)]
@@ -1976,6 +2018,7 @@ async fn reload(
     tables: &StatHandleTables,
     capture: Option<(&proxy_observability::capture::CaptureSupervisor, usize)>,
     running_ledger: Option<&proxy_observability::ledger::LedgerConfig>,
+    running_traces: Option<&proxy_observability::traces::config::TraceExportConfig>,
 ) -> Option<SnapshotVersion> {
     let mut snapshot = match source.load() {
         Ok(snapshot) => snapshot,
@@ -2010,6 +2053,16 @@ async fn reload(
         tracing::error!(
             "SIGHUP: node.metadata[\"io.llmproxy.ledger\"] (the dialect's `ledger`) cannot change \
              on reload; restart the process to apply it. Continuing to serve the previous snapshot"
+        );
+        return None;
+    }
+    // Trace export is boot-scoped like the ledger: its directory lock, codec
+    // and destination are fixed once opened.
+    if snapshot.traces.as_ref() != running_traces {
+        tracing::error!(
+            "SIGHUP: node.metadata[\"io.llmproxy.traces\"] (the dialect's `observability.traces`) \
+             cannot change on reload; restart the process to apply it. Continuing to serve the \
+             previous snapshot"
         );
         return None;
     }
@@ -2234,6 +2287,53 @@ fn effective_node(
             .map(str::to_string)
             .unwrap_or_else(|| bootstrap.cluster.clone()),
     }
+}
+
+/// Opens trace export (ADR-0008): the emergency gate (closed when a disable
+/// was persisted), admission, and the exporter thread, which locks the
+/// directory and raises the epoch mark. The node id names every segment, so
+/// it is required and must be unique per replica. Errors start with the
+/// namespace path.
+type OpenedTraces = (
+    Arc<proxy_observability::traces::capture::TraceAdmission>,
+    Arc<proxy_observability::traces::gate::TraceGate>,
+    proxy_observability::traces::exporter::TraceExporter,
+);
+
+fn open_traces(
+    config: &proxy_observability::traces::config::TraceExportConfig,
+    node_id: &str,
+    capture_supervisor: Option<proxy_observability::capture::CaptureSupervisor>,
+    stats: &proxy_observability::stats::StatsControl,
+) -> Result<OpenedTraces, String> {
+    use proxy_observability::traces::{capture, exporter, gate};
+    const ROOT: &str = "node.metadata[\"io.llmproxy.traces\"]";
+    let gate = Arc::new(gate::TraceGate::open(&config.directory));
+    let trace_stats = capture::TraceStats::resolve(stats);
+    let (admission, traces) = match capture_supervisor {
+        Some(supervisor) => capture::TraceAdmission::with_capture_gate(
+            config,
+            Arc::clone(&gate),
+            supervisor,
+            trace_stats,
+        ),
+        None => capture::TraceAdmission::new(config, Arc::clone(&gate), trace_stats),
+    };
+    let exporter =
+        exporter::TraceExporter::spawn(config, node_id, Arc::clone(&admission), traces, stats)
+            .map_err(|e| match e {
+                proxy_observability::traces::segment::OpenError::NodeId => format!(
+                    "{ROOT}: trace export requires a node id (--service-node or node.id): {e}"
+                ),
+                other => format!("{ROOT}.directory: {other}"),
+            })?;
+    if gate.status().disabled {
+        tracing::warn!(
+            "trace capture starts DISABLED: a disable was persisted in the trace directory; \
+             POST /traces/capture enables it"
+        );
+    }
+    Ok((admission, gate, exporter))
 }
 
 /// Opens the billing ledger (ADR-0009). Its `instance_id` is the node id,
@@ -2930,6 +3030,7 @@ struct AdminStartRuntime<'a> {
     lifecycle: Arc<LifecycleState>,
     capture_agent: Option<proxy_admin::CaptureAgentProvider>,
     ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
+    trace_gate: Option<Arc<proxy_observability::traces::gate::TraceGate>>,
 }
 
 async fn start_admin(
@@ -2975,6 +3076,7 @@ async fn start_admin(
             credential_probe: runtime.credential_probe,
             capture_agent: runtime.capture_agent,
             ledger: runtime.ledger,
+            trace_gate: runtime.trace_gate,
         },
     )
     .await
@@ -3020,6 +3122,7 @@ async fn worker_main(
     tracing_handles: Option<proxy_core::listener::TracingHandles>,
     metadata_sink: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
+    traces: Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
     // This worker's clone of the ONE per-serve
     // `SharedFactoryState` -- see `run_serve`'s own comment on the Arc this
     // is cloned from.
@@ -3090,6 +3193,7 @@ async fn worker_main(
         metadata: metadata_sink,
         // One shared handle: admission is process-wide (ADR-0009 decision 5).
         ledger,
+        traces,
         connection_limiter: ctx.connection_limiter.clone(),
     };
 
@@ -3387,6 +3491,7 @@ mod tests {
                 lifecycle: Arc::new(LifecycleState::new()),
                 capture_agent: None,
                 ledger: None,
+                trace_gate: None,
             },
         )
         .await
@@ -3420,6 +3525,7 @@ mod tests {
                 lifecycle: Arc::new(LifecycleState::new()),
                 capture_agent: None,
                 ledger: None,
+                trace_gate: None,
             },
         )
         .await
@@ -3458,6 +3564,7 @@ mod tests {
                 lifecycle: Arc::new(LifecycleState::new()),
                 capture_agent: None,
                 ledger: None,
+                trace_gate: None,
             },
         )
         .await

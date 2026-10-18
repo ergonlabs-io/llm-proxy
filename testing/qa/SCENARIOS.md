@@ -20,6 +20,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-11 | Redis tenant-to-key cutover and persisted spend after SIGKILL | passing — requires `QA_REDIS_ADDR` |
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
 | QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17; approved via WP-108 (owner) |
+| QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -524,3 +525,16 @@ refused. A run on 2026-10-17 under load hit it on the first full-range ack.
 Entries lost to the crash window (the last `group_commit_interval`) are not
 counted exactly: the client cannot see which served requests had committed.
 The case logs served versus committed for the killed epoch.
+
+## QA-14 — Trace export captures an opted-in tenant only
+
+**Property.** With `observability.traces` writing to a directory and two
+tenants created over the admin API, only the tenant that opted in through
+`PUT /tenants/{id}/trace_export` gets a trace. The line carries the request
+body the client sent and the streamed response reassembled into one chat
+completion, with a `complete` capture state; the other tenant produces no
+line. Segments are sealed by SIGTERM and read as gzip JSON lines.
+
+**Why black box.** The Rust tests drive the tee, the exporter and the binary
+separately; this one checks the documented surface end to end: the dialect
+block, the admin opt-in, the on-disk layout and the line a consumer reads.

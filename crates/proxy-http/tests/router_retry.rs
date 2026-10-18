@@ -140,6 +140,15 @@ async fn build_router_with_stats_and_breakers(
     fwd: ForwardAction,
     circuit_breakers: proxy_config::ir::CircuitBreakers,
 ) -> (FilterChainHandler, Arc<RouterStats>) {
+    build_router_with_filters(addr, fwd, circuit_breakers, Vec::new()).await
+}
+
+async fn build_router_with_filters(
+    addr: SocketAddr,
+    fwd: ForwardAction,
+    circuit_breakers: proxy_config::ir::CircuitBreakers,
+    filters: Vec<Arc<dyn proxy_http::filter::FilterInstanceFactory>>,
+) -> (FilterChainHandler, Arc<RouterStats>) {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -200,7 +209,7 @@ async fn build_router_with_stats_and_breakers(
         Arc::new(RouterFilterFactory::new(Arc::new(manager), stats.clone()));
     (
         FilterChainHandler::new(
-            Vec::new(),
+            filters,
             terminal_factory,
             Arc::new(route_table),
             false,
@@ -1757,6 +1766,105 @@ async fn attempt_count_headers_are_absent_when_both_flags_are_off() {
                 "upstream request must not carry x-envoy-attempt-count when \
                  include_request_attempt_count is false, got: {header_text:?}"
             );
+        })
+        .await;
+}
+
+/// Stands in for the auth filter's consent pin (ADR-0008 decision 2).
+struct OptedIn;
+
+impl proxy_http::filter::HttpFilter for OptedIn {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn proxy_http::filter::DecoderCallbacks,
+        _headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> proxy_http::filter::FilterHeadersStatus {
+        let mut info = cb.stream_info();
+        info.auth.tenant = Some("tenant-a".into());
+        info.auth.trace_export = true;
+        proxy_http::filter::FilterHeadersStatus::Continue
+    }
+}
+
+impl proxy_http::filter::FilterInstanceFactory for OptedIn {
+    fn create_filter(&self) -> Box<dyn proxy_http::filter::HttpFilter> {
+        Box::new(OptedIn)
+    }
+}
+
+/// Answers the first request with a 503 carrying its own body, and every
+/// later one with a 200 carrying another.
+async fn spawn_upstream_fails_with_a_body_then_succeeds() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_one_request(&mut stream).await;
+            let response: &[u8] = if attempt == 0 {
+                b"HTTP/1.1 503 X\r\nContent-Length: 19\r\nConnection: close\r\n\r\nFAILED-ATTEMPT-BODY"
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nserved-body"
+            };
+            let _ = stream.write_all(response).await;
+        }
+    });
+    addr
+}
+
+/// A request retried after a failed attempt is captured once: the request
+/// as the client sent it, and only the response the client received. The
+/// failed attempt's body never reaches the trace.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retried_request_is_traced_once_with_only_the_delivered_response() {
+    use proxy_observability::traces::capture::{TraceAdmission, TraceStats};
+    use proxy_observability::traces::config::{TraceCodec, TraceExportConfig};
+    use proxy_observability::traces::gate::TraceGate;
+
+    LocalSet::new()
+        .run_until(async {
+            let addr = spawn_upstream_fails_with_a_body_then_succeeds().await;
+            let (handler, _) = build_router_with_filters(
+                addr,
+                forward_to_up(Some(retry_policy("5xx", 1))),
+                proxy_config::ir::CircuitBreakers::default(),
+                vec![Arc::new(OptedIn)],
+            )
+            .await;
+            let config = TraceExportConfig {
+                directory: "/unused".into(),
+                max_disk_bytes: 1 << 40,
+                max_age: None,
+                codec: TraceCodec::Gzip,
+                max_request_body_bytes: 1 << 20,
+                max_response_body_bytes: 1 << 20,
+                max_memory_bytes: 64 << 20,
+                max_queued_traces: 16,
+                segment_max_bytes: 64 << 20,
+                segment_max_age: Duration::from_secs(300),
+                max_open_segments: 4,
+                s3: None,
+            };
+            let stats = StatsControl::new(1);
+            let (admission, traces) = TraceAdmission::new(
+                &config,
+                Arc::new(TraceGate::unpersisted()),
+                TraceStats::resolve(&stats),
+            );
+            let handler = handler.with_traces(admission);
+
+            let resp = handler
+                .handle(request_with_body("/v1/chat", b"{\"prompt\":\"hi\"}"))
+                .await;
+            assert_eq!(resp.head.status, StatusCode::OK);
+            resp.body.collect().await.unwrap();
+
+            let trace = traces.try_recv().expect("the request is traced");
+            assert!(traces.try_recv().is_err(), "once, not once per attempt");
+            assert_eq!(trace.request, b"{\"prompt\":\"hi\"}");
+            assert_eq!(trace.response_bytes(), b"served-body");
+            assert_eq!(trace.meta.status, Some(200));
         })
         .await;
 }

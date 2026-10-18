@@ -24,6 +24,21 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   failed over, and is counted in `llmproxy_provider_credential_requests_total`.
   Failed mints retry with backoff and keep the last token until it expires.
   The configured `access_token` modes are unchanged.
+- Trace export (ADR-0008): the dialect's `observability.traces` block (Envoy
+  mode: `node.metadata["io.llmproxy.traces"]`, requires `auth` and
+  `--service-node`) writes the request body as received and the response body
+  as delivered, one JSON line per request, to gzip or zstd segments under
+  `tenant=<t>/date=<d>/`. Off unless the operator sets the block and the
+  tenant opts in with `PUT /tenants/{id}/trace_export`; there is no
+  redaction, and the opt-in is consent to raw capture. SSE responses are
+  reassembled for `openai` (chat, completions, Responses) and `anthropic`;
+  other streams export as delivered bytes marked partial. An optional `s3`
+  destination uploads sealed segments with static keys and drops the oldest
+  unsent segment at `max_disk_bytes`; only a local test double was tested, not
+  AWS, GCS, R2 or MinIO. `POST /traces/capture` is a persisted emergency
+  switch (`GET` reads it). Every loss is counted by reason in
+  `llmproxy_trace_*` metrics. Best effort, for analytics, never billing.
+  See `docs/site/src/content/docs/observability/trace-export.md`.
 - Request records and the `%LLM_USER_ID%` access-log operator now name the
   authenticated user. A virtual key is its user, so the value is the key id.
   A JWT names a user only when `subject_claim` is set; the value is then the

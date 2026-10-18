@@ -1,0 +1,21 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","created_at":1760000200,"status":"in_progress","model":"gpt-4o-mini","output":[]}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1760000200,"status":"in_progress","model":"gpt-4o-mini","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_1","status":"in_progress","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Hello"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_1","output_index":0,"content_index":0,"delta":", world!"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":5,"item_id":"msg_1","output_index":0,"content_index":0,"text":"Hello, world!"}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp_1","object":"response","created_at":1760000200,"status":"completed","model":"gpt-4o-mini","output":[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hello, world!","annotations":[]}]}],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}}
+

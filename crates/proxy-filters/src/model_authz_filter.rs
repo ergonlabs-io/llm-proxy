@@ -1115,6 +1115,7 @@ mod tests {
             key_tenants: Default::default(),
             tenant_credentials: HashMap::new(),
             generation: None,
+            trace_export: std::collections::HashSet::new(),
         })));
         ModelAuthzFilterInstance {
             snapshot,

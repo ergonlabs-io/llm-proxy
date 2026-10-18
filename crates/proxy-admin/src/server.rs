@@ -86,6 +86,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}/policy",
     "/tenants/{id}/budget",
     "/tenants/{id}/limits",
+    "/tenants/{id}/trace_export",
     "/tenants/{id}/provider_credentials",
     "/tenants/{id}/provider_credentials/{provider}",
     // A READ, but gated like a write -- see
@@ -102,6 +103,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}/policy",
     "/chains/{stat_prefix}/tenants/{id}/budget",
     "/chains/{stat_prefix}/tenants/{id}/limits",
+    "/chains/{stat_prefix}/tenants/{id}/trace_export",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider}",
     "/chains/{stat_prefix}/tenants/{id}/spend",
@@ -115,6 +117,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     // user identity and charges, so both are bearer-gated.
     "/ledger/entries?after=<cursor>&limit=<1..=1000> (bearer-gated page of committed entries)",
     "/ledger/ack?through=<cursor> (bearer-gated POST that removes entries through the cursor)",
+    // Trace export's emergency switch (ADR-0008 decision 2). Both gated.
+    "/traces/capture (bearer-gated GET status; POST {disabled, expected_generation})",
 ];
 
 /// Hard cap on a write request's body. No legitimate admin write is large (the biggest, a `PUT .../policy`,
@@ -235,6 +239,9 @@ pub struct AdminRuntime {
     /// The billing ledger behind `/ledger/*` (ADR-0009 decision 8). `None`
     /// makes those endpoints answer 404 after the bearer gate.
     pub ledger: Option<Arc<Ledger>>,
+    /// Trace export's emergency gate behind `/traces/capture`. `None` makes
+    /// that endpoint answer 404 after the bearer gate.
+    pub trace_gate: Option<Arc<proxy_observability::traces::gate::TraceGate>>,
 }
 
 /// One static file served under `/ui/`.
@@ -576,6 +583,7 @@ async fn handle(
     match req.uri().path() {
         "/ledger/entries" => return handle_ledger_entries(&req, runtime, peer).await,
         "/ledger/ack" => return handle_ledger_ack(req, runtime, peer).await,
+        "/traces/capture" => return handle_traces_capture(req, runtime, peer).await,
         _ => {}
     }
     let method = req.method().clone();
@@ -716,6 +724,12 @@ async fn handle(
         WriteRoute::TenantLimits(id) | WriteRoute::ScopedTenantLimits(_, id) => {
             handle_set_tenant_limits(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
+        WriteRoute::TenantTraceExport(id) | WriteRoute::ScopedTenantTraceExport(_, id) => {
+            handle_set_trace_export(&control_plane, id, &body)
+        }
+        WriteRoute::TenantTraceExportGet(id) | WriteRoute::ScopedTenantTraceExportGet(_, id) => {
+            handle_get_trace_export(&control_plane, id)
+        }
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
             handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
         }
@@ -817,6 +831,12 @@ fn handle_lifecycle(
 /// identity data (which keys exist, which tenant owns them, what ceiling they run against), and spend is money.
 /// Neither is answerable to an unauthenticated caller just because the verb is GET.
 enum WriteRoute<'a> {
+    /// `PUT` and `GET /tenants/{id}/trace_export`: a tenant's trace-export
+    /// opt-in (ADR-0008 decision 2). Split by method like the key collection.
+    TenantTraceExport(&'a str),
+    TenantTraceExportGet(&'a str),
+    ScopedTenantTraceExport(&'a str, &'a str),
+    ScopedTenantTraceExportGet(&'a str, &'a str),
     /// `GET /keys` -- the gated list read. Distinct from [`Self::Keys`]
     /// (POST, mint) so a GET is never answered with a 405 and a POST never
     /// with a listing.
@@ -879,6 +899,12 @@ impl<'a> WriteRoute<'a> {
             // The gated list read: GET on the collection path.
             WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => Method::GET,
             WriteRoute::TenantPolicy(_) => Method::PUT,
+            WriteRoute::TenantTraceExport(_) | WriteRoute::ScopedTenantTraceExport(..) => {
+                Method::PUT
+            }
+            WriteRoute::TenantTraceExportGet(_) | WriteRoute::ScopedTenantTraceExportGet(..) => {
+                Method::GET
+            }
             WriteRoute::TenantBudget(_) | WriteRoute::TenantLimits(_) => Method::PUT,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::TenantCredentials(_) | WriteRoute::ScopedTenantCredentials(..) => {
@@ -931,6 +957,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantPolicy(_)
             | WriteRoute::TenantBudget(_)
             | WriteRoute::TenantLimits(_)
+            | WriteRoute::TenantTraceExport(_)
+            | WriteRoute::TenantTraceExportGet(_)
             | WriteRoute::TenantSpend(_)
             | WriteRoute::TenantCredentials(_)
             | WriteRoute::TenantCredentialPut(..)
@@ -950,6 +978,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenantPolicy(s, _)
             | WriteRoute::ScopedTenantBudget(s, _)
             | WriteRoute::ScopedTenantLimits(s, _)
+            | WriteRoute::ScopedTenantTraceExport(s, _)
+            | WriteRoute::ScopedTenantTraceExportGet(s, _)
             | WriteRoute::ScopedTenantSpend(s, _)
             | WriteRoute::ScopedTenantCredentials(s, _)
             | WriteRoute::ScopedTenantCredentialPut(s, ..)
@@ -988,6 +1018,10 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
         ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
         ["tenants", id, "limits"] => Some(WriteRoute::TenantLimits(id)),
+        ["tenants", id, "trace_export"] if *method == Method::GET => {
+            Some(WriteRoute::TenantTraceExportGet(id))
+        }
+        ["tenants", id, "trace_export"] => Some(WriteRoute::TenantTraceExport(id)),
         // A GET, gated like a write -- see `WriteRoute`'s doc.
         ["tenants", id, "spend"] => Some(WriteRoute::TenantSpend(id)),
         ["tenants", id, "provider_credentials"] => Some(WriteRoute::TenantCredentials(id)),
@@ -1045,6 +1079,12 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "tenants", id, "limits"] => {
             Some(WriteRoute::ScopedTenantLimits(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "trace_export"] if *method == Method::GET => {
+            Some(WriteRoute::ScopedTenantTraceExportGet(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "trace_export"] => {
+            Some(WriteRoute::ScopedTenantTraceExport(stat_prefix, id))
         }
         ["chains", stat_prefix, "tenants", id, "spend"] => {
             Some(WriteRoute::ScopedTenantSpend(stat_prefix, id))
@@ -1466,6 +1506,75 @@ fn capture_error(error: InspectError) -> Response<Full<Bytes>> {
         status,
         &serde_json::json!({ "error": format!("{hint} ({error})") }),
     )
+}
+
+const TRACES_NOT_CONFIGURED: &str = "no trace export is configured for this proxy; \
+     /traces/capture needs observability.traces (node.metadata[\"io.llmproxy.traces\"] in Envoy mode)";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTraceCaptureRequest {
+    disabled: bool,
+    expected_generation: u64,
+}
+
+/// `GET /traces/capture` reports the emergency gate; `POST` closes or opens
+/// it with a compare-and-set on its generation (ADR-0008 decision 2). A
+/// disable always takes effect, and the answer's `persisted` says whether it
+/// will survive a restart.
+async fn handle_traces_capture(
+    req: Request<Incoming>,
+    runtime: &AdminRuntime,
+    peer: &GatePeer,
+) -> Response<Full<Bytes>> {
+    if req.method() != Method::GET && req.method() != Method::POST {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "/traces/capture accepts GET and POST",
+        );
+    }
+    if let Some(refusal) = admin_gate(
+        req.uri().path(),
+        runtime.admin_token.as_deref(),
+        req.headers(),
+        peer,
+    ) {
+        return refusal;
+    }
+    let Some(gate) = runtime.trace_gate.clone() else {
+        return text(StatusCode::NOT_FOUND, TRACES_NOT_CONFIGURED);
+    };
+    if req.method() == Method::GET {
+        return json(StatusCode::OK, &gate.status());
+    }
+    let body = match read_limited_body(req.into_body(), MAX_ADMIN_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let request: SetTraceCaptureRequest = match parse_json_body(&body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    use proxy_observability::traces::gate::GateError;
+    match gate.set_disabled(request.disabled, request.expected_generation) {
+        Ok(change) => {
+            tracing::warn!(
+                disabled = change.status.disabled,
+                generation = change.status.generation,
+                persisted = change.persisted,
+                "admin: trace capture gate changed"
+            );
+            json(StatusCode::OK, &change)
+        }
+        Err(GateError::Stale { current }) => json(
+            StatusCode::CONFLICT,
+            &serde_json::json!({"error": "stale_generation", "generation": current}),
+        ),
+        Err(error @ GateError::Exhausted) => text(StatusCode::CONFLICT, &error.to_string()),
+        Err(error @ GateError::Marker { .. }) => {
+            text(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+        }
+    }
 }
 
 /// How long a ledger read or acknowledgement waits for the writer thread,
@@ -2730,6 +2839,98 @@ fn handle_set_tenant_limits(
         Ok(()) => no_content(),
         Err(err) => store_error_response("/tenants/{id}/limits", err),
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTraceExportRequest {
+    #[serde(
+        rename = "schema_version",
+        deserialize_with = "read_trace_export_api_schema_version"
+    )]
+    _schema_version: (),
+    enabled: bool,
+}
+
+fn read_trace_export_api_schema_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<(), D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if version == 1 {
+        Ok(())
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported trace_export API schema version {version}"
+        )))
+    }
+}
+
+/// `PUT /tenants/{id}/trace_export`: the tenant's consent to raw capture of
+/// its request and response bodies (ADR-0008 decision 2). Unset is not
+/// consent. The tenant must exist, and its id must make a valid segment
+/// directory name, so every opted-in tenant can actually be written.
+fn handle_set_trace_export(
+    control_plane: &ControlPlane,
+    tenant: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let request: SetTraceExportRequest = match parse_json_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let tenant_id = TenantId::new(tenant);
+    match tenant_exists(control_plane, &tenant_id) {
+        Ok(true) => {}
+        Ok(false) => return tenant_not_found(),
+        Err(err) => return store_error_response("/tenants/{id}/trace_export", err),
+    }
+    if request.enabled
+        && proxy_observability::traces::tenant_dir(tenant).len()
+            > proxy_observability::traces::MAX_TENANT_DIR_BYTES
+    {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "tenant_id_too_long",
+            "id: too long to name a trace segment directory once percent-encoded",
+        );
+    }
+    match control_plane.set_trace_export(&tenant_id, request.enabled) {
+        Ok(()) => {
+            tracing::info!(
+                endpoint = "/tenants/{id}/trace_export",
+                tenant,
+                enabled = request.enabled,
+                "admin: set a tenant's trace export opt-in"
+            );
+            no_content()
+        }
+        Err(err) => store_error_response("/tenants/{id}/trace_export", err),
+    }
+}
+
+/// `GET /tenants/{id}/trace_export`: the opt-in as this replica's snapshot
+/// holds it.
+fn handle_get_trace_export(control_plane: &ControlPlane, tenant: &str) -> Response<Full<Bytes>> {
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let tenant_id = TenantId::new(tenant);
+    match tenant_exists(control_plane, &tenant_id) {
+        Ok(true) => {}
+        Ok(false) => return tenant_not_found(),
+        Err(err) => return store_error_response("/tenants/{id}/trace_export", err),
+    }
+    json(
+        StatusCode::OK,
+        &serde_json::json!({
+            "schema_version": 1,
+            "tenant": tenant,
+            "enabled": control_plane.trace_export(&tenant_id),
+        }),
+    )
 }
 
 /// `PUT /keys/{id}/limits`: a key's counters narrow its tenant's counters.

@@ -127,6 +127,7 @@ async fn handler_with(
         tracing_handles: None,
         metadata: None,
         ledger: None,
+        traces: None,
         factory_state: &shared,
     };
     build_listener_hcm(&snapshot.listeners["authorized_http"], &runtime)

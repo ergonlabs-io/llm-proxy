@@ -380,6 +380,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         end_user_capture: None,
         end_user_capture_configured: false,
         ledger: None,
+        traces: None,
         // This fixture is a static-config snapshot, which
         // is what `None` means -- no control plane is involved.
         ads: None,
@@ -543,6 +544,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         end_user_capture: None,
         end_user_capture_configured: false,
         ledger: None,
+        traces: None,
         ads: None,
         max_downstream_connections: None,
         version: SnapshotVersion(1),
@@ -638,6 +640,7 @@ async fn start_full_with_readiness(
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -669,6 +672,7 @@ async fn start_with_cluster_state(
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -1275,6 +1279,7 @@ async fn start_lifecycle(
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -3252,6 +3257,7 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             credential_probe: None,
             capture_agent: None,
             ledger: None,
+            trace_gate: None,
         },
     )
     .await
@@ -3428,3 +3434,4 @@ mod ledger;
 mod limits;
 mod pricing;
 mod tenant_budget_cutover;
+mod trace_export;

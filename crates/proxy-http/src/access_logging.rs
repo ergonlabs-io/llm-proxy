@@ -498,6 +498,22 @@ impl LoggingBody {
         );
     }
 
+    /// Copies a delivered frame into the request's trace capture, if it has
+    /// one (ADR-0008). The frame itself is untouched and yielded in this same
+    /// poll, so chunking and timing seen by the client do not change.
+    fn tee_response(&mut self, data: &Bytes) {
+        let Some(ctx) = &self.ctx else {
+            return;
+        };
+        let mut info = ctx.stream_info.borrow_mut();
+        if let Some(tee) = info.trace_tee.as_mut() {
+            if !tee.capture.push_response(data) {
+                // Discarded by an emergency disable, already counted.
+                info.trace_tee = None;
+            }
+        }
+    }
+
     fn finish(&mut self) {
         let Some(mut ctx) = self.ctx.take() else {
             // Already logged (`poll_frame` beat `Drop` to it, or vice versa).
@@ -663,7 +679,8 @@ impl LoggingBody {
             // Not dialled: dropping the ticket releases its slot.
             _ => None,
         };
-        if record_sink.is_some() || reservation.is_some() {
+        let trace_tee = ctx.stream_info.borrow_mut().trace_tee.take();
+        if record_sink.is_some() || reservation.is_some() || trace_tee.is_some() {
             // Request records never use the caller's x-request-id as their
             // identity. Internal identity is pinned at request admission.
             let request_id = ctx
@@ -852,6 +869,20 @@ impl LoggingBody {
                 }
             }
             let mut record = Some(record);
+            if let Some(tee) = trace_tee {
+                // The same record the ledger and the record sink get, so all
+                // three carry one `event_id`. Cloned only when one of them
+                // also takes it.
+                let trace_record = if reservation.is_some() || record_sink.is_some() {
+                    record.clone()
+                } else {
+                    record.take()
+                };
+                if let Some(trace_record) = trace_record {
+                    let meta = trace_meta(&ctx, &tee);
+                    tee.capture.finish(trace_record, meta);
+                }
+            }
             if let Some(reservation) = reservation {
                 // Cloned only when the best-effort record sink also takes it.
                 let entry_record = if record_sink.is_some() {
@@ -1126,6 +1157,37 @@ fn empty_body() -> StreamBody {
     )
 }
 
+/// The bounded facts the trace exporter needs besides the two bodies.
+fn trace_meta(
+    ctx: &AccessLogContext,
+    tee: &crate::stream_info::TraceTee,
+) -> proxy_observability::traces::capture::TraceMeta {
+    use proxy_observability::traces::capture::{TraceDialect, TraceMeta};
+    let header = |name: http::header::HeaderName| {
+        ctx.response_headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(proxy_observability::records::bounded_field)
+    };
+    TraceMeta {
+        path: tee.path.clone(),
+        status: Some(ctx.response_code),
+        request_content_type: tee.request_content_type.clone(),
+        request_content_encoding: tee.request_content_encoding.clone(),
+        response_content_type: header(http::header::CONTENT_TYPE),
+        response_content_encoding: header(http::header::CONTENT_ENCODING),
+        // The member actually dialled (AGENTS.md invariant 6).
+        dialect: ctx
+            .stream_info
+            .borrow()
+            .upstream_usage_dialect
+            .map(|d| match d {
+                proxy_config::ir::UsageDialect::OpenAi => TraceDialect::OpenAi,
+                proxy_config::ir::UsageDialect::Anthropic => TraceDialect::Anthropic,
+            }),
+    }
+}
+
 impl Body for LoggingBody {
     type Data = Bytes;
     type Error = BodyError;
@@ -1144,6 +1206,7 @@ impl Body for LoggingBody {
                 if let Some(data) = frame.data_ref() {
                     this.bytes_sent += data.len() as u64;
                     finished_by_length = this.note_frame_len(data.len());
+                    this.tee_response(data);
                 }
                 if let Some(trailers) = frame.trailers_ref() {
                     this.trailers = trailers.clone();

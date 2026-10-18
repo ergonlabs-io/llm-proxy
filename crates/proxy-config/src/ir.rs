@@ -82,6 +82,11 @@ pub struct ConfigSnapshot {
     /// per process, carried forward unchanged by xDS deliveries and not
     /// applied by a reload.
     pub ledger: Option<proxy_observability::ledger::LedgerConfig>,
+    /// Trace export (ADR-0008), from `node.metadata["io.llmproxy.traces"]`.
+    /// `None` means no export: no capture admission, nothing retained.
+    /// Bootstrap-scoped like [`Self::ledger`]: carried forward by xDS
+    /// deliveries, and a reload that changes it is refused.
+    pub traces: Option<proxy_observability::traces::config::TraceExportConfig>,
     /// ADS transport configuration, from bootstrap `dynamic_resources`.
     /// `None` -- the default, and every release through v0.2.0 -- means fully
     /// static configuration and no control-plane connection is ever attempted.
@@ -182,6 +187,7 @@ impl ConfigSnapshot {
             end_user_capture: self.end_user_capture.clone(),
             end_user_capture_configured: self.end_user_capture_configured,
             ledger: self.ledger.clone(),
+            traces: self.traces.clone(),
             ads: self.ads.clone(),
             max_downstream_connections: self.max_downstream_connections,
             version,
