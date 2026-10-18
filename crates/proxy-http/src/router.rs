@@ -36,6 +36,7 @@ use crate::codec::UpstreamCodecError;
 use crate::credential_provider::{
     CredentialProvider, CredentialProviderError, ProviderCredentials,
 };
+use crate::endpoint::Endpoint;
 use crate::filter::{
     DecoderCallbacks, FilterDataStatus, FilterHeadersStatus, FilterTrailersStatus, HttpFilter,
     RequestHeaders, RequestTrailers, ResponseHeaders, TerminalFilterInstanceFactory,
@@ -1153,7 +1154,7 @@ impl RouterHandler {
             routed_model.as_deref(),
             force_include_usage,
             max_output_tokens,
-            head.uri.path(),
+            Endpoint::classify(&head.method, head.uri.path()),
         ) {
             Ok(None) => original_body,
             Ok(Some(reconciled)) => {
@@ -2808,18 +2809,16 @@ impl Refusal {
     }
 }
 
-/// The body fields that bound output tokens for a request path.
+/// The body fields that bound output tokens for an endpoint.
 ///
-/// `/responses` (OpenAI Responses) and `/messages` (Anthropic) each have
-/// exactly one such field. Every other path is treated as chat completions or
-/// completions, which accept `max_completion_tokens`, `max_tokens`, or both.
-fn output_token_fields(path: &str) -> &'static [&'static str] {
-    if path.ends_with("/responses") {
-        &["max_output_tokens"]
-    } else if path.ends_with("/messages") {
-        &["max_tokens"]
-    } else {
-        &["max_completion_tokens", "max_tokens"]
+/// Responses (OpenAI) and Messages (Anthropic) each have exactly one such
+/// field. Every other endpoint is treated as chat completions or completions,
+/// which accept `max_completion_tokens`, `max_tokens`, or both.
+fn output_token_fields(endpoint: Endpoint) -> &'static [&'static str] {
+    match endpoint {
+        Endpoint::Responses => &["max_output_tokens"],
+        Endpoint::Messages => &["max_tokens"],
+        _ => &["max_completion_tokens", "max_tokens"],
     }
 }
 
@@ -2833,8 +2832,8 @@ fn output_token_fields(path: &str) -> &'static [&'static str] {
 ///
 /// A request that names no limit passes unchanged. This is the one place that
 /// decides the absent case.
-fn check_output_cap(path: &str, cap: u32, facts: &BodyDecodeFacts) -> Result<(), Refusal> {
-    for field in output_token_fields(path) {
+fn check_output_cap(endpoint: Endpoint, cap: u32, facts: &BodyDecodeFacts) -> Result<(), Refusal> {
+    for field in output_token_fields(endpoint) {
         let mut seen = facts.token_limits.iter().filter(|(name, _)| name == field);
         let Some((_, value)) = seen.next() else {
             // Absent: forwarded as the client sent it.
@@ -2874,7 +2873,7 @@ fn reconcile_request_body(
     requested_model: Option<&str>,
     force_include_usage: bool,
     max_output_tokens: Option<u32>,
-    path: &str,
+    endpoint: Endpoint,
 ) -> Result<Option<Bytes>, Refusal> {
     if requested_model.is_none() && !force_include_usage && max_output_tokens.is_none() {
         return Ok(None);
@@ -2900,7 +2899,7 @@ fn reconcile_request_body(
         }
     }
     if let Some(cap) = max_output_tokens {
-        check_output_cap(path, cap, &facts)?;
+        check_output_cap(endpoint, cap, &facts)?;
     }
     if !(force_include_usage && facts.stream == Some(true) && !facts.include_usage) {
         return Ok(None);
@@ -4239,12 +4238,12 @@ mod tests {
             model,
             force,
             None,
-            "/v1/chat/completions",
+            Endpoint::ChatCompletions,
         )
         .map_err(|r| r.message)
     }
 
-    /// Run the reconcile step with an output-token cap on `path`.
+    /// Run the reconcile step with an output-token cap on a `POST` to `path`.
     fn reconcile_capped(
         body: &'static str,
         path: &str,
@@ -4256,7 +4255,7 @@ mod tests {
             model,
             false,
             Some(cap),
-            path,
+            Endpoint::classify(&http::Method::POST, path),
         )
     }
 
@@ -4372,14 +4371,18 @@ mod tests {
     #[test]
     fn cap_check_and_forced_usage_coexist() {
         let body = Bytes::from_static(br#"{"stream":true,"max_tokens":50}"#);
-        let rewritten = reconcile_request_body(&body, None, true, Some(100), CHAT)
-            .unwrap()
-            .expect("usage is still forced");
+        let rewritten =
+            reconcile_request_body(&body, None, true, Some(100), Endpoint::ChatCompletions)
+                .unwrap()
+                .expect("usage is still forced");
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         assert_eq!(value["max_tokens"], 50);
         assert_eq!(value["stream_options"]["include_usage"], true);
         let over = Bytes::from_static(br#"{"stream":true,"max_tokens":500}"#);
-        assert!(reconcile_request_body(&over, None, true, Some(100), CHAT).is_err());
+        assert!(
+            reconcile_request_body(&over, None, true, Some(100), Endpoint::ChatCompletions)
+                .is_err()
+        );
     }
 
     #[test]
