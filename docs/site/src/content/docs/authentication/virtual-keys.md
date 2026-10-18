@@ -53,7 +53,7 @@ with `model_policy: false` is a load error at
 or `ALLOW` (1).
 
 `TenantPolicy` carries a per-tenant model allow-list and spend ceiling
-(`crates/proxy-filters/src/auth.rs:226-251`, the `model_access` and `budget`
+(`crates/proxy-control/src/auth.rs:226-251`, the `model_access` and `budget`
 fields). A tenant with no spend ceiling is unlimited. Two more `llmproxy.*` filters
 enforce these policies, `llmproxy.model_authz` and `llmproxy.spend_limit`
 (`crates/proxy-filters/src/model_authz_filter.rs`,
@@ -91,16 +91,16 @@ Configuration never holds the plaintext key — only a digest:
 `hex(HMAC-SHA256(hmac_secret, <plaintext key>))`, a keyed hash rather than a
 plain one, so read access to the configured key set does not by itself let
 someone precompute matching keys offline
-(`crates/proxy-filters/src/auth.rs`'s module doc, "Why keyed HMAC-SHA256").
+(`crates/proxy-control/src/auth.rs`'s module doc, "Why keyed HMAC-SHA256").
 Comparison against a presented key is `ring::hmac::verify`, run once against
 the single digest that a table lookup already narrowed to — the constant-time
 comparison the crate's own module doc explains is `ring`'s documented
 replacement for the deprecated
 `ring::constant_time::verify_slices_are_equal`
-(`crates/proxy-filters/src/auth.rs:493-499`, `KeySet::find`). A
+(`crates/proxy-control/src/auth.rs:493-499`, `KeySet::find`). A
 `KeyRecord` — the value stored per digest — carries only `key_id`, `tenant`,
 and `revoked`; there is no field for the plaintext key anywhere in the type
-(`crates/proxy-filters/src/auth.rs:411-415`).
+(`crates/proxy-control/src/auth.rs:411-415`).
 
 ## An unrecognized credential is not the same failure as a bad one
 
@@ -120,7 +120,7 @@ that fell through a *bad* virtual key to try a JWT authenticator would leak,
 one probe at a time, whether a guessed value was recognized as a virtual key
 at all. `AuthenticatorChain::authenticate` stops at the first `Rejected` and
 never tries a later authenticator in that case
-(`crates/proxy-filters/src/auth.rs:592-621`; the probing-oracle case is
+(`crates/proxy-control/src/auth.rs:592-621`; the probing-oracle case is
 covered directly by
 `a_rejected_first_authenticator_short_circuits_a_chain_that_would_otherwise_authenticate`
 in `crates/proxy-filters/src/auth_filter.rs`).
@@ -424,7 +424,7 @@ does, and refuse rather than guess when more than one does
 `crates/proxy-admin/src/server.rs`). Each call writes
 the store first and republishes immediately, so the change is visible to
 every worker's very next request rather than waiting on a periodic refresh
-(`crates/proxy-filters/src/control.rs:1713-1775`, `ControlPlane::mint_key`,
+(`crates/proxy-control/src/control.rs:1713-1775`, `ControlPlane::mint_key`,
 `revoke_key`, `set_policy`, `set_budget`, each documented "then republishes").
 `DELETE /tenants/{id}` revokes every key that authenticates as the tenant and
 answers `204`. Keys minted through `POST /keys` are revoked and their rows

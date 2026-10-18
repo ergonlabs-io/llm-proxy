@@ -83,7 +83,7 @@ These rules apply to the opt-in:
 - For a JWT request, the proxy withholds the opt-in while the policy snapshot
   is stale. Each such request adds one to
   `llmproxy_trace_consent_stale_total`
-  (`crates/proxy-filters/src/auth.rs:805-830`).
+  (`crates/proxy-control/src/auth.rs:805-830`).
 
 A request with no authenticated tenant is never captured.
 

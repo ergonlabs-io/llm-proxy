@@ -4,7 +4,7 @@
 //! one that matters: it proves the generator (this command) and the
 //! verifier (`proxy_filters::auth`, loaded from nothing but the printed
 //! digest) actually agree, rather than merely re-deriving the digest with
-//! the same function both share -- see `crates/proxy-filters/src/auth.rs`'s
+//! the same function both share -- see `crates/proxy-control/src/auth.rs`'s
 //! `digest_hex` doc for why that sharing can't drift on its own, and why
 //! this test exists anyway to prove it end to end regardless.
 //!

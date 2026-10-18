@@ -29,7 +29,7 @@ Inspect these paths before editing; comments describing older behavior can be st
 - `crates/proxy-observability/src/access_log.rs` and `sink.rs`: formatting and stdout/stderr/buffered append-file writers. Current writers can perform synchronous I/O on their caller.
 - `crates/proxy-http/src/stream_info.rs`, `router.rs`, and `filter_manager.rs`: request state, upstream attempts, body transforms, and streaming lifecycle.
 - `crates/proxy-filters/src/usage_filter.rs`: terminal usage extraction and pricing attribution.
-- `crates/proxy-filters/src/control.rs` and `spend/recovery.rs`: control-plane state, durable aggregate spend, and recovery checkpoints. The control store deliberately excludes request history.
+- `crates/proxy-control/src/control.rs` and `spend/recovery.rs`: control-plane state, durable aggregate spend, and recovery checkpoints. The control store deliberately excludes request history.
 - `crates/proxy-config/src/ir.rs`: configuration boundary. Other crates must consume IR, not generated Envoy configuration protos.
 
 Read `AGENTS.md`, the pricing design brief, and the applicable S1–S10 sections of `internal-docs/envoy-semantics.md` before implementation. Existing Envoy metrics and access-log formatting are compatibility surfaces.
