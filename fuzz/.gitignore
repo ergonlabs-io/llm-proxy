@@ -1,0 +1,5 @@
+target/
+artifacts/
+coverage/
+# The working corpus grows on every run; only the curated seeds are tracked.
+corpus/

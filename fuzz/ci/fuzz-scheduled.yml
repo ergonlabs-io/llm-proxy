@@ -1,0 +1,55 @@
+# PROPOSED scheduled fuzz job (WP-29). Not enabled: GitHub only runs
+# workflows under .github/workflows/. To enable, copy this file to
+# .github/workflows/fuzz.yml.
+#
+# Runs every target for FUZZ_SECONDS on a nightly schedule, caching the
+# working corpus between runs so coverage accumulates. A crash fails the job
+# and uploads fuzz/artifacts/ for minimization (see the fuzzing section of
+# the Makefile).
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "600"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [usage_extract, body_prefix_scan, dialect_config]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        run: make fuzz-one TARGET=${{ matrix.target }} FUZZ_SECONDS=${{ inputs.seconds || '600' }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
