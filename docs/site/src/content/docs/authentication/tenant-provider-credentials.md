@@ -99,7 +99,7 @@ key in a file. The file must meet these rules. The proxy refuses to load a
 file that breaks any of them.
 
 - It is a regular file. A symbolic link fails, because the check reads the
-  link's own metadata (`crates/proxy-filters/src/tenant_credential_crypto.rs`,
+  link's own metadata (`crates/proxy-control/src/tenant_credential_crypto.rs`,
   `CredentialKek::load`).
 - It has no group or other permission bits. Mode `0600` passes. Mode `0644`
   fails with `credential key file must not be group- or world-accessible`.
@@ -370,14 +370,14 @@ Example `PUT` error when the provider rejects the key:
 New keys are sealed under the new key. Existing rows still open under the
 previous key. The proxy does not re-seal existing rows. Only a new `PUT` seals
 a row under the new key (`rotation_opens_old_rows_and_reseals_under_the_new_key`
-in `crates/proxy-filters/src/tenant_credential_crypto.rs`). The metadata does
+in `crates/proxy-control/src/tenant_credential_crypto.rs`). The metadata does
 not show which key sealed a row. Keep each previous key listed while any tenant
 might still hold a row sealed under it.
 
 If you remove a key from the list and a row still needs it, that row fails
 closed. The tenant then gets `503` until it stores the key again
 (`rotation_keeps_old_rows_openable_only_while_the_old_key_is_listed` in
-`crates/proxy-filters/src/control.rs`).
+`crates/proxy-control/src/control.rs`).
 
 ## Admin API
 
@@ -530,7 +530,7 @@ the top level. It is `null` when there is no budget.
 A tenant with a platform-scoped budget and its own stored key is not limited
 by that budget. Its tenant-mode spend is not recorded against it. Budget rows written before the scope existed read as
 platform-scoped (`crates/proxy-filters/src/spend_limit_filter.rs`, the module
-doc and `on_request_headers`; `crates/proxy-filters/src/control.rs`,
+doc and `on_request_headers`; `crates/proxy-control/src/control.rs`,
 `legacy_credential_source`).
 
 
@@ -574,7 +574,7 @@ doc and `on_request_headers`; `crates/proxy-filters/src/control.rs`,
 - **Rollback.** A build from before budget scopes has no scope field. It
   ignores `credential_source` on a budget row. It then applies that budget to
   all traffic, and charges all spend to it
-  (`crates/proxy-filters/src/control.rs`, `EncodedTenantBudget`, which has no
+  (`crates/proxy-control/src/control.rs`, `EncodedTenantBudget`, which has no
   `deny_unknown_fields`). Remove tenant-scoped budgets before a rollback. No
   test covers this rollback path.
 

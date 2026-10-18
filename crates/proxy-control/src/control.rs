@@ -24,7 +24,7 @@ use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 use crate::tenant_credential_crypto::{
     self as credential_crypto, CryptoError, KeyRing, TenantSecret,
 };
-use proxy_http::tenant_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
+use proxy_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
 use zeroize::Zeroizing;
 // Spend owns period-key and calendar-alignment logic; this module only stores
 // and retrieves the resulting keys.
@@ -140,7 +140,7 @@ impl std::fmt::Debug for StoredTenantCredential {
 ///
 /// The store treats the card as an opaque document. `card_json` is the
 /// validated pricing document that `PUT /pricing` accepts and `GET /pricing`
-/// serves, and only `crate::usage_filter` parses it. That keeps price
+/// serves, and only `proxy_filters::usage_filter` parses it. That keeps price
 /// arithmetic out of the storage layer and lets a store hold a card that a
 /// newer or older build would read differently.
 ///
@@ -913,8 +913,7 @@ pub struct ControlPlaneSnapshot {
     /// entry is in platform mode. A row that failed to decrypt is present as
     /// `TenantCredential::Unusable`, never absent, so that tenant fails
     /// closed.
-    pub tenant_credentials:
-        HashMap<TenantId, Arc<proxy_http::tenant_credentials::TenantCredentialSet>>,
+    pub tenant_credentials: HashMap<TenantId, Arc<proxy_credentials::TenantCredentialSet>>,
     /// The store's `policy_generation`, read before the load this snapshot
     /// was built from, so it can lag the data by one write but never lead
     /// it. `None` when that read failed. Request records carry it.
@@ -4893,8 +4892,8 @@ fn next_poll_delay(interval: Duration) -> Duration {
 /// handle that is never [`ControlPlane::rebuild`]-ed. Every filter-behavior
 /// test that only cares about "authenticate against this static key set" uses
 /// this instead of standing up a full [`ControlPlane`] + store.
-#[cfg(test)]
-pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnapshot>> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnapshot>> {
     Arc::new(ArcSwap::new(Arc::new(ControlPlaneSnapshot {
         keys,
         policies: TenantPolicyMap::new(),
@@ -4913,13 +4912,13 @@ pub(crate) fn test_snapshot_handle(keys: KeySet) -> Arc<ArcSwap<ControlPlaneSnap
 /// tests that assert a control is loud. Install it with
 /// `tracing::subscriber::set_default`, which is per thread, so the code under
 /// test must run on the test's own thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
-pub(crate) struct ErrorCapture {
-    pub(crate) lines: Arc<Mutex<Vec<String>>>,
+pub struct ErrorCapture {
+    pub lines: Arc<Mutex<Vec<String>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl tracing::Subscriber for ErrorCapture {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
@@ -4952,11 +4951,8 @@ impl tracing::Subscriber for ErrorCapture {
 
 /// The value of `llmproxy_policy_store_emptied_total{scope}` in `registry`'s
 /// Prometheus rendering.
-#[cfg(test)]
-pub(crate) fn rendered_emptied_count(
-    registry: &proxy_observability::stats::Registry,
-    scope: &str,
-) -> u64 {
+#[cfg(any(test, feature = "test-support"))]
+pub fn rendered_emptied_count(registry: &proxy_observability::stats::Registry, scope: &str) -> u64 {
     let prefix = format!("envoy_llmproxy_policy_store_emptied_total{{scope=\"{scope}\"}}");
     proxy_observability::stats::prometheus_render::render(registry)
         .lines()
@@ -4972,16 +4968,16 @@ pub(crate) fn rendered_emptied_count(
 /// through another, which is the property replica propagation depends on.
 /// Reports itself durable and shared because it plays the part of a store
 /// that is both.
-#[cfg(test)]
-pub(crate) struct SharedMemoryStore {
-    pub(crate) inner: Arc<InMemoryControlPlaneStore>,
+#[cfg(any(test, feature = "test-support"))]
+pub struct SharedMemoryStore {
+    pub inner: Arc<InMemoryControlPlaneStore>,
     /// Makes rate card writes fail, to test what a refused write leaves behind.
-    pub(crate) refuse_rate_cards: Arc<std::sync::atomic::AtomicBool>,
+    pub refuse_rate_cards: Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl SharedMemoryStore {
-    pub(crate) fn new() -> (Self, Arc<InMemoryControlPlaneStore>) {
+    pub fn new() -> (Self, Arc<InMemoryControlPlaneStore>) {
         let inner = Arc::new(InMemoryControlPlaneStore::default());
         (
             SharedMemoryStore {
@@ -4993,7 +4989,7 @@ impl SharedMemoryStore {
     }
 
     /// Another handle on the same underlying store.
-    pub(crate) fn handle(&self) -> Self {
+    pub fn handle(&self) -> Self {
         SharedMemoryStore {
             inner: Arc::clone(&self.inner),
             refuse_rate_cards: Arc::clone(&self.refuse_rate_cards),
@@ -5008,7 +5004,7 @@ impl SharedMemoryStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ControlPlaneStore for SharedMemoryStore {
     fn add_window_batch(
         &self,
@@ -5133,38 +5129,38 @@ impl ControlPlaneStore for SharedMemoryStore {
 /// which the crate's fail-open rules ask for (AGENTS.md "Fail-open controls":
 /// check what the log line renders). Shared by this crate's test modules, like
 /// [`test_snapshot_handle`].
-#[cfg(test)]
-pub(crate) mod log_capture {
+#[cfg(any(test, feature = "test-support"))]
+pub mod log_capture {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     /// One captured event: its level and every field rendered to a string. The
     /// message is the field named `message`.
-    pub(crate) type Event = (tracing::Level, BTreeMap<String, String>);
+    pub type Event = (tracing::Level, BTreeMap<String, String>);
 
     /// Records every event emitted on the current thread (`set_default` is
     /// thread-local, so an event from the policy poller's own thread is not
     /// seen; tests that need one call the function the poller calls).
     #[derive(Default)]
-    pub(crate) struct Capture {
+    pub struct Capture {
         events: Mutex<Vec<Event>>,
     }
 
     impl Capture {
         /// Starts capturing on this thread until the guard drops.
-        pub(crate) fn start() -> (Arc<Capture>, tracing::subscriber::DefaultGuard) {
+        pub fn start() -> (Arc<Capture>, tracing::subscriber::DefaultGuard) {
             let capture = Arc::new(Capture::default());
             let guard = tracing::subscriber::set_default(Arc::clone(&capture));
             (capture, guard)
         }
 
-        pub(crate) fn events(&self) -> Vec<Event> {
+        pub fn events(&self) -> Vec<Event> {
             self.events.lock().unwrap().clone()
         }
 
         /// Every captured event at `level` or more severe, with its fields
         /// joined into one string: what an operator would read on one line.
-        pub(crate) fn rendered_at_or_above(&self, level: tracing::Level) -> Vec<String> {
+        pub fn rendered_at_or_above(&self, level: tracing::Level) -> Vec<String> {
             self.events()
                 .into_iter()
                 .filter(|(event_level, _)| *event_level <= level)

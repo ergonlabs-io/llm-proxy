@@ -30,6 +30,7 @@ use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
+use proxy_credentials::CredentialSource;
 use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
@@ -37,7 +38,6 @@ use proxy_http::filter::{
     ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::LlmSpendCharge;
-use proxy_http::tenant_credentials::CredentialSource;
 use proxy_observability::records::{ChargeScope, ChargedScope};
 use proxy_observability::ResponseFlag;
 
@@ -1168,7 +1168,7 @@ mod tests {
     use proxy_http::stream_info::StreamInfo;
     use proxy_http::LlmTokenUsage;
 
-    use proxy_http::tenant_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
+    use proxy_credentials::{TenantCredential, TenantCredentialSet, TenantSecret};
 
     use crate::auth::{HmacSecret, KeySet};
     use crate::control::ControlPlane;
@@ -2495,7 +2495,7 @@ mod tests {
             .store()
             .load_spend(
                 &ctx.stat_prefix,
-                &crate::spend::key_spend_subject(&key_id),
+                &crate::spend::test_support::key_spend_subject(&key_id),
                 &period.key_for(now),
             )
             .expect("load_spend must succeed");
@@ -2515,7 +2515,7 @@ mod tests {
     /// `spend::tests::a_failed_startup_prefetch_still_serves_and_the_next_flush_corrects_the_base`.
     #[test]
     fn a_failed_startup_prefetch_builds_the_filter_and_warns_once() {
-        use crate::spend::tests::ProbeStore;
+        use crate::spend::test_support::ProbeStore;
         let probe = Arc::try_unwrap(ProbeStore::new())
             .ok()
             .expect("nothing else holds the new store");

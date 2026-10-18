@@ -37,7 +37,7 @@
 //!
 //! ADR-0005 names the trap: with N workers, a per-worker counter that never
 //! aggregates is wrong by the worker count (the same mistake made a token
-//! budget wrong by N — see `proxy_filters::token_limit`'s module doc for that
+//! budget wrong by N — see `proxy_control::token_limit`'s module doc for that
 //! story). [`Registry`] lays out one contiguous shard per worker, indexed by
 //! [`WorkerId`], each shard holding one slot per handle. A worker only ever
 //! touches its own shard, so two workers never write the same cache line and

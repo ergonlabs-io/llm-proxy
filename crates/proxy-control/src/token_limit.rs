@@ -11,7 +11,7 @@
 //!
 //! # The central semantic: retrospective enforcement, never mid-stream cutoff
 //!
-//! Token usage is not known until a response completes — [`crate::usage`]'s
+//! Token usage is not known until a response completes — `proxy_filters::usage`'s
 //! extractors only produce a [`TokenUsage`] at the end of a (possibly
 //! streaming) exchange. So token limits are *retrospective*: a request is
 //! admitted against usage **already accumulated**, and only once it finishes
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::control::{WindowDimension, WindowKey};
-use crate::usage::TokenUsage;
+use crate::token_usage::TokenUsage;
 
 /// The identity a budget is tracked against: which route, and who the budget
 /// belongs to (see [`LimitSubject`]).
@@ -123,7 +123,7 @@ impl LimitKey {
 
     /// The bucket for a keyed rule's canonical `subject`; see
     /// [`LimitSubject::Rule`]. The caller hashes any secret-shaped part.
-    pub(crate) fn for_rule(subject: String) -> Self {
+    pub fn for_rule(subject: String) -> Self {
         LimitKey {
             route: String::new(),
             subject: LimitSubject::Rule(subject),

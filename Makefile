@@ -378,7 +378,8 @@ docs-build: ## Production build of the docs site to docs/site/dist/
 # -------------------------------------------------------------------- deps --
 
 .PHONY: deps-check
-deps-check: ## Fail if any crate declares a dependency nothing references
+deps-check: ## Fail on an unused dependency or an edge against the layering table
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_check_deps.py
 	python3 scripts/check-deps.py
 
 .PHONY: version-check

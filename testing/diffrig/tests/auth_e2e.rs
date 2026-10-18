@@ -30,7 +30,7 @@ const KEY_REVOKED: &str = "llmp_e2e-revoked-key";
 /// Well-formed (`llmp_`-prefixed) but never configured -- exercises the
 /// "credential presented, unknown" path, distinct from "no credential at
 /// all" (see [`AuthOutcome::NoCredential`] vs. `Rejected(UnknownKey)` in
-/// `crates/proxy-filters/src/auth.rs`).
+/// `crates/proxy-control/src/auth.rs`).
 const UNKNOWN_KEY: &str = "llmp_e2e-never-configured";
 
 /// The credential the CLUSTER injects via `io.llmproxy.provider_auth`

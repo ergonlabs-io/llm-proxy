@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use ring::rand::SystemRandom;
 
-use proxy_filters::auth::{digest_hex, generate_plaintext_key, HmacSecret};
+use proxy_control::auth::{digest_hex, generate_plaintext_key, HmacSecret};
 
 /// Env var carrying the HMAC secret, mirroring the dialect's `hmac_secret:
 /// ${VAR}` idiom (`schema/llmproxy-v0.schema.json`'s `Auth.hmac_secret`).
@@ -25,7 +25,7 @@ fn resolve_secret(hmac_secret_file: Option<&PathBuf>) -> Result<Vec<u8>, String>
     if let Some(path) = hmac_secret_file {
         let raw = std::fs::read(path)
             .map_err(|e| format!("--hmac-secret-file {}: {e}", path.display()))?;
-        let bytes = proxy_filters::auth::secret_bytes_from_file(&raw).to_vec();
+        let bytes = proxy_control::auth::secret_bytes_from_file(&raw).to_vec();
         if bytes.is_empty() {
             return Err(format!(
                 "--hmac-secret-file {}: file is empty or contains only whitespace (an empty \

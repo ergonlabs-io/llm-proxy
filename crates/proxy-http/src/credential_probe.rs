@@ -20,7 +20,7 @@ use proxy_config::ir::TenantCredentialSlot;
 
 use crate::credential_provider::{CredentialProvider, ProviderCredentials};
 use crate::filter::RequestHeaders;
-use crate::tenant_credentials::TenantSecret;
+use proxy_credentials::TenantSecret;
 
 /// How long one probe may take, from connect to response head.
 pub const CREDENTIAL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);

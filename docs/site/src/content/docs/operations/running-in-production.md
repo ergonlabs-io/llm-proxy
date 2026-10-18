@@ -151,7 +151,7 @@ newline is stripped automatically, the same treatment `hmac_secret_file`
 gets, so `echo "redis://..." > url.txt` cannot silently corrupt the URL.
 
 `namespace` is optional and defaults to `llmproxy`
-(`crates/proxy-filters/src/control_redis.rs`'s `DEFAULT_NAMESPACE`, line 63).
+(`crates/proxy-control/src/control_redis.rs`'s `DEFAULT_NAMESPACE`, line 63).
 Set it explicitly when more than one deployment shares one Redis instance, so
 their keys cannot collide.
 
@@ -230,7 +230,7 @@ With a shared store, `add_spend` is additive: each flush sends a delta and a
 (`internal-docs/adr/0006-shared-state-tiers.md` §2; the convergence itself is
 proven by
 `two_accumulators_sharing_one_store_converge_on_the_true_total` in
-`crates/proxy-filters/src/spend.rs`). That is what makes two replicas' spend
+`crates/proxy-control/src/spend.rs`). That is what makes two replicas' spend
 add up instead of last-writer-wins clobbering — but it means the number a
 replica enforces against is never more current than its last successful
 flush.
@@ -259,11 +259,11 @@ number is uncomfortable for your budgets, at the cost of more store writes.
 `llmproxy.auth` polls a monotonic generation counter in the store —
 bumped by every tier-2 admin write, never by a spend write — and only does
 the full re-read of keys and policy when that counter has moved
-(`crates/proxy-filters/src/control.rs`, `ControlPlane::poll_once`, and the
+(`crates/proxy-control/src/control.rs`, `ControlPlane::poll_once`, and the
 generation-stamp reads at lines 217–219). `poll_interval_seconds` defaults to
 **48 seconds**, and the actual wait is jittered by up to a quarter of the
 interval so that every replica does not wake up and re-read at the same
-instant (`next_poll_delay`, `crates/proxy-filters/src/control.rs:2052–2070`).
+instant (`next_poll_delay`, `crates/proxy-control/src/control.rs:2052–2070`).
 
 That makes the worst case **48 + 12 = 60 seconds**
 (`crates/proxy-api/vendor/llmproxy/filters/v0/auth.proto`'s
@@ -287,7 +287,7 @@ and every admin write. The spend lane carries spend reconciliation and the
 spend reads at bind time. A slow call on one lane does not delay a call on the
 other. Each lane has a 1 second timeout for connect, read, and write. After an
 error, the lane drops its own connection and reconnects on the next call. The
-other lane keeps its connection (`crates/proxy-filters/src/control_redis.rs:88`;
+other lane keeps its connection (`crates/proxy-control/src/control_redis.rs:88`;
 tests `a_flush_stuck_on_the_spend_lane_does_not_delay_policy_calls`,
 `a_load_stuck_on_the_control_lane_does_not_delay_spend_reconciliation`, and
 `a_failed_call_resets_only_its_own_lane_and_that_lane_reconnects`).
@@ -356,7 +356,7 @@ While a replica is stale, over-admission grows to roughly:
 (replica_count - 1) x per-replica spend during the outage
 ```
 
-(ADR-0006 §5, and `crates/proxy-filters/src/spend.rs`'s `SpendReport`
+(ADR-0006 §5, and `crates/proxy-control/src/spend.rs`'s `SpendReport`
 doc, lines 1077–1080.) Unlike the steady-state bound above, this one is not
 capped by a flush interval — it grows for as long as the outage lasts,
 because `ALLOW` is the only wired behavior. Watch it end-to-end: `GET
@@ -453,7 +453,7 @@ are keyed by its node ID.
   spend counters and nothing else — never per-request history. That lives in
   access logs and the usage filter, and stays there by owner decision:
   `ControlPlaneStore`'s own trait doc states "counters only" so this is not
-  merely a backlog note (`crates/proxy-filters/src/control.rs`, lines
+  merely a backlog note (`crates/proxy-control/src/control.rs`, lines
   195–211). If you need historical spend, export it from access logs; the
   admin `/spend` endpoint only ever answers "right now, this window."
 - **Token and request limits count locally unless `auth.store` is shared.**
@@ -518,7 +518,7 @@ enforcement, checkpointed backlog recovery after SIGKILL, and exact replay.
 Both explicitly skip when `QA_REDIS_ADDR` is absent; a plain `make tq` does not
 run them. The lower-level Redis tests also require a real Redis and an explicit
 ignored-test run. See the Makefile's `t1` target and
-`crates/proxy-filters/src/control_redis.rs` for their environment variable.
+`crates/proxy-control/src/control_redis.rs` for their environment variable.
 
 ## Troubleshooting
 

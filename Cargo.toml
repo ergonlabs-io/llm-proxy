@@ -12,6 +12,8 @@ members = [
     "crates/proxy-capture-protocol",
     "crates/proxy-capture-agent",
     "crates/proxy-admin",
+    "crates/proxy-control",
+    "crates/proxy-credentials",
     "crates/proxy-filters",
     "crates/proxy-simple-config",
     "crates/proxy",
@@ -38,6 +40,8 @@ proxy-cluster = { path = "crates/proxy-cluster" }
 proxy-xds = { path = "crates/proxy-xds" }
 proxy-observability = { path = "crates/proxy-observability" }
 proxy-admin = { path = "crates/proxy-admin" }
+proxy-control = { path = "crates/proxy-control" }
+proxy-credentials = { path = "crates/proxy-credentials" }
 proxy-filters = { path = "crates/proxy-filters" }
 proxy-simple-config = { path = "crates/proxy-simple-config" }
 

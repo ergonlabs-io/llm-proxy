@@ -1673,7 +1673,7 @@ mod tests {
     use chrono::TimeZone;
 
     use crate::spend::{Charge, MicroUsd, Period, SpendAccumulator};
-    use proxy_http::tenant_credentials::CredentialSource;
+    use proxy_credentials::CredentialSource;
 
     // ------------------------------------------------------------------
     // Unit tests: no Redis needed. `Client::open` only parses the URL, so
@@ -2611,7 +2611,7 @@ mod tests {
         use crate::auth::{HmacSecret, KeySet};
         use crate::control::{ControlPlane, CredentialKeys};
         use crate::tenant_credential_crypto::{CredentialKek, KeyRing, TenantSecret};
-        use proxy_http::tenant_credentials::TenantCredential;
+        use proxy_credentials::TenantCredential;
 
         let url = std::env::var("LLM_PROXY_TEST_REDIS").expect("LLM_PROXY_TEST_REDIS is not set");
         let namespace = format!(

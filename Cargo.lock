@@ -1905,8 +1905,8 @@ dependencies = [
  "proxy-capture-spool",
  "proxy-cluster",
  "proxy-config",
+ "proxy-control",
  "proxy-core",
- "proxy-filters",
  "proxy-http",
  "proxy-observability",
  "proxy-simple-config",
@@ -1937,7 +1937,9 @@ dependencies = [
  "proxy-api",
  "proxy-capture-protocol",
  "proxy-config",
+ "proxy-control",
  "proxy-core",
+ "proxy-credentials",
  "proxy-filters",
  "proxy-http",
  "proxy-observability",
@@ -2049,6 +2051,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-control"
+version = "0.5.0"
+dependencies = [
+ "arc-swap",
+ "base64",
+ "chrono",
+ "http",
+ "proxy-config",
+ "proxy-credentials",
+ "proxy-observability",
+ "rand",
+ "redb",
+ "redis",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "proxy-core"
 version = "0.5.0"
 dependencies = [
@@ -2064,6 +2089,7 @@ dependencies = [
  "proxy-api",
  "proxy-cluster",
  "proxy-config",
+ "proxy-control",
  "proxy-filters",
  "proxy-http",
  "proxy-observability",
@@ -2086,6 +2112,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-credentials"
+version = "0.5.0"
+dependencies = [
+ "proxy-observability",
+ "zeroize",
+]
+
+[[package]]
 name = "proxy-filters"
 version = "0.5.0"
 dependencies = [
@@ -2101,12 +2135,12 @@ dependencies = [
  "prost-reflect",
  "proxy-api",
  "proxy-config",
+ "proxy-control",
+ "proxy-credentials",
  "proxy-http",
  "proxy-observability",
  "rand",
  "rcgen",
- "redb",
- "redis",
  "regex",
  "ring",
  "rsa",
@@ -2115,11 +2149,9 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tracing",
- "zeroize",
 ]
 
 [[package]]
@@ -2138,6 +2170,7 @@ dependencies = [
  "prost-reflect",
  "proxy-cluster",
  "proxy-config",
+ "proxy-credentials",
  "proxy-observability",
  "rand",
  "ring",
@@ -2147,7 +2180,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zeroize",
 ]
 
 [[package]]

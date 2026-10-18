@@ -1,7 +1,7 @@
 //! Spend accounting for the spend filter: money, periods, and the
 //! accumulator that reconciles with the store.
 //!
-//! Cost comes from the chain's rate card (`crate::pricing`), which prices the
+//! Cost comes from the chain's rate card (`proxy_filters::pricing`), which prices the
 //! dialled cluster (AGENTS.md invariant 6). Integer micro-dollars avoid
 //! floating-point drift. An unpriced request stays distinguishable from a
 //! configured zero rate so gaps can be reported while metering stays
@@ -22,7 +22,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use crate::control::{ControlPlaneStore, SpendDelta, StoreError};
 use crate::reconciliation_age::{ReconciliationAgeGauge, Seam};
-use proxy_http::tenant_credentials::CredentialSource;
+use proxy_credentials::CredentialSource;
 
 /// An amount of money in integer micro-dollars (1e-6 USD). See the module
 /// doc's "Money is integer, never `f64`" section for why.
@@ -177,7 +177,7 @@ pub enum Charge {
 //
 // Everything below answers "how much has this tenant spent this period, and
 // when does the durable store find out". The rate card answers "what did this
-// request cost" (`crate::pricing`).
+// request cost" (`proxy_filters::pricing`).
 //
 // # Rollover happens on RECORD, never on the flush tick -- a correctness
 // property, not an optimization
@@ -246,7 +246,7 @@ pub enum Charge {
 
 /// How many distinct unpriced `(cluster, model)` pairs one bucket
 /// remembers before it stops inserting and only counts. `model` is read out
-/// of the request body (see [`crate::usage`]), so a caller that varies it
+/// of the request body (see `proxy_filters::usage`), so a caller that varies it
 /// on every request can grow this set without bound if nothing caps it --
 /// a remote memory-growth vector, not a theoretical one. Pinned by
 /// `unpriced_pairs_cap_at_32_pairs_and_set_the_truncated_flag`; its
@@ -2122,6 +2122,224 @@ impl Drop for SpendAccumulator {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::*;
+    use crate::control::{FlushToken, InMemoryControlPlaneStore};
+
+    /// [`super::key_spend_subject`] for proxy-filters' tests, which read a
+    /// key's spend row directly. Production callers go through the `*_key`
+    /// methods, so the function itself stays `pub(crate)`.
+    pub fn key_spend_subject(key_id: &KeyId) -> TenantId {
+        super::key_spend_subject(key_id)
+    }
+
+    /// A store double for the flush-shape tests. It delegates to an in-memory
+    /// store, counts the calls the flusher makes, fails on demand, and can run
+    /// a closure on either side of an `add_spend` so a test can interleave
+    /// something with a delivery that is genuinely in flight.
+    ///
+    /// `pub` behind `test-support` so `recovery.rs`'s journal tests and
+    /// proxy-filters' `spend_limit_filter` prefetch test drive the same double.
+    pub struct ProbeStore {
+        pub inner: InMemoryControlPlaneStore,
+        pub add_spend_calls: std::sync::atomic::AtomicUsize,
+        pub last_flush_seq_calls: std::sync::atomic::AtomicUsize,
+        pub load_spend_calls: std::sync::atomic::AtomicUsize,
+        /// `add_spend` fails without applying anything.
+        pub fail_add_spend: std::sync::atomic::AtomicBool,
+        /// `add_spend` applies its delta and THEN reports failure, once: the
+        /// write landed and the response did not.
+        pub lose_next_response: std::sync::atomic::AtomicBool,
+        /// `last_flush_seq` fails: the store cannot even seed a sequence.
+        pub fail_last_flush_seq: std::sync::atomic::AtomicBool,
+        /// Runs at the start of every `add_spend`, before it applies.
+        pub before_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Runs after an `add_spend` has applied, before it returns.
+        pub after_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// `load_spend` fails without reading anything.
+        pub fail_load_spend: std::sync::atomic::AtomicBool,
+        /// Runs at the start of every `load_spend`.
+        pub before_load_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Runs after a `load_spend` has read, before it returns.
+        pub after_load_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl ProbeStore {
+        pub fn new() -> Arc<Self> {
+            Arc::new(ProbeStore {
+                inner: InMemoryControlPlaneStore::default(),
+                add_spend_calls: Default::default(),
+                last_flush_seq_calls: Default::default(),
+                load_spend_calls: Default::default(),
+                fail_add_spend: Default::default(),
+                lose_next_response: Default::default(),
+                fail_last_flush_seq: Default::default(),
+                before_add_spend: Mutex::new(None),
+                after_add_spend: Mutex::new(None),
+                fail_load_spend: Default::default(),
+                before_load_spend: Mutex::new(None),
+                after_load_spend: Mutex::new(None),
+            })
+        }
+
+        pub fn add_spend_calls(&self) -> usize {
+            self.add_spend_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub fn load_spend_calls(&self) -> usize {
+            self.load_spend_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ControlPlaneStore for ProbeStore {
+        fn add_window_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[crate::control::WindowDelta<'_>],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.inner.add_window_batch(scope, node_id, rows)
+        }
+        fn last_window_seq_batch(
+            &self,
+            scope: &str,
+            node_id: &str,
+            rows: &[crate::control::WindowRow],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.inner.last_window_seq_batch(scope, node_id, rows)
+        }
+        fn load_window_batch(
+            &self,
+            scope: &str,
+            rows: &[crate::control::WindowRow],
+        ) -> Vec<Result<u64, crate::control::StoreError>> {
+            self.inner.load_window_batch(scope, rows)
+        }
+        fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
+            self.inner.load()
+        }
+        fn policy_generation(&self) -> Result<u64, StoreError> {
+            self.inner.policy_generation()
+        }
+        fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+            self.inner.create_tenant(tenant)
+        }
+        fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
+            self.inner.delete_tenant(tenant)
+        }
+        fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
+            self.inner.put_key(rec)
+        }
+        fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
+            self.inner.revoke_key(key_id)
+        }
+        fn set_policy(
+            &self,
+            tenant: &TenantId,
+            access: &crate::model_authz::ModelAccess,
+        ) -> Result<(), StoreError> {
+            self.inner.set_policy(tenant, access)
+        }
+        fn set_budget(
+            &self,
+            tenant: &TenantId,
+            budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_budget(tenant, budget)
+        }
+        fn set_limits(
+            &self,
+            subject: &TenantId,
+            limits: Option<&crate::control::LimitPolicy>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_limits(subject, limits)
+        }
+        fn add_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            delta_micros: u64,
+            token: FlushToken<'_>,
+        ) -> Result<u64, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.add_spend_calls.fetch_add(1, SeqCst);
+            if let Some(hook) = self.before_add_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.fail_add_spend.load(SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: add_spend refused".to_string(),
+                ));
+            }
+            let total = self
+                .inner
+                .add_spend(stat_prefix, tenant, period, delta_micros, token)?;
+            if let Some(hook) = self.after_add_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.lose_next_response.swap(false, SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: the write landed, the response did not".to_string(),
+                ));
+            }
+            Ok(total)
+        }
+        fn overwrite_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            total_micros: u64,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .overwrite_spend(stat_prefix, tenant, period, total_micros)
+        }
+        fn last_flush_seq(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+            node_id: &str,
+        ) -> Result<u64, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.last_flush_seq_calls.fetch_add(1, SeqCst);
+            if self.fail_last_flush_seq.load(SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: last_flush_seq refused".to_string(),
+                ));
+            }
+            self.inner
+                .last_flush_seq(stat_prefix, tenant, period, node_id)
+        }
+        fn load_spend(
+            &self,
+            stat_prefix: &str,
+            tenant: &TenantId,
+            period: &PeriodKey,
+        ) -> Result<u64, StoreError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.load_spend_calls.fetch_add(1, SeqCst);
+            if let Some(hook) = self.before_load_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            if self.fail_load_spend.load(SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "probe: load_spend refused".to_string(),
+                ));
+            }
+            let total = self.inner.load_spend(stat_prefix, tenant, period)?;
+            if let Some(hook) = self.after_load_spend.lock().unwrap().as_ref() {
+                hook();
+            }
+            Ok(total)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2202,6 +2420,7 @@ pub(crate) mod tests {
     // Periods, the accumulator, and the flusher.
     // ------------------------------------------------------------------
 
+    use super::test_support::ProbeStore;
     use crate::control::{FlushToken, InMemoryControlPlaneStore};
 
     fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
@@ -3914,211 +4133,6 @@ pub(crate) mod tests {
     // store calls it makes. A suite that only checked delivered totals would
     // stay green if a tick quietly went back to three copies and three
     // fsyncs.
-
-    /// A store double for the flush-shape tests. It delegates to an in-memory
-    /// store, counts the calls the flusher makes, fails on demand, and can run
-    /// a closure on either side of an `add_spend` so a test can interleave
-    /// something with a delivery that is genuinely in flight.
-    ///
-    /// `pub(crate)` so `recovery.rs`'s journal tests and `spend_limit_filter`'s
-    /// prefetch test drive the same double.
-    pub(crate) struct ProbeStore {
-        pub(super) inner: InMemoryControlPlaneStore,
-        pub(super) add_spend_calls: std::sync::atomic::AtomicUsize,
-        pub(super) last_flush_seq_calls: std::sync::atomic::AtomicUsize,
-        pub(super) load_spend_calls: std::sync::atomic::AtomicUsize,
-        /// `add_spend` fails without applying anything.
-        pub(super) fail_add_spend: std::sync::atomic::AtomicBool,
-        /// `add_spend` applies its delta and THEN reports failure, once: the
-        /// write landed and the response did not.
-        pub(super) lose_next_response: std::sync::atomic::AtomicBool,
-        /// `last_flush_seq` fails: the store cannot even seed a sequence.
-        pub(super) fail_last_flush_seq: std::sync::atomic::AtomicBool,
-        /// Runs at the start of every `add_spend`, before it applies.
-        pub(super) before_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-        /// Runs after an `add_spend` has applied, before it returns.
-        pub(super) after_add_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-        /// `load_spend` fails without reading anything.
-        pub(crate) fail_load_spend: std::sync::atomic::AtomicBool,
-        /// Runs at the start of every `load_spend`.
-        pub(crate) before_load_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-        /// Runs after a `load_spend` has read, before it returns.
-        pub(super) after_load_spend: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-    }
-
-    impl ProbeStore {
-        pub(crate) fn new() -> Arc<Self> {
-            Arc::new(ProbeStore {
-                inner: InMemoryControlPlaneStore::default(),
-                add_spend_calls: Default::default(),
-                last_flush_seq_calls: Default::default(),
-                load_spend_calls: Default::default(),
-                fail_add_spend: Default::default(),
-                lose_next_response: Default::default(),
-                fail_last_flush_seq: Default::default(),
-                before_add_spend: Mutex::new(None),
-                after_add_spend: Mutex::new(None),
-                fail_load_spend: Default::default(),
-                before_load_spend: Mutex::new(None),
-                after_load_spend: Mutex::new(None),
-            })
-        }
-
-        pub(super) fn add_spend_calls(&self) -> usize {
-            self.add_spend_calls
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        pub(crate) fn load_spend_calls(&self) -> usize {
-            self.load_spend_calls
-                .load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    impl ControlPlaneStore for ProbeStore {
-        fn add_window_batch(
-            &self,
-            scope: &str,
-            node_id: &str,
-            rows: &[crate::control::WindowDelta<'_>],
-        ) -> Vec<Result<u64, crate::control::StoreError>> {
-            self.inner.add_window_batch(scope, node_id, rows)
-        }
-        fn last_window_seq_batch(
-            &self,
-            scope: &str,
-            node_id: &str,
-            rows: &[crate::control::WindowRow],
-        ) -> Vec<Result<u64, crate::control::StoreError>> {
-            self.inner.last_window_seq_batch(scope, node_id, rows)
-        }
-        fn load_window_batch(
-            &self,
-            scope: &str,
-            rows: &[crate::control::WindowRow],
-        ) -> Vec<Result<u64, crate::control::StoreError>> {
-            self.inner.load_window_batch(scope, rows)
-        }
-        fn load(&self) -> Result<crate::control::StoredControlPlane, StoreError> {
-            self.inner.load()
-        }
-        fn policy_generation(&self) -> Result<u64, StoreError> {
-            self.inner.policy_generation()
-        }
-        fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
-            self.inner.create_tenant(tenant)
-        }
-        fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
-            self.inner.delete_tenant(tenant)
-        }
-        fn put_key(&self, rec: &crate::control::StoredKey) -> Result<(), StoreError> {
-            self.inner.put_key(rec)
-        }
-        fn revoke_key(&self, key_id: &crate::auth::KeyId) -> Result<(), StoreError> {
-            self.inner.revoke_key(key_id)
-        }
-        fn set_policy(
-            &self,
-            tenant: &TenantId,
-            access: &crate::model_authz::ModelAccess,
-        ) -> Result<(), StoreError> {
-            self.inner.set_policy(tenant, access)
-        }
-        fn set_budget(
-            &self,
-            tenant: &TenantId,
-            budget: Option<&TenantBudget>,
-        ) -> Result<(), StoreError> {
-            self.inner.set_budget(tenant, budget)
-        }
-        fn set_limits(
-            &self,
-            subject: &TenantId,
-            limits: Option<&crate::control::LimitPolicy>,
-        ) -> Result<(), StoreError> {
-            self.inner.set_limits(subject, limits)
-        }
-        fn add_spend(
-            &self,
-            stat_prefix: &str,
-            tenant: &TenantId,
-            period: &PeriodKey,
-            delta_micros: u64,
-            token: FlushToken<'_>,
-        ) -> Result<u64, StoreError> {
-            use std::sync::atomic::Ordering::SeqCst;
-            self.add_spend_calls.fetch_add(1, SeqCst);
-            if let Some(hook) = self.before_add_spend.lock().unwrap().as_ref() {
-                hook();
-            }
-            if self.fail_add_spend.load(SeqCst) {
-                return Err(StoreError::Unavailable(
-                    "probe: add_spend refused".to_string(),
-                ));
-            }
-            let total = self
-                .inner
-                .add_spend(stat_prefix, tenant, period, delta_micros, token)?;
-            if let Some(hook) = self.after_add_spend.lock().unwrap().as_ref() {
-                hook();
-            }
-            if self.lose_next_response.swap(false, SeqCst) {
-                return Err(StoreError::Unavailable(
-                    "probe: the write landed, the response did not".to_string(),
-                ));
-            }
-            Ok(total)
-        }
-        fn overwrite_spend(
-            &self,
-            stat_prefix: &str,
-            tenant: &TenantId,
-            period: &PeriodKey,
-            total_micros: u64,
-        ) -> Result<(), StoreError> {
-            self.inner
-                .overwrite_spend(stat_prefix, tenant, period, total_micros)
-        }
-        fn last_flush_seq(
-            &self,
-            stat_prefix: &str,
-            tenant: &TenantId,
-            period: &PeriodKey,
-            node_id: &str,
-        ) -> Result<u64, StoreError> {
-            use std::sync::atomic::Ordering::SeqCst;
-            self.last_flush_seq_calls.fetch_add(1, SeqCst);
-            if self.fail_last_flush_seq.load(SeqCst) {
-                return Err(StoreError::Unavailable(
-                    "probe: last_flush_seq refused".to_string(),
-                ));
-            }
-            self.inner
-                .last_flush_seq(stat_prefix, tenant, period, node_id)
-        }
-        fn load_spend(
-            &self,
-            stat_prefix: &str,
-            tenant: &TenantId,
-            period: &PeriodKey,
-        ) -> Result<u64, StoreError> {
-            use std::sync::atomic::Ordering::SeqCst;
-            self.load_spend_calls.fetch_add(1, SeqCst);
-            if let Some(hook) = self.before_load_spend.lock().unwrap().as_ref() {
-                hook();
-            }
-            if self.fail_load_spend.load(SeqCst) {
-                return Err(StoreError::Unavailable(
-                    "probe: load_spend refused".to_string(),
-                ));
-            }
-            let total = self.inner.load_spend(stat_prefix, tenant, period)?;
-            if let Some(hook) = self.after_load_spend.lock().unwrap().as_ref() {
-                hook();
-            }
-            Ok(total)
-        }
-    }
 
     fn accumulator_over(store: &Arc<ProbeStore>) -> SpendAccumulator {
         SpendAccumulator::new(

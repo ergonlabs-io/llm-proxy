@@ -209,7 +209,7 @@ pub struct AttemptInfo {
     pub bytes_response: u64,
     /// Set by the router at the credential step; `None` if the attempt
     /// never got there.
-    pub credential_source: Option<crate::tenant_credentials::CredentialSource>,
+    pub credential_source: Option<proxy_credentials::CredentialSource>,
 }
 
 impl AttemptInfo {
@@ -331,11 +331,11 @@ pub struct StreamInfo {
     /// the auth filter from the snapshot it authenticated against. `None`
     /// means platform mode. The request keeps this `Arc` for its lifetime, so
     /// a credential change applies to the next request, not to in-flight ones.
-    pub tenant_credentials: Option<std::sync::Arc<crate::tenant_credentials::TenantCredentialSet>>,
+    pub tenant_credentials: Option<std::sync::Arc<proxy_credentials::TenantCredentialSet>>,
     /// Whose credential the most recent attempt was sent with. Kept here as
     /// well as on `AttemptInfo` because attempt snapshots exist only while
     /// metadata capture is on, and access logs need it regardless.
-    pub credential_source: Option<crate::tenant_credentials::CredentialSource>,
+    pub credential_source: Option<proxy_credentials::CredentialSource>,
     /// The request body's `model` field, published by
     /// the body_rewrite filter (`proxy_filters::body_rewrite_filter`) on the
     /// decode path once it has scanned the body -- the same scan that filter

@@ -75,13 +75,13 @@ impl ReconciliationAgeGauge {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::*;
 
     /// The value `registry` renders on `/stats/prometheus` for one series,
     /// or `None` when the series is not exported.
-    pub(crate) fn rendered_age(registry: &Registry, scope: &str, seam: Seam) -> Option<u64> {
+    pub fn rendered_age(registry: &Registry, scope: &str, seam: Seam) -> Option<u64> {
         let series = format!(
             "envoy_llmproxy_counter_reconciliation_age_seconds{{scope=\"{scope}\",seam=\"{}\"}}",
             seam.as_str()
@@ -96,12 +96,7 @@ pub(crate) mod test_support {
     /// Wait, up to a deadline only a broken run reaches, until the series
     /// reads at least `at_least` seconds; returns whether it did. For tests
     /// of a control-side thread, which publishes on its own schedule.
-    pub(crate) fn wait_for_age(
-        registry: &Registry,
-        scope: &str,
-        seam: Seam,
-        at_least: u64,
-    ) -> bool {
+    pub fn wait_for_age(registry: &Registry, scope: &str, seam: Seam, at_least: u64) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             if rendered_age(registry, scope, seam).is_some_and(|age| age >= at_least) {

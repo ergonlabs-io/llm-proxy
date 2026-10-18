@@ -14,7 +14,7 @@ proxy-admin = { workspace = true }
 proxy-cluster = { workspace = true }
 proxy-config = { workspace = true }
 proxy-core = { workspace = true }
-proxy-filters = { workspace = true }
+proxy-control = { workspace = true }
 proxy-http = { workspace = true }
 proxy-observability = { workspace = true }
 proxy-simple-config = { workspace = true }
@@ -39,7 +39,7 @@ proxy-capture-agent = { path = "../proxy-capture-agent" }
 proxy-capture-spool = { path = "../proxy-capture-spool" }
 tempfile = { version = "=3.27.0", default-features = false }
 # tests/keygen.rs decodes the printed key's base64url body directly (the
-# generator itself now lives in `proxy_filters::auth::generate_plaintext_key`,
+# generator itself now lives in `proxy_control::auth::generate_plaintext_key`,
 # which this crate no longer calls outside that test).
 base64 = { workspace = true }
 # tests/keygen.rs's end-to-end proof builds a real

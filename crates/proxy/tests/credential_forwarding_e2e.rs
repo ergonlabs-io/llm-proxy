@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use proxy_filters::auth::{digest_hex, HmacSecret};
+use proxy_control::auth::{digest_hex, HmacSecret};
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);

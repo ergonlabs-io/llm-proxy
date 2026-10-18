@@ -1,0 +1,17 @@
+[package]
+name = "proxy-credentials"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A tenant's own provider credentials as the request path sees them
+# (ADR-0007). Both the router (proxy-http) and the store that decrypts them
+# (proxy-control) name these types, so they sit below both.
+
+[dependencies]
+# `CredentialSource`, which usage records also carry.
+proxy-observability = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+proxy-credentials = { workspace = true }
 proxy-config = { workspace = true }
 proxy-core = { workspace = true }
 proxy-observability = { workspace = true }
 # The admin write API mints/revokes keys and
-# edits tenant policy through `proxy_filters::control::ControlPlane` -- the
+# edits tenant policy through `proxy_control::control::ControlPlane` -- the
 # one type that owns the store and republishes its snapshot.
+proxy-control = { workspace = true }
 proxy-filters = { workspace = true }
 # For `SharedFactoryState`: the admin write handlers resolve the live
 # `ControlPlane` out of it per request (see `server.rs`'s `resolve_control_plane`),
@@ -22,7 +24,7 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 # The admin bearer-token compare: the double-HMAC constant-time check in
 # `server.rs`'s `secrets_match`, never `==`. Same primitive
-# (`ring::hmac::verify`) and same reasoning as `proxy_filters::auth`'s data-
+# (`ring::hmac::verify`) and same reasoning as `proxy_control::auth`'s data-
 # plane key check -- see that function's doc.
 ring = { workspace = true }
 serde = { workspace = true }

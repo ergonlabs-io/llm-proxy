@@ -25,6 +25,7 @@ use proxy_config::ir::{
     RouteActionIR, RouteEntry, RouteMatcher, RouteTable, TenantCredentialSlot, UpgradeConfig,
     VirtualHostIR,
 };
+use proxy_credentials::{CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret};
 use proxy_http::filter::{
     DecoderCallbacks, FilterHeadersStatus, FilterInstanceFactory, HttpFilter, RequestHeaders,
     TerminalFilterInstanceFactory,
@@ -33,9 +34,6 @@ use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
 use proxy_http::stat_handles::{RouterStats, StatHandles};
-use proxy_http::tenant_credentials::{
-    CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret,
-};
 use proxy_observability::access_log::parse_format;
 use proxy_observability::records::{BoundedRecordSink, RequestRecord};
 use proxy_observability::stats::{instruments, Registry, StatsControl, WorkerId};

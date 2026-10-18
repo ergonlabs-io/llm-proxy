@@ -26,7 +26,7 @@ use std::thread;
 use super::*;
 use crate::control::log_capture::Capture;
 use crate::spend::{MicroUsd, Period};
-use proxy_http::tenant_credentials::CredentialSource;
+use proxy_credentials::CredentialSource;
 
 /// What the fake answers `add_spend` with. Distinct from the `1` every other
 /// script call gets, so a reply that reached the wrong caller shows.

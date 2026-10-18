@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 
-use proxy_filters::auth::{digest_hex, generate_plaintext_key, HmacSecret};
+use proxy_control::auth::{digest_hex, generate_plaintext_key, HmacSecret};
 use ring::rand::{SecureRandom as _, SystemRandom};
 
 const CONFIG_FILE: &str = "llmproxy.yaml";

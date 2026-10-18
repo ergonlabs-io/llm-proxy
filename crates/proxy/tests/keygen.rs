@@ -2,9 +2,9 @@
 //!
 //! Test 4 (`printed_key_and_digest_authenticate_together_end_to_end`) is the
 //! one that matters: it proves the generator (this command) and the
-//! verifier (`proxy_filters::auth`, loaded from nothing but the printed
+//! verifier (`proxy_control::auth`, loaded from nothing but the printed
 //! digest) actually agree, rather than merely re-deriving the digest with
-//! the same function both share -- see `crates/proxy-filters/src/auth.rs`'s
+//! the same function both share -- see `crates/proxy-control/src/auth.rs`'s
 //! `digest_hex` doc for why that sharing can't drift on its own, and why
 //! this test exists anyway to prove it end to end regardless.
 //!
@@ -18,7 +18,7 @@ use base64::Engine as _;
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, HeaderValue};
 
-use proxy_filters::auth::{
+use proxy_control::auth::{
     digest_hex, AuthOutcome, Authenticator, HmacSecret, KeyId, KeyRecord, KeySet, TenantId,
     VirtualKeyAuthenticator,
 };
@@ -68,7 +68,7 @@ fn parse_output(stdout: &str) -> (String, String) {
 }
 
 /// Reverses [`digest_hex`]'s hex formatting, independently of
-/// `proxy_filters::auth`'s own (private) `decode_hex_digest` -- this is test
+/// `proxy_control::auth`'s own (private) `decode_hex_digest` -- this is test
 /// code turning a printed digest back into the bytes `KeySet::insert_digest`
 /// wants, not a second production implementation to keep in sync.
 fn decode_hex(hex: &str) -> Vec<u8> {

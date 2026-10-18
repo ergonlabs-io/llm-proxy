@@ -33,7 +33,7 @@ const NONCE_BYTES: usize = 12;
 
 /// The plaintext type is shared with the router, which lives below this crate
 /// (ADR-0007 decision 3), so it is defined in `proxy-http` and re-exported here.
-pub use proxy_http::tenant_credentials::TenantSecret;
+pub use proxy_credentials::TenantSecret;
 
 /// Errors from KEK loading and key-ring construction.
 ///

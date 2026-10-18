@@ -1,0 +1,63 @@
+[package]
+name = "proxy-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The control plane under the filters: the `ControlPlaneStore` trait and its
+# in-memory, redb and Redis stores, the published snapshot and its poller,
+# spend and window accumulators, and the identity types they store. Nothing
+# here touches a stream; proxy-filters applies it on the request path.
+
+[dependencies]
+# The `ControlPlane` publishes an immutable snapshot
+# workers `load()` lock-free -- the same crate `proxy-core::WorkerConfigHandle`
+# and `StatHandles` already use for this exact shape.
+arc-swap = { workspace = true }
+# `window_usage` reads the route table to resolve window rules.
+proxy-config = { workspace = true }
+# The BYOK types the snapshot carries; the router reads the same types.
+proxy-credentials = { workspace = true }
+proxy-observability = { workspace = true }
+http = { workspace = true }
+# Virtual-key authentication (HMAC-SHA256 + constant-time
+# compare). A keyed cryptographic
+# hash, NOT `token_limit_filter::hash_credential`'s FNV-1a.
+ring = { workspace = true }
+# `auth::generate_plaintext_key` -- the single shared
+# virtual-key generator, so `ControlPlane::mint_key` can call it too.
+base64 = { workspace = true }
+# The embedded persistent `ControlPlaneStore` -- see
+# `control.rs`'s `RedbControlPlaneStore`. `serde` (for `Serialize`/
+# `Deserialize` derives on its row types) rides along with it; `serde_json`
+# does the actual encoding.
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+# `RedbControlPlaneStore`'s Redis-backed sibling -- see
+# `control_redis.rs`'s module doc for the key layout and why `add_spend`
+# needs a Lua script rather than a pipeline.
+redis = { workspace = true }
+tracing = { workspace = true }
+# UTC calendar-aligned spend periods
+# (`spend::Period::key_for`) -- `proxy-cluster`/`proxy-observability` already
+# depend on this for the same reason (wall-clock rendering).
+chrono = { workspace = true }
+# Jitters the policy-poller's interval so N replicas observing the
+# same generation bump do not all rebuild at once -- see
+# `control.rs::ControlPlane::start_policy_poller`, modeled on
+# `proxy-cluster::health_check`'s `next_delay`.
+rand = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []
+# Test helpers that proxy-filters' unit tests share with this crate's own
+# (`control::test_snapshot_handle`, `control::log_capture`, the probe stores).
+# Only dev-dependencies enable it.
+test-support = []
+
+[lints]
+workspace = true

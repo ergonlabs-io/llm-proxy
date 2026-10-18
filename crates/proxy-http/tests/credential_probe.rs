@@ -19,11 +19,11 @@ use proxy_config::ir::{
     ClusterConfig, ClusterKind, ClusterName, DiscoveryType, EndpointIR, HeaderAppendAction,
     HeaderMutation, LbPolicy, ProviderRuntimeConfig, TenantCredentialSlot,
 };
+use proxy_credentials::TenantSecret;
 use proxy_http::credential_probe::{
     ClusterCredentialProbe, CredentialProbeOutcome, CredentialProbeRequest, TenantCredentialProbe,
     CREDENTIAL_PROBE_TIMEOUT,
 };
-use proxy_http::tenant_credentials::TenantSecret;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;

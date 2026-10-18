@@ -265,7 +265,7 @@ reconciliation with the store since the period ended, if it has no pending
 charge. A settled bucket costs the store nothing more: the flusher does not
 visit it, and the recovery journal does not grow with it. The proxy keeps a
 settled bucket readable in memory until 1 hour after its period ends
-(`SETTLED_BUCKET_GRACE_SECS` in `crates/proxy-filters/src/spend.rs:828`). Then
+(`SETTLED_BUCKET_GRACE_SECS` in `crates/proxy-control/src/spend.rs:828`). Then
 it evicts the bucket.
 
 A charge that arrives after eviction creates the bucket again. The new bucket

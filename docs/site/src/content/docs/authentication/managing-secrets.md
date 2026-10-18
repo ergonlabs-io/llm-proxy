@@ -46,7 +46,7 @@ is not.** `echo "s3cret" > secret.txt` â€” the obvious way to create the file â€
 appends a newline. Both `llm-proxy --mode keygen --hmac-secret-file` and the
 running proxy's own verifier strip trailing whitespace from a *file* before
 using it as the HMAC key, so the two agree
-(`crates/proxy-filters/src/auth.rs`'s `secret_bytes_from_file`, shared by
+(`crates/proxy-control/src/auth.rs`'s `secret_bytes_from_file`, shared by
 `crates/proxy/src/keygen.rs`'s `resolve_secret` and
 `crates/proxy-filters/src/auth_filter.rs`'s `parse_hmac_secret`; proven by
 `a_secret_file_with_a_trailing_newline_keys_on_the_secret_alone` in

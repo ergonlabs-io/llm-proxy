@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 proxy-config = { workspace = true }
+# Tenant BYOK credential types the router writes into the upstream request.
+proxy-credentials = { workspace = true }
 proxy-observability = { workspace = true }
 arc-swap = { workspace = true }
 # The router (router.rs) picks a host/pool through the cluster
@@ -26,7 +28,6 @@ rand = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 ring = { workspace = true }
-zeroize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # S3.2 `refused-stream`: the retry engine has to tell an h2 REFUSED_STREAM
