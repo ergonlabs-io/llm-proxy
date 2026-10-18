@@ -1483,8 +1483,7 @@ struct RunTerminalFilterCtx<'a> {
     /// The matched HCM's `request_headers_timeout`. Enforced for HTTP/1 only, because hyper's h2 server
     /// exposes no per-stream header progress (internal-docs/envoy-divergences.md).
     request_headers_timeout: Option<Duration>,
-    /// The matched HCM's `max_request_headers_kb` and `max_headers_count`. Enforced for HTTP/1 only;
-    /// hyper's h2 defaults apply on HTTP/2 (internal-docs/envoy-divergences.md).
+    /// The matched HCM's `max_request_headers_kb` and `max_headers_count`, enforced by both codecs.
     request_head_limits: RequestHeadLimits,
 }
 
@@ -1577,7 +1576,15 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
                     if request_headers_timeout.is_some() {
                         warn_h2_header_timeout_not_enforced_once(name);
                     }
-                    if let Err(err) = serve_http2(stream, handler, shutdown_fut, downstream).await {
+                    if let Err(err) = serve_http2(
+                        stream,
+                        handler,
+                        request_head_limits,
+                        shutdown_fut,
+                        downstream,
+                    )
+                    .await
+                    {
                         tracing::debug!(listener = %name, peer = %peer, error = %err, "http/2 connection ended with an error");
                     }
                 }

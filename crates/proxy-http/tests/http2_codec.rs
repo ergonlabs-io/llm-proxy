@@ -60,6 +60,7 @@ fn get_returns_fixed_response_over_h2() {
             serve_http2(
                 server_io,
                 handler,
+                Default::default(),
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -108,6 +109,7 @@ fn post_body_is_echoed_back_over_h2() {
             serve_http2(
                 server_io,
                 handler,
+                Default::default(),
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -200,6 +202,7 @@ fn streamed_response_arrives_incrementally_over_h2_not_buffered() {
             serve_http2(
                 server_io,
                 handler,
+                Default::default(),
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -307,6 +310,7 @@ fn request_and_response_headers_survive_intact_and_authority_reaches_routing() {
             serve_http2(
                 server_io,
                 handler,
+                Default::default(),
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )
@@ -422,6 +426,7 @@ fn several_concurrent_streams_get_their_own_response_without_crosstalk() {
             serve_http2(
                 server_io,
                 handler,
+                Default::default(),
                 never_shutdown(),
                 DownstreamInfo::loopback(),
             )

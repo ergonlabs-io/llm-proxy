@@ -46,15 +46,19 @@ pub struct Http1Options {
 }
 
 /// HCM `max_request_headers_kb` and `common_http_protocol_options.
-/// max_headers_count`, as the h1 codec enforces them. [`Default`] is Envoy's
-/// default: 60 KiB and 100 headers.
+/// max_headers_count`, enforced by both downstream codecs. [`Default`] is
+/// Envoy's default: 60 KiB and 100 headers.
 ///
-/// Envoy's parser counts the raw head: request line, header lines and the
-/// blank line. hyper hands over a parsed head, so the size check measures the
-/// head as it would be written canonically (`name: value` with one space and
-/// CRLF line ends). That equals the raw size for a conventionally formatted
-/// request and differs only by optional whitespace around values
-/// (`internal-docs/envoy-divergences.md`).
+/// On HTTP/1, Envoy's parser counts the raw head: request line, header lines
+/// and the blank line. hyper hands over a parsed head, so the size check
+/// measures the head as it would be written canonically (`name: value` with
+/// one space and CRLF line ends). That equals the raw size for a
+/// conventionally formatted request and differs only by optional whitespace
+/// around values (`internal-docs/envoy-divergences.md`).
+///
+/// On HTTP/2, Envoy counts the decoded header list: name plus value of every
+/// field, pseudo-headers included, with no per-field overhead. The count
+/// includes the pseudo-headers too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestHeadLimits {
     /// The largest request head accepted, in bytes.
@@ -193,9 +197,11 @@ where
 
 /// Serve an HTTP/2 connection until peer close, shutdown, or connection error.
 /// Streams run as worker-local tasks, each with its own filter manager.
+/// A request over `limits` has its stream reset and never reaches the handler.
 pub async fn serve_http2<IO>(
     io: IO,
     handler: Rc<dyn StreamHandler>,
+    limits: RequestHeadLimits,
     shutdown: impl Future<Output = ()>,
     downstream: DownstreamInfo,
 ) -> Result<(), CodecError>
@@ -213,11 +219,19 @@ where
         let handler = handler.clone();
         let tunnels = service_tunnels.clone();
         async move {
-            Ok::<_, std::convert::Infallible>(serve_one(&*handler, req, downstream, &tunnels).await)
+            // Envoy checks as each field is decoded and resets the stream
+            // with INTERNAL_ERROR, not a `431`, and keeps the connection.
+            // A service error makes hyper send that same reset.
+            let (len, count) = h2_header_list_len(&req);
+            if len > limits.max_bytes || count > limits.max_headers {
+                return Err(HeaderListTooLarge);
+            }
+            Ok(serve_one(&*handler, req, downstream, &tunnels).await)
         }
     });
 
     let mut builder = hyper::server::conn::http2::Builder::new(LocalExec);
+    builder.max_header_list_size(h2_header_list_bound(limits));
     // S10.2: the ONLY opt-in an h2 server needs to
     // accept an RFC 8441 extended CONNECT at all -- unlike h1's
     // `.with_upgrades()`, there is no separate per-connection "allow
@@ -249,6 +263,57 @@ where
     // keeps "returned" meaning "no tunnel left" on both codecs.
     tunnels.wait_idle().await;
     result.map_err(CodecError::Connection)
+}
+
+/// The service error that resets an HTTP/2 stream whose header list is over
+/// [`RequestHeadLimits`]. hyper resets with INTERNAL_ERROR, as Envoy does.
+#[derive(Debug, thiserror::Error)]
+#[error("request header list over the configured limits")]
+struct HeaderListTooLarge;
+
+/// `SETTINGS_MAX_HEADER_LIST_SIZE` for a downstream h2 connection. h2 counts
+/// 32 bytes of overhead per field (RFC 9113 section 6.5.2) that Envoy does
+/// not, and answers a list at or over the setting with `431` and
+/// REFUSED_STREAM itself. So the setting sits above anything the exact check
+/// in [`serve_http2`] passes: it only bounds memory, and a list far over the
+/// limit gets h2's `431`, or past four times the setting h2's GOAWAY, instead
+/// of Envoy's reset (`internal-docs/envoy-divergences.md`).
+fn h2_header_list_bound(limits: RequestHeadLimits) -> u32 {
+    let bound = limits
+        .max_bytes
+        .saturating_add(limits.max_headers.saturating_mul(32))
+        .saturating_add(1);
+    u32::try_from(bound).unwrap_or(u32::MAX)
+}
+
+/// The decoded size and field count of an h2 request's header list as Envoy
+/// measures them: name plus value per field, pseudo-headers included. hyper
+/// folds the pseudo-headers into the method, URI and extensions, so they are
+/// rebuilt from there. Envoy leaves `cookie` crumbs out of both until the
+/// list is complete; they are counted here, so the limit bounds them too
+/// (`internal-docs/envoy-divergences.md`).
+fn h2_header_list_len<B>(req: &Request<B>) -> (usize, usize) {
+    let uri = req.uri();
+    let protocol = req.extensions().get::<hyper::ext::Protocol>();
+    let pseudo = [
+        Some(":method".len() + req.method().as_str().len()),
+        uri.scheme_str().map(|s| ":scheme".len() + s.len()),
+        uri.authority()
+            .map(|a| ":authority".len() + a.as_str().len()),
+        uri.path_and_query()
+            .map(|pq| ":path".len() + pq.as_str().len()),
+        protocol.map(|p| ":protocol".len() + p.as_str().len()),
+    ];
+    let (mut len, mut count) = (0, 0);
+    for size in pseudo.into_iter().flatten() {
+        len += size;
+        count += 1;
+    }
+    for (name, value) in req.headers() {
+        len += name.as_str().len() + value.len();
+        count += 1;
+    }
+    (len, count)
 }
 
 /// Upstream (proxy-to-origin) connection-level codec failures. Distinct from

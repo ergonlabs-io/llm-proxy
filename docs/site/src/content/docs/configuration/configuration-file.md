@@ -911,8 +911,8 @@ operation name `embeddings`. Proof:
 | `request_timeout` | `Duration` | no | `60s` | Time allowed to receive the whole request, headers and body. Does not bound the response. `0s` disables it. |
 | `stream_idle_timeout` | `Duration` | no | `10m` | How long a request may go with no activity: the wait for the provider's response headers (`408`, flag `SI`) and, on a route with no `idle_timeout`, gaps between response chunks. `0s` disables it. |
 | `max_stream_duration` | `Duration` | no | none | The longest a request may live, however active the stream is. Before response headers the proxy answers `504` (flag `UMSDR`); after, the stream ends without a clean finish. `0s` also means no limit. |
-| `max_request_headers_kb` | integer, 1 to 8192 | no | `60` | The largest request head accepted, in KiB: the request line, every header line and the blank line after them. Enforced for HTTP/1 only. |
-| `max_request_headers_count` | integer, at least 1 | no | `100` | The most headers a request may carry. Enforced for HTTP/1 only. |
+| `max_request_headers_kb` | integer, 1 to 8192 | no | `60` | The largest request head accepted, in KiB: the request line, every header line and the blank line after them. |
+| `max_request_headers_count` | integer, at least 1 | no | `100` | The most headers a request may carry. |
 
 The first three limits above default to Envoy's edge-proxy guidance and apply even
 when `listen` is the shorthand `host:port` form. Envoy-mode config keeps
@@ -924,7 +924,7 @@ Envoy's defaults, which are disabled.
 |---|---|
 | `max_connections` | The proxy closes the new connection without a response. It adds 1 to the `listener.<name>.downstream_global_cx_overflow` stat. The connection is not counted in `downstream_cx_total`. A closed connection frees its slot. |
 | `request_headers_timeout` | On HTTP/1, the proxy closes a connection that has not sent complete headers in time. The limit does not apply to a response that is still streaming. On HTTP/2, the proxy does not enforce this limit. It logs one `warn` line per process when an HTTP/2 connection meets a listener that sets it: `request_headers_timeout is not enforced on HTTP/2 connections`. |
-| `max_request_headers_kb`, `max_request_headers_count` | On HTTP/1, the proxy answers `431` and closes the connection. The request never reaches the provider. The size counts each header as `name: value` with one space. HTTP/2 clients are not limited by these fields; the HTTP/2 layer allows 16 KiB of headers. |
+| `max_request_headers_kb`, `max_request_headers_count` | On HTTP/1, the proxy answers `431` and closes the connection. The request never reaches the provider. The size counts each header as `name: value` with one space. On HTTP/2, the proxy resets the stream (`RST_STREAM` with `INTERNAL_ERROR`) and keeps the connection open. The request never reaches the provider. The size is the name and value of every header, pseudo-headers included, and the count includes the pseudo-headers and each `cookie` header. A request whose headers are much larger than the limit gets `431` from the HTTP/2 layer instead, and a request more than about four times the limit closes the connection. |
 | `request_timeout` | If the request body is not complete in time, the proxy answers `408` with the body `request timeout`, and closes the connection. The response code detail is `request_overall_timeout`. The request never reaches the provider. A response that streams past the deadline is not cut. |
 | TLS handshake (10 s) | The proxy closes the connection and counts it in `listener.<name>.downstream_cx_transport_socket_connect_timeout`. The slot is freed. Before this limit, a client that connected and stalled held a connection slot for ever. |
 
@@ -936,6 +936,9 @@ Proof: `connection_cap_closes_the_overflow_and_frees_the_slot_when_a_connection_
 `request_head_limits_default_to_60_kib_and_100_headers` and
 `configured_request_head_limits_are_enforced` in
 `crates/proxy/tests/h1_framing_e2e.rs`;
+`h2_request_head_limits_default_to_60_kib_and_100_headers` and
+`configured_h2_request_head_limits_are_enforced` in
+`crates/proxy/tests/h2_head_limits_e2e.rs`;
 `warn_h2_header_timeout_not_enforced_once` in
 `crates/proxy-core/src/listener.rs`;
 `stalled_tls_handshake_is_closed_at_the_deadline_and_frees_the_slot` in the

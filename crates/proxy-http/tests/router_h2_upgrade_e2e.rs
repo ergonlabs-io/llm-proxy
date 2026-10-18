@@ -353,6 +353,7 @@ async fn h2_websocket_tunnel_echoes_bytes_end_to_end() {
                 serve_http2(
                     server_io,
                     handler,
+                    Default::default(),
                     async {
                         let _ = shutdown_rx.await;
                     },
