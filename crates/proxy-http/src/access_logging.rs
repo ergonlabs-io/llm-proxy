@@ -820,6 +820,8 @@ impl LoggingBody {
                 // The router overwrites this on every attempt, so it holds the
                 // final (selected) attempt's source.
                 credential_source: ctx.stream_info.borrow().credential_source,
+                // Stamped by the delivery path that writes the record.
+                record_seq: None,
                 attempts: attempts
                     .into_iter()
                     .map(|attempt| proxy_observability::records::AttemptRecord {

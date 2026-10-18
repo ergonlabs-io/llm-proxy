@@ -256,6 +256,12 @@ pub struct RequestRecord {
     /// the credential step.
     #[serde(default)]
     pub credential_source: Option<CredentialSource>,
+    /// This record's number within its `instance_id`, 1-based, stamped by the
+    /// delivery path that writes it (ADR-0011 decision 2). A gap means a record
+    /// numbered but not delivered. `None` until delivery stamps it; absent in
+    /// records from older builds.
+    #[serde(default)]
+    pub record_seq: Option<u64>,
 }
 
 impl RequestRecord {

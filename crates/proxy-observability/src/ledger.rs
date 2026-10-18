@@ -1373,6 +1373,7 @@ pub mod testing {
             attempts: vec![],
             attempts_truncated: false,
             credential_source: None,
+            record_seq: None,
         }
     }
 
