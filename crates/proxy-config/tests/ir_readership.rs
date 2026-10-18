@@ -53,38 +53,6 @@ struct AllowlistEntry {
 }
 
 const ALLOWLIST: &[AllowlistEntry] = &[
-    AllowlistEntry {
-        struct_name: "OAuth2JwtBearer",
-        field_name: "assertion_lifetime",
-        kind: EntryKind::KnownInert,
-        reason: "The cluster's token refresher reads this field; it lands in \
-                 the commit after the IR change (AGENTS.md invariant 8). Until \
-                 then no lowering produces the credential.",
-    },
-    AllowlistEntry {
-        struct_name: "OAuth2JwtBearer",
-        field_name: "refresh_before",
-        kind: EntryKind::KnownInert,
-        reason: "The cluster's token refresher reads this field; it lands in \
-                 the commit after the IR change (AGENTS.md invariant 8). Until \
-                 then no lowering produces the credential.",
-    },
-    AllowlistEntry {
-        struct_name: "OAuth2JwtBearer",
-        field_name: "token_cluster",
-        kind: EntryKind::KnownInert,
-        reason: "The cluster's token refresher reads this field; it lands in \
-                 the commit after the IR change (AGENTS.md invariant 8). Until \
-                 then no lowering produces the credential.",
-    },
-    AllowlistEntry {
-        struct_name: "OAuth2JwtBearer",
-        field_name: "token_url",
-        kind: EntryKind::KnownInert,
-        reason: "The cluster's token refresher reads this field; it lands in \
-                 the commit after the IR change (AGENTS.md invariant 8). Until \
-                 then no lowering produces the credential.",
-    },
     // --- ADS fields whose readers are outside the runtime scan.
     AllowlistEntry {
         struct_name: "AdsConfig",

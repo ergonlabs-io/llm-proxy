@@ -819,6 +819,19 @@ pub mod instruments {
         attribute_keys: &["provider", "outcome"],
         buckets: None,
     };
+    /// Requests refused because the selected cluster's minted credential had
+    /// no unexpired token (ADR-0005, amendment 2026-10-17). `cluster` comes
+    /// from config, so its values are bounded by config; `outcome` is
+    /// `unavailable`.
+    pub const PROVIDER_CREDENTIAL_REQUESTS: Instrument = Instrument {
+        name: "llmproxy_provider_credential_requests_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["cluster", "outcome"],
+        buckets: None,
+    };
+    /// Refused with `503 provider token unavailable`.
+    pub const PROVIDER_CREDENTIAL_UNAVAILABLE: &str = "unavailable";
     /// Oversized JSON responses (past the usage filter's body cap) whose
     /// `usage` could not be recovered, so the request went unmetered: no
     /// usage, no cost, nothing counted by spend or token limits. `scope` is
@@ -1231,6 +1244,26 @@ pub fn record_tenant_credential_request(
         instruments::TENANT_CREDENTIAL_SERIES_CEILING,
         &[
             ("provider", instruments::TENANT_CREDENTIAL_SERIES_OVERFLOW),
+            ("outcome", outcome),
+        ],
+    );
+    registry.incr(worker, handle, 1);
+}
+
+/// Counts one request refused for want of a minted provider token. Only
+/// the refusal path calls it, so a healthy request never resolves a series.
+pub fn record_provider_credential_request(
+    registry: &Registry,
+    worker: WorkerId,
+    cluster: &str,
+    outcome: &'static str,
+) {
+    let handle = registry.resolve_capped(
+        &instruments::PROVIDER_CREDENTIAL_REQUESTS,
+        &[("cluster", cluster), ("outcome", outcome)],
+        instruments::TENANT_CREDENTIAL_SERIES_CEILING,
+        &[
+            ("cluster", instruments::TENANT_CREDENTIAL_SERIES_OVERFLOW),
             ("outcome", outcome),
         ],
     );

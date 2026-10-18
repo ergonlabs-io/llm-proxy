@@ -24,6 +24,10 @@ base64 = { workspace = true }
 ring = { workspace = true }
 
 [dev-dependencies]
+# tests/oauth2_jwt_bearer.rs generates the throwaway RSA key a valid
+# `private_key_file` needs (`ring` cannot generate RSA keys).
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+rand = { workspace = true }
 prost = { workspace = true }
 # Test-only: pins the three llmproxy filter type URLs that `lower.rs` duplicates
 # as string literals rather than importing (see `check_lane_h_filter_order`).

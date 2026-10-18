@@ -10,6 +10,15 @@ arc-swap = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+# OAuth2 JWT-bearer minting (minted_credential.rs): RS256 signing, base64url,
+# and an HTTP/1.1 client over the token cluster's own connections. All were
+# already in the tree.
+base64 = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+ring = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,6 +28,11 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Generates the throwaway RSA key the OAuth2 token tests sign with (`ring`
+# cannot generate RSA keys). Test-only, and the same version proxy-filters
+# already uses for its tests.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+rand = { workspace = true }
 
 [lints]
 workspace = true

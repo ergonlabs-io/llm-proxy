@@ -243,6 +243,44 @@ pub struct ListenTls {
     pub key_file: String,
 }
 
+/// `providers.<name>.oauth2_jwt_bearer`. Every value is config; the proxy
+/// knows no provider's token URL or scope.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuth2JwtBearerDef {
+    /// Token endpoint. `https`, or `http` to a loopback host only.
+    pub token_url: String,
+    /// JWT `iss`, for example a service account's email address.
+    pub issuer: String,
+    /// JWT `sub`, when the grant impersonates another principal.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// JWT header `kid`.
+    #[serde(default)]
+    pub key_id: Option<String>,
+    /// RSA private key, PKCS#8 PEM. Read and checked at every load.
+    pub private_key_file: String,
+    /// Joined with spaces into the JWT `scope` claim.
+    pub scopes: Vec<String>,
+    /// JWT `aud`; defaults to `token_url`.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// `exp - iat` of each assertion. Default 1h.
+    #[serde(default)]
+    pub assertion_lifetime: Option<SimpleDuration>,
+    /// Mint the next token this long before the current one expires.
+    /// Default 5m.
+    #[serde(default)]
+    pub refresh_before: Option<SimpleDuration>,
+    /// Bounds one token request. Default 10s.
+    #[serde(default)]
+    pub timeout: Option<SimpleDuration>,
+    /// PEM bundle that verifies an `https` token endpoint instead of the
+    /// platform roots.
+    #[serde(default)]
+    pub ca_file: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
@@ -267,6 +305,11 @@ pub struct Provider {
     /// is required for a Vertex provider.
     #[serde(default)]
     pub access_token_file: Option<String>,
+    /// Mint and refresh the access token with the OAuth2 JWT-bearer grant
+    /// (RFC 7523) instead of configuring one. A Vertex token source, exclusive
+    /// with `access_token` and `access_token_file`.
+    #[serde(default)]
+    pub oauth2_jwt_bearer: Option<OAuth2JwtBearerDef>,
     /// AWS region used by Amazon Bedrock.
     #[serde(default)]
     pub region: Option<String>,

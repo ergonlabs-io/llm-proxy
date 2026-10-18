@@ -133,6 +133,9 @@ struct ManagedCluster {
     /// The published token for an `OAuth2JwtBearer` credential, or `None` for every other credential. Only the
     /// cluster's refresher writes it; workers read it through [`ClusterEntry::minted_credential`].
     minted: Option<Arc<MintedCredential>>,
+    /// The task that keeps `minted` fresh ([`run_token_refresh`]). Set by [`ClusterManager::install`] after the
+    /// first mint; it holds only a `Weak`. Aborted on `Drop`.
+    token_refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for ManagedCluster {
@@ -164,6 +167,12 @@ impl Drop for ManagedCluster {
                 handle.abort();
             }
         }
+        // The token refresher, for the same reason: it may be sleeping for most of a token's lifetime.
+        if let Ok(mut task) = self.token_refresh_task.lock() {
+            if let Some(handle) = task.take() {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -186,8 +195,8 @@ impl ManagedCluster {
                     .as_ref()
                     .and_then(|runtime| runtime.credential.as_ref())
                 {
-                    Some(ProviderCredential::OAuth2JwtBearer(_)) => {
-                        Some(Arc::new(MintedCredential::new(&config.name)))
+                    Some(ProviderCredential::OAuth2JwtBearer(oauth2)) => {
+                        Some(Arc::new(MintedCredential::new(&config.name, oauth2)))
                     }
                     _ => None,
                 };
@@ -231,6 +240,7 @@ impl ManagedCluster {
                     outlier_sweep: Mutex::new(outlier_sweep),
                     dns_refresh_task: Mutex::new(None),
                     minted,
+                    token_refresh_task: Mutex::new(None),
                 })
             }
             ClusterKind::Aggregate { .. } => {
@@ -265,6 +275,7 @@ impl ManagedCluster {
                     dns_refresh_task: Mutex::new(None),
                     // Credentials live on the member actually dialled (AGENTS.md invariant 6).
                     minted: None,
+                    token_refresh_task: Mutex::new(None),
                 })
             }
         }
@@ -492,6 +503,37 @@ pub struct PendingRemoval {
     names: Vec<ClusterName>,
 }
 
+/// Re-mints a cluster's token on the schedule [`MintedCredential::mint_and_publish`] returns. The token cluster
+/// is looked up in the live registry on every mint, so a reload that rebuilds it is picked up. A cluster from
+/// an older generation keeps refreshing while connections built on that generation still route through it.
+async fn run_token_refresh(
+    cluster: Weak<ManagedCluster>,
+    registry: Weak<ArcSwap<HashMap<ClusterName, Arc<ManagedCluster>>>>,
+    mut wait: Duration,
+) {
+    loop {
+        tokio::time::sleep(wait).await;
+        let (Some(managed), Some(registry)) = (cluster.upgrade(), registry.upgrade()) else {
+            return;
+        };
+        let Some(minted) = managed.minted.clone() else {
+            return;
+        };
+        // Do not hold the cluster itself across the mint: its last connection may close meanwhile.
+        drop(managed);
+        let token_cluster = registry
+            .load()
+            .get(minted.token_cluster())
+            .map(|token_cluster| ClusterHandle {
+                managed: Arc::clone(token_cluster),
+                registry: Arc::clone(&registry),
+            });
+        wait = minted
+            .mint_and_publish(token_cluster.as_ref().map(|h| h as &dyn ClusterEntry))
+            .await;
+    }
+}
+
 /// Immutable view of the registry for one listener/HCM configuration generation. Existing connections keep
 /// their generation's view, while a new configuration serves new connections from its replacement.
 #[derive(Clone)]
@@ -648,6 +690,37 @@ impl ClusterManager {
             }
             self.start_dns_refresh(managed, resolved.is_ok());
         }
+        // Mint each freshly built cluster's first token before the set is published, so a new provider or a
+        // rotated key serves at once instead of refusing requests until the refresher's first tick. Mints run
+        // concurrently, each bounded by its own request timeout; a failure publishes nothing, warns, and leaves
+        // retrying to the refresher. A carried-forward cluster keeps its token and refresher.
+        let minting: Vec<(Arc<ManagedCluster>, Arc<MintedCredential>)> = freshly_built
+            .iter()
+            .filter_map(|name| {
+                let managed = &next[name];
+                managed
+                    .minted
+                    .clone()
+                    .map(|minted| (Arc::clone(managed), minted))
+            })
+            .collect();
+        let waits = futures::future::join_all(minting.iter().map(|(_, minted)| {
+            let token_cluster =
+                next.get(minted.token_cluster())
+                    .map(|token_cluster| ClusterHandle {
+                        managed: Arc::clone(token_cluster),
+                        registry: Arc::clone(&self.clusters),
+                    });
+            async move {
+                minted
+                    .mint_and_publish(token_cluster.as_ref().map(|h| h as &dyn ClusterEntry))
+                    .await
+            }
+        }))
+        .await;
+        for ((managed, _), wait) in minting.iter().zip(waits) {
+            self.start_token_refresh(managed, wait);
+        }
         let previous = self.clusters.load_full();
         let mut dropped = Vec::new();
         for (name, managed) in previous.iter() {
@@ -703,6 +776,19 @@ impl ClusterManager {
             first_wait,
         ));
         if let Some(previous) = managed.dns_refresh_task.lock().unwrap().replace(task) {
+            previous.abort();
+        }
+    }
+
+    /// Starts the task that re-mints `managed`'s token, first after `wait`. Like the DNS timer it runs on the
+    /// control runtime and holds `Weak`s, so it ends with the cluster.
+    fn start_token_refresh(&self, managed: &Arc<ManagedCluster>, wait: Duration) {
+        let task = tokio::spawn(run_token_refresh(
+            Arc::downgrade(managed),
+            Arc::downgrade(&self.clusters),
+            wait,
+        ));
+        if let Some(previous) = managed.token_refresh_task.lock().unwrap().replace(task) {
             previous.abort();
         }
     }

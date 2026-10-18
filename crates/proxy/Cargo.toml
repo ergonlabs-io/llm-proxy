@@ -77,6 +77,10 @@ prost-types = { workspace = true }
 # channel itself is built in `proxy_core::ads_transport`, so `tonic` is a test
 # dependency here.
 tonic = { workspace = true }
+# tests/oauth2_token_e2e.rs generates the throwaway RSA keys its mock token
+# endpoint checks assertions against (`ring` cannot generate RSA keys).
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+rand = { workspace = true }
 
 [lints]
 workspace = true

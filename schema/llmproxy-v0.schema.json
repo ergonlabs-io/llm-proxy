@@ -401,12 +401,73 @@
         "access_token": {
           "type": "string",
           "minLength": 1,
-          "description": "OAuth access token for Vertex AI. Exactly one of `access_token` / `access_token_file` is required for `vertex`."
+          "description": "OAuth access token for Vertex AI, applied as is and never refreshed. Exactly one of `access_token` / `access_token_file` / `oauth2_jwt_bearer` is required for `vertex`."
         },
         "access_token_file": {
           "type": "string",
           "minLength": 1,
-          "description": "Read the Vertex OAuth access token from this file. Exactly one of `access_token` / `access_token_file` is required for `vertex`."
+          "description": "Read the Vertex OAuth access token from this file. Exactly one of `access_token` / `access_token_file` / `oauth2_jwt_bearer` is required for `vertex`."
+        },
+        "oauth2_jwt_bearer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["token_url", "issuer", "private_key_file", "scopes"],
+          "description": "Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503. Valid only for `vertex`.",
+          "properties": {
+            "token_url": {
+              "type": "string",
+              "pattern": "^https?://[^/?#@]+",
+              "description": "Token endpoint. Must be `https`; plain `http` is accepted only to a loopback host."
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 1,
+              "description": "JWT `iss`, for example a service account's email address."
+            },
+            "subject": {
+              "type": "string",
+              "minLength": 1,
+              "description": "JWT `sub`, when the grant impersonates another principal."
+            },
+            "key_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "JWT header `kid`."
+            },
+            "private_key_file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "RSA private key, PKCS#8 PEM (`BEGIN PRIVATE KEY`). Read and checked at every load; a bad key is a load error."
+            },
+            "scopes": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^\\S+$" },
+              "description": "Scopes, joined with spaces into the JWT `scope` claim."
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "description": "JWT `aud`. Defaults to `token_url`."
+            },
+            "assertion_lifetime": {
+              "$ref": "#/$defs/Duration",
+              "description": "`exp - iat` of each assertion, whole seconds from 1s to 24h. Default `1h`."
+            },
+            "refresh_before": {
+              "$ref": "#/$defs/Duration",
+              "description": "Mint the next token this long before the current one expires, whole seconds from 1s to 24h. Default `5m`."
+            },
+            "timeout": {
+              "$ref": "#/$defs/Duration",
+              "description": "Bounds one token request, connect included, whole seconds from 1s to 24h. Default `10s`."
+            },
+            "ca_file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "PEM bundle that verifies an `https` token endpoint instead of the platform roots."
+            }
+          }
         },
         "region": {
           "type": "string",
@@ -535,8 +596,9 @@
           "then": {
             "required": ["base_url", "project", "location", "publisher"],
             "oneOf": [
-              { "required": ["access_token"], "not": { "required": ["access_token_file"] } },
-              { "required": ["access_token_file"], "not": { "required": ["access_token"] } }
+              { "required": ["access_token"], "not": { "anyOf": [{ "required": ["access_token_file"] }, { "required": ["oauth2_jwt_bearer"] }] } },
+              { "required": ["access_token_file"], "not": { "anyOf": [{ "required": ["access_token"] }, { "required": ["oauth2_jwt_bearer"] }] } },
+              { "required": ["oauth2_jwt_bearer"], "not": { "anyOf": [{ "required": ["access_token"] }, { "required": ["access_token_file"] }] } }
             ],
             "not": {
               "anyOf": [
@@ -567,7 +629,8 @@
                 { "required": ["location"] },
                 { "required": ["publisher"] },
                 { "required": ["access_token"] },
-                { "required": ["access_token_file"] }
+                { "required": ["access_token_file"] },
+                { "required": ["oauth2_jwt_bearer"] }
               ]
             }
           }

@@ -819,7 +819,7 @@ impl RouterHandler {
         {
             dcb.stream_info()
                 .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
-            return credential_failure_reply(attempt_cluster, attempt_entry, &err);
+            return credential_failure_reply(attempt_cluster, attempt_entry, &err, &self.stats);
         }
         dcb.stream_info().credential_source = Some(source);
         if let AttemptCredentials::Tenant(slot, _) = &credentials {
@@ -1707,7 +1707,12 @@ impl RouterHandler {
                 {
                     dcb.stream_info()
                         .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
-                    return credential_failure_reply(attempt_cluster, attempt_entry, &err);
+                    return credential_failure_reply(
+                        attempt_cluster,
+                        attempt_entry,
+                        &err,
+                        &self.stats,
+                    );
                 }
                 dcb.stream_info().credential_source = Some(source);
                 if let AttemptCredentials::Tenant(slot, _) = &credentials {
@@ -3403,9 +3408,11 @@ fn credential_failure_reply(
     cluster: &str,
     entry: &dyn ClusterEntry,
     err: &CredentialProviderError,
+    stats: &RouterStats,
 ) -> HttpResponseParts {
     match err {
         CredentialProviderError::TokenUnavailable => {
+            stats.record_provider_credential(cluster, instruments::PROVIDER_CREDENTIAL_UNAVAILABLE);
             // Every request to the provider fails this way until a mint lands, so warn once a minute.
             if let Some(suppressed) = entry.minted_credential().and_then(|m| m.note_refusal()) {
                 tracing::warn!(
