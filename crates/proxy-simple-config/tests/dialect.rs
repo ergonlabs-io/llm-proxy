@@ -4284,6 +4284,7 @@ observability:
             assert_eq!(json["llm_cost_kind"], "%LLM_COST_KIND%");
             assert_eq!(json["llm_upstream_id"], "%LLM_UPSTREAM_ID%");
             assert_eq!(json["llm_upstream_usage"], "%LLM_UPSTREAM_USAGE%");
+            assert_eq!(json["response_code_details"], "%RESPONSE_CODE_DETAILS%");
         } else {
             let text = log_format["text_format"].as_str().expect("text_format");
             assert!(
@@ -4294,6 +4295,12 @@ observability:
             assert!(
                 text.contains("llm_upstream_id=\"%LLM_UPSTREAM_ID%\" "),
                 "text format must carry the upstream id, got {text}"
+            );
+            // A local refusal says why only here, for example
+            // `endpoint_not_metered` (ADR-0010 decision 1).
+            assert!(
+                text.contains("response_code_details=\"%RESPONSE_CODE_DETAILS%\" "),
+                "text format must carry the response code details, got {text}"
             );
             // Raw JSON would break the text line's quoting.
             assert!(!text.contains("%LLM_UPSTREAM_USAGE%"), "got {text}");

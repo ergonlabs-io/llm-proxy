@@ -403,6 +403,10 @@ async fn build_handler(
     registry.register(Arc::new(
         proxy_filters::token_limit_filter::TokenLimitFilterFactory,
     ));
+    // ...and tenant ownership of provider files and batches.
+    registry.register(Arc::new(
+        proxy_filters::object_ownership_filter::ObjectOwnershipFilterFactory,
+    ));
     let factory_ctx = FactoryContext::default();
     let mut filters = Vec::new();
     for f in hcm.http_filters.iter().filter(|f| !f.is_router) {

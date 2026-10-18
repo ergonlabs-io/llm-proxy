@@ -83,7 +83,10 @@ increments, lanes, or planning-document parts; git history records provenance.
   both scopes when both are configured.
 
 Keep `routing_revision`, `policy_generation`, and counter reconciliation
-separate. Request workers never query disk or remote stores.
+separate. Request workers never query disk or remote stores. One exception: a
+request naming a provider object (file or batch) whose owner is not cached waits
+on an off-worker auth-store read, and gets 503 if the store cannot answer
+(ADR-0012).
 
 Every completed request emits usage containing tenant, user, requested model,
 selected provider/model, rate-card version, token usage, cost, status, and

@@ -26,6 +26,28 @@ entry counts each virtual key apart (two keys of one tenant get two
 buckets). Use `key: tenant` for a limit for each tenant. See [Virtual keys](../../authentication/virtual-keys/) for why the
 tenant is the safer key.
 
+## Endpoints a token limit cannot count
+
+A token limit counts tokens, and only five endpoints report tokens that the
+proxy can read: chat completions, completions, Responses, Messages and
+embeddings. A token limit that applies to a request for any other endpoint,
+such as images, audio, batches or files, refuses it with `403`
+`endpoint_not_metered`. The request does not reach the provider.
+
+- A token limit applies to a request when the static rule is set, when the
+  tenant or key has a `tokens_per_minute` limit, or when a `limits` entry with
+  `tokens_per_minute` matches the request. An entry with `models` applies
+  only when the request names a matching model, so the proxy refuses at the
+  end of the request body.
+- Request limits and concurrent-stream limits can count every endpoint, so
+  they never refuse a request for this reason.
+- `GET .../models`, `GET .../usage` and `POST .../messages/count_tokens` cost
+  nothing and pass without a missing-usage warning.
+- A request that no token limit applies to is not refused and logs nothing.
+
+The counter and the detail are the same as for spend budgets. See
+[Spend policies](../spend-policies/#endpoints-a-budget-cannot-count).
+
 ## Windows
 
 A window is a fixed period aligned to the Unix epoch: a 60-second window

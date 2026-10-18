@@ -8,6 +8,7 @@
 use proxy_config::ConfigError;
 use proxy_filters::auth_filter::AuthFilterFactory;
 use proxy_filters::model_authz_filter::ModelAuthzFilterFactory;
+use proxy_filters::object_ownership_filter::ObjectOwnershipFilterFactory;
 use proxy_filters::spend_limit_filter::SpendLimitFilterFactory;
 use proxy_filters::token_limit_filter::TokenLimitFilterFactory;
 use proxy_http::filter::{FactoryContext, HttpFilterFactory};
@@ -71,6 +72,7 @@ fn auth_lowers_model_authz_and_spend_limit_in_the_required_order() {
         names(&text),
         [
             "llmproxy.auth",
+            "llmproxy.object_ownership",
             "llmproxy.body_rewrite",
             "llmproxy.model_authz",
             "llmproxy.token_limit",
@@ -127,6 +129,17 @@ fn the_lowered_chain_loads_strictly_and_the_real_factories_accept_it() {
             &ctx,
         )
         .expect("token_limit in policy-only mode, over auth's control plane");
+    ObjectOwnershipFilterFactory
+        .create(
+            &config_of(proxy_filters::object_ownership_filter::TYPE_URL),
+            &ctx,
+        )
+        .expect("object_ownership, over auth's control plane");
+    assert!(ctx
+        .shared
+        .get_across_scopes(proxy_filters::object_ownership_filter::TYPE_URL)
+        .expect("one scope")
+        .is_some());
     assert!(
         ctx.shared
             .get_across_scopes(proxy_filters::token_limit_filter::TYPE_URL)
@@ -198,6 +211,29 @@ fn enforce_model_policy_false_omits_model_authz_and_warns() {
             .iter()
             .any(|w| w.field_path == "auth.enforce.model_policy"
                 && w.message.contains("NOT enforced")),
+        "{:?}",
+        lowered.warnings
+    );
+    lower_to_loaded(&parse(&text).unwrap()).expect("strict loader accepts it");
+}
+
+/// The fail-open opt-out: no filter, and a warning that says what is open.
+/// `tenant_object_ownership_e2e.rs` drives the same opt-out at the socket.
+#[test]
+fn enforce_object_ownership_false_omits_the_filter_and_warns() {
+    let text = with_auth("  enforce: { object_ownership: false }\n", PRICING);
+    let chain = names(&text);
+    assert!(
+        !chain.contains(&"llmproxy.object_ownership".to_string()),
+        "{chain:?}"
+    );
+    let lowered = lower(&parse(&text).unwrap()).unwrap();
+    assert!(
+        lowered
+            .warnings
+            .iter()
+            .any(|w| w.field_path == "auth.enforce.object_ownership"
+                && w.message.contains("NOT kept to their tenant")),
         "{:?}",
         lowered.warnings
     );

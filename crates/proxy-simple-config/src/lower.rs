@@ -33,6 +33,17 @@ const AUTH_FILTER_NAME: &str = "llmproxy.auth";
 /// `tests/auth.rs`. Same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`].
 const MODEL_AUTHZ_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelAuthz";
 
+/// Must equal `proxy_filters::object_ownership_filter::TYPE_URL`; pinned by
+/// `tests/auth_enforce.rs`.
+const OBJECT_OWNERSHIP_FILTER_TYPE_URL: &str =
+    "type.llmproxy.dev/llmproxy.filters.v0.ObjectOwnership";
+
+/// The provider object collections `auth` protects. These are endpoint
+/// shapes, not providers: a POST to the path returns an object with a
+/// top-level `id`, and `<path>/<id>` names that object. OpenAI and Anthropic
+/// files share the first; the batch endpoints differ by path only.
+const OBJECT_COLLECTIONS: [&str; 3] = ["/v1/files", "/v1/batches", "/v1/messages/batches"];
+
 /// Must equal `proxy_filters::spend_limit_filter::TYPE_URL`; pinned by
 /// `tests/auth.rs`.
 const SPEND_LIMIT_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
@@ -141,6 +152,7 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "llm_served_model=\"%LLM_SERVED_MODEL%\" ",
     "llm_usage_completeness=\"%LLM_USAGE_COMPLETENESS%\" llm_cost_kind=\"%LLM_COST_KIND%\" ",
     "llm_upstream_id=\"%LLM_UPSTREAM_ID%\" ",
+    "response_code_details=\"%RESPONSE_CODE_DETAILS%\" ",
     "timing_us=\"ds_rx=%COMMON_DURATION(DS_RX_BEG:DS_RX_END:us)% ",
     "pre_upstream=%COMMON_DURATION(DS_RX_END:US_TX_BEG:us)% ",
     "us_tx=%COMMON_DURATION(US_TX_BEG:US_TX_END:us)% ",
@@ -541,6 +553,15 @@ fn warn_unenforced_tenant_controls(config: &SimpleConfig, warnings: &mut Vec<Con
             "auth.enforce.limits",
             "tenant and key rate limits are NOT enforced: llmproxy.token_limit is omitted, so \
              the admin API refuses PUT /tenants/{id}/limits and PUT /keys/{id}/limits",
+        ));
+    }
+    if !auth.enforce.object_ownership {
+        warnings.push(warning(
+            "auth.enforce.object_ownership",
+            "provider files and batches are NOT kept to their tenant: \
+             llmproxy.object_ownership is omitted, so any tenant that knows another tenant's \
+             file or batch ID can read, cancel or delete it, and listing them returns every \
+             tenant's",
         ));
     }
     if !auth.enforce.spend {
@@ -1600,6 +1621,15 @@ fn allows_tenants_without_policy(config: &SimpleConfig) -> bool {
 /// `llmproxy.token_limit` for tenant and key limits.
 fn enforces_tenant_limits(config: &SimpleConfig) -> bool {
     config.auth.as_ref().is_some_and(|auth| auth.enforce.limits)
+}
+
+/// `auth` is set and `auth.enforce.object_ownership` is on: the chain
+/// carries `llmproxy.object_ownership`.
+fn enforces_object_ownership(config: &SimpleConfig) -> bool {
+    config
+        .auth
+        .as_ref()
+        .is_some_and(|auth| auth.enforce.object_ownership)
 }
 
 /// `auth` is set and `auth.enforce.spend` is on: the chain carries
@@ -2663,6 +2693,7 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "protocol": "%PROTOCOL%",
                 "response_code": "%RESPONSE_CODE%",
                 "response_flags": "%RESPONSE_FLAGS%",
+                "response_code_details": "%RESPONSE_CODE_DETAILS%",
                 "bytes_received": "%BYTES_RECEIVED%",
                 "bytes_sent": "%BYTES_SENT%",
                 "duration_ms": "%DURATION%",
@@ -3051,6 +3082,17 @@ fn lower_listener(
         // limiter must see `StreamInfo::auth.tenant` already written).
         http_filters.push(auth_filter);
     }
+    if enforces_object_ownership(config) {
+        // After auth (reads the tenant and its control-plane store); before
+        // anything that reads the body, so a refused request is not parsed.
+        http_filters.push(json!({
+            "name": "llmproxy.object_ownership",
+            "typed_config": {
+                "@type": OBJECT_OWNERSHIP_FILTER_TYPE_URL,
+                "collections": OBJECT_COLLECTIONS,
+            },
+        }));
+    }
     if needs_body_rewrite_filter(config) {
         // Decode-path filter, so it must precede the router in config order --
         // decode callbacks run in FORWARD config order (S2.1), and a decode
@@ -3161,8 +3203,16 @@ fn lower_listener(
     // fall back to Envoy's own 5 minute default, not to the dialect's.
     hcm["typed_config"]["stream_idle_timeout"] = json!(stream_idle_timeout.to_string());
     if let Some(max) = max_stream_duration {
-        hcm["typed_config"]["common_http_protocol_options"] =
-            json!({ "max_stream_duration": max.to_string() });
+        hcm["typed_config"]["common_http_protocol_options"]["max_stream_duration"] =
+            json!(max.to_string());
+    }
+    // Unset is left out, so Envoy's own defaults (60 KiB, 100) apply.
+    let spec = listener_spec(config);
+    if let Some(kb) = spec.and_then(|s| s.max_request_headers_kb) {
+        hcm["typed_config"]["max_request_headers_kb"] = json!(kb);
+    }
+    if let Some(count) = spec.and_then(|s| s.max_request_headers_count) {
+        hcm["typed_config"]["common_http_protocol_options"]["max_headers_count"] = json!(count);
     }
     if let Some(access_log) = access_log {
         hcm["typed_config"]["access_log"] = json!([access_log]);

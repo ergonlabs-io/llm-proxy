@@ -157,6 +157,15 @@ OTLP only: `llmproxy_ledger_rejected_total` (label `reason`),
 (Definitions: `crates/proxy-observability/src/stats.rs`, section "billing
 ledger".)
 
+### Unmetered endpoint refusals
+
+`llmproxy_unmetered_endpoint_refused_total` (labels `endpoint` and `control`)
+counts requests that a spend budget or a token limit refused because the
+proxy cannot count their endpoint. See
+[Spend policies](../../limits-and-budgets/spend-policies/#endpoints-a-budget-cannot-count).
+(Definition: `crates/proxy-observability/src/stats.rs`,
+`UNMETERED_ENDPOINT_REFUSED`.)
+
 ### Unknown names
 
 A recorder that gets a cluster or listener name with no resolved handle does

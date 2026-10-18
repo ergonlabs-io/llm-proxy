@@ -419,8 +419,8 @@ pub trait ControlPlaneStore: Send + Sync {
     /// poller to notice.
     fn policy_generation(&self) -> Result<u64, StoreError>;
 
-    // Writes. The data plane never calls any of these -- only the admin
-    // API does, off the request path.
+    // Tier-2 writes. The data plane never calls any of these -- only the
+    // admin API does, off the request path.
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
     fn delete_tenant(&self, tenant: &TenantId) -> Result<(), StoreError>;
     /// Creates or replaces the credential row for (`rec.tenant`,
@@ -555,6 +555,39 @@ pub trait ControlPlaneStore: Send + Sync {
     /// counters as the fleet's.
     fn is_shared(&self) -> bool {
         false
+    }
+
+    // Object ownership. A provider issues file and batch IDs in one namespace
+    // per provider account, and every tenant reaches the provider through the
+    // proxy's account, so only the proxy knows which tenant created an
+    // object. These rows record that. They are not tier-2 policy: `load`
+    // does not return them and writing one bumps no generation, because a
+    // row per created object would make every replica reload the whole store
+    // on every create. The data plane writes them, off the worker, as the
+    // provider answers a create. Rows are never removed: deleting a tenant
+    // leaves its rows, so a tenant id must not be reused for another
+    // customer while its objects exist at the provider.
+
+    /// Records `tenant` as the owner of `object_id` unless the object
+    /// already has one, and returns the owner the store holds afterwards.
+    /// Never overwrites: a claim by a second tenant returns the first.
+    ///
+    /// The default refuses, so a store without ownership rows fails closed:
+    /// an object whose owner cannot be recorded stays unreachable.
+    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+        let _ = (object_id, tenant);
+        Err(StoreError::Unavailable(
+            "object ownership is not supported by this store".into(),
+        ))
+    }
+
+    /// The tenant that owns `object_id`, or `None` when none has claimed it.
+    /// The default refuses, for the reason [`Self::claim_object`]'s does.
+    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+        let _ = object_id;
+        Err(StoreError::Unavailable(
+            "object ownership is not supported by this store".into(),
+        ))
     }
 
     // Spend rows, keyed `(stat_prefix, tenant,
@@ -921,6 +954,8 @@ struct InMemoryState {
     rate_cards: HashMap<String, StoredRateCard>,
     // Tenants opted in to trace export (ADR-0008 decision 2).
     trace_export: HashSet<TenantId>,
+    // Object id -> owning tenant. Not tier 2: no generation bump.
+    object_owners: HashMap<String, TenantId>,
     // Keyed on the full `(stat_prefix, tenant,
     // period)` triple as one tuple key -- there is no `load()`-style
     // wholesale read for spend (each row is read/written independently by
@@ -971,6 +1006,7 @@ impl InMemoryControlPlaneStore {
                 tenant_credentials: HashMap::new(),
                 rate_cards: HashMap::new(),
                 trace_export: HashSet::new(),
+                object_owners: HashMap::new(),
                 spend: HashMap::new(),
                 spend_seq: HashMap::new(),
                 windows: HashMap::new(),
@@ -1271,6 +1307,28 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         Ok(true)
     }
 
+    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+        check_object_id(object_id)?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        Ok(state
+            .object_owners
+            .entry(object_id.to_string())
+            .or_insert_with(|| tenant.clone())
+            .clone())
+    }
+
+    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+        check_object_id(object_id)?;
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        Ok(state.object_owners.get(object_id).cloned())
+    }
+
     // Rust note: an explicit override rather than the trait default, so the
     // fact that this store dies with the process is stated where it is true.
     fn is_durable(&self) -> bool {
@@ -1482,6 +1540,8 @@ const TENANT_CREDENTIALS_TABLE: TableDefinition<(&str, &str), &[u8]> =
 // A chain's rate card, keyed by the chain's `stat_prefix`. JSON bytes like
 // every other table here -- see `EncodedRateCardRow`.
 const RATE_CARDS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("rate_cards");
+// Object id -> `encode_object_owner_row`. Not tier 2: no generation bump.
+const OBJECT_OWNERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("object_owners");
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -1724,6 +1784,54 @@ pub(crate) fn decode_trace_export_row(tenant: &str, value: &[u8]) -> bool {
             );
             false
         }
+    }
+}
+
+pub(crate) const OBJECT_OWNER_SCHEMA_VERSION: u32 = 1;
+
+/// Longest object id an ownership row may name. Provider ids are short; the
+/// cap keeps a hostile response or path from writing an unbounded key.
+pub const MAX_OBJECT_ID_BYTES: usize = 256;
+
+/// Refuses an object id the store must never hold.
+pub(crate) fn check_object_id(object_id: &str) -> Result<(), StoreError> {
+    if object_id.is_empty() || object_id.len() > MAX_OBJECT_ID_BYTES {
+        return Err(StoreError::InvalidInput(format!(
+            "object id must be 1 to {MAX_OBJECT_ID_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// An object-ownership row, the same JSON in redb and Redis.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EncodedObjectOwner {
+    schema_version: u32,
+    tenant: String,
+}
+
+pub(crate) fn encode_object_owner_row(tenant: &TenantId) -> Vec<u8> {
+    encode_json(&EncodedObjectOwner {
+        schema_version: OBJECT_OWNER_SCHEMA_VERSION,
+        tenant: tenant.as_str().to_string(),
+    })
+}
+
+/// The owner a stored row names. A row this build cannot read is an error,
+/// not "no owner": an unreadable row must not let the object be claimed by,
+/// or opened to, someone else.
+pub(crate) fn decode_object_owner_row(value: &[u8]) -> Result<TenantId, StoreError> {
+    match serde_json::from_slice::<EncodedObjectOwner>(value) {
+        Ok(row) if row.schema_version == OBJECT_OWNER_SCHEMA_VERSION => {
+            Ok(TenantId::new(row.tenant))
+        }
+        Ok(row) => Err(StoreError::Unavailable(format!(
+            "object owner row has unsupported schema version {}",
+            row.schema_version
+        ))),
+        Err(_) => Err(StoreError::Unavailable(
+            "object owner row does not parse".into(),
+        )),
     }
 }
 
@@ -2084,6 +2192,7 @@ impl RedbControlPlaneStore {
         txn.open_table(TENANT_CREDENTIALS_TABLE)
             .map_err(store_err)?;
         txn.open_table(RATE_CARDS_TABLE).map_err(store_err)?;
+        txn.open_table(OBJECT_OWNERS_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_TABLE).map_err(store_err)?;
         txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(WINDOWS_TABLE).map_err(store_err)?;
@@ -2624,6 +2733,43 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(true)
+    }
+
+    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+        check_object_id(object_id)?;
+        // redb serializes write transactions, so the read and the insert
+        // below cannot interleave with another claim.
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let owner = {
+            let mut table = txn.open_table(OBJECT_OWNERS_TABLE).map_err(store_err)?;
+            let existing = table
+                .get(object_id)
+                .map_err(store_err)?
+                .map(|row| decode_object_owner_row(row.value()))
+                .transpose()?;
+            match existing {
+                Some(owner) => owner,
+                None => {
+                    table
+                        .insert(object_id, encode_object_owner_row(tenant).as_slice())
+                        .map_err(store_err)?;
+                    tenant.clone()
+                }
+            }
+        };
+        txn.commit().map_err(store_err)?;
+        Ok(owner)
+    }
+
+    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+        check_object_id(object_id)?;
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let table = txn.open_table(OBJECT_OWNERS_TABLE).map_err(store_err)?;
+        table
+            .get(object_id)
+            .map_err(store_err)?
+            .map(|row| decode_object_owner_row(row.value()))
+            .transpose()
     }
 
     fn is_durable(&self) -> bool {
@@ -4922,6 +5068,12 @@ impl ControlPlaneStore for SharedMemoryStore {
     fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
         self.inner.set_trace_export(tenant, enabled)
     }
+    fn claim_object(&self, object_id: &str, tenant: &TenantId) -> Result<TenantId, StoreError> {
+        self.inner.claim_object(object_id, tenant)
+    }
+    fn object_owner(&self, object_id: &str) -> Result<Option<TenantId>, StoreError> {
+        self.inner.object_owner(object_id)
+    }
     fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
         self.check_rate_cards()?;
         self.inner.put_rate_card(card)
@@ -7134,6 +7286,75 @@ mod tests {
             assert_eq!(open().policy_generation().unwrap(), before + 4, "{name}");
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Object ownership in both embedded stores: the first claim wins and is
+    /// never overwritten, the row survives reopening the redb file, and no
+    /// claim bumps the generation (owner rows are not tier-2 policy).
+    #[test]
+    fn the_first_object_claim_wins_survives_a_reopen_and_bumps_no_generation() {
+        let path = temp_db_path("object-owners");
+        type Open = Box<dyn Fn() -> Box<dyn ControlPlaneStore>>;
+        let stores: Vec<(&str, Open)> = vec![
+            ("in_memory", {
+                let (store, _) = SharedMemoryStore::new();
+                Box::new(move || Box::new(store.handle()))
+            }),
+            ("redb", {
+                let path = path.clone();
+                Box::new(move || Box::new(RedbControlPlaneStore::open(&path).unwrap()))
+            }),
+        ];
+        for (name, open) in stores {
+            let (a, b) = (TenantId::new("a"), TenantId::new("b"));
+            let before = open().policy_generation().unwrap();
+            assert_eq!(open().object_owner("file-1").unwrap(), None, "{name}");
+            assert_eq!(open().claim_object("file-1", &a).unwrap(), a, "{name}");
+            assert_eq!(
+                open().claim_object("file-1", &b).unwrap(),
+                a,
+                "{name}: a second claim must return the first owner"
+            );
+            assert_eq!(
+                open().object_owner("file-1").unwrap(),
+                Some(a.clone()),
+                "{name}"
+            );
+            assert_eq!(open().object_owner("file-2").unwrap(), None, "{name}");
+            assert_eq!(open().policy_generation().unwrap(), before, "{name}");
+            for bad in ["", &"x".repeat(MAX_OBJECT_ID_BYTES + 1)] {
+                assert!(
+                    matches!(
+                        open().claim_object(bad, &a),
+                        Err(StoreError::InvalidInput(_))
+                    ),
+                    "{name}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An owner row this build cannot read is an error, never "no owner":
+    /// reading it as absent would let the object be claimed by someone else.
+    #[test]
+    fn an_unreadable_object_owner_row_is_an_error_not_an_absent_owner() {
+        let store = RedbControlPlaneStore::in_memory();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(OBJECT_OWNERS_TABLE).unwrap();
+                table.insert("garbled", b"{".as_slice()).unwrap();
+                table
+                    .insert("future", br#"{"schema_version":2,"tenant":"a"}"#.as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        for id in ["garbled", "future"] {
+            assert!(store.object_owner(id).is_err(), "{id}");
+            assert!(store.claim_object(id, &TenantId::new("b")).is_err(), "{id}");
+        }
     }
 
     /// A row this build cannot read is not consent, and it does not fail the

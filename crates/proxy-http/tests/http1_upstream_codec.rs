@@ -40,6 +40,7 @@ async fn spawn_upstream(handler: Rc<dyn StreamHandler>) -> std::net::SocketAddr 
             Http1Options {
                 keep_alive: true,
                 header_read_timeout: None,
+                request_head_limits: Default::default(),
             },
             std::future::pending(),
             DownstreamInfo::loopback(),
@@ -89,6 +90,7 @@ async fn get_returns_fixed_response() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
             )
             .await
@@ -148,6 +150,7 @@ async fn post_body_is_streamed_and_echoed_back() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
             )
             .await
@@ -202,6 +205,7 @@ async fn connect_to_nothing_yields_handshake_error() {
                     Http1Options {
                         keep_alive: true,
                         header_read_timeout: None,
+                        request_head_limits: Default::default(),
                     },
                 )
                 .await;

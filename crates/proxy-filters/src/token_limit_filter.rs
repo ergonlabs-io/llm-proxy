@@ -8,6 +8,12 @@
 //! it never denies a successful request. Unlimited routes stay silent, and
 //! warnings are periodically suppressed per key (AGENTS.md "Fail-open controls").
 //!
+//! A token limit that binds a request refuses it with 403
+//! `endpoint_not_metered` when its endpoint reports no tokens the proxy can
+//! read (images, audio, batches, files and every unknown path; ADR-0010
+//! decision 1, [`crate::unmetered`]). Free endpoints pass without a
+//! missing-usage warning.
+//!
 //! # Local admission, reconciled counters
 //!
 //! Every limit is checked against local counters
@@ -171,6 +177,7 @@ use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
+use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders,
@@ -191,6 +198,7 @@ use crate::model_authz::ModelPattern;
 use crate::token_limit::{
     CredentialDigest, LimitDecision, LimitKey, LimitOn, LimitRule, StreamLease, TenantUsage,
 };
+use crate::unmetered::{self, RefusalCounter};
 use crate::usage::TokenUsage;
 use crate::window_counter::{
     unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, LeaseStore, WindowAccumulator,
@@ -667,6 +675,7 @@ fn create_filter_factory_with_clock(
         .shared
         .get("", crate::usage_filter::STATS_REGISTRY_KEY)
         .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok());
+    let stats_registry_for_refusals = stats_registry.clone();
 
     let shared = ctx
         .shared
@@ -718,6 +727,7 @@ fn create_filter_factory_with_clock(
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
         usage_reader: shared.usage_reader.clone(),
         route_names,
+        unmetered: stats_registry_for_refusals.map(|r| Arc::new(RefusalCounter::new(r))),
     }))
 }
 
@@ -745,6 +755,7 @@ struct TokenLimitInstanceFactory {
     usage_missing_warner: Arc<UsageMissingWarner>,
     usage_reader: Option<Arc<UsageReader>>,
     route_names: Option<Arc<ChainRouteNames>>,
+    unmetered: Option<Arc<RefusalCounter>>,
 }
 
 impl FilterInstanceFactory for TokenLimitInstanceFactory {
@@ -761,6 +772,8 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
             usage_reader: self.usage_reader.clone(),
             route_names: self.route_names.clone(),
+            unmetered: self.unmetered.clone(),
+            endpoint: Endpoint::Unmetered,
             usage_read: UsageRead::Idle,
             key: None,
             policy_charges: Vec::new(),
@@ -768,6 +781,12 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
             recorded: false,
         })
     }
+}
+
+/// Whether a token limit can admit `endpoint`: it counts its tokens, or no
+/// provider bills it.
+fn can_count(endpoint: Endpoint) -> bool {
+    endpoint == Endpoint::Free || unmetered::metered_under_token_limit(endpoint)
 }
 
 /// Control-plane limits are per minute, matching the dialect's
@@ -1001,6 +1020,10 @@ struct TokenLimitFilterInstance {
     usage_reader: Option<Arc<UsageReader>>,
     /// The chain's route names, the rows a store read asks for.
     route_names: Option<Arc<ChainRouteNames>>,
+    /// `None` only where no stats registry exists (unit tests).
+    unmetered: Option<Arc<RefusalCounter>>,
+    /// The request's endpoint class, set in `decode_headers`.
+    endpoint: Endpoint,
     /// Where a held `GET /v1/usage` stands.
     usage_read: UsageRead,
     /// Set in `decode_headers`, from the route + hashed credential. `None`
@@ -1156,6 +1179,54 @@ impl TokenLimitFilterInstance {
         Some(LimitKey::for_rule(format!("{subject}{}", rule.scope)))
     }
 
+    /// Whether a token limit binds this request before its model is known:
+    /// the static rule, a tenant or key tokens-per-minute row, or an unscoped
+    /// keyed rule with a token limit that applies to it. Request-count and
+    /// stream limits can count any endpoint, so they do not bind here.
+    fn binds_tokens(
+        &self,
+        tenant: Option<&str>,
+        key_id: Option<&str>,
+        client: Option<std::net::IpAddr>,
+        headers: &RequestHeaders,
+    ) -> bool {
+        if self.rule.is_some() {
+            return true;
+        }
+        // Control-plane limits apply only to an authenticated tenant, as in
+        // `admit_policy`.
+        if let (Some(tenant), Some(policy)) = (tenant, self.policy.as_ref()) {
+            let snapshot = policy.load();
+            let tenant_tokens = snapshot
+                .tenant_limits
+                .get(&TenantId::new(tenant))
+                .is_some_and(|limits| limits.tokens_per_minute.is_some());
+            let key_tokens = key_id
+                .and_then(|id| snapshot.key_limits.get(&KeyId::new(id)))
+                .is_some_and(|limits| limits.tokens_per_minute.is_some());
+            if tenant_tokens || key_tokens {
+                return true;
+            }
+        }
+        self.rules.iter().any(|rule| {
+            rule.models.is_empty()
+                && rule.limits.tokens_per_minute.is_some()
+                && Self::rule_key(rule, tenant, key_id, client, headers).is_some()
+        })
+    }
+
+    /// Refuse a request a token limit binds but cannot count (ADR-0010
+    /// decision 1). Nothing was dialled, so nothing is recorded.
+    fn refuse_unmetered(&mut self, cb: &mut dyn DecoderCallbacks) {
+        self.recorded = true;
+        unmetered::refuse(
+            cb,
+            self.endpoint,
+            unmetered::Control::TokenLimit,
+            self.unmetered.as_deref(),
+        );
+    }
+
     /// Admit the model-scoped rules once the model is known (the request
     /// body has been read, as for `llmproxy.model_authz`). A request whose
     /// model is unknown matches no scoped rule.
@@ -1176,6 +1247,14 @@ impl TokenLimitFilterInstance {
                 .collect(),
         );
         if buckets.is_empty() {
+            return;
+        }
+        if !can_count(self.endpoint)
+            && buckets
+                .iter()
+                .any(|(_, limits)| limits.tokens_per_minute.is_some())
+        {
+            self.refuse_unmetered(cb);
             return;
         }
         let order: Vec<&PolicyBucket> = buckets.iter().collect();
@@ -1216,14 +1295,22 @@ impl TokenLimitFilterInstance {
         // Rust note: read the field out of the `RefMut` guard and drop it
         // before recording -- `stream_info()` must not be held across another
         // call (see its doc).
-        let usage: Option<LlmTokenUsage> = cb.stream_info().llm.usage;
+        let (usage, dialled): (Option<LlmTokenUsage>, bool) = {
+            let info = cb.stream_info();
+            (info.llm.usage, info.upstream_cluster.is_some())
+        };
 
         // `None` must stay unrecorded -- inventing a zero-cost record would
         // be wrong (nothing happened) and a nonzero guess would be worse
         // (this feeds a real budget). See `token_limit`'s central semantic.
         let Some(usage) = usage else {
-            self.usage_missing_warner
-                .warn_if_due(warn_key, Instant::now());
+            // Silence is not a metering gap when nothing could be billed: a
+            // free endpoint costs nothing, and a request that reached no
+            // provider (a synthetic 404, a local reply) spent nothing.
+            if self.endpoint != Endpoint::Free && dialled {
+                self.usage_missing_warner
+                    .warn_if_due(warn_key, Instant::now());
+            }
             return;
         };
 
@@ -1646,6 +1733,15 @@ impl HttpFilter for TokenLimitFilterInstance {
             (info.auth.tenant.clone(), info.auth.key_id.clone())
         };
 
+        self.endpoint = Endpoint::classify(&headers.method, headers.uri.path());
+        if !can_count(self.endpoint) {
+            let client: Option<std::net::IpAddr> = cb.stream_info().client_address;
+            if self.binds_tokens(tenant.as_deref(), key_id.as_deref(), client, headers) {
+                self.refuse_unmetered(cb);
+                return FilterHeadersStatus::Continue;
+            }
+        }
+
         if let Some(rule) = self.rule {
             let key = match &tenant {
                 // An identity the proxy assigned. The client's `authorization`
@@ -2030,6 +2126,11 @@ mod tests {
     }
 
     impl TestCallbacks {
+        /// The router dialled a provider, which is what makes missing usage
+        /// a metering gap rather than a request that spent nothing.
+        fn set_dialled(&self) {
+            self.stream_info.borrow_mut().upstream_cluster = Some("provider".to_owned());
+        }
         fn new(route: Option<Arc<RouteEntry>>) -> Self {
             TestCallbacks {
                 route,
@@ -2230,6 +2331,8 @@ mod tests {
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
             usage_reader: None,
             route_names: None,
+            unmetered: None,
+            endpoint: Endpoint::Unmetered,
             usage_read: UsageRead::Idle,
             key: None,
             policy_charges: Vec::new(),
@@ -2300,6 +2403,7 @@ mod tests {
         filter.decode_headers(&mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
+            cb.set_dialled();
             if let Some(usage) = usage {
                 cb.set_usage(usage);
             }
@@ -2610,6 +2714,7 @@ mod tests {
         filter.decode_headers(&mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
+            cb.set_dialled();
             if let Some(usage) = usage {
                 cb.set_usage(usage);
             }
@@ -2864,6 +2969,7 @@ mod tests {
         filter.decode_headers(&mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
+            cb.set_dialled();
             if let Some(usage) = usage {
                 cb.set_usage(usage);
             }
@@ -3495,8 +3601,10 @@ mod tests {
     fn requests_other_than_get_v1_usage_are_unaffected_by_the_usage_endpoint() {
         let store = store_with(10, Duration::from_secs(60));
 
-        // Wrong method, exact path: a POST to `/v1/usage` must be treated
-        // as an ordinary request (budget-checked, not intercepted).
+        // Wrong method, exact path: a POST to `/v1/usage` is not intercepted.
+        // It reaches the ordinary path, where the token limit cannot count an
+        // unknown endpoint and refuses it (ADR-0010 decision 1), rather than
+        // answering with the usage report.
         let mut filter = filter_with(Arc::clone(&store));
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         cb.set_authenticated_tenant("acme");
@@ -3506,10 +3614,13 @@ mod tests {
             headers: HeaderMap::new(),
         };
         filter.decode_headers(&mut cb, &mut head, true);
-        assert!(
-            cb.local_reply.is_none(),
-            "POST /v1/usage must be admitted like any other ordinary request, not intercepted"
+        let (status, _, body) = cb.local_reply.expect("refused as unmetered");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "not the usage report: {body}"
         );
+        assert!(body.contains("cannot be metered"), "{body}");
 
         // Right method, wrong path: unaffected, exactly as before this change.
         let reply = run_request(&store, "r1", Some("Bearer sk-1"), Some(usage(10)));

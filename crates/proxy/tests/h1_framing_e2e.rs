@@ -355,52 +355,107 @@ fn expect_100_continue_is_answered_by_the_proxy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A request head over hyper's buffer limit, or with more headers than
-/// hyper's header count limit, gets `431` and never reaches the upstream.
-/// `max_request_headers_kb` is not supported (strict mode rejects it), so
-/// these are hyper's fixed limits, not Envoy's 60 KiB default; see
-/// envoy-divergences.md.
+/// With neither `max_request_headers_kb` nor `max_request_headers_count` set,
+/// Envoy's defaults apply: 60 KiB for the raw head and 100 headers.
 #[test]
-fn oversized_request_heads_get_431_and_do_not_reach_the_upstream() {
-    let dir = scratch_dir("oversized");
+fn request_head_limits_default_to_60_kib_and_100_headers() {
+    let dir = scratch_dir("head-default");
     let (upstream, received) = spawn_strict_upstream();
     let proxy = Proxy::start(&dir, upstream);
-
-    let huge = format!("X-Big: {}\r\n", "a".repeat(512 * 1024));
-    let many: String = (0..120).map(|i| format!("X-H{i}: v\r\n")).collect();
-    for (name, extra) in [("one huge header", huge), ("too many headers", many)] {
-        let mut stream = connect(proxy.listen);
-        // The proxy may answer and close before the whole head is written.
-        let _ = stream.write_all(&request(
-            &format!("{extra}Content-Length: {}\r\n", BODY.len()),
-            BODY.as_bytes(),
-        ));
-        let reply = read_response(&mut stream).unwrap_or_else(|| panic!("{name}: no response"));
-        assert_eq!(reply.status, 431, "{name}:\n{}", reply.head);
-        if let Ok(event) = received.recv_timeout(QUIET) {
-            panic!("{name}: an oversized head reached the upstream:\n{event:?}");
-        }
-    }
-
-    // Control: a head well under both limits is accepted, so the 431s above
-    // come from the size, not from the request shape.
-    let mut stream = connect(proxy.listen);
-    let extra = format!(
-        "X-Big: {}\r\nContent-Length: {}\r\n",
-        "a".repeat(32 * 1024),
-        BODY.len()
-    );
-    stream
-        .write_all(&request(&extra, BODY.as_bytes()))
-        .expect("write");
-    let reply = read_response(&mut stream).expect("a response");
-    assert_eq!(reply.status, 200, "{}", reply.head);
-    received
-        .recv_timeout(IO_TIMEOUT)
-        .expect("the control reaches the upstream");
-
+    assert_head_limits(&proxy, &received, 60 * 1024, 100);
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Configured limits replace the defaults, upward too: a head and a header
+/// count that the defaults refuse are accepted.
+#[test]
+fn configured_request_head_limits_are_enforced() {
+    let dir = scratch_dir("head-configured");
+    let (upstream, received) = spawn_strict_upstream();
+    let proxy = Proxy::start_with(
+        &dir,
+        upstream,
+        "max_request_headers_kb: 96, max_request_headers_count: 120",
+    );
+    assert_head_limits(&proxy, &received, 96 * 1024, 120);
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A head at each limit reaches the upstream. One byte or one header over
+/// gets `431`, the connection closes, and nothing reaches the upstream, not
+/// even the head. A head far over the limit is refused by hyper's read
+/// buffer before it is parsed, and must get the same answer.
+fn assert_head_limits(
+    proxy: &Proxy,
+    received: &mpsc::Receiver<UpstreamRequest>,
+    max_bytes: usize,
+    max_headers: usize,
+) {
+    let cases = [
+        ("head at the size limit", sized_request(max_bytes), 200),
+        (
+            "head one byte over the size limit",
+            sized_request(max_bytes + 1),
+            431,
+        ),
+        (
+            "head far over the size limit",
+            sized_request(max_bytes * 8),
+            431,
+        ),
+        (
+            "headers at the count limit",
+            counted_request(max_headers),
+            200,
+        ),
+        (
+            "one header over the count limit",
+            counted_request(max_headers + 1),
+            431,
+        ),
+    ];
+    for (name, raw, status) in cases {
+        let mut stream = connect(proxy.listen);
+        // The proxy may answer and close before the whole head is written.
+        let _ = stream.write_all(&raw);
+        let reply = read_response(&mut stream).unwrap_or_else(|| panic!("{name}: no response"));
+        assert_eq!(reply.status, status, "{name}:\n{}", reply.head);
+        if status == 200 {
+            let event = received
+                .recv_timeout(IO_TIMEOUT)
+                .unwrap_or_else(|_| panic!("{name}: the request did not reach the upstream"));
+            assert_eq!(event.body.as_deref(), Ok(BODY.as_bytes()), "{name}");
+        } else {
+            if let Ok(event) = received.recv_timeout(QUIET) {
+                panic!("{name}: a refused head reached the upstream:\n{event:?}");
+            }
+            assert!(is_closed(&mut stream), "{name}: the connection must close");
+        }
+    }
+}
+
+/// A request whose head is exactly `len` bytes, padded by one header.
+fn sized_request(len: usize) -> Vec<u8> {
+    let framing = format!("Content-Length: {}\r\n", BODY.len());
+    let base = head_with(&format!("{framing}X-Pad: \r\n")).len();
+    let pad = "a".repeat(len.checked_sub(base).expect("limit below the base head"));
+    let extra = format!("{framing}X-Pad: {pad}\r\n");
+    assert_eq!(head_with(&extra).len(), len, "padding arithmetic");
+    request(&extra, BODY.as_bytes())
+}
+
+/// A request with exactly `count` header lines: `head_with`'s Host and
+/// Content-Type, Content-Length, and fillers.
+fn counted_request(count: usize) -> Vec<u8> {
+    let fillers: String = (3..count).map(|i| format!("X-H{i}: v\r\n")).collect();
+    let extra = format!("{fillers}Content-Length: {}\r\n", BODY.len());
+    let raw = request(&extra, BODY.as_bytes());
+    let head = String::from_utf8_lossy(&raw);
+    let lines = head.split("\r\n\r\n").next().unwrap().lines().count();
+    assert_eq!(lines - 1, count, "header count arithmetic");
+    raw
 }
 
 // ------------------------------------------------------------------ helpers --
@@ -503,9 +558,11 @@ fn read_response(stream: &mut TcpStream) -> Option<Reply> {
 
 /// True when the peer closes the connection within `QUIET`.
 fn is_closed(stream: &mut TcpStream) -> bool {
-    stream
-        .set_read_timeout(Some(QUIET))
-        .expect("set_read_timeout");
+    // macOS fails `setsockopt` with EINVAL once the peer has reset the
+    // connection, which is a close.
+    if stream.set_read_timeout(Some(QUIET)).is_err() {
+        return true;
+    }
     let mut buf = [0u8; 64];
     match stream.read(&mut buf) {
         Ok(0) => true,
@@ -629,10 +686,16 @@ fn spawn_strict_upstream() -> (SocketAddr, mpsc::Receiver<UpstreamRequest>) {
     (addr, rx)
 }
 
-fn config_text(listen: u16, admin: u16, upstream: SocketAddr) -> String {
+/// `listen_extra` is spliced into the `listen` object, after `address`.
+fn config_text(listen: u16, admin: u16, upstream: SocketAddr, listen_extra: &str) -> String {
+    let listen_extra = if listen_extra.is_empty() {
+        String::new()
+    } else {
+        format!(", {listen_extra}")
+    };
     format!(
         r#"version: 0
-listen: {{ address: "127.0.0.1:{listen}" }}
+listen: {{ address: "127.0.0.1:{listen}"{listen_extra} }}
 admin: 127.0.0.1:{admin}
 providers:
   openai:
@@ -664,10 +727,16 @@ struct Proxy {
 
 impl Proxy {
     fn start(dir: &Path, upstream: SocketAddr) -> Proxy {
+        Proxy::start_with(dir, upstream, "")
+    }
+
+    /// Like [`Proxy::start`], with extra fields on the `listen` object.
+    fn start_with(dir: &Path, upstream: SocketAddr, listen_extra: &str) -> Proxy {
         let listen = free_port();
         let admin = free_port();
         let path = dir.join("llmproxy.yaml");
-        std::fs::write(&path, config_text(listen, admin, upstream)).expect("write temp config");
+        std::fs::write(&path, config_text(listen, admin, upstream, listen_extra))
+            .expect("write temp config");
         let child = Command::new(BIN)
             .args([
                 "--config",

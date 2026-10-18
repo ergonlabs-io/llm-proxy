@@ -11,6 +11,52 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Security
+
+- Spend budgets and token limits no longer let images, audio, batches and
+  files through for free (ADR-0010 phase 1). A budget or token limit that
+  applies to a request now refuses every endpoint whose cost the proxy
+  cannot count with `403` and response-code detail `endpoint_not_metered`,
+  before the provider is dialled. Before, these requests were served and
+  charged $0, also when the client added a `"model"` field to a batch body.
+  Each refusal increments
+  `llmproxy_unmetered_endpoint_refused_total{endpoint, control}`. Requests
+  that no budget or limit applies to are unchanged and log nothing.
+  `GET .../models`, `GET .../usage` and `POST .../messages/count_tokens`
+  pass and no longer log a missing-usage warning under a budget or limit;
+  neither does a request that reached no provider, such as the synthetic
+  `404` for an unknown model.
+  Retrievals of stored objects, such as `GET /v1/batches/{id}` and
+  `GET /v1/responses/{id}`, are refused under a budget or limit too.
+- Tenants can no longer reach each other's provider files and batches
+  (ADR-0012). Every tenant uses the proxy's one provider account, so file and
+  batch IDs share one namespace; before, tenant B could get, read, cancel and
+  delete tenant A's file or batch, and list both. The new
+  `llmproxy.object_ownership` filter records the tenant that created each
+  object in `auth.store` and answers `404` before dialling when a request
+  names an object, by path or by a `*_file_id` body member, that the caller's
+  tenant does not own or that no tenant owns. Listing `/v1/files`,
+  `/v1/batches` and `/v1/messages/batches` is refused. If the store cannot
+  answer for an owner the proxy has not cached, the request gets `503`
+  (`object_owner_unavailable`). The dialect turns it on with `auth`;
+  `auth.enforce.object_ownership: false` turns it off with a load warning.
+  **Upgrade note:** objects created before this release have no owner and
+  get `404` until assigned with `PUT /tenants/{id}/objects/{object_id}`, and
+  with `auth.store: in_memory` owners are lost on restart.
+- The `--config` access-log formats gain `response_code_details`
+  (`%RESPONSE_CODE_DETAILS%`), so a local refusal says why.
+
+### Changed
+
+- **Behavior change:** HTTP/1 request heads are now limited to 60 KiB and 100
+  headers, Envoy's defaults; a larger head gets `431` and closes the
+  connection before any filter runs. Before, only hyper's own limits applied
+  (about 408 KiB and 100 headers). Envoy mode maps HCM `max_request_headers_kb`
+  and `common_http_protocol_options.max_headers_count`, which were refused at
+  load; the dialect adds `listen.max_request_headers_kb` and
+  `max_request_headers_count`. HTTP/2 keeps hyper's defaults
+  (`internal-docs/envoy-divergences.md`).
+
 ## [0.5.0] - 2026-10-18
 
 ### Added

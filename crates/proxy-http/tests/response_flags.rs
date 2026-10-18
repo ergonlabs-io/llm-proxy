@@ -926,6 +926,7 @@ async fn a_client_that_dies_mid_upload_records_and_renders_the_dc_flag() {
                     proxy_http::codec::Http1Options {
                         keep_alive: true,
                         header_read_timeout: None,
+                        request_head_limits: Default::default(),
                     },
                     std::future::pending::<()>(),
                     DownstreamInfo::loopback(),

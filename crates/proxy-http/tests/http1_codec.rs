@@ -61,6 +61,7 @@ fn get_returns_fixed_response() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -113,6 +114,7 @@ fn post_body_is_echoed_back() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -208,6 +210,7 @@ fn early_flush_streaming_head_and_first_chunk_arrive_before_pause_elapses() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -284,6 +287,7 @@ fn keep_alive_true_serves_two_requests_on_one_connection() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -334,6 +338,7 @@ fn keep_alive_false_closes_connection_after_one_response() {
                 Http1Options {
                     keep_alive: false,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -464,6 +469,7 @@ fn upgrade_shaped_request_hands_handler_a_some_on_upgrade() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -516,6 +522,7 @@ fn plain_request_hands_handler_a_none_on_upgrade() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 never_shutdown(),
                 DownstreamInfo::loopback(),
@@ -569,6 +576,7 @@ fn drain_completes_in_flight_request_then_closes() {
                 Http1Options {
                     keep_alive: true,
                     header_read_timeout: None,
+                    request_head_limits: Default::default(),
                 },
                 shutdown,
                 DownstreamInfo::loopback(),
@@ -638,6 +646,7 @@ fn spawn_fixed_server(
             Http1Options {
                 keep_alive: true,
                 header_read_timeout,
+                request_head_limits: Default::default(),
             },
             never_shutdown(),
             DownstreamInfo::loopback(),

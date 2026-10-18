@@ -224,6 +224,14 @@ pub struct ListenerSpec {
     /// however active it is. Unset means no limit.
     #[serde(default)]
     pub max_stream_duration: Option<SimpleDuration>,
+    /// The largest request head (request line and headers) accepted, in KiB.
+    /// Unset means Envoy's 60; must be in 1..=8192. A larger head gets `431`.
+    #[serde(default)]
+    pub max_request_headers_kb: Option<u32>,
+    /// The most headers a request may carry. Unset means Envoy's 100; must be
+    /// greater than 0. More gets `431`.
+    #[serde(default)]
+    pub max_request_headers_count: Option<u32>,
 }
 
 /// Safe edge-proxy defaults for the admission limits, from Envoy's edge
@@ -455,6 +463,11 @@ pub struct AuthEnforce {
     /// (`PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits`).
     #[serde(default = "default_true")]
     pub limits: bool,
+    /// Keep provider files and batches to the tenant that created them
+    /// (`llmproxy.object_ownership`). Every tenant reaches a provider through
+    /// one provider account, so the provider cannot tell them apart.
+    #[serde(default = "default_true")]
+    pub object_ownership: bool,
     /// What a tenant with no stored model policy may use. Absent means
     /// `deny`. Only meaningful with `model_policy: true`; set alongside
     /// `model_policy: false` it is a load error, since nothing would read it.
@@ -484,6 +497,7 @@ impl Default for AuthEnforce {
             model_policy: true,
             spend: true,
             limits: true,
+            object_ownership: true,
             tenants_without_policy: None,
         }
     }

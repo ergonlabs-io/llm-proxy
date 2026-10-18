@@ -210,6 +210,7 @@ static_resources:
                     Http1Options {
                         keep_alive: true,
                         header_read_timeout: None,
+                        request_head_limits: Default::default(),
                     },
                     std::future::pending::<()>(),
                     DownstreamInfo::loopback(),
