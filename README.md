@@ -467,8 +467,7 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 
 Ship gates, evidence, and deliberate caveats for each release:
 [`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md). Data-plane parity
-is not scheduled. Its corpus scorecard now belongs to the Envoy differential rig
-work.
+is not scheduled. Its Envoy differential rig work and corpus scorecard were closed as not needed on 2026-10-17.
 
 ## What is not built yet
 

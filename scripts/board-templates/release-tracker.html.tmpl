@@ -185,10 +185,10 @@
 </style>
 
 <div class="wrap">
-  <p class="eyebrow">llm-proxy · release tracking · latest release v0.3.5 · planning updated 2026-10-14 · test totals: <code>make tq-count</code></p>
+  <p class="eyebrow">llm-proxy · release tracking · latest release v0.4.1 · planning updated 2026-10-17 · test totals: <code>make tq-count</code></p>
   <h1>Release tracker</h1>
   <p class="lede">
-    Six releases, each with exactly one <strong>ship gate</strong>: a single objectively checkable
+    Every release has exactly one <strong>ship gate</strong>: a single objectively checkable
     statement. Not "done enough" — checkable. If a gate needs someone to argue that it passed, it
     isn't a gate. Normative copy lives in <code>internal-docs/MILESTONES.md</code>; this is the view.
   </p>
@@ -210,8 +210,9 @@
       The backlog is allowed to be large; the <i>active</i> set has to be small and named.
       <br><br>
       <b>P2 is a commitment, not a graveyard.</b> The 2026-07-26 pivot moved LLM work ahead of parity
-      work <i>in time</i>. It cancelled nothing — xDS, the admin server, the corpus scorecard,
-      ext_authz/ext_proc, and downstream h2 all remain owed, and v1.0.0 depends on them.
+      work <i>in time</i>. xDS, the admin server and downstream h2 have since shipped. On 2026-10-17 the owner closed
+      the Envoy differential rig work, the corpus scorecard and the ext_authz/ext_proc extras as not needed;
+      h2c, 1xx passthrough and h2spec remain in WP-10, unscheduled. v1.0.0 has no gate.
     </p>
   </section>
 

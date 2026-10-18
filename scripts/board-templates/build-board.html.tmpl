@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/boards/backlog.yaml · internal-docs/MILESTONES.md · P0–P2 priorities · planning updated 2026-10-11 · test totals: <code>make tq-count</code></p>
+  <p class="eyebrow">internal-docs/boards/backlog.yaml · internal-docs/MILESTONES.md · P0–P3 priorities · planning updated 2026-10-17 · test totals: <code>make tq-count</code></p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -184,7 +184,7 @@
     <button class="chip" data-ms="v0.3.2">v0.3.2 · xDS gate<span class="n" id="n-v032"></span></button>
     <button class="chip" data-ms="v0.3.3">v0.3.3 · tenant creds<span class="n" id="n-v033"></span></button>
     <button class="chip" data-ms="v0.3.4">v0.3.4 · hardening<span class="n" id="n-v034"></span></button>
-    <button class="chip" data-ms="v0.4.0">v0.4.0 · parity<span class="n" id="n-v040"></span></button>
+    <button class="chip" data-ms="v0.4.0">v0.4.0 · gateway<span class="n" id="n-v040"></span></button>
     <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
     <span class="sep"></span>
     <button class="chip" data-prio="P0">P0 · LLM product<span class="n" id="n-P0"></span></button>
@@ -192,335 +192,17 @@
     <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
   </div>
   <p class="now">
-    <b>Planning update 2026-09-23:</b> WP-64 is started: spend enforcement uses stable
-    <code>key_id</code>. WP-65 is started: same-dialect model providers lower to ordered
-    fallback. Generic per-attempt OpenAI/Anthropic model-body rewriting remains open. Neither
-    changes the current ADS ship gate.
-    <b>Status update 2026-10-11:</b> WP-66 is DONE (05dd378, request body capped before auth).
-    WP-67 (7f0009f) and WP-25 (88434cc) are STARTED, not done: their core behavior landed with tests,
-    but WP-67 has known test gaps (no GOAWAY or TCP-proxy drain test, Go QA-7 not run) and WP-25's
-    istioctl and /clusters smoke-diff acceptance items were never run. None of the three moves the
-    v0.3.2 gate, which is still RED.
-    <b>Planning update 2026-10-10 (owner decisions):</b> tags v0.3.0 (2026-09-29) and v0.3.1
-    (2026-10-09) are shipped; the latest release is v0.3.1. <b>The "Dynamic configuration" gate
-    was still open when they were cut, so it moved to v0.3.2 — same gate text, still RED.</b>
-    v0.3.2 carries the open gate work plus WP-69 (H1 makes the clause "ACKs and NACKs correctly
-    per S8" false today) and the five live defects WP-66, WP-67, WP-68, WP-70, WP-74, plus WP-25
-    (health-check toggles and <code>/drain_listeners</code>, to land together with WP-67; WP-67 does
-    not depend on it). v0.3.3 "tenant creds" (WP-85, swapped ahead of hardening by owner decision
-    2026-10-11) is DONE (c48d86c adds the failover negative assertion): its gate is met and it is ready to
-    tag, not tagged. v0.3.4
-    "hardening" holds WP-71-73, WP-75-84 and WP-86 (done); its gate is that every C/H finding in
-    <code>architecture.md</code> section 11 is closed or has a recorded owner decision. Every
-    WP-71-84 item is unstarted. v0.4.0 is back to Envoy-parity scope only.
-    <b>Now — v0.3.2 "dynamic configuration" (formerly v0.3.0): be deployable the way Envoy is deployed.</b> Current
-    since v0.3.1 shipped. Everything below about this gate was written while it was labelled
-    v0.3.0. <b>WP-20 is DONE, 2026-09-05/06 — all six
-    increments (0 through 5).</b> Increment 5 landed all five WP-28 acceptance scenarios {ACK,
-    NACK-recover, reconnect-resync, spurious-nonce, out-of-order-response} over a real socket, plus
-    <code>make xds-conformance</code>, which <b>found a real deadlock on its first run</b>
-    against a pinned go-control-plane: our client queued its initial request only after awaiting
-    stream headers, and grpc-go withholds those until it has a request to answer — our own puppet
-    harness structurally cannot catch this, since tonic sends headers eagerly. The client is also
-    now reachable from the shipped binary (increment 4d-iii) — until that landed, every piece of
-    WP-20 was built, tested, and unreachable. RDS and EDS moved to WP-21, which now subscribes,
-    applies, and warms their dependent resources. One ordering gap stays open,
-    deliberately and in writing: ACK-before-apply in <code>main.rs</code>, which two independent
-    test attempts could not observe from outside (the ACK's own network round trip dwarfs the
-    race window) — publish-ordering is closed instead by the type system.
-    <b>WP-21 (warming, ordering, make-before-break) started 2026-09-06, and increment 2 landed
-    EDS ingest end to end on 2026-09-07.</b> An ADS-delivered <code>ClusterLoadAssignment</code>
-    now lowers through the same converter the static path uses, resolves to the cluster(s)
-    subscribing to it, and reaches <code>ClusterManager::accept_eds_update</code> — proven by an
-    <code>ads_e2e</code> scenario that routes a real request through the result. Two bugs were
-    caught in review rather than by a test, and both are the same shape: a constraint written
-    down in one increment that the next increment did not honour. Increment 2a accepted a
-    hostname in an EDS endpoint (nothing resolves one — refused at lowering now), and 2b-ii
-    called the sink with the EDS <i>resource</i> name where <code>accept_eds_update</code> is
-    keyed by <code>Cluster.name</code>, which Envoy lets differ. <code>/ready</code> now gates on
-    cluster warming, and WP-58 request admission distinguishes <code>cluster_not_warmed</code>
-    from <code>no_healthy_upstream</code>. RDS delivery, replacement-listener warming, last-good
-    retention, and ADS initial-fetch timeout landed 2026-09-11. Init-manager sequencing and full
-    5k-rps, Envoy-baselined rename churn remain ahead of WP-21.
-    <b>WP-54 (tenant self-service usage API) is DONE, 2026-09-06, both increments</b> — not
-    gate-moving, it never was part of the ADS gate. <b>WP-55 (usage history) was decided
-    2026-09-06 — export-only, stay stateless — and DONE 2026-09-07</b>: a <code>tenant</code>
-    dimension on the token-usage instrument, capped at 4000 series so an unbounded tenant space
-    folds into one overflow series rather than growing the registry, dropping the dimension and
-    never the measurement. It was resized L → S once its own stale starting claim (the
-    token-usage metric "never recorded") was checked against the code and found wrong.
-    <b>WP-21 increment 3 landed 2026-09-07: <code>/ready</code> now gates on cluster
-    warming</b>, which finally gives <code>ClusterManager::is_initialized</code> a production
-    caller — it had none outside its own unit tests since WP-16, so warming was inert for every
-    discovery type. The deadline (<code>initial_fetch_timeout</code>) never marks a cluster
-    initialized: it only stops warming gating readiness, so WP-58 can still tell "never fed"
-    from "all hosts ejected". <b>WP-56 landed the same day</b> — endpoint metadata lowers into
-    the IR, with <code>envoy.lb</code> refused by dotted path rather than accepted and ignored,
-    because accepting a subset-routing selector we do not implement would leave an operator's
-    exclusion list installed and never enforced. <b>WP-59 increment 1 landed too</b>, and it
-    closed a live defect: <code>update_from_snapshot</code> published every rebuilt cluster with
-    an EMPTY host set and only then resolved them, serially — so a slow STRICT_DNS cluster left
-    every other cluster in the same reload empty and rejecting traffic for the whole span.
-    <code>swap_under_load.rs</code>, which closed v0.2.0's zero-dropped-streams clause, uses
-    STATIC clusters only and structurally could not see it.
-    <b>WP-60 and WP-61 shipped 2026-09-07</b> (composable spend counters — the absolute-write
-    design loses spend with two writers rather than double-counting it, the unsafe direction —
-    and policy propagation by version-stamp polling, bound decided at 60s), which unblocked
-    <b>WP-62 (Redis-backed shared stores): increments 1-3 landed 2026-09-07</b> — reconciliation
-    staleness is observable, a Redis-backed store (Lua scripts for the token check, 13 tests
-    green against real Redis 7), and the store is now selectable from config. <b>Not proven yet,
-    named rather than hidden:</b> no test exercises a real <code>kill -9</code>, socket
-    reconnection after a partition, or process supervision — that is the Go QA suite's job and it
-    is not written. None of WP-60/61/62 touches the v0.3.0 gate; they ship in this milestone by
-    placement (ADR-0006, running multiple replicas), not by dependency on it.
-    <b>WP-59 is now DONE, both increments (2026-09-08)</b> — increment 2 is the carry-forward
-    itself: an unrelated cluster's config change no longer wipes health-check state, outlier
-    ejections, or EDS membership for clusters whose own config didn't change (6 more tests,
-    103 → 109). <b>WP-22 increments 1, 2a, 2b and 2c landed by 2026-09-12</b> — SDS ingest,
-    listener binding, certificate and validation-context delivery, shared IR types, and the
-    running binary's SDS subscription. Delta ADS remains open. Neither WP-59 nor WP-22 moves
-    the v0.3.0 gate.
-    <b>2026-09-08, later the same day: WP-58 shipped</b> (<code>b71ec42</code>/<code>6226ee7</code>,
-    3 new tests) — <code>router.rs</code> now checks <code>is_initialized</code> at both
-    cluster-lookup sites before routing, so a not-yet-warm cluster renders
-    <code>cluster_not_warmed</code> distinctly from an all-hosts-ejected
-    <code>no_healthy_upstream</code>, closing the request-admission half of what WP-21 increment
-    3 left open. <b>WP-22 increments 2a, 2b and 2c landed by 2026-09-12</b>
-    (<code>6e0c6ef</code>/<code>bdff97f</code>, <code>f500946</code>/<code>136064e</code>): a
-    listener can now name an SDS secret and binds with an empty cert set instead of being
-    refused, and a new <code>SdsSecretRegistry</code> (name → <code>Weak</code> factory map)
-    makes a delivered secret actually reach <code>DownstreamTlsFactory::update_certificates</code>.
-    A <code>validation_context</code> secret now hot-swaps downstream trust anchors through its
-    own registry path. The running binary drives the SDS subscription as well as the
-    client/applier and registry layers. Test total this refresh: <b>1961 passed, 26 skipped</b>
-    (<code>make tq</code> + <code>make tq-doc</code>). None of WP-58 or WP-22 moves the gate.
-    <b>Four new work packages, scoped 2026-09-07, three of them driven by an external consumer:</b>
-    a sibling project (<code>remote-llm</code>) is building a sidecar that registers GPU inference
-    nodes, and asked for per-endpoint metadata (WP-56), a <code>/clusters</code> view that shows
-    live host sets rather than configured ones (WP-57), and a failure that distinguishes "never
-    fed" from "all hosts ejected" (WP-58). Its review also prompted <b>WP-59, the one to read</b>:
-    <code>update_from_snapshot</code> rebuilds every config-sourced cluster wholesale, so any
-    change clears health-check state and outlier ejections proxy-wide — harmless under a human
-    SIGHUP, a standing mechanism for silently clearing ejection state once cluster config arrives
-    on a 10-second heartbeat. Before all of this, 2026-08-29 through
-    2026-09-02, WP-50 increment 3 landed (operator control plane: tenants, spend budgets), P0
-    product-defining work gating neither v0.2.0 nor v0.3.0 — see the dated block at the end of
-    this paragraph.
-    <span class="gate"><b>✓ P0 FOUND AND FIXED 2026-09-04 —</b>
-    <code>llmproxy.model_authz</code> denied <b>every</b> request in any chain that enabled it,
-    a 100% outage that made WP-50 3a/3b-iv non-functional in production (fails closed, so not a
-    bypass). It read <code>StreamInfo::requested_model</code> in <code>decode_headers</code>,
-    but <code>body_rewrite</code> writes it in <code>decode_data</code> and the filter manager
-    runs all header callbacks before any data — a header/data <b>phase</b> mismatch that config
-    ordering could never have fixed. Found by the first drill ever to run the admin API against
-    the real binary; 18 unit tests had passed because they called <code>decode_headers</code>
-    directly. Rule 16, again: a suite that never switches a feature on cannot regress it.</span>
-    <b>v0.2.0 "production-ready serving" shipped 2026-08-29</b> and is tagged.
-    <b>v0.1.0 "LLM gateway" shipped 2026-08-08</b> and is tagged. <b>v0.0.1 shipped 2026-08-01</b>:
-    the live smoke test ran against the real OpenAI and Anthropic endpoints and passed all four
-    cases (both providers, streaming and not) on the first attempt.
-    <span class="gate"><b>v0.1.0's SHIP GATE —</b> per-request token counts (input / cache-read /
-    cache-write / output) and TTFT/TPOT reach the access log for live traffic; a token-based rate
-    limit is enforced; and the proxy fails over from one provider to another mid-request without
-    the client seeing an error. <b>All three clauses verified end to end, against mock upstreams —
-    not against real providers.</b> Token counts + TTFT/TPOT: QA-1 and QA-10, against a mock with
-    known pacing (observed ttft=402ms/tpot=122.129ms/max_stall=152ms in the actual access log).
-    Provider failover (WP-35): <code>testing/diffrig/tests/failover_e2e.rs</code> drives the real
-    binary against a real dialect config and a mock forced to 429 — exact attempt accounting, the
-    credential-isolation negative (standby's key only), and the standby's own Host header, all
-    mutation-tested. Token-based rate limiting: <code>testing/diffrig/tests/auth_e2e.rs</code>,
-    verified last — it could not be verified honestly until WP-50 increment 2a gave the limiter a
-    proxy-assigned identity to key on, since before that a caller could reset its own quota by
-    changing its own <code>Authorization</code> header. <b>Unlike v0.0.1, this release was tagged
-    without running its live-provider drill</b> — it exists
-    (<code>testing/diffrig/tests/live_gate_v0_1_0.rs</code>, one command, three billable calls) and
-    was deliberately not run before tagging; recorded in <code>internal-docs/MILESTONES.md</code> as a named
-    departure, not a gap that was missed. WP-35's scope closed narrower than its title:
-    same-dialect fallback only — cross-dialect (openai → anthropic) is a deliberate hard error,
-    split into new WP-52 (v1.0.0) rather than left as a silent gap.</span>
-    <span class="gate"><b>v0.2.0's SHIP GATE — CLOSED, shipped 2026-08-29 (tag <code>v0.2.0</code>).</b>
-    A published capacity report (p99, tokens/sec ceiling, RSS under sustained long-lived streams)
-    from a run that is not harness-bound, plus <code>/config_dump</code> and <code>/stats</code>
-    on the admin endpoint, plus a config swap under live traffic with zero dropped streams. All
-    three met: <code>/config_dump</code>/<code>/stats</code> closed 2026-08-09
-    (<code>/stats</code> reports real traffic, not an empty registry —
-    <code>crates/proxy/tests/stats_e2e.rs</code>); the swap clause closed the same day
-    (<code>testing/diffrig/tests/swap_under_load.rs</code>, terminal-frame assertion, not a
-    request count); the capacity report published <code>054b809</code> after two loadgen
-    measurement-honesty bugs (a truncated-SSE false positive, failed requests skewing p99
-    <i>down</i>) and the real 202-concurrent-stream h2 ceiling (hyper's default) were fixed —
-    WP-15 slice C took it to 808. Last in-scope item WP-51 (OpenTelemetry) closed
-    <code>0d7bd1b</code>; HTTP upgrades/WebSocket tunneling (WP-10 S10) landed the same window as
-    a bonus, not gate-required. Full history of this gate's long path to closing is in
-    <code>internal-docs/MILESTONES.md</code>, not repeated here now that it's shipped.</span>
-    <span class="gate"><b>v0.3.2's SHIP GATE (carried over from v0.3.0, which was tagged without it) — still RED.</b> The proxy
-    takes its entire configuration from an ADS control plane, ACKs and NACKs correctly per S8,
-    and survives a control-plane reconnect with make-before-break cluster warming. <b>WP-20 (ADS
-    client) is DONE, 2026-09-05/06 — all six increments.</b> It opens a real gRPC stream,
-    ACKs/NACKs, reconnects and resyncs forever with a jittered backoff, applies accepted LDS/CDS
-    resources into the IR, all five WP-28 acceptance scenarios pass over a real socket, and
-    <code>make xds-conformance</code> found and fixed a real deadlock against a pinned
-    go-control-plane on its first run — evidence for why that opt-in target exists, since our own
-    puppet harness structurally cannot reproduce it. <b>Read that as the ADS client working, not
-    as the gate moving</b>: RDS and EDS belong to WP-21. <b>WP-21 started 2026-09-06:</b> increment 1
-    added the EDS cluster IR surface; increment 2 (2026-09-07) wired EDS ingest end to end,
-    proven over a real socket; increment 3 (2026-09-07) wired <code>/ready</code> to gate on
-    cluster warming, giving <code>is_initialized</code> its first production caller — though the
-    deadline only stops warming from gating readiness, it never marks a cluster initialized.
-    <b>WP-58 (2026-09-08) gave it a second caller</b>: <code>router.rs</code> now checks
-    <code>is_initialized</code> before routing, so a not-yet-warm cluster fails distinctly
-    (<code>cluster_not_warmed</code>) instead of through the generic ejected-hosts path — this is
-    admission, not make-before-break by itself. RDS delivery, replacement-listener warming,
-    last-good retention, and ADS initial-fetch timeout landed 2026-09-11. Init-manager sequencing
-    and full 5k-rps, Envoy-baselined rename churn remain. <b>WP-22 landed increments 1, 2a, 2b and
-    2c by 2026-09-12</b> — SDS ingest, a listener naming an SDS secret binding empty instead of
-    being refused, and certificate plus validation-context delivery reaching the serving TLS chain
-    via <code>SdsSecretRegistry</code>.
-    The running binary now includes the SDS subscription; delta ADS remains open. Neither WP-58
-    nor WP-22 touches this gate's own text (ACK/NACK/warming/reconnect) either way. WP-28 (the control-plane
-    test harness) has landed the DropStream/Wait chunk WP-20's own reconnect-resync scenario
-    needed and is otherwise still scaffolding. <b>WP-59 (incremental cluster application) shipped
-    complete 2026-09-08</b> — a direct safety consequence of this gate's own subject (a fast CDS
-    heartbeat would otherwise clear ejection state proxy-wide on a timer) but not itself a gate
-    requirement. WP-20 is done; WP-21 and WP-22 remain started, WP-28 is scaffolding only.</span>
-    <span class="sub"><b>The honest read on v0.1.0:</b> all three gate clauses are proven against
-    mocks that were built to exercise exactly these failure paths (a forced 429, an exhausted
-    budget) — arguably a better instrument than an on-demand real-provider drill for those two, but
-    that is an argument, not the v0.0.1 standard, which was a manual run against real endpoints,
-    executed and recorded. <b>Second standing risk, named 2026-08-01, narrower as of 2026-08-23:</b>
-    the LLM layer stacks on serving foundations that were not finished at the time. Two have since
-    closed: downstream h2 landed 2026-08-02 (only h2c and S10 upgrades remain, WP-10), and h2
-    upstream connection pooling went from connect-per-stream to a bounded per-key connection set
-    that measured 808 concurrent streams, 4x its prior ceiling (WP-15 slice C, 2026-08-22). h1
-    upstream keep-alive reuse and connection-level circuit breakers also landed (WP-15 slices B/D);
-    watermarks remain aliased to buffering rather than real backpressure (WP-11), a caveat not
-    exercised by the tests that closed v0.1.0's gate.
-    <b>WP-41, the black-box QA suite, found five real bugs across the two milestones</b> — no
-    dialect access logs at all, <code>%REQ(:METHOD)%</code> always <code>-</code> (Envoy mode too),
-    no response flag on a mid-stream failure, a JSON-float usage report silently billed as zero
-    (WP-48), and <code>%LLM_RESPONSE_CHUNKS%</code> over-counting by one on every response with a
-    body. All five fixed; one had been <i>described as intended</i> in its own doc comment — the
-    class of defect an inside view cannot see.
-    <b>WP-50 increment 2a (downstream authentication, 2026-08-08)</b> was not planned v0.1.0 scope —
-    it became the precondition once the rate-limit clause turned out to be advisory by
-    construction. Proxy-issued virtual keys, keyed HMAC-SHA-256 verified in constant time, fail
-    closed, an <code>Authenticator</code> trait chain so OIDC lands later without reshaping
-    anything above it. Increments 2b (persistent key store), 2c (OIDC), and 3
-    (tenants/budgets/admin CRUD) remain. WP-47's three pre-existing borrowed-message filters
-    now use owned <code>llmproxy.filters.v0</code> protos (completed 2026-09-12).
-    <b>Test-suite note, re-measured 2026-08-08:</b> full workspace run is <b>18.3s</b>, 1045 tests
-    green, 24 skipped, zero slow — a real re-run, not carried forward from the 968/21 count at the
-    last refresh (this batch's volume of landed work explains the jump). The <code>cli.rs</code>
-    drain test once suspected of a "200x slowdown" and separately flagged flaky-on-timing was
-    root-caused 2026-08-08 as a fixed-port collision — the readiness fence connected to whatever
-    else was squatting on <code>:10000</code> and reported ready, then failed three screens later
-    at the drain assertion. Fixed by giving it its own ephemeral port; 12/12 clean re-runs, 3/3 with
-    both old fixed ports deliberately held by another process. The <code>diffrig</code> hang
-    mitigation (multi-threaded runtime + <code>terminate-after</code>) holds; those tests still
-    carry no request timeouts, unchanged.
-    <b>Re-measured 2026-08-09 via <code>make tq-count</code>: 1130 tests passed, 24 skipped</b>
-    — the skip count is unchanged and the increase is explained by that day's new test files
-    (<code>reload.rs</code>, <code>stats_e2e.rs</code>, <code>swap_under_load.rs</code>, an
-    expanded <code>router_retry.rs</code>); doctests re-run clean via <code>make tq-doc</code>.
-    <b>WP-24 (access logs) corrected 2026-08-09:</b> this board had it as <code>done</code>; its
-    own machinery (response flags, mid-stream failure visibility, credential-safe logging) has
-    been complete for a while, but the differential acceptance gate against the WP-13 lifecycle
-    suite is genuinely still open, so the card moved back to <code>started</code> rather than
-    staying <code>done</code> on a technicality.
-    <b>A live run against a local Ollama (2026-08-14) found two real defects that 1141 passing
-    tests had not</b> — the same lesson WP-41's QA suite already taught, found again outside it.
-    One is fixed: a successful content-length-framed 200 was logged
-    <code>response_flags: DC</code>, because hyper stops polling the body once the declared
-    length is written and <code>LoggingBody</code> never saw its own clean end — traced to
-    <code>mock_e2e.rs</code> never configuring <code>access_logs</code> at all, so no mock test
-    had ever inspected a rendered log line. The other is a <b>confirmed quota bypass, now
-    visible but still open by design</b>: a 20-token/minute budget survived six ~16-token
-    requests with zero 429s because the limiter read no usage and said nothing; now warns loudly
-    (at most once per budget key per minute) but still admits the request uncharged — an owner
-    decision, not a partial fix. Root cause is architectural: <code>body_rewrite</code>'s
-    anti-spoofing rewrite can re-route a request onto a route whose usage dialect no longer
-    matches the response shape, and WP-35's card now
-    carries the prerequisite this forces — the usage dialect must move from the route to the
-    cluster before WP-52 makes cross-dialect fallback legal, see WP-34/WP-35/WP-52's cards.
-    Re-run directly this refresh: 4 of 7 <code>local_openai_smoke.rs</code> cases pass, 3
-    correctly fail on that same reason.
-    <b>Landed since, not gate-moving:</b> Apache-2.0 licensing (<code>LICENSE</code>,
-    <code>NOTICE</code> with a 242-crate dependency audit, <code>SECURITY.md</code>), a README
-    rewritten against the running code, and every user-facing Envoy reference removed — the docs
-    site (now nine pages, up from three), the JSON schema, strict-mode error messages, and
-    <code>--help</code> — with the configuration now called <i>the configuration</i> rather than
-    a dialect. That work also surfaces a distinct punch list for an actual public release, not
-    tracked as a WP: no git remote yet, no release workflow or published binaries, six
-    dependencies' license texts recorded as owed but not bundled, and
-    <code>SECURITY.md</code>'s reporting contact still unfilled.
-    <b>Test count reconciled this refresh: 1146 tests passed, 24 skipped</b> — re-run directly
-    via <code>make tq-count</code>, plus <code>cargo fmt --check</code>,
-    <code>cargo clippy -D warnings</code>, <code>make tq-doc</code>, and <code>make qa</code> all
-    independently green. The +16 over the 1130 above reconciles exactly against every landing
-    commit's own reported delta: +6 (loadgen truncation tests), +5
-    (<code>reload.rs</code>/<code>drain_strategy_warning.rs</code>), +1 (the DC-on-200
-    regression test), +4 (the token-budget warning tests).
-    <b>Not re-verified this refresh (2026-08-21):</b> a capacity benchmark was running on this
-    box, and running <code>cargo</code> during it was explicitly out of bounds, so the count above
-    is carried forward from 2026-08-18, not re-measured. The commits landed since (mockupstream,
-    the h2-format fix, the sweep-harness fixes) self-report +21 (+15 mockupstream, +4
-    proxy-simple-config, +2 loadgen), which would put the total at 1167 — recorded as an
-    UNVERIFIED claim, not written into the count above, per this board's own rule that a stale
-    count beside a fresh date is safer than an unverified one presented as re-measured.
-    <b>Two new work packages, not gate-moving:</b> WP-54 (tenant self-service usage API — a
-    read-only endpoint over state the token limiter already computes, no new storage) and WP-55
-    (usage history export-vs-own-a-datastore, <b>decided 2026-09-06: export-only</b>) were scoped 2026-08-21 from
-    the owner's question about serving management and observability. Neither is v0.2.0 scope —
-    slotted into v0.3.0 as a placement call, since v0.2.0 is current and its scope stays frozen.
-    <b>WP-53 correction, same day:</b> this board previously read "design brief only; no registry
-    or filter code is merged on <code>main</code>" — true about <code>main</code>, misleading about
-    reality. ~1,500 lines of an implementation attempt were found sitting uncommitted in an
-    abandoned agent worktree and rescued onto a branch rather than lost — unreviewed, unbuilt, not
-    verified to compile, and edits three files that have since changed independently on
-    <code>main</code>. Recorded as a rescued starting point, not progress; WP-53's status is
-    unchanged.
-    <b>Re-measured 2026-08-23:</b> <b>1222 tests passed, 23 skipped</b> (<code>make
-    tq-count</code>, a real re-run) — up from 1167/24. The +55/-1 reconciles against the
-    self-reported delta of every commit between the two refreshes, ending exactly at the measured
-    number: WP-15 slice C (h2 pooling, 202 → 808 concurrent streams), the refused-stream retry
-    decode, WP-40's dependency cleanup, WP-23 increment 6b plus its renderer and
-    access-log-gating follow-ups, WP-35's cluster-side usage-dialect carrier plus a
-    <code>routes:</code>-surface dialect fix, and WP-11 chunk 4's decode-side
-    <code>ContinueAndDontEndStream</code> (also the skip-count change: chunk 4's own ignored-test
-    count went 9 → 8, "8 and moving" as of this refresh, not a fixed number). Doctests unchanged
-    at 5 passed / 2 ignored. <b>WP-24's response-flag audit</b> (2026-08-22/23) found two flags
-    declared and never set (<code>RL</code>, <code>URX</code> — both fixed) and two more that
-    were declared, looked wired, and were dead code (<code>UR</code>, <code>DC</code> — both
-    fixed 2026-08-23; <code>DC</code>'s own unit test had fabricated its trigger condition
-    instead of driving it, which is exactly why the gap survived). <b>WP-10's row</b> is
-    corrected above (downstream h2 has been done since 2026-08-02; this board mislabelled it as
-    outstanding until 2026-08-23). None of the above moved v0.2.0's gate; it shipped 2026-08-29
-    with every clause closed, see the gate span above.
-    <b>2026-09-02 — WP-50 increment 3 (tenants, budgets, spend) shipped complete, and it is the
-    only thing on this refresh that moved: no v0.3.0 gate work landed.</b> 3a (per-tenant model
-    allow-lists, config-only, <code>39ea4d5</code>), 3b (a selectable embedded-<code>redb</code>
-    control-plane store, an admin write API gated on <code>LLMPROXY_ADMIN_TOKEN</code>, and
-    chains addressed by <code>stat_prefix</code> instead of position), and 3c (a
-    <code>(cluster, model)</code> price table, per-tenant spend budgets with a period, and a new
-    <code>llmproxy.spend_limit</code> filter returning 429 + <code>x-ratelimit-*</code> in
-    micro-dollars) are all done — WP-50's card carries the full breakdown and every open item.
-    <b>Two security-relevant defects were found and fixed along the way, in code that was
-    already shipped and already green:</b> a <code>SharedFactoryState</code> singleton keyed on
-    <code>type_url</code> alone let a second <code>llmproxy.auth</code>-configured listener
-    silently authenticate against the first's keys (<code>df0ae8c</code>), and the token limiter
-    built one budget store <b>per worker</b>, so a configured N tokens/minute admitted roughly
-    N × core count (<code>0dc91d1</code>) — a live quota bypass, not a hypothetical one. <b>Left
-    open, stated plainly rather than folded into "done":</b> spend budgets are enforced per
-    process, not per fleet (the same shape as the worker bug above, one level up, unfixed for
-    spend); the admin write API's unscoped endpoints support exactly one
-    <code>llmproxy.auth</code> chain; and the admin API has never been run against the real
-    binary — no test sets <code>LLMPROXY_ADMIN_TOKEN</code>, and four of the five defects found
-    this window were wiring bugs unit tests structurally could not see. <b>An overlap with
-    WP-42 was found and deliberately left unresolved</b>: 3c's spend enforcement now meets
-    WP-42's stated acceptance criteria without going through WP-53's versioned-pricing
-    prerequisite — see WP-42's and WP-53's cards. <b>Test count re-measured directly this
-    refresh: 1565 passed, 16 skipped</b> (<code>make tq-count</code>), up from 1435 at the start
-    of this range — not carried forward from a commit message.</span>
+    <b>State 2026-10-17.</b> No milestone is current. The latest release is tag v0.4.1; v0.4.0 (Gateway
+    completeness) shipped in tag v0.4.0 on 2026-10-16. On main and untagged: user id on request records
+    (WP-98), the billing ledger (WP-104 to WP-107, ADR-0009) and a loader fix for <code>${VAR}</code>
+    inside YAML comments. None of these sits in a milestone.
+    <b>Open work:</b> WP-108 (ledger docs and end-to-end QA; WP-107 is done), trace export WP-99 to WP-103
+    (ADR-0008, still proposed), WP-38 (started: a new-user hello-world drill and an examples-or-default lint
+    are all that is left), and unscheduled WP-10, WP-29, WP-37, WP-41, WP-49, WP-65, WP-82, WP-88 and WP-91.
+    <b>Closed by the owner today:</b> WP-26 (Envoy differential rig; the code in <code>testing/diffrig</code>
+    stays), WP-32 (the ext_authz header-only slice shipped, the rest is dropped) and WP-43 (no response
+    caching). WP-29 fuzzing is kept and re-scoped to the parsers this product wrote.
+    <b>Test count:</b> not re-run for this refresh; run <code>make tq-count</code> for a number.
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
@@ -542,7 +224,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = "v0.3.2";
+  const CURRENT_MS = ""; // no milestone is current (MILESTONES.md)
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = /*__DATA__*/;
