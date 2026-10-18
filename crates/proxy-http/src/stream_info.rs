@@ -169,6 +169,10 @@ pub struct AuthInfo {
     /// The tenant's trace-export opt-in (ADR-0008 decision 2), pinned by the
     /// auth filter at admission. `false` (the default) captures nothing.
     pub trace_export: bool,
+    /// The auth filter refused this request: no identity was established, so
+    /// its request record names the reserved tenant `unauthenticated`
+    /// (ADR-0011 decision 3). `false` when no auth filter ran.
+    pub denied: bool,
 }
 
 /// Physical upstream attempt snapshots. A new entry is created at dispatch,

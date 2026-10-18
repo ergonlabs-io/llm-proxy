@@ -1350,6 +1350,7 @@ impl HttpFilter for AuthFilterInstance {
                         user_id: principal.user_id.clone(),
                         policy_generation: principal.policy_generation,
                         trace_export: principal.trace_export,
+                        denied: false,
                     };
                     // Hand-off of the set the key was verified against, so the
                     // router never reads the snapshot itself. A request keeps
