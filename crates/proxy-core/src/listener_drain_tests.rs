@@ -237,6 +237,7 @@ async fn start_worker(initial: Arc<ConfigSnapshot>) -> Worker {
         tracing: None,
         metadata: None,
         ledger: None,
+        traces: None,
         connection_limiter: crate::admission::ConnectionLimiter::default(),
     };
     let factory_state = Arc::new(SharedFactoryState::default());

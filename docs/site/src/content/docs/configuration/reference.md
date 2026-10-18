@@ -176,6 +176,7 @@ Used at: `observability`.
 | `access_logs` | [object](#observabilityaccess_logs) | no | none | Where and how per-request/per-session access log entries are written. |
 | `force_usage_reporting` | boolean | no | `true` | Forces `stream_options.include_usage` onto every streaming OpenAI-dialect request, including ones where the client asked for no usage, so token usage is always logged/accounted for streamed responses. This makes the provider emit one extra final SSE frame carrying usage; well-behaved SDKs handle it, but a hand-rolled client that iterates `choices[0]` without a guard can trip over that frame. Set to `false` for strict passthrough if that's a concern. Examples: `true`, `false`. |
 | `metrics` | [object](#observabilitymetrics) | no | none | OTLP metric export. Independent of `tracing`: set this without `tracing` to export metrics with tracing fully off, and note that turning tracing off does not stop metrics. Omit entirely for no OTLP metric export -- which does not disable `/stats/prometheus`, which works with no OTLP configuration at all. `export_deadline` must be shorter than `export_interval`, or every export is abandoned as a timeout before the next one is due. |
+| `traces` | [Traces](#traces) | no | none | Trace export: one record per request (headers and bodies, size-capped) for tenants that opt in through tenant policy, written to a local directory as compressed JSON-lines segments and optionally uploaded to S3-compatible storage. Requires the top-level `auth` block, since without tenants nothing can opt in. Boot-scoped: a reload that changes it is refused and the previous configuration keeps serving. Needs a node id unique to this replica (`--service-node`). Omit for no trace export. |
 | `tracing` | [object](#observabilitytracing) | no | none | OTLP trace export. With this block set, the proxy exports spans to `otlp_endpoint`; omit it to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span. |
 
 Any other field is a load error.
@@ -357,6 +358,28 @@ OTLP metric export. Independent of `tracing`: set this without `tracing` to expo
 
 Any other field is a load error.
 
+## `Traces`
+
+Used at: `observability.traces`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `directory` | string; minimum length 1 | yes | none | Absolute path of the segment directory. Created owner-only (0700). One proxy process uses it at a time; a second is refused at startup. |
+| `max_disk_bytes` | integer; minimum 1048576, maximum 1125899906842624 | yes | none | Budget for every segment on disk, open or sealed, uploaded or not. Must be at least 2 x max_open_segments x segment_max_bytes. At the cap the oldest unsent segment is dropped and counted. |
+| `max_age` | [Duration](#duration) | no | none | Directory destination only (rejected with `s3`, whose objects expire by the bucket's lifecycle rules): sealed segments older than this are deleted. Bounded to 10 years. |
+| `codec` | one of `gzip`, `zstd` | no | `gzip` | Segment compression. `gzip` is read by every warehouse loader; `zstd` needs a consumer that reads long-window zstd. |
+| `zstd_window_log` | integer; minimum 20, maximum 27 | no | `24` | log2 of the zstd window. Only with `codec: zstd`. max_open_segments x 2^zstd_window_log must not exceed 2 GiB. |
+| `max_request_body_bytes` | integer; minimum 1024, maximum 67108864 | no | `1048576` | Per-request cap on the captured request body. |
+| `max_response_body_bytes` | integer; minimum 1024, maximum 67108864 | no | `4194304` | Per-request cap on the captured response body. |
+| `max_memory_bytes` | integer; minimum 1048576, maximum 1099511627776 | no | `268435456` | Global cap on every retained body byte, in flight and queued. Must be at least max_request_body_bytes + max_response_body_bytes. |
+| `max_queued_traces` | integer; minimum 1, maximum 1048576 | no | `4096` | Global cap on captures in flight plus queued. |
+| `segment_max_bytes` | integer; minimum 1048576, maximum 1073741824 | no | `67108864` | A segment is sealed when its compressed size reaches this. Must be at least the largest line: both body caps base64-expanded, plus 1 MiB. |
+| `segment_max_age` | [Duration](#duration) | no | `5m` | A segment is sealed when it is this old. Bounded to 10s-1h. |
+| `max_open_segments` | integer; minimum 1, maximum 4096 | no | `64` | Open (tenant, date) segments; the least recently used is sealed beyond this. |
+| `s3` | [TracesS3](#tracess3) | no | none | An S3-compatible upload destination. Sealed segments are uploaded, then deleted locally. |
+
+Any other field is a load error.
+
 ## `observability.tracing`
 
 OTLP trace export. With this block set, the proxy exports spans to `otlp_endpoint`; omit it to keep tracing off. An inbound `traceparent`'s sampled bit is always honored regardless of `sample_ratio`; the ratio only applies when this proxy mints a new root span.
@@ -438,6 +461,26 @@ One retired key-encryption key.
 
 Any other field is a load error.
 
+## `TracesS3`
+
+Used at: `observability.traces.s3`.
+
+An S3-compatible upload destination. Sealed segments are uploaded, then deleted locally.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `bucket` | string; minimum length 3 | yes | none | Bucket name: 3-63 bytes of lowercase letters, digits, `.` and `-`. A name containing `.` requires `path_style: true`. |
+| `region` | string; minimum length 1 | yes | none | Required and never inferred: at most 64 bytes of lowercase letters, digits and `-`. |
+| `endpoint` | string | no | none | `http://` or `https://` host and optional port, with no path, query or userinfo. Default: `https://s3.<region>.amazonaws.com`. `http` to a non-loopback host is accepted with a startup warning. Examples: `https://s3.eu-west-1.amazonaws.com`. |
+| `path_style` | boolean | no | `false` | Path-style addressing; needed for MinIO and most S3-compatible stores. |
+| `prefix` | string | no | `` | Object key prefix: no leading or trailing `/`, no empty, `.` or `..` segments. |
+| `access_key_id` | string; minimum length 1 | yes | none | Static access key id. Use `${ENV}` substitution rather than a literal. |
+| `secret_access_key` | string; minimum length 1 | yes | none | Static secret key. Never logged. Use `${ENV}` substitution rather than a literal. |
+| `session_token` | string | no | none | Session token for temporary credentials. |
+| `upload_timeout` | [Duration](#duration) | no | `120s` | Deadline for one upload. Bounded to 1s-1h. |
+
+Any other field is a load error.
+
 ## `PriceEntry`
 
 Used at: `pricing.price_list.entries[]`.
@@ -485,7 +528,7 @@ Type: string; pattern `^[0-9]+(ms|s|m|h)$`.
 
 A duration: integer plus unit — `ms` (milliseconds), `s` (seconds), `m` (minutes), or `h` (hours).
 
-Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.tracing.export_deadline`.
+Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.traces.max_age`, `observability.traces.segment_max_age`, `observability.tracing.export_deadline`, `observability.traces.s3.upload_timeout`.
 
 Examples: `500ms`, `30s`, `5m`, `1h`.
 

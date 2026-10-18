@@ -937,8 +937,8 @@
       "additionalProperties": false,
       "required": ["bucket", "region", "access_key_id", "secret_access_key"],
       "properties": {
-        "bucket": { "type": "string", "minLength": 3, "maxLength": 63, "description": "Bucket name: lowercase letters, digits, `.` and `-`. A name containing `.` requires `path_style: true`." },
-        "region": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Required and never inferred: lowercase letters, digits and `-`." },
+        "bucket": { "type": "string", "minLength": 3, "description": "Bucket name: 3-63 bytes of lowercase letters, digits, `.` and `-`. A name containing `.` requires `path_style: true`." },
+        "region": { "type": "string", "minLength": 1, "description": "Required and never inferred: at most 64 bytes of lowercase letters, digits and `-`." },
         "endpoint": { "type": "string", "description": "`http://` or `https://` host and optional port, with no path, query or userinfo. Default: `https://s3.<region>.amazonaws.com`. `http` to a non-loopback host is accepted with a startup warning.", "examples": ["https://s3.eu-west-1.amazonaws.com"] },
         "path_style": { "type": "boolean", "default": false, "description": "Path-style addressing; needed for MinIO and most S3-compatible stores." },
         "prefix": { "type": "string", "default": "", "description": "Object key prefix: no leading or trailing `/`, no empty, `.` or `..` segments." },

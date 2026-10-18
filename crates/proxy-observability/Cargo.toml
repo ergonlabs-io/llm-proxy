@@ -13,6 +13,11 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+# Binary bodies in trace lines (`traces::reassemble`).
+base64 = { workspace = true }
+# Trace segment codecs, and inflating gzip/deflate bodies off the worker.
+flate2 = { workspace = true }
+zstd = { workspace = true }
 # `stats::Registry` publishes its per-handle metadata and
 # shard storage through `ArcSwap<Snapshot>` so resolution can grow the
 # registry under `&self`, surviving a config swap -- the same pattern
@@ -49,6 +54,8 @@ proxy-capture-protocol = { path = "../proxy-capture-protocol" }
 # The billing ledger's writer appends to the encrypted spool (ADR-0009).
 [target.'cfg(unix)'.dependencies]
 proxy-capture-spool = { path = "../proxy-capture-spool" }
+# The trace directory's exclusive lock, as `proxy-capture-spool` takes it.
+rustix = { version = "=1.1.4", features = ["fs"] }
 # `ledger::testing`, behind `test-support`.
 tempfile = { version = "=3.27.0", default-features = false, optional = true }
 

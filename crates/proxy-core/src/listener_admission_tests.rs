@@ -221,6 +221,7 @@ async fn start(initial: Arc<ConfigSnapshot>) -> Harness {
         tracing: None,
         metadata: None,
         ledger: None,
+        traces: None,
         connection_limiter: limiter.clone(),
     };
     let factory_state = Arc::new(SharedFactoryState::default());

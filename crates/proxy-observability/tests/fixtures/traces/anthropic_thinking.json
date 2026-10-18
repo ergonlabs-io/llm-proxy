@@ -1,0 +1,1 @@
+{"id":"msg_01K","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"thinking","thinking":"The user greets me. I should greet back.","signature":"EqQBCgIYAhIM"},{"type":"text","text":"Hi!"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":30}}

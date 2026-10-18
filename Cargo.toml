@@ -92,6 +92,13 @@ zeroize = "1"
 # dependency (rcgen, tonic-build, ...), so this promotes an existing build
 # artifact to a direct dependency instead of adding new build cost.
 base64 = "0.22"
+# Trace export segments (ADR-0008 decision 11). `flate2` was already built
+# as a transitive dependency (hdrhistogram); gzip is the default codec every
+# warehouse loader reads.
+flate2 = "1.1"
+# The long-window codec for agent traffic, which resends the whole
+# conversation each turn. Vendored C built by `cc`: no cmake or NASM.
+zstd = { version = "0.13", default-features = false }
 
 # Utilities
 arc-swap = "1"

@@ -4,7 +4,12 @@
 
 pub mod capture;
 pub mod config;
+pub mod exporter;
+#[cfg(all(test, unix))]
+mod exporter_tests;
 pub mod gate;
+pub mod reassemble;
+pub mod segment;
 
 /// Longest `tenant=<encoded id>` directory name a tenant may have to opt in.
 /// Segment file names sit under it and must stay below `NAME_MAX` (255).

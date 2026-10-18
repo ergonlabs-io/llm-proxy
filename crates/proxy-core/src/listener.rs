@@ -264,6 +264,7 @@ struct HcmRuntime<'a> {
     tracing_handles: Option<&'a TracingHandles>,
     metadata: Option<&'a Arc<dyn proxy_observability::records::RequestRecordSink>>,
     ledger: Option<&'a Arc<proxy_observability::ledger::Ledger>>,
+    traces: Option<&'a Arc<proxy_observability::traces::capture::TraceAdmission>>,
     factory_state: &'a Arc<SharedFactoryState>,
 }
 
@@ -395,6 +396,9 @@ pub struct StatsRecorders {
     /// the one `Ledger`: admission slots are process-wide, and its single writer numbers
     /// entries, so `seq` is gapless across the instance.
     pub ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
+    /// Trace export admission (ADR-0008). `None` when export is off. Shared
+    /// by every worker: its slot and byte budgets are process-wide.
+    pub traces: Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
     /// The process-wide downstream connection counter. Not a recorder, but bundled for the same
     /// argument-count reason.
     pub connection_limiter: crate::admission::ConnectionLimiter,
@@ -436,6 +440,7 @@ struct WorkerShared<'a> {
     tracing: &'a Option<TracingHandles>,
     metadata: &'a Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     ledger: &'a Option<Arc<proxy_observability::ledger::Ledger>>,
+    traces: &'a Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
     /// The per-serve [`SharedFactoryState`], shared by every worker's filter-factory build. Passed
     /// to each `HttpFilterFactory::create` through `FactoryContext`.
     factory_state: &'a Arc<SharedFactoryState>,
@@ -465,6 +470,7 @@ fn spawn_bound(
         tracing_handles: shared.tracing.as_ref(),
         metadata: shared.metadata.as_ref(),
         ledger: shared.ledger.as_ref(),
+        traces: shared.traces.as_ref(),
         factory_state: shared.factory_state,
     };
     let hcm = build_listener_hcm(listener_ir, &hcm_runtime)?;
@@ -495,6 +501,7 @@ fn spawn_bound(
             tracing_handles: shared.tracing.clone(),
             metadata: shared.metadata.clone(),
             ledger: shared.ledger.clone(),
+            traces: shared.traces.clone(),
             factory_state: shared.factory_state.clone(),
             secret_registry: shared.secret_registry.clone(),
         },
@@ -556,6 +563,7 @@ pub fn initial_bind(
         tracing: &stats.tracing,
         metadata: &stats.metadata,
         ledger: &stats.ledger,
+        traces: &stats.traces,
         factory_state,
         secret_registry,
     };
@@ -631,6 +639,7 @@ struct AcceptLoopShared {
     tracing_handles: Option<TracingHandles>,
     metadata: Option<Arc<dyn proxy_observability::records::RequestRecordSink>>,
     ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
+    traces: Option<Arc<proxy_observability::traces::capture::TraceAdmission>>,
     /// This worker's [`SharedFactoryState`] handle -- see
     /// [`WorkerShared::factory_state`]; needed here (not just at
     /// [`spawn_bound`] time) for the identical reason `token_stats` is (the
@@ -672,6 +681,7 @@ fn spawn_accept_loop(
         tracing_handles,
         metadata,
         ledger,
+        traces,
         factory_state,
         secret_registry,
     } = shared;
@@ -763,6 +773,7 @@ fn spawn_accept_loop(
                         tracing_handles: tracing_handles.as_ref(),
                         metadata: metadata.as_ref(),
                         ledger: ledger.as_ref(),
+                        traces: traces.as_ref(),
                         factory_state: &factory_state,
                     };
                     match build_listener_hcm(l, &hcm_runtime) {
@@ -1415,6 +1426,9 @@ fn build_hcm_handler(
     if let Some(ledger) = runtime.ledger {
         handler = handler.with_ledger(ledger.clone());
     }
+    if let Some(traces) = runtime.traces {
+        handler = handler.with_traces(traces.clone());
+    }
     // `.with_tracing` on the FilterChainHandler half: it mints the SERVER span and joins or propagates
     // an inbound `traceparent`. The CLIENT-span half is on the router above.
     if let Some(t) = runtime.tracing_handles {
@@ -1565,6 +1579,7 @@ fn reconcile(
         tracing: &stats.tracing,
         metadata: &stats.metadata,
         ledger: &stats.ledger,
+        traces: &stats.traces,
         factory_state,
         secret_registry,
     };
@@ -2351,6 +2366,7 @@ mod tests {
             tracing: None,
             metadata: None,
             ledger: None,
+            traces: None,
             connection_limiter: crate::admission::ConnectionLimiter::default(),
         };
         let factory_state = Arc::new(SharedFactoryState::default());
@@ -3567,6 +3583,7 @@ mod tests {
                 tracing: None,
                 metadata: None,
                 ledger: None,
+                traces: None,
                 connection_limiter: crate::admission::ConnectionLimiter::default(),
             };
             let factory_state = Arc::new(SharedFactoryState::default());
@@ -4534,6 +4551,7 @@ static_resources:
             tracing_handles: None,
             metadata: None,
             ledger: None,
+            traces: None,
             factory_state: &factory_state,
         };
         let err = match build_listener_hcm(listener_ir, &hcm_runtime) {
@@ -4659,6 +4677,7 @@ static_resources:
             tracing_handles: None,
             metadata: None,
             ledger: None,
+            traces: None,
             factory_state: &factory_state,
         };
         build_listener_hcm(l1, &hcm_runtime).expect("listener l1's filter chain must build");
@@ -4754,6 +4773,7 @@ static_resources:
             tracing_handles: None,
             metadata: None,
             ledger: None,
+            traces: None,
             factory_state,
         };
         build_listener_hcm(

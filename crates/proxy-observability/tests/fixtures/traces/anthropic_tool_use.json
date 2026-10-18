@@ -1,0 +1,1 @@
+{"id":"msg_01T","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Checking."},{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Paris"}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":42}}

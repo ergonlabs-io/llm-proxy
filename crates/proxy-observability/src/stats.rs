@@ -1065,6 +1065,62 @@ pub mod instruments {
         attribute_keys: &["reason"],
         buckets: None,
     };
+    /// Lines written, `capture` = `complete` or `partial`.
+    pub const TRACE_WRITTEN: Instrument = Instrument {
+        name: "llmproxy_trace_written_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &["capture"],
+        buckets: None,
+    };
+    /// Each partial reason a written trace carries.
+    pub const TRACE_PARTIAL: Instrument = Instrument {
+        name: "llmproxy_trace_partial_total",
+        kind: InstrumentKind::Counter,
+        unit: "{trace}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments sealed, by why.
+    pub const TRACE_SEGMENTS_SEALED: Instrument = Instrument {
+        name: "llmproxy_trace_segments_sealed_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments lost before reaching their destination, by why.
+    pub const TRACE_SEGMENTS_LOST: Instrument = Instrument {
+        name: "llmproxy_trace_segments_lost_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segments removed by the directory destination's retention.
+    pub const TRACE_SEGMENTS_EXPIRED: Instrument = Instrument {
+        name: "llmproxy_trace_segments_expired_total",
+        kind: InstrumentKind::Counter,
+        unit: "{segment}",
+        attribute_keys: &["reason"],
+        buckets: None,
+    };
+    /// Segment bytes on disk, open and sealed.
+    pub const TRACE_DISK_BYTES: Instrument = Instrument {
+        name: "llmproxy_trace_disk_bytes",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "By",
+        attribute_keys: &[],
+        buckets: None,
+    };
+    /// 1 while the exporter thread runs, 0 once it has stopped.
+    pub const TRACE_EXPORTER_UP: Instrument = Instrument {
+        name: "llmproxy_trace_exporter_up",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "1",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// Body bytes retained by captures in flight or queued.
     pub const TRACE_MEMORY_BYTES: Instrument = Instrument {
         name: "llmproxy_trace_memory_bytes",
