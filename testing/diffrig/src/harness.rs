@@ -184,6 +184,53 @@ impl ProxyProcess {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    /// Ask the proxy to reload its config file. Shells out to `kill` because
+    /// the workspace denies `unsafe`, which rules out calling `libc::kill`.
+    pub fn sighup(&self) {
+        let status = Command::new("kill")
+            .args(["-HUP", &self.child.id().to_string()])
+            .status()
+            .expect("run kill -HUP");
+        assert!(status.success(), "kill -HUP {} failed", self.child.id());
+    }
+
+    /// Poll the captured log until a line contains `needle`, or panic with
+    /// the log after `timeout`. ANSI color codes are stripped first, because
+    /// the tracing formatter colors output even when it goes to a file.
+    ///
+    /// Blocks the calling thread, like [`Self::wait_until_ready`].
+    pub fn wait_for_log(&self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let log = strip_ansi(&std::fs::read_to_string(&self.log_path).unwrap_or_default());
+            if log.contains(needle) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("log line {needle:?} never appeared within {timeout:?}; log:\n{log}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Removes `ESC [ ... m` color sequences.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl Drop for ProxyProcess {
