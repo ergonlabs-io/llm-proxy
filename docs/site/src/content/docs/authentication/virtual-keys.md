@@ -305,17 +305,16 @@ same way in both modes, because it talks to the store that the chain built.
 ## Reload and restart
 
 A `SIGHUP` reload does not change authentication. The HMAC secret, the
-`auth.keys` list, the store selection, and the policy-poll interval are fixed
-when the proxy starts. A key that you add to `auth.keys`, remove from it, or
-set to `revoked: true` keeps its old state until a restart. A removed or
-revoked configured key still authenticates until then. Use the admin write API
+`auth.keys` list, the store selection, the credential key ring and the
+policy-poll interval are fixed when the proxy starts. A reload that changes
+one of them is refused whole: the proxy logs `SIGHUP: config reload refused`
+with the field and keeps the previous configuration. A key that you add to
+`auth.keys`, remove from it, or set to `revoked: true` keeps its old state
+until a restart. A removed or revoked configured key still authenticates until
+then. Use the admin write API
 to change keys, allow-lists, and budgets on a running process. See the reload
 table in
 [Reload configuration](../../operations/config-reload/#what-a-reload-applies).
-
-> **Warning:** Do not change the HMAC secret and send `SIGHUP`. The reload
-> verifies keys with the new secret but keeps the old digests and mints with
-> the old secret, so every key is refused until a restart.
 
 ## Limits of the `llmproxy` dialect
 

@@ -69,18 +69,15 @@ spends time reporting them, and so operators can judge the risk themselves:
   `tenants_without_policy: allow`, so its key can use every model. Remove that
   setting before you issue keys to other people.
 - **Keys in the config file change only on restart.** `auth.keys`, the HMAC
-  secret, the auth store and the policy poll interval are fixed when the proxy
-  starts. A `SIGHUP` reload does not apply changes to them, so setting
-  `revoked: true` on a configured key takes effect only after a restart. To
-  revoke without a restart, use the admin API: `DELETE /keys/{id}` revokes an
-  API-minted key, and `DELETE /tenants/{id}` revokes every key of a tenant,
-  including configured keys. Other replicas see a revocation at their next
-  policy poll (48 to 60 seconds). A request that was admitted before the
-  revocation is not stopped.
-- **Do not change the HMAC secret and send `SIGHUP`.** A reload installs the
-  new secret for verification but keeps the old secret for minting and the old
-  key digests, so every key is refused until a restart. Rotate the secret with
-  a restart.
+  secret, the auth store, the credential key ring and the policy poll interval
+  are fixed when the proxy starts. A `SIGHUP` reload that changes one of them
+  is refused whole and logged at `error`, so setting `revoked: true` on a
+  configured key takes effect only after a restart. To revoke without a
+  restart, use the admin API: `DELETE /keys/{id}` revokes an API-minted key,
+  and `DELETE /tenants/{id}` revokes every key of a tenant, including
+  configured keys. Other replicas see a revocation at their next policy poll
+  (48 to 60 seconds). A request that was admitted before the revocation is not
+  stopped.
 - **File-sourced credentials and certificates are not watched.** Nothing
   re-reads a file when it changes on disk; see
   [Config reload](docs/site/src/content/docs/operations/config-reload.md) for

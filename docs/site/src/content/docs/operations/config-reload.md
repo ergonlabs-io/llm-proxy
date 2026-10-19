@@ -96,19 +96,28 @@ that start after a successful reload.
 | Listener admission limits | Active from the next accepted connection. | No |
 | `pricing` | Installed if the chain has no auth store. With an `auth:` block, the stored card wins; use `PUT /pricing`. | No |
 | `auth.max_policy_staleness` | Active. | No |
-| `auth.keys` (add, remove, `revoked: true`) | **Not applied.** The proxy keeps the key list it started with. A removed or revoked configured key still authenticates. | Yes |
-| `auth.hmac_secret` / `auth.hmac_secret_file` | **Do not change and reload.** See the warning below. | Yes |
-| `auth.store`, `auth.tenant_credentials` | Not applied. | Yes |
-| `observability.tracing`, `observability.metrics` | Not applied. The OTLP exporters keep the settings from startup. No warning is logged. | Yes |
-| `ledger`, `observability.traces` | A change makes the proxy refuse the whole reload and keep the previous snapshot. | Yes |
+| `auth.keys` (add, remove, `revoked: true`) | A change makes the proxy refuse the whole reload. A removed or revoked configured key keeps authenticating until a restart. | Yes |
+| `auth.hmac_secret` / `auth.hmac_secret_file` | A changed secret makes the proxy refuse the whole reload. Keys keep working with the secret from startup. | Yes |
+| `auth.store`, `auth.tenant_credentials` | A change makes the proxy refuse the whole reload. A rotated key file at the same path is a change. | Yes |
+| `observability.tracing`, `observability.metrics` | A change makes the proxy refuse the whole reload. | Yes |
+| `ledger`, `observability.traces` | A change makes the proxy refuse the whole reload. | Yes |
 | Keys, tenants and policy from the admin API | Not part of the file. They stay in the auth store and are not changed by a reload. | No |
 
-> **Warning: rotate the HMAC secret with a restart.** After a reload that
-> changes the secret, the proxy verifies presented keys with the new secret
-> but keeps the old key digests, and it mints new keys with the old secret.
-> Every virtual key, including one minted after the reload, is refused with
-> `401`, and the log still says the reload succeeded. A restart applies the
-> new secret to both sides. This is a known defect.
+A refused reload keeps the previous snapshot and logs this line at `error`:
+
+```text
+SIGHUP: config reload refused; continuing to serve the previous snapshot
+```
+
+Its `detail` field names the chain, the filter and the field that changed,
+for example `typed_config.hmac_secret` with the dialect's
+`auth.hmac_secret` / `auth.hmac_secret_file`, and says to restart. For
+`ledger` and the `observability` blocks, the message itself names the field.
+The log never contains the secret.
+
+To rotate the HMAC secret, change it and restart. Configured keys must be digested again under the new secret, and
+keys minted through the admin API stop working, because their digests were
+made with the old secret.
 
 To revoke a key without a restart, use the admin API: `DELETE /keys/{id}` for
 a key minted through the API, or `DELETE /tenants/{id}` to revoke every key
@@ -132,7 +141,10 @@ when a worker builds the new listener, after the reload has logged success:
 - A provider cluster that fails to build is left out of the cluster set and
   logged at `error`.
 - A TLS file that cannot be read, or a filter that fails to build, makes the
-  listener reset new connections until a later reload succeeds.
+  listener reset new connections until a later reload succeeds. The
+  `llmproxy.auth` filter is the exception: its config is parsed before the
+  reload is applied, so an `auth` error (such as an unreadable
+  `auth.hmac_secret_file`) refuses the reload instead.
 
 Run `--mode validate` before you send `SIGHUP`, and check the log after it.
 

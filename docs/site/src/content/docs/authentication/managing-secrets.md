@@ -21,7 +21,8 @@ generate it, install its digest, grant its tenant access to models, verify
 it, revoke it, and rotate the HMAC secret that keys every digest.
 
 **Every change to `auth.keys` or the HMAC secret takes a restart.** A
-`SIGHUP` reload does not apply them (see
+`SIGHUP` reload that changes them is refused, and the proxy keeps the running
+keys and secret (see
 [Reload configuration](../../operations/config-reload/#what-a-reload-applies)). Keys
 can also be minted and revoked at runtime through the admin API, without a
 restart; see
@@ -118,7 +119,7 @@ llm-proxy --config llmproxy.yaml --mode validate
 ## Step 3: Restart the proxy
 
 Stop the proxy and start it again with the same command. A `SIGHUP` reload
-does not add the key.
+that adds the key is refused, and the log names `auth.keys`.
 
 ## Step 4: Know the starting policy
 
@@ -216,17 +217,16 @@ keys to every caller:
 5. Give the new plaintext keys to the callers. A caller that sends an old key
    gets `401`.
 
-> **Warning:** Do not change the secret and send `SIGHUP`. The reload checks
-> keys with the new secret but keeps the old digests and mints with the old
-> secret, so every key is refused until a restart. This is a known defect.
+A `SIGHUP` after you change the secret is refused: the proxy logs
+`SIGHUP: config reload refused` naming `auth.hmac_secret` and keeps serving
+with the old secret and the old digests.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Every request gets `401` with a key you believe is correct | The digest was computed with a different secret than the one the proxy loaded. A common cause is a trailing newline in an inline secret, or `hmac_secret_file` pointing at another file. | Regenerate with `--mode keygen --hmac-secret-file` against the file the proxy uses, then restart. |
-| Every key gets `401` after a `SIGHUP` | The HMAC secret changed before the reload. | Restart the proxy. |
-| A new or changed key in `auth.keys` has no effect | The proxy was reloaded with `SIGHUP`, not restarted. | Restart the proxy. |
+| A new or changed key in `auth.keys`, or a new secret, has no effect | The proxy was reloaded with `SIGHUP`, not restarted, and refused the reload (`SIGHUP: config reload refused` in the log). | Restart the proxy. |
 | `403` `forbidden` after a successful key setup | The tenant has no model policy. | Grant access (step 5). |
 | `403` on every admin call | `LLMPROXY_ADMIN_TOKEN` is not set for the proxy, or the request sent another token. | Set the variable for the proxy process and send it as `authorization: Bearer`. |
 | `--mode keygen requires --tenant <TENANT>` | `keygen` ran without `--tenant`. | Add `--tenant <name>`. |

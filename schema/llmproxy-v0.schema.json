@@ -217,26 +217,26 @@
       "properties": {
         "hmac_secret": {
           "type": "string",
-          "description": "The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` interpolation rather than inlining it. Fixed when the proxy starts: rotate it with a restart, never with a `SIGHUP` reload (see `hmac_secret_file`).",
+          "description": "The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` interpolation rather than inlining it. Fixed when the proxy starts: a `SIGHUP` reload that changes it is refused and the proxy keeps the running secret. Rotate it with a restart.",
           "examples": ["${LLMPROXY_AUTH_SECRET}"]
         },
         "hmac_secret_file": {
           "type": "string",
-          "description": "Read the HMAC secret from this file (trailing whitespace trimmed). The secret is fixed when the proxy starts: rotate it with a restart. Do not change it and send `SIGHUP`: the reload verifies keys with the new secret but keeps the old digests and mints with the old secret, so every key is refused until a restart."
+          "description": "Read the HMAC secret from this file (trailing whitespace trimmed). The file is read again on each `SIGHUP` reload, but the secret is fixed when the proxy starts: a reload that changes it is refused and the proxy keeps the running secret. Rotate it with a restart."
         },
         "keys": {
           "type": "array",
           "default": [],
-          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning. The list is fixed when the proxy starts: a `SIGHUP` reload does not add, remove, or revoke a configured key, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning. The list is fixed when the proxy starts: a `SIGHUP` reload that adds, removes, or revokes a configured key is refused whole, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
           "items": { "$ref": "#/$defs/AuthKey" }
         },
         "store": {
-          "description": "Where minted keys, revocations, and tenant policy live. Absent means `in_memory`, which keeps them only for the life of the process. Exactly one of the three shapes below, the same three the Envoy-mode `llmproxy.auth` filter accepts. The store is fixed at startup: changing it takes a restart, not a `SIGHUP` reload.",
+          "description": "Where minted keys, revocations, and tenant policy live. Absent means `in_memory`, which keeps them only for the life of the process. Exactly one of the three shapes below, the same three the Envoy-mode `llmproxy.auth` filter accepts. The store is fixed at startup: a `SIGHUP` reload that changes it is refused, so changing it takes a restart.",
           "$ref": "#/$defs/AuthStore"
         },
         "tenant_credentials": {
           "$ref": "#/$defs/AuthTenantCredentials",
-          "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials. Requires a durable `store`, `persistent` or `shared`; with `store` absent or `in_memory` this block is a load error."
+          "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials. Requires a durable `store`, `persistent` or `shared`; with `store` absent or `in_memory` this block is a load error. Fixed at startup: a `SIGHUP` reload that changes it, including new key bytes in a file at the same path, is refused."
         },
         "enforce": { "$ref": "#/$defs/AuthEnforce" },
         "max_policy_staleness": {
