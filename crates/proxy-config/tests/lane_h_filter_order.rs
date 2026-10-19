@@ -8,7 +8,7 @@ use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, S
 // Resolve type URLs from the lowerer so the tests also pin its constants.
 use proxy_config::lower::{
     AUTH_FILTER_TYPE as AUTH, BODY_REWRITE_FILTER_TYPE as BODY_REWRITE,
-    LEGACY_BODY_REWRITE_FILTER_TYPE as LEGACY_BODY_REWRITE,
+    GUARDRAIL_FILTER_TYPE as GUARDRAIL, LEGACY_BODY_REWRITE_FILTER_TYPE as LEGACY_BODY_REWRITE,
     LEGACY_TOKEN_LIMIT_FILTER_TYPE as LEGACY_TOKEN_LIMIT, LEGACY_USAGE_FILTER_TYPE as LEGACY_USAGE,
     MODEL_AUTHZ_FILTER_TYPE as MODEL_AUTHZ, MODEL_RESOLVER_FILTER_TYPE as MODEL_RESOLVER,
     OBJECT_OWNERSHIP_FILTER_TYPE as OBJECT_OWNERSHIP, SPEND_LIMIT_FILTER_TYPE as SPEND_LIMIT,
@@ -95,6 +95,12 @@ fn the_type_url_literals_in_lower_rs_match_the_filters_that_define_them() {
          proxy-config/src/lower.rs or BOTH spend_limit ordering rules \
          silently stop firing"
     );
+    assert_eq!(
+        GUARDRAIL,
+        proxy_filters::guardrail_filter::TYPE_URL,
+        "the guardrail filter's type URL changed; update `GUARDRAIL_FILTER_TYPE` in \
+         proxy-config/src/lower.rs or every guardrail ordering rule silently stops firing"
+    );
 }
 
 /// One `http_filters` entry. The configs are the minimum each message needs to
@@ -114,6 +120,9 @@ fn filter_entry(name: &str, type_url: &str) -> String {
         MODEL_RESOLVER => "\n                      rules: { default_model: fast }",
         SPEND_LIMIT => "\n                      default_period: MONTHLY",
         OBJECT_OWNERSHIP => "\n                      collections: [\"/v1/files\"]",
+        GUARDRAIL => {
+            "\n                      default_check:\n                        http: { uri: \"http://127.0.0.1:9/check\", timeout_ms: 100, max_body_bytes: 1024 }\n                        failure_mode: FAIL_CLOSED"
+        }
         other => panic!("unexpected type url {other}"),
     };
     format!(
@@ -481,6 +490,7 @@ fn each_lane_h_filter_alone_is_a_valid_chain() {
         ("llmproxy.body_rewrite", BODY_REWRITE),
         ("llmproxy.model_authz", MODEL_AUTHZ),
         ("llmproxy.spend_limit", SPEND_LIMIT),
+        ("llmproxy.guardrail", GUARDRAIL),
     ] {
         chain(&[(name, url)])
             .unwrap_or_else(|e| panic!("`{name}` alone must be a valid chain, got {e:?}"));
@@ -670,4 +680,92 @@ fn model_resolver_with_legacy_body_rewrite_is_accepted() {
         ("llmproxy.model_resolver", MODEL_RESOLVER),
     ])
     .expect("the one-release legacy body_rewrite type satisfies the resolver");
+}
+
+// --- guardrail: after auth, body_rewrite, model_resolver and model_authz;
+// --- before token_limit, spend_limit and usage ------------------------------
+
+const GUARDRAIL_CHAIN: [(&str, &str); 8] = [
+    ("llmproxy.auth", AUTH),
+    ("llmproxy.body_rewrite", BODY_REWRITE),
+    ("llmproxy.model_resolver", MODEL_RESOLVER),
+    ("llmproxy.model_authz", MODEL_AUTHZ),
+    ("llmproxy.guardrail", GUARDRAIL),
+    ("llmproxy.token_limit", TOKEN_LIMIT),
+    ("llmproxy.spend_limit", SPEND_LIMIT),
+    ("llmproxy.usage", USAGE),
+];
+
+/// `GUARDRAIL_CHAIN` with the guardrail moved to `to`.
+fn guardrail_at(to: usize) -> Vec<(&'static str, &'static str)> {
+    let mut order: Vec<_> = GUARDRAIL_CHAIN.to_vec();
+    let guardrail = order.remove(4);
+    order.insert(to, guardrail);
+    order
+}
+
+#[test]
+fn guardrail_in_its_place_in_the_full_chain_is_accepted() {
+    chain(&GUARDRAIL_CHAIN).expect("the guardrail between model_authz and token_limit loads");
+}
+
+/// Each misplacement is rejected naming both filters and what goes wrong.
+#[test]
+fn a_misplaced_guardrail_is_rejected_naming_both_filters() {
+    let cases = [
+        (
+            0,
+            "llmproxy.auth",
+            "every tenant would get the default check",
+        ),
+        (1, "llmproxy.body_rewrite", "no model"),
+        (2, "llmproxy.model_resolver", "resolved model"),
+        (3, "llmproxy.model_authz", "disclosed"),
+    ];
+    for (to, must_precede, consequence) in cases {
+        let (_, reason) = expect_invalid(chain(&guardrail_at(to)));
+        assert!(
+            reason.starts_with(&format!(
+                "`{must_precede}` must be configured BEFORE `llmproxy.guardrail`"
+            )),
+            "guardrail at {to}: {reason}"
+        );
+        assert!(reason.contains(consequence), "guardrail at {to}: {reason}");
+    }
+    // Each later filter alone, so no earlier rule in the list fires first.
+    let cases = [
+        (("llmproxy.token_limit", TOKEN_LIMIT), "token budget"),
+        (("llmproxy.spend_limit", SPEND_LIMIT), "charged"),
+        (("llmproxy.usage", USAGE), "metered"),
+    ];
+    for (later, consequence) in cases {
+        let (field_path, reason) =
+            expect_invalid(chain(&[later, ("llmproxy.guardrail", GUARDRAIL)]));
+        assert!(
+            reason.starts_with(&format!(
+                "`llmproxy.guardrail` must be configured BEFORE `{}`",
+                later.0
+            )),
+            "guardrail after {}: {reason}",
+            later.0
+        );
+        assert!(reason.contains(consequence), "{reason}");
+        assert_eq!(
+            field_path,
+            "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]",
+            "the path names the misplaced guardrail"
+        );
+    }
+}
+
+#[test]
+fn guardrail_before_auth_is_rejected_at_the_auth_entry() {
+    let (field_path, _) = expect_invalid(chain(&[
+        ("llmproxy.guardrail", GUARDRAIL),
+        ("llmproxy.auth", AUTH),
+    ]));
+    assert_eq!(
+        field_path,
+        "static_resources.listeners[0].filter_chains[0].filters[0].typed_config.http_filters[1]"
+    );
 }

@@ -70,6 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "llmproxy/filters/v0/model_authz.proto",
         // Per-tenant resolution of the reserved `auto` model.
         "llmproxy/filters/v0/model_resolver.proto",
+        // Body-aware request guardrails.
+        "llmproxy/filters/v0/guardrail.proto",
         // Tenant ownership of provider object IDs.
         "llmproxy/filters/v0/object_ownership.proto",
         // The spend-budget filter's (cluster, model)

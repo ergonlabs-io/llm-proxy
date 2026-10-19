@@ -1,0 +1,84 @@
+// Body-aware request guardrails for the llm-proxy data plane.
+//
+// Vendored for its own sake, like `model_resolver.proto`: Envoy's ext_authz
+// stays header-only here, and no compiled Envoy message shapes a per-tenant
+// check with an explicit failure mode.
+
+syntax = "proto3";
+
+package llmproxy.filters.v0;
+
+// Configures the guardrail filter (`llmproxy.guardrail`).
+//
+// The filter sends each request's buffered body, with its tenant and its
+// requested and resolved model, to a check, and refuses the request when the
+// check denies it. A refused request is never dialled and never charged. The
+// filter only allows or denies: it never changes the request.
+//
+// Sending a request body to a check is a data-disclosure decision: the check
+// sees every prompt it is asked about.
+message Guardrail {
+  // Required. The check for a tenant with no entry in `tenants`, and for a
+  // request with no authenticated tenant. There is no unchecked default.
+  GuardrailCheck default_check = 1;
+
+  // Per-tenant checks that replace `default_check`. Each `tenant` must be
+  // unique.
+  repeated TenantGuardrail tenants = 2;
+}
+
+// One tenant's check.
+message TenantGuardrail {
+  // Required. Matches `StreamInfo::auth.tenant` as written by `llmproxy.auth`.
+  string tenant = 1;
+
+  // Required.
+  GuardrailCheck check = 2;
+}
+
+// What a check does when it cannot decide. Required: the zero value is a load
+// error, so a check never fails open by default.
+enum FailureMode {
+  FAILURE_MODE_UNSPECIFIED = 0;
+  // Refuse the request when the check errors, times out, or the body is over
+  // the check's limit.
+  FAIL_CLOSED = 1;
+  // Admit the request in those cases. Each admission is counted and logged
+  // (rate limited), so the bypass is visible.
+  FAIL_OPEN = 2;
+}
+
+// One check: a backend and its failure mode.
+message GuardrailCheck {
+  // Required (exactly one branch must be set). A oneof so other backends can
+  // be added as further branches.
+  oneof backend {
+    // An external HTTP service.
+    HttpGuardrail http = 1;
+  }
+
+  // Required. See `FailureMode`.
+  FailureMode failure_mode = 2;
+}
+
+// An external HTTP check.
+//
+// The filter sends `POST <uri>` with a JSON object:
+// `{"tenant", "requested_model", "resolved_model", "body"}`, where each of
+// the first three is a string or null, and `body` is the request body as
+// text. A body that is not UTF-8 is sent as `body_base64` instead of `body`.
+// The service answers 200 with `{"decision": "allow"}` or
+// `{"decision": "deny", "reason": "..."}`. Any other answer is an error.
+message HttpGuardrail {
+  // Required. An absolute `http` or `https` URI with no user information.
+  // `https` verifies the server against the platform's root certificates.
+  string uri = 1;
+
+  // Required, greater than 0. Bounds the whole check: connect, request and
+  // response. A check that takes longer is a timeout.
+  uint32 timeout_ms = 2;
+
+  // Required, greater than 0. A request body longer than this is not sent;
+  // the check's failure mode decides the request.
+  uint64 max_body_bytes = 3;
+}

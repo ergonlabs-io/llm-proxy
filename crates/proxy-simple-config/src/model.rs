@@ -59,6 +59,93 @@ pub struct SimpleConfig {
     /// dialled request. Absent means no ledger.
     #[serde(default)]
     pub ledger: Option<Ledger>,
+    /// Body-aware request checks. Absent means no request is checked.
+    #[serde(default)]
+    pub guardrails: Option<Guardrails>,
+}
+
+/// `guardrails`: which check each request's body is sent to. Lowers to the
+/// `llmproxy.guardrail` filter. Required fields are `Option`s so a missing one
+/// is reported at its own path, as for [`Ledger`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guardrails {
+    /// The check for a tenant with no entry in `tenants`, and for a request
+    /// with no authenticated tenant. Required.
+    #[serde(default)]
+    pub default: Option<GuardrailCheck>,
+    /// Tenant -> check, replacing `default`. `deserialize_with` rejects a
+    /// duplicate tenant rather than keeping the last one.
+    #[serde(default, deserialize_with = "deserialize_guardrail_tenants")]
+    pub tenants: BTreeMap<String, GuardrailCheck>,
+}
+
+/// One check: exactly one backend (only `http` today) and its failure mode.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardrailCheck {
+    #[serde(default)]
+    pub http: Option<HttpGuardrail>,
+    #[serde(default)]
+    pub failure_mode: Option<GuardrailFailureMode>,
+}
+
+/// What a check does when it cannot decide. No default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailFailureMode {
+    Closed,
+    Open,
+}
+
+/// An external HTTP check.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpGuardrail {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<SimpleDuration>,
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+}
+
+/// Deserializes `guardrails.tenants`, erroring on a literal duplicate tenant,
+/// for the same reason as [`deserialize_model_catalog`].
+fn deserialize_guardrail_tenants<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, GuardrailCheck>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct GuardrailTenantsVisitor;
+
+    impl<'de> Visitor<'de> for GuardrailTenantsVisitor {
+        type Value = BTreeMap<String, GuardrailCheck>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of tenant -> check")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut out = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if out.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate `guardrails.tenants` entry `{key}`"
+                    )));
+                }
+                let value = map.next_value::<GuardrailCheck>()?;
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(GuardrailTenantsVisitor)
 }
 
 /// `ledger`: lowers to `node.metadata["io.llmproxy.ledger"]`, which owns the

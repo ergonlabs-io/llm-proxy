@@ -107,6 +107,10 @@ pub enum FormatOp {
     /// `%LLM_RESOLVED_MODEL%` -- the model a resolver chose when the
     /// requested model was `auto`. `-` when nothing was resolved.
     LlmResolvedModel,
+    /// `%LLM_GUARDRAIL%` -- the `llmproxy.guardrail` outcome (`allowed`,
+    /// `denied`, `error`, `timeout`, `over_limit`, `failure_mode_allowed`).
+    /// `-` when no guardrail checked the request.
+    LlmGuardrail,
     LlmSelectedModel,
     /// `%LLM_SERVED_MODEL%` -- the model the provider's response says it
     /// served, which can differ from the selected model (dated snapshots,
@@ -498,6 +502,10 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmResolvedModel
         }
+        "LLM_GUARDRAIL" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmGuardrail
+        }
         "LLM_SELECTED_MODEL" => {
             bare(name, args, truncate, input)?;
             FormatOp::LlmSelectedModel
@@ -717,6 +725,8 @@ pub struct LogContext<'a> {
     pub llm_user_id: Option<&'a str>,
     pub llm_requested_model: Option<&'a str>,
     pub llm_resolved_model: Option<&'a str>,
+    /// The guardrail outcome; `None` when no guardrail checked the request.
+    pub llm_guardrail: Option<&'a str>,
     pub llm_selected_model: Option<&'a str>,
     /// The model the provider reported serving; `None` when the response named none.
     pub llm_served_model: Option<&'a str>,
@@ -936,6 +946,7 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::LlmUserId => out.push_str(ctx.llm_user_id.unwrap_or("-")),
         FormatOp::LlmRequestedModel => out.push_str(ctx.llm_requested_model.unwrap_or("-")),
         FormatOp::LlmResolvedModel => out.push_str(ctx.llm_resolved_model.unwrap_or("-")),
+        FormatOp::LlmGuardrail => out.push_str(ctx.llm_guardrail.unwrap_or("-")),
         FormatOp::LlmSelectedModel => out.push_str(ctx.llm_selected_model.unwrap_or("-")),
         FormatOp::LlmServedModel => out.push_str(ctx.llm_served_model.unwrap_or("-")),
         FormatOp::LlmUpstreamId => out.push_str(ctx.llm_upstream_id.unwrap_or("-")),
@@ -1275,6 +1286,7 @@ mod tests {
             llm_user_id: None,
             llm_requested_model: None,
             llm_resolved_model: None,
+            llm_guardrail: None,
             llm_selected_model: None,
             llm_served_model: None,
             llm_upstream_id: None,
@@ -1322,6 +1334,17 @@ mod tests {
         c.llm_selected_model = Some("provider-fast-v2");
         assert_eq!(render(&fs, &c), "auto fast provider-fast-v2");
         assert!(parse_format("%LLM_RESOLVED_MODEL(x)%").is_err());
+    }
+
+    #[test]
+    fn renders_the_guardrail_outcome_and_dash_when_unchecked() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%LLM_GUARDRAIL%");
+        assert_eq!(render(&fs, &c), "-");
+        c.llm_guardrail = Some("denied");
+        assert_eq!(render(&fs, &c), "denied");
+        assert!(parse_format("%LLM_GUARDRAIL(x)%").is_err());
     }
 
     #[test]

@@ -1215,6 +1215,7 @@ mod tests {
             llm_user_id: None,
             llm_requested_model: None,
             llm_resolved_model: None,
+            llm_guardrail: None,
             llm_selected_model: None,
             llm_served_model: None,
             llm_upstream_id: None,

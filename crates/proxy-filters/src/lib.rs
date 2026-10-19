@@ -27,6 +27,9 @@
 //! - [`proxy_control::control`] and [`proxy_control::control_redis`] hold the `ControlPlaneStore` trait, its
 //!   in-memory, redb and Redis implementations, and the published
 //!   `ControlPlaneSnapshot` the authenticators read.
+//! - [`guardrail_filter`] sends each request's buffered body to a check and
+//!   refuses what it denies; it must run after `llmproxy.model_authz` and
+//!   before `llmproxy.token_limit`, `llmproxy.spend_limit` and `llmproxy.usage`.
 //! - [`pricing`] and [`proxy_control::spend`] provide the rate card and spend accumulation;
 //!   [`spend_limit_filter`] enforces per-tenant spend budgets.
 
@@ -35,6 +38,7 @@ pub mod body_rewrite;
 pub mod body_rewrite_filter;
 pub mod cors;
 pub mod ext_authz;
+pub mod guardrail_filter;
 pub mod jwks_refresh;
 pub mod jwt_auth;
 pub mod local_ratelimit;
