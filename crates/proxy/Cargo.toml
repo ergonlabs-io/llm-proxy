@@ -76,6 +76,9 @@ tokio-rustls = { workspace = true }
 # the wire, same idiom as `crates/proxy-xds/tests/apply.rs`'s own fixtures.
 prost = { workspace = true }
 prost-types = { workspace = true }
+# tests/ads_e2e.rs encodes an `llmproxy.auth` typed_config, which has no
+# generated Rust type, from `proxy_api::descriptor_pool()`.
+prost-reflect = { workspace = true }
 # tests/otlp_trace_e2e.rs's mock OTLP collector: a real `TraceServiceServer`
 # (generated in `proxy-api`) served over a real ephemeral `tonic` endpoint --
 # the only way to prove spans actually cross the wire in the shape a real
