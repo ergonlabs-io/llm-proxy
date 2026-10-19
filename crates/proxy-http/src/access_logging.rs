@@ -254,9 +254,8 @@ pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestS
 
 /// Maps the GenAI request targets this proxy understands to OTel's
 /// operation label. `responses` is deliberately the documented custom value
-/// for OpenAI's Responses API: semconv v1.27 only standardizes `chat`,
-/// `text_completion` and `embeddings`, and calling Responses "chat" would be a
-/// false label.
+/// for OpenAI's Responses API: semconv 1.41 has no well-known value for it,
+/// and calling Responses "chat" would be a false label.
 fn gen_ai_operation(method: &str, path: &str) -> Option<&'static str> {
     let method = http::Method::from_bytes(method.as_bytes()).ok()?;
     match Endpoint::classify(&method, path) {
@@ -975,28 +974,29 @@ impl LoggingBody {
             token_stats.record_usage(provider, tenant.as_deref(), tokens);
         }
 
-        // Semconv v1.27's latency metrics require an operation, requested
-        // model, and GenAI system. Each comes from a trustworthy local source:
+        // The semconv GenAI histograms are labelled by operation, requested
+        // model, and provider. Each comes from a trustworthy local source:
         // operation from the request target, model from the body-rewrite
         // filter's parsed `requested_model` (never a cluster-name substitute),
-        // and system from the route-selected usage filter. Missing any one is
+        // and provider from the route-selected usage filter. Missing any one is
         // an honest absence, not a reason to invent a label. Failed/truncated
-        // responses are excluded because both semconv metrics are for
-        // successful responses.
+        // responses are excluded; see `GEN_AI_CLIENT_OPERATION_DURATION` for
+        // why the client duration is success-only too.
+        let gen_ai_operation_name = gen_ai_operation(&ctx.request.method, &ctx.request.path);
         if response_flags.is_empty() && (200..300).contains(&ctx.response_code) {
-            if let (Some(latency_stats), Some(operation), Some(model), Some(system)) = (
+            if let (Some(latency_stats), Some(operation), Some(model), Some(provider)) = (
                 ctx.latency_stats.as_ref(),
-                gen_ai_operation(&ctx.request.method, &ctx.request.path),
+                gen_ai_operation_name,
                 requested_model.as_deref(),
                 llm_system,
             ) {
                 latency_stats.record(
                     operation,
                     model,
-                    system.as_str(),
+                    provider.as_str(),
                     llm_time_to_first_body_byte,
                     stream_duration,
-                    llm_tokens.map(|tokens| tokens.output),
+                    llm_tokens,
                 );
             }
         }
@@ -1030,6 +1030,39 @@ impl LoggingBody {
                 {
                     attributes.push(("x-request-id", request_id.to_string()));
                 }
+                // Semconv GenAI span attributes, each only where this stream
+                // knows it. Token counts use semconv's meaning (input includes
+                // both cache buckets), with the cache buckets also broken out
+                // under their own semconv 1.41 names.
+                if let Some(operation) = gen_ai_operation_name {
+                    attributes.push(("gen_ai.operation.name", operation.to_string()));
+                }
+                if let Some(provider) = llm_system {
+                    attributes.push(("gen_ai.provider.name", provider.as_str().to_string()));
+                }
+                if let Some(model) = requested_model.as_deref() {
+                    attributes.push(("gen_ai.request.model", model.to_string()));
+                }
+                if let Some(model) = llm_served_model.as_deref() {
+                    attributes.push(("gen_ai.response.model", model.to_string()));
+                }
+                if let Some(id) = llm_upstream.0.as_deref() {
+                    attributes.push(("gen_ai.response.id", id.to_string()));
+                }
+                let int_attributes = llm_tokens
+                    .map(|tokens| {
+                        let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+                        vec![
+                            ("gen_ai.usage.input_tokens", int(tokens.semconv_input())),
+                            ("gen_ai.usage.output_tokens", int(tokens.output)),
+                            ("gen_ai.usage.cache_read.input_tokens", int(tokens.cached)),
+                            (
+                                "gen_ai.usage.cache_creation.input_tokens",
+                                int(tokens.cache_creation),
+                            ),
+                        ]
+                    })
+                    .unwrap_or_default();
                 sink.emit(FinishedSpan {
                     context: span_ctx,
                     name: format!("{} {}", ctx.request.method, ctx.request.path),
@@ -1037,6 +1070,7 @@ impl LoggingBody {
                     start: ctx.start_time,
                     end: SystemTime::now(),
                     attributes,
+                    int_attributes,
                     status: if ctx.response_code >= 500 {
                         SpanStatus::Error
                     } else {
@@ -2348,6 +2382,127 @@ mod tests {
             assert!(attrs.contains(&("gen_ai.request.model".to_string(), "gpt-4o".to_string())));
             assert_eq!(registry.histogram_snapshot(handle).count, 1);
         }
+    }
+
+    /// Drives one successful chat completion whose usage has cache reads and
+    /// cache writes through the real `LoggingBody::finish`, with both token
+    /// recorders and a span sink wired, and returns what each one saw.
+    async fn finish_cached_completion() -> (
+        Arc<proxy_observability::stats::Registry>,
+        proxy_observability::trace::FinishedSpan,
+    ) {
+        let capture = Arc::new(CaptureSink::default());
+        let control = proxy_observability::stats::StatsControl::new(1);
+        let registry = control.registry();
+        let handles = Arc::new(crate::stat_handles::TokenUsageStatHandles::build(
+            &control,
+            ["openai_primary"],
+        ));
+        let mut ctx = flags_ctx(&capture);
+        ctx.request.method = "POST".to_string();
+        ctx.request.path = "/v1/chat/completions".to_string();
+        ctx.token_stats = Some(Arc::new(crate::stat_handles::GenAiTokenStats::new(
+            registry.clone(),
+            handles,
+            proxy_observability::stats::WorkerId(0),
+        )));
+        ctx.latency_stats = Some(Arc::new(GenAiLatencyStats::new(
+            registry.clone(),
+            proxy_observability::stats::WorkerId(0),
+        )));
+        let (sink, mut spans) = proxy_observability::trace::SpanSink::new(4);
+        ctx.span_sink = Some(sink);
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.trace = Some(proxy_observability::trace::TraceContext::new_root(true));
+            info.upstream_cluster = Some("openai_primary".to_string());
+            info.requested_model = Some("gpt-4o".to_string());
+            info.llm.served_model = Some("gpt-4o-2024-08-06".to_string());
+            info.llm.upstream_response_id = Some("chatcmpl-123".to_string());
+            info.llm.system = Some(crate::stream_info::GenAiSystem::OpenAi);
+            info.llm.usage = Some(LlmTokenUsage {
+                input_tokens: 10,
+                cached_tokens: 80,
+                cache_creation_tokens: 30,
+                output_tokens: 7,
+            });
+        }
+
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|infallible: std::convert::Infallible| match infallible {}),
+        );
+        let _ = LoggingBody::new(body, ctx).collect().await.unwrap();
+        let span = spans.try_recv().expect("the server span was emitted");
+        (registry, span)
+    }
+
+    #[tokio::test]
+    async fn cached_tokens_make_semconv_input_differ_from_llm_input() {
+        let (registry, _) = finish_cached_completion().await;
+
+        let llm_input: u64 = registry
+            .counters()
+            .filter(|(instrument, _, _)| instrument.name == "llm.client.token.usage")
+            .filter(|(_, attrs, _)| attrs.iter().any(|(k, v)| k == "type" && v == "input"))
+            .map(|(_, _, value)| value)
+            .sum();
+        assert_eq!(
+            llm_input, 10,
+            "llm.client.token.usage input excludes both cache buckets"
+        );
+
+        let semconv = |token_type: &str| {
+            let (handle, _, _) = registry
+                .histograms()
+                .find(|(_, instrument, attrs)| {
+                    instrument.name == "gen_ai.client.token.usage"
+                        && attrs
+                            .contains(&("gen_ai.token.type".to_string(), token_type.to_string()))
+                })
+                .unwrap_or_else(|| panic!("no gen_ai.client.token.usage {token_type} series"));
+            registry.histogram_snapshot(handle)
+        };
+        let input = semconv("input");
+        assert_eq!(input.count, 1, "one observation per request");
+        assert_eq!(
+            input.sum, 120.0,
+            "semconv input is 10 + 80 cached + 30 cache writes"
+        );
+        assert_eq!(semconv("output").sum, 7.0);
+    }
+
+    #[tokio::test]
+    async fn server_span_carries_semconv_gen_ai_attributes() {
+        let (_, span) = finish_cached_completion().await;
+
+        let string = |key: &str| {
+            span.attributes
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(string("gen_ai.operation.name"), Some("chat"));
+        assert_eq!(string("gen_ai.provider.name"), Some("openai"));
+        assert_eq!(string("gen_ai.request.model"), Some("gpt-4o"));
+        assert_eq!(string("gen_ai.response.model"), Some("gpt-4o-2024-08-06"));
+        assert_eq!(string("gen_ai.response.id"), Some("chatcmpl-123"));
+        assert_eq!(
+            string("gen_ai.system"),
+            None,
+            "deprecated since semconv 1.37"
+        );
+
+        let int = |key: &str| {
+            span.int_attributes
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(int("gen_ai.usage.input_tokens"), Some(120));
+        assert_eq!(int("gen_ai.usage.output_tokens"), Some(7));
+        assert_eq!(int("gen_ai.usage.cache_read.input_tokens"), Some(80));
+        assert_eq!(int("gen_ai.usage.cache_creation.input_tokens"), Some(30));
     }
 
     /// A body that yields one `"hi"` data frame, then a configurable error.

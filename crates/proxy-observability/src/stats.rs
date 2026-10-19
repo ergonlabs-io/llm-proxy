@@ -250,8 +250,11 @@
 //!
 //! [`SEMCONV_VERSION`] names the OTel semantic-conventions revision this
 //! module's instrument names/attributes were written against. The GenAI
-//! conventions are experimental upstream and have already churned once
-//! (`gen_ai.usage.prompt_tokens` → `gen_ai.usage.input_tokens`). **Bumping
+//! conventions are experimental upstream and have churned repeatedly
+//! (`gen_ai.usage.prompt_tokens` → `gen_ai.usage.input_tokens` in 1.27,
+//! `gen_ai.system` → `gen_ai.provider.name` in 1.37). 1.41 is the last
+//! release that carries GenAI in the core semantic-conventions repository;
+//! 1.42 moved it to a separate repository that has no release yet. **Bumping
 //! this constant is a breaking change to the metric surface** — for anyone
 //! with a dashboard built on these names, it is exactly that — and belongs
 //! in the CHANGELOG under a heading that says so.
@@ -388,7 +391,7 @@ mod prometheus_conformance;
 /// attribute keys were written against. See the module doc's "Decision 5" —
 /// changing this value is a breaking change to the metric surface and must
 /// be called out in the CHANGELOG, not just bumped in passing.
-pub const SEMCONV_VERSION: &str = "1.27.0";
+pub const SEMCONV_VERSION: &str = "1.41.0";
 
 /// Envoy's default `rq_time`-family histogram bucket boundaries, in
 /// **milliseconds**. Vendored verbatim from
@@ -407,7 +410,7 @@ pub const ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS: [f64; 19] = [
     60000.0, 300000.0, 600000.0, 1800000.0, 3600000.0,
 ];
 
-/// OTel GenAI v1.27's recommended explicit boundaries for time to first
+/// OTel GenAI semconv 1.41's recommended explicit boundaries for time to first
 /// token, in seconds. These deliberately do not reuse Envoy's millisecond
 /// request-time buckets: an instrument's unit and its boundaries are one
 /// contract, and these names are exported through OTLP as OTel metrics.
@@ -415,10 +418,23 @@ pub const GEN_AI_TIME_TO_FIRST_TOKEN_BUCKETS_SECONDS: [f64; 16] = [
     0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
 
-/// OTel GenAI v1.27's recommended explicit boundaries for time per output
+/// OTel GenAI semconv 1.41's recommended explicit boundaries for time per output
 /// token, in seconds.
 pub const GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS: [f64; 13] = [
     0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5,
+];
+
+/// OTel GenAI semconv 1.41's recommended explicit boundaries for
+/// `gen_ai.client.token.usage`, in tokens (powers of four from 1 to 4^13).
+pub const GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS_TOKENS: [f64; 14] = [
+    1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
+    16777216.0, 67108864.0,
+];
+
+/// OTel GenAI semconv 1.41's recommended explicit boundaries for
+/// `gen_ai.client.operation.duration`, in seconds (doubling from 0.01).
+pub const GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS_SECONDS: [f64; 14] = [
+    0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
 ];
 
 /// Which OTel instrument shape a metric follows.
@@ -477,6 +493,7 @@ pub struct Instrument {
 pub mod instruments {
     use super::{
         Instrument, InstrumentKind, ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS,
+        GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS_SECONDS, GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS_TOKENS,
         GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS, GEN_AI_TIME_TO_FIRST_TOKEN_BUCKETS_SECONDS,
     };
 
@@ -565,16 +582,13 @@ pub mod instruments {
     /// `access_log.rs`). Hence a proprietary `llm.*` name, not a borrowed
     /// semconv one.
     ///
-    /// The upstream semconv equivalent is defined as a *histogram* (a
-    /// per-request token count distribution), not a counter. This starter
-    /// still models it as a running-total `Counter` rather than switching it
-    /// to a `Histogram` now that histogram support has landed — that switch needs
-    /// its own bucket boundaries (OTel doesn't mandate Envoy's millisecond
-    /// `rq_time` set for a token count) and is a call for later, not this
-    /// one's. Keeping it a `Counter` here avoids guessing at that number
-    /// now. Attribute keys (`provider`, `type`) are our own short names
-    /// rather than semconv's fully qualified attribute names; the
-    /// Prometheus renderer is where full key names matter.
+    /// The semconv instrument is exported alongside this one as
+    /// [`GEN_AI_CLIENT_TOKEN_USAGE`], a per-request histogram whose `input`
+    /// includes both cache buckets. This counter stays because it is the
+    /// one whose four buckets sum to the billed total, and because it is the
+    /// only one labelled by `provider` (the cluster dialled) and `tenant`.
+    /// Attribute keys (`provider`, `type`) are our own short names rather
+    /// than semconv's fully qualified attribute names.
     ///
     /// `tenant` is the third attribute key, added so operators can
     /// build per-tenant usage dashboards over OTel export (the owner's
@@ -668,7 +682,7 @@ pub mod instruments {
         buckets: Some(&ENVOY_DEFAULT_HISTOGRAM_BUCKETS_MS),
     };
 
-    /// OTel GenAI semantic conventions v1.27: proxy-observed time from
+    /// OTel GenAI semantic conventions 1.41: proxy-observed time from
     /// receiving the downstream request to the first response-body byte.
     ///
     /// This is emitted only for successful LLM responses whose route exposed
@@ -682,12 +696,12 @@ pub mod instruments {
         attribute_keys: &[
             "gen_ai.operation.name",
             "gen_ai.request.model",
-            "gen_ai.system",
+            "gen_ai.provider.name",
         ],
         buckets: Some(&GEN_AI_TIME_TO_FIRST_TOKEN_BUCKETS_SECONDS),
     };
 
-    /// OTel GenAI semantic conventions v1.27: proxy-observed mean decode
+    /// OTel GenAI semantic conventions 1.41: proxy-observed mean decode
     /// time per output token after the first token. See the recorder for the
     /// exact eligibility and arithmetic rules.
     pub const GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN: Instrument = Instrument {
@@ -697,9 +711,58 @@ pub mod instruments {
         attribute_keys: &[
             "gen_ai.operation.name",
             "gen_ai.request.model",
-            "gen_ai.system",
+            "gen_ai.provider.name",
         ],
         buckets: Some(&GEN_AI_TIME_PER_OUTPUT_TOKEN_BUCKETS_SECONDS),
+    };
+
+    /// OTel GenAI semantic conventions 1.41: tokens used by one GenAI
+    /// operation, one observation per `gen_ai.token.type` (`input`,
+    /// `output`). The proxy is the client of the provider it dials, so the
+    /// `client` instrument is the right one.
+    ///
+    /// `input` is semconv's: it includes cache reads and cache writes
+    /// (`LlmTokens::semconv_input`). That is why this does not replace
+    /// [`LLM_CLIENT_TOKEN_USAGE`], whose `input` excludes them; on a request
+    /// with cached tokens the two `input` values differ by design.
+    ///
+    /// Recorded under the same conditions as the `gen_ai.server.*`
+    /// histograms: a successful response with a body-derived requested
+    /// model and a known provider. The registry needs a fixed key set, so a
+    /// request without a requested model is not recorded rather than
+    /// recorded without `gen_ai.request.model`. The model label is capped
+    /// like the latency series.
+    pub const GEN_AI_CLIENT_TOKEN_USAGE: Instrument = Instrument {
+        name: "gen_ai.client.token.usage",
+        kind: InstrumentKind::Histogram,
+        unit: "{token}",
+        attribute_keys: &[
+            "gen_ai.operation.name",
+            "gen_ai.request.model",
+            "gen_ai.provider.name",
+            "gen_ai.token.type",
+        ],
+        buckets: Some(&GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS_TOKENS),
+    };
+
+    /// OTel GenAI semantic conventions 1.41: proxy-observed duration of one
+    /// GenAI operation, from receiving the downstream request to the end of
+    /// the response stream, in seconds.
+    ///
+    /// Successful operations only. Semconv also records failures, labelled
+    /// with `error.type`; the registry's fixed key set cannot carry a label
+    /// that only failures have, so failures are left out rather than
+    /// recorded as if they succeeded.
+    pub const GEN_AI_CLIENT_OPERATION_DURATION: Instrument = Instrument {
+        name: "gen_ai.client.operation.duration",
+        kind: InstrumentKind::Histogram,
+        unit: "s",
+        attribute_keys: &[
+            "gen_ai.operation.name",
+            "gen_ai.request.model",
+            "gen_ai.provider.name",
+        ],
+        buckets: Some(&GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS_SECONDS),
     };
 
     // ------------------------------------------------ operational self-signals --
@@ -3634,7 +3697,26 @@ mod tests {
         // doc, "Decision 5") and must appear in the CHANGELOG -- this test
         // exists so bumping the literal without doing that is at least a
         // deliberate, visible edit to this assertion, not a drive-by.
-        assert_eq!(SEMCONV_VERSION, "1.27.0");
+        assert_eq!(SEMCONV_VERSION, "1.41.0");
+    }
+
+    #[test]
+    fn gen_ai_client_buckets_are_semconv_1_41s() {
+        // Same standing as the version pin: these are the boundaries the
+        // semconv 1.41 metric spec recommends, and a change breaks every
+        // percentile query built against them.
+        let powers_of_four: Vec<f64> = (0..14).map(|i| 4f64.powi(i)).collect();
+        assert_eq!(
+            GEN_AI_CLIENT_TOKEN_USAGE_BUCKETS_TOKENS.to_vec(),
+            powers_of_four
+        );
+        assert_eq!(
+            GEN_AI_CLIENT_OPERATION_DURATION_BUCKETS_SECONDS,
+            [
+                0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96,
+                81.92
+            ]
+        );
     }
 
     // ==== Histograms ==========================================
@@ -4276,7 +4358,7 @@ mod tests {
         let overflow_attrs = [
             ("gen_ai.operation.name", "chat"),
             ("gen_ai.request.model", "-cardinality-overflow-"),
-            ("gen_ai.system", "openai"),
+            ("gen_ai.provider.name", "openai"),
         ];
         let resolve = |model: &str| {
             registry.resolve_histogram_capped(
@@ -4284,7 +4366,7 @@ mod tests {
                 &[
                     ("gen_ai.operation.name", "chat"),
                     ("gen_ai.request.model", model),
-                    ("gen_ai.system", "openai"),
+                    ("gen_ai.provider.name", "openai"),
                 ],
                 2,
                 &overflow_attrs,
@@ -4839,13 +4921,13 @@ mod tests {
                 &[
                     ("gen_ai.operation.name", "chat"),
                     ("gen_ai.request.model", model),
-                    ("gen_ai.system", "openai"),
+                    ("gen_ai.provider.name", "openai"),
                 ],
                 3,
                 &[
                     ("gen_ai.operation.name", "chat"),
                     ("gen_ai.request.model", TOKEN_OVERFLOW),
-                    ("gen_ai.system", "openai"),
+                    ("gen_ai.provider.name", "openai"),
                 ],
             )
         };
@@ -4900,13 +4982,13 @@ mod tests {
                 &[
                     ("gen_ai.operation.name", "chat"),
                     ("gen_ai.request.model", "secret-model-a"),
-                    ("gen_ai.system", "openai"),
+                    ("gen_ai.provider.name", "openai"),
                 ],
                 1,
                 &[
                     ("gen_ai.operation.name", "chat"),
                     ("gen_ai.request.model", TOKEN_OVERFLOW),
-                    ("gen_ai.system", "openai"),
+                    ("gen_ai.provider.name", "openai"),
                 ],
             );
             for model in ["secret-model-b", "secret-model-c"] {
@@ -4915,13 +4997,13 @@ mod tests {
                     &[
                         ("gen_ai.operation.name", "chat"),
                         ("gen_ai.request.model", model),
-                        ("gen_ai.system", "openai"),
+                        ("gen_ai.provider.name", "openai"),
                     ],
                     1,
                     &[
                         ("gen_ai.operation.name", "chat"),
                         ("gen_ai.request.model", TOKEN_OVERFLOW),
-                        ("gen_ai.system", "openai"),
+                        ("gen_ai.provider.name", "openai"),
                     ],
                 );
             }

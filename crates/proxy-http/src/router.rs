@@ -1067,6 +1067,7 @@ impl RouterHandler {
             start,
             end: SystemTime::now(),
             attributes,
+            int_attributes: Vec::new(),
             status,
         });
     }

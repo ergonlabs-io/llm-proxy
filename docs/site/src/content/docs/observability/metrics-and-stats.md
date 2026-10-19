@@ -48,8 +48,10 @@ becomes `envoy_llm_client_token_usage`.
 | `downstream_cx_transport_socket_connect_timeout` | counter | `listener` | Each accepted connection that the proxy closes because the TLS handshake missed `transport_socket_connect_timeout`. | `listener.<listener>.downstream_cx_transport_socket_connect_timeout` |
 | `downstream_rq_active` | gauge | `scope` (the HCM `stat_prefix`) | Requests in flight now: from the moment a request reaches the HTTP connection manager until its response body is written out or cut. A streaming response counts for its whole stream. An upgraded (WebSocket) stream stops counting when the `101` response is sent. The value starts at 0 in each process. | `http.<scope>.downstream_rq_active` |
 | `llm.client.token.usage` | counter | `provider`, `type`, `tenant` | Tokens from the provider's own usage report. `type` is `input`, `output`, `cached`, or `cache_creation`. | Not shown |
-| `gen_ai.server.time_to_first_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.system` | Time from the request to the first response body byte. 16 bucket boundaries from 0.001 to 10. | Not shown |
-| `gen_ai.server.time_per_output_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.system` | Mean time for each output token after the first token. 13 bucket boundaries from 0.01 to 2.5. | Not shown |
+| `gen_ai.client.token.usage` | histogram, {token} | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.token.type` | Tokens of each successful request, one observation for `input` and one for `output`. `input` includes cached tokens and cache writes, as OpenTelemetry defines it. Thus on a request with cached tokens it is larger than the `input` of `llm.client.token.usage`. 14 bucket boundaries from 1 to 67,108,864. | Not shown |
+| `gen_ai.client.operation.duration` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.provider.name` | Time from the request to the end of the response, for successful requests only. 14 bucket boundaries from 0.01 to 81.92. | Not shown |
+| `gen_ai.server.time_to_first_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.provider.name` | Time from the request to the first response body byte. 16 bucket boundaries from 0.001 to 10. | Not shown |
+| `gen_ai.server.time_per_output_token` | histogram, s | `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.provider.name` | Mean time for each output token after the first token. 13 bucket boundaries from 0.01 to 2.5. | Not shown |
 | `ext_authz` | counter | `scope`, `outcome` | Decisions of the external authorization filter. | `http.<scope>.<outcome>` |
 | `llmproxy_tenant_credential_requests_total` | counter | `provider`, `outcome` | Tenant-mode credential decisions: `applied`, `missing`, `unusable`. | Not shown |
 | `llmproxy_provider_credential_requests_total` | counter | `cluster`, `outcome` | Requests refused with `503 provider token unavailable` because the provider's minted OAuth2 token was missing or expired: `outcome="unavailable"`. | Not shown |
@@ -213,7 +215,7 @@ series keeps it.
 | Metric | Label | Cap (live series) | Overflow value |
 |---|---|---|---|
 | `llm.client.token.usage` | `tenant` | 4,000 | `tenant="-cardinality-overflow-"` |
-| `gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token` | `gen_ai.request.model` | 1,000 for each histogram | `gen_ai.request.model="-cardinality-overflow-"` |
+| `gen_ai.client.token.usage`, `gen_ai.client.operation.duration`, `gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token` | `gen_ai.request.model` | 1,000 for each histogram | `gen_ai.request.model="-cardinality-overflow-"` |
 | `llmproxy_tenant_credential_requests_total` | `provider` | 256 | `provider="-cardinality-overflow-"` |
 | `llmproxy_provider_credential_requests_total` | `cluster` | 256 | `cluster="-cardinality-overflow-"` |
 | `ext_authz` | `scope` | 1,024 | `scope="overflow"` |
@@ -342,8 +344,15 @@ from the client is always honored. `sample_ratio` applies only when the proxy
 creates a new root span.
 
 Spans carry no request or response body. A server span has the method, the
-path, the response flags, the upstream cluster, and the `x-request-id`. A client
-span has the response status code. To export bodies, see
+path, the response flags, the upstream cluster, and the `x-request-id`. For an
+LLM request, it also has the OpenTelemetry GenAI attributes that the proxy
+knows: `gen_ai.operation.name`, `gen_ai.provider.name`,
+`gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`, and the
+token counts `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
+`gen_ai.usage.cache_read.input_tokens` and
+`gen_ai.usage.cache_creation.input_tokens`, as integers.
+`gen_ai.usage.input_tokens` includes the two cache counts. A client span has the
+response status code. To export bodies, see
 [Request and response body export](../trace-export/).
 
 ### If the collector fails

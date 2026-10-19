@@ -562,6 +562,17 @@ impl LlmTokens {
             .saturating_add(self.cache_creation)
             .saturating_add(self.output)
     }
+
+    /// Input tokens as OTel GenAI semconv counts them: `input` plus both
+    /// cache buckets. Semconv 1.41 says `gen_ai.usage.input_tokens` SHOULD
+    /// include cache reads and cache writes, while our `input` excludes both
+    /// so the four buckets sum without double-counting. Use this for every
+    /// `gen_ai.*` token value and the plain fields for every `llm.*` one.
+    pub fn semconv_input(&self) -> u64 {
+        self.input
+            .saturating_add(self.cached)
+            .saturating_add(self.cache_creation)
+    }
 }
 
 /// One of Envoy's `%COMMON_DURATION%` time points (v1.38

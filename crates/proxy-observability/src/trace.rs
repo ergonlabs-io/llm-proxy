@@ -203,6 +203,10 @@ pub struct FinishedSpan {
     pub start: SystemTime,
     pub end: SystemTime,
     pub attributes: Vec<(&'static str, String)>,
+    /// Integer-valued attributes, exported as OTLP `int_value` rather than
+    /// strings, for semconv attributes typed `int` (the `gen_ai.usage.*`
+    /// token counts).
+    pub int_attributes: Vec<(&'static str, i64)>,
     pub status: SpanStatus,
 }
 
@@ -422,6 +426,7 @@ mod tests {
             start: SystemTime::now(),
             end: SystemTime::now(),
             attributes: Vec::new(),
+            int_attributes: Vec::new(),
             status: SpanStatus::Unset,
         };
 
@@ -450,6 +455,7 @@ mod tests {
             start: SystemTime::now(),
             end: SystemTime::now(),
             attributes: Vec::new(),
+            int_attributes: Vec::new(),
             status: SpanStatus::Unset,
         };
 

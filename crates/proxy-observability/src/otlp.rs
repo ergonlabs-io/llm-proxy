@@ -85,6 +85,11 @@ pub fn map_span(span: &FinishedSpan) -> Span {
             .attributes
             .iter()
             .map(|(key, value)| string_attribute(key, value))
+            .chain(
+                span.int_attributes
+                    .iter()
+                    .map(|(key, value)| int_attribute(key, *value)),
+            )
             .collect(),
         status: Some(map_status(span.status)),
         ..Default::default()
@@ -98,6 +103,16 @@ fn string_attribute(key: &str, value: &str) -> KeyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),
         // `key_strindex` is left at its default: this proxy emits no profiles.
+        ..Default::default()
+    }
+}
+
+fn int_attribute(key: &str, value: i64) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::IntValue(value)),
+        }),
         ..Default::default()
     }
 }
@@ -619,6 +634,7 @@ mod tests {
             start: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
             end: SystemTime::UNIX_EPOCH + Duration::from_secs(1_001),
             attributes: vec![("http.request.method", "GET".to_string())],
+            int_attributes: Vec::new(),
             status,
         }
     }
@@ -694,6 +710,24 @@ mod tests {
         match &attr.value.as_ref().unwrap().value {
             Some(any_value::Value::StringValue(s)) => assert_eq!(s, "GET"),
             other => panic!("expected StringValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_span_exports_int_attributes_as_int_values() {
+        let span = FinishedSpan {
+            int_attributes: vec![("gen_ai.usage.input_tokens", 42)],
+            ..sample_span(SpanKind::Server, SpanStatus::Ok)
+        };
+        let mapped = map_span(&span);
+        let attr = mapped
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "gen_ai.usage.input_tokens")
+            .expect("int attribute exported");
+        match &attr.value.as_ref().unwrap().value {
+            Some(any_value::Value::IntValue(n)) => assert_eq!(*n, 42),
+            other => panic!("expected IntValue, got {other:?}"),
         }
     }
 
@@ -1078,6 +1112,7 @@ mod tests {
             start: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
             end: SystemTime::UNIX_EPOCH + Duration::from_secs(1_001),
             attributes: Vec::new(),
+            int_attributes: Vec::new(),
             status: SpanStatus::Unset,
         }
     }

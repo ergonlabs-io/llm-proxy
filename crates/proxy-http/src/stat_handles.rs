@@ -671,10 +671,12 @@ pub struct GenAiTokenStats {
 pub const GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING: usize = 1_000;
 pub const GEN_AI_LATENCY_MODEL_CARDINALITY_OVERFLOW: &str = "-cardinality-overflow-";
 
-/// Records OTel GenAI latency histograms at stream completion. Unlike token
-/// usage, model labels cannot be resolved at boot: the model is extracted
-/// from each request body by the body-rewrite filter. `resolve_histogram_capped`
-/// is therefore intentionally the only request-path resolution involved.
+/// Records the OTel GenAI semconv histograms (the `gen_ai.server.*` latency
+/// pair and the `gen_ai.client.*` duration and token-usage pair) at stream
+/// completion. Unlike `llm.client.token.usage`, model labels cannot be
+/// resolved at boot: the model is extracted from each request body by the
+/// body-rewrite filter. `resolve_histogram_capped` is therefore intentionally
+/// the only request-path resolution involved.
 pub struct GenAiLatencyStats {
     registry: Arc<Registry>,
     worker: WorkerId,
@@ -683,6 +685,8 @@ pub struct GenAiLatencyStats {
     /// process-wide lock. See `proxy_observability::stats::HandleMemo`.
     ttft_memo: HandleMemo<HistogramHandle>,
     tpot_memo: HandleMemo<HistogramHandle>,
+    duration_memo: HandleMemo<HistogramHandle>,
+    token_usage_memo: HandleMemo<HistogramHandle>,
 }
 
 impl GenAiLatencyStats {
@@ -692,27 +696,31 @@ impl GenAiLatencyStats {
             worker,
             ttft_memo: HandleMemo::new(),
             tpot_memo: HandleMemo::new(),
+            duration_memo: HandleMemo::new(),
+            token_usage_memo: HandleMemo::new(),
         }
     }
 
-    /// Records the semconv-v1.27 TTFT histogram whenever the response
-    /// successfully reached a first body byte. Records TPOT only when the
-    /// provider reported at least two output tokens and the total duration is
-    /// no shorter than TTFT: semconv defines it as time *after the first
-    /// token*, divided by output tokens after that first token.
+    /// Records one successful GenAI operation: `gen_ai.client.operation.duration`
+    /// always, `gen_ai.client.token.usage` when the provider reported usage,
+    /// and the two `gen_ai.server.*` latency histograms.
+    ///
+    /// Token usage is recorded with semconv's meaning of `input`, which
+    /// includes both cache buckets (`LlmTokens::semconv_input`). Missing usage
+    /// records no token observation at all: "not reported" is not zero.
     pub fn record(
         &self,
         operation: &str,
         model: &str,
-        system: &str,
+        provider: &str,
         time_to_first_body_byte: Option<Duration>,
         stream_duration: Duration,
-        output_tokens: Option<u64>,
+        tokens: Option<LlmTokens>,
     ) {
         let attrs = [
             ("gen_ai.operation.name", operation),
             ("gen_ai.request.model", model),
-            ("gen_ai.system", system),
+            ("gen_ai.provider.name", provider),
         ];
         let overflow_attrs = [
             ("gen_ai.operation.name", operation),
@@ -720,16 +728,76 @@ impl GenAiLatencyStats {
                 "gen_ai.request.model",
                 GEN_AI_LATENCY_MODEL_CARDINALITY_OVERFLOW,
             ),
-            ("gen_ai.system", system),
+            ("gen_ai.provider.name", provider),
         ];
 
+        let handle = self.registry.resolve_histogram_capped_memo(
+            &self.duration_memo,
+            &instruments::GEN_AI_CLIENT_OPERATION_DURATION,
+            &attrs,
+            GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
+            &overflow_attrs,
+        );
+        self.registry
+            .observe(self.worker, handle, stream_duration.as_secs_f64());
+
+        if let Some(tokens) = tokens {
+            for (token_type, count) in
+                [("input", tokens.semconv_input()), ("output", tokens.output)]
+            {
+                let handle = self.registry.resolve_histogram_capped_memo(
+                    &self.token_usage_memo,
+                    &instruments::GEN_AI_CLIENT_TOKEN_USAGE,
+                    &[
+                        ("gen_ai.operation.name", operation),
+                        ("gen_ai.request.model", model),
+                        ("gen_ai.provider.name", provider),
+                        ("gen_ai.token.type", token_type),
+                    ],
+                    GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
+                    &[
+                        ("gen_ai.operation.name", operation),
+                        (
+                            "gen_ai.request.model",
+                            GEN_AI_LATENCY_MODEL_CARDINALITY_OVERFLOW,
+                        ),
+                        ("gen_ai.provider.name", provider),
+                        ("gen_ai.token.type", token_type),
+                    ],
+                );
+                self.registry.observe(self.worker, handle, count as f64);
+            }
+        }
+
+        self.record_server_latency(
+            &attrs,
+            &overflow_attrs,
+            time_to_first_body_byte,
+            stream_duration,
+            tokens.map(|tokens| tokens.output),
+        );
+    }
+
+    /// Records the TTFT histogram whenever the response successfully reached
+    /// a first body byte. Records TPOT only when the provider reported at
+    /// least two output tokens and the total duration is no shorter than
+    /// TTFT: semconv defines it as time *after the first token*, divided by
+    /// output tokens after that first token.
+    fn record_server_latency(
+        &self,
+        attrs: &[(&str, &str)],
+        overflow_attrs: &[(&str, &str)],
+        time_to_first_body_byte: Option<Duration>,
+        stream_duration: Duration,
+        output_tokens: Option<u64>,
+    ) {
         if let Some(ttft) = time_to_first_body_byte {
             let handle = self.registry.resolve_histogram_capped_memo(
                 &self.ttft_memo,
                 &instruments::GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
-                &attrs,
+                attrs,
                 GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
-                &overflow_attrs,
+                overflow_attrs,
             );
             self.registry
                 .observe(self.worker, handle, ttft.as_secs_f64());
@@ -747,9 +815,9 @@ impl GenAiLatencyStats {
         let handle = self.registry.resolve_histogram_capped_memo(
             &self.tpot_memo,
             &instruments::GEN_AI_SERVER_TIME_PER_OUTPUT_TOKEN,
-            &attrs,
+            attrs,
             GEN_AI_LATENCY_MODEL_CARDINALITY_CEILING,
-            &overflow_attrs,
+            overflow_attrs,
         );
         self.registry.observe(
             self.worker,
@@ -889,6 +957,13 @@ mod tests {
         (handle, snapshot)
     }
 
+    fn output_tokens(output: u64) -> LlmTokens {
+        LlmTokens {
+            output,
+            ..LlmTokens::default()
+        }
+    }
+
     #[test]
     fn gen_ai_latency_records_semconv_ttft_and_tpot_with_correct_units_and_formula() {
         let control = StatsControl::new(1);
@@ -901,7 +976,7 @@ mod tests {
             "openai",
             Some(Duration::from_millis(100)),
             Duration::from_secs(1),
-            Some(5),
+            Some(output_tokens(5)),
         );
 
         let (_, ttft) = latency_histogram(&registry, "gen_ai.server.time_to_first_token");
@@ -928,7 +1003,7 @@ mod tests {
             "openai",
             Some(Duration::from_millis(100)),
             Duration::from_secs(1),
-            Some(1),
+            Some(output_tokens(1)),
         );
 
         let (_, ttft) = latency_histogram(&registry, "gen_ai.server.time_to_first_token");
@@ -938,6 +1013,32 @@ mod tests {
                 .histograms()
                 .all(|(_, instrument, _)| instrument.name != "gen_ai.server.time_per_output_token"),
             "one output token leaves no post-first-token duration to report"
+        );
+    }
+
+    #[test]
+    fn client_duration_is_the_stream_duration_in_seconds() {
+        let control = StatsControl::new(1);
+        let registry = control.registry();
+        let stats = GenAiLatencyStats::new(registry.clone(), WorkerId(0));
+
+        stats.record(
+            "chat",
+            "gpt-4o",
+            "openai",
+            None,
+            Duration::from_millis(1_500),
+            None,
+        );
+
+        let (_, duration) = latency_histogram(&registry, "gen_ai.client.operation.duration");
+        assert_eq!(duration.count, 1);
+        assert!((duration.sum - 1.5).abs() < f64::EPSILON, "seconds, not ms");
+        assert!(
+            registry
+                .histograms()
+                .all(|(_, instrument, _)| instrument.name != "gen_ai.client.token.usage"),
+            "no reported usage records no token observation, not a zero"
         );
     }
 
@@ -1657,13 +1758,16 @@ mod tests {
                 "openai",
                 Some(Duration::from_millis(100)),
                 Duration::from_secs(1),
-                Some(5),
+                Some(output_tokens(5)),
             )
         };
 
         record();
         let after_cold = registry.capped_lock_acquisitions();
-        assert_eq!(after_cold, 2, "TTFT and TPOT each resolve once");
+        assert_eq!(
+            after_cold, 5,
+            "duration, TTFT, TPOT and the two token types each resolve once"
+        );
         record();
         record();
         assert_eq!(registry.capped_lock_acquisitions(), after_cold);

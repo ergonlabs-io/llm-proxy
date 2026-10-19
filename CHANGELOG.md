@@ -11,6 +11,33 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Breaking
+
+- The OpenTelemetry semantic-conventions version moves from 1.27.0 to 1.41.0,
+  the last release that holds the GenAI conventions in the core repository.
+  On `gen_ai.server.time_to_first_token` and
+  `gen_ai.server.time_per_output_token`, the label `gen_ai.system` is now
+  `gen_ai.provider.name` (`gen_ai_provider_name` in `/stats/prometheus`). The
+  values (`openai`, `anthropic`) do not change. Update dashboards and alerts
+  that select on `gen_ai.system`.
+
+### Added
+
+- The OpenTelemetry GenAI client metrics `gen_ai.client.token.usage`
+  (histogram, `{token}`, labelled by `gen_ai.token.type`) and
+  `gen_ai.client.operation.duration` (histogram, seconds), for successful LLM
+  requests with a known requested model. Their `input` includes cached tokens
+  and cache writes, as OpenTelemetry defines it, so on a request with cached
+  tokens it is larger than the `input` of `llm.client.token.usage`, which does
+  not change. The `gen_ai.request.model` label has the same 1,000-series cap as
+  the latency histograms.
+- The server span of an LLM request carries `gen_ai.operation.name`,
+  `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`,
+  `gen_ai.response.id`, and the integer token counts
+  `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
+  `gen_ai.usage.cache_read.input_tokens` and
+  `gen_ai.usage.cache_creation.input_tokens`, where the proxy knows them.
+
 ### Security
 
 - Spend budgets and token limits no longer let images, audio, batches and
