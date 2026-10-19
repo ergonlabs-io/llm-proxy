@@ -646,6 +646,12 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         "llmproxy.filters.v0.ModelResolver" => &["rules"],
         "llmproxy.filters.v0.StaticModelRules" => &["default_model", "tenants"],
         "llmproxy.filters.v0.TenantModelRule" => &["tenant", "model"],
+        // Guardrails. Listed so a future backend branch is a strict-mode
+        // error until a reader is deliberately added.
+        "llmproxy.filters.v0.Guardrail" => &["default_check", "tenants"],
+        "llmproxy.filters.v0.TenantGuardrail" => &["tenant", "check"],
+        "llmproxy.filters.v0.GuardrailCheck" => &["http", "failure_mode"],
+        "llmproxy.filters.v0.HttpGuardrail" => &["uri", "timeout_ms", "max_body_bytes"],
         "llmproxy.filters.v0.ObjectOwnership" => &[
             "collections",
             "collection",
@@ -2387,6 +2393,7 @@ pub const MODEL_RESOLVER_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters
 pub const OBJECT_OWNERSHIP_FILTER_TYPE: &str =
     "type.llmproxy.dev/llmproxy.filters.v0.ObjectOwnership";
 pub const SPEND_LIMIT_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
+pub const GUARDRAIL_FILTER_TYPE: &str = "type.llmproxy.dev/llmproxy.filters.v0.Guardrail";
 
 /// Rejects llmproxy filter chains whose order silently disables a filter.
 ///
@@ -2590,6 +2597,68 @@ fn check_lane_h_filter_order(
              config order, so the usage filter must come LATER in config order for its \
              report to exist by then; with this order reversed every request would be \
              priced as free and a configured ceiling could never be reached",
+        ),
+        (
+            AUTH_FILTER_TYPE,
+            "llmproxy.auth",
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            "the guardrail picks its check by the tenant the auth filter resolves and must \
+             only see authenticated requests, and decode callbacks run in config order; with \
+             this order reversed every tenant would get the default check",
+        ),
+        (
+            BODY_REWRITE_FILTER_TYPE,
+            "llmproxy.body_rewrite",
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            "the guardrail sends the requested model body_rewrite publishes, and the body \
+             as body_rewrite leaves it; with this order reversed the check would see no model \
+             and a body that is not the one sent upstream",
+        ),
+        (
+            MODEL_RESOLVER_FILTER_TYPE,
+            "llmproxy.model_resolver",
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            "the guardrail sends the model the resolver chose; with this order reversed a \
+             request for `auto` would be checked without its resolved model",
+        ),
+        (
+            MODEL_AUTHZ_FILTER_TYPE,
+            "llmproxy.model_authz",
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            "only an authorized request may be sent to the guardrail; with this order \
+             reversed the prompt of a request model authorization refuses would still be \
+             disclosed to the check",
+        ),
+        (
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            TOKEN_LIMIT_FILTER_TYPE,
+            "llmproxy.token_limit",
+            "a request the guardrail denies must not consume token budget, and decode \
+             callbacks run in config order; with this order reversed a denied request would \
+             still be counted against its tenant's limits",
+        ),
+        (
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            SPEND_LIMIT_FILTER_TYPE,
+            "llmproxy.spend_limit",
+            "a request the guardrail denies must not be charged, and decode callbacks run in \
+             config order; with this order reversed the spend limiter would see a request \
+             that is never served",
+        ),
+        (
+            GUARDRAIL_FILTER_TYPE,
+            "llmproxy.guardrail",
+            USAGE_FILTER_TYPE,
+            "llmproxy.usage",
+            "a request the guardrail denies must not be metered, and decode callbacks run in \
+             config order; with this order reversed the usage filter would see a request that \
+             is never served",
         ),
     ];
 

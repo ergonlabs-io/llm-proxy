@@ -115,6 +115,12 @@ fn filter_registry() -> &'static Arc<FilterRegistry> {
         registry.register(Arc::new(
             proxy_filters::model_resolver_filter::ModelResolverFilterFactory,
         ));
+        // Body-aware request guardrails. Must come AFTER `llmproxy.auth`, `llmproxy.body_rewrite`,
+        // `llmproxy.model_resolver` and `llmproxy.model_authz`, and BEFORE `llmproxy.token_limit`,
+        // `llmproxy.spend_limit` and `llmproxy.usage` (enforced by `check_lane_h_filter_order`).
+        registry.register(Arc::new(
+            proxy_filters::guardrail_filter::GuardrailFilterFactory,
+        ));
         // Tenant ownership of provider object IDs (files, batches). Must come
         // AFTER `llmproxy.auth` (enforced by `check_lane_h_filter_order`).
         registry.register(Arc::new(

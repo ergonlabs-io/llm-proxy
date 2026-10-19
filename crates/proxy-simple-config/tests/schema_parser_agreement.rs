@@ -162,6 +162,21 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "PreviousCredentialKey",
             parser_fields::<PreviousCredentialKey>,
         ),
+        (
+            "#/$defs/Guardrails",
+            "Guardrails",
+            parser_fields::<Guardrails>,
+        ),
+        (
+            "#/$defs/GuardrailCheck",
+            "GuardrailCheck",
+            parser_fields::<GuardrailCheck>,
+        ),
+        (
+            "#/$defs/HttpGuardrail",
+            "HttpGuardrail",
+            parser_fields::<HttpGuardrail>,
+        ),
     ]
 }
 
@@ -202,6 +217,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/Ledger/properties/on_unavailable",
             "LedgerOnUnavailable",
             parser_variants::<LedgerOnUnavailable>,
+        ),
+        (
+            "#/$defs/GuardrailCheck/properties/failure_mode",
+            "GuardrailFailureMode",
+            parser_variants::<GuardrailFailureMode>,
         ),
         (
             "#/$defs/Traces/properties/codec",

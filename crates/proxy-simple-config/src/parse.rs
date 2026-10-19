@@ -522,6 +522,7 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         parse_host_port(admin, "admin")?;
     }
     validate_auto(config)?;
+    validate_guardrails(config)?;
     validate_output_caps(config)?;
     Ok(())
 }
@@ -548,6 +549,97 @@ fn validate_output_caps(config: &SimpleConfig) -> Result<(), ConfigError> {
                          not apply"
                     .to_string(),
             });
+        }
+    }
+    Ok(())
+}
+
+/// `guardrails:` checks. Each failure the filter would report at its
+/// `typed_config` path is reported here at the dialect path instead.
+fn validate_guardrails(config: &SimpleConfig) -> Result<(), ConfigError> {
+    let Some(guardrails) = &config.guardrails else {
+        return Ok(());
+    };
+    let invalid = |field_path: String, reason: &str| ConfigError::InvalidValue {
+        field_path,
+        reason: reason.to_string(),
+    };
+    let Some(default) = &guardrails.default else {
+        return Err(invalid(
+            "guardrails.default".to_string(),
+            "is required: a request with no tenant entry must still be checked",
+        ));
+    };
+    if !guardrails.tenants.is_empty() && config.auth.is_none() {
+        return Err(invalid(
+            "guardrails.tenants".to_string(),
+            "requires an `auth` block: without authentication no request has a tenant, so \
+             these checks would never apply",
+        ));
+    }
+    if guardrails.tenants.contains_key("") {
+        return Err(invalid(
+            "guardrails.tenants".to_string(),
+            "a tenant must not be empty",
+        ));
+    }
+    let checks = std::iter::once(("guardrails.default".to_string(), default)).chain(
+        guardrails
+            .tenants
+            .iter()
+            .map(|(tenant, check)| (format!("guardrails.tenants.{tenant}"), check)),
+    );
+    for (path, check) in checks {
+        let Some(http) = &check.http else {
+            return Err(invalid(
+                path,
+                "a backend is required; `http` is the only backend supported",
+            ));
+        };
+        if check.failure_mode.is_none() {
+            return Err(invalid(
+                format!("{path}.failure_mode"),
+                "is required: `closed` or `open`; there is no default",
+            ));
+        }
+        // The filter parses the URL fully; this catches what it would reject
+        // so the error names the dialect path.
+        let url = http.url.as_deref().unwrap_or_default();
+        let authority = url
+            .strip_prefix("http://")
+            .or_else(|| url.strip_prefix("https://"))
+            .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+        let valid = authority.is_some_and(|a| {
+            !a.is_empty()
+                && !a.starts_with(':')
+                && !a.contains('@')
+                && !a.contains(char::is_whitespace)
+        });
+        if !valid {
+            return Err(invalid(
+                format!("{path}.http.url"),
+                "must be an absolute `http` or `https` URL with a host and no user information",
+            ));
+        }
+        match http.timeout {
+            None => {
+                return Err(invalid(format!("{path}.http.timeout"), "is required"));
+            }
+            Some(SimpleDuration(timeout))
+                if timeout.is_zero() || timeout.as_millis() > u128::from(u32::MAX) =>
+            {
+                return Err(invalid(
+                    format!("{path}.http.timeout"),
+                    "must be at least 1ms and fit in 32 bits of milliseconds",
+                ));
+            }
+            Some(_) => {}
+        }
+        if !http.max_body_bytes.is_some_and(|max| max > 0) {
+            return Err(invalid(
+                format!("{path}.http.max_body_bytes"),
+                "is required and must be greater than 0",
+            ));
         }
     }
     Ok(())

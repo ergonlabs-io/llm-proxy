@@ -168,6 +168,15 @@ const MODEL_RESOLVER_FILTER_NAME: &str = "llmproxy.model_resolver";
 /// the same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
 /// `tests/auto_model.rs` pins it.
 const MODEL_RESOLVER_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.ModelResolver";
+
+/// The guardrail's name in `http_filters`, emitted only when `guardrails:` is
+/// set. Placed after `llmproxy.model_authz` and before the limiters.
+const GUARDRAIL_FILTER_NAME: &str = "llmproxy.guardrail";
+
+/// Must equal `proxy_filters::guardrail_filter::TYPE_URL`. Duplicated for the
+/// same dependency-tree reason as [`USAGE_FILTER_TYPE_URL`];
+/// `tests/guardrails.rs` pins it.
+const GUARDRAIL_FILTER_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Guardrail";
 /// Emitted when a `limits` entry lowers; there is no per-route override.
 const TOKEN_LIMIT_FILTER_NAME: &str = "llmproxy.token_limit";
 
@@ -223,6 +232,7 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "llm_response_chunks=\"%LLM_RESPONSE_CHUNKS%\" ",
     "key_id=\"%LLM_KEY_ID%\" tenant=\"%LLM_TENANT%\" user_id=\"%LLM_USER_ID%\" ",
     "requested_model=\"%LLM_REQUESTED_MODEL%\" resolved_model=\"%LLM_RESOLVED_MODEL%\" ",
+    "guardrail=\"%LLM_GUARDRAIL%\" ",
     "selected_provider=\"%UPSTREAM_CLUSTER%\" ",
     "selected_model=\"%LLM_SELECTED_MODEL%\" rate_card_version=\"%LLM_RATE_CARD_VERSION%\" ",
     "llm_list_cost_nanodollars=\"%LLM_LIST_COST%\" ",
@@ -1761,6 +1771,35 @@ fn model_resolver_typed_config(auto: &crate::model::AutoModel) -> Value {
     json!({ "@type": MODEL_RESOLVER_FILTER_TYPE_URL, "rules": rules })
 }
 
+/// `guardrails:` -> `llmproxy.filters.v0.Guardrail`. Parse validation already
+/// guarantees every field this reads.
+fn guardrail_typed_config(guardrails: &crate::model::Guardrails) -> Value {
+    let check = |check: &crate::model::GuardrailCheck| {
+        let http = check.http.as_ref().expect("validated: a backend is set");
+        let timeout = http.timeout.expect("validated: a timeout is set").0;
+        json!({
+            "http": {
+                "uri": http.url,
+                "timeout_ms": u32::try_from(timeout.as_millis()).expect("validated: fits u32"),
+                "max_body_bytes": http.max_body_bytes,
+            },
+            "failure_mode": match check.failure_mode.expect("validated: a failure mode is set") {
+                crate::model::GuardrailFailureMode::Closed => "FAIL_CLOSED",
+                crate::model::GuardrailFailureMode::Open => "FAIL_OPEN",
+            },
+        })
+    };
+    json!({
+        "@type": GUARDRAIL_FILTER_TYPE_URL,
+        "default_check": check(guardrails.default.as_ref().expect("validated: default is set")),
+        "tenants": guardrails
+            .tenants
+            .iter()
+            .map(|(tenant, c)| json!({ "tenant": tenant, "check": check(c) }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 // -------------------------------------------------------------------- routes --
 
 /// Model glob -> Envoy header matcher on [`MODEL_HEADER`]. `*` alone means
@@ -2820,6 +2859,7 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "llm_user_id": "%LLM_USER_ID%",
                 "llm_requested_model": "%LLM_REQUESTED_MODEL%",
                 "llm_resolved_model": "%LLM_RESOLVED_MODEL%",
+                "llm_guardrail": "%LLM_GUARDRAIL%",
                 "llm_selected_model": "%LLM_SELECTED_MODEL%",
                 "llm_rate_card_version": "%LLM_RATE_CARD_VERSION%",
                 "selected_provider": "%UPSTREAM_CLUSTER%",
@@ -3240,6 +3280,17 @@ fn lower_listener(
         http_filters.push(json!({
             "name": "llmproxy.model_authz",
             "typed_config": typed_config,
+        }));
+    }
+    if let Some(guardrails) = &config.guardrails {
+        // After auth, body_rewrite, the resolver and model_authz (only an
+        // authorized request is disclosed to a check, with its resolved
+        // model); before the limiters and usage, so a denied request is never
+        // counted or charged. `check_lane_h_filter_order` rejects any other
+        // order.
+        http_filters.push(json!({
+            "name": GUARDRAIL_FILTER_NAME,
+            "typed_config": guardrail_typed_config(guardrails),
         }));
     }
     if let Some(token_limit_filter) = token_limit_filter {
