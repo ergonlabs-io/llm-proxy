@@ -255,6 +255,7 @@
         P0: "Product-defining — the LLM gateway itself",
         P1: "Serving-critical — needed to run real traffic",
         P2: "Envoy parity / breadth — backlog, not dropped",
+        P3: "Later — unscheduled until a trigger or a deployment needs it",
       }[w.prio];
       el.innerHTML = `
         <div class="card-top">
