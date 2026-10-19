@@ -362,6 +362,11 @@ pub struct StreamInfo {
     /// pricing use [`StreamInfo::routing_model`]; `requested_model` keeps what
     /// the client sent, so usage records show both.
     pub resolved_model: Option<String>,
+    /// The outcome `llmproxy.guardrail` recorded for this request, rendered
+    /// by `%LLM_GUARDRAIL%`: `allowed`, `denied`, `error`, `timeout`,
+    /// `over_limit`, or `failure_mode_allowed`. `None` when no guardrail
+    /// checked the request. Never carries the body or the check's reason.
+    pub guardrail: Option<&'static str>,
     /// Provider-owned model selected for the current upstream attempt.
     pub selected_model: Option<String>,
     pub attempts: Vec<Rc<RefCell<AttemptInfo>>>,
@@ -435,6 +440,7 @@ impl Default for StreamInfo {
             force_include_usage: false,
             max_output_tokens: None,
             resolved_model: None,
+            guardrail: None,
             selected_model: None,
             attempts: Vec::new(),
             metadata_enabled: false,
