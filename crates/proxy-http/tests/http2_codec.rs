@@ -504,3 +504,59 @@ fn several_concurrent_streams_get_their_own_response_without_crosstalk() {
         let _ = t_start.elapsed();
     });
 }
+
+/// h2spec http2/3.5/2. An invalid client preface ends the connection with an
+/// error and no GOAWAY: hyper's h2 server fails the handshake after sending
+/// its SETTINGS and before a GOAWAY can be written. RFC 9113 section 3.4
+/// allows the GOAWAY to be omitted; Envoy sends one
+/// (`internal-docs/envoy-divergences.md`). If this starts to fail because a
+/// GOAWAY arrives, remove the divergence row and the h2spec known failure.
+#[test]
+fn invalid_connection_preface_closes_the_connection_without_goaway() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    run_local(async {
+        let (mut client_io, server_io) = duplex(64 * 1024);
+        let handler: Rc<dyn StreamHandler> = Rc::new(FixedResponseHandler {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
+        let server = tokio::task::spawn_local(serve_http2(
+            server_io,
+            handler,
+            Default::default(),
+            never_shutdown(),
+            DownstreamInfo::loopback(),
+        ));
+
+        client_io
+            .write_all(b"INVALID CONNECTION PREFACE\r\n\r\n")
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve_http2 must end on an invalid preface")
+            .expect("server task should not panic");
+        assert!(result.is_err(), "an invalid preface is a connection error");
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client_io.read_to_end(&mut received))
+            .await
+            .expect("the server side is closed, so the read ends")
+            .unwrap();
+        let mut frame_types = Vec::new();
+        let mut rest = &received[..];
+        while rest.len() >= 9 {
+            let len = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+            frame_types.push(rest[3]);
+            rest = &rest[(9 + len).min(rest.len())..];
+        }
+        const SETTINGS: u8 = 0x4;
+        assert_eq!(
+            frame_types,
+            vec![SETTINGS],
+            "the server sends its SETTINGS and then closes; no GOAWAY (0x7)"
+        );
+    });
+}
