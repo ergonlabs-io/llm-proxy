@@ -78,8 +78,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - Billing ledger: when an acknowledgement at the disk cap could not put the
   spool's acknowledgement reserve back, admissions stayed closed with nothing
   left to acknowledge, so the documented "acknowledge until `admitting` is
-  `true`" loop never ended and a restart was needed. Repeating the last
-  acknowledgement now retries the reserve.
+  `true`" loop never ended and a restart was needed. The same happened when
+  the retried commit of held entries was refused once more after everything
+  was acknowledged. Repeating the last acknowledgement now puts the reserve
+  back and lets the held commit try the disk again.
 
 ## [0.5.0] - 2026-10-18
 

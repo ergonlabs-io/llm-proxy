@@ -242,8 +242,27 @@ func (p *qa13Proxy) drain() []qa13Entry {
 		// The writer writes the held entries after the ack; let them commit.
 		time.Sleep(50 * time.Millisecond)
 	}
-	p.t.Fatalf("ledger never resumed admitting\n--- proxy log ---\n%s", p.proc.Log())
+	p.t.Fatalf("ledger never resumed admitting (last ack through=%d)\n--- ledger stats ---\n%s\n--- proxy log ---\n%s",
+		acked, p.ledgerStats(), p.proc.Log())
 	return nil
+}
+
+// ledgerStats is every ledger series in /stats/prometheus, for a failure
+// message: it shows how far commits and acknowledgements got.
+func (p *qa13Proxy) ledgerStats() string {
+	resp, err := p.client.Get("http://" + p.admin + "/stats/prometheus")
+	if err != nil {
+		return err.Error()
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.Contains(line, "ledger") && !strings.HasPrefix(line, "#") {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // metric sums every series of name in /stats/prometheus whose line contains

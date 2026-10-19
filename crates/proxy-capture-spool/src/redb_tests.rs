@@ -1466,3 +1466,35 @@ fn a_repeated_acknowledgement_retries_a_reserve_that_did_not_fit() {
     spool.append(b"admitted").unwrap();
     spool.commit().unwrap();
 }
+
+/// A commit refused at the ceiling closes admissions until an acknowledgement.
+/// If the retry after a full acknowledgement is refused too, nothing new is
+/// left to acknowledge; a repeated acknowledgement must still let the pending
+/// commit try again, or the spool refuses it unseen forever.
+#[test]
+fn a_repeated_acknowledgement_lets_a_refused_commit_try_again() {
+    let temp = TempDir::new().unwrap();
+    let config = test_config(&temp);
+    let hooks = Arc::new(Hooks::default());
+    let mut spool =
+        MetadataSpool::open_with_hooks(config.clone(), key(), [], hooks.clone()).unwrap();
+    assert!(spool
+        .append_batch(&[PAYLOAD; 8])
+        .unwrap()
+        .iter()
+        .all(Result::is_ok));
+    spool.commit().unwrap();
+    spool.append(b"held").unwrap();
+
+    hooks.refuse_commits(2);
+    assert!(matches!(spool.commit(), Err(Error::Full)));
+    spool.acknowledge(8).unwrap();
+    assert!(matches!(spool.commit(), Err(Error::Full)));
+    let stats = spool.stats().unwrap();
+    assert_eq!(stats.acknowledged_through_sequence, 8);
+    assert_eq!(stats.durable_through_sequence, 8);
+    assert!(stats.headroom_reserved);
+
+    spool.acknowledge(8).unwrap();
+    assert_eq!(spool.commit().unwrap().through_sequence, 9);
+}

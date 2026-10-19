@@ -512,6 +512,10 @@ impl MetadataSpool {
         }
         self.admissible()?;
         self.quota.arm(self.database_cap);
+        #[cfg(test)]
+        if self.hooks.take_refused_commit() {
+            self.quota.arm(0);
+        }
         let result = (|| {
             let mut hash = self.hash.clone();
             for (sequence, bytes) in &self.pending {
@@ -606,16 +610,13 @@ impl MetadataSpool {
             return Err(Error::InvalidAcknowledgement);
         }
         if through_sequence <= self.state.acknowledged {
-            // Nothing new to delete, but an earlier acknowledgement may have
-            // spent the reserve and failed to put it back. With everything
-            // acknowledged, a repeat is the consumer's only way to reopen
-            // admissions, so it retries the reserve. With the reserve held,
-            // admissions are already open or wait for space a repeat cannot
-            // free.
-            if !self.headroom {
-                return self.restore_headroom();
-            }
-            return Ok(());
+            // Nothing new to delete. A consumer repeats an acknowledgement
+            // when it has nothing new to acknowledge and admissions are still
+            // closed, so the repeat must make progress on its own: put back a
+            // reserve an earlier acknowledgement could not, and let the next
+            // write try the disk again instead of refusing it unseen. A write
+            // still refused at the ceiling closes admissions again.
+            return self.restore_headroom();
         }
         let result = match self.acknowledge_prefix(through_sequence) {
             Err(Error::Full) => self.acknowledge_at_ceiling(through_sequence),
