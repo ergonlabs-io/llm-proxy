@@ -199,7 +199,7 @@
           "examples": [200]
         },
         "tls": {
-          "description": "Terminate TLS for client connections. Certificate files are read once at startup; a renewed certificate needs a restart to be served. The hot-swap mechanism exists internally but nothing watches the files yet, so do not plan renewal around it.",
+          "description": "Terminate TLS for client connections. Nothing watches the certificate files. After a `SIGHUP` reload, the next accepted connection reads `cert_file` and `key_file` again, so a renewed certificate is served to new connections; existing connections keep the old one. A reload does not check the files: if one cannot be read, the listener resets every new TLS connection until a later reload succeeds, so check the files before you send `SIGHUP`.",
           "type": "object",
           "additionalProperties": false,
           "required": ["cert_file", "key_file"],
@@ -217,17 +217,17 @@
       "properties": {
         "hmac_secret": {
           "type": "string",
-          "description": "The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` interpolation rather than inlining it.",
+          "description": "The operator secret that keys the HMAC over virtual-key digests. Use `${ENV_VAR}` interpolation rather than inlining it. Fixed when the proxy starts: rotate it with a restart, never with a `SIGHUP` reload (see `hmac_secret_file`).",
           "examples": ["${LLMPROXY_AUTH_SECRET}"]
         },
         "hmac_secret_file": {
           "type": "string",
-          "description": "Read the HMAC secret from this file (trailing whitespace trimmed; read once at startup -- hot reload is not supported yet)."
+          "description": "Read the HMAC secret from this file (trailing whitespace trimmed). The secret is fixed when the proxy starts: rotate it with a restart. Do not change it and send `SIGHUP`: the reload verifies keys with the new secret but keeps the old digests and mints with the old secret, so every key is refused until a restart."
         },
         "keys": {
           "type": "array",
           "default": [],
-          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning.",
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning. The list is fixed when the proxy starts: a `SIGHUP` reload does not add, remove, or revoke a configured key, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
           "items": { "$ref": "#/$defs/AuthKey" }
         },
         "store": {
@@ -402,7 +402,7 @@
         },
         "api_key_file": {
           "type": "string",
-          "description": "Read the API key from this file (trailing whitespace trimmed; read once at startup -- hot reload is not supported yet). Preferred over `api_key` for secret managers that mount files."
+          "description": "Read the API key from this file (trailing whitespace trimmed). Nothing watches the file; a `SIGHUP` reload reads it again, and requests that start after the reload use the new key. Preferred over `api_key` for secret managers that mount files."
         },
         "project": {
           "type": "string",
@@ -896,7 +896,7 @@
           }
         },
         "traces": {
-          "description": "Trace export: one record per request (headers and bodies, size-capped) for tenants that opt in through tenant policy, written to a local directory as compressed JSON-lines segments and optionally uploaded to S3-compatible storage. Requires the top-level `auth` block, since without tenants nothing can opt in. Boot-scoped: a reload that changes it is refused and the previous configuration keeps serving. Needs a node id unique to this replica (`--service-node`). Omit for no trace export.",
+          "description": "Trace export: one record per request (request and response bodies, size-capped; no headers) for tenants that opt in through tenant policy, written to a local directory as compressed JSON-lines segments and optionally uploaded to S3-compatible storage. Requires the top-level `auth` block, since without tenants nothing can opt in. Boot-scoped: a reload that changes it is refused and the previous configuration keeps serving. Needs a node id unique to this replica (`--service-node`). Omit for no trace export.",
           "$ref": "#/$defs/Traces"
         },
         "tracing": {

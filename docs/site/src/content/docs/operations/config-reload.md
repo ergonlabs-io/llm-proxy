@@ -4,7 +4,7 @@ description: "Apply config changes with SIGHUP, and see which settings a reload 
 summary: SIGHUP re-reads the config file a running proxy booted with and
   publishes a new snapshot. A config that fails to parse or validate leaves
   the proxy serving the previous snapshot and logs the full error.
-lastUpdated: 2026-10-17
+lastUpdated: 2026-10-18
 related:
   - configuration/configuration-file
   - observability/metrics-and-stats
@@ -27,12 +27,9 @@ A bootstrap with `dynamic_resources` ignores `SIGHUP` and logs a warning.
 Apply dynamic changes through its configured xDS source. The proxy also
 ignores reload signals while draining or shutting down.
 
-Some settings require a restart:
-
-- The auth control-plane store and policy poll interval are fixed at startup.
-- Changing `ledger` or `observability.traces` rejects the entire reload and
-  retains the previous snapshot. Their writers and destinations are opened
-  at startup.
+Some settings need a restart, and some changes make the proxy refuse the
+whole reload. See [What a reload applies](#what-a-reload-applies) for the
+full list.
 
 Validate the edited file before signalling the running process:
 
@@ -93,14 +90,61 @@ changing anything is harmless, not a no-op that skips logging
 `snapshot_version_advances_across_reloads` in
 `crates/proxy/tests/reload.rs`).
 
-## What picks up a reload, and what does not
+## What a reload applies
 
-Listeners and clusters both reconcile against the new snapshot — a route
-added, a provider's `base_url` changed, or a whole new listener all take
-effect. A provider's `api_key_file` or `auth.hmac_secret_file` is also
-re-read from disk on a reload, since the whole config file is re-parsed
-from scratch — this is the practical way to rotate a file-based secret
-without a restart, even though nothing watches the file automatically.
+A reload parses the whole file again, so every file the config names (such as
+`api_key_file` or `price_list_file`) is read again. Being read again does not
+always mean the new value is used. This table says what is active for requests
+that start after a successful reload.
+
+| Setting | After `SIGHUP` | Restart needed |
+|---|---|---|
+| `routes`, `models`, `limits` rules | Active for new requests. | No |
+| `providers.*` (`base_url`, `api_key`, `api_key_file`, other fields) | Active. Upstream keep-alive connections from before the reload close, so a rotated provider key is not sent again. | No |
+| `${ENV}` values | Read again from the environment of the running process, which does not change. | Yes, to change the value |
+| `listen.tls` `cert_file` / `key_file` | Read again on the next accepted connection. New connections get the new certificate. A file that cannot be read makes the listener reset every new TLS connection until a later reload succeeds. | No |
+| Listener admission limits | Active from the next accepted connection. | No |
+| `pricing` | Installed if the chain has no auth store. With an `auth:` block, the stored card wins; use `PUT /pricing`. | No |
+| `auth.max_policy_staleness` | Active. | No |
+| `auth.keys` (add, remove, `revoked: true`) | **Not applied.** The proxy keeps the key list it started with. A removed or revoked configured key still authenticates. | Yes |
+| `auth.hmac_secret` / `auth.hmac_secret_file` | **Do not change and reload.** See the warning below. | Yes |
+| `auth.store`, `auth.tenant_credentials` | Not applied. | Yes |
+| `observability.tracing`, `observability.metrics` | Not applied. The OTLP exporters keep the settings from startup. No warning is logged. | Yes |
+| `ledger`, `observability.traces` | A change makes the proxy refuse the whole reload and keep the previous snapshot. | Yes |
+| Keys, tenants and policy from the admin API | Not part of the file. They stay in the auth store and are not changed by a reload. | No |
+
+> **Warning: rotate the HMAC secret with a restart.** After a reload that
+> changes the secret, the proxy verifies presented keys with the new secret
+> but keeps the old key digests, and it mints new keys with the old secret.
+> Every virtual key, including one minted after the reload, is refused with
+> `401`, and the log still says the reload succeeded. A restart applies the
+> new secret to both sides. This is a known defect.
+
+To revoke a key without a restart, use the admin API: `DELETE /keys/{id}` for
+a key minted through the API, or `DELETE /tenants/{id}` to revoke every key
+of a tenant, configured keys included. See
+[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+
+### Requests in flight
+
+A request that started before the reload finishes on the configuration it
+started with, including its retries and fallbacks. A downstream HTTP
+connection from before the reload closes gracefully after its current
+request: an idle keep-alive closes, and the next request opens a new
+connection that uses the new configuration. A TCP proxy connection is not
+closed.
+
+### Errors that a reload does not catch
+
+A reload checks that the file parses and validates. Some errors appear only
+when a worker builds the new listener, after the reload has logged success:
+
+- A provider cluster that fails to build is left out of the cluster set and
+  logged at `error`.
+- A TLS file that cannot be read, or a filter that fails to build, makes the
+  listener reset new connections until a later reload succeeds.
+
+Run `--mode validate` before you send `SIGHUP`, and check the log after it.
 
 The admin server's `/config_dump` and `/clusters` endpoints reflect a reload.
 The admin server and the workers register their snapshot handles with one
@@ -110,8 +154,7 @@ registry, and a reload publishes into every handle in it. The end-to-end test
 that both endpoints show the new name. The unit test
 `start_admin_registers_its_handle_into_the_shared_registry` in
 `crates/proxy/src/main.rs` checks that a snapshot published through the shared
-registry reaches `/config_dump`. Before this fix both endpoints served the boot
-snapshot after a reload.
+registry reaches `/config_dump`.
 
 These items also change on a reload:
 

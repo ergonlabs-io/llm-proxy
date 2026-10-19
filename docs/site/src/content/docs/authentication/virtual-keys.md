@@ -5,7 +5,7 @@ summary: How downstream authentication works — the `auth:` block, the
   `llmp_`-prefixed bearer credential, keyed HMAC-SHA256 verification, JWT
   providers (Envoy mode only), and why the token limiter buckets on the
   resolved tenant rather than the client's header.
-lastUpdated: 2026-10-13
+lastUpdated: 2026-10-18
 related:
   - authentication/managing-secrets
   - authentication/tenant-provider-credentials
@@ -33,8 +33,7 @@ header. A provider never receives the virtual key.
 
 ## Authentication and authorization fail closed
 
-These are two different questions, and the code answers them differently on
-purpose:
+With an `auth:` block, both checks refuse by default:
 
 - **Authentication** — "who is this?" — fails closed. With `auth:` present,
   a request carrying no recognized credential is refused with a 401, never
@@ -43,6 +42,15 @@ purpose:
   with no stored model policy is refused with a `403` and the response-code
   detail `model_not_permitted`. A tenant that has only a budget is also
   refused. The proxy logs the first refusal for each tenant once at warn.
+- **Provider authorization** does not exist. A tenant that may use a model
+  may use every provider that serves it. The only per-provider rule is for
+  tenants that store their own provider keys; see
+  [Tenant provider credentials](../../authentication/tenant-provider-credentials/).
+
+**The starter config is an exception.** `llm-proxy init` writes
+`auth.enforce.tenants_without_policy: allow`, so the key it prints can use
+every model without a stored policy. Remove that line before you issue keys
+to other people.
 
 To let a tenant use models, set its policy with `PUT /tenants/{id}/policy`.
 The body `{"access":"all"}` grants every model. To grant every model to all
@@ -144,20 +152,12 @@ same file and, end to end over a real socket, by
 `testing/diffrig/tests/auth_e2e.rs`). A caller must not be able to learn from
 the response alone whether a key they guessed was ever valid.
 
-The three reasons are recorded separately, but only internally: each call
-sets `StreamInfo::response_code_details` to one of `auth_no_credential`,
-`auth_unknown_key`, or `auth_revoked_key`
-(`crates/proxy-filters/src/auth_filter.rs:357-376`, and
-`the_three_failure_reasons_produce_three_different_details_strings` pins the
-exact three strings). **This is a real gap, not a documented feature yet:**
-`StreamInfo::response_code_details` is populated on every local reply
-(`crates/proxy-http/src/filter_manager.rs:1293`, `:1382`, `:2866`), but the
-access-log format-string engine has no `%RESPONSE_CODE_DETAILS%` operator —
-`crates/proxy-observability/src/access_log.rs`'s operator match has no case
-for it, and it does not appear in either the text or JSON access-log format
-described in [Access logs](../../observability/access-logs/). So today, an
-operator cannot yet tell an unknown key from a revoked one by reading the
-access log; only the identical 401 is externally visible either way.
+The three reasons are recorded separately: each refusal sets the
+response-code details to `auth_no_credential`, `auth_unknown_key`, or
+`auth_revoked_key`. The access log shows them as `response_code_details`
+(`%RESPONSE_CODE_DETAILS%`); see
+[Access logs](../../observability/access-logs/). A caller sees only the
+identical 401.
 
 ## The token limiter keys on the identity the proxy assigned, not the header the caller sent
 
@@ -437,8 +437,10 @@ answers `204`. Keys minted through `POST /keys` are revoked and their rows
 stay, as with `DELETE /keys/{id}`. A key from `auth.keys` for that tenant is
 revoked by a revoked row in the store under the same key id. That row wins over
 the config entry on every replica that shares the store, and across restarts.
-Revoked key ids are permanent. The next request with any of those keys gets
-`401`.
+Revoked key ids are permanent. On the replica that took the call, the next
+request with any of those keys gets `401`. Other replicas that share the store
+apply it at their next policy poll, 48 to 60 seconds later. A request that was
+admitted before the revocation is not stopped; it runs to completion.
 
 The tenant names `default` and `unauthenticated` are reserved. `POST /tenants`
 and `POST /keys` refuse them with `400`. Request records use `default` for a
@@ -514,16 +516,17 @@ startup, so changing it takes a restart. The admin write API
 itself works the same way regardless of dialect, since it talks to whichever
 store the chain built.
 
-A `SIGHUP` reload does not change any of this for an already-running
-listener. The HMAC secret, the config's bootstrap key list, the store
-selection, and the policy-poll interval are all read once, the first time a
-worker builds this filter chain, and are reused as-is on every later reload
-of that same chain — editing `auth.keys`, `typed_config.store`, or
-`poll_interval_seconds` and sending `SIGHUP` has no effect; only a process
-restart picks up the new value
-(`crates/proxy-filters/src/auth_filter.rs:404-409`, `:455-459`). The admin
-write API is the supported way to change keys, allow-lists, and budgets on a
-running process; a config reload is not.
+A `SIGHUP` reload does not change any of this. The HMAC secret, the
+`auth.keys` list, the store selection, and the policy-poll interval are fixed
+when the proxy starts. A key that you add to `auth.keys`, remove from it, or
+set to `revoked: true` keeps its old state until a restart; a removed or
+revoked configured key still authenticates until then. Use the admin write API
+to change keys, allow-lists, and budgets on a running process. See the reload
+table in [Config reload](../../operations/config-reload/#what-a-reload-applies).
+
+> **Warning:** Do not change the HMAC secret and send `SIGHUP`. The reload
+> verifies keys with the new secret but keeps the old digests and mints with
+> the old secret, so every key is refused until a restart.
 
 ## What is not built yet
 
