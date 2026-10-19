@@ -60,6 +60,18 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   load; the dialect adds `listen.max_request_headers_kb` and
   `max_request_headers_count`. Remaining differences from Envoy are in
   `internal-docs/envoy-divergences.md`.
+- **Behavior change:** a config reload (SIGHUP) or xDS listener update that
+  changes `auth.hmac_secret` / `auth.hmac_secret_file` contents, `auth.keys`,
+  `auth.store`, the policy poll interval or `auth.tenant_credentials` is now
+  refused whole and names the field; the previous config keeps serving and
+  a restart applies the change. Before, a changed secret was taken by the
+  request authenticator but not by the control plane, so every key got `401`
+  after a reload that logged success, and edits to `auth.keys` (including a
+  removed or revoked key) were ignored silently. An xDS update with such a
+  change is NACKed. A reload that changes `observability.tracing` or
+  `observability.metrics` is refused too; both start once at boot and were
+  ignored. Provider `api_key_file` and credential files are still re-read on
+  each reload.
 
 ## [0.5.0] - 2026-10-18
 

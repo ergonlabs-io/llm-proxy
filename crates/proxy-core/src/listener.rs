@@ -351,7 +351,7 @@ fn build_listener_hcm(
     for (i, chain) in listener.filter_chains.iter().enumerate() {
         let handler = match chain.filters.last() {
             Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
-                let context = format!("listener '{}' filter_chains[{i}]", listener.name);
+                let context = chain_context(&listener.name, Some(i));
                 Some(build_hcm_handler(
                     hcm,
                     runtime.routes,
@@ -370,7 +370,7 @@ fn build_listener_hcm(
         .and_then(|c| c.filters.last())
     {
         Some(NetworkFilterSpec::HttpConnectionManager(hcm)) => {
-            let context = format!("listener '{}' default_filter_chain", listener.name);
+            let context = chain_context(&listener.name, None);
             Some(build_hcm_handler(
                 hcm,
                 runtime.routes,
