@@ -235,6 +235,11 @@ run: ## Run the proxy with CONFIG (default: examples/tcp-proxy.yaml)
 validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.yaml
 	cargo run -p proxy -- -c $(CONFIG) --mode validate
 
+# Opt-in, not part of `make ci`: downloads the pinned h2spec and starts the binary.
+.PHONY: h2spec
+h2spec: ## HTTP/2 conformance (h2spec) against the downstream h2 listener, plaintext + TLS
+	scripts/h2spec.sh $(ARGS)
+
 # ------------------------------------------------- xDS conformance (docker) --
 
 # The go-control-plane cross-implementation check is an OPT-IN target, NOT part
