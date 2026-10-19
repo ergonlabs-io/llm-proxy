@@ -59,6 +59,10 @@ type OpenAI struct {
 	NonStreaming *ChatCompletion
 	// Stream is served for any request with "stream": true.
 	Stream *StreamConfig
+	// NonStreamingDelay holds each non-streaming request (after it is
+	// recorded) before the response is written, so a scenario can keep a
+	// request in flight at the upstream (QA-8).
+	NonStreamingDelay time.Duration
 }
 
 func NewOpenAI() *OpenAI {
@@ -123,6 +127,7 @@ func (m *OpenAI) serveNonStreaming(w http.ResponseWriter, body map[string]any) {
 	}
 	c := m.NonStreaming
 	model, _ := body["model"].(string)
+	time.Sleep(m.NonStreamingDelay)
 
 	resp := map[string]any{
 		"id":      c.ID,
