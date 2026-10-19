@@ -18,6 +18,8 @@ export default defineConfig({
 			// Overrides Starlight's theme tokens only (accent, greys, fonts) so
 			// these docs match ergonlabs.io, which serves them.
 			customCss: ['./src/styles/custom.css'],
+			// Adds the frontmatter `related` list to every page footer.
+			components: { Footer: './src/components/Footer.astro' },
 			// No `social` entry: `git remote -v` in this repo has no configured
 			// remote to link to. Add one here once the repo has a GitHub home.
 			plugins: [

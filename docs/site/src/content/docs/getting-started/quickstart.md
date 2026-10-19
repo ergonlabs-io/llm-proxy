@@ -1,12 +1,13 @@
 ---
 title: Getting started with llm-proxy
+description: "Install llm-proxy, connect one provider, and send your first request through it."
 summary: Build the llm-proxy binary, validate a config, serve it against an
   OpenAI-compatible provider, and read the access log line it writes for the
   request.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../getting-started/introduction/
-  - ../configuration/configuration-file/
+  - getting-started/introduction
+  - configuration/configuration-file
 ---
 
 # Getting started

@@ -1,15 +1,16 @@
 ---
 title: WebSocket and other HTTP upgrades
+description: "Forward WebSocket and other HTTP upgrade requests through llm-proxy to a provider."
 summary: How the HTTP connection manager tunnels an HTTP/1.1 `Upgrade`
   request or an HTTP/2 extended CONNECT request (WebSocket included) to a
   provider, what gates it, and the real limits of today's transparent tunnel
   — bootstrap configuration only, not yet reachable from the plain
   configuration format.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/timeouts-and-retries/
-  - ../configuration/configuration-file/
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/timeouts-and-retries
+  - configuration/configuration-file
 ---
 
 # WebSocket and other HTTP upgrades

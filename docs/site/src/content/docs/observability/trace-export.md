@@ -1,16 +1,17 @@
 ---
 title: Trace export
+description: "Export request and response bodies to an external store, with tenant consent and redaction controls."
 summary: Opt-in export of request and response bodies for analytics and
   fine-tuning. Covers the two consent switches, what a trace holds, the line
   format, local and S3 storage, sizing, every loss reason and metric, the
   emergency switch, and what is not available.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-17
 related:
-  - ../observability/request-capture/
-  - ../observability/metrics-and-stats/
-  - ../observability/admin-endpoints/
-  - ../authentication/virtual-keys/
-  - ../configuration/reference/
+  - observability/request-capture
+  - observability/metrics-and-stats
+  - observability/admin-endpoints
+  - authentication/virtual-keys
+  - configuration/reference
 ---
 
 # Trace export

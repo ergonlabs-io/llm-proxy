@@ -1,17 +1,18 @@
 ---
 title: Virtual keys
+description: "How llm-proxy authenticates callers with virtual keys and decides which models each tenant may use."
 summary: How downstream authentication works — the `auth:` block, the
   `llmp_`-prefixed bearer credential, keyed HMAC-SHA256 verification, JWT
   providers (Envoy mode only), and why the token limiter buckets on the
   resolved tenant rather than the client's header.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../authentication/managing-secrets/
-  - ../authentication/tenant-provider-credentials/
-  - ../configuration/configuration-file/
-  - ../providers-and-routing/providers-and-clusters/
-  - ../authentication/external-authorization/
-  - ../observability/admin-endpoints/
+  - authentication/managing-secrets
+  - authentication/tenant-provider-credentials
+  - configuration/configuration-file
+  - providers-and-routing/providers-and-clusters
+  - authentication/external-authorization
+  - observability/admin-endpoints
 ---
 
 # Virtual keys

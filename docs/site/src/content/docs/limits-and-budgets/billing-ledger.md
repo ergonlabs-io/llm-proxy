@@ -1,15 +1,16 @@
 ---
 title: Billing ledger
+description: "Write a durable, per-request billing record stream and read its delivery guarantees."
 summary: A durable, encrypted record of every request the proxy sends to a
   provider. What an entry holds, the ledger config, what happens when the
   ledger is full or fails, and how a consumer pulls and acknowledges entries.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-17
 related:
-  - ../limits-and-budgets/spend-policies/
-  - ../observability/admin-endpoints/
-  - ../observability/metrics-and-stats/
-  - ../observability/request-capture/
-  - ../configuration/reference/
+  - limits-and-budgets/spend-policies
+  - observability/admin-endpoints
+  - observability/metrics-and-stats
+  - observability/request-capture
+  - configuration/reference
 ---
 
 # Billing ledger

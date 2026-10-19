@@ -1,14 +1,15 @@
 ---
 title: Token rate limiting
+description: "Limit tokens, requests, or concurrent streams per tenant, key, or header, and read current usage."
 summary: How the token limiter buckets and enforces a budget, and the
   `GET /v1/usage` endpoint an authenticated caller uses to read its own
   current standing.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-17
 related:
-  - ../authentication/virtual-keys/
-  - ../configuration/configuration-file/
-  - ../observability/access-logs/
-  - ../observability/metrics-and-stats/
+  - authentication/virtual-keys
+  - configuration/configuration-file
+  - observability/access-logs
+  - observability/metrics-and-stats
 ---
 
 # Token rate limiting

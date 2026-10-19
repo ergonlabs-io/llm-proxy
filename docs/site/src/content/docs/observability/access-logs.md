@@ -1,11 +1,12 @@
 ---
 title: Access logs
+description: "Write one access log line per request, with token counts, timing, tenant, and selected provider."
 summary: The format-string engine behind observability.access_logs, the
   operators it supports, and when a line is actually written.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../configuration/configuration-file/
-  - ../observability/metrics-and-stats/
+  - configuration/configuration-file
+  - observability/metrics-and-stats
 ---
 
 # Access logs

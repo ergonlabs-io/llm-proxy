@@ -1,13 +1,14 @@
 ---
 title: Request capture
+description: "Record per-request metadata (no bodies) to a file or the capture agent for analytics."
 summary: Opt-in end-user metadata records, the llm-capture-agent that stores
   them in a local spool, the flags and bootstrap key that enable them, the
   spool inspection endpoints, and the metrics.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../observability/access-logs/
-  - ../observability/metrics-and-stats/
-  - ../reference/cli/
+  - observability/access-logs
+  - observability/metrics-and-stats
+  - reference/cli
 ---
 
 # Request capture

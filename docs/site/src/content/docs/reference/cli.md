@@ -1,13 +1,14 @@
 ---
 title: CLI reference
+description: "Every llm-proxy mode and flag: serve, validate, translate, keygen, and init."
 summary: Every llm-proxy flag documented on this site, verified against
   --help and the real argument parser.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-17
 related:
-  - ../getting-started/quickstart/
-  - ../operations/draining-and-shutdown/
-  - ../operations/config-reload/
-  - ../observability/request-capture/
+  - getting-started/quickstart
+  - operations/draining-and-shutdown
+  - operations/config-reload
+  - observability/request-capture
 ---
 
 # CLI reference

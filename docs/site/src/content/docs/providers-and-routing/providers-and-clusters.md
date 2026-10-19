@@ -1,14 +1,15 @@
 ---
 title: Providers and clusters
+description: "Add an LLM provider, set its base URL and credential, and control upstream connections."
 summary: How a configuration `provider` becomes an engine cluster, what
   identity (TLS, credentials, headers) travels with it, and how the `models`
   catalogue differs from `routes`.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../configuration/configuration-file/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../providers-and-routing/load-balancing/
-  - ../providers-and-routing/timeouts-and-retries/
+  - configuration/configuration-file
+  - providers-and-routing/failover-and-aggregates
+  - providers-and-routing/load-balancing
+  - providers-and-routing/timeouts-and-retries
 ---
 
 # Providers and clusters

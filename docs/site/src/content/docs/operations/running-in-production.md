@@ -1,14 +1,15 @@
 ---
 title: Running in production
+description: "Run several replicas that share keys, policy, counters, and spend through one store."
 summary: What changes when you run more than one replica — which state is
   shared, which stays local, the propagation and staleness bounds for each,
   and what the store does when it cannot be reached. Both configuration
   dialects support a shared store.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-17
 related:
-  - ../authentication/virtual-keys/
-  - ../limits-and-budgets/token-rate-limiting/
-  - ../operations/config-reload/
+  - authentication/virtual-keys
+  - limits-and-budgets/token-rate-limiting
+  - operations/config-reload
 ---
 
 # Running in production

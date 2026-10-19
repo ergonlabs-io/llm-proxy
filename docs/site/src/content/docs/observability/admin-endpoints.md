@@ -1,16 +1,17 @@
 ---
 title: Admin endpoints
+description: "Use the admin server: readiness, config dump, stats, the web UI, and the bearer-gated write API for keys and tenants."
 summary: Reference for every route the admin server answers, which routes
   need the admin token, the request body limits, and the admin UI.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../authentication/virtual-keys/
-  - ../authentication/tenant-provider-credentials/
-  - ../limits-and-budgets/spend-policies/
-  - ../limits-and-budgets/billing-ledger/
-  - ../operations/draining-and-shutdown/
-  - ../observability/metrics-and-stats/
-  - ../observability/request-capture/
+  - authentication/virtual-keys
+  - authentication/tenant-provider-credentials
+  - limits-and-budgets/spend-policies
+  - limits-and-budgets/billing-ledger
+  - operations/draining-and-shutdown
+  - observability/metrics-and-stats
+  - observability/request-capture
 ---
 
 # Admin endpoints

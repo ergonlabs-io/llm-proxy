@@ -1,14 +1,15 @@
 ---
 title: The auto model
+description: "Let a client send model \"auto\" and have the proxy replace it with the model the operator chose for the tenant."
 summary: How the reserved model name `auto` resolves to a real model for each
   tenant, what the provider and the logs see, and the Envoy-mode filter and
   its ordering rules.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../configuration/configuration-file/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../observability/access-logs/
-  - ../authentication/virtual-keys/
+  - configuration/configuration-file
+  - providers-and-routing/failover-and-aggregates
+  - observability/access-logs
+  - authentication/virtual-keys
 ---
 
 # The auto model

@@ -1,14 +1,15 @@
 ---
 title: Configuration file reference
+description: "Write an llmproxy.yaml file: complete examples, how the blocks relate, validation, and links to the field reference."
 summary: Field-by-field reference for the llm-proxy configuration file
   (--config), derived from schema/llmproxy-v0.schema.json, the normative
   source. Covers what each field does, its default, and whether it is
   enforced.
-last_updated: 2026-10-15
+lastUpdated: 2026-10-15
 related:
-  - ../reference/
-  - ../getting-started/introduction/
-  - ../getting-started/quickstart/
+  - configuration/reference
+  - getting-started/introduction
+  - getting-started/quickstart
 ---
 
 # Configuration file reference

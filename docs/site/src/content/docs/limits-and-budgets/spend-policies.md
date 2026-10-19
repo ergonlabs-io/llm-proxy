@@ -1,7 +1,7 @@
 ---
 title: Spend policies and recovery
-description: Key and tenant ceilings, migration, shared Redis accounting, and crash recovery.
-last_updated: 2026-10-13
+description: "Key and tenant ceilings, migration, shared Redis accounting, and crash recovery."
+lastUpdated: 2026-10-13
 ---
 
 Spend enforcement uses two kinds of ceiling, and either one can refuse a

@@ -1,13 +1,14 @@
 ---
 title: xDS conformance
+description: "How the Envoy-mode xDS client is checked against Envoy behavior. Contributor and advanced material."
 summary: An opt-in, docker-based check that runs the real ADS client
   against go-control-plane, the reference xDS implementation, instead of
   our own test harness. What it checks, its current status, and how to
   run it.
-last_updated: 2026-09-07
+lastUpdated: 2026-09-07
 related:
-  - ../operations/config-reload/
-  - ../configuration/configuration-file/
+  - operations/config-reload
+  - configuration/configuration-file
 ---
 
 # xDS conformance

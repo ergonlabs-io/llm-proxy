@@ -1,15 +1,16 @@
 ---
 title: External authorization
+description: "Envoy mode only: send request headers to a gRPC authorization service that allows or denies each request."
 summary: How the `envoy.filters.http.ext_authz` filter asks a gRPC service
   to allow or deny each request, what the filter does when that service
   fails, and which fields the strict-mode subset accepts. Envoy mode and
   bootstrap only.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../authentication/virtual-keys/
-  - ../configuration/configuration-file/
-  - ../observability/access-logs/
-  - ../observability/metrics-and-stats/
+  - authentication/virtual-keys
+  - configuration/configuration-file
+  - observability/access-logs
+  - observability/metrics-and-stats
 ---
 
 # External authorization

@@ -1,13 +1,14 @@
 ---
 title: Metrics and /stats
+description: "Read proxy metrics on /stats and /stats/prometheus, or export them over OTLP."
 summary: The metrics llm-proxy records, how /stats, /stats/prometheus, and OTLP
   export show them, the limits on label cardinality, how a series ends when
   its cluster or listener leaves the config, and how to turn on OTLP export.
-last_updated: 2026-10-16
+lastUpdated: 2026-10-16
 related:
-  - ../configuration/configuration-file/
-  - ../operations/config-reload/
-  - ../limits-and-budgets/billing-ledger/
+  - configuration/configuration-file
+  - operations/config-reload
+  - limits-and-budgets/billing-ledger
 ---
 
 # Metrics and `/stats`

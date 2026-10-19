@@ -1,16 +1,17 @@
 ---
 title: Listener TLS and downstream admission
+description: "Terminate TLS on a listener and limit the downstream connections the proxy admits."
 summary: How to terminate TLS on the listener in both config front-ends, how
   to encrypt the xDS control-plane channel, and
   the limits that decide whether a client connection is admitted - the TLS
   handshake deadline, the global connection cap, and the request header and
   request timeouts.
-last_updated: 2026-10-14
+lastUpdated: 2026-10-14
 related:
-  - ../configuration/configuration-file/
-  - ../providers-and-routing/timeouts-and-retries/
-  - ../observability/metrics-and-stats/
-  - ../operations/running-in-production/
+  - configuration/configuration-file
+  - providers-and-routing/timeouts-and-retries
+  - observability/metrics-and-stats
+  - operations/running-in-production
 ---
 
 # Listener TLS and downstream admission

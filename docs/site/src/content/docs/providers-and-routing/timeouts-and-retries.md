@@ -1,14 +1,15 @@
 ---
 title: Timeouts and retries
+description: "Set request and idle timeouts, and configure when llm-proxy retries a failed provider request."
 summary: The timeouts a route and a listener have, exactly which failures
   trigger a retry, and what bounds a slow or silent provider.
-last_updated: 2026-10-14
+lastUpdated: 2026-10-14
 related:
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../configuration/configuration-file/
-  - ../observability/access-logs/
-  - ../operations/tls/
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/failover-and-aggregates
+  - configuration/configuration-file
+  - observability/access-logs
+  - operations/tls
 ---
 
 # Timeouts and retries

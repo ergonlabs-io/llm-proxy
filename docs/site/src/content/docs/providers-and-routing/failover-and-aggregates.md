@@ -1,13 +1,14 @@
 ---
 title: Failover and aggregates
+description: "Try more providers in order when one fails, with fallbacks and model entries that list several providers."
 summary: What a route's `fallbacks` list actually does — the aggregate
   cluster it lowers to, the same-dialect requirement, and how retry budget
   and member order interact.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/timeouts-and-retries/
-  - ../configuration/configuration-file/
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/timeouts-and-retries
+  - configuration/configuration-file
 ---
 
 # Failover and aggregates

@@ -1,13 +1,14 @@
 ---
 title: Load balancing
+description: "How a cluster picks one of its endpoints. A dialect provider has one endpoint; balancing needs an Envoy bootstrap."
 summary: Which `lb_policy` values a cluster can actually run, why two are
   rejected at load time rather than approximated, and why load balancing has
   nothing to choose between in the plain configuration format.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../configuration/configuration-file/
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/failover-and-aggregates
+  - configuration/configuration-file
 ---
 
 # Load balancing

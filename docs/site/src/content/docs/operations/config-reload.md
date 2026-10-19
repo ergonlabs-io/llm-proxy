@@ -1,13 +1,14 @@
 ---
 title: Config reload
+description: "Apply config changes with SIGHUP, and see which settings a reload applies and which need a restart."
 summary: SIGHUP re-reads the config file a running proxy booted with and
   publishes a new snapshot. A config that fails to parse or validate leaves
   the proxy serving the previous snapshot and logs the full error.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-17
 related:
-  - ../configuration/configuration-file/
-  - ../observability/metrics-and-stats/
-  - ../operations/draining-and-shutdown/
+  - configuration/configuration-file
+  - observability/metrics-and-stats
+  - operations/draining-and-shutdown
 ---
 
 # Config reload

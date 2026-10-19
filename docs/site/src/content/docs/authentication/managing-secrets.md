@@ -1,15 +1,16 @@
 ---
 title: Managing secrets
+description: "Create a virtual key in the config file, grant it model access, verify it, revoke it, and rotate the HMAC secret."
 summary: Generate a virtual key with `--mode keygen`, install its digest in
   configuration, verify it, revoke it, and what rotating the HMAC secret
   costs you. Every step here edits the config file; keys minted through the
   admin API are covered on the Virtual keys page.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../authentication/virtual-keys/
-  - ../configuration/configuration-file/
-  - ../operations/config-reload/
-  - ../reference/cli/
+  - authentication/virtual-keys
+  - configuration/configuration-file
+  - operations/config-reload
+  - reference/cli
 ---
 
 # Managing secrets

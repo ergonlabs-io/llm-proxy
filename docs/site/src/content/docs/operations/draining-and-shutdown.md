@@ -1,11 +1,12 @@
 ---
 title: Draining and shutdown
+description: "Stop the proxy without dropping in-flight requests: drain on SIGTERM and the shutdown sequence."
 summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
   changes, and what the drain deadline cuts.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../operations/config-reload/
-  - ../reference/cli/
+  - operations/config-reload
+  - reference/cli
 ---
 
 # Draining and shutdown

@@ -1,18 +1,19 @@
 ---
 title: Tenant provider credentials
+description: "Let a tenant store its own provider API key, so its requests use that key instead of the platform credential."
 summary: Let a tenant send its traffic on its own provider key. Covers strict
   tenant mode, Envoy-mode setup with the key-encryption key file and the
   cluster slot, the admin API and its save-time key check, access-log and
   counter attribution, budget scope, and what does not work yet.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../authentication/virtual-keys/
-  - ../authentication/managing-secrets/
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../limits-and-budgets/spend-policies/
-  - ../observability/access-logs/
-  - ../observability/metrics-and-stats/
+  - authentication/virtual-keys
+  - authentication/managing-secrets
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/failover-and-aggregates
+  - limits-and-budgets/spend-policies
+  - observability/access-logs
+  - observability/metrics-and-stats
 ---
 
 # Tenant provider credentials

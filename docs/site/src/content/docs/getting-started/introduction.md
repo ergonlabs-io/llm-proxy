@@ -1,13 +1,14 @@
 ---
 title: Introduction to llm-proxy
+description: "What llm-proxy is, what it does for LLM traffic, its security defaults, and where to start."
 summary: llm-proxy is a Rust proxy for LLM inference APIs, configured with a
   single YAML file (schema/llmproxy-v0.schema.json). It meters tokens,
   enforces token-based rate limits, fails over between same-dialect
   providers, and authenticates callers.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-13
 related:
-  - ../getting-started/quickstart/
-  - ../configuration/configuration-file/
+  - getting-started/quickstart
+  - configuration/configuration-file
 ---
 
 # Introduction to llm-proxy
