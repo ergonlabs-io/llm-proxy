@@ -158,7 +158,7 @@ for it, and that number is wrong.
   nanodollars as `%LLM_LIST_COST%`. To total the cost of one tenant, sum
   `%LLM_LIST_COST%` by `%LLM_TENANT%` in your log pipeline. The rate card is
   the `pricing` section of the configuration file. See
-  [`pricing`](../../configuration/configuration-file/#pricing-pricing). The
+  [`pricing`](../../configuration/reference/#pricing). The
   operators are in the
   [access log reference](../../observability/access-logs/#the-operator-set).
 

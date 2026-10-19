@@ -165,7 +165,7 @@
           "examples": [10000]
         },
         "request_headers_timeout": {
-          "description": "Time allowed from the first byte of a request to its complete headers. Slow clients that exceed it are disconnected. Default: 10s (Envoy's edge-proxy guidance). `0s` disables the timeout. Lowers to the HTTP connection manager's `request_headers_timeout`.",
+          "description": "Time allowed from the first byte of a request to its complete headers. Slow clients that exceed it are disconnected. Enforced for HTTP/1 only: on HTTP/2 the proxy logs one warning per process and does not enforce it. Default: 10s (Envoy's edge-proxy guidance). `0s` disables the timeout. Lowers to the HTTP connection manager's `request_headers_timeout`.",
           "$ref": "#/$defs/Duration",
           "default": "10s"
         },
@@ -376,7 +376,7 @@
       "additionalProperties": false,
       "properties": {
         "type": {
-          "description": "Provider API shape. `openrouter` uses OpenAI-compatible requests with cluster-owned /v1 to /api/v1 path rewriting. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai`, `anthropic`, or `openrouter`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` uses Google Cloud project/location/publisher settings and an OAuth access token. `bedrock` uses an AWS region and SigV4 credential sources.",
+          "description": "Provider API shape. `openrouter` uses OpenAI-compatible requests with cluster-owned /v1 to /api/v1 path rewriting. `openai-compatible` covers vLLM, Ollama, TGI, Together, and most self-hosted servers. Inferred for providers named `openai`, `anthropic`, or `openrouter`; defaults to `openai-compatible` otherwise. `azure-openai` uses Azure's deployment URL and `api-version` query parameter. `vertex` uses Google Cloud project/location/publisher settings and an OAuth access token; the proxy rewrites the request path to `/v1/projects/<project>/locations/<location>/publishers/<publisher>/models/<model>:streamRawPredict`. `bedrock` uses an AWS region and SigV4 credential sources; the proxy rewrites the request path to `/model/<model>/invoke` and signs the request.",
           "enum": ["openai", "anthropic", "openai-compatible", "openrouter", "azure-openai", "vertex", "bedrock"]
         },
         "base_url": {
@@ -433,7 +433,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["token_url", "issuer", "private_key_file", "scopes"],
-          "description": "Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503. Valid only for `vertex`.",
+          "description": "Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503 with the body `provider token unavailable`; they do not fall back to the next provider, and `llmproxy_provider_credential_requests_total` counts them with `outcome=unavailable`. Valid only for `vertex`.",
           "properties": {
             "token_url": {
               "type": "string",
@@ -737,7 +737,7 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 4294967295,
-          "description": "Upper bound on the output tokens a request for this model may ask for. A request whose limit is larger is refused with a 400 naming the field and the cap; it is never lowered or rewritten. A limit that is not a non-negative integer, or a limit key repeated in the body, is also refused with a 400. A request that names no limit is forwarded unchanged. The field checked follows the request path: `/responses` uses `max_output_tokens`, `/messages` uses `max_tokens`, and any other path (chat completions, completions) checks both `max_completion_tokens` and `max_tokens`. A body that is not JSON is forwarded unchanged. The cap follows the model the request names, so it cannot be combined with the `auto` block (a load error). Absent means no cap.",
+          "description": "Upper bound on the output tokens a request for this model may ask for. A request whose limit is larger is refused with a 400 naming the field and the cap; it is never lowered or rewritten. A limit that is not a non-negative integer, or a limit key repeated in the body, is also refused with a 400. A request that names no limit is forwarded unchanged. Each refusal adds 1 to `llmproxy_router_max_output_tokens_rejected_total`. The field checked follows the request path: `/responses` uses `max_output_tokens`, `/messages` uses `max_tokens`, and any other path (chat completions, completions) checks both `max_completion_tokens` and `max_tokens`. A body that is not JSON is forwarded unchanged. The cap follows the model the request names, so it cannot be combined with the `auto` block (a load error). Absent means no cap.",
           "examples": [4096]
         }
       }

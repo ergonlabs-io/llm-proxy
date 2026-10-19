@@ -19,7 +19,7 @@ A `limits:` entry in the configuration file caps the tokens, the requests,
 or the concurrent streams of a group of callers. The proxy enforces every
 `limits` field and every key: `global`, `client-ip`, `tenant`, and
 `header:<name>`. See the `limits[]`
-reference in [Configuration file](../../configuration/configuration-file/#limits-limit)
+reference in [Field reference](../../configuration/reference/#limit)
 for the field table, the keys, and how entries combine.
 
 `key: header:authorization` counts each credential apart. With `auth:`

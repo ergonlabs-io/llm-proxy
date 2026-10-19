@@ -277,7 +277,7 @@ snapshot, including requests that finished during the drain.
 
 ### In a `llmproxy` config file
 
-The full field reference is in the [configuration file](../../configuration/configuration-file/#observability-observability). This page gives the defaults and an example.
+The full field reference is in the [field reference](../../configuration/reference/#observability). This page gives the defaults and an example.
 
 ```yaml
 observability:

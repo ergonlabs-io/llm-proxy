@@ -35,7 +35,7 @@ routes:
 The name `openai` sets the provider type and the `base_url` default. For a
 self-hosted server, set `type: openai-compatible` and a `base_url`. The field
 list is in the
-[Configuration file reference](../../configuration/configuration-file/#provider-specific-fields).
+[Field reference](../../configuration/reference/#provider).
 
 ## One provider, one cluster, one endpoint
 
@@ -112,7 +112,7 @@ Envoy in detail.
 | `bedrock` | none (required) | Needs `region`, an access key ID, and a secret access key. The proxy signs each request with AWS SigV4. The dialect comes from a `models` entry. |
 
 The fields for `azure-openai`, `vertex`, and `bedrock` are in
-[Configuration file reference](../../configuration/configuration-file/#provider-specific-fields).
+[Field reference](../../configuration/reference/#provider).
 The proxy stores each one in the cluster's metadata, so the credential
 follows the cluster, as the next section describes. Vertex and
 Bedrock credentials are static values read at load time.

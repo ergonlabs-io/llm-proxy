@@ -52,9 +52,13 @@ routes:
 `tls.cert_file` is the PEM certificate chain. `tls.key_file` is the PEM
 private key. Both are required.
 
-The proxy reads the certificate files once at startup. A renewed
-certificate needs a restart. The schema states that nothing watches the
-files (`listen.tls` description).
+Nothing watches the certificate files. To serve a renewed certificate, send
+`SIGHUP`: after the reload, the next accepted connection reads both files
+again, and new connections get the new certificate. Existing connections keep
+the old one. A reload does not check the files. If a file cannot be read, the
+listener resets every new TLS connection until a later reload succeeds, so
+check the files before you send the signal. See
+[Reload configuration](../../operations/config-reload/#what-a-reload-applies).
 
 The dialect lowers `tls` to one filter chain with an
 `envoy.transport_sockets.tls` transport socket.
