@@ -2183,3 +2183,258 @@ async fn a_control_plane_loss_mid_listener_warm_keeps_the_last_good_generation_s
     let _ = std::fs::remove_file(&config_path);
     harness.shutdown().await;
 }
+
+/// `proxy_filters::auth_filter::TYPE_URL`; this crate does not depend on
+/// `proxy-filters`, so the value is spelled out.
+const AUTH_TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
+const AUTH_SECRET: &str = "ads-e2e-auth-secret";
+const AUTH_ROTATED_SECRET: &str = "ads-e2e-auth-rotated-secret";
+const AUTH_KEY_1: &str = "llmp_ads-e2e-auth-key-1";
+const AUTH_KEY_2: &str = "llmp_ads-e2e-auth-key-2";
+
+/// An `llmproxy.auth` typed_config that admits `keys`, each digested under
+/// `secret`. The filter has no generated Rust type, so the message is built
+/// from the embedded descriptor pool, as the config loader decodes it.
+fn auth_filter_config(secret: &str, keys: &[&str]) -> prost_types::Any {
+    let hmac = proxy_control::auth::HmacSecret::new(secret.as_bytes());
+    let virtual_keys: Vec<serde_json::Value> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            serde_json::json!({
+                "keyId": format!("key-{i}"),
+                "tenant": "tenant-a",
+                "digestHex": proxy_control::auth::digest_hex(&hmac, key),
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "hmacSecret": { "inlineString": secret },
+        "virtualKeys": virtual_keys,
+        "inMemory": {},
+    });
+    let descriptor = proxy_api::descriptor_pool()
+        .get_message_by_name("llmproxy.filters.v0.Authentication")
+        .expect("the descriptor pool carries llmproxy.filters.v0.Authentication");
+    let message = prost_reflect::DynamicMessage::deserialize(descriptor, json)
+        .expect("the auth typed_config matches its descriptor");
+    prost_types::Any {
+        type_url: AUTH_TYPE_URL.to_string(),
+        value: message.encode_to_vec(),
+    }
+}
+
+/// An ADS-delivered HCM listener with an inline route to `cluster` behind an
+/// `llmproxy.auth` filter configured by `auth`.
+fn dynamic_auth_listener(
+    name: &str,
+    port: u32,
+    cluster: &str,
+    auth: prost_types::Any,
+) -> listener_v3::Listener {
+    listener_v3::Listener {
+        name: name.to_string(),
+        address: Some(core_v3::Address {
+            address: Some(core_v3::address::Address::SocketAddress(
+                core_v3::SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_specifier: Some(core_v3::socket_address::PortSpecifier::PortValue(port)),
+                    ..Default::default()
+                },
+            )),
+        }),
+        filter_chains: vec![listener_v3::FilterChain {
+            filters: vec![listener_v3::Filter {
+                name: "envoy.filters.network.http_connection_manager".to_string(),
+                config_type: Some(listener_v3::filter::ConfigType::TypedConfig(any_of(
+                    &hcm_v3::HttpConnectionManager {
+                        stat_prefix: name.to_string(),
+                        route_specifier: Some(
+                            hcm_v3::http_connection_manager::RouteSpecifier::RouteConfig(
+                                route_to_cluster("local", cluster),
+                            ),
+                        ),
+                        http_filters: vec![
+                            hcm_v3::HttpFilter {
+                                name: "llmproxy.auth".to_string(),
+                                config_type: Some(hcm_v3::http_filter::ConfigType::TypedConfig(
+                                    auth,
+                                )),
+                                ..Default::default()
+                            },
+                            hcm_v3::HttpFilter {
+                                name: "envoy.filters.http.router".to_string(),
+                                config_type: Some(hcm_v3::http_filter::ConfigType::TypedConfig(
+                                    any_of(&router_v3::Router::default(), ROUTER_TYPE),
+                                )),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    HCM_TYPE,
+                ))),
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// `GET /` carrying `Authorization: Bearer <key>`; returns the full response.
+fn get_with_bearer(addr: SocketAddr, key: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set_read_timeout");
+    stream
+        .write_all(
+            format!(
+                "GET / HTTP/1.1\r\nHost: auth.test\r\nAuthorization: Bearer {key}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read response to EOF");
+    String::from_utf8_lossy(&response).to_string()
+}
+
+/// The xDS half of the startup-fixed auth control plane: an LDS update that
+/// changes a running `llmproxy.auth` chain's `hmac_secret` is NACKed by name
+/// before publish, never ACKed, and the last-good listener keeps verifying
+/// with the secret its keys were minted under. Applying it would split the
+/// mint and verify secrets and refuse every key with 401. The negative half:
+/// a key digested only under the rejected secret must stay refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_lds_update_that_changes_a_running_auth_secret_is_nacked_and_last_good_keeps_authenticating(
+) {
+    const CLUSTER: &str = "backend";
+    const LISTENER: &str = "auth-ingress";
+
+    let upstream = spawn_mock_upstream();
+    let listener_port = free_port();
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+
+    let harness = Harness::spawn(vec![
+        Step::Send {
+            type_url: CDS_TYPE_URL.to_string(),
+            version_info: "cds-v1".to_string(),
+            nonce: "cds-n1".to_string(),
+            resources: vec![any_of(
+                &minimal_cluster(CLUSTER, upstream.port() as u32),
+                CLUSTER_TYPE,
+            )],
+        },
+        Step::Send {
+            type_url: LDS_TYPE_URL.to_string(),
+            version_info: "lds-v1".to_string(),
+            nonce: "lds-n1".to_string(),
+            resources: vec![any_of(
+                &dynamic_auth_listener(
+                    LISTENER,
+                    listener_port as u32,
+                    CLUSTER,
+                    auth_filter_config(AUTH_SECRET, &[AUTH_KEY_1]),
+                ),
+                LISTENER_TYPE,
+            )],
+        },
+        Step::WaitForAck {
+            type_url: LDS_TYPE_URL.to_string(),
+            version_info: "lds-v1".to_string(),
+            response_nonce: "lds-n1".to_string(),
+        },
+        Step::Push {
+            // The operator rotates the secret and re-digests every key under
+            // it, as a rotation would require.
+            type_url: LDS_TYPE_URL.to_string(),
+            version_info: "lds-v2".to_string(),
+            nonce: "lds-n2".to_string(),
+            resources: vec![any_of(
+                &dynamic_auth_listener(
+                    LISTENER,
+                    listener_port as u32,
+                    CLUSTER,
+                    auth_filter_config(AUTH_ROTATED_SECRET, &[AUTH_KEY_1, AUTH_KEY_2]),
+                ),
+                LISTENER_TYPE,
+            )],
+        },
+        Step::WaitForNack {
+            type_url: LDS_TYPE_URL.to_string(),
+            response_nonce: "lds-n2".to_string(),
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-ads-e2e-auth-nack-{}-{listener_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&config_path, bootstrap_dynamic_listeners(harness.addr)).expect("write config");
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    let nack = loop {
+        let log = harness.log.snapshot();
+        if let Some(nack) = log.iter().find(|r| {
+            r.type_url == LDS_TYPE_URL
+                && r.kind() == RequestKind::Nack
+                && r.response_nonce == "lds-n2"
+        }) {
+            break nack.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a NACK of lds-n2; ADS requests so far: {log:?}; stderr: {:?}",
+            drain_available_lines(&stderr_rx)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let detail = nack.error_detail.expect("a NACK carries error_detail");
+    assert!(
+        detail.contains("typed_config.hmac_secret"),
+        "the NACK must name the startup-fixed field, got: {detail}"
+    );
+    assert!(
+        !detail.contains(AUTH_SECRET) && !detail.contains(AUTH_ROTATED_SECRET),
+        "the NACK must not render a secret: {detail}"
+    );
+    assert_eq!(
+        nack.version_info, "lds-v1",
+        "a SotW NACK echoes the last accepted version"
+    );
+    assert!(
+        !harness
+            .log
+            .snapshot()
+            .iter()
+            .any(|r| r.kind() == RequestKind::Ack && r.response_nonce == "lds-n2"),
+        "the rejected response must never be ACKed"
+    );
+
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "listener at {listener_addr} never became connectable; stderr: {:?}",
+        drain_available_lines(&stderr_rx)
+    );
+    let kept = get_with_bearer(listener_addr, AUTH_KEY_1);
+    assert!(
+        kept.starts_with("HTTP/1.1 200"),
+        "the key minted under the running secret must keep authenticating; got:\n{kept}"
+    );
+    let rejected = get_with_bearer(listener_addr, AUTH_KEY_2);
+    assert!(
+        rejected.starts_with("HTTP/1.1 401"),
+        "a key digested only under the NACKed secret must stay refused; got:\n{rejected}"
+    );
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+    harness.shutdown().await;
+}

@@ -1898,6 +1898,7 @@ dependencies = [
  "h2",
  "http",
  "prost",
+ "prost-reflect",
  "prost-types",
  "proxy-admin",
  "proxy-api",
