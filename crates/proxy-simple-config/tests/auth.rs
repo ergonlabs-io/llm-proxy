@@ -168,9 +168,8 @@ fn hmac_secret_file_lowers_to_filename_and_warns_and_a_missing_file_errors() {
             .warnings
             .iter()
             .any(|w| w.field_path == "auth.hmac_secret_file"
-                && w.message
-                    == "the key file is read once at startup; hot reload is not supported yet"),
-        "expected the api_key_file-style warning (same wording), got: {:?}",
+                && w.message == proxy_simple_config::lower::HMAC_SECRET_FILE_WARNING),
+        "expected the hmac_secret_file reload warning, got: {:?}",
         lowered.warnings
     );
 

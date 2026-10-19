@@ -574,6 +574,123 @@ struct AuthConfig {
     jwt_providers: Vec<JwtProviderConfig>,
     /// Loaded `typed_config.tenant_credentials` key ring, if configured.
     credential_ring: Option<KeyRing>,
+    /// What the per-serve [`ControlPlane`] is built from, as one-way digests.
+    /// See [`BootInputs`].
+    boot_inputs: BootInputs,
+}
+
+/// The singleton key under which each chain records the [`BootInputs`] its
+/// [`ControlPlane`] was built from, beside the `ControlPlane` itself.
+pub const BOOT_INPUTS_KEY: &str = "llmproxy.auth/boot_inputs";
+
+/// The inputs the per-serve [`ControlPlane`] singleton fixes at its first
+/// build: the HMAC secret it mints with, the bootstrap keys, the store, the
+/// poll interval and the credential key ring. A reload reuses the singleton,
+/// so a change to any of these cannot apply. Before this record existed the
+/// request authenticator took a changed secret and the control plane did
+/// not, which refused every key with 401 after a reload that logged success.
+///
+/// Each value is a SHA-256, so the record holds no second copy of a secret.
+/// [`check_reload`] compares a reloaded config with it and refuses the whole
+/// reload on a difference (AGENTS.md invariant 1).
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootInputs {
+    hmac_secret: [u8; 32],
+    virtual_keys: [u8; 32],
+    store: [u8; 32],
+    poll_interval: Duration,
+    tenant_credentials: Option<[u8; 32]>,
+}
+
+// Rust note: hand-written, not derived. A digest of a short HMAC secret can
+// be brute-forced offline, so no digest is ever rendered.
+impl std::fmt::Debug for BootInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootInputs")
+            .field("poll_interval", &self.poll_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BootInputs {
+    /// The refusal for the first field `self` (reloaded) differs from
+    /// `running` in, at its Envoy field path; the reason names the dialect
+    /// field too. `None` when equal.
+    fn refusal(&self, running: &BootInputs) -> Option<ConfigError> {
+        let (field, dialect) = if self.hmac_secret != running.hmac_secret {
+            (
+                "typed_config.hmac_secret",
+                " (the dialect's `auth.hmac_secret` / `auth.hmac_secret_file`)",
+            )
+        } else if self.virtual_keys != running.virtual_keys {
+            ("typed_config.virtual_keys", " (the dialect's `auth.keys`)")
+        } else if self.store != running.store {
+            ("typed_config.store", " (the dialect's `auth.store`)")
+        } else if self.poll_interval != running.poll_interval {
+            ("typed_config.poll_interval_seconds", "")
+        } else if self.tenant_credentials != running.tenant_credentials {
+            (
+                "typed_config.tenant_credentials",
+                " (the dialect's `auth.tenant_credentials`)",
+            )
+        } else {
+            return None;
+        };
+        Some(invalid(
+            field,
+            format!(
+                "this field{dialect} is fixed at startup and cannot change on reload; restart \
+                 the process to apply it"
+            ),
+        ))
+    }
+}
+
+/// SHA-256 over `parts`, each length-prefixed so two different splits of
+/// the same bytes cannot collide.
+fn digest_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in parts {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(context.finish().as_ref());
+    out
+}
+
+fn store_digest(store: &StoreSpec) -> [u8; 32] {
+    match store {
+        StoreSpec::InMemory => digest_parts([b"in_memory".as_slice()]),
+        StoreSpec::Persistent(path) => digest_parts([b"persistent".as_slice(), path.as_bytes()]),
+        StoreSpec::Shared { url, namespace } => digest_parts([
+            b"shared".as_slice(),
+            url.as_bytes(),
+            if namespace.is_some() { b"ns" } else { b"no-ns" },
+            namespace.as_deref().unwrap_or_default().as_bytes(),
+        ]),
+    }
+}
+
+/// Refuses a reloaded `llmproxy.auth` config for the chain `scope` when it
+/// would change an input the running [`ControlPlane`] fixed at startup (see
+/// [`BootInputs`]), or when it no longer parses. Called before a snapshot is
+/// published, so a refused reload leaves every worker on the previous one. A
+/// `scope` with no running control plane yet is new and has nothing to
+/// conflict with.
+pub fn check_reload(
+    config: &DynamicMessage,
+    scope: &str,
+    shared: &proxy_http::filter::SharedFactoryState,
+) -> Result<(), ConfigError> {
+    let reloaded = parse_config(config)?.boot_inputs;
+    let Some(running) = shared
+        .get(scope, BOOT_INPUTS_KEY)
+        .and_then(|any| any.downcast::<BootInputs>().ok())
+    else {
+        return Ok(());
+    };
+    reloaded.refusal(&running).map_or(Ok(()), Err)
 }
 
 /// One parsed `typed_config.jwt_providers[i]` -- the pieces
@@ -869,6 +986,8 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     // the duplicate-detection rule.
     let mut seen_key_ids: HashMap<String, usize> = HashMap::new();
     let mut seen_digests: HashMap<Vec<u8>, usize> = HashMap::new();
+    // Every entry, for `BootInputs::virtual_keys`.
+    let mut key_entries: Vec<(String, String, Vec<u8>, bool)> = Vec::new();
 
     // Absent `virtual_keys` and an empty `virtual_keys` are indistinguishable
     // here (both yield `&[]`), and that's correct: the proto doc says empty
@@ -951,6 +1070,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         }
         seen_key_ids.insert(key_id.clone(), i);
         seen_digests.insert(digest.clone(), i);
+        key_entries.push((key_id.clone(), tenant.clone(), digest.clone(), revoked));
 
         key_set.insert_digest(
             digest,
@@ -980,6 +1100,25 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         ));
     }
 
+    // Sorted so reordering the same keys is not a change; `key_id` is unique.
+    key_entries.sort();
+    let boot_inputs = BootInputs {
+        hmac_secret: digest_parts([secret_bytes.as_slice()]),
+        virtual_keys: digest_parts(key_entries.iter().flat_map(
+            |(key_id, tenant, digest, revoked)| {
+                [
+                    key_id.as_bytes(),
+                    tenant.as_bytes(),
+                    digest.as_slice(),
+                    if *revoked { b"revoked" } else { b"live" },
+                ]
+            },
+        )),
+        store: store_digest(&store_spec),
+        poll_interval,
+        tenant_credentials: credential_ring.as_ref().map(KeyRing::fingerprint),
+    };
+
     Ok(AuthConfig {
         secret_bytes,
         bootstrap_keys: key_set,
@@ -988,6 +1127,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         max_policy_staleness,
         jwt_providers: parse_jwt_providers(config)?,
         credential_ring,
+        boot_inputs,
     })
 }
 
@@ -1019,7 +1159,21 @@ impl HttpFilterFactory for AuthFilterFactory {
             max_policy_staleness,
             jwt_providers,
             credential_ring,
+            boot_inputs,
         } = parse_config(config)?;
+
+        // A reload is refused before publish when these differ (see
+        // `check_reload`); this is the backstop for a build that skipped that
+        // check. Failing the chain build is loud, where reusing the running
+        // control plane would refuse every key under a split secret.
+        if let Some(running) = ctx
+            .get(BOOT_INPUTS_KEY)
+            .and_then(|any| any.downcast::<BootInputs>().ok())
+        {
+            if let Some(refusal) = boot_inputs.refusal(&running) {
+                return Err(refusal);
+            }
+        }
 
         // One shared JWKS snapshot per JWT provider,
         // built here (outside the singleton closure) so every worker's
@@ -1099,11 +1253,12 @@ impl HttpFilterFactory for AuthFilterFactory {
         // serve, not once per worker (a second, per-worker open of the same
         // path would fail outright).
         //
-        // Corollary, and a real limitation worth knowing: because the slot is
-        // per-SERVE and a SIGHUP reload reuses the same `SharedFactoryState`,
-        // the store -- like the HMAC secret and the bootstrap keys -- is
-        // fixed at the first build. Editing `typed_config.store` and
-        // reloading does NOT reopen anything; changing it takes a restart.
+        // Corollary: because the slot is per-SERVE and a SIGHUP reload reuses
+        // the same `SharedFactoryState`, the store -- like the HMAC secret,
+        // the bootstrap keys, the poll interval and the key ring -- is fixed
+        // at the first build. A reload that changes one is refused before
+        // publish (`check_reload`, against the `BootInputs` recorded below);
+        // changing it takes a restart.
         //
         // Rust note: two independent `HmacSecret`s built from the SAME bytes
         // -- see `parse_config`'s doc for why bytes (not an `HmacSecret`)
@@ -1223,17 +1378,21 @@ impl HttpFilterFactory for AuthFilterFactory {
                 // -- so `cp` is wrapped in `Arc` here, one line earlier than
                 // it otherwise would be, purely to make that call possible.
                 //
-                // Same per-serve-pinning caveat as the store and the secret
-                // above: because this slot is built once and reused across a
-                // SIGHUP reload, changing `poll_interval_seconds` and
-                // reloading does NOT restart the poller with the new
-                // interval -- that takes a restart, same as `typed_config.store`.
+                // Same per-serve pinning as the store and the secret above:
+                // the poller keeps this interval for the whole serve, so a
+                // reload that changes `poll_interval_seconds` is refused.
                 let cp = Arc::new(cp);
                 cp.start_policy_poller(poll_interval);
                 Ok(cp as Arc<dyn std::any::Any + Send + Sync>)
             })?
             .downcast::<ControlPlane>()
             .expect("auth control-plane singleton is always a ControlPlane");
+        // Recorded on the first build only, after the control plane exists,
+        // so a failed first build leaves nothing for a later reload to be
+        // compared against.
+        ctx.get_or_try_init(BOOT_INPUTS_KEY, || {
+            Ok(Arc::new(boot_inputs) as Arc<dyn std::any::Any + Send + Sync>)
+        })?;
         // The chain's rate card lives in this store. If the usage filter was
         // built before this one (the lowering does not fix their relative
         // order), it could not find the store, so link it from this side.
@@ -4116,5 +4275,140 @@ mod tests {
             let loaded = parse_config(&config).expect("no tenant_credentials must load");
             assert!(loaded.credential_ring.is_none());
         }
+    }
+
+    // --- reload against the startup-fixed control plane ----------------------
+
+    const RELOAD_SCOPE: &str = "listener 'l' filter_chains[0]";
+
+    fn reload_ctx(shared: &Arc<SharedFactoryState>) -> FactoryContext {
+        FactoryContext {
+            shared: Arc::clone(shared),
+            scope: RELOAD_SCOPE.to_string(),
+            stat_prefix: "l".to_string(),
+        }
+    }
+
+    fn two_key_config(secret: &str, revoked_b: bool, reversed: bool) -> DynamicMessage {
+        let mut keys = vec![
+            virtual_key(
+                "key-a",
+                "tenant-a",
+                &digest_hex(secret.as_bytes(), "llmp_a"),
+                false,
+            ),
+            virtual_key(
+                "key-b",
+                "tenant-b",
+                &digest_hex(secret.as_bytes(), "llmp_b"),
+                revoked_b,
+            ),
+        ];
+        if reversed {
+            keys.reverse();
+        }
+        authentication(inline_secret(secret), keys)
+    }
+
+    fn refused_field(result: Result<(), ConfigError>) -> String {
+        match result {
+            Err(ConfigError::InvalidValue { field_path, reason }) => {
+                assert!(
+                    reason.contains("restart"),
+                    "reason must say to restart: {reason}"
+                );
+                field_path
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_reload_refuses_a_changed_secret_or_key_list_and_accepts_the_rest() {
+        let shared = Arc::new(SharedFactoryState::default());
+        let running = two_key_config("reload-secret", false, false);
+        AuthFilterFactory
+            .create(&running, &reload_ctx(&shared))
+            .expect("first build must succeed");
+
+        check_reload(&running, RELOAD_SCOPE, &shared).expect("an unchanged config reloads");
+        check_reload(
+            &two_key_config("reload-secret", false, true),
+            RELOAD_SCOPE,
+            &shared,
+        )
+        .expect("reordering the same keys is not a change");
+
+        let secret = refused_field(check_reload(
+            &two_key_config("rotated-secret", false, false),
+            RELOAD_SCOPE,
+            &shared,
+        ));
+        assert!(secret.starts_with("typed_config.hmac_secret"), "{secret}");
+        let keys = refused_field(check_reload(
+            &two_key_config("reload-secret", true, false),
+            RELOAD_SCOPE,
+            &shared,
+        ));
+        assert!(keys.starts_with("typed_config.virtual_keys"), "{keys}");
+        let fewer = authentication(
+            inline_secret("reload-secret"),
+            vec![virtual_key(
+                "key-a",
+                "tenant-a",
+                &digest_hex(b"reload-secret", "llmp_a"),
+                false,
+            )],
+        );
+        let removed = refused_field(check_reload(&fewer, RELOAD_SCOPE, &shared));
+        assert!(
+            removed.starts_with("typed_config.virtual_keys"),
+            "{removed}"
+        );
+
+        // A chain with no running control plane has nothing to conflict with.
+        check_reload(
+            &two_key_config("rotated-secret", false, false),
+            "listener 'new' filter_chains[0]",
+            &shared,
+        )
+        .expect("a new chain builds its own control plane");
+    }
+
+    #[test]
+    fn create_refuses_a_changed_secret_on_a_chain_that_is_already_built() {
+        let shared = Arc::new(SharedFactoryState::default());
+        AuthFilterFactory
+            .create(
+                &two_key_config("reload-secret", false, false),
+                &reload_ctx(&shared),
+            )
+            .expect("first build must succeed");
+        let rebuilt = AuthFilterFactory
+            .create(
+                &two_key_config("rotated-secret", false, false),
+                &reload_ctx(&shared),
+            )
+            .map(|_| ());
+        let field = refused_field(rebuilt);
+        assert!(field.starts_with("typed_config.hmac_secret"), "{field}");
+    }
+
+    #[test]
+    fn boot_inputs_debug_renders_no_digest() {
+        let inputs = parse_config(&two_key_config("reload-secret", false, false))
+            .expect("parses")
+            .boot_inputs;
+        let rendered = format!("{inputs:?}");
+        let digest = inputs
+            .hmac_secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert!(!rendered.contains(&digest), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("{:?}", inputs.hmac_secret)),
+            "{rendered}"
+        );
     }
 }

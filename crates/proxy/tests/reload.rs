@@ -498,6 +498,62 @@ fn sighup_with_an_unchanged_config_is_harmless() {
     harness.finish();
 }
 
+/// OTLP trace and metric export start once at boot, so a reload that adds
+/// either block is refused by name rather than ignored (AGENTS.md invariant
+/// 1). The closing reload of the original file proves the refusals left the
+/// process reloadable.
+#[test]
+fn sighup_that_changes_otlp_export_is_refused_by_name() {
+    let port = free_port();
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-reload-otlp-{}-{}.yaml",
+        std::process::id(),
+        port
+    ));
+    let original = one_listener_config(port);
+    std::fs::write(&config_path, &original).expect("write initial config");
+    let mut harness = Harness::spawn(config_path, port);
+
+    let collector = format!("http://127.0.0.1:{}", free_port());
+    let tracing = format!(
+        "node:\n  metadata:\n    io.llmproxy.tracing:\n      otlp_endpoint: \"{collector}\"\n\
+         \x20     service_name: \"reload\"\n{original}"
+    );
+    let metrics = format!(
+        "node:\n  metadata:\n    io.llmproxy.metrics:\n      otlp_endpoint: \"{collector}\"\n\
+         \x20     service_name: \"reload\"\n{original}"
+    );
+    for (config, field) in [
+        (tracing, "`observability.tracing`) cannot change on reload"),
+        (metrics, "`observability.metrics`) cannot change on reload"),
+    ] {
+        harness.rewrite_config(&config);
+        harness.sighup();
+        assert!(
+            harness.wait_for_log(field, RELOAD_TIMEOUT),
+            "expected the refusal to name {field:?}; stderr so far: {:?}",
+            harness.log
+        );
+    }
+    assert!(
+        !harness
+            .log
+            .iter()
+            .any(|line| strip_ansi(line).contains("SIGHUP: config reload succeeded")),
+        "a refused reload must not also report success; stderr so far: {:?}",
+        harness.log
+    );
+
+    harness.rewrite_config(&original);
+    harness.sighup();
+    assert!(
+        harness.wait_for_log("SIGHUP: config reload succeeded", RELOAD_TIMEOUT),
+        "the original config must still reload; stderr so far: {:?}",
+        harness.log
+    );
+    harness.finish();
+}
+
 /// Requirement (test list item 4): the snapshot version strictly advances
 /// across reloads, so `config_ping` observers (and `/config_dump`) can tell
 /// two snapshots apart even when nothing else about them differs.

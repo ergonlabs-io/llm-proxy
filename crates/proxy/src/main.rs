@@ -1008,6 +1008,9 @@ async fn run_serve(
     // that cannot be locked or written stops startup rather than accepting a
     // block that records nothing (AGENTS.md invariant 1).
     let running_traces = snapshot.traces.clone();
+    // OTLP export starts once below and never restarts; `reload` refuses a
+    // change to either block.
+    let running_otlp = (snapshot.tracing.clone(), snapshot.metrics.clone());
     let (trace_admission, trace_gate, trace_exporter) = match &snapshot.traces {
         None => (None, None, None),
         Some(config) => {
@@ -1309,6 +1312,8 @@ async fn run_serve(
 
     let startup_gate_for_workers = startup_gate.clone();
     let lifecycle_for_workers = lifecycle.clone();
+    // The control loop checks reloads against the singletons workers build.
+    let factory_state_for_reload = factory_state.clone();
     let mut publisher = WorkerPool::spawn(
         WorkerPoolConfig {
             concurrency,
@@ -1382,6 +1387,7 @@ async fn run_serve(
                         &cluster_manager_for_reload,
                         &stats_control,
                         &stat_handle_tables_for_reload,
+                        &factory_state_for_reload,
                     ).await {
                         current_version = version;
                     }
@@ -1456,6 +1462,8 @@ async fn run_serve(
                         capture_supervisor.as_ref().map(|s|(s,concurrency)),
                         running_ledger.as_ref(),
                         running_traces.as_ref(),
+                        &running_otlp,
+                        &factory_state_for_reload,
                     )
                     .await
                     {
@@ -1483,6 +1491,7 @@ async fn run_serve(
                         &cluster_manager_for_reload,
                         &stats_control,
                         &stat_handle_tables_for_reload,
+                        &factory_state_for_reload,
                     )
                     .await
                     {
@@ -1957,6 +1966,8 @@ async fn apply_snapshot(
 /// reply: `Ok` lets the response be ACKed, `Err` NACKs it with the clusters'
 /// dotted paths (S8). Returns the new version, or `None` when the snapshot
 /// was refused and last-good keeps serving.
+// Same shape as `reload`, which takes the same running state.
+#[allow(clippy::too_many_arguments)]
 async fn apply_ads_snapshot(
     mut snapshot: ConfigSnapshot,
     reply: oneshot::Sender<Result<(), String>>,
@@ -1965,6 +1976,7 @@ async fn apply_ads_snapshot(
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
     stats_control: &proxy_observability::stats::StatsControl,
     tables: &StatHandleTables,
+    factory_state: &proxy_http::filter::SharedFactoryState,
 ) -> Option<SnapshotVersion> {
     // Rust note: authoritative version stamping happens HERE, not inside
     // `ResourceApplier`. Two producers stamp a version: `reload` (SIGHUP) does
@@ -1972,6 +1984,17 @@ async fn apply_ads_snapshot(
     // `ResourceApplier::assemble_snapshot`'s internal version is advisory
     // only and is discarded here.
     snapshot.version = SnapshotVersion(current_version.0 + 1);
+    // A listener update that would change an auth chain's startup-fixed
+    // inputs is NACKed whole, like an unbuildable cluster (S8).
+    if let Err(detail) = proxy_core::listener::check_reload_compatible(&snapshot, factory_state) {
+        tracing::error!(
+            %detail,
+            "xDS: a listener in the discovery response changes state fixed at startup; \
+             rejecting the response and keeping the last-good configuration"
+        );
+        let _ = reply.send(Err(detail));
+        return None;
+    }
     let applied = apply_snapshot(
         snapshot,
         OnClusterRejection::RefuseSnapshot,
@@ -2003,7 +2026,7 @@ async fn apply_ads_snapshot(
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
-// The boot-scoped inputs (capture, ledger, traces) are each checked against the
+// The boot-scoped inputs (capture, ledger, traces, OTLP, auth) are each checked against the
 // reloaded snapshot here, where it is loaded; bundling them only for the lint
 // would hide which one refused a reload.
 #[allow(clippy::too_many_arguments)]
@@ -2017,6 +2040,11 @@ async fn reload(
     capture: Option<(&proxy_observability::capture::CaptureSupervisor, usize)>,
     running_ledger: Option<&proxy_observability::ledger::LedgerConfig>,
     running_traces: Option<&proxy_observability::traces::config::TraceExportConfig>,
+    running_otlp: &(
+        Option<proxy_config::ir::TracingConfig>,
+        Option<proxy_config::ir::MetricsExportConfig>,
+    ),
+    factory_state: &proxy_http::filter::SharedFactoryState,
 ) -> Option<SnapshotVersion> {
     let mut snapshot = match source.load() {
         Ok(snapshot) => snapshot,
@@ -2061,6 +2089,33 @@ async fn reload(
             "SIGHUP: node.metadata[\"io.llmproxy.traces\"] (the dialect's `observability.traces`) \
              cannot change on reload; restart the process to apply it. Continuing to serve the \
              previous snapshot"
+        );
+        return None;
+    }
+    // OTLP trace and metric export start once at boot (see `run_serve`).
+    if snapshot.tracing != running_otlp.0 {
+        tracing::error!(
+            "SIGHUP: node.metadata[\"io.llmproxy.tracing\"] (the dialect's \
+             `observability.tracing`) cannot change on reload; restart the process to apply it. \
+             Continuing to serve the previous snapshot"
+        );
+        return None;
+    }
+    if snapshot.metrics != running_otlp.1 {
+        tracing::error!(
+            "SIGHUP: node.metadata[\"io.llmproxy.metrics\"] (the dialect's \
+             `observability.metrics`) cannot change on reload; restart the process to apply it. \
+             Continuing to serve the previous snapshot"
+        );
+        return None;
+    }
+    // The auth control plane is built once per chain and reused across a
+    // reload; a reload that would change its secret, bootstrap keys, store,
+    // poll interval or key ring is refused here, before workers see it.
+    if let Err(detail) = proxy_core::listener::check_reload_compatible(&snapshot, factory_state) {
+        tracing::error!(
+            %detail,
+            "SIGHUP: config reload refused; continuing to serve the previous snapshot"
         );
         return None;
     }

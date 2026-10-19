@@ -1254,6 +1254,11 @@ fn lower_oauth2_jwt_bearer(
     Ok(block)
 }
 
+/// The load warning for `auth.hmac_secret_file`.
+pub const HMAC_SECRET_FILE_WARNING: &str =
+    "the secret file is read at startup and again on each SIGHUP reload; a reload that \
+     changes the secret is refused, so rotating it takes a restart";
+
 /// Read one provider secret during config compilation. Runtime requests only
 /// see the immutable value carried by the published cluster snapshot.
 fn provider_secret(
@@ -1268,7 +1273,8 @@ fn provider_secret(
         (None, Some(file)) => {
             warnings.push(warning(
                 format!("providers.{provider_name}.{field}_file"),
-                "the credential file is read once at startup; hot reload is required for rotation",
+                "the credential file is read at startup and again on each SIGHUP reload; to rotate \
+                 it, replace the file and reload",
             ));
             std::fs::read_to_string(file)
                 .map_err(|e| ConfigError::Io {
@@ -1350,7 +1356,8 @@ fn auth_header(
         (None, Some(file)) => {
             warnings.push(warning(
                 format!("providers.{name}.api_key_file"),
-                "the key file is read once at startup; hot reload is not supported yet",
+                "the key file is read at startup and again on each SIGHUP reload; to rotate it, \
+                 replace the file and reload",
             ));
             std::fs::read_to_string(file)
                 .map_err(|e| ConfigError::Io {
@@ -2291,19 +2298,17 @@ fn lower_auth(
             json!({ "inline_string": secret })
         }
         (None, Some(file)) => {
-            // Same wording as `api_key_file`'s warning -- see that field's
-            // comment in `lower_provider`/`auth_header`.
-            warnings.push(warning(
-                "auth.hmac_secret_file",
-                "the key file is read once at startup; hot reload is not supported yet",
-            ));
+            // Unlike `api_key_file`, a changed secret cannot apply on reload:
+            // the auth control plane mints and verifies with the secret it
+            // started with, so the proxy refuses that reload.
+            warnings.push(warning("auth.hmac_secret_file", HMAC_SECRET_FILE_WARNING));
             // Read once, here, purely to validate (readable, non-empty) with
             // a dialect-scoped error -- the CONTENTS are discarded, never
             // echoed, and never folded into `hmac_secret`: the lowered
             // config keeps `filename` (not `inline_string`), so the real
             // proxy reads this file again itself at listener-bind time
-            // (`auth_filter::parse_hmac_secret`), exactly once per restart,
-            // same as `api_key_file` today.
+            // (`auth_filter::parse_hmac_secret`) on every build, and a reload
+            // compares it with the running secret.
             let contents = std::fs::read_to_string(file).map_err(|e| ConfigError::Io {
                 path: file.clone(),
                 reason: e.to_string(),
