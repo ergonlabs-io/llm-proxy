@@ -49,6 +49,23 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `user.claim` are required, and a tenant named `default` or containing `:` is
   a load error. JWT callers always use the operator's provider keys; the proxy
   warns when `auth.tenant_credentials` is also set.
+- Body-aware request guardrails: the dialect's top-level `guardrails` block
+  (Envoy mode: the `llmproxy.guardrail` filter) sends each request body, with
+  its tenant and its requested and resolved model, to an external HTTP check
+  before any provider is dialled. A check that answers `deny` refuses the
+  request with `403` and the check's reason (response-code detail
+  `guardrail_denied`); the request is not dialled, not charged, not counted
+  against a limit, and gets no ledger entry. `default` is required and
+  `tenants` (which requires `auth`) replaces it per tenant. Each check sets
+  `failure_mode` with no default: `closed` refuses an error or timeout with
+  `503` and a body over `max_body_bytes` with `413`; `open` admits them,
+  counts each as `failure_mode_allowed`, and warns at most once a minute
+  naming only the check's host. Only authenticated, model-authorized requests
+  are sent, and the check sees every prompt it is asked about. Outcomes are
+  counted in `llmproxy_guardrail_checks_total{scope, outcome}` and logged by
+  the new `%LLM_GUARDRAIL%` access-log operator, which the dialect's default
+  formats now carry. The check only allows or denies; it never changes the
+  request.
 
 ### Security
 
@@ -137,23 +154,6 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
-- Body-aware request guardrails: the dialect's top-level `guardrails` block
-  (Envoy mode: the `llmproxy.guardrail` filter) sends each request body, with
-  its tenant and its requested and resolved model, to an external HTTP check
-  before any provider is dialled. A check that answers `deny` refuses the
-  request with `403` and the check's reason (response-code detail
-  `guardrail_denied`); the request is not dialled, not charged, not counted
-  against a limit, and gets no ledger entry. `default` is required and
-  `tenants` (which requires `auth`) replaces it per tenant. Each check sets
-  `failure_mode` with no default: `closed` refuses an error or timeout with
-  `503` and a body over `max_body_bytes` with `413`; `open` admits them,
-  counts each as `failure_mode_allowed`, and warns at most once a minute
-  naming only the check's host. Only authenticated, model-authorized requests
-  are sent, and the check sees every prompt it is asked about. Outcomes are
-  counted in `llmproxy_guardrail_checks_total{scope, outcome}` and logged by
-  the new `%LLM_GUARDRAIL%` access-log operator, which the dialect's default
-  formats now carry. The check only allows or denies; it never changes the
-  request.
 - Minted Vertex access tokens: `providers.<name>.oauth2_jwt_bearer` (Envoy
   mode: `scheme: oauth2-jwt-bearer` in `io.llmproxy.provider_auth`) makes the
   provider cluster mint its OAuth2 access token with the JWT-bearer grant
