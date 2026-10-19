@@ -1,11 +1,12 @@
 ---
 title: Request capture
-description: "Record per-request metadata (no bodies) to a file or the capture agent for analytics."
-summary: Opt-in end-user metadata records, the llm-capture-agent that stores
-  them in a local spool, the flags and bootstrap key that enable them, the
-  spool inspection endpoints, and the metrics.
-lastUpdated: 2026-10-13
+description: "Write one metadata record for each request (no bodies) to a JSON-lines file, or experimentally to the capture agent."
+summary: Opt-in request metadata records. The supported file workflow comes
+  first, then the record fields, loss accounting, and metrics. The
+  experimental capture agent has its own section.
+lastUpdated: 2026-10-18
 related:
+  - observability/overview
   - observability/access-logs
   - observability/metrics-and-stats
   - reference/cli
@@ -16,30 +17,142 @@ related:
 Request capture writes one metadata record for each completed request. A
 record names the tenant, the user, the requested model, the selected provider
 and model, the status, the token usage, and the cost. A record holds no
-request body, no response body, and no headers.
+request body, no response body, and no headers. To export bodies, see
+[Request and response body export](../trace-export/).
 
-Capture is off by default. It starts only when you supply a destination.
+Capture is off by default. It starts only when you give the proxy a
+destination. There are two destinations:
 
-**Experimental.**
-Delivery to the `llm-capture-agent` spool is experimental. The agent writes
-records and nothing reads them back. It never removes acknowledged records.
-It has no retention, and it does not remove duplicates when a batch is sent
-again. When the spool reaches its disk limit, capture stops. Free space does
-not restart it. For supported delivery, use `--request-records-file`.
-The proxy and the agent print a warning at startup when the spool is in use.
+- A JSON-lines file you name. This is the supported destination.
+- The `llm-capture-agent` spool. This destination is experimental. See
+  [Experimental: capture agent](#experimental-capture-agent).
 
 **A record contains end-user identities and model history.** Protect the
-destination. The spool is the place to restrict access.
+destination.
+
+## Write records to a file
+
+Use this procedure to turn capture on, make one record, and read it.
+
+1. Choose a file path. The directory must exist, and the proxy user must be
+   able to write to it.
+
+2. Start the proxy with `--request-records-file`. The flag works with the
+   `llmproxy` dialect (`--config`) and with a `-c` bootstrap.
+
+   ```sh
+   llm-proxy --config llmproxy.yaml \
+     --request-records-file /var/lib/llmproxy/request-records.jsonl
+   ```
+
+3. Send one request through the proxy. Use any route in your config. This
+   example assumes a route for `gpt-4o-mini` on port 8080.
+
+   ```sh
+   curl --max-time 30 http://127.0.0.1:8080/v1/chat/completions \
+     -H "content-type: application/json" \
+     -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+   ```
+
+4. Read the last record. The proxy writes each record as one JSON line.
+
+   ```sh
+   tail -n 1 /var/lib/llmproxy/request-records.jsonl | jq .
+   ```
+
+The record looks like this. The example is abridged and the values are
+illustrative. A real record has more fields. See
+[What a record holds](#what-a-record-holds).
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "<request id>",
+  "instance_id": "<instance id>",
+  "record_seq": 1,
+  "tenant_id": "default",
+  "user_id": null,
+  "key_id": null,
+  "method": "POST",
+  "requested_model": "gpt-4o-mini",
+  "selected_provider": "openai",
+  "selected_model": "gpt-4o-mini",
+  "status": 200,
+  "termination": "complete",
+  "usage": {
+    "input_tokens": 9,
+    "output_tokens": 12,
+    "completeness": "complete",
+    "provenance": "provider"
+  },
+  "cost": {"amount": 1200, "unit": "nanodollars", "currency": "USD", "kind": "list"},
+  "attempts_truncated": false
+}
+```
+
+If the config has no price for the model, `cost` is `null`. A record never holds the
+prompt or the answer.
+
+### Destination permissions
+
+The proxy creates a new file with mode `0600`. The file is a regular file.
+The proxy refuses to start with `cannot start metadata collector: metadata
+destination must be a regular file` if the path is a directory or another
+kind of file. If the file already exists, the proxy keeps its mode. Set the
+mode of an existing file yourself.
+
+### Rotation and retention
+
+You rotate the file. The proxy does not rotate, expire, or compress it. The
+proxy opens the file once at start and appends to it. It does not reopen the
+file on `SIGHUP`.
+
+- A file that you rename keeps receiving records, because the proxy holds the
+  open file. Renaming alone does not start a new file.
+- A copy-then-truncate rotation works with the append mode of the proxy.
+- To start on a new file, change the path and restart the proxy.
+
+Set the retention and the access control of the old files in your own tooling.
+
+### Delivery limits
+
+File delivery is best effort. It is not a billing record. For billing, use the
+[billing ledger](../../limits-and-budgets/billing-ledger/).
+
+- The proxy hands each record to a writer thread through a queue of 1,024
+  records. A full queue drops the new record and counts it. Forwarding does
+  not wait.
+- The proxy does not call `fsync`. A successful write is not a durability
+  acknowledgement.
+- After one failed write, the proxy stops accepting records for the rest of
+  the process. It discards the queued records and counts them in
+  `llmproxy_metadata_dropped{reason="drained_after_close"}`. Forwarding
+  continues.
+- On shutdown, the proxy writes the queued records for up to 5 seconds
+  (less on a fast exit). A process that `SIGKILL` stops loses the queued
+  records.
+
+See [Check that no record was lost](#check-that-no-record-was-lost) and
+[Record delivery metrics](#record-delivery-metrics).
+
+### Flags
+
+| Flag | Required | Default | What it does |
+|---|---|---|---|
+| `--request-records-file <PATH>` | no | none | Append JSON lines to this file. Conflicts with `--request-records-agent`. |
+| `--request-record-max-attempts <N>` | no | `64` | Attempt summaries to keep for each record. Range 1 to 64. Needs a file or an agent. |
+
+The flags are read at start. A reload does not change them. The `llmproxy`
+dialect has no capture field.
 
 ## What a record holds
 
-The record type is `RequestRecord` in
-`crates/proxy-observability/src/records.rs`. These are some of its fields:
+These are some of the fields of a record:
 
 | Field | Meaning |
 |---|---|
 | `request_id`, `event_id`, `instance_id` | Identify the request, the record, and the proxy instance. |
-| `record_seq` | The record's number within its `instance_id`: 1, 2, 3, and so on, in the order the delivery path wrote the records. A gap means a record that was numbered but not delivered. Absent in records from builds before ADR-0011. |
+| `record_seq` | The record's number within its `instance_id`: 1, 2, 3, and so on, in the order the delivery path wrote the records. A gap means a record that was numbered but not delivered. Absent in records from older builds. |
 | `tenant_id`, `user_id`, `key_id` | Identify who made the request. `user_id` and `key_id` can be `null`. `tenant_id` is `default` when the request had no tenant (no auth configured, or a credential that names none), and `unauthenticated` when the auth filter refused it; `error_category` then gives the reason, for example `auth_unknown_key`. Both names are reserved. |
 | `requested_model` | The model name the client sent. |
 | `selected_provider`, `selected_model` | The provider and model the proxy dialled. |
@@ -71,20 +184,50 @@ To reconcile, for each `instance_id`:
 Give the proxy a stop timeout longer than `--drain-time-s`, so that it can
 drain and write the summary.
 
-## Ways to deliver records
+### Record delivery metrics
+
+These series are on `/stats/prometheus` with the `envoy_` prefix. See
+[Metrics and stats](../metrics-and-stats/). The proxy creates them at start,
+so an idle proxy shows `0` and not a missing series.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `llmproxy_metadata_admission` | `outcome`: `accepted`, `capacity_exceeded`, `closed` | Whether the queue took the record. |
+| `llmproxy_metadata_queue_depth` | none | Records in the queue. |
+| `llmproxy_metadata_queue_capacity` | none | Queue size. `0` means capture is not configured. |
+| `llmproxy_metadata_written` | none | Records delivered. In file mode, an append. In agent mode, a durable local receipt. |
+| `llmproxy_metadata_durable` | none | Records the agent confirmed as durable. |
+| `llmproxy_metadata_write_failures` | none | Write failures, or deliveries with an unknown result. |
+
+Alert on a rising `llmproxy_metadata_write_failures` and on
+`llmproxy_metadata_admission{outcome="capacity_exceeded"}`.
+
+## Experimental: capture agent
+
+**Experimental.** Delivery to the `llm-capture-agent` spool is experimental.
+Use `--request-records-file` for supported delivery. The proxy and the agent
+print a warning at startup when the spool is in use.
+
+- The agent writes records, and nothing reads them back except the inspection
+  endpoints below.
+- The agent never removes acknowledged records. It has no retention.
+- The agent does not remove duplicates when the proxy sends a batch again.
+- When the spool reaches its disk limit, capture stops. Free space does not
+  restart it.
+
+### Ways to deliver records
 
 | Mode | Flags or key | Where records go |
 |---|---|---|
-| File | `--request-records-file` | One JSON line per record, appended to a file you name. |
+| File | `--request-records-file` | One JSON line per record, appended to a file you name. Supported. See [Write records to a file](#write-records-to-a-file). |
 | Agent | `--request-records-agent` and three more flags | The `llm-capture-agent`, over a Unix socket. The agent commits to an encrypted local spool. |
 | Declarative | `node.metadata["io.llmproxy.capture"]` in a `-c` bootstrap | The agent, with limits set in the bootstrap file. |
 
-`--request-records-file` conflicts with `--request-records-agent`. Clap
-rejects the two flags together (`crates/proxy/src/main.rs:104`).
+`--request-records-file` conflicts with `--request-records-agent`. The
+command line rejects the two flags together.
 
 The declarative key cannot combine with any CLI capture flag. The proxy
-refuses to start with this message
-(`crates/proxy/src/main.rs:311-319`):
+refuses to start with this message:
 
 ```text
 node.metadata["io.llmproxy.capture"]: cannot combine declarative and CLI capture
@@ -93,11 +236,11 @@ node.metadata["io.llmproxy.capture"]: cannot combine declarative and CLI capture
 The `llmproxy` dialect (`--config`) has no capture field. Use the flags, or a
 bootstrap file passed with `-c`.
 
-## Run the capture agent
+### Run the capture agent
 
-The release archive contains `llm-capture-agent` beside `llm-proxy`
-(`.github/workflows/release.yml:74-76`). The installer script copies both
-files into the same directory (`scripts/install.sh:241-245`). The installer
+The release archive contains `llm-capture-agent` beside `llm-proxy`.
+The installer script copies both
+files into the same directory. The installer
 does not create an agent configuration or start the agent.
 
 Start the agent with a JSON file:
@@ -139,8 +282,7 @@ Prepare the host before you start the agent:
 
 All fields are required except `spool.cache_bytes` (default 4 MiB) and
 `producers[].inspect` (default `false`). An unknown field fails at its full
-path. The agent README (`crates/proxy-capture-agent/README.md`) lists the
-other limits:
+path. These limits also apply:
 
 - The configuration file is at most 128 KiB.
 - IDs are 1 to 128 bytes.
@@ -156,7 +298,7 @@ UID and the node ID of the agent. The socket has mode `0600`. The normal
 deployment runs both processes under the same UID. This does not protect
 against a hostile process under the same UID, or against root.
 
-## Enable capture in the proxy
+### Enable capture in the proxy
 
 Pass the agent socket and three identity values. Each of the three is
 required when you pass `--request-records-agent`.
@@ -171,31 +313,19 @@ llm-proxy -c /absolute/path/bootstrap.yaml \
 
 | Flag | Required | Default | What it does |
 |---|---|---|---|
-| `--request-records-file <PATH>` | no | none | Append JSON lines to this file. Conflicts with `--request-records-agent`. |
 | `--request-records-agent <SOCKET>` | no | none | Send records to the agent at this Unix socket. |
 | `--request-records-agent-uid <UID>` | with agent | none | The OS UID the agent must run as. |
 | `--request-records-agent-node <ID>` | with agent | none | The `node_id` the agent must report. The proxy checks it on the handshake and on every receipt. |
 | `--request-records-producer <ID>` | with agent | none | The `producer_id` in the agent grant for this proxy. |
 | `--request-record-max-attempts <N>` | no | `64` | Attempt summaries to keep for each record. Range 1 to 64. Needs a file or an agent. |
 
-The flags are read at start. A reload does not change them. Source:
-`crates/proxy/src/main.rs:102-121`, `:546-553`.
+The flags are read at start. A reload does not change them. Setting
+`--request-record-max-attempts` without a destination is an error.
 
-If you set neither `--request-records-file` nor `--request-records-agent`,
-capture stays off. Setting `--request-record-max-attempts` alone is an error
-because it requires a destination (`main.rs:120`).
-
-### The file destination
-
-`--request-records-file` appends records to the file as JSON lines. The
-proxy does not rotate, expire, or restrict the file. Set the access mode and
-the retention on the file yourself (`main.rs:102-103`).
-
-### The declarative bootstrap key
+#### The declarative bootstrap key
 
 You can set capture in a bootstrap file instead of flags. The decoder is
-strict. An unknown key fails with its full path
-(`crates/proxy-config/src/capture.rs`).
+strict. An unknown key fails with its full path.
 
 ```yaml
 node:
@@ -231,40 +361,37 @@ node:
 | `budgets.*`, `transport.*` | no | see source | Memory and deadline limits. Defaults are in `CaptureBudgets::default` and `CaptureTransportLimits::default`. |
 
 A SIGHUP reload applies the declarative capture block. If the proxy rejects
-the new block, it keeps the previous snapshot (`main.rs:1920-1923`).
-Declarative capture also requires `--concurrency` of 8 or less
-(`main.rs:321`).
+the new block, it keeps the previous snapshot.
+Declarative capture also requires `--concurrency` of 8 or less.
 
-This page does not describe the emergency control protocol. The code
-verified here shows only that the two keys are required. Treat the control
-socket as a privileged interface.
+This page does not describe the emergency control protocol. Treat the
+control socket as a privileged interface.
 
-## What the proxy does when the agent is down
+### What the proxy does when the agent is down
 
 Capture never changes forwarding. The proxy sends a record from a dedicated
 writer, with a queue of 1,024 events. The request worker never connects to
 the agent. If the agent is down, the proxy keeps serving requests and the
-counters below show the lost records. Each event gets at most three transport
-attempts in the legacy agent mode, per the agent README.
+counters below show the lost records. In the agent mode that the flags select, each event gets at most three
+transport attempts.
 
 Retries keep the event ID. A lost acknowledgement can leave a duplicate
 record. Treat the spool as at-least-once, not exactly-once.
 
-## Inspect the spool
+### Inspect the spool
 
 Two admin endpoints read the spool through the proxy. Both need an agent
 endpoint. Both need the producer grant to have `"inspect": true`. An
 inspection never acknowledges a record and never changes the spool.
 
 An inspect grant reads every stored record of its tenants, whichever
-producer wrote the record (agent README).
+producer wrote the record.
 
-### `GET /capture/spool/stats`
+#### `GET /capture/spool/stats`
 
 This endpoint needs no token. It returns counters and byte sizes only, with
 no record contents. The proxy caches the answer for 5 seconds. Concurrent
-callers share one agent query, and the cache also holds errors
-(`crates/proxy-admin/src/server.rs:203-214`).
+callers share one agent query, and the cache also holds errors.
 
 ```sh
 curl --max-time 5 http://127.0.0.1:53422/capture/spool/stats
@@ -273,10 +400,9 @@ curl --max-time 5 http://127.0.0.1:53422/capture/spool/stats
 The JSON fields are `node_id`, `next_sequence`, `durable_through_sequence`,
 `acknowledged_through_sequence`, `pending_records`, `retained_records`,
 `database_bytes`, `disk_bytes`, `max_disk_bytes`, `quarantine_bytes`,
-`poisoned`, `durable_total`, `rejected_total`, and `failures_total`
-(`admin-ui/src/components/Capture.tsx:12-27`).
+`poisoned`, `durable_total`, `rejected_total`, and `failures_total`.
 
-### `GET /capture/spool/records`
+#### `GET /capture/spool/records`
 
 This endpoint needs the admin token (`Authorization: Bearer <token>`). The
 token is the value of `LLMPROXY_ADMIN_TOKEN`. It returns one page of stored
@@ -295,9 +421,9 @@ curl --max-time 5 -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
 The response has `records`, `next_after_sequence`, and
 `durable_through_sequence`. Use `next_after_sequence` as the next `after`.
 An unknown or repeated parameter gives `400`. A method other than `GET`
-gives `405` (`server.rs:1462-1530`).
+gives `405`.
 
-### Status codes
+#### Status codes
 
 | Status | Endpoint | Cause | Fix |
 |---|---|---|---|
@@ -312,7 +438,7 @@ gives `405` (`server.rs:1462-1530`).
 The error body is JSON: `{"error": "<text> (<detail>)"}`. Each message ends
 with a fixed detail phrase. It never contains record contents.
 
-## The Capture tab in the admin UI
+### The Capture tab in the admin UI
 
 The admin UI has a Capture tab. It shows the spool stats from
 `/capture/spool/stats` and refreshes them every 10 seconds while the tab is
@@ -320,20 +446,20 @@ visible. It marks a poisoned spool with a red `SPOOL POISONED` banner. The
 Records section loads pages of 50 records from `/capture/spool/records` with
 the token from the header bar. You can filter the loaded rows by tenant,
 user, model, or request ID. The filter works on the rows already loaded in
-the browser (`admin-ui/src/components/Capture.tsx`).
+the browser.
 
-## Metrics
+### Agent and capture metrics
 
 All names below appear on `/stats/prometheus` with the `envoy_` prefix, for
 example `envoy_llmproxy_capture_agent_reachable`. See
 [Metrics and stats](../metrics-and-stats/).
 
-### Spool gauges
+#### Spool gauges
 
 The proxy asks the agent for spool stats every 10 seconds. The first poll
 runs one period after start. Each poll has a 2-second limit. The poll runs
 only when an agent endpoint exists at start. A reload that first adds an
-endpoint is not polled until you restart (`main.rs:1191-1202`).
+endpoint is not polled until you restart.
 
 | Gauge | Meaning |
 |---|---|
@@ -347,7 +473,7 @@ endpoint is not polled until you restart (`main.rs:1191-1202`).
 | `llmproxy_capture_spool_durable_through_sequence` | Highest durable sequence. |
 | `llmproxy_capture_spool_poisoned` | `1` if the spool reports itself poisoned. |
 
-The proxy logs on a change only, not on every poll (`main.rs:648-720`):
+The proxy logs on a change only, not on every poll:
 
 - `capture agent unreachable: ...` at `warn`, when the agent goes down.
 - `capture agent reachable again` at `info`.
@@ -356,31 +482,21 @@ The proxy logs on a change only, not on every poll (`main.rs:648-720`):
 - `capture agent spool stats are off: the agent closed on the inspection query, ...`
   at `info`, once.
 
-### Record counters
+#### Capture pipeline counters
 
 The proxy creates these series at start, so an idle proxy shows `0` and not
-a missing series (`crates/proxy-observability/src/stats.rs:769-776`).
+a missing series. The `llmproxy_metadata_*` series are in
+[Record delivery metrics](#record-delivery-metrics).
 
 | Metric | Labels | Meaning |
 |---|---|---|
-| `llmproxy_metadata_admission` | `outcome`: `accepted`, `capacity_exceeded`, `closed` | Whether the queue took the record. |
-| `llmproxy_metadata_queue_depth` | none | Records in the queue. |
-| `llmproxy_metadata_queue_capacity` | none | Queue size. `0` means capture is not configured. |
-| `llmproxy_metadata_written` | none | Records delivered. In file mode, an append. In agent mode, a durable local receipt. |
-| `llmproxy_metadata_durable` | none | Records the agent confirmed as durable. |
-| `llmproxy_metadata_write_failures` | none | Write failures, or deliveries with an unknown result. |
 | `llmproxy_capture_state_admission` | `outcome`: `accepted`, `disabled`, `capacity_exceeded`, `closed` | Whether a request got capture state. |
 | `llmproxy_capture_active_requests` | none | Requests with capture state now. |
 | `llmproxy_capture_state_reserved_bytes` | none | Bytes reserved for request state. |
 | `llmproxy_capture_event_reserved_bytes` | none | Bytes reserved for queued events. |
 | `llmproxy_capture_drops` | `reason`: `disabled`, `expired`, `encoded_limit`, `delivery_unknown`, `identity_limit`, `transport_capacity`, `agent_rejected`, `unavailable` | Records dropped, by cause. |
 
-I did not verify the precise trigger for each `llmproxy_capture_drops`
-reason beyond its name and the tests that increment it
-(`crates/proxy-observability/src/capture_tests.rs`). The
-`delivery_unknown` reason does not prove the record was lost.
-
-## Limits
+### Limits
 
 - **Local spool only.** The agent writes to a local encrypted spool. No
   upload, no query service, no transcripts, and no billing-ledger guarantee.
@@ -391,15 +507,15 @@ reason beyond its name and the tests that increment it
   forwarding or readiness. Watch `llmproxy_capture_agent_reachable` and
   `llmproxy_metadata_write_failures`.
 - **At least once.** A lost acknowledgement can produce a duplicate record.
-- **Memory.** The agent README makes no whole-process memory claim. Set a
-  memory limit for the agent process yourself.
+- **Memory.** The agent makes no whole-process memory limit. Set a memory
+  limit for the agent process yourself.
 - **Shutdown.** The agent waits at most 5 seconds for the writer to drain.
   After SIGKILL a stale socket can remain. Stop the old process, remove that
   socket, and restart. The agent never removes an existing socket.
 - **Spool keys.** Keep the key file and the spool files. The spool cannot be
   read without the key.
 
-## Troubleshooting
+### Troubleshooting
 
 **`GET /capture/spool/stats` returns 404.** The proxy has no agent endpoint.
 Pass the four agent flags or the bootstrap key.
@@ -417,3 +533,25 @@ agent. Record delivery is not affected.
 **The proxy refuses to start with `cannot combine declarative and CLI
 capture`.** Remove the `--request-records-*` flags or remove the bootstrap
 key.
+
+## Implementation notes
+
+For maintainers. Each behavior above has this source or test.
+
+- File sink: `crates/proxy-observability/src/metadata.rs`. The module doc
+  states the best-effort contract. `MetadataDelivery::start` sets mode `0600`
+  and the append open. The writer thread stops admission after a failed write
+  (`close_on_failure`) and stamps `record_seq`.
+- Flags, conflicts, and the startup warning: `crates/proxy/src/main.rs`,
+  `Args` and the capture setup in `serve`.
+- Record type: `RequestRecord` in `crates/proxy-observability/src/records.rs`.
+- Declarative decoder: `crates/proxy-config/src/capture.rs`.
+- Agent limits: `crates/proxy-capture-agent/README.md`.
+- Release archive and installer: `.github/workflows/release.yml` and
+  `scripts/install.sh`.
+- Admin endpoints: `crates/proxy-admin/src/server.rs`. Admin UI:
+  `admin-ui/src/components/Capture.tsx`.
+- Metric definitions: `crates/proxy-observability/src/stats.rs`. Tests:
+  `crates/proxy-observability/src/capture_tests.rs`. The precise trigger of
+  each `llmproxy_capture_drops` reason is checked only by those tests. The
+  `delivery_unknown` reason does not prove the record was lost.

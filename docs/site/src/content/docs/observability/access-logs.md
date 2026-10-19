@@ -2,9 +2,10 @@
 title: Access logs
 description: "Write one access log line per request, with token counts, timing, tenant, and selected provider."
 summary: The format-string engine behind observability.access_logs, the
-  operators it supports, and when a line is actually written.
-lastUpdated: 2026-10-13
+  operators it supports, and when a line is written.
+lastUpdated: 2026-10-18
 related:
+  - observability/overview
   - configuration/configuration-file
   - observability/metrics-and-stats
 ---
@@ -12,7 +13,7 @@ related:
 # Access logs
 
 Configure `observability.access_logs` to have llm-proxy write one line per
-completed request. Omit it and no access log is written at all — there is
+completed request. If you omit it, the proxy writes no access log. There is
 no default destination.
 
 ```yaml
@@ -24,23 +25,20 @@ observability:
 
 ## When a line is written
 
-A line is rendered and written exactly once per request, at the end of the
-response stream — not when response headers are produced, and not once per
-chunk (`crates/proxy-http/src/access_logging.rs`). This matters for LLM
-traffic specifically: a streamed response's headers arrive almost
-immediately, but the tokens (the actual duration and byte count worth
-logging) take the whole length of the generation. Logging at header time
-would report a near-zero duration and byte count for every streamed
+The proxy writes one line for each request, at the end of the response
+stream. It does not write at the response headers, and it does not write for
+each chunk. This matters for LLM traffic. The headers of a streamed response
+arrive at once, but the tokens take the whole generation. A line at header
+time would show a near-zero duration and byte count for every streamed
 response.
 
 A line is written whether the stream ends cleanly, errors, or is abandoned
-(a client that disconnects mid-stream). llm-proxy never injects a synthetic
-event into the response body to explain a failure — the client sees an
-unclean end to the stream, and the failure is recorded in the access log
-and a `tracing` warning instead. Forging an error frame in the provider's
-own event schema risks a client mistaking it for something the model
-actually said; this is a transparent proxy, and failure attribution belongs
-in observability, not in the response body.
+(a client that disconnects mid-stream). llm-proxy does not add a synthetic
+event to the response body to explain a failure. The client sees an unclean
+end to the stream. The proxy records the failure in the access log and in a
+`tracing` warning. An error frame in the provider's event schema could look
+like model output, so the proxy keeps failure reports out of the response
+body.
 
 ## Text format
 
@@ -49,8 +47,7 @@ you supply your own format string: it offers only `text` and `json`, and both
 use a fixed format. In Envoy mode you can set `log_format` yourself. See
 [Envoy mode](#envoy-mode-log_format).
 
-The fixed text format of the `llmproxy` config file is
-(`crates/proxy-simple-config/src/lower.rs`, `ACCESS_LOG_TEXT_FORMAT`):
+The fixed text format of the `llmproxy` config file is:
 
 ```text
 [%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
@@ -85,10 +82,11 @@ cost fields come before `timing_us`. The JSON format carries the same fields.
 On a connection that is used again, that value is from an earlier request. A
 connect that the request did make is part of `pre_upstream`.
 
-For a request that fails to connect to its provider, `%RESPONSE_FLAGS%` is `UF`. See "Response
-flags" below. A dash in `llm_tokens="-/-/-/-/-"` is not a zero. A dash means
-the provider reported no usage for this exchange. That is a different fact
-from "zero tokens were used". Do not confuse the two on a billing dashboard.
+For a request that fails to connect to its provider, `%RESPONSE_FLAGS%` is
+`UF`. See [Response flags](#response-flags). A dash in
+`llm_tokens="-/-/-/-/-"` is not a zero. A dash means the provider reported no
+usage for this exchange. That is different from "zero tokens were used". Do
+not confuse the two on a billing dashboard.
 
 Both fixed formats include `%LLM_CREDENTIAL_SOURCE%`, `%LLM_SERVED_MODEL%`,
 `%LLM_USAGE_COMPLETENESS%`, `%LLM_COST_KIND%`, and `%LLM_UPSTREAM_ID%`. Only the
@@ -101,13 +99,11 @@ See [Tenant provider credentials](../../authentication/tenant-provider-credentia
 One JSON object per line. Every value renders as a JSON string, including
 numbers. The one exception is `llm_upstream_usage`, which is a JSON object
 (or `null`). The field values all go through the same format-string engine as the
-text format. `AccessLogFormat::Json` carries no typed (numeric or boolean)
-value today (`crates/proxy-http/src/access_logging.rs`, `render_json`). The
+text format. The JSON format has no typed (numeric or boolean) value. The
 real line in [Getting started](../../getting-started/quickstart/#step-5-read-the-access-log)
 shows the keys in alphabetical order.
 
-The fixed JSON format of the `llmproxy` config file has these keys
-(`crates/proxy-simple-config/src/lower.rs`, `lower_access_log`):
+The fixed JSON format of the `llmproxy` config file has these keys:
 
 | Key | Operator |
 |---|---|
@@ -148,10 +144,7 @@ in both formats.
 
 In Envoy mode, the file, stdout, and stderr access loggers accept `log_format`
 with `text_format` or `json_format`. If you omit `log_format`, the logger uses
-Envoy's default format. `text_format_source` is not implemented
-(`crates/proxy-config/src/lower.rs`, the `FileAccessLog`,
-`StdoutAccessLog`, and `StderrAccessLog` field lists, and
-`convert_substitution_format`). Any operator in the table below is valid in
+Envoy's default format. `text_format_source` is not implemented. Any operator in the table below is valid in
 `log_format`.
 
 ## The operator set
@@ -159,10 +152,10 @@ Envoy's default format. `text_format_source` is not implemented
 The table below documents every operator the engine understands. Use it to
 read the two fixed formats above field by field. In Envoy mode you can build
 your own format string from these operators.
-Every operator is resolved once, at config-load time, into a
-pre-built list — nothing is re-parsed per request
-(`crates/proxy-observability/src/access_log.rs`). An unknown `%OPERATOR%`
-is a load error, never silently dropped or emitted as literal text.
+The proxy resolves every operator once, at config-load time, into a
+pre-built list. It does not parse the format again for each request. An
+unknown `%OPERATOR%` is a load error. The proxy never drops it silently or
+writes it as literal text.
 
 | Operator | Renders |
 |---|---|
@@ -179,7 +172,7 @@ is a load error, never silently dropped or emitted as literal text.
 | `%BYTES_RECEIVED%` / `%BYTES_SENT%` | Request/response body byte counts. |
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
 | `%DOWNSTREAM_REMOTE_ADDRESS%` | The client's socket address. |
-| `%LLM_INPUT_TOKENS%` / `%LLM_CACHED_TOKENS%` / `%LLM_CACHE_CREATION_TOKENS%` / `%LLM_OUTPUT_TOKENS%` / `%LLM_TOTAL_TOKENS%` | Token counts from the provider's own usage report. `-` when the provider reported none — never a confident-looking `0`. |
+| `%LLM_INPUT_TOKENS%` / `%LLM_CACHED_TOKENS%` / `%LLM_CACHE_CREATION_TOKENS%` / `%LLM_OUTPUT_TOKENS%` / `%LLM_TOTAL_TOKENS%` | Token counts from the provider's own usage report. `-` when the provider reported none. It is never `0` in that case. |
 | `%LLM_LIST_COST%` | Configured list cost in integer nanodollars, captured once when final response usage is available. `-` when usage, the requested model, actual provider, or a rate-card entry is unknown; this is distinct from a configured zero price. |
 | `%LLM_TTFT%` | Time to first token (response headers to first body byte), in milliseconds. |
 | `%LLM_TPOT%` | Mean time per output token: `(duration - ttft) / output_tokens`, in fractional milliseconds. `-` if usage, TTFT, or duration is missing, or output tokens is zero. |
@@ -188,7 +181,7 @@ is a load error, never silently dropped or emitted as literal text.
 | `%LLM_TENANT%` | The authenticated tenant id the auth filter resolved. `-` when the request is not authenticated. |
 | `%LLM_CREDENTIAL_SOURCE%` | The source of the last provider credential applied to this request: `platform` (the operator's) or `tenant` (the tenant's own key). `-` when no credential was applied, for example after a `403 tenant_credential_missing`. See [Tenant provider credentials](../../authentication/tenant-provider-credentials/#access-log). |
 | `%LLM_KEY_ID%` | The `key_id` of the credential the auth filter resolved. This is the key's configured identifier, not the key itself. `-` when the request is not authenticated. |
-| `%LLM_USER_ID%` | Always `-` in this release. The proxy does not yet publish an authenticated user, so there is no value to render. |
+| `%LLM_USER_ID%` | Always `-` in this release. The proxy does not publish an authenticated user, so there is no value to render. |
 | `%LLM_REQUESTED_MODEL%` | The `model` value the body-rewrite filter read from the request body, before any provider model mapping. `-` when no filter set it. |
 | `%LLM_RESOLVED_MODEL%` | The model a resolver chose when the requested model was `auto` (see [The auto model](../../providers-and-routing/auto-model/)). `-` when nothing was resolved. Takes no argument. `%LLM_REQUESTED_MODEL%` stays `auto`. |
 | `%LLM_SELECTED_MODEL%` | The model name sent to the provider that served the response, after any provider model mapping. If no mapping matches, it is the requested model. `-` when there is no requested model. |
@@ -244,8 +237,7 @@ config error.
 
 ## Response flags
 
-`%RESPONSE_FLAGS%` renders zero or more of these short codes, comma-joined
-(`crates/proxy-observability/src/flags.rs`):
+`%RESPONSE_FLAGS%` renders zero or more of these short codes, comma-joined:
 
 | Code | Meaning |
 |---|---|
@@ -274,16 +266,15 @@ config error.
 
 `observability.access_logs.output` is `stdout`, `stderr`, or a file path.
 A worker thread never writes the line itself. It copies the line into a queue,
-and a separate writer thread writes it
-(`crates/proxy-observability/src/sink.rs`, `QueuedSink`).
+and a separate writer thread writes it.
 
 - Each destination has one writer thread.
 - `stdout` and `stderr` each share one queue in the process. Every logger that
   writes to `stdout` uses the same queue.
 - The proxy turns each file path into an absolute path. Each absolute path gets
   one sink in the process. It does not resolve symlinks, so two symlinks to one
-  file get two sinks (`canonical_key`).
-- Each queue holds at most 8 MiB of line bytes (`QUEUE_MAX_BYTES`).
+  file get two sinks.
+- Each queue holds at most 8 MiB of line bytes.
 
 A full queue drops the new line, not an old one. The request is not affected.
 Each dropped line adds 1 to `llmproxy_access_log_dropped_lines`. This counter
@@ -297,5 +288,21 @@ At shutdown the proxy flushes the queues that still hold lines. It waits at most
 
 A broken destination (disk full, a deleted stdout pipe) never fails a request.
 The writer thread swallows the write error. It logs a warning at most once every
-5 seconds, so a failing destination does not become a performance problem
-(`RateLimiter` in `sink.rs`).
+5 seconds, so a failing destination does not become a performance problem.
+
+## Implementation notes
+
+For maintainers. Each behavior above has this source.
+
+- Write once at stream end: `crates/proxy-http/src/access_logging.rs`. JSON
+  rendering: `render_json` in the same file.
+- Fixed formats: `ACCESS_LOG_TEXT_FORMAT` and `lower_access_log` in
+  `crates/proxy-simple-config/src/lower.rs`.
+- Envoy mode `log_format`: `FileAccessLog`, `StdoutAccessLog`,
+  `StderrAccessLog`, and `convert_substitution_format` in
+  `crates/proxy-config/src/lower.rs`.
+- Operator resolution: `crates/proxy-observability/src/access_log.rs`.
+- Response flags: `crates/proxy-observability/src/flags.rs`.
+- Queue, size limit, path keys, and warning rate limit: `QueuedSink`,
+  `QUEUE_MAX_BYTES`, `canonical_key`, and `RateLimiter` in
+  `crates/proxy-observability/src/sink.rs`.

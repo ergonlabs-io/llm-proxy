@@ -4,8 +4,9 @@ description: "Read proxy metrics on /stats and /stats/prometheus, or export them
 summary: The metrics llm-proxy records, how /stats, /stats/prometheus, and OTLP
   export show them, the limits on label cardinality, how a series ends when
   its cluster or listener leaves the config, and how to turn on OTLP export.
-lastUpdated: 2026-10-16
+lastUpdated: 2026-10-18
 related:
+  - observability/overview
   - configuration/configuration-file
   - operations/config-reload
   - limits-and-budgets/billing-ledger
@@ -23,14 +24,11 @@ registry:
 
 The admin server (the top-level `admin` field) serves the first two. Both are
 read-only. They differ in coverage: `/stats` shows only the metrics that have
-an Envoy name. `/stats/prometheus` and OTLP show every metric
-(`crates/proxy-observability/src/stats/envoy_render.rs`, `envoy_counter_name`
-and `envoy_histogram_name`; `prometheus_render.rs`, module doc).
+an Envoy name. `/stats/prometheus` and OTLP show every metric.
 
 Both endpoints return `404` if the admin server has no stats registry. The
-proxy does not fake an empty `200`, because an empty `/stats` would tell an
-operator "no traffic" when the real answer is "not wired up"
-(`crates/proxy-admin/src/server.rs:606-636`).
+proxy does not return an empty `200`, because an empty `/stats` would mean
+"no traffic" when the real answer is "no stats registry".
 
 ## Inventory
 
@@ -68,8 +66,7 @@ Notes on the traffic metrics:
 - **Token usage.** The proxy records `llm.client.token.usage` once per
   completed stream, and only if the provider reported usage. A stream with no
   usage report records nothing. The `provider` label is the cluster that the
-  proxy actually dialled, so after a fallback it names the fallback cluster
-  (`crates/proxy-http/src/access_logging.rs:745-766`).
+  proxy dialled, so after a fallback it names the fallback cluster.
 - **Latency histograms.** The proxy records them only for a response with no
   response flags and a `2xx` status. The request path must end in
   `/chat/completions` or `/messages` (operation `chat`), `/completions`
@@ -78,16 +75,12 @@ Notes on the traffic metrics:
   have a model name that the body-rewrite filter read from the body. The proxy
   never uses a cluster name in its place. The time-per-output-token histogram
   needs at least two output tokens and a duration that is not shorter than the
-  time to first token
-  (`crates/proxy-http/src/access_logging.rs:768-792`;
-  `crates/proxy-http/src/stat_handles.rs`, `GenAiLatencyStats::record`).
+  time to first token.
 - **External authorization.** `scope` is the `stat_prefix` of the HTTP
   connection manager plus `.ext_authz`, with the filter's own `stat_prefix`
   added after it when you set one. `outcome` is one of `ok`, `denied`,
   `error`, `invalid`, `disabled`, `failure_mode_allowed`, or
-  `ignored_dynamic_metadata`
-  (`crates/proxy-core/src/listener.rs:1494-1498`;
-  `crates/proxy-filters/src/ext_authz.rs:25-33`). See
+  `ignored_dynamic_metadata`. See
   [External authorization](../../authentication/external-authorization/).
 - **Tenant credentials.** The counter is for tenant-mode requests only. See
   [Tenant provider credentials](../../authentication/tenant-provider-credentials/#counter).
@@ -112,10 +105,7 @@ reachable).
 | `llmproxy_otel_spans_dropped` | counter | none | Spans that the proxy discarded before export: the span queue was full, or the export of the batch failed. |
 
 The proxy resolves the two `llmproxy_otel_*` metrics at start, even when
-OTLP export is off, so a scrape shows `0` and not a missing series
-(`crates/proxy/src/main.rs:972-980` and `:1016-1030`; test
-`a_failing_metric_export_is_counted_and_forwarding_continues` in
-`crates/proxy/tests/otlp_trace_e2e.rs`).
+OTLP export is off, so a scrape shows `0` and not a missing series.
 
 ### Capture metrics
 
@@ -142,9 +132,6 @@ each is on [Request capture](../../observability/request-capture/).
   `llmproxy_capture_spool_poisoned`, `llmproxy_capture_agent_reachable`, and
   `llmproxy_capture_spool_stats_available`.
 
-(Definitions: `crates/proxy-observability/src/stats.rs:754-978`. The code that
-writes each series is in the capture crates and is not checked here.)
-
 ### Ledger metrics
 
 The billing ledger records six counters. They are in `/stats/prometheus` and
@@ -155,8 +142,6 @@ OTLP only: `llmproxy_ledger_rejected_total` (label `reason`),
 `llmproxy_spend_charged_micro_usd_total`, and
 `llmproxy_ledger_spend_written_micro_usd_total`. The meaning of each is on
 [Billing ledger](../../limits-and-budgets/billing-ledger/#metrics).
-(Definitions: `crates/proxy-observability/src/stats.rs`, section "billing
-ledger".)
 
 ### Unmetered endpoint refusals
 
@@ -164,15 +149,12 @@ ledger".)
 counts requests that a spend budget or a token limit refused because the
 proxy cannot count their endpoint. See
 [Spend policies](../../limits-and-budgets/spend-policies/#endpoints-a-budget-cannot-count).
-(Definition: `crates/proxy-observability/src/stats.rs`,
-`UNMETERED_ENDPOINT_REFUSED`.)
 
 ### Unknown names
 
 A recorder that gets a cluster or listener name with no resolved handle does
 nothing and does not fail. It logs one warning for each unknown name, for up
-to 64 names, then one summary line
-(`crates/proxy-http/src/stat_handles.rs:94`, `UNKNOWN_NAME_WARN_CAP`). The
+to 64 names, then one summary line. The
 metric does not appear until a config names the cluster or listener.
 
 ## `/stats`
@@ -195,8 +177,7 @@ histogram with no observations renders `No recorded values`.
 
 Envoy keys the listener stats by the listener address. llm-proxy uses the
 listener name. The name stays the same when the listener binds to a new
-address (`crates/proxy-observability/src/stats/envoy_render.rs`, comment in
-`envoy_counter_name`).
+address.
 
 ## `/stats/prometheus`
 
@@ -220,16 +201,14 @@ Every attribute becomes a label. The proxy does not fold labels into the
 metric name, as `/stats` does. Metric and label names outside `[a-zA-Z0-9_]`
 change to `_`. The proxy escapes backslash, newline, and quote in label
 values. Histogram buckets are cumulative and end in `le="+Inf"`, followed by
-`_sum` and `_count`. The output has one `# TYPE` line for each metric family
-(`crates/proxy-observability/src/stats/prometheus_render.rs`, module doc).
+`_sum` and `_count`. The output has one `# TYPE` line for each metric family.
 
 ## Label cardinality
 
 A label whose values come from a request can grow without bound. The proxy
 caps the number of live series for each such metric. Past the cap, a new label
 value folds into one shared overflow series. A value that already has its own
-series keeps it
-(`crates/proxy-observability/src/stats.rs`, `Registry::resolve_capped`).
+series keeps it.
 
 | Metric | Label | Cap (live series) | Overflow value |
 |---|---|---|---|
@@ -239,9 +218,6 @@ series keeps it
 | `llmproxy_provider_credential_requests_total` | `cluster` | 256 | `cluster="-cardinality-overflow-"` |
 | `ext_authz` | `scope` | 1,024 | `scope="overflow"` |
 | `downstream_rq_active` | `scope` | 1,024 | `scope="overflow"` |
-
-(Constants: `stats.rs:639` and `:806`; `stat_handles.rs:702`;
-`ext_authz.rs:45`.)
 
 The cap counts series, not label values. Each tenant of
 `llm.client.token.usage` uses up to four series for each provider, one for each
@@ -259,7 +235,7 @@ Three rules apply to every cap:
 A request with no authenticated tenant records `llm.client.token.usage` with
 `tenant="-unauthenticated-"`. The proxy records this usage and does not skip
 it. It resolves these series for each cluster when it applies a config,
-without the cap (`crates/proxy-http/src/stat_handles.rs:608-668`).
+without the cap.
 
 ## Series lifetime and reload
 
@@ -272,40 +248,32 @@ labels: `cluster` and `provider` (both against the cluster names), and
 1. **Hidden.** A series whose label is not in the set stops appearing in
    `/stats`, `/stats/prometheus`, and OTLP. It stops counting against its cap.
    It still records. If the next config names it again, it reappears with its
-   value. A name that is absent from a single config loses nothing (test
-   `a_series_absent_from_one_scope_is_hidden_and_reappears_with_its_old_value`).
+   value. A name that is absent from a single config loses nothing.
 2. **Reclaimed.** A series that two consecutive configs hide is drained. Its
    old handles stop recording. The proxy then frees the slot for reuse, after
    no reader holds an older snapshot. A name that returns later starts a new
-   series at zero (test
-   `a_series_absent_from_two_scopes_is_freed_and_returns_at_zero`).
+   series at zero.
 
 For xDS, only an update that changes the listener, cluster, or route set
 counts as a config. A heartbeat, an endpoint update, or a re-sent identical
-resource does not (`crates/proxy/src/main.rs:1786-1793`). A returning name
+resource does not. A returning name
 starts at zero, so Prometheus sees a counter reset.
 
 The proxy does not hide or reclaim a series by its `tenant` or
 `gen_ai.request.model` label. The registry can do this. The running binary
-passes no tenant set and no model set, because no config field names them
-(`crates/proxy/src/main.rs:1768-1775`, `live_scope_for`). A tenant series ends
-only when its `provider` cluster leaves the config (test
-`retiring_a_provider_frees_the_cap_slots_of_its_tenant_series`).
+passes no tenant set and no model set, because no config field names them.
+A tenant series ends
+only when its `provider` cluster leaves the config.
 
 ## OTLP export
 
 Set an OTLP/gRPC collector endpoint to push metrics. Metric export and trace
 export are separate. Each has its own task, endpoint, and deadline. You can
-turn on one without the other. Metric export does not need the admin server
-(`crates/proxy-observability/src/otlp.rs`, module doc;
-`crates/proxy/src/main.rs:1016-1080`).
+turn on one without the other. Metric export does not need the admin server.
 
 Each export sends a full cumulative snapshot of the registry. It includes the
 metrics that `/stats` omits. On a clean shutdown the proxy sends a last
-snapshot, including requests that finished during the drain (tests
-`a_clean_shutdown_delivers_a_final_metric_snapshot` and
-`the_final_snapshot_includes_traffic_served_during_drain` in
-`crates/proxy/tests/otlp_trace_e2e.rs`).
+snapshot, including requests that finished during the drain.
 
 ### In a `llmproxy` config file
 
@@ -334,9 +302,6 @@ observability:
 | `tracing.service_name` | `llm-proxy` | The OTLP resource attribute `service.name`. |
 | `tracing.export_deadline` | `5s` | Deadline for one batch of spans. Range: 100ms to 60s. |
 | `tracing.sample_ratio` | `1.0` | Head-sampling ratio for a new root span. |
-
-(Defaults and ranges: `schema/llmproxy-v0.schema.json`, `observability.metrics`
-and `observability.tracing`; `crates/proxy-config/src/lower.rs:5127-5160`.)
 
 ### In Envoy mode
 
@@ -367,28 +332,26 @@ node:
 - Any other key under these two names is a load error that names the full
   path, for example ``node.metadata["io.llmproxy.metrics"].foo``.
 
-(`crates/proxy-config/src/lower.rs:4965-5230`.) The `llmproxy` config file
-lowers to these same keys (`crates/proxy-simple-config/src/lower.rs:2299-2395`).
+The `llmproxy` config file lowers to these same keys.
 
 ### Tracing
 
 With `tracing` set, the proxy exports a server span for each sampled request
 and a client span for each upstream attempt, in batches. A sampled `traceparent`
 from the client is always honored. `sample_ratio` applies only when the proxy
-creates a new root span (test
-`traceparent_join_and_fallback_produce_the_right_span_tree` in
-`crates/proxy/tests/otlp_trace_e2e.rs`; also `tracing_without_metrics_exports_spans_and_no_metrics` and `a_clean_shutdown_delivers_a_final_trace_batch` in the same file; span emission at
-`crates/proxy-http/src/access_logging.rs:796-835` and
-`crates/proxy-http/src/router.rs:992`).
+creates a new root span.
+
+Spans carry no request or response body. A server span has the method, the
+path, the response flags, the upstream cluster, and the `x-request-id`. A client
+span has the response status code. To export bodies, see
+[Request and response body export](../trace-export/).
 
 ### If the collector fails
 
 A hung or unreachable collector costs one bounded timeout for each attempt, and
 never stops request forwarding. Each failed export adds to
-`llmproxy_otel_export_failures` for its signal. Tests
-`a_hung_collector_is_bounded_by_the_export_deadline` and
-`a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped` in
-`crates/proxy/tests/otlp_trace_e2e.rs` cover this.
+`llmproxy_otel_export_failures` for its signal. The proxy also counts a
+dropped batch of spans in `llmproxy_otel_spans_dropped`.
 
 ## What `/stats` does not do
 
@@ -398,3 +361,36 @@ never stops request forwarding. Each failed export adds to
   [Series lifetime and reload](#series-lifetime-and-reload).
 - It does not show the token, latency, health, or capture metrics. Use
   `/stats/prometheus` or OTLP for these.
+
+## Implementation notes
+
+For maintainers. Each behavior above has this source or test.
+
+- `/stats` coverage and Envoy names: `envoy_counter_name` and
+  `envoy_histogram_name` in
+  `crates/proxy-observability/src/stats/envoy_render.rs`. Prometheus format:
+  `crates/proxy-observability/src/stats/prometheus_render.rs`.
+- `404` without a registry: `crates/proxy-admin/src/server.rs`.
+- Token usage and latency histograms: `crates/proxy-http/src/access_logging.rs`
+  and `GenAiLatencyStats::record` in `crates/proxy-http/src/stat_handles.rs`.
+- Metric definitions and label caps: `crates/proxy-observability/src/stats.rs`
+  (`Registry::resolve_capped`), `stat_handles.rs`, and
+  `crates/proxy-filters/src/ext_authz.rs`.
+- Unknown names: `UNKNOWN_NAME_WARN_CAP` in `stat_handles.rs`.
+- Series lifetime: `live_scope_for` in `crates/proxy/src/main.rs`. Tests
+  `a_series_absent_from_one_scope_is_hidden_and_reappears_with_its_old_value`,
+  `a_series_absent_from_two_scopes_is_freed_and_returns_at_zero`, and
+  `retiring_a_provider_frees_the_cap_slots_of_its_tenant_series`.
+- OTLP export: `crates/proxy-observability/src/otlp.rs`. Lowering:
+  `crates/proxy-config/src/lower.rs` and
+  `crates/proxy-simple-config/src/lower.rs`. Defaults come from
+  `schema/llmproxy-v0.schema.json`.
+- OTLP tests in `crates/proxy/tests/otlp_trace_e2e.rs`:
+  `a_failing_metric_export_is_counted_and_forwarding_continues`,
+  `a_clean_shutdown_delivers_a_final_metric_snapshot`,
+  `the_final_snapshot_includes_traffic_served_during_drain`,
+  `traceparent_join_and_fallback_produce_the_right_span_tree`,
+  `a_hung_collector_is_bounded_by_the_export_deadline`, and
+  `a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped`.
+- Span attributes: `crates/proxy-http/src/access_logging.rs` and
+  `crates/proxy-http/src/router.rs`.
