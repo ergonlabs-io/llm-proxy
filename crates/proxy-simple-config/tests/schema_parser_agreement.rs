@@ -98,6 +98,31 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_fields::<PreviousCredentialKey>,
         ),
         ("#/$defs/AuthKey", "AuthKey", parser_fields::<AuthKey>),
+        (
+            "#/$defs/AuthJwtProvider",
+            "JwtProviderDef",
+            parser_fields::<JwtProviderDef>,
+        ),
+        (
+            "#/$defs/AuthJwtJwks",
+            "JwtJwksDef",
+            parser_fields::<JwtJwksDef>,
+        ),
+        (
+            "#/$defs/AuthJwtKey",
+            "JwtKeyDef",
+            parser_fields::<JwtKeyDef>,
+        ),
+        (
+            "#/$defs/AuthJwtTenant",
+            "JwtTenantDef",
+            parser_fields::<JwtTenantDef>,
+        ),
+        (
+            "#/$defs/AuthJwtUser",
+            "JwtUserDef",
+            parser_fields::<JwtUserDef>,
+        ),
         ("#/$defs/Provider", "Provider", parser_fields::<Provider>),
         (
             "#/$defs/Provider/properties/request_fields",
@@ -345,7 +370,12 @@ fn every_schema_object_and_enum_is_paired_with_a_model_type() {
 /// no reflection over module types, so the source is scanned.
 #[test]
 fn every_strict_model_type_is_paired_with_a_schema_location() {
-    let source = include_str!("../src/model.rs");
+    // Every file of the `model` module, its submodules included.
+    let source = [
+        include_str!("../src/model.rs"),
+        include_str!("../src/model/jwt.rs"),
+    ]
+    .join("\n");
     let lines: Vec<&str> = source.lines().collect();
     let type_name = |line: &str| {
         line.trim_start_matches("pub ")

@@ -30,7 +30,7 @@
       "examples": ["127.0.0.1:9901"]
     },
     "auth": {
-      "description": "Downstream authentication: verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is a separate axis: an authenticated tenant with no stored model policy is refused (403) unless `enforce.tenants_without_policy` is `allow`. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
+      "description": "Downstream authentication: verifies inbound requests carry a known virtual key or a valid JWT (`auth.jwt`) before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is a separate axis: an authenticated tenant with no stored model policy is refused (403) unless `enforce.tenants_without_policy` is `allow`. Omit `auth` entirely to keep today's behavior (no application-level authentication).",
       "$ref": "#/$defs/Auth"
     },
     "providers": {
@@ -248,12 +248,82 @@
           "$ref": "#/$defs/Duration",
           "default": "720h",
           "description": "How long the proxy keeps the owner of a stored response (`/v1/responses`) or a stored chat completion (`/v1/chat/completions` with `store: true`). These are created by inference requests, so their owners expire rather than accumulate. After the TTL the object is refused to every tenant, its creator included, until `PUT /tenants/{id}/objects/{object_id}` assigns it again; set it to at least the provider's retention. Whole seconds, at least `1s`. A load error with `enforce.object_ownership: false`, which omits the filter that reads it."
+        },
+        "jwt": {
+          "type": "array",
+          "default": [],
+          "description": "JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. JWT callers always use the operator's provider keys, never a tenant's stored provider credentials, so lowering warns when `tenant_credentials` is also set. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning.",
+          "items": { "$ref": "#/$defs/AuthJwtProvider" }
         }
       },
       "oneOf": [
         { "required": ["hmac_secret"], "not": { "required": ["hmac_secret_file"] } },
         { "required": ["hmac_secret_file"], "not": { "required": ["hmac_secret"] } }
       ]
+    },
+    "AuthJwtProvider": {
+      "type": "object",
+      "description": "One JWT issuer. Every field is required.",
+      "additionalProperties": false,
+      "required": ["issuer", "audience", "jwks", "tenant", "user"],
+      "properties": {
+        "issuer": { "type": "string", "minLength": 1, "description": "The token's `iss` must equal this exactly. Unique within `auth.jwt`.", "examples": ["https://login.microsoftonline.com/9f1c0000-0000-0000-0000-000000000000/v2.0"] },
+        "audience": { "type": "string", "minLength": 1, "description": "The token's `aud` must contain this value. A token without `aud` is refused.", "examples": ["api://llm-proxy"] },
+        "jwks": { "$ref": "#/$defs/AuthJwtJwks" },
+        "tenant": { "$ref": "#/$defs/AuthJwtTenant" },
+        "user": { "$ref": "#/$defs/AuthJwtUser" }
+      }
+    },
+    "AuthJwtJwks": {
+      "type": "object",
+      "description": "Where the issuer's signing keys come from: exactly one of `discovery_url` or `keys`.",
+      "additionalProperties": false,
+      "properties": {
+        "discovery_url": { "type": "string", "pattern": "^https://[^/]", "description": "OIDC discovery document URL (`.../.well-known/openid-configuration`). A background thread fetches it, follows its `jwks_uri`, and refreshes the key set every `refresh_interval`; requests never wait on it. Until the first fetch succeeds every token from this issuer is refused. A failed refresh logs a warning and keeps the last key set; after 6 missed refreshes (`6 x refresh_interval`) the set is stale and every token from this issuer is refused (401) until a refresh succeeds." },
+        "refresh_interval": { "$ref": "#/$defs/Duration", "default": "10m", "description": "How often the key set is refreshed. Whole seconds, at least `1s`. Only with `discovery_url`." },
+        "trusted_ca_file": { "type": "string", "minLength": 1, "description": "PEM bundle of CA certificates trusted for the discovery and JWKS fetches instead of the system roots. Only with `discovery_url`." },
+        "keys": { "type": "array", "minItems": 1, "description": "A static key set, copied from the issuer's JWKS document. Never refreshed.", "items": { "$ref": "#/$defs/AuthJwtKey" } }
+      },
+      "oneOf": [
+        { "required": ["discovery_url"], "not": { "required": ["keys"] } },
+        { "required": ["keys"], "not": { "anyOf": [ { "required": ["discovery_url"] }, { "required": ["refresh_interval"] }, { "required": ["trusted_ca_file"] } ] } }
+      ]
+    },
+    "AuthJwtKey": {
+      "type": "object",
+      "description": "One RSA public key, as in a JWKS document.",
+      "additionalProperties": false,
+      "required": ["kid", "n", "e"],
+      "properties": {
+        "kid": { "type": "string", "minLength": 1, "description": "Matched against the token's `kid` header. Unique within `keys`." },
+        "n": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "description": "RSA modulus, base64url without padding." },
+        "e": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "description": "RSA public exponent, base64url without padding.", "examples": ["AQAB"] }
+      }
+    },
+    "AuthJwtTenant": {
+      "type": "object",
+      "description": "Which claim names the tenant, and which claim values are admitted as which tenant.",
+      "additionalProperties": false,
+      "required": ["claim", "values"],
+      "properties": {
+        "claim": { "type": "string", "minLength": 1, "description": "The claim whose string value selects the tenant, for example Entra's `tid`. A token without it is refused.", "examples": ["tid"] },
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Claim value -> llm-proxy tenant. A token whose claim value is not listed is refused (401); a claim value is never used as a tenant name directly. A tenant must not be `default`, must not contain `:`, and must be short enough that `jwt:<issuer>:<tenant>:` leaves 36 bytes of the 128-byte user id for the user claim. A longer user id makes the proxy drop that request's usage record, so keep user claims to 36 bytes or fewer (Entra's `oid` is 36).",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "examples": [{ "9f1c0000-0000-0000-0000-000000000000": "acme" }]
+        }
+      }
+    },
+    "AuthJwtUser": {
+      "type": "object",
+      "description": "Which claim names the user.",
+      "additionalProperties": false,
+      "required": ["claim"],
+      "properties": {
+        "claim": { "type": "string", "minLength": 1, "description": "The claim whose string value names the user, for example Entra's `oid` or `sub`. A token without it is refused. The user id is `jwt:<issuer>:<tenant>:<value>`; per-user key policy, budget and limits apply when a key with that id is minted under the same tenant (`POST /keys`), and only narrow the tenant.", "examples": ["oid"] }
+      }
     },
     "AuthEnforce": {
       "type": "object",

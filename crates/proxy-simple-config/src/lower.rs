@@ -16,6 +16,8 @@ use serde_json::{json, Value};
 use crate::model::*;
 use crate::parse::parse_host_port;
 
+mod jwt;
+
 /// The request header the route table matches models against. Populated
 /// The body-rewrite filter populates this from the request body and removes
 /// any client-supplied value before routing.
@@ -2403,7 +2405,9 @@ fn lower_auth(
         }));
     }
 
-    if auth.keys.is_empty() {
+    let jwt_providers = jwt::lower_jwt_providers(auth, warnings)?;
+
+    if auth.keys.is_empty() && jwt_providers.is_empty() {
         // Legal (fail closed is the correct reading of "authentication is
         // enabled, and no credential is valid"), but almost certainly not
         // what the operator meant -- AGENTS.md invariant 1's "warn, don't silently
@@ -2461,6 +2465,11 @@ fn lower_auth(
         "hmac_secret": hmac_secret,
         "virtual_keys": virtual_keys,
     });
+    // Absent when `auth.jwt` is empty, so configs without it lower
+    // byte-identically.
+    if !jwt_providers.is_empty() {
+        typed_config["jwt_providers"] = json!(jwt_providers);
+    }
     // Only an explicit `store:` adds a member. Absent means no store field at
     // all, which is what keeps configs written before this field lowering
     // byte-identical.
