@@ -12,10 +12,10 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-2  | Bad config fails loudly with the field path, exits nonzero | passing                                                 |
 | QA-3  | Streamed response arrives incrementally                    | passing                                                 |
 | QA-4  | Credentials reach upstream, never reach the log            | passing                                                 |
-| QA-5  | Non-streaming responses log real bytes and tokens          | approved                                                |
+| QA-5  | Non-streaming responses log real bytes and tokens          | passing — since 2026-10-18 (`qa5_nonstreaming_log_test.go`) |
 | QA-6  | Upstream dying mid-stream errors, and is not retried       | passing                                                 |
 | QA-7  | SIGTERM during an active stream drains to completion       | passing                                                 |
-| QA-8  | Circuit-breaker rejection fails fast, does not queue       | approved                                                |
+| QA-8  | Circuit-breaker rejection fails fast, does not queue       | passing — since 2026-10-18 (`qa8_circuit_breaker_test.go`) |
 | QA-10 | TTFT and TPOT reach the access log with sane values        | passing — since 2026-08-08 (`qa10_llm_latency_test.go`) |
 | QA-11 | Redis tenant-to-key cutover and persisted spend after SIGKILL | passing — requires `QA_REDIS_ADDR` |
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
