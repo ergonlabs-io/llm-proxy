@@ -169,7 +169,7 @@
 </style>
 
 <header>
-  <p class="eyebrow">internal-docs/boards/backlog.yaml · internal-docs/MILESTONES.md · P0–P3 priorities · planning updated 2026-10-17 · test totals: <code>make tq-count</code></p>
+  <p class="eyebrow">internal-docs/boards/backlog.yaml · internal-docs/MILESTONES.md · P0–P3 priorities · planning updated 2026-10-18 · test totals: <code>make tq-count</code></p>
   <h1>llm-proxy build board <span class="dim">— proxy for LLM inference</span></h1>
   <div class="chips" id="filters">
     <button class="chip" data-status="done">done<span class="n" id="n-done"></span></button>
@@ -185,22 +185,24 @@
     <button class="chip" data-ms="v0.3.3">v0.3.3 · tenant creds<span class="n" id="n-v033"></span></button>
     <button class="chip" data-ms="v0.3.4">v0.3.4 · hardening<span class="n" id="n-v034"></span></button>
     <button class="chip" data-ms="v0.4.0">v0.4.0 · gateway<span class="n" id="n-v040"></span></button>
+    <button class="chip" data-ms="v0.5.0">v0.5.0 · ledger<span class="n" id="n-v050"></span></button>
+    <button class="chip" data-ms="v0.6.0">v0.6.0 · metering<span class="n" id="n-v060"></span></button>
+    <button class="chip" data-ms="unscheduled">unscheduled<span class="n" id="n-unsched"></span></button>
     <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
     <span class="sep"></span>
     <button class="chip" data-prio="P0">P0 · LLM product<span class="n" id="n-P0"></span></button>
     <button class="chip" data-prio="P1">P1 · serving<span class="n" id="n-P1"></span></button>
     <button class="chip" data-prio="P2">P2 · Envoy parity<span class="n" id="n-P2"></span></button>
+    <button class="chip" data-prio="P3">P3 · later<span class="n" id="n-P3"></span></button>
   </div>
   <p class="now">
-    <b>State 2026-10-17.</b> No milestone is current. The latest release is tag v0.4.1; v0.4.0 (Gateway
-    completeness) shipped in tag v0.4.0 on 2026-10-16. On main and untagged: user id on request records
-    (WP-98), the billing ledger (WP-104 to WP-107, ADR-0009) and a loader fix for <code>${VAR}</code>
-    inside YAML comments. The first two sit in milestone v0.5.0 (Billing ledger and trace export), not yet tagged: it ships when WP-108 and WP-103 are done.
-    <b>Open work:</b> v0.5.0: WP-108 (ledger docs and end-to-end QA; WP-107 is done) and trace export WP-99 to WP-103
-    (ADR-0008, still proposed). v0.4.0 has no open cards (WP-38 closed done today, with stated limits). Unscheduled: WP-10, WP-29, WP-37, WP-41, WP-49, WP-65, WP-82, WP-88, WP-91 and WP-109 (live provider smoke tests).
-    <b>Closed by the owner today:</b> WP-26 (Envoy differential rig; the code in <code>testing/diffrig</code>
-    stays), WP-32 (the ext_authz header-only slice shipped, the rest is dropped) and WP-43 (no response
-    caching). WP-29 fuzzing is kept and re-scoped to the parsers this product wrote.
+    <b>State 2026-10-18.</b> Current milestone: <b>v0.6.0 Metering completeness</b> (approved 2026-10-18).
+    The latest release is tag v0.5.0 (Billing ledger and trace export, 2026-10-18).
+    <b>v0.6.0:</b> WP-111 is done (ADR-0010 phase 1: endpoints that cannot be metered are refused under a budget
+    or token limit). Open: WP-124 (meter image generation), WP-125 (meter speech, transcription and image edits),
+    WP-117 (chargeback tags) and WP-115 (OTel GenAI semconv). ADR-0010 is accepted; batch waits on its own ADR.
+    <b>In progress, unscheduled:</b> WP-41 (QA-5 and QA-8), WP-10 (h2spec run), WP-29 (remaining fuzz targets).
+    <b>Next candidates:</b> WP-112 (JWT in the dialect; needs a claims-mapping ADR) and WP-114 (guardrail filter).
     <b>Test count:</b> not re-run for this refresh; run <code>make tq-count</code> for a number.
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
@@ -223,7 +225,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = ""; // no milestone is current (MILESTONES.md)
+  const CURRENT_MS = "v0.6.0"; // the current milestone (MILESTONES.md)
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = /*__DATA__*/;
@@ -276,11 +278,12 @@
   for (const s of ["done", "ready", "started", "blocked"]) {
     document.getElementById("n-" + s).textContent = wps.filter(w => w.status === s).length;
   }
-  for (const pr of ["P0", "P1", "P2"]) {
+  for (const pr of ["P0", "P1", "P2", "P3"]) {
     document.getElementById("n-" + pr).textContent = wps.filter(w => w.prio === pr).length;
   }
   for (const [ms, id] of [["v0.0.1", "n-v001"], ["v0.1.0", "n-v010"], ["v0.2.0", "n-v020"],
-                          ["v0.3.0", "n-v030"], ["v0.3.2", "n-v032"], ["v0.3.3", "n-v033"], ["v0.3.4", "n-v034"], ["v0.4.0", "n-v040"], ["v1.0.0", "n-v100"]]) {
+                          ["v0.3.0", "n-v030"], ["v0.3.2", "n-v032"], ["v0.3.3", "n-v033"], ["v0.3.4", "n-v034"], ["v0.4.0", "n-v040"],
+                          ["v0.5.0", "n-v050"], ["v0.6.0", "n-v060"], ["unscheduled", "n-unsched"], ["v1.0.0", "n-v100"]]) {
     document.getElementById(id).textContent = wps.filter(w => w.ms === ms).length;
   }
 
