@@ -79,7 +79,7 @@ not reach the provider.
 Each refusal increments
 `llmproxy_unmetered_endpoint_refused_total{endpoint, control}`. `control` is
 `spend` for a budget and `token_limit` for a token limit (see
-[Token rate limiting](../token-rate-limiting/#endpoints-a-token-limit-cannot-count)).
+[Configure rate limits](../token-rate-limiting/#endpoints-a-token-limit-cannot-count)).
 `endpoint` is one of `image_generation`, `image_edit`, `speech`,
 `transcription`, `translation` and `unmetered` (every other path). The access
 log shows the detail in `%RESPONSE_CODE_DETAILS%` (`response_code_details` in

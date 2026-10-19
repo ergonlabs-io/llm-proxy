@@ -98,7 +98,7 @@ See [Virtual keys](../../authentication/virtual-keys/) and
 
 llm-proxy does not watch its config file for changes. A running process
 re-reads its config only on `SIGHUP` — see
-[Config reload](../../operations/config-reload/) — never automatically. Changing a
+[Reload configuration](../../operations/config-reload/) — never automatically. Changing a
 config file on disk has no effect until you either send `SIGHUP` or restart
 the process.
 

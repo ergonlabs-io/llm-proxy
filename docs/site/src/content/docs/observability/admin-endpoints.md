@@ -182,10 +182,10 @@ model and examples.
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
 | `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
-| `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Trace export](../trace-export/). |
+| `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Request and response body export](../trace-export/). |
 | `/tenants/{id}/objects/{object_id}` | PUT | `204` | Assigns a provider object that no tenant owns to the tenant. No body. An object whose owner expired has no owner, so it can be assigned again. An assignment never expires. `204` also when the tenant already owns it. `409` `object_owned` when another tenant owns it: an owner is never replaced. `404` for an unknown tenant. `409` `not_enforced` when no chain runs `llmproxy.object_ownership`. See "Object ownership". |
 | `/tenants/{id}/objects/{object_id}` | GET | `200` | Reads whether the store records the tenant as the owner. The answer is `{"tenant": "...", "object_id": "...", "owned": true, "expires_at": ...}`. `expires_at` is the expiry of the owner in Unix seconds, or `null` when the owner never expires. Any other case gives `404` `object_not_owned`, and the answer does not say whether another tenant owns the object. |
-| `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. See [Trace export](../trace-export/). |
+| `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. See [Request and response body export](../trace-export/). |
 
 The mint answer is the only time the proxy returns the key text. The store
 keeps a digest only (`handle_mint_key`, `server.rs:1846`).
@@ -346,7 +346,7 @@ These rules apply:
 - A window is one minute (`POLICY_WINDOW`, `token_limit_filter.rs`). Windows
   start on whole minutes (they are aligned to the Unix epoch), so the first
   window can be shorter than a minute. See
-  [Token rate limiting](../../limits-and-budgets/token-rate-limiting/#windows).
+  [Configure rate limits](../../limits-and-budgets/token-rate-limiting/#windows).
 - A write applies to the next request. No reload is needed.
 - The limits persist with the configured store. They survive a restart on
   the persistent store (test `limits_survive_a_restart_with_a_persistent_store`,

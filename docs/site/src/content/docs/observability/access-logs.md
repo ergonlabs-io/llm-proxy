@@ -100,8 +100,7 @@ One JSON object per line. Every value renders as a JSON string, including
 numbers. The one exception is `llm_upstream_usage`, which is a JSON object
 (or `null`). The field values all go through the same format-string engine as the
 text format. The JSON format has no typed (numeric or boolean) value. The
-real line in [Getting started](../../getting-started/quickstart/#step-5-read-the-access-log)
-shows the keys in alphabetical order.
+keys appear in alphabetical order.
 
 The fixed JSON format of the `llmproxy` config file has these keys:
 

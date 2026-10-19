@@ -43,6 +43,8 @@ export default defineConfig({
 					items: [
 						{ label: 'Introduction', slug: 'getting-started/introduction' },
 						{ label: 'Quickstart', slug: 'getting-started/quickstart' },
+						{ label: 'Install llm-proxy', slug: 'getting-started/installation' },
+						{ label: 'Connect your application', slug: 'getting-started/connect-your-application' },
 						// {
 						// 	label: 'Choosing a config front-end',
 						// 	slug: 'getting-started/choosing-a-config-front-end',
@@ -68,19 +70,15 @@ export default defineConfig({
 						{ label: 'WebSocket and other upgrades', slug: 'providers-and-routing/websocket-and-upgrades' },
 					],
 				},
-				// {
-				// 	label: 'API compatibility',
-				// 	items: [
-				// 		{ label: 'OpenAI Chat Completions', slug: 'api-compatibility/openai-chat-completions' },
-				// 		{ label: 'OpenAI Responses', slug: 'api-compatibility/openai-responses' },
-				// 		{ label: 'Anthropic Messages', slug: 'api-compatibility/anthropic-messages' },
-				// 	],
-				// },
+				{
+					label: 'API compatibility',
+					items: [{ label: 'API compatibility', slug: 'api-compatibility/overview' }],
+				},
 				{
 					label: 'Authentication',
 					items: [
 						{ label: 'Virtual keys', slug: 'authentication/virtual-keys' },
-						{ label: 'Managing secrets', slug: 'authentication/managing-secrets' },
+						{ label: 'Manage configured virtual keys', slug: 'authentication/managing-secrets' },
 						{ label: 'Tenant provider credentials', slug: 'authentication/tenant-provider-credentials' },
 						{ label: 'External authorization', slug: 'authentication/external-authorization' },
 					],
@@ -88,7 +86,8 @@ export default defineConfig({
 				{
 					label: 'Limits and budgets',
 					items: [
-						{ label: 'Token rate limiting', slug: 'limits-and-budgets/token-rate-limiting' },
+						{ label: 'Configure rate limits', slug: 'limits-and-budgets/token-rate-limiting' },
+						{ label: 'Read current usage', slug: 'limits-and-budgets/current-usage' },
 						{ label: 'Spend policies', slug: 'limits-and-budgets/spend-policies' },
 						{ label: 'Billing ledger', slug: 'limits-and-budgets/billing-ledger' },
 						// { label: 'Tenants', slug: 'limits-and-budgets/tenants' },
@@ -97,20 +96,21 @@ export default defineConfig({
 				{
 					label: 'Observability',
 					items: [
+						{ label: 'Observability overview', slug: 'observability/overview' },
 						{ label: 'Access logs', slug: 'observability/access-logs' },
 						{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
 						{ label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
 						{ label: 'Request capture', slug: 'observability/request-capture' },
-						{ label: 'Trace export', slug: 'observability/trace-export' },
+						{ label: 'Request and response body export', slug: 'observability/trace-export' },
 					],
 				},
 				{
 					label: 'Operations',
 					items: [
-						{ label: 'Running in production', slug: 'operations/running-in-production' },
-						{ label: 'Config reload', slug: 'operations/config-reload' },
+						{ label: 'Share state across replicas', slug: 'operations/running-in-production' },
+						{ label: 'Reload configuration', slug: 'operations/config-reload' },
 						{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
-						{ label: 'xDS conformance', slug: 'operations/xds-conformance' },
+						{ label: 'xDS conformance (advanced)', slug: 'operations/xds-conformance' },
 						{ label: 'TLS', slug: 'operations/tls' },
 					],
 				},

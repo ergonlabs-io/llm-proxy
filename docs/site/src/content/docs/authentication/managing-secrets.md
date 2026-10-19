@@ -22,7 +22,7 @@ it, revoke it, and rotate the HMAC secret that keys every digest.
 
 **Every change to `auth.keys` or the HMAC secret takes a restart.** A
 `SIGHUP` reload does not apply them (see
-[Config reload](../../operations/config-reload/#what-a-reload-applies)). Keys
+[Reload configuration](../../operations/config-reload/#what-a-reload-applies)). Keys
 can also be minted and revoked at runtime through the admin API, without a
 restart; see
 [Managing keys and tenants at runtime](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).

@@ -132,7 +132,7 @@ File delivery is best effort. It is not a billing record. For billing, use the
   (less on a fast exit). A process that `SIGKILL` stops loses the queued
   records.
 
-See [Check that no record was lost](#check-that-no-record-was-lost) and
+See [Check that no record was lost](#checking-that-no-record-was-lost) and
 [Record delivery metrics](#record-delivery-metrics).
 
 ### Flags

@@ -1,5 +1,5 @@
 ---
-title: Running in production
+title: Share state across replicas
 description: "Run several replicas that share keys, policy, counters, and spend through one store."
 summary: What changes when you run more than one replica — which state is
   shared, which stays local, the propagation and staleness bounds for each,
@@ -12,7 +12,7 @@ related:
   - operations/config-reload
 ---
 
-# Running in production
+# Share state across replicas
 
 A single `llm-proxy` replica needs no extra configuration. Every piece of
 state — minted keys, revocations, tenant policy, accrued spend — lives in
@@ -48,7 +48,7 @@ fails validation. The bootstrap equivalent is shown below.
 Token and request windows also use the store selected by `auth.store`.
 With `shared`, they reconcile fleet totals about once a second; concurrent
 streams use expiring leases. See
-[Token rate limiting](../../limits-and-budgets/token-rate-limiting/).
+[Configure rate limits](../../limits-and-budgets/token-rate-limiting/).
 
 ## Four kinds of state, four different rules
 
@@ -461,7 +461,7 @@ are keyed by its node ID.
   With a shared store, both configured `limits:` and tenant/key rate limits
   reconcile through Redis. Admission uses last-known totals plus local counts,
   so the fleet can exceed a ceiling between reconciles. See
-  [Token rate limiting](../../limits-and-budgets/token-rate-limiting/).
+  [Configure rate limits](../../limits-and-budgets/token-rate-limiting/).
 - **The rate card is shared only through `auth.store: shared`.** With an `auth`
   store, the rate card is stored per chain and `PUT /pricing` writes it there.
   A `persistent` store is one replica's file, so only `shared` reaches other

@@ -1,5 +1,5 @@
 ---
-title: Config reload
+title: Reload configuration
 description: "Apply config changes with SIGHUP, and see which settings a reload applies and which need a restart."
 summary: SIGHUP re-reads the config file a running proxy booted with and
   publishes a new snapshot. A config that fails to parse or validate leaves
@@ -11,7 +11,7 @@ related:
   - operations/draining-and-shutdown
 ---
 
-# Config reload
+# Reload configuration
 
 llm-proxy re-reads its config on `SIGHUP`. There is no file-system watcher —
 nothing reloads automatically when the file changes on disk — so a reload

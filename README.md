@@ -498,7 +498,7 @@ Stated plainly, because a feature list without this is not much use:
   OTLP `tracing`/`metrics` blocks; those take a restart. Changing the HMAC
   secret and sending `SIGHUP` refuses every key until a restart (a known
   defect). See the reload table in
-  [Config reload](docs/site/src/content/docs/operations/config-reload.md).
+  [Reload configuration](docs/site/src/content/docs/operations/config-reload.md).
 - **Authorization covers models only.** There is no per-provider
   authorization. An authenticated tenant with no stored model policy is refused
   with 403 unless `auth.enforce.tenants_without_policy` is `allow`.
