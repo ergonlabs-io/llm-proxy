@@ -17,9 +17,21 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+bytes = "1"
+# Same features as the workspace pin; the access-log target checks a pattern
+# with the strftime parser the renderer uses.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+http = "1"
 libfuzzer-sys = "0.4"
+# `fuzzing` exposes the crate-private entry points in each crate's
+# `fuzzing` module; nothing else enables it.
+proxy-admin = { path = "../crates/proxy-admin", features = ["fuzzing"] }
+proxy-config = { path = "../crates/proxy-config" }
+proxy-control = { path = "../crates/proxy-control" }
 proxy-filters = { path = "../crates/proxy-filters" }
-proxy-simple-config = { path = "../crates/proxy-simple-config" }
+proxy-http = { path = "../crates/proxy-http", features = ["fuzzing"] }
+proxy-observability = { path = "../crates/proxy-observability" }
+proxy-simple-config = { path = "../crates/proxy-simple-config", features = ["fuzzing"] }
 serde_json = "1"
 
 # Same lint as the root workspace (AGENTS.md invariant 3).
@@ -43,6 +55,55 @@ bench = false
 [[bin]]
 name = "dialect_config"
 path = "fuzz_targets/dialect_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_wildcard"
+path = "fuzz_targets/model_wildcard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vhost_domain"
+path = "fuzz_targets/vhost_domain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "route_model_glob"
+path = "fuzz_targets/route_model_glob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "access_log_format"
+path = "fuzz_targets/access_log_format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admin_body"
+path = "fuzz_targets/admin_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "virtual_key_auth"
+path = "fuzz_targets/virtual_key_auth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "router_body"
+path = "fuzz_targets/router_body.rs"
 test = false
 doc = false
 bench = false

@@ -73,6 +73,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   ignored. Provider `api_key_file` and credential files are still re-read on
   each reload.
 
+- **Behavior change:** an access-log `%START_TIME(fmt)%` pattern that chrono
+  cannot format (an unknown specifier, or abseil extensions such as Envoy's
+  `%E3S`) is now a config load error, or a NACK over xDS, that names the
+  pattern. Before, it loaded and then logged a timestamp cut off at the bad
+  specifier on every request. `internal-docs/envoy-divergences.md` row 42.
+
 ### Fixed
 
 - Billing ledger: when an acknowledgement at the disk cap could not put the
@@ -82,6 +88,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   the retried commit of held entries was refused once more after everything
   was acknowledged. Repeating the last acknowledgement now puts the reserve
   back and lets the held commit try the disk again.
+
+- Route header matchers (`string_match` and `safe_regex`) now match header
+  values that are UTF-8 beyond ASCII. Before, such a value never matched, so a
+  request whose model name has a non-ASCII character (the dialect publishes it
+  on `x-llmproxy-model`) missed its route and fell through to the next one.
 
 ## [0.5.0] - 2026-10-18
 

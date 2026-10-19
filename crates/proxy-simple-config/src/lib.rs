@@ -9,6 +9,12 @@ pub mod lower;
 pub mod model;
 pub mod parse;
 
+// Compiled under `test` too, so `make tq` keeps the seam building even though
+// only the nightly-only fuzz crate enables the feature.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzzing;
+
 pub use lower::{
     has_inline_secrets, lower, lower_to_loaded, require_node_id_for_shared_store, to_envoy_yaml,
     to_envoy_yaml_with_secrets, Lowered, MODEL_HEADER, REDACTED,

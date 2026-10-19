@@ -3354,3 +3354,9 @@ struct ServerInfo {
 
 #[cfg(test)]
 mod tests;
+
+// Compiled under `test` too, so `make tq` keeps the seam building even though
+// only the nightly-only fuzz crate enables the feature.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzzing;

@@ -13,6 +13,11 @@ serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 chrono = { workspace = true }
 
+[features]
+default = []
+# Entry points the cargo-fuzz crate (fuzz/) calls into; see `src/fuzzing.rs`.
+fuzzing = []
+
 [dev-dependencies]
 # tests/oauth2_jwt_bearer.rs generates the throwaway RSA key a valid
 # `private_key_file` needs (`ring` cannot generate RSA keys).

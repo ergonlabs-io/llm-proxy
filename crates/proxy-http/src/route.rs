@@ -103,9 +103,12 @@ fn header_matches(hm: &HeaderMatch, headers: &http::HeaderMap) -> bool {
     // (possibly repeated) header name; we short-circuit on the first value
     // that satisfies the matcher.
     headers.get_all(hm.name.as_str()).iter().any(|v| {
-        // Non-UTF-8 header values can never match a string/regex matcher;
-        // treat them as simply not matching rather than panicking.
-        let Ok(v) = v.to_str() else {
+        // Envoy matches the value's bytes. A UTF-8 value matches as text;
+        // `HeaderValue::to_str` would refuse every byte above 0x7E, so a
+        // model such as `aéb` (which the model filter does publish) could
+        // never match its route and fell through to the next one. Non-UTF-8
+        // values still match nothing rather than panicking.
+        let Ok(v) = std::str::from_utf8(v.as_bytes()) else {
             return false;
         };
         header_kind_matches(&hm.kind, v)

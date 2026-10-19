@@ -368,6 +368,19 @@ fn build_op(
                     "`%START_TIME%` does not support `:Z` truncation in format string `{input}`"
                 )));
             }
+            // chrono stops writing at the first specifier it cannot format,
+            // so an accepted bad pattern would log a truncated timestamp on
+            // every request (AGENTS.md invariant 1,
+            // `internal-docs/envoy-divergences.md`).
+            if let Some(pattern) = &args {
+                if chrono::format::StrftimeItems::new(pattern)
+                    .any(|item| matches!(item, chrono::format::Item::Error))
+                {
+                    return Err(err(format!(
+                        "`%START_TIME({pattern})%` is not a supported strftime pattern in format string `{input}`"
+                    )));
+                }
+            }
             FormatOp::StartTime(args)
         }
         "REQ" => FormatOp::Req(header_spec(name, args, truncate, input)?),
@@ -1072,6 +1085,25 @@ mod tests {
             parse("%START_TIME(%Y-%m-%dT%H:%M:%S.%3fZ)%").0,
             vec![FormatOp::StartTime(Some("%Y-%m-%dT%H:%M:%S.%3fZ".into()))]
         );
+    }
+
+    /// Found by the `access_log_format` fuzz target: these patterns used to
+    /// load, then render a timestamp cut off at the bad specifier.
+    #[test]
+    fn start_time_pattern_chrono_cannot_render_is_refused() {
+        for pattern in [
+            "%Y-%m-%dT%H:%3.M:f%%SZ",
+            // Envoy's (abseil) sub-second seconds; chrono has no `%E`.
+            "%Y-%m-%dT%H:%M:%E3SZ",
+            "%Q",
+        ] {
+            let src = format!("[%START_TIME({pattern})%]");
+            let e = parse_format(&src).unwrap_err();
+            assert!(
+                e.0.contains("not a supported strftime pattern"),
+                "{src}: {e}"
+            );
+        }
     }
 
     #[test]
