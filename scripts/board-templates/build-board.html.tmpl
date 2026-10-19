@@ -201,8 +201,9 @@
     <b>v0.6.0:</b> WP-111 is done (ADR-0010 phase 1: endpoints that cannot be metered are refused under a budget
     or token limit). Open: WP-124 (meter image generation), WP-125 (meter speech, transcription and image edits),
     WP-117 (chargeback tags) and WP-115 (OTel GenAI semconv). ADR-0010 is accepted; batch waits on its own ADR.
-    <b>In progress, unscheduled:</b> WP-29 (targets complete; the scheduled fuzz CI job waits on the owner).
-    WP-41 and WP-10 closed 2026-10-19 (h2spec: 291 of 292 cases pass, the one failure filed as envoy-divergences row 41).
+    <b>In progress, unscheduled:</b> none. WP-41 and WP-10 closed 2026-10-19 (h2spec: 291 of 292 cases pass, the one
+    failure filed as envoy-divergences row 41). WP-29 closed 2026-10-19: every fuzz target runs twice a week in CI
+    (.github/workflows/fuzz.yml).
     <b>Next candidates:</b> WP-112 (JWT in the dialect; needs a claims-mapping ADR) and WP-114 (guardrail filter).
     <b>Test count:</b> not re-run for this refresh; run <code>make tq-count</code> for a number.
   </p>

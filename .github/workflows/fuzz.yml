@@ -1,0 +1,89 @@
+# Scheduled fuzzing. Runs every target in fuzz/ for FUZZ_SECONDS, one matrix
+# job per target, caching each working corpus between runs so coverage
+# accumulates. `make fuzz-one` reseeds the corpus with fuzz/seed.sh first. A
+# crash (or libFuzzer OOM/timeout) fails the job and uploads
+# fuzz/artifacts/<target>/ for minimization (see the fuzzing section of the
+# Makefile).
+#
+# Budget: 10 targets x (300 s fuzzing + build) is roughly 80 runner-minutes per
+# run. Twice a week keeps that near 700 minutes a month, inside the free tier
+# for a private repository, and runs often enough that the corpus caches are
+# not evicted (GitHub drops caches unused for 7 days).
+name: Fuzz
+
+on:
+  schedule:
+    # Mondays and Thursdays, 03:17 UTC.
+    - cron: "17 3 * * 1,4"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target (keep under 2400 for the job timeout)
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-fuzz needs nightly. Pin a dated nightly so a toolchain regression
+  # does not show up as a fuzz failure; bump it deliberately.
+  FUZZ_TOOLCHAIN: nightly-2026-08-22
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - usage_extract
+          - body_prefix_scan
+          - dialect_config
+          - model_wildcard
+          - vhost_domain
+          - route_model_glob
+          - access_log_format
+          - admin_body
+          - virtual_key_auth
+          - router_body
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          # Each job builds only its own target binary.
+          key: ${{ matrix.target }}
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Toolchain versions
+        run: cargo +"$FUZZ_TOOLCHAIN" --version && cargo +"$FUZZ_TOOLCHAIN" fuzz --version
+      - name: Fuzz
+        run: make fuzz-one TARGET="$TARGET" FUZZ_SECONDS="$SECONDS_PER_TARGET" FUZZ_TOOLCHAIN="$FUZZ_TOOLCHAIN"
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '300' }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
