@@ -37,6 +37,18 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
   `gen_ai.usage.cache_read.input_tokens` and
   `gen_ai.usage.cache_creation.input_tokens`, where the proxy knows them.
+- JWT/OIDC authentication in the config file (ADR-0014). The new `auth.jwt`
+  list sets an issuer, an audience, a key source (`jwks.discovery_url` or
+  static `jwks.keys`), the claim and value map that select the tenant, and the
+  claim that names the user. Each entry becomes one Envoy-mode
+  `jwt_providers` entry, so verification is unchanged: RS256 only, and an
+  expired, wrongly signed, wrong-issuer, wrong-audience or unmapped token gets
+  `401`. A token gets no models from its claims. Its tenant gets the model
+  policy, budget and limits set through the admin API, so a mapped tenant with
+  no stored policy gets `403`. `issuer`, `audience`, `tenant.values` and
+  `user.claim` are required, and a tenant named `default` or containing `:` is
+  a load error. JWT callers always use the operator's provider keys; the proxy
+  warns when `auth.tenant_credentials` is also set.
 
 ### Security
 

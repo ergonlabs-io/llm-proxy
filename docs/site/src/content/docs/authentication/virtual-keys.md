@@ -3,9 +3,9 @@ title: Virtual keys
 description: "How llm-proxy authenticates callers with virtual keys and decides which models each tenant may use."
 summary: How downstream authentication works — the `auth:` block, the
   `llmp_`-prefixed bearer credential, keyed HMAC-SHA256 verification, JWT
-  providers (Envoy mode only), and why the token limiter buckets on the
+  providers, and why the token limiter buckets on the
   resolved tenant rather than the client's header.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-19
 related:
   - authentication/managing-secrets
   - authentication/tenant-provider-credentials
@@ -144,7 +144,7 @@ The authenticator treats two cases differently:
   uses a different auth scheme, or has a bearer value without the `llmp_`
   prefix (for example, a JWT). The virtual-key authenticator does not refuse
   it. In Envoy mode, the JWT authenticator can take it. See
-  [JWT authentication](#jwt-authentication-envoy-mode-only).
+  [JWT authentication](#jwt-authentication).
 - **A bad credential of this kind.** The value has the `llmp_` prefix and its
   digest matches no configured key, or it matches a key marked `revoked`. The
   proxy refuses the request. No later authenticator runs.
@@ -322,8 +322,9 @@ table in
   in `schema/llmproxy-v0.schema.json` has no such field. The `auth:` block
   enforces them, and you set them through the admin write API. See "Managing
   keys and tenants at runtime".
-- **JWT is not available.** `jwt_providers` exists only in the `llmproxy.auth`
-  filter of an Envoy-mode bootstrap.
+- **JWT fields are stricter than in Envoy mode.** `auth.jwt` requires
+  `issuer`, `audience`, `tenant.values` and `user.claim`. See
+  [JWT authentication](#jwt-authentication).
 - **JWT accepts RS256 only.** The filter rejects other algorithms.
 
 ## Related tools
@@ -361,11 +362,75 @@ http_filters:
 Place `llmproxy.auth` before any other `llmproxy.*` filter in `http_filters`.
 See "Token limits use the tenant, not the header" for the reason.
 
-## JWT authentication (Envoy mode only)
+## JWT authentication
 
-The `llmproxy.auth` filter can also accept a JWT as the bearer value. Set
-`typed_config.jwt_providers` on the filter. The `llmproxy` dialect has no
-field for it, so JWT needs a hand-written bootstrap config.
+The `llmproxy.auth` filter can also accept a JWT as the bearer value. In the
+config file, set `auth.jwt`. In an Envoy-mode bootstrap, set
+`typed_config.jwt_providers` on the filter. Each `auth.jwt` entry becomes one
+`jwt_providers` entry. The design is in ADR-0014.
+
+### JWT in the config file
+
+```yaml
+auth:
+  hmac_secret: ${LLMPROXY_AUTH_SECRET}
+  keys: []          # optional; virtual keys and JWTs can be used together
+  jwt:
+    - issuer: https://login.microsoftonline.com/<directory-id>/v2.0
+      audience: api://llm-proxy
+      jwks:
+        discovery_url: https://login.microsoftonline.com/<directory-id>/v2.0/.well-known/openid-configuration
+        refresh_interval: 10m
+      tenant:
+        claim: tid
+        values:
+          "<directory-id>": acme
+      user:
+        claim: oid
+```
+
+| Field | Required | Envoy-mode field | What it does |
+|---|---|---|---|
+| `issuer` | yes | `issuer` | The token `iss` must equal it. Must be unique in `auth.jwt`. |
+| `audience` | yes | `audience` | The token `aud` must contain it. |
+| `jwks.discovery_url` | one of the two | `discovery_url` | OIDC discovery URL. Must use `https`. |
+| `jwks.keys` | one of the two | `keys` | Static RSA keys: `kid`, `n`, `e` (base64url, no padding). |
+| `jwks.refresh_interval` | no | `refresh_interval_seconds` | Whole seconds. Only with `discovery_url`. Default `10m`. |
+| `jwks.trusted_ca_file` | no | `trusted_ca.filename` | PEM bundle for the fetches. Only with `discovery_url`. |
+| `tenant.claim` | yes | `tenant_claim` | The claim that selects the tenant. |
+| `tenant.values` | yes | `tenant_values` | Claim value to tenant. Must not be empty. |
+| `user.claim` | yes | `subject_claim` | The claim that names the user. |
+
+The config file is stricter than Envoy mode. These rules are load errors, and
+each error names its dotted path, for example `auth.jwt[0].tenant.values`:
+
+- `issuer` and `audience` are required. Without an audience, a token that the
+  identity provider issued for any other application would be accepted.
+- `tenant.values` is required. The proxy never uses a claim value as a tenant
+  name directly, so the identity provider cannot select a tenant that you did
+  not list.
+- A tenant in `tenant.values` must not be `default`, and must not contain `:`.
+- The user id is `jwt:<issuer>:<tenant>:<user claim>`, and a request record
+  holds at most 128 bytes of it. The tenant must be short enough to leave 36
+  bytes for the user claim. If a user claim is longer than what is left, the
+  proxy drops the usage record of that request. Entra's `oid` is 36 bytes.
+
+A token gets no models from its claims. Its tenant gets the model policy,
+budget, limits and object ownership that you set through the admin API, the
+same as for a virtual key of that tenant. A mapped tenant with no stored model
+policy is refused with `403` under the default
+`enforce.tenants_without_policy: deny`.
+
+A JWT user has no key record, so no per-user policy narrows it. To narrow one
+user, mint a key with `POST /keys` whose `key_id` is that user's id
+(`jwt:<issuer>:<tenant>:<user claim>`) under the same tenant, and set
+`/keys/{id}/policy`, `/budget` or `/limits` on it.
+
+JWT callers always use the operator's provider keys. A tenant's stored
+provider credentials apply to virtual-key requests only, so lowering warns
+when `auth.jwt` and `auth.tenant_credentials` are both set.
+
+### JWT in an Envoy-mode bootstrap
 
 The filter tries the virtual-key authenticator first. A bearer value with
 the `llmp_` prefix stays with it. The filter gives every other bearer value

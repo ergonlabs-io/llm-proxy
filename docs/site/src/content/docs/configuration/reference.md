@@ -24,7 +24,7 @@ The configuration format for llm-proxy. This file is the single source of truth 
 | `version` | constant `0` | yes | none | Schema version. Must be 0. Future schema revisions bump this; llm-proxy refuses configs whose version it does not understand. |
 | `listen` | [HostPort](#hostport) or [Listener](#listener) | no | `0.0.0.0:8080` | Where the proxy accepts client traffic. Shorthand string `host:port`, or an object to enable TLS. Default: `0.0.0.0:8080` (plaintext). Examples: `0.0.0.0:8080`, `{"address": "0.0.0.0:8443", "tls": {"cert_file": "/etc/llmproxy/tls.crt", "key_file": "/etc/llmproxy/tls.key"}}`. |
 | `admin` | [HostPort](#hostport) | no | none | Admin/observability endpoint (`/ready`, `/config_dump`, `/clusters`, `/server_info`, `/stats`). `/stats` renders a flat text format, one `name: value` line per counter or histogram. Disabled when omitted. Bind to loopback unless you know why not. Examples: `127.0.0.1:9901`. |
-| `auth` | [Auth](#auth) | no | none | Downstream authentication: verifies inbound requests carry a known virtual key before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is a separate axis: an authenticated tenant with no stored model policy is refused (403) unless `enforce.tenants_without_policy` is `allow`. Omit `auth` entirely to keep today's behavior (no application-level authentication). |
+| `auth` | [Auth](#auth) | no | none | Downstream authentication: verifies inbound requests carry a known virtual key or a valid JWT (`auth.jwt`) before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is a separate axis: an authenticated tenant with no stored model policy is refused (403) unless `enforce.tenants_without_policy` is `allow`. Omit `auth` entirely to keep today's behavior (no application-level authentication). |
 | `providers` | map of [Provider](#provider), keys match `^[a-z0-9][a-z0-9-]*$`; minimum entries 1 | yes | none | Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai`, `anthropic`, and `openrouter` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`. |
 | `models` | map of [ModelDef](#modeldef), keys match `^([^*]+\*?\|\*)$` | no | `{}` | Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. The providers are tried in order: `providers[0]` serves the request, and each later entry is a fallback with the same retry rules as `routes[].fallbacks`. Weighted or cost-aware selection among them is not supported. Examples: `{"claude-sonnet-4-5": {"providers": ["anthropic/claude-sonnet-4-5-20250929", {"provider": "vertex-us", "model": "claude-sonnet-4-5@20250929", "dialect": "anthropic"}]}, "claude-*": {"providers": ["anthropic/claude-3-5-haiku-latest"]}, "*": {"providers": ["openai/gpt-4o-mini"]}}`. |
 | `routes` | array of [Route](#route); minimum items 0 | yes | none | Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule and no `models` entry get a 404 with a JSON error body listing known models. |
@@ -75,6 +75,7 @@ Downstream authentication. Exactly one of `hmac_secret` / `hmac_secret_file` is 
 | `enforce` | [AuthEnforce](#authenforce) | no | none | Which tenant controls the proxy enforces when `auth` is set. Each defaults to `true`. Setting one to `false` removes that filter from the chain and logs a load-time warning; the matching admin writes (`PUT /tenants/{id}/policy`, `PUT /tenants/{id}/budget`, `PUT /tenants/{id}/limits`, `PUT /tenants/{id}/objects/{object_id}`) are then refused with 409. |
 | `max_policy_staleness` | [Duration](#duration) | no | `4m` | How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`. |
 | `stored_output_owner_ttl` | [Duration](#duration) | no | `720h` | How long the proxy keeps the owner of a stored response (`/v1/responses`) or a stored chat completion (`/v1/chat/completions` with `store: true`). These are created by inference requests, so their owners expire rather than accumulate. After the TTL the object is refused to every tenant, its creator included, until `PUT /tenants/{id}/objects/{object_id}` assigns it again; set it to at least the provider's retention. Whole seconds, at least `1s`. A load error with `enforce.object_ownership: false`, which omits the filter that reads it. |
+| `jwt` | array of [AuthJwtProvider](#authjwtprovider) | no | `[]` | JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. JWT callers always use the operator's provider keys, never a tenant's stored provider credentials, so lowering warns when `tenant_credentials` is also set. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning. |
 
 Any other field is a load error.
 
@@ -304,6 +305,22 @@ Which tenant controls the proxy enforces when `auth` is set. Each defaults to `t
 
 Any other field is a load error.
 
+## `AuthJwtProvider`
+
+Used at: `auth.jwt[]`.
+
+One JWT issuer. Every field is required.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `issuer` | string; minimum length 1 | yes | none | The token's `iss` must equal this exactly. Unique within `auth.jwt`. Examples: `https://login.microsoftonline.com/9f1c0000-0000-0000-0000-000000000000/v2.0`. |
+| `audience` | string; minimum length 1 | yes | none | The token's `aud` must contain this value. A token without `aud` is refused. Examples: `api://llm-proxy`. |
+| `jwks` | [AuthJwtJwks](#authjwtjwks) | yes | none | Where the issuer's signing keys come from: exactly one of `discovery_url` or `keys`. |
+| `tenant` | [AuthJwtTenant](#authjwttenant) | yes | none | Which claim names the tenant, and which claim values are admitted as which tenant. |
+| `user` | [AuthJwtUser](#authjwtuser) | yes | none | Which claim names the user. |
+
+Any other field is a load error.
+
 ## `providers.<name>.oauth2_jwt_bearer`
 
 Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503 with the body `provider token unavailable`; they do not fall back to the next provider, and `llmproxy_provider_credential_requests_total` counts them with `outcome=unavailable`. Valid only for `vertex`.
@@ -486,6 +503,50 @@ One retired key-encryption key.
 
 Any other field is a load error.
 
+## `AuthJwtJwks`
+
+Used at: `auth.jwt[].jwks`.
+
+Where the issuer's signing keys come from: exactly one of `discovery_url` or `keys`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `discovery_url` | string; pattern `^https://[^/]` | no | none | OIDC discovery document URL (`.../.well-known/openid-configuration`). A background thread fetches it, follows its `jwks_uri`, and refreshes the key set every `refresh_interval`; requests never wait on it. Until the first fetch succeeds every token from this issuer is refused. A failed refresh logs a warning and keeps the last key set; after 6 missed refreshes (`6 x refresh_interval`) the set is stale and every token from this issuer is refused (401) until a refresh succeeds. |
+| `refresh_interval` | [Duration](#duration) | no | `10m` | How often the key set is refreshed. Whole seconds, at least `1s`. Only with `discovery_url`. |
+| `trusted_ca_file` | string; minimum length 1 | no | none | PEM bundle of CA certificates trusted for the discovery and JWKS fetches instead of the system roots. Only with `discovery_url`. |
+| `keys` | array of [AuthJwtKey](#authjwtkey); minimum items 1 | no | none | A static key set, copied from the issuer's JWKS document. Never refreshed. |
+
+Any other field is a load error.
+
+Rules:
+
+- Exactly one of these holds: `discovery_url` is set and `keys` is not set; or `keys` is set and none of `discovery_url`, `refresh_interval`, `trusted_ca_file` is set.
+
+## `AuthJwtTenant`
+
+Used at: `auth.jwt[].tenant`.
+
+Which claim names the tenant, and which claim values are admitted as which tenant.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `claim` | string; minimum length 1 | yes | none | The claim whose string value selects the tenant, for example Entra's `tid`. A token without it is refused. Examples: `tid`. |
+| `values` | map of string; minimum entries 1 | yes | none | Claim value -> llm-proxy tenant. A token whose claim value is not listed is refused (401); a claim value is never used as a tenant name directly. A tenant must not be `default`, must not contain `:`, and must be short enough that `jwt:<issuer>:<tenant>:` leaves 36 bytes of the 128-byte user id for the user claim. A longer user id makes the proxy drop that request's usage record, so keep user claims to 36 bytes or fewer (Entra's `oid` is 36). Examples: `{"9f1c0000-0000-0000-0000-000000000000": "acme"}`. |
+
+Any other field is a load error.
+
+## `AuthJwtUser`
+
+Used at: `auth.jwt[].user`.
+
+Which claim names the user.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `claim` | string; minimum length 1 | yes | none | The claim whose string value names the user, for example Entra's `oid` or `sub`. A token without it is refused. The user id is `jwt:<issuer>:<tenant>:<value>`; per-user key policy, budget and limits apply when a key with that id is minted under the same tenant (`POST /keys`), and only narrow the tenant. Examples: `oid`. |
+
+Any other field is a load error.
+
 ## `TracesS3`
 
 Used at: `observability.traces.s3`.
@@ -521,6 +582,20 @@ Used at: `pricing.price_list.entries[]`.
 
 Any other field is a load error.
 
+## `AuthJwtKey`
+
+Used at: `auth.jwt[].jwks.keys[]`.
+
+One RSA public key, as in a JWKS document.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `kid` | string; minimum length 1 | yes | none | Matched against the token's `kid` header. Unique within `keys`. |
+| `n` | string; pattern `^[A-Za-z0-9_-]+$` | yes | none | RSA modulus, base64url without padding. |
+| `e` | string; pattern `^[A-Za-z0-9_-]+$` | yes | none | RSA public exponent, base64url without padding. Examples: `AQAB`. |
+
+Any other field is a load error.
+
 ## `PricingTier`
 
 Used at: `pricing.price_list.entries[].tiers[]`.
@@ -553,7 +628,7 @@ Type: string; pattern `^[0-9]+(ms|s|m|h)$`.
 
 A duration: integer plus unit — `ms` (milliseconds), `s` (seconds), `m` (minutes), or `h` (hours).
 
-Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `auth.stored_output_owner_ttl`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `providers.<name>.oauth2_jwt_bearer.assertion_lifetime`, `providers.<name>.oauth2_jwt_bearer.refresh_before`, `providers.<name>.oauth2_jwt_bearer.timeout`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.traces.max_age`, `observability.traces.segment_max_age`, `observability.tracing.export_deadline`, `observability.traces.s3.upload_timeout`.
+Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `auth.stored_output_owner_ttl`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `providers.<name>.oauth2_jwt_bearer.assertion_lifetime`, `providers.<name>.oauth2_jwt_bearer.refresh_before`, `providers.<name>.oauth2_jwt_bearer.timeout`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.traces.max_age`, `observability.traces.segment_max_age`, `observability.tracing.export_deadline`, `auth.jwt[].jwks.refresh_interval`, `observability.traces.s3.upload_timeout`.
 
 Examples: `500ms`, `30s`, `5m`, `1h`.
 

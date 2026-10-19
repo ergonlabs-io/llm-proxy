@@ -13,6 +13,9 @@ use std::time::Duration;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+mod jwt;
+pub use jwt::*;
+
 /// Top-level keys reserved for future schema versions; rejected in v0 so they
 /// can be added compatibly later.
 pub const RESERVED_KEYS: &[&str] = &["envoy", "tracing", "clusters"];
@@ -448,6 +451,9 @@ pub struct Auth {
     /// least 1s. Only meaningful with `enforce.object_ownership: true`.
     #[serde(default)]
     pub stored_output_owner_ttl: Option<SimpleDuration>,
+    /// JWT/OIDC providers (ADR-0014). Tried in order after virtual keys.
+    #[serde(default)]
+    pub jwt: Vec<JwtProviderDef>,
 }
 
 /// `auth.enforce`: opt-out switches for the controls that read the admin
