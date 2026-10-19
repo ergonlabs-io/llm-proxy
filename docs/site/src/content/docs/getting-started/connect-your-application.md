@@ -205,17 +205,17 @@ virtual key in code that runs in a browser.
 The statements above rest on this code and these tests.
 
 - Virtual key read from `Authorization: Bearer` only:
-  `crates/proxy-control/src/auth.rs:738-757`.
-- Routing by body `model`: `crates/proxy-simple-config/src/lower.rs:466-475`
+  `crates/proxy-control/src/auth.rs`.
+- Routing by body `model`: `crates/proxy-simple-config/src/lower.rs`
   (404 backstop; test `missing_catch_all_gets_404_backstop`).
 - No-model refusal: test `a_bodyless_request_is_refused_rather_than_slipping_through`.
 - Model list: tests `models_lists_only_what_the_caller_may_use_and_is_never_forwarded`
   and `models_without_auth_lists_the_whole_catalogue` in
   `crates/proxy/tests/embeddings_e2e.rs`.
-- Body limit: `crates/proxy-http/src/filter_manager.rs:1539`; tests in
+- Body limit: `crates/proxy-http/src/filter_manager.rs`; tests in
   `crates/proxy/tests/request_body_limit_e2e.rs`.
-- Unmetered refusal: `crates/proxy-filters/src/unmetered.rs:32`.
-- Object ownership: `crates/proxy-filters/src/object_ownership_filter.rs:470`.
-- Token and spend 429: `crates/proxy-filters/src/token_limit_filter.rs:821`,
-  `crates/proxy-filters/src/spend_limit_filter.rs:948`.
-- `anthropic-version` default: `crates/proxy-simple-config/src/lower.rs:1990`.
+- Unmetered refusal: `crates/proxy-filters/src/unmetered.rs`.
+- Object ownership: `crates/proxy-filters/src/object_ownership_filter.rs`.
+- Token and spend 429: `crates/proxy-filters/src/token_limit_filter.rs`,
+  `crates/proxy-filters/src/spend_limit_filter.rs`.
+- `anthropic-version` default: `crates/proxy-simple-config/src/lower.rs`.

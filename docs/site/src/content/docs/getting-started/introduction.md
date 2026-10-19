@@ -24,35 +24,31 @@ providers, and enforce per-caller budgets.
 llm-proxy is configured with a single YAML file, normatively defined by
 `schema/llmproxy-v0.schema.json`. You name providers and routes by model
 pattern; llm-proxy handles the rest. Parsing is strict — an unknown or
-misspelled field is a load error naming its exact dotted path, never a
-silent ignore. [Configuration file reference](../../configuration/configuration-file/)
+misspelled field is a load error naming its exact dotted path, and the
+proxy does not start. [Configuration file reference](../../configuration/configuration-file/)
 is the field-by-field reference.
 
 ## Features
 
-These LLM-specific behaviors are implemented and covered by tests:
+These are the LLM-specific features:
 
 - **Token metering.** Every response is parsed for token counts — OpenAI chat
   completions, OpenAI Responses, and Anthropic Messages, streaming and
-  non-streaming — without buffering the response body
-  (`crates/proxy-filters/src/usage.rs`). Counts reach the access log as
+  non-streaming — without buffering the response body. Counts reach the access log as
   `%LLM_INPUT_TOKENS%`, `%LLM_OUTPUT_TOKENS%`, `%LLM_CACHED_TOKENS%`,
   `%LLM_CACHE_CREATION_TOKENS%`, and `%LLM_TOTAL_TOKENS%`, plus TTFT and TPOT
-  timing (`crates/proxy-observability/src/access_log.rs`).
+  timing.
 - **Rate limiting.** A `limits` entry keyed on `global`, `client-ip`,
   `tenant`, or `header:<name>` caps tokens, requests, or concurrent streams
   in a one-minute window. A refusal is a 429 with `x-ratelimit-*` headers.
-  A request already streaming is never truncated
-  (`crates/proxy-filters/src/token_limit_filter.rs`).
+  A request that is already streaming is not truncated.
 - **Provider failover.** A route's `fallbacks` list is tried in order when the
   primary provider's connection fails, or it returns a 429 or a 5xx before any
   response byte — never after streaming to the client has begun. This works
-  today between providers that speak the **same** wire dialect (for example,
-  one OpenAI-shaped provider falling back to another); a cross-dialect chain
-  (OpenAI primary, Anthropic fallback) is a load-time error, not a silent
-  best-effort attempt, because the wrong dialect's parser would read the
-  response and report the wrong token counts
-  (`crates/proxy-simple-config/src/lower.rs`, `lower_route`).
+  between providers that speak the **same** wire dialect (for example, one
+  OpenAI-shaped provider falling back to another). A cross-dialect chain
+  (OpenAI primary, Anthropic fallback) is a load-time error, because the wrong
+  dialect's parser would read the response and report the wrong token counts.
 - **Authentication and model access.** With an `auth:` block, a request must
   carry a recognized virtual key, or the proxy refuses it with `401` before
   any provider is reached. An authenticated tenant also needs a model policy
@@ -97,15 +93,14 @@ See [Virtual keys](../../authentication/virtual-keys/) and
 ## What it is not
 
 llm-proxy does not watch its config file for changes. A running process
-re-reads its config only on `SIGHUP` — see
-[Reload configuration](../../operations/config-reload/) — never automatically. Changing a
-config file on disk has no effect until you either send `SIGHUP` or restart
-the process.
+re-reads its config only on `SIGHUP`. See
+[Reload configuration](../../operations/config-reload/). Changing a config file
+on disk has no effect until you send `SIGHUP` or restart the process.
 
-Provider fallback is scoped to same-dialect chains, as described above — it
-is not yet a general "try any provider on failure" mechanism. And the
+Provider fallback works only within a chain of providers that use the same
+dialect. It is not a general "try any provider on failure" mechanism. The
 `models` catalogue in the configuration (a named model mapped to an ordered
-list of providers) lowers a list of more than one provider to an ordered
-fallback chain, and the same-dialect rule applies to it; see
-[Configuration file reference](../../configuration/configuration-file/)
-for the exact field-by-field behavior.
+list of providers) turns a list of more than one provider into an ordered
+fallback chain. The same-dialect rule applies to it. See the
+[Configuration file reference](../../configuration/configuration-file/) for the
+field-by-field behavior.

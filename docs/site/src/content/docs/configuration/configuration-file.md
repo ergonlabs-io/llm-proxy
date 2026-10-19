@@ -50,7 +50,7 @@ A request moves through the blocks in this way:
 4. The proxy sends the request to the first provider in the chosen list. It
    moves to the next provider on failure.
 5. The proxy sends the request with the credentials of the provider it
-   actually dialled.
+   dialled.
 6. `limits`, `pricing` and `observability` use the result.
 
 Credentials and other values that vary by provider belong to the provider, not

@@ -174,18 +174,18 @@ keeps the client query string.
 
 ## Implementation notes
 
-- Endpoint classes and metering: `crates/proxy-http/src/endpoint.rs:49-83`.
-- Unmetered refusal text: `crates/proxy-filters/src/unmetered.rs:32`; tests in
+- Endpoint classes and metering: `crates/proxy-http/src/endpoint.rs`.
+- Unmetered refusal text: `crates/proxy-filters/src/unmetered.rs`; tests in
   `crates/proxy/tests/unmetered_endpoint_e2e.rs`.
-- Object ownership `404`: `crates/proxy-filters/src/object_ownership_filter.rs:470`.
+- Object ownership `404`: `crates/proxy-filters/src/object_ownership_filter.rs`.
 - `include_usage` injection and its exclusions:
-  `crates/proxy-filters/src/body_rewrite_filter.rs:301-310, 453-470`.
-- Routing header: `crates/proxy-simple-config/src/lower.rs:22`; 404 backstop at
-  `lower.rs:466-475`.
-- Path rewrites: `crates/proxy-simple-config/src/lower.rs:1155-1178`;
-  Vertex and Bedrock paths in `crates/proxy-http/src/router.rs:2665-2710`.
-- Provider header names: `crates/proxy-simple-config/src/lower.rs:1376-1377`;
-  `anthropic-version`: `lower.rs:1990-2005`.
-- Virtual key header: `crates/proxy-control/src/auth.rs:738-757`; test
+  `crates/proxy-filters/src/body_rewrite_filter.rs`.
+- Routing header: `crates/proxy-simple-config/src/lower.rs`; 404 backstop at
+  `lower.rs`.
+- Path rewrites: `crates/proxy-simple-config/src/lower.rs`;
+  Vertex and Bedrock paths in `crates/proxy-http/src/router.rs`.
+- Provider header names: `crates/proxy-simple-config/src/lower.rs`;
+  `anthropic-version`: `lower.rs`.
+- Virtual key header: `crates/proxy-control/src/auth.rs`; test
   `the_virtual_key_never_reaches_any_provider_type`.
-- Body limit: `crates/proxy-http/src/filter_manager.rs:1539`.
+- Body limit: `crates/proxy-http/src/filter_manager.rs`.
