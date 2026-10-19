@@ -2147,3 +2147,419 @@ async fn traces_and_metrics_can_target_different_collectors() {
 
     terminate(&mut child);
 }
+
+// ------------------------------- OTel GenAI semantic conventions --
+
+/// OpenAI chat completion usage with cache reads and cache writes. OpenAI's
+/// `prompt_tokens` already includes both, so our exclusive `input` bucket is
+/// 120 - 80 - 30 = 10 while semconv's `input` is the full 120.
+const CACHED_COMPLETION_BODY: &str = r#"{"id":"chatcmpl-e2e","object":"chat.completion","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":7,"total_tokens":127,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":30}}}"#;
+
+/// Answers every request with [`CACHED_COMPLETION_BODY`] after reading the
+/// whole request, so the proxy never sees a reset while still sending.
+fn spawn_cached_completion_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
+    let addr = listener.local_addr().expect("no local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let Some(header_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let content_length = text[..header_end]
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    CACHED_COMPLETION_BODY.len(),
+                    CACHED_COMPLETION_BODY
+                );
+                let _ = stream.write_all(response.as_bytes());
+            });
+        }
+    });
+    addr
+}
+
+fn post_json(addr: SocketAddr, path: &str, body: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set_read_timeout");
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: test.local\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .expect("write request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read response to EOF");
+    String::from_utf8_lossy(&response).to_string()
+}
+
+/// One LLM listener (body rewrite, usage, router) with both OTLP surfaces
+/// pointed at `collector`.
+fn write_llm_config(
+    listener_port: u16,
+    admin_port: u16,
+    upstream: SocketAddr,
+    collector: SocketAddr,
+) -> std::path::PathBuf {
+    let endpoints = OtlpEndpoints::both(collector);
+    let traces = endpoints.traces.expect("both sets traces");
+    let metrics = endpoints.metrics.expect("both sets metrics");
+    let node_block = build_node_block(&[
+        format!(
+            r#"    io.llmproxy.tracing:
+      otlp_endpoint: "{}"
+      service_name: "otlp-genai-e2e"
+      sample_ratio: 1.0
+      export_deadline: {}"#,
+            traces.endpoint, traces.deadline_secs
+        ),
+        format!(
+            r#"    io.llmproxy.metrics:
+      otlp_endpoint: "{}"
+      service_name: "otlp-genai-e2e"
+      export_interval: {}
+      export_deadline: {}"#,
+            metrics.endpoint, metrics.interval_secs, metrics.deadline_secs
+        ),
+    ]);
+    let config_yaml = format!(
+        r#"{node_block}
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: {admin_port} }}
+
+static_resources:
+  listeners:
+    - name: ingress_llm
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {listener_port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_llm
+                http_filters:
+                  - name: llmproxy.body_rewrite
+                    typed_config:
+                      "@type": type.llmproxy.dev/llmproxy.filters.v0.BodyRewrite
+                      enabled: true
+                      dialect: openai
+                  - name: llmproxy.usage
+                    typed_config:
+                      "@type": type.llmproxy.dev/envoy.config.core.v3.DataSource
+                      inline_string: openai
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: llm_backend
+
+  clusters:
+    - name: llm_backend
+      type: STATIC
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: llm_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: {upstream_ip}, port_value: {upstream_port} }}
+"#,
+        upstream_ip = upstream.ip(),
+        upstream_port = upstream.port(),
+    );
+    write_temp_config(listener_port, config_yaml)
+}
+
+/// Polls exports newest-first until every metric in `names` has a data point
+/// in one export, and returns that export's metrics.
+async fn wait_for_metrics(
+    metrics: &Arc<Mutex<Vec<ResourceMetrics>>>,
+    names: &[&str],
+    deadline: Duration,
+) -> Option<Vec<proxy_api::opentelemetry::proto::metrics::v1::Metric>> {
+    let start = std::time::Instant::now();
+    loop {
+        {
+            let collected = metrics.lock().expect("mutex poisoned");
+            for resource_metrics in collected.iter().rev() {
+                let all: Vec<_> = resource_metrics
+                    .scope_metrics
+                    .iter()
+                    .flat_map(|sm| sm.metrics.iter().cloned())
+                    .collect();
+                if names.iter().all(|name| all.iter().any(|m| m.name == *name)) {
+                    return Some(all);
+                }
+            }
+        }
+        if start.elapsed() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn string_value(
+    value: &Option<proxy_api::opentelemetry::proto::common::v1::AnyValue>,
+) -> Option<&str> {
+    match value.as_ref()?.value.as_ref()? {
+        proxy_api::opentelemetry::proto::common::v1::any_value::Value::StringValue(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Every data point's attribute-key set, sorted, for one histogram metric.
+fn histogram_key_sets(
+    metric: &proxy_api::opentelemetry::proto::metrics::v1::Metric,
+) -> Vec<Vec<String>> {
+    let Some(metric::Data::Histogram(histogram)) = metric.data.as_ref() else {
+        panic!(
+            "{} must be exported as an OTLP histogram, got {:?}",
+            metric.name, metric.data
+        );
+    };
+    histogram
+        .data_points
+        .iter()
+        .map(|point| {
+            let mut keys: Vec<String> = point.attributes.iter().map(|kv| kv.key.clone()).collect();
+            keys.sort();
+            keys
+        })
+        .collect()
+}
+
+/// The OTLP wire carries the semconv 1.41 GenAI instruments with their
+/// names, units and attribute keys, `gen_ai.system` is gone from every
+/// metric, and cached tokens make semconv `input` differ from ours.
+#[tokio::test(flavor = "multi_thread")]
+async fn gen_ai_semconv_instruments_reach_the_collector() {
+    let upstream = spawn_cached_completion_upstream();
+    let (spans, metrics, collector_addr) = spawn_mock_collector();
+    assert!(
+        wait_for_connectable(("127.0.0.1", collector_addr.port()), STARTUP_TIMEOUT),
+        "mock OTLP collector never became connectable"
+    );
+
+    let listener_port = free_port();
+    let admin_port = free_port();
+    let config_path = write_llm_config(listener_port, admin_port, upstream, collector_addr);
+    let (mut child, stderr_rx) = spawn_proxy(&config_path);
+    assert!(
+        wait_for_connectable(("127.0.0.1", listener_port), STARTUP_TIMEOUT),
+        "listener never became connectable (stderr so far: {:?})",
+        drain_available_lines(&stderr_rx)
+    );
+
+    let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
+    let response = post_json(
+        listener_addr,
+        "/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected the chat completion to succeed, got:\n{response}\n(stderr so far: {:?})",
+        drain_available_lines(&stderr_rx)
+    );
+
+    let names = [
+        "gen_ai.client.token.usage",
+        "gen_ai.client.operation.duration",
+        "gen_ai.server.time_to_first_token",
+        "gen_ai.server.time_per_output_token",
+        "llm.client.token.usage",
+    ];
+    let exported = wait_for_metrics(&metrics, &names, Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the collector never received all of {names:?} in one export (stderr so far: \
+                 {:?})",
+                drain_available_lines(&stderr_rx)
+            )
+        });
+    let by_name = |name: &str| {
+        exported
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+    };
+
+    let base = [
+        "gen_ai.operation.name",
+        "gen_ai.provider.name",
+        "gen_ai.request.model",
+    ];
+    for (name, unit, extra) in [
+        (
+            "gen_ai.client.token.usage",
+            "{token}",
+            Some("gen_ai.token.type"),
+        ),
+        ("gen_ai.client.operation.duration", "s", None),
+        ("gen_ai.server.time_to_first_token", "s", None),
+        ("gen_ai.server.time_per_output_token", "s", None),
+    ] {
+        let metric = by_name(name);
+        assert_eq!(metric.unit, unit, "{name} unit");
+        let mut expected: Vec<String> = base.iter().map(|k| k.to_string()).collect();
+        expected.extend(extra.map(str::to_string));
+        expected.sort();
+        for keys in histogram_key_sets(metric) {
+            assert_eq!(keys, expected, "{name} attribute keys");
+        }
+    }
+
+    // `gen_ai.system` is deprecated since semconv 1.37, and no label may
+    // carry a raw user id.
+    for metric in &exported {
+        let points: Vec<_> = match metric.data.as_ref() {
+            Some(metric::Data::Histogram(h)) => h
+                .data_points
+                .iter()
+                .flat_map(|p| p.attributes.iter())
+                .collect(),
+            Some(metric::Data::Sum(s)) => s
+                .data_points
+                .iter()
+                .flat_map(|p| p.attributes.iter())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for kv in points {
+            assert_ne!(
+                kv.key, "gen_ai.system",
+                "{} still carries gen_ai.system",
+                metric.name
+            );
+            assert!(
+                !kv.key.contains("user"),
+                "{} carries a user label {:?}",
+                metric.name,
+                kv.key
+            );
+        }
+    }
+
+    let Some(metric::Data::Histogram(token_usage)) =
+        by_name("gen_ai.client.token.usage").data.as_ref()
+    else {
+        unreachable!("checked above");
+    };
+    let semconv_sum = |token_type: &str| -> f64 {
+        token_usage
+            .data_points
+            .iter()
+            .filter(|p| {
+                p.attributes.iter().any(|kv| {
+                    kv.key == "gen_ai.token.type" && string_value(&kv.value) == Some(token_type)
+                })
+            })
+            .map(|p| p.sum.unwrap_or(0.0))
+            .sum()
+    };
+    assert_eq!(
+        semconv_sum("input"),
+        120.0,
+        "semconv input includes both cache buckets"
+    );
+    assert_eq!(semconv_sum("output"), 7.0);
+
+    let Some(metric::Data::Sum(llm_usage)) = by_name("llm.client.token.usage").data.as_ref() else {
+        panic!("llm.client.token.usage must stay a Sum");
+    };
+    let llm_input: i64 = llm_usage
+        .data_points
+        .iter()
+        .filter(|p| {
+            p.attributes
+                .iter()
+                .any(|kv| kv.key == "type" && string_value(&kv.value) == Some("input"))
+        })
+        .map(|p| match p.value {
+            Some(
+                proxy_api::opentelemetry::proto::metrics::v1::number_data_point::Value::AsInt(v),
+            ) => v,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        llm_input, 10,
+        "llm.client.token.usage input still excludes cached tokens"
+    );
+
+    // The server span carries the semconv usage attributes as integers.
+    wait_for_spans(&spans, 1, Duration::from_secs(20)).await;
+    let collected = spans.lock().expect("mutex poisoned");
+    let server = collected
+        .iter()
+        .find(|s| s.kind == OtlpSpanKind::Server as i32)
+        .expect("a server span reached the collector");
+    let int = |key: &str| {
+        server
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                proxy_api::opentelemetry::proto::common::v1::any_value::Value::IntValue(n) => {
+                    Some(*n)
+                }
+                _ => None,
+            })
+    };
+    assert_eq!(int("gen_ai.usage.input_tokens"), Some(120));
+    assert_eq!(int("gen_ai.usage.output_tokens"), Some(7));
+    assert_eq!(int("gen_ai.usage.cache_read.input_tokens"), Some(80));
+    assert_eq!(int("gen_ai.usage.cache_creation.input_tokens"), Some(30));
+    assert!(
+        server
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "gen_ai.provider.name" && string_value(&kv.value) == Some("openai")),
+        "server span names the provider: {:?}",
+        server.attributes
+    );
+    drop(collected);
+
+    terminate(&mut child);
+    let _ = std::fs::remove_file(&config_path);
+}

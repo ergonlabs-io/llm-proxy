@@ -70,8 +70,12 @@ impl LlmTokenUsage {
 
 /// The response wire system the usage filter identified for a stream.
 ///
+/// It names the dialect, not the vendor: an OpenAI-compatible upstream also
+/// reports `openai`. Semconv allows that (`gen_ai.provider.name` is the
+/// instrumentation's best knowledge), and it keeps the label at two values.
+///
 /// This stays a small closed enum rather than a caller-provided string: it is
-/// used as an OTel `gen_ai.system` attribute, so accepting arbitrary values
+/// used as the OTel `gen_ai.provider.name` attribute, so accepting arbitrary values
 /// here would create a cardinality path from the request into metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenAiSystem {
