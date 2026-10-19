@@ -7,6 +7,9 @@
 //! Rust note: the mocks share a counter with the test through
 //! `Arc<AtomicUsize>`. `Arc` lets two threads own it; the atomic needs no lock.
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -414,11 +417,6 @@ fn wait_until(condition: impl Fn() -> bool, what: &str) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
 }
 
 /// A mock OpenAI upstream that reports 10 total tokens and counts the requests

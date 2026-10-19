@@ -6,10 +6,15 @@
 //! The negative cases matter more than the happy path. Every upstream TLS defect in this project's history has been on
 //! the verification path, not the handshake-succeeds path.
 
+#[path = "../src/test_ports.rs"]
+mod test_ports;
+
 use std::net::SocketAddr;
+
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use test_ports::free_port;
 
 use proxy_cluster::manager::ClusterManager;
 use proxy_config::ir::{
@@ -79,14 +84,6 @@ fn default_params() -> TlsParametersIR {
 }
 
 // --------------------------------------------------------- upstream fixture --
-
-/// Reserves an ephemeral port, then frees it, so the bootstrap YAML can name the port before the listener binds it.
-async fn free_port() -> u16 {
-    let l = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
-}
 
 /// A real TLS HTTP/1.1 upstream on loopback. It terminates TLS with `cert` and `key` through the same
 /// `DownstreamTlsFactory` the listener side uses, then serves one fixed 200 per connection.
@@ -376,7 +373,7 @@ fn router_forwards_a_real_request_to_a_real_tls_upstream_over_http1() {
         let upstream_addr =
             spawn_tls_http_upstream(&upstream_cert, &upstream_key, upstream_body).await;
 
-        let listener_port = free_port().await;
+        let listener_port = free_port();
         let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
         let snapshot = snapshot_from(&bootstrap_yaml(
             listener_port,
@@ -414,7 +411,7 @@ fn a_tls_upstream_records_the_handshake_end_after_the_tcp_connect() {
         let upstream_cert = mint_leaf(&ca, &["upstream.test"], &upstream_key);
         let upstream_addr = spawn_tls_http_upstream(&upstream_cert, &upstream_key, b"ok").await;
 
-        let listener_port = free_port().await;
+        let listener_port = free_port();
         let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
         let log = std::env::temp_dir().join(format!(
             "proxy-core-upstream-tls-timing-{}-{listener_port}.log",
@@ -479,7 +476,7 @@ fn upstream_tls_verification_rejects_the_wrong_ca() {
         let upstream_addr =
             spawn_tls_http_upstream(&upstream_cert, &upstream_key, b"should never be seen").await;
 
-        let listener_port = free_port().await;
+        let listener_port = free_port();
         let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
         // ...but the cluster only trusts `real_ca`.
         let snapshot = snapshot_from(&bootstrap_yaml(
@@ -523,7 +520,7 @@ fn upstream_tls_trusted_ca_alone_does_not_verify_the_hostname() {
         let upstream_addr =
             spawn_tls_http_upstream(&upstream_cert, &upstream_key, upstream_body).await;
 
-        let listener_port = free_port().await;
+        let listener_port = free_port();
         let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
         let snapshot = snapshot_from(&bootstrap_yaml(
             listener_port,
@@ -563,7 +560,7 @@ fn upstream_tls_san_matcher_rejects_a_mismatched_certificate() {
         let upstream_addr =
             spawn_tls_http_upstream(&upstream_cert, &upstream_key, b"should never be seen").await;
 
-        let listener_port = free_port().await;
+        let listener_port = free_port();
         let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
         let mismatched_matcher = "              match_typed_subject_alt_names:\n                - san_type: DNS\n                  matcher: { exact: wrong.test }\n";
         let snapshot = snapshot_from(&bootstrap_yaml(
@@ -601,7 +598,7 @@ fn upstream_tls_san_matcher_rejects_a_mismatched_certificate() {
         let upstream_addr =
             spawn_tls_http_upstream(&upstream_cert, &upstream_key, upstream_body).await;
 
-        let listener_port = free_port().await;
+        let listener_port = free_port();
         let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
         let matching_matcher = "              match_typed_subject_alt_names:\n                - san_type: DNS\n                  matcher: { exact: upstream.test }\n";
         let snapshot = snapshot_from(&bootstrap_yaml(

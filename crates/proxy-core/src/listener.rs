@@ -1914,6 +1914,7 @@ mod drain_tests;
 mod tests {
     use super::*;
     use crate::runtime::run_local;
+    use crate::test_ports::free_port;
     use proxy_config::ir::{
         FilterChainMatch, FilterChainSpec, ListenerConfig as IrListenerConfig, SourceType,
     };
@@ -1929,15 +1930,6 @@ mod tests {
         LbPolicy, TcpProxyConfig, TlsCertificateIR, TlsParametersIR, TlsVersion, UpstreamTlsSpec,
     };
     use rcgen::{CertificateParams, DnType, KeyPair};
-
-    /// Rust note: reserve an ephemeral port by binding port 0, reading back the OS choice, then
-    /// dropping the listener. Another process could take the port in between; acceptable for tests.
-    async fn free_port() -> u16 {
-        let l = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
-    }
 
     /// The accept loop's accept sets `TCP_NODELAY`, so a small response write is not held for the
     /// client's delayed ACK. The client side of the same connection is left at the kernel default,
@@ -2558,7 +2550,7 @@ mod tests {
     #[test]
     fn accept_and_match_keeps_connection_open() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let listener_ir = match_all_listener("l1", addr, "up");
@@ -2594,7 +2586,7 @@ mod tests {
     #[test]
     fn no_match_closes_with_reset() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = sni_only_listener("l1", addr, "unused");
             let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
@@ -2626,7 +2618,7 @@ mod tests {
     #[test]
     fn tls_inspector_sni_match_keeps_connection_open() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "up");
@@ -2661,7 +2653,7 @@ mod tests {
     #[test]
     fn tls_inspector_sni_mismatch_closes_with_reset() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "unused");
             let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
@@ -2695,7 +2687,7 @@ mod tests {
     #[test]
     fn tls_inspector_plaintext_connection_closes_with_reset() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = sni_only_listener_with_tls_inspector("l1", addr, "unused");
             let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
@@ -2729,7 +2721,7 @@ mod tests {
     #[test]
     fn chain_update_without_rebind_applies_to_new_connections_only() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let v1 = match_all_listener("l1", addr, "up");
@@ -2790,9 +2782,9 @@ mod tests {
     #[test]
     fn address_replacement_serves_new_listener_and_drains_existing_connection() {
         run_local(async {
-            let old_port = free_port().await;
+            let old_port = free_port();
             let old_addr: SocketAddr = format!("127.0.0.1:{old_port}").parse().unwrap();
-            let new_port = free_port().await;
+            let new_port = free_port();
             let new_addr: SocketAddr = format!("127.0.0.1:{new_port}").parse().unwrap();
             let upstream_addr = spawn_echo_upstream().await;
             let harness = spawn_manager(snapshot_with_cluster(
@@ -2840,7 +2832,7 @@ mod tests {
     #[test]
     fn same_address_listener_rename_warms_replacement_before_retiring_old_name() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_echo_upstream().await;
             let harness = spawn_manager(snapshot_with_cluster(
@@ -2873,7 +2865,7 @@ mod tests {
     #[test]
     fn failed_address_replacement_keeps_previous_listener_accepting() {
         run_local(async {
-            let old_port = free_port().await;
+            let old_port = free_port();
             let old_addr: SocketAddr = format!("127.0.0.1:{old_port}").parse().unwrap();
             // A plain Tokio listener does not opt into SO_REUSEPORT, so it blocks the replacement address.
             let occupied = TokioTcpListener::bind("127.0.0.1:0")
@@ -2912,7 +2904,7 @@ mod tests {
     #[test]
     fn listener_removal_stops_new_accepts_but_keeps_existing_open() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let v1 = match_all_listener("l1", addr, "up");
@@ -3148,7 +3140,7 @@ mod tests {
     #[test]
     fn alpn_negotiated_protocol_selects_the_serving_codec() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let (cert, key) = mint_self_signed("alpn.example.com");
             let mut tls_spec = downstream_tls_spec(&cert, &key);
@@ -3262,7 +3254,7 @@ mod tests {
     #[test]
     fn plaintext_codec_auto_detects_h2_prior_knowledge_and_an_ordinary_h1_request() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = match_all_listener_with_filter(
                 "l1",
@@ -3315,7 +3307,7 @@ mod tests {
     #[test]
     fn plaintext_codec_type_http2_serves_h2_unconditionally() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = match_all_listener_with_filter(
                 "l1",
@@ -3363,7 +3355,7 @@ mod tests {
     #[test]
     fn plaintext_codec_type_http1_serves_h1_unconditionally() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = match_all_listener_with_filter(
                 "l1",
@@ -3410,7 +3402,7 @@ mod tests {
     #[test]
     fn tls_termination_handshake_completes_and_holds_connection() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let (listener_ir, _cert) = tls_chain_listener("l1", addr, "server.example.com", "up");
@@ -3483,7 +3475,7 @@ mod tests {
     #[test]
     fn stalled_tls_handshake_is_closed_at_the_deadline_and_frees_the_slot() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let harness = spawn_manager(capped_tls_snapshot(
@@ -3532,7 +3524,7 @@ mod tests {
     #[test]
     fn handshake_deadline_does_not_apply_after_the_handshake_completes() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let harness = spawn_manager(capped_tls_snapshot(
@@ -3589,7 +3581,7 @@ mod tests {
     #[test]
     fn sni_selects_matching_chain_and_serves_its_certificate() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let (listener_ir, cert_a, cert_b) =
                 tls_dual_sni_listener("l1", addr, "host-a.example.com", "host-b.example.com");
@@ -3674,7 +3666,7 @@ mod tests {
     #[test]
     fn initial_bind_propagates_a_tls_build_failure_as_fatal() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let mut listener_ir = match_all_listener("l1", addr, "unused");
             listener_ir.filter_chains[0].transport_socket = Some(DownstreamTlsSpec {
@@ -3744,7 +3736,7 @@ mod tests {
     #[test]
     fn tcp_proxy_bidirectional_round_trip() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_echo_upstream().await;
             let listener_ir = match_all_listener("l1", addr, "up");
@@ -3780,7 +3772,7 @@ mod tests {
     #[test]
     fn tcp_proxy_large_bidirectional_transfer_does_not_deadlock() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_echo_upstream().await;
             let listener_ir = match_all_listener("l1", addr, "up");
@@ -3829,7 +3821,7 @@ mod tests {
     #[test]
     fn tcp_proxy_upstream_to_downstream_independent_of_client_writes() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
             // A dedicated upstream that speaks first, unprompted -- proves
@@ -3872,7 +3864,7 @@ mod tests {
     #[test]
     fn tcp_proxy_half_close_propagates_fin_without_killing_other_direction() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
             let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
@@ -3934,7 +3926,7 @@ mod tests {
     #[test]
     fn tcp_proxy_idle_timeout_closes_connection_after_inactivity() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_holding_upstream().await;
             let listener_ir = match_all_listener_with_filter(
@@ -3971,7 +3963,7 @@ mod tests {
     #[test]
     fn tcp_proxy_idle_timeout_does_not_close_connection_with_active_traffic() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_echo_upstream().await;
             let listener_ir = match_all_listener_with_filter(
@@ -4012,7 +4004,7 @@ mod tests {
     #[test]
     fn tcp_proxy_missing_cluster_closes_connection_promptly() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             // No cluster in the snapshot at all: `nonexistent` never resolves.
             let listener_ir = match_all_listener("l1", addr, "nonexistent");
@@ -4038,7 +4030,7 @@ mod tests {
     #[test]
     fn tcp_proxy_over_downstream_tls_round_trips() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_addr = spawn_echo_upstream().await;
             let (listener_ir, _cert) = tls_chain_listener("l1", addr, "server.example.com", "up");
@@ -4082,7 +4074,7 @@ mod tests {
     #[test]
     fn hcm_terminal_filter_serves_http_over_the_real_socket() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = match_all_listener_with_filter("l1", addr, hcm_filter());
             let harness = spawn_manager(snapshot_with(listener_ir, 1)).await;
@@ -4120,7 +4112,7 @@ mod tests {
     #[test]
     fn hcm_filter_chain_mutates_headers_over_the_real_socket() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let listener_ir = match_all_listener_with_filter(
                 "l1",
@@ -4341,7 +4333,7 @@ mod tests {
     #[test]
     fn router_forwards_a_real_request_to_a_real_upstream_over_http1() {
         run_local(async {
-            let port = free_port().await;
+            let port = free_port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
             let upstream_body: &'static [u8] = b"hello from upstream";
             let upstream_addr = spawn_http_upstream(upstream_body).await;
@@ -4442,7 +4434,7 @@ mod tests {
         use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
 
         run_local(async {
-            let proxy_port = free_port().await;
+            let proxy_port = free_port();
             let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
 
             let upstream_body: &'static [u8] = br#"{"id":"x","usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}"#;
@@ -5050,7 +5042,7 @@ static_resources:
         use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
 
         run_local(async {
-            let proxy_port = free_port().await;
+            let proxy_port = free_port();
             let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
 
             let upstream_addr = spawn_http_upstream_echoing_request_body().await;
@@ -5201,7 +5193,7 @@ static_resources:
         use proxy_config::{build_snapshot, parse_bootstrap, ConfigFormat, StrictMode};
 
         run_local(async {
-            let proxy_port = free_port().await;
+            let proxy_port = free_port();
             let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
 
             // input=20 (100 prompt - 80 cached), cached=80, cache_creation=0, output=20: total 120, as in

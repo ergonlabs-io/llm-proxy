@@ -9,19 +9,16 @@
 //! rather than shared, and `env!("CARGO_BIN_EXE_llm-proxy")` +
 //! `Command::new(BIN).spawn()` drive the real binary.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
-}
 
 fn spawn_line_reader(
     mut reader: BufReader<impl std::io::Read + Send + 'static>,

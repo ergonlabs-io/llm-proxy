@@ -8,6 +8,9 @@
 //!
 //! Rust note: same harness shape as `tests/request_body_limit_e2e.rs`.
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -181,11 +184,6 @@ fn wait_for_connectable(addr: SocketAddr, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
 }
 
 /// A mock provider that reads each whole request, sends the body it

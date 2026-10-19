@@ -12,6 +12,9 @@
 //! (std threads, ephemeral ports, a child killed on drop), plus a stderr
 //! reader so the reload's log line can be awaited.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -381,11 +384,6 @@ fn wait_for_connectable(addr: SocketAddr, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     false
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-    listener.local_addr().expect("local addr").port()
 }
 
 /// A provider that answers every request `200 {}`; only the proxy's auth

@@ -6,8 +6,10 @@
 //! (TLS worked) or counts a refused handshake, so a proxy that never dialled
 //! cannot pass the negative case.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
@@ -106,14 +108,6 @@ impl Drop for TempFiles {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 /// Kills and reaps the child on drop, so a failing assert leaks no process

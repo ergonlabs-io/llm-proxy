@@ -21,6 +21,9 @@
 //! Rust note: same harness shape as `tests/tenant_enforcement_e2e.rs` (std
 //! threads, ephemeral ports, a `Drop` that kills the proxy, every wait bounded).
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -797,11 +800,6 @@ fn wait_for_connectable(addr: SocketAddr, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
 }
 
 fn chunk(data: &str) -> Vec<u8> {

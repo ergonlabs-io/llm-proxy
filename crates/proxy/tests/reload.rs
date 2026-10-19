@@ -9,8 +9,11 @@
 //! duplicated, and `env!("CARGO_BIN_EXE_llm-proxy")` drives the real binary
 //! because `crates/proxy` has no `[lib]` target to link against.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -23,11 +26,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 /// `STARTUP_TIMEOUT`.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
-}
 
 fn wait_for_connectable(addr: (&str, u16), timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;

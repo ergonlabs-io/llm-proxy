@@ -6,6 +6,9 @@
 //! absolute path of the `llm-proxy` binary this crate produces, so we don't
 //! have to guess `target/debug/...` ourselves.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Write as _};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
@@ -295,19 +298,6 @@ static_resources:
         exit.success(),
         "expected exit 0 after SIGTERM, got {exit:?}"
     );
-}
-
-/// Reserves a free ephemeral port and reserves it long enough to hand back
-/// its number.
-///
-/// Rust note: standard "bind to port 0, read back what the OS picked, then
-/// drop it" technique -- there's a small window where another process could
-/// grab the same port before `llm-proxy` binds it, but that race is
-/// acceptable for a test (and far less likely to collide in CI than the
-/// example config's hardcoded port 10000 would be).
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
 }
 
 #[test]

@@ -3,6 +3,9 @@
 //! text equivalent. `downstream_cx_total` is checked in both formats; its label
 //! uses the listener name (internal-docs/envoy-divergences.md).
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -13,12 +16,6 @@ use std::time::Duration;
 use proxy_observability::stats::instruments::LLM_CLIENT_TOKEN_USAGE_NO_TENANT;
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
-
-/// Reserves and returns an ephemeral port.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
-}
 
 /// How long to wait for the freshly spawned `llm-proxy` to become
 /// connectable -- see `tests/cli.rs`'s `STARTUP_TIMEOUT` for why this is a

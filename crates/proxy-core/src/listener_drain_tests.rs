@@ -2,6 +2,7 @@
 //! accept loops, and HTTP/1 codec over real sockets (`internal-docs/architecture.md` section 8, "Drain"). Every wait is
 //! bounded by `WAIT`.
 use super::*;
+use crate::test_ports::free_port;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -60,14 +61,6 @@ impl Upstream {
             task,
         }
     }
-}
-
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 /// Upstream that answers its first request with `101 Switching Protocols`,
@@ -338,7 +331,7 @@ async fn drain_start_closes_the_listening_socket() {
     LocalSet::new()
         .run_until(async {
             let upstream = Upstream::spawn().await;
-            let port = reserve_port();
+            let port = free_port();
             let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
             TcpStream::connect(addr(port))
                 .await
@@ -356,7 +349,7 @@ async fn a_snapshot_published_after_drain_start_binds_nothing() {
     LocalSet::new()
         .run_until(async {
             let upstream = Upstream::spawn().await;
-            let (first, second) = (reserve_port(), reserve_port());
+            let (first, second) = (free_port(), free_port());
             let worker = start_worker(snapshot_for(&[first], upstream.address.port(), 1)).await;
 
             worker.start_drain();
@@ -384,7 +377,7 @@ async fn an_idle_keep_alive_connection_is_closed_at_drain_start() {
         .run_until(async {
             let upstream = Upstream::spawn().await;
             upstream.gate.add_permits(1);
-            let port = reserve_port();
+            let port = free_port();
             let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
 
             let mut client = TcpStream::connect(addr(port)).await.unwrap();
@@ -417,7 +410,7 @@ async fn an_in_flight_request_finishes_with_connection_close_then_the_connection
     LocalSet::new()
         .run_until(async {
             let mut upstream = Upstream::spawn().await;
-            let port = reserve_port();
+            let port = free_port();
             let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
 
             let mut client = TcpStream::connect(addr(port)).await.unwrap();
@@ -456,7 +449,7 @@ async fn drain_worker_reports_done_when_only_an_idle_connection_remains() {
         .run_until(async {
             let upstream = Upstream::spawn().await;
             upstream.gate.add_permits(1);
-            let port = reserve_port();
+            let port = free_port();
             let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
             let (done_tx, mut done_rx) = mpsc::unbounded_channel();
             tokio::task::spawn_local(crate::drain::drain_worker(
@@ -508,7 +501,7 @@ async fn an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_c
     LocalSet::new()
         .run_until(async {
             let upstream = spawn_upgrade_echo_upstream().await;
-            let port = reserve_port();
+            let port = free_port();
             let worker = start_worker(websocket_snapshot_for(&[port], upstream.port(), 1)).await;
             let (done_tx, mut done_rx) = mpsc::unbounded_channel();
             tokio::task::spawn_local(crate::drain::drain_worker(
@@ -617,7 +610,7 @@ async fn a_streaming_response_survives_drain_start(request: &'static [u8]) {
     LocalSet::new()
         .run_until(async {
             let (upstream, gate, mut arrived) = spawn_streaming_upstream().await;
-            let port = reserve_port();
+            let port = free_port();
             let worker = start_worker(snapshot_for(&[port], upstream.port(), 1)).await;
 
             let mut client = TcpStream::connect(addr(port)).await.unwrap();
