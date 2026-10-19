@@ -11,6 +11,9 @@
 //! Rust note: same harness shape as `tests/auth_store_e2e.rs` (std threads,
 //! ephemeral ports, a guard that kills the child on drop, every wait bounded).
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -247,11 +250,6 @@ fn wait_for_connectable(addr: SocketAddr, timeout: Duration) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
 }
 
 /// A mock of OpenRouter's key endpoint. Records each request head

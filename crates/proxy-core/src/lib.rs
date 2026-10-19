@@ -16,6 +16,9 @@ pub mod tls;
 pub mod tls_inspector;
 pub mod transport;
 
+#[cfg(test)]
+mod test_ports;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;

@@ -3,6 +3,9 @@
 //! A multi-thread runtime lets the server and blocking test waits progress together
 //! (AGENTS.md "Build And Test"); `ChildGuard` reaps spawned processes.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -29,12 +32,6 @@ use proxy_api::opentelemetry::proto::trace::v1::status::StatusCode as OtlpStatus
 use proxy_api::opentelemetry::proto::trace::v1::Span;
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
-
-/// Reserves an ephemeral port. Each integration-test file is a separate crate.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
-}
 
 /// Returns an unused loopback address for an immediate connection failure.
 fn dead_addr() -> SocketAddr {

@@ -14,6 +14,9 @@
 //! `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`, which
 //! proves the seam works but not that `main.rs` uses it.
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -79,11 +82,6 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // --------------------------------------------------------------- helpers --
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
-}
 
 /// A reserved-then-immediately-dropped port: nothing is listening on it, so
 /// a connect attempt fails fast -- what test C's ADS cluster needs to point

@@ -3,6 +3,7 @@
 //! `run_listener_manager` path, with real accept loops and sockets. Assertions are on outcomes inside the bounded
 //! `WAIT`, never on a wall-clock window (AGENTS.md "Build And Test").
 use super::*;
+use crate::test_ports::free_port;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -10,18 +11,6 @@ use tokio::{
 };
 
 const WAIT: Duration = Duration::from_secs(10);
-
-/// Reserve-then-release an ephemeral port number, the same technique the
-/// sibling listener tests use (the proxy binds with `SO_REUSEPORT`, so a
-/// reservation socket that stays open would receive a share of the
-/// connections).
-fn reserve_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn addr(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
@@ -90,7 +79,7 @@ impl ListenerSpec {
     fn new(name: &'static str) -> Self {
         Self {
             name,
-            port: reserve_port(),
+            port: free_port(),
             ignore_global_conn_limit: false,
             hcm_extra: String::new(),
         }
@@ -477,7 +466,7 @@ fn log_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "llm-proxy-admission-{tag}-{}-{}.log",
         std::process::id(),
-        reserve_port()
+        free_port()
     ))
 }
 

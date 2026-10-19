@@ -1,4 +1,7 @@
 #![cfg(unix)]
+mod common;
+
+use common::free_port;
 use proxy_capture_agent::{config::Config, Agent};
 use proxy_capture_spool::MetadataSpool;
 use std::{
@@ -206,8 +209,8 @@ fn declarative_capture_reload_and_emergency_gate_on_keepalive() {
     });
     let agent = collector(serde_json::from_value(agent_config.clone()).unwrap());
     let upstream = mock();
-    let listener = port();
-    let admin = port();
+    let listener = free_port();
+    let admin = free_port();
     let bootstrap = temp.path().join("proxy.yaml");
     let log = temp.path().join("proxy.log");
     let mut capture = serde_json::json!({
@@ -424,7 +427,7 @@ fn capture_to_the_agent_spool_warns_that_it_is_experimental() {
     });
     let _agent = collector(serde_json::from_value(agent_config).unwrap());
     let upstream = mock();
-    let (listener, admin) = (port(), port());
+    let (listener, admin) = (free_port(), free_port());
     let capture = serde_json::json!({
         "version":1,"metadata":{"enabled":true,"max_attempts":8},"policy":{"version":"warn"},
         "endpoint":{"unix_socket_path":socket,"expected_agent_uid":uid,
@@ -492,7 +495,7 @@ fn a_request_spanning_sigterm_is_captured() {
     let release = Arc::new(AtomicBool::new(false));
     let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = gated_mock(release.clone(), arrived.clone());
-    let (listener, admin) = (port(), port());
+    let (listener, admin) = (free_port(), free_port());
     let capture = serde_json::json!({
         "version":1,"metadata":{"enabled":true,"max_attempts":8},"policy":{"version":"drain"},
         "endpoint":{"unix_socket_path":socket,"expected_agent_uid":uid,
@@ -625,13 +628,6 @@ fn mock() -> Mock {
         thread: Some(thread),
     }
 }
-fn port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 fn get(port: u16, path: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
@@ -721,8 +717,8 @@ fn metadata_agent_outage_preserves_forwarding_and_recovery_commits_actual_record
         "spool":{"directory":temp.path().join("spool"),"max_record_bytes":524288,"max_disk_bytes":4194304,"cache_bytes":4194304},
         "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]});
     let upstream = mock();
-    let listener = port();
-    let admin = port();
+    let listener = free_port();
+    let admin = free_port();
     let bootstrap = temp.path().join("proxy.yaml");
     std::fs::write(&bootstrap, format!(r#"
 admin:
@@ -920,8 +916,8 @@ fn inspect_rig(inspect: bool) -> InspectRig {
         "active_key_id":"key","keys":[{"key_id":"key","key_file":key}]});
     let agent = collector(serde_json::from_value(config).unwrap());
     let upstream = mock();
-    let listener = port();
-    let admin = port();
+    let listener = free_port();
+    let admin = free_port();
     let bootstrap = temp.path().join("proxy.yaml");
     std::fs::write(
         &bootstrap,

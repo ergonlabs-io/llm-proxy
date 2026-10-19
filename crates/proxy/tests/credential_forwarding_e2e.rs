@@ -18,6 +18,9 @@
 //! drop); each `tests/*.rs` file is its own crate, so the helpers are
 //! duplicated rather than shared.
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -33,11 +36,6 @@ const HMAC_SECRET: &str = "credential-forwarding-e2e-secret";
 const VIRTUAL_KEY: &str = "llmp_credential-forwarding-e2e-key";
 const OPENAI_KEY: &str = "sk-openai-provider-key";
 const ANTHROPIC_KEY: &str = "sk-ant-provider-key";
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
-}
 
 fn wait_for_connectable(addr: (&str, u16), timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;

@@ -7,6 +7,9 @@
 //! and the writer themselves are tested in `proxy-core` and
 //! `proxy-observability`; the admin endpoints' contract in `proxy-admin`.
 
+mod common;
+
+use common::free_port;
 use proxy_observability::ledger::testing::{committed_entries, TempLedgerDir};
 use proxy_observability::ledger::{LedgerConfig, OnUnavailable};
 use std::io::{Read, Write};
@@ -517,14 +520,6 @@ fn http(addr: SocketAddr, method: &str, path: &str, bearer: Option<&str>, body: 
 fn json_body(response: &str) -> serde_json::Value {
     let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b);
     serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn mock_upstream() -> SocketAddr {

@@ -17,6 +17,9 @@
 //! ephemeral ports, a guard that kills the proxy on drop); each `tests/*.rs`
 //! file is its own crate, so the helpers are duplicated.
 
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -35,11 +38,6 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to reserve a port");
-    listener.local_addr().expect("no local addr").port()
 }
 
 fn wait_for_connectable(port: u16) -> bool {

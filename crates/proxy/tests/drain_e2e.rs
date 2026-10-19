@@ -15,6 +15,9 @@
 
 #![cfg(unix)]
 
+mod common;
+
+use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -27,14 +30,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 /// Liveness backstop for every wait, not an expectation of speed.
 const WAIT: Duration = Duration::from_secs(30);
 const ADMIN_TOKEN: &str = "drain-e2e-token";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
 
 fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;

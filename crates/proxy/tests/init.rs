@@ -1,3 +1,6 @@
+mod common;
+
+use common::free_port;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -86,14 +89,6 @@ impl Drop for Serving {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve a port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 /// Sends one HTTP/1.1 request with `Connection: close` and returns the whole
