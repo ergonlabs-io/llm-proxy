@@ -1,28 +1,45 @@
 ---
 title: Providers and clusters
+description: "Add an LLM provider, set its base URL and credential, and control upstream connections."
 summary: How a configuration `provider` becomes an engine cluster, what
   identity (TLS, credentials, headers) travels with it, and how the `models`
   catalogue differs from `routes`.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-18
 related:
-  - ../configuration/configuration-file/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../providers-and-routing/load-balancing/
-  - ../providers-and-routing/timeouts-and-retries/
+  - configuration/configuration-file
+  - providers-and-routing/failover-and-aggregates
+  - providers-and-routing/load-balancing
+  - providers-and-routing/timeouts-and-retries
 ---
 
 # Providers and clusters
 
-A `providers.<name>` entry in the configuration names one upstream LLM API.
-Internally the engine calls its routing unit a *cluster* — every provider
-becomes exactly one cluster, named `provider:<name>`
-(`crates/proxy-simple-config/src/lower.rs`'s `lower_provider`). This page
-describes what that conversion does, and what stays attached to the cluster
-rather than the route that picks it.
+A `providers.<name>` entry names one upstream LLM API: its type, base URL,
+and credential. Add a provider for each API that your routes send requests to.
+The engine calls its routing unit a *cluster*. Every provider becomes exactly
+one cluster, named `provider:<name>`. This page describes what that conversion
+does, and what stays attached to the cluster and not to the route that picks it.
+
+A minimal provider in the `llmproxy` dialect:
+
+```yaml
+version: 0
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+routes:
+  - model: "gpt-*"
+    provider: openai
+```
+
+The name `openai` sets the provider type and the `base_url` default. For a
+self-hosted server, set `type: openai-compatible` and a `base_url`. The field
+list is in the
+[Field reference](../../configuration/reference/#provider).
 
 ## One provider, one cluster, one endpoint
 
-Lowering derives a cluster's address from `base_url`: a literal IP becomes a
+The proxy derives a cluster's address from `base_url`: a literal IP becomes a
 `STATIC` cluster; a hostname becomes `LOGICAL_DNS`, looked up again every 5
 seconds (this schema version has no field to change that; a bootstrap
 configuration does, see [DNS re-resolution](#dns-re-resolution)). Either
@@ -32,7 +49,7 @@ way, a provider gets exactly one endpoint: the host and port parsed out of
 That matters for load balancing: with one endpoint, the load-balancing policy
 a cluster runs has nothing to choose between. See
 [Load balancing](../../providers-and-routing/load-balancing/) for where a real
-choice of endpoints and policy is actually reachable.
+choice of endpoints and policy is reachable.
 
 ## DNS re-resolution
 
@@ -95,68 +112,64 @@ Envoy in detail.
 | `bedrock` | none (required) | Needs `region`, an access key ID, and a secret access key. The proxy signs each request with AWS SigV4. The dialect comes from a `models` entry. |
 
 The fields for `azure-openai`, `vertex`, and `bedrock` are in
-[Configuration file reference](../../configuration/configuration-file/#provider-specific-fields).
-Each one is lowered into the cluster's metadata
-(`crates/proxy-simple-config/src/lower.rs`, `lower_provider`), so the
-credential follows the cluster, as the next section describes. Vertex and
+[Field reference](../../configuration/reference/#provider).
+The proxy stores each one in the cluster's metadata, so the credential
+follows the cluster, as the next section describes. Vertex and
 Bedrock credentials are static values read at load time.
 
 `base_url` is host-and-port only. A path prefix (Groq's API sits under
-`/openai`) is a load error, not a silent truncation — there is no workaround
+`/openai`) is a load error. There is no workaround
 for that in this schema version.
 
 ## Credentials, TLS, and headers travel with the cluster
 
 An API key, the Anthropic `anthropic-version` default, and every
 `extra_headers` entry are resolved once per provider and attached to that
-provider's cluster, never to the routes that target it
-(`ClusterConfig::request_headers_to_add` in `crates/proxy-config/src/ir.rs`).
-This is deliberate, and the reason is failover: the moment a route can reach
+provider's cluster, never to the routes that target it. This is deliberate, and the reason is
+failover: the moment a route can reach
 more than one provider (see
 [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/)),
 a credential attached to the *route* would follow the routing decision
 instead of the connection — the primary provider's API key sent to the
 fallback's endpoint, a real key disclosure to a third party. Attaching it to
-the cluster means whichever member actually gets dialed supplies its own
+the cluster means whichever member the proxy dials supplies its own
 key, never a previous attempt's.
 
 The auth header follows the provider's wire shape: `Authorization: Bearer
-<key>` for OpenAI-shaped providers, `x-api-key: <key>` for Anthropic
-(`crates/proxy-simple-config/src/lower.rs`'s `auth_header`). Headers apply in
+<key>` for OpenAI-shaped providers, `x-api-key: <key>` for Anthropic.
+Headers apply in
 this order — the auth header, then the `anthropic-version` default (skipped
 if `extra_headers` already sets it, matched case-insensitively), then every
 `extra_headers` entry — and each later entry overwrites an earlier header of
 the same name rather than duplicating it, so `extra_headers` can deliberately
 override the default `anthropic-version`.
 
-An `https://` `base_url` gets upstream TLS, with the upstream's certificate
-checked against a subject-alternative-name match on its hostname, verified
-against `ca_file` if set or the platform trust store otherwise
-(`crates/proxy-simple-config/src/lower.rs`'s `lower_provider`). `ca_file` on a
-plaintext (`http://`) provider is ignored and produces a load-time warning.
-`protocol: http2` (default `http1`) reuses multiplexed connections instead of
-connecting fresh on every request: each worker keeps up to 4 connections to
-each address of that provider, and dials another when every open one carries
-100 streams (`MAX_CONNECTIONS_PER_KEY` and `SOFT_STREAMS_PER_CONNECTION` in
-`crates/proxy-http/src/upstream_pool.rs`). Most hosted providers support it;
-many local plaintext servers do not.
+An `https://` `base_url` gets upstream TLS. The proxy checks the upstream's
+certificate against the hostname (subject-alternative-name match). It verifies
+the chain against `ca_file` if set, or against the platform trust store
+otherwise. `ca_file` on a plaintext (`http://`) provider is ignored and
+produces a load-time warning.
 
-`http1` reuses connections too, automatically, with no field to configure it.
-Each worker keeps up to 8 idle keep-alive connections per (cluster, address);
-a request that finds one reuses it instead of dialing fresh, and a
-connection is only ever returned to that idle pool once its current response
-body has reached a clean, error-free end of stream — a truncated body, a
-`Connection: close` response, or a full idle pool all cause the connection to
-be dropped rather than reused (`H1ConnCache`/`H1ReuseBody` in
-`crates/proxy-http/src/upstream_pool.rs`; proven end to end by
-`reuse_across_two_requests_opens_one_connection` and
-`connection_close_response_is_not_reused` in
-`crates/proxy-http/src/router.rs`'s test module).
+### Connection reuse
 
-With `protocol: http2`, each worker keeps up to 4 connections per (cluster,
-address). A request takes the connection with the fewest streams. The worker
-dials another connection when every open one carries 100 streams or more, up
-to the limit of 4 (`MAX_CONNECTIONS_PER_KEY`, `SOFT_STREAMS_PER_CONNECTION`).
+`protocol` sets how the proxy talks to the provider. The default is `http1`.
+Most hosted providers support `http2`. Many local plaintext servers do not.
+
+- **`http1`** reuses connections with no field to configure it. Each worker
+  thread keeps up to 8 idle HTTP/1.1 connections per (cluster, address,
+  protocol) key. A request that finds an idle connection reuses it and does
+  not dial a new one. The proxy returns a connection to the idle pool only
+  after its response body ends cleanly. A truncated body, a `Connection: close`
+  response, or a full idle pool (8 connections) causes the proxy to drop the
+  connection and not reuse it.
+- **`http2`** multiplexes streams. Each worker thread keeps up to 4
+  connections per (cluster, address, protocol) key. A request takes the
+  connection with the fewest streams. The worker dials another connection when
+  every open connection carries 100 streams or more, up to the limit of 4.
+
+The idle cache belongs to each worker thread, so these limits apply for each
+worker and not for the whole process. The cache key also includes the build of
+the cluster, as described below.
 
 ### How a pooled connection ends
 
@@ -179,13 +192,6 @@ Three mechanisms end a pooled connection. None needs a request to trigger it.
   connection from the old one. A reload that leaves the cluster unchanged
   keeps its warm connections.
 
-Proof: `an_idle_connection_closed_by_its_peer_gives_its_slot_back` (for h1 and
-h2), `evicting_an_h2_connection_keeps_its_slot_until_the_stream_on_it_ends`, and
-`the_sweep_retires_a_key_whose_endpoint_is_gone` in
-`crates/proxy-http/src/upstream_pool.rs`;
-`connection_reuse_follows_the_cluster_build_across_reloads` in
-`crates/proxy-http/tests/router_cluster_rebuild.rs`.
-
 ### When DNS or EDS removes an endpoint
 
 When a DNS refresh or an EDS update removes an address from a cluster, the next
@@ -199,13 +205,6 @@ addresses refresh.
 
 If a dial or handshake to an h2 address fails, the cache removes the empty key
 that the dial created. A dial that another request is waiting on keeps its key.
-Proof: `h1_removed_endpoints_idle_connection_is_closed_at_the_next_sweep`,
-`h2_removed_endpoints_idle_connection_is_closed_at_the_next_sweep`,
-`a_removed_endpoints_h2_stream_in_flight_finishes_before_the_connection_closes`,
-and `a_failed_dial_removes_its_slot_but_not_one_another_checkout_is_waiting_on`
-in `upstream_pool.rs`; `has_host_follows_an_eds_replacement` in
-`crates/proxy-cluster/src/manager.rs`; the oracle is installed per worker in
-`crates/proxy/src/main.rs` (`set_worker_membership`).
 
 ### Hop-by-hop headers
 
@@ -219,11 +218,6 @@ provider, so it does not close a pooled connection. When the proxy closes a
 downstream connection itself (for example during drain), it adds its own
 `connection: close`. For an upgrade request the rules differ; see
 [WebSocket and upgrades](../../providers-and-routing/websocket-and-upgrades/#hop-by-hop-headers-on-an-upgrade).
-Proof: `sanitize_hop_by_hop` in `crates/proxy-http/src/headers.rs`, called by
-`serve_one` in `crates/proxy-http/src/codec.rs`; the tests
-`a_downstream_keepalive_connection_survives_an_upstream_connection_close` and
-`client_connection_management_headers_do_not_reach_the_upstream` in
-`crates/proxy/tests/hop_by_hop_e2e.rs`, which run the real binary.
 
 ## `routes` vs. the `models` catalogue
 
@@ -234,9 +228,9 @@ backstop.
 
 The two surfaces are not equivalent. `models.<name>` has no `retries`,
 `idle_timeout`, or `streaming` field. The schema's `ModelDef` carries only
-`providers`. Providers after the first are fallbacks, in order: the route
-retries `count - 1` times, and every provider must speak the same wire dialect
-as the first (`lower_model` in `crates/proxy-simple-config/src/lower.rs`). The
+`providers` and `max_output_tokens`. Providers after the first are fallbacks,
+in order: the route retries `count - 1` times, and every provider must speak
+the same wire dialect as the first. The
 idle timeout is always `90s`. A `routes` entry lets you set the retry count,
 the idle timeout, and `streaming`. See
 [Configuration file reference](../../configuration/configuration-file/) for the
@@ -258,3 +252,37 @@ heterogeneous members — the aggregate cluster mechanism has no per-member
 credential mechanism of its own. That gap is the reason this configuration
 format exists as its own front end rather than asking every user to write
 a raw bootstrap configuration for LLM provider fallback.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- Provider lowering: `lower_provider`, `auth_header`, and `lower_model` in
+  `crates/proxy-simple-config/src/lower.rs`. The cluster header list is
+  `ClusterConfig::request_headers_to_add` in `crates/proxy-config/src/ir.rs`.
+- Connection cache: `H1ConnCache`, `H1ReuseBody`, `MAX_IDLE_PER_KEY` (8),
+  `MAX_CONNECTIONS_PER_KEY` (4), `SOFT_STREAMS_PER_CONNECTION` (100), and the
+  per-worker `thread_local` `WORKER_H1_CONN_CACHE` in
+  `crates/proxy-http/src/upstream_pool.rs`. `ConnKey` holds the cluster name,
+  address, protocol, and cluster build ID. Tests in the same file:
+  `an_idle_connection_closed_by_its_peer_gives_its_slot_back`,
+  `evicting_an_h2_connection_keeps_its_slot_until_the_stream_on_it_ends`,
+  `the_sweep_retires_a_key_whose_endpoint_is_gone`,
+  `h1_removed_endpoints_idle_connection_is_closed_at_the_next_sweep`,
+  `h2_removed_endpoints_idle_connection_is_closed_at_the_next_sweep`,
+  `a_removed_endpoints_h2_stream_in_flight_finishes_before_the_connection_closes`,
+  and `a_failed_dial_removes_its_slot_but_not_one_another_checkout_is_waiting_on`.
+- Reuse tests in the `crates/proxy-http/src/router.rs` test module:
+  `reuse_across_two_requests_opens_one_connection` and
+  `connection_close_response_is_not_reused`. Reload test:
+  `connection_reuse_follows_the_cluster_build_across_reloads` in
+  `crates/proxy-http/tests/router_cluster_rebuild.rs`.
+- Endpoint removal: `has_host_follows_an_eds_replacement` in
+  `crates/proxy-cluster/src/manager.rs`. The binary installs the membership
+  check per worker with `set_worker_membership` in `crates/proxy/src/main.rs`.
+- Hop-by-hop headers: `sanitize_hop_by_hop` in
+  `crates/proxy-http/src/headers.rs`, called by `serve_one` in
+  `crates/proxy-http/src/codec.rs`. Tests that run the real binary:
+  `a_downstream_keepalive_connection_survives_an_upstream_connection_close`
+  and `client_connection_management_headers_do_not_reach_the_upstream` in
+  `crates/proxy/tests/hop_by_hop_e2e.rs`.

@@ -6,13 +6,14 @@ service. Please report suspected vulnerabilities privately.
 
 ## Reporting a vulnerability
 
-<!-- TODO before publishing: replace with a real contact. GitHub private
-     vulnerability reporting (Security > Advisories > "Report a vulnerability")
-     is the lowest-friction option and needs no published address. -->
+<!-- TODO(owner): name a real private reporting channel here, then link it from
+     README.md and the docs site. Do not publish this file with a placeholder.
+     If you use GitHub private vulnerability reporting (Security > Advisories >
+     "Report a vulnerability"), check that it is enabled on the repository first. -->
 
-**Contact: _not yet published_.** Until this line names a real destination,
-there is no private channel — please do not file suspected vulnerabilities in
-public issues in the meantime; wait, or contact the maintainer directly.
+**Contact: _not yet published_.** There is no private reporting channel yet.
+Do not report a suspected vulnerability in a public issue. Wait until this
+section names a private channel.
 
 Please include: what you observed, how to reproduce it, the version or commit,
 and the configuration involved (with secrets redacted). A proof of concept is
@@ -60,14 +61,27 @@ Out of scope:
 These are documented weaknesses, not vulnerabilities. They are listed so nobody
 spends time reporting them, and so operators can judge the risk themselves:
 
-- **Credential and certificate files are read once at startup.** There is no
-  file watching. A rotated key or a renewed certificate takes effect only after
-  a restart or a SIGHUP config reload.
-- **There is no credential revocation store.** Virtual keys come from
-  configuration, so revoking one means changing the config and reloading.
-- **Authorization defaults open.** An authenticated tenant with no configured
-  policy may use every model and provider. Authentication fails closed;
-  authorization does not.
+- **Authorization covers models only.** With an `auth:` block, an authenticated
+  tenant that has no stored model policy is refused with `403` (the default,
+  `auth.enforce.tenants_without_policy: deny`). There is no per-tenant provider
+  authorization: a tenant that may use a model may use every provider that
+  serves it. The starter config that `llm-proxy init` writes sets
+  `tenants_without_policy: allow`, so its key can use every model. Remove that
+  setting before you issue keys to other people.
+- **Keys in the config file change only on restart.** `auth.keys`, the HMAC
+  secret, the auth store, the credential key ring and the policy poll interval
+  are fixed when the proxy starts. A `SIGHUP` reload that changes one of them
+  is refused whole and logged at `error`, so setting `revoked: true` on a
+  configured key takes effect only after a restart. To revoke without a
+  restart, use the admin API: `DELETE /keys/{id}` revokes an API-minted key,
+  and `DELETE /tenants/{id}` revokes every key of a tenant, including
+  configured keys. Other replicas see a revocation at their next policy poll
+  (48 to 60 seconds). A request that was admitted before the revocation is not
+  stopped.
+- **File-sourced credentials and certificates are not watched.** Nothing
+  re-reads a file when it changes on disk; see
+  [Config reload](docs/site/src/content/docs/operations/config-reload.md) for
+  which files a `SIGHUP` re-reads.
 - Sending a request with no recognized credential is refused, but there is no
   rate limiting on authentication attempts themselves.
 - **A token budget is not charged if usage cannot be read from the response.**

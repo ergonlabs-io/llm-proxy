@@ -1,16 +1,19 @@
 ---
 title: Draining and shutdown
+description: "Stop the proxy without dropping in-flight requests: drain on SIGTERM and the shutdown sequence."
 summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
   changes, and what the drain deadline cuts.
-last_updated: 2026-10-13
+lastUpdated: 2026-10-18
 related:
-  - ../operations/config-reload/
-  - ../reference/cli/
+  - operations/config-reload
+  - reference/cli
 ---
 
 # Draining and shutdown
 
-`SIGTERM` or `SIGINT` starts a drain instead of killing the process. Signal
+Use a drain to stop the proxy without dropping requests that are in flight.
+Send `SIGTERM` or `SIGINT`, or call `POST /drain_listeners`. Both start a drain
+instead of killing the process. No config is needed to enable it. Signal
 handlers are installed before any listener binds, so a signal at startup never
 falls back to the OS default.
 
@@ -37,9 +40,7 @@ TCP proxy connections are not closed early. They run until the window ends.
 
 An upgrade tunnel, for example a WebSocket, counts as an active connection. The
 drain start does not close it. The drain stays open until a peer closes the
-tunnel or the drain deadline passes (test
-`an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes`
-in `crates/proxy-core/src/listener_drain_tests.rs`).
+tunnel or the drain deadline passes.
 
 ## Access-log lines at exit
 
@@ -48,7 +49,7 @@ The proxy writes access-log lines from background writer threads (see
 workers stop, the process waits for those queues to empty. It waits at most
 5 seconds. After a second signal it waits at most 1 second. If a queue is not
 empty at the end, the proxy logs `access-log writers did not drain before the
-shutdown budget; queued lines are lost` (`crates/proxy/src/main.rs:1510-1519`).
+shutdown budget; queued lines are lost`.
 
 ## A second signal
 
@@ -97,3 +98,12 @@ warming, until `initial_fetch_timeout`.
 | `--drain-strategy` | none | Accepted for Envoy command lines. It has no effect: both values drain as described above, and the proxy logs a warning at startup when the flag is given. |
 
 See [CLI reference](../../reference/cli/) for the full flag list.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- Shutdown sequence and the access-log flush budget: `crates/proxy/src/main.rs`.
+- Upgrade tunnel during a drain:
+  `an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes`
+  in `crates/proxy-core/src/listener_drain_tests.rs`.

@@ -1,19 +1,22 @@
 ---
 title: CLI reference
-summary: Every llm-proxy flag documented on this site, verified against
-  --help and the real argument parser.
-last_updated: 2026-10-17
+description: "Every llm-proxy mode and flag: serve, validate, translate, keygen, and init."
+summary: The llm-proxy modes and flags that this site documents, with
+  defaults, required flags, and the error text for a missing config.
+lastUpdated: 2026-10-18
 related:
-  - ../getting-started/quickstart/
-  - ../operations/draining-and-shutdown/
-  - ../operations/config-reload/
-  - ../observability/request-capture/
+  - getting-started/quickstart
+  - operations/draining-and-shutdown
+  - operations/config-reload
+  - observability/request-capture
 ---
 
 # CLI reference
 
-Run `llm-proxy --help` for the authoritative list. This page documents the
-subset this site's other pages rely on.
+Use `llm-proxy` to serve traffic, check a config, translate a config, generate
+a key, or write a starter setup. Run `llm-proxy --help` for the full list of
+flags. This page documents the modes and flags that the other pages of this
+site use.
 
 ## Modes
 
@@ -102,7 +105,7 @@ digest. Store it immediately.
 | `--drain-strategy <gradual\|immediate>` | none | Accepted for Envoy compatibility. Both values behave the same and the proxy warns at startup when the flag is given. See [Draining and shutdown](../../operations/draining-and-shutdown/). |
 | `--base-id <N>` | — | Accepted for compatibility with tooling that always passes it. llm-proxy has no hot-restart implementation, so this is parsed and ignored. |
 | `-l`, `--log-level <LEVEL>` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `critical`, or `off`. `critical` maps to `error`. |
-| `--service-node <NAME>` | — | Overrides the bootstrap `node.id`. The proxy uses it as the node ID sent to an xDS control plane and as the writer identity for spend limits. Set a stable value for each replica. See [Running in production](../../operations/running-in-production/). |
+| `--service-node <NAME>` | — | Overrides the bootstrap `node.id`. The proxy uses it as the node ID sent to an xDS control plane and as the writer identity for spend limits. Set a stable value for each replica. See [Share state across replicas](../../operations/running-in-production/). |
 | `--service-cluster <NAME>` | — | Overrides the bootstrap `node.cluster`. The proxy sends it to an xDS control plane. |
 
 `--config` and `-c` conflict. Pass only one of them. The `llmproxy` dialect
@@ -128,7 +131,7 @@ limits, and the metrics.
 
 `llm-proxy init [DIRECTORY]` writes a starter setup. `DIRECTORY` defaults to
 `.`. The command creates the directory if it does not exist and writes two
-files (`crates/proxy/src/init.rs`):
+files:
 
 - `llmproxy.yaml`: a starter `llmproxy` config that routes every model to a
   local Ollama at `127.0.0.1:11434`, with `listen: 0.0.0.0:53421` and
@@ -150,7 +153,7 @@ refusing to overwrite existing file <path>; move it or choose another directory
 ```
 
 A running `serve` process also responds to `SIGHUP` (config reload — see
-[Config reload](../../operations/config-reload/)) and `SIGTERM`/`SIGINT`
+[Reload configuration](../../operations/config-reload/)) and `SIGTERM`/`SIGINT`
 (graceful shutdown).
 
 ## Every mode
@@ -162,8 +165,8 @@ A running `serve` process also responds to `SIGHUP` (config reload — see
 
 ## Errors this site's other pages reference
 
-Running `serve` or `validate` with neither `--config` nor `-c` is refused
-rather than silently defaulting to anything:
+Running `serve` or `validate` with neither `--config` nor `-c` is refused.
+The program has no default config:
 
 ```text
 a config is required: pass -c/--config-path or --config (only --mode keygen runs without one)
@@ -174,3 +177,7 @@ Running `keygen` without `--tenant`:
 ```text
 --mode keygen requires --tenant <TENANT>
 ```
+
+## Implementation notes
+
+For maintainers. The `init` command is in `crates/proxy/src/init.rs`.

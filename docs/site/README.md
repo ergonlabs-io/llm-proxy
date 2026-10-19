@@ -35,5 +35,20 @@ Or from this directory directly:
   page there when it should appear in navigation. Commented entries describe
   pages that have not been added yet.
 
+## Page frontmatter
+
+`src/content.config.ts` defines the contract, and the build enforces it:
+
+- `title` and `description` are required. `description` is one sentence (at
+  most 200 characters) that says the task and the outcome. Starlight puts it in
+  `<meta name="description">` and `llms.txt`.
+- `lastUpdated` (a date) shows as "Last updated" in the page footer. Change it
+  when you change what the page says.
+- `related` is a list of docs slugs, for example
+  `authentication/virtual-keys`. `src/components/Footer.astro` renders them as
+  "Related pages". A slug that names no page fails the build.
+- `summary` is an optional longer abstract for readers of the Markdown source.
+  The site does not render it.
+
 Check out [Starlight's docs](https://starlight.astro.build/) or
 [the Astro documentation](https://docs.astro.build) for more.

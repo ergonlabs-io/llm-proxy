@@ -1,0 +1,46 @@
+---
+// Starlight's footer with a "Related pages" list from the `related`
+// frontmatter field (see src/content.config.ts).
+import { getEntry } from 'astro:content';
+import Default from '@astrojs/starlight/components/Footer.astro';
+
+const related = Astro.locals.starlightRoute.entry.data.related ?? [];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const links = await Promise.all(
+	related.map(async (raw) => {
+		const slug = raw.replace(/^(\.\.\/)+/, '').replace(/^\/+|\/+$/g, '');
+		const entry = await getEntry('docs', slug);
+		if (!entry) {
+			throw new Error(
+				`${Astro.locals.starlightRoute.entry.id}: related entry "${raw}" names no page`,
+			);
+		}
+		return { href: `${base}/${slug}/`, title: entry.data.title };
+	}),
+);
+---
+
+{
+	links.length > 0 && (
+		<nav class="related" aria-labelledby="related-pages">
+			<h2 id="related-pages">Related pages</h2>
+			<ul>
+				{links.map((l) => (
+					<li>
+						<a href={l.href}>{l.title}</a>
+					</li>
+				))}
+			</ul>
+		</nav>
+	)
+}
+<Default {...Astro.props}><slot /></Default>
+
+<style>
+	.related {
+		margin-top: 3rem;
+	}
+	.related h2 {
+		font-size: var(--sl-text-h4);
+	}
+</style>

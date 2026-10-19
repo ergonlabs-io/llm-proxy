@@ -164,6 +164,23 @@ impl KeyRing {
         Ok(Self { current, previous })
     }
 
+    /// A SHA-256 over every key's id and bytes, in ring order. A config
+    /// reload compares it with the running ring's, because the ring is fixed
+    /// at startup and a rotated key file at an unchanged path must still be
+    /// seen as a change. One-way, so holding it keeps no second copy of the
+    /// keys.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+        for key in std::iter::once(&self.current).chain(&self.previous) {
+            context.update(&(key.id.len() as u64).to_be_bytes());
+            context.update(key.id.as_bytes());
+            context.update(key.key.as_slice());
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(context.finish().as_ref());
+        out
+    }
+
     fn lookup(&self, id: &str) -> Option<&CredentialKek> {
         if self.current.id == id {
             Some(&self.current)
@@ -347,6 +364,16 @@ mod tests {
 
     fn secret() -> TenantSecret {
         TenantSecret::new(PLAINTEXT.to_string())
+    }
+
+    #[test]
+    fn fingerprint_changes_with_a_key_or_its_id() {
+        let base = ring("k1", KEY_A).fingerprint();
+        assert_eq!(base, ring("k1", KEY_A).fingerprint());
+        assert_ne!(base, ring("k1", KEY_B).fingerprint());
+        assert_ne!(base, ring("k2", KEY_A).fingerprint());
+        let with_previous = KeyRing::new(kek("k1", KEY_A), vec![kek("k0", KEY_B)]).unwrap();
+        assert_ne!(base, with_previous.fingerprint());
     }
 
     #[test]

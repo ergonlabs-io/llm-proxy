@@ -1,18 +1,19 @@
 ---
 title: Tenant provider credentials
+description: "Let a tenant store its own provider API key, so its requests use that key instead of the platform credential."
 summary: Let a tenant send its traffic on its own provider key. Covers strict
   tenant mode, Envoy-mode setup with the key-encryption key file and the
   cluster slot, the admin API and its save-time key check, access-log and
-  counter attribution, budget scope, and what does not work yet.
-last_updated: 2026-10-13
+  counter attribution, budget scope, and limitations.
+lastUpdated: 2026-10-18
 related:
-  - ../authentication/virtual-keys/
-  - ../authentication/managing-secrets/
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../limits-and-budgets/spend-policies/
-  - ../observability/access-logs/
-  - ../observability/metrics-and-stats/
+  - authentication/virtual-keys
+  - authentication/managing-secrets
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/failover-and-aggregates
+  - limits-and-budgets/spend-policies
+  - observability/access-logs
+  - observability/metrics-and-stats
 ---
 
 # Tenant provider credentials
@@ -21,6 +22,12 @@ A tenant can store its own provider key. When that tenant calls llm-proxy with
 its virtual key, the proxy sends the tenant's key to the provider. The operator
 key is not used for that tenant. The proxy stores the tenant key encrypted at
 rest.
+
+Use this when a tenant must pay its own provider bill, or must use its own
+provider account. To enable it, create a key-encryption key file, add
+`auth.tenant_credentials` to the config, set `tenant_credentials: true` on each
+provider that tenants may bring a key for, and store each key with the admin
+API. The sections under "Setup" give the steps.
 
 This page uses these terms:
 
@@ -52,8 +59,7 @@ credential to any provider. Each attempt uses one of the outcomes below.
 | Tenant mode, the stored key cannot be decrypted | `503`, body `provider credential failure` | Nothing. The provider is not dialled |
 | Tenant mode, the provider answers `401` to the tenant key | The provider's `401`, passed through | The tenant key, on one attempt. No retry and no fallback |
 
-The `403` reply has this body (`crates/proxy-http/src/router.rs`,
-`tenant_credential_missing_reply`):
+The `403` reply has this body:
 
 ```json
 {"error":{"message":"no tenant credential for provider openrouter","type":"tenant_credential_missing"}}
@@ -68,22 +74,15 @@ does not retry them.
 Aggregates follow the same rule. An aggregate skips each member that has no
 slot, and each member whose provider the tenant does not hold. The proxy never
 dials a skipped member. If no member is eligible, the reply is the `403` above.
-Tests: `aggregate_skips_member_without_a_slot`,
-`aggregate_skips_member_whose_provider_the_tenant_lacks`, and
-`aggregate_with_no_eligible_member_is_403_and_dials_nothing` in
-`crates/proxy-http/tests/router_tenant_credentials.rs`.
 
 When a tenant credential applies, the proxy first applies the cluster's static
 headers. Then it removes the `authorization`, `x-api-key`, and `api-key`
 headers from the request. Then it sets the slot header to the tenant value. A
 client header with one of those three names is removed too. The removal covers
 only those three names. A cluster that places its platform key on another
-header keeps that header (`crates/proxy-http/src/credential_provider.rs`,
-`ProviderCredentials::apply`).
+header keeps that header.
 
-Deleting the last stored key for a tenant returns that tenant to platform mode
-(`a_stored_tenant_key_replaces_the_operator_key_and_survives_a_restart` in
-`crates/proxy/tests/tenant_credentials_e2e.rs`).
+Deleting the last stored key for a tenant returns that tenant to platform mode.
 
 ## Setup
 
@@ -99,8 +98,7 @@ key in a file. The file must meet these rules. The proxy refuses to load a
 file that breaks any of them.
 
 - It is a regular file. A symbolic link fails, because the check reads the
-  link's own metadata (`crates/proxy-control/src/tenant_credential_crypto.rs`,
-  `CredentialKek::load`).
+  link's own metadata.
 - It has no group or other permission bits. Mode `0600` passes. Mode `0644`
   fails with `credential key file must not be group- or world-accessible`.
 - It holds exactly 32 raw bytes. Any other length fails with `credential key
@@ -122,9 +120,7 @@ starts with `-rw-------`.
 
 Set `auth.tenant_credentials` and turn the feature on for each provider with
 `tenant_credentials: true`. A provider that opts in without the key ring is a
-load error. A key ring with no opted-in provider loads and adds no slot
-(`key_ring_without_an_opted_in_provider_adds_no_slot` in
-`crates/proxy-simple-config/tests/tenant_credentials.rs`).
+load error. A key ring with no opted-in provider loads and adds no slot.
 
 Tenant credentials require a durable store: `persistent` (redb, one replica) or
 `shared` (Redis, several replicas). Setting `auth.tenant_credentials` with
@@ -242,14 +238,10 @@ transport settings your provider needs.
 Rules for the slot:
 
 - Only header API-key shapes are supported. A cluster with Vertex OAuth2 or
-  Bedrock SigV4 credentials cannot carry a slot. The load fails
-  (`tenant_credential_with_vertex_or_bedrock_is_a_hard_error` in
-  `crates/proxy-config/tests/provider_auth_metadata.rs`).
+  Bedrock SigV4 credentials cannot carry a slot. The load fails.
 - An unknown key inside the slot is a load error that names its full path.
-  A typo such as `provder` fails. Test:
-  `tenant_credential_unknown_key_names_the_full_dotted_path`.
-- A cluster with a slot and no platform headers loads. Test:
-  `tenant_credential_slot_alone_lowers_to_provider_runtime`.
+  A typo such as `provder` fails.
+- A cluster with a slot and no platform headers loads.
 
 ### 4. Start the proxy
 
@@ -369,15 +361,12 @@ Example `PUT` error when the provider rejects the key:
 
 New keys are sealed under the new key. Existing rows still open under the
 previous key. The proxy does not re-seal existing rows. Only a new `PUT` seals
-a row under the new key (`rotation_opens_old_rows_and_reseals_under_the_new_key`
-in `crates/proxy-control/src/tenant_credential_crypto.rs`). The metadata does
+a row under the new key. The metadata does
 not show which key sealed a row. Keep each previous key listed while any tenant
 might still hold a row sealed under it.
 
 If you remove a key from the list and a row still needs it, that row fails
-closed. The tenant then gets `503` until it stores the key again
-(`rotation_keeps_old_rows_openable_only_while_the_old_key_is_listed` in
-`crates/proxy-control/src/control.rs`).
+closed. The tenant then gets `503` until it stores the key again.
 
 ## Admin API
 
@@ -402,8 +391,7 @@ characters) and `fingerprint`. The fingerprint is a keyed HMAC of the key. It
 uses a key derived from `hmac_secret`, so it changes if `hmac_secret` changes.
 Decryption does not depend on `hmac_secret`.
 
-Status codes for `PUT`, from `crates/proxy-admin/src/server.rs`
-(`put_tenant_credential_inner`). The order of the checks is in
+Status codes for `PUT`. The order of the checks is in
 [Save-time check](#save-time-check).
 
 | Status | Body | When |
@@ -433,7 +421,7 @@ Status codes for `GET` and `DELETE`:
 
 Error messages carry fixed text. A client never sees the key in a response,
 in a log line, or in an error message. The admin tests check this for every
-status above (`crates/proxy-admin/src/server/tests/credentials.rs`).
+status above.
 
 ## Observability
 
@@ -447,14 +435,10 @@ Two access-log operators show the attribution:
 | `%LLM_CREDENTIAL_SOURCE%` | `platform` or `tenant`. The source of the last provider credential applied to this request. `-` when no credential was applied, for example after a `403 tenant_credential_missing`. |
 
 Both operators are in the [access log reference](../../observability/access-logs/#the-operator-set).
-Test: `access_log_renders_the_credential_source_the_router_chose` in
-`crates/proxy-http/tests/router_tenant_credentials.rs`.
 
 The fixed access-log formats of the `llmproxy` config file include
 `%LLM_TENANT%` but not `%LLM_CREDENTIAL_SOURCE%`. To log the credential
-source, use Envoy mode and set `log_format` on the access logger
-(`crates/proxy-simple-config/src/lower.rs`, `ACCESS_LOG_TEXT_FORMAT` and
-`lower_access_log`).
+source, use Envoy mode and set `log_format` on the access logger.
 
 ### Counter
 
@@ -476,22 +460,18 @@ stops adding new series at 256, and later provider values fold into
 
 The counter appears only on `/stats/prometheus`, and the rendered name is
 `envoy_llmproxy_tenant_credential_requests_total`. The flat `/stats` output
-omits it (`crates/proxy-observability/src/stats.rs`,
-`TENANT_CREDENTIAL_REQUESTS`; `crates/proxy-observability/src/stats/prometheus_render.rs`).
+omits it.
 
 ### Request records
 
 Each request record has a `credential_source` field. Each attempt record has
-one too. The field is optional under schema version 1
-(`crates/proxy-observability/src/records.rs`, `RequestRecord` and
-`AttemptRecord`). A record written before this field existed has no value.
+one too. The field is optional under schema version 1. A record written before this field existed has no value.
 Read a missing value as `platform`. A `null` value on a new record means that
 no attempt reached a credential. It does not mean `platform`. A `403` or a
 `503` from this step can produce `null`.
 
 Records leave the proxy only when you start it with `--request-records-file`
-or `--request-records-agent` (`crates/proxy/src/main.rs`, the
-`capture_destination` group).
+or `--request-records-agent`.
 
 ## Budgets
 
@@ -518,9 +498,7 @@ curl --max-time 10 -X PUT \
 
 `credential_source` takes `"platform"` or `"tenant"`. Leave it out for
 `platform`, which keeps the meaning that existing budgets had. Any other value
-returns `400` and stores nothing. The `400` message does not echo the value
-(`budget_from_spec` in `crates/proxy-admin/src/server.rs`, and
-`crates/proxy-admin/src/server/tests/budget_scope.rs`).
+returns `400` and stores nothing. The `400` message does not echo the value.
 
 The scope shows in three places. The key listing (`GET /keys`) returns it inside
 each `budget` object, and `budget` is `null` when the key has no budget. Both
@@ -528,18 +506,14 @@ spend reads, `GET /tenants/{id}/spend` and `GET /keys/{id}/spend`, return it at
 the top level. It is `null` when there is no budget.
 
 A tenant with a platform-scoped budget and its own stored key is not limited
-by that budget. Its tenant-mode spend is not recorded against it. Budget rows written before the scope existed read as
-platform-scoped (`crates/proxy-filters/src/spend_limit_filter.rs`, the module
-doc and `on_request_headers`; `crates/proxy-control/src/control.rs`,
-`legacy_credential_source`).
-
+by that budget. Its tenant-mode spend is not recorded against it. Budget rows
+written before the scope existed read as platform-scoped.
 
 ## Limitations
 
 - **Virtual-key principals only.** A JWT principal reads no control-plane
   snapshot, so it always uses the platform credential. Its records show
-  `platform` (`crates/proxy-filters/src/jwt_auth.rs`, which sets
-  `tenant_credentials: None`).
+  `platform`.
 - **One check, at save time.** `PUT` checks the key once, before it stores the
   key. The proxy does not check the key again. If the provider revokes the key
   later, `verified_at` does not change. The tenant's next request then gets the
@@ -549,10 +523,10 @@ doc and `on_request_headers`; `crates/proxy-control/src/control.rs`,
   platform credential for that provider.
 - **Durable store only.** With tenant credentials configured, the default
   `in_memory` store is a load error, because it loses the keys on restart and
-  tenants would then silently use the platform credential. Use `persistent` or
+  tenants would then use the platform credential. Use `persistent` or
   `shared`. A config that sets `auth.tenant_credentials` or Envoy's
   `tenant_credentials` with another store fails at load and names the field
-  path (`crates/proxy-filters/src/auth_filter.rs`, `parse_config`).
+  path.
 - **Header shapes.** Only the `Authorization`, `x-api-key`, and `api-key` shapes
   work. A cluster with Vertex OAuth2 or Bedrock SigV4 cannot carry a slot.
 - **Three header names are cleared.** In tenant mode the proxy clears only
@@ -569,14 +543,11 @@ doc and `on_request_headers`; `crates/proxy-control/src/control.rs`,
   key file, a bad permission, or a duplicate id fails the load with the path
   `typed_config.tenant_credentials.…`, not `auth.tenant_credentials.…`. The
   rejection is the same. Only the path differs. Presence and empty-value checks
-  in the config file use the `auth.tenant_credentials.…` path
-  (`crates/proxy-simple-config/src/lower.rs`, `lower_tenant_credentials`).
+  in the config file use the `auth.tenant_credentials.…` path.
 - **Rollback.** A build from before budget scopes has no scope field. It
   ignores `credential_source` on a budget row. It then applies that budget to
-  all traffic, and charges all spend to it
-  (`crates/proxy-control/src/control.rs`, `EncodedTenantBudget`, which has no
-  `deny_unknown_fields`). Remove tenant-scoped budgets before a rollback. No
-  test covers this rollback path.
+  all traffic, and charges all spend to it. Remove tenant-scoped budgets before
+  a rollback.
 
 ## Troubleshooting
 
@@ -660,3 +631,47 @@ doc and `on_request_headers`; `crates/proxy-control/src/control.rs`,
   Redis data and namespace, across restarts. The proxy refuses to start with
   tenant credentials on an absent or `in_memory` store, so the keys cannot be
   dropped that way. Keys stored against the old store must be stored again.
+
+## Implementation notes
+
+For maintainers. These entries name the code and tests behind the behavior
+above.
+
+- Refusal replies: `tenant_credential_missing_reply` in
+  `crates/proxy-http/src/router.rs`. Header handling:
+  `ProviderCredentials::apply` in `crates/proxy-http/src/credential_provider.rs`.
+- Router tests in `crates/proxy-http/tests/router_tenant_credentials.rs`:
+  `aggregate_skips_member_without_a_slot`,
+  `aggregate_skips_member_whose_provider_the_tenant_lacks`,
+  `aggregate_with_no_eligible_member_is_403_and_dials_nothing`, and
+  `access_log_renders_the_credential_source_the_router_chose`.
+- Return to platform mode after the last delete:
+  `a_stored_tenant_key_replaces_the_operator_key_and_survives_a_restart` in
+  `crates/proxy/tests/tenant_credentials_e2e.rs`.
+- Key file checks: `CredentialKek::load` in
+  `crates/proxy-control/src/tenant_credential_crypto.rs`. Rotation tests:
+  `rotation_opens_old_rows_and_reseals_under_the_new_key` (same file) and
+  `rotation_keeps_old_rows_openable_only_while_the_old_key_is_listed` in
+  `crates/proxy-control/src/control.rs`.
+- Config lowering: `lower_tenant_credentials`, `ACCESS_LOG_TEXT_FORMAT`, and
+  `lower_access_log` in `crates/proxy-simple-config/src/lower.rs`. Test:
+  `key_ring_without_an_opted_in_provider_adds_no_slot` in
+  `crates/proxy-simple-config/tests/tenant_credentials.rs`.
+- Slot parsing tests in `crates/proxy-config/tests/provider_auth_metadata.rs`:
+  `tenant_credential_with_vertex_or_bedrock_is_a_hard_error`,
+  `tenant_credential_unknown_key_names_the_full_dotted_path`, and
+  `tenant_credential_slot_alone_lowers_to_provider_runtime`.
+- Admin routes: `put_tenant_credential_inner` and `budget_from_spec` in
+  `crates/proxy-admin/src/server.rs`. Tests: `server/tests/credentials.rs` and
+  `server/tests/budget_scope.rs` in `crates/proxy-admin/src/`.
+- Budget scope: `crates/proxy-filters/src/spend_limit_filter.rs`, and
+  `legacy_credential_source` and `EncodedTenantBudget` in
+  `crates/proxy-control/src/control.rs`. `EncodedTenantBudget` has no
+  `deny_unknown_fields`, which is why an older build ignores the scope.
+- Store check: `parse_config` in `crates/proxy-filters/src/auth_filter.rs`.
+  JWT principals: `crates/proxy-filters/src/jwt_auth.rs` sets
+  `tenant_credentials: None`.
+- Counter: `TENANT_CREDENTIAL_REQUESTS` in
+  `crates/proxy-observability/src/stats.rs`, rendered in
+  `stats/prometheus_render.rs`. Records: `RequestRecord` and `AttemptRecord`
+  in `crates/proxy-observability/src/records.rs`.

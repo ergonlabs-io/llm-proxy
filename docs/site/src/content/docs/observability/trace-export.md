@@ -1,25 +1,34 @@
 ---
-title: Trace export
+title: Request and response body export
+description: "Export raw request and response bodies to files or S3-compatible storage for tenants that opt in; this is not OTLP distributed tracing."
 summary: Opt-in export of request and response bodies for analytics and
   fine-tuning. Covers the two consent switches, what a trace holds, the line
   format, local and S3 storage, sizing, every loss reason and metric, the
   emergency switch, and what is not available.
-last_updated: 2026-10-17
+lastUpdated: 2026-10-18
 related:
-  - ../observability/request-capture/
-  - ../observability/metrics-and-stats/
-  - ../observability/admin-endpoints/
-  - ../authentication/virtual-keys/
-  - ../configuration/reference/
+  - observability/overview
+  - observability/request-capture
+  - observability/metrics-and-stats
+  - observability/admin-endpoints
+  - authentication/virtual-keys
+  - configuration/reference
 ---
 
-# Trace export
+# Request and response body export
 
-Trace export writes the body of each request and the body of its response to
-compressed JSON-lines files. You use the files to analyse agent behaviour and
-to fine-tune your own models.
+Body export writes the raw body of each request and the raw body of its
+response to compressed JSON-lines files. You use the files to analyse agent
+behaviour and to fine-tune your own models. You enable it with the
+`observability.traces` block.
 
-Trace export is best effort. It is for analytics. It is never for billing.
+Body export is not OTLP distributed tracing. Distributed tracing sends spans
+with no bodies to a collector, and you enable it with `observability.tracing`.
+See [Observability overview](../overview/) for the difference. This page uses
+"trace" only for one exported record, because the config field and the metric
+names use that word.
+
+Body export is best effort. It is for analytics. It is never for billing.
 The billing ledger is the only record of charges. Nothing reads a trace back
 to enforce a limit or to charge a tenant. A lost trace is a counted loss, not
 an accounting error.
@@ -29,8 +38,8 @@ consents to raw capture of its request and response bodies. Prompts,
 completions, tool arguments, and any secret inside them go into the files
 unchanged. Protect the directory and the bucket.
 
-This page is not the metadata record. For the record that holds no bodies,
-see [Request capture](../request-capture/).
+For the record that holds no bodies, see
+[Request capture](../request-capture/).
 
 ## Two switches, both required
 
@@ -44,8 +53,7 @@ request.
 | Opt-in | Each tenant | `PUT /tenants/{id}/trace_export` on the admin server. |
 
 The dialect refuses `observability.traces` without `auth`. The error is
-`observability.traces: requires auth: tenants opt in through tenant policy`
-(`crates/proxy-simple-config/src/lower.rs:495-500`).
+`observability.traces: requires auth: tenants opt in through tenant policy`.
 
 ### Opt in a tenant
 
@@ -59,8 +67,7 @@ curl -X PUT http://$ADMIN_ADDR/tenants/acme/trace_export \
 ```
 
 The answer is `204`. The body accepts only `schema_version` (must be `1`) and
-`enabled`. An unknown field gives `400`
-(`crates/proxy-admin/src/server.rs:2840-2866`). To read the flag, send
+`enabled`. An unknown field gives `400`. To read the flag, send
 `GET /tenants/{id}/trace_export`. The answer is
 `{"schema_version":1,"tenant":"acme","enabled":true}`.
 
@@ -70,8 +77,7 @@ These rules apply to the opt-in:
   authenticates with a JWT must be created first by the operator with
   `POST /tenants`.
 - A tenant id that is too long gives `400` with `tenant_id_too_long`. The
-  limit is 200 bytes for `tenant=` plus the percent-encoded id
-  (`crates/proxy-observability/src/traces/mod.rs`, `MAX_TENANT_DIR_BYTES`).
+  limit is 200 bytes for `tenant=` plus the percent-encoded id.
 - An absent flag is not consent. A new tenant is not opted in.
 - With the default `in_memory` store, the flag resets to off when the proxy
   restarts. Use the `persistent` or `shared` store to keep it. See
@@ -82,8 +88,7 @@ These rules apply to the opt-in:
   stop a request that is already in flight from being captured.
 - For a JWT request, the proxy withholds the opt-in while the policy snapshot
   is stale. Each such request adds one to
-  `llmproxy_trace_consent_stale_total`
-  (`crates/proxy-control/src/auth.rs:805-830`).
+  `llmproxy_trace_consent_stale_total`.
 
 A request with no authenticated tenant is never captured.
 
@@ -110,14 +115,12 @@ A trace never holds:
 
 The proxy captures a refusal that it sends after authentication, such as a
 `403` for a model grant or a `429` for a limit. That reply is the response
-that the tenant received. The request body of each refused request is kept
-(`a_local_reply_after_consent_is_captured` in
-`crates/proxy-http/src/filter_manager/trace_tests.rs`).
+that the tenant received. The request body of each refused request is kept.
 
 The request thread copies bytes and hands them over. It does not parse,
 compress, or write. A separate exporter thread does that work.
 
-## Enable trace export
+## Enable body export
 
 1. Set the secrets in the environment of the proxy.
 
@@ -181,12 +184,10 @@ The proxy refuses to start in these cases:
 | No node id | `node.metadata["io.llmproxy.traces"]: trace export requires a node id (--service-node or node.id)` |
 | Another process holds the directory | `node.metadata["io.llmproxy.traces"].directory: another process holds` |
 
-The node id must be 1 to 128 bytes, and not `-`
-(`crates/proxy-observability/src/traces/segment.rs`, `OpenError`).
+The node id must be 1 to 128 bytes, and not `-`.
 
 The block is fixed at start. A reload that changes it is refused, the proxy
-logs `cannot change on reload`, and the previous configuration keeps serving
-(`crates/proxy/src/main.rs:2059-2068`). Restart the proxy to change it.
+logs `cannot change on reload`, and the previous configuration keeps serving. Restart the proxy to change it.
 
 ### Envoy mode
 
@@ -231,8 +232,7 @@ this table. An unknown field is an error with its full path.
 | `max_open_segments` | integer, 1 to 4096 | `64` | no | Open (tenant, date) segments. The least recently written is sealed beyond this. |
 | `s3` | object | none | no | S3 destination. See [S3 upload](#s3-upload). |
 
-The load checks (`crates/proxy-observability/src/traces/config.rs`,
-`validate`) also refuse these:
+The load checks also refuse these:
 
 - `max_memory_bytes` smaller than the two body caps together.
 - `segment_max_bytes` smaller than the largest line. See [Sizing](#sizing).
@@ -287,8 +287,7 @@ stream, the final event was seen. The state does not depend on the status. An
 error response can be `complete`.
 
 Embedded JSON bodies keep their original text, without outer whitespace. A
-reassembled Anthropic body has its keys sorted
-(`internal-docs/trace-export-design.md`, section 15).
+reassembled Anthropic body has its keys sorted.
 
 ### Streams
 
@@ -304,16 +303,14 @@ not keep the raw stream.
 | `anthropic`, messages | A message object. Text, thinking, and tool input are joined by block. |
 | Any other dialect, or an event shape that the proxy does not know | The delivered bytes as `body_text` or `body_base64`. The trace is `partial`. |
 
-The proxy picks the dialect from the provider that it dialled
-(`crates/proxy-observability/src/traces/reassemble.rs`,
-`reassemble_response`). It does not guess a shape.
+The proxy picks the dialect from the provider that it dialled. It does not
+guess a shape.
 
 A body with `content-encoding: gzip` or `deflate` is inflated. The cap
 applies to the inflated size. The direction then has
 `"representation":"decoded"` and keeps the original `content_encoding`. Any
 other encoding is exported as `body_base64` with `"representation":"wire"`.
-The trace is `partial` with `content_encoding`
-(`crates/proxy-observability/src/traces/exporter.rs`, `decode`).
+The trace is `partial` with `content_encoding`.
 
 ## Storage
 
@@ -335,9 +332,7 @@ written has a leading `.` and the suffix `.open`. Read only sealed files.
 - `epoch` is a start time in milliseconds. The proxy raises it past a saved
   mark on each start, so a name never repeats after a restart. `seq` counts
   segments inside one epoch.
-- The directory is `0700` and the files are `0600`
-  (`crates/proxy-observability/src/traces/exporter_tests.rs`,
-  `a_captured_stream_becomes_one_line_in_a_sealed_private_segment`).
+- The directory is `0700` and the files are `0600`.
 
 There is one open segment for each tenant and date. The proxy seals a segment
 for these reasons:
@@ -416,8 +411,7 @@ The object key is `<prefix>/` followed by the segment path under
 `<directory>`. For the example, a key is
 `llmproxy/tenant=acme/date=2026-10-17/proxy-a-1760000000000-0.jsonl.gz`.
 The upload is one `PUT` of the whole file with `content-type:
-application/x-ndjson`. The request is signed with SigV4
-(`crates/proxy-observability/src/traces/uploader.rs`).
+application/x-ndjson`. The request is signed with SigV4.
 
 | Field | Type | Default | Required | What it does |
 |---|---|---|---|---|
@@ -450,8 +444,7 @@ Follow these rules:
 - Do not set `max_age`. The bucket lifecycle rules remove old objects.
 
 **Tested stores.** The upload is tested only against a local test double
-that checks the SigV4 signature and the key
-(`crates/proxy-observability/src/traces/uploader_tests.rs`). AWS S3, Google
+that checks the SigV4 signature and the key. AWS S3, Google
 Cloud Storage, Cloudflare R2, and MinIO were not tested. Test your store
 before you depend on it.
 
@@ -467,7 +460,7 @@ reach `max_disk_bytes`, the proxy deletes the oldest unsent segment. It adds
 one to `llmproxy_trace_segments_lost_total{reason="upload_backlog"}`. It adds
 the lines of that segment to `llmproxy_trace_dropped_total{reason="upload_backlog"}`
 when this process sealed it. After recovery, the proxy uploads the segments
-that remain (`an_outage_drops_the_oldest_unsent_segment_and_recovery_uploads_the_rest`).
+that remain.
 
 At shutdown, the uploader finishes the upload in progress if time allows.
 Segments that are not sent stay on disk. The next start uploads them.
@@ -500,7 +493,7 @@ this codec.
 
 ### Cost
 
-Object stores charge for each request and for stored bytes. Trace export is
+Object stores charge for each request and for stored bytes. Body export is
 built for both.
 
 - It writes few, large objects. A segment is sealed at 64 MiB compressed or
@@ -627,8 +620,7 @@ trace. You decide whether to train on a partial trace.
 ### Metrics
 
 Each series below is registered at start, so an idle exporter shows zeros.
-The names are in `crates/proxy-observability/src/stats.rs`. On
-`/stats/prometheus`, the proxy adds the prefix `envoy_`. For example,
+On `/stats/prometheus`, the proxy adds the prefix `envoy_`. For example,
 `llmproxy_trace_dropped_total` is `envoy_llmproxy_trace_dropped_total`. These
 metrics are not in `/stats`. See
 [Metrics and /stats](../metrics-and-stats/).
@@ -697,8 +689,7 @@ restart the proxy, or to opt the tenant out.
 
 To enable capture again, send `{"disabled":false,"expected_generation":1}`.
 
-The switch works like this
-(`crates/proxy-observability/src/traces/gate.rs`):
+The switch works like this:
 
 - It is compare-and-set. A stale generation gives `409` with
   `{"error":"stale_generation","generation":N}`, and changes nothing.
@@ -714,8 +705,6 @@ The switch works like this
   with `cannot update <path>: <reason>`, and capture stays closed.
 - Without a `traces` block, both calls give `404`.
 
-`the_emergency_switch_stops_capture` in
-`crates/proxy/tests/trace_export_e2e.rs` tests this against the real binary.
 
 ## Load the files into a warehouse
 
@@ -796,3 +785,34 @@ user from inside a segment is not supported.
 - Deletion of one user inside a segment.
 - Credentials from an instance role.
 - Direct writes to a warehouse.
+
+## Implementation notes
+
+For maintainers. Each behavior above has this source or test.
+
+- Dialect refusal without `auth`: `crates/proxy-simple-config/src/lower.rs`.
+- Opt-in body and status codes: `crates/proxy-admin/src/server.rs`.
+- Tenant id length: `MAX_TENANT_DIR_BYTES` in
+  `crates/proxy-observability/src/traces/mod.rs`.
+- Stale JWT consent: `crates/proxy-control/src/auth.rs`.
+- Refusals after authentication are captured: test
+  `a_local_reply_after_consent_is_captured` in
+  `crates/proxy-http/src/filter_manager/trace_tests.rs`.
+- Node id rules: `OpenError` in
+  `crates/proxy-observability/src/traces/segment.rs`.
+- Block fixed at start: `crates/proxy/src/main.rs`.
+- Load checks: `validate` in `crates/proxy-observability/src/traces/config.rs`.
+- Stream reassembly: `reassemble_response` in
+  `crates/proxy-observability/src/traces/reassemble.rs`. Content encoding:
+  `decode` in `crates/proxy-observability/src/traces/exporter.rs`.
+- Segment permissions: test
+  `a_captured_stream_becomes_one_line_in_a_sealed_private_segment` in
+  `crates/proxy-observability/src/traces/exporter_tests.rs`.
+- Upload signing and the tested store: `uploader.rs` and `uploader_tests.rs`
+  in the same directory. Outage behavior: test
+  `an_outage_drops_the_oldest_unsent_segment_and_recovery_uploads_the_rest`.
+- Metric names: `crates/proxy-observability/src/stats.rs`.
+- Emergency switch: `crates/proxy-observability/src/traces/gate.rs`. End to
+  end test: `the_emergency_switch_stops_capture` in
+  `crates/proxy/tests/trace_export_e2e.rs`.
+- Design notes: `internal-docs/trace-export-design.md`.

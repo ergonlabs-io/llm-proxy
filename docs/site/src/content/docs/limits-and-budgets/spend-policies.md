@@ -1,8 +1,14 @@
 ---
 title: Spend policies and recovery
-description: Key and tenant ceilings, migration, shared Redis accounting, and crash recovery.
-last_updated: 2026-10-13
+description: "Key and tenant ceilings, migration, shared Redis accounting, and crash recovery."
+lastUpdated: 2026-10-18
 ---
+
+Use a spend budget to stop a key or a tenant from spending more than a set
+amount in a period. To enable it in the `llmproxy` dialect, add an `auth:`
+block and a `pricing` rate card, then set a ceiling with
+`PUT /keys/{id}/budget` or `PUT /tenants/{id}/budget` on the admin API. See
+[Key lifecycle and API version](#key-lifecycle-and-api-version).
 
 Spend enforcement uses two kinds of ceiling, and either one can refuse a
 request. A key budget counts the spend of one stable `key_id`. A tenant budget
@@ -20,7 +26,7 @@ With `auth:` and no `pricing`, every request costs $0, so the proxy warns that
 budgets cannot fire.
 
 Missing budget means unlimited; an explicit zero denies the first request.
-Charges use integer micro-dollars and the rate card for the provider actually
+Charges use integer micro-dollars and the rate card for the provider the proxy
 dialled, including after fallback. A request that the rate card does not price
 adds $0 to every budget. The
 spend reports count these requests in `unpriced_requests`.
@@ -30,14 +36,11 @@ filter chain and model. The warning names the chain, the model, the cluster,
 and the reason. It also tells you to add the model to the rate card. A request with no applicable budget logs nothing. The proxy
 remembers at most 256 model names for each chain. After that it logs one
 summary line and names no more models. The request still adds $0 and still
-counts in `unpriced_requests`
-(`crates/proxy-filters/src/spend_limit_filter.rs`; tests
-`an_unpriced_model_without_a_budget_stays_silent` and
-`the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary`).
+counts in `unpriced_requests`.
 
 The proxy does not reject a request because its model has no price. It serves
 the request, adds $0 to the budget, and logs the warning above. This is a
-choice for availability, not an oversight. The proxy learns the provider that
+choice for availability. The proxy learns the provider that
 serves a request only when the router dials it, after the spend filter has
 admitted the request. A model that the rate card prices on one provider can be
 unpriced on its fallback provider. Rejecting at admission would therefore
@@ -53,8 +56,7 @@ completions, Responses, Messages and embeddings. It cannot count the cost of
 other endpoints, such as images, audio, batches and files. A budget that
 applies to a request for one of these endpoints refuses it with
 `403` and the response-code detail `endpoint_not_metered`. The request does
-not reach the provider. Before this, such a request was served and charged
-$0.
+not reach the provider.
 
 - The proxy finds the endpoint from the request method and path, before any
   path rewrite. It compares whole path segments, so
@@ -77,12 +79,12 @@ $0.
 Each refusal increments
 `llmproxy_unmetered_endpoint_refused_total{endpoint, control}`. `control` is
 `spend` for a budget and `token_limit` for a token limit (see
-[Token rate limiting](../token-rate-limiting/#endpoints-a-token-limit-cannot-count)).
+[Configure rate limits](../token-rate-limiting/#endpoints-a-token-limit-cannot-count)).
 `endpoint` is one of `image_generation`, `image_edit`, `speech`,
 `transcription`, `translation` and `unmetered` (every other path). The access
 log shows the detail in `%RESPONSE_CODE_DETAILS%` (`response_code_details` in
-the `--config` formats). Tests: `crates/proxy/tests/unmetered_endpoint_e2e.rs`.
-The design, and the phases that will meter images and audio, are in ADR-0010.
+the `--config` formats). The design, and the phases that will meter images and
+audio, are in ADR-0010.
 
 ## Cut streams and estimated charges
 
@@ -143,7 +145,7 @@ reset or reassignment.
 
 ## Migrating tenant budgets
 
-Stored key/budget rows now write schema version `2`. Readers accept unversioned
+Stored key and budget rows use schema version `2`. Readers accept unversioned
 legacy rows as version `1`, and reject unknown versions. Existing tenant totals
 stay in their original rows; they cannot establish per-key spend without
 separate attribution evidence.
@@ -193,16 +195,6 @@ authenticated key identity returns `403`. A request that has a key but no
 tenant also returns `403` when any tenant budget is configured.
 `%RESPONSE_CODE_DETAILS%` shows `spend_identity_missing` for both.
 
-These tests in `crates/proxy-filters/src/spend_limit_filter.rs` prove the
-behavior: `legacy_tenant_budgets_require_explicit_cutover_even_when_zero` (the
-start refusal and the cutover),
-`tenant_budget_aggregates_keys_with_independent_periods` (the tenant ledger and
-the separate ceilings), `tenant_zero_budget_applies_without_any_key_budget` (a
-tenant ceiling alone refuses), and
-`missing_identity_cannot_bypass_a_tenant_budget` (the `403`). The end-to-end
-test `tenant_budget_aggregates_multiple_keys_and_enforces_both_scopes` in
-`testing/diffrig/tests/admin_e2e.rs` runs two keys against one tenant ceiling on
-the real binary.
 
 ## Redis and crash recovery
 
@@ -264,14 +256,12 @@ period. A bucket whose period has ended is settled after one successful
 reconciliation with the store since the period ended, if it has no pending
 charge. A settled bucket costs the store nothing more: the flusher does not
 visit it, and the recovery journal does not grow with it. The proxy keeps a
-settled bucket readable in memory until 1 hour after its period ends
-(`SETTLED_BUCKET_GRACE_SECS` in `crates/proxy-control/src/spend.rs:828`). Then
+settled bucket readable in memory until 1 hour after its period ends. Then
 it evicts the bucket.
 
 A charge that arrives after eviction creates the bucket again. The new bucket
 starts from the last flush sequence of the store, so the store total stays
-exact (test
-`a_late_charge_after_eviction_reseeds_from_the_store_and_lands_exactly_once`).
+exact.
 A report for an ended period with no bucket in memory reads the store and
 creates nothing. The unpriced-request detail of an evicted bucket does not
 survive eviction.
@@ -294,13 +284,34 @@ pipeline resolves keys and tenants. Key and user IDs are never metrics labels.
 Versioned cards price the selected provider's upstream model; legacy spend
 tables retain their requested-model lookup for compatibility.
 
-QA-11 proves explicit tenant-to-key cutover, independent key ceilings, and
-persisted Redis spend after SIGKILL. QA-12 proves three-process convergence,
-socket partition, local enforcement and staleness observability, checkpointed
-backlog recovery after SIGKILL, and clean restart without duplicate charges.
-Unit tests additionally cover crash replay after an ambiguous remote response.
-Run the process drills with a disposable Redis:
+Two process drills cover the cutover and recovery paths. The first covers
+explicit tenant-to-key cutover, independent key ceilings, and persisted Redis
+spend after SIGKILL. The second covers three-process convergence, socket
+partition, local enforcement and staleness observability, checkpointed backlog
+recovery after SIGKILL, and clean restart without duplicate charges. Unit tests
+also cover crash replay after an ambiguous remote response. Run the drills with
+a disposable Redis:
 
 ```sh
 QA_REDIS_ADDR=127.0.0.1:6379 make qa-case CASE='TestQA11|TestQA12'
 ```
+
+## Implementation notes
+
+This section is for maintainers.
+
+- Spend filter: `crates/proxy-filters/src/spend_limit_filter.rs`. Tests in the
+  same file: `an_unpriced_model_without_a_budget_stays_silent`,
+  `the_remembered_model_names_are_bounded_and_the_cap_logs_one_summary`,
+  `legacy_tenant_budgets_require_explicit_cutover_even_when_zero` (start
+  refusal and cutover), `tenant_budget_aggregates_keys_with_independent_periods`
+  (tenant ledger and separate ceilings),
+  `tenant_zero_budget_applies_without_any_key_budget`, and
+  `missing_identity_cannot_bypass_a_tenant_budget` (the `403`).
+- End-to-end tests: `tenant_budget_aggregates_multiple_keys_and_enforces_both_scopes`
+  in `testing/diffrig/tests/admin_e2e.rs` (two keys, one tenant ceiling, real
+  binary); `crates/proxy/tests/unmetered_endpoint_e2e.rs` (unmetered endpoint
+  refusal).
+- Settled-bucket grace: `SETTLED_BUCKET_GRACE_SECS` in
+  `crates/proxy-control/src/spend.rs`. Test:
+  `a_late_charge_after_eviction_reseeds_from_the_store_and_lands_exactly_once`.

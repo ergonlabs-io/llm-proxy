@@ -197,7 +197,7 @@ fn build_listener_tls(
     for (i, chain) in listener.filter_chains.iter().enumerate() {
         let factory = match &chain.transport_socket {
             Some(spec) => {
-                let context = format!("listener '{}' filter_chains[{i}]", listener.name);
+                let context = chain_context(&listener.name, Some(i));
                 warn_if_handshake_unbounded(chain, &context);
                 let factory = Arc::new(DownstreamTlsFactory::build(spec, &context)?);
                 if !spec.certificate_sds_names.is_empty() {
@@ -218,7 +218,7 @@ fn build_listener_tls(
         .and_then(|c| c.transport_socket.as_ref())
     {
         Some(spec) => {
-            let context = format!("listener '{}' default_filter_chain", listener.name);
+            let context = chain_context(&listener.name, None);
             if let Some(chain) = &listener.default_filter_chain {
                 warn_if_handshake_unbounded(chain, &context);
             }
@@ -281,6 +281,63 @@ impl ListenerHcm {
             default_handler: None,
         }
     }
+}
+
+/// A chain's identity: its error context and its `FactoryContext::scope`.
+/// `None` is the listener's `default_filter_chain`.
+fn chain_context(listener: &str, index: Option<usize>) -> String {
+    match index {
+        Some(i) => format!("listener '{listener}' filter_chains[{i}]"),
+        None => format!("listener '{listener}' default_filter_chain"),
+    }
+}
+
+/// Refuses `snapshot` when an HTTP filter on a chain that is already built
+/// would change state that filter fixed at its first build, so the reload or
+/// xDS update is rejected before publish instead of failing per worker as
+/// connection resets. Only `llmproxy.auth` has such state today (see
+/// `proxy_filters::auth_filter::check_reload`). Every refusal is returned,
+/// sorted, as `<chain>: http filter '<name>': <field>: <reason>`.
+pub fn check_reload_compatible(
+    snapshot: &ConfigSnapshot,
+    factory_state: &SharedFactoryState,
+) -> Result<(), String> {
+    let mut refusals = Vec::new();
+    for listener in snapshot.listeners.values() {
+        let chains = listener
+            .filter_chains
+            .iter()
+            .enumerate()
+            .map(|(i, chain)| (Some(i), chain))
+            .chain(
+                listener
+                    .default_filter_chain
+                    .iter()
+                    .map(|chain| (None, chain)),
+            );
+        for (index, chain) in chains {
+            let Some(NetworkFilterSpec::HttpConnectionManager(hcm)) = chain.filters.last() else {
+                continue;
+            };
+            let context = chain_context(&listener.name, index);
+            for f in &hcm.http_filters {
+                if f.type_url != proxy_filters::auth_filter::TYPE_URL {
+                    continue;
+                }
+                let Some(config) = &f.config else { continue };
+                if let Err(e) =
+                    proxy_filters::auth_filter::check_reload(config, &context, factory_state)
+                {
+                    refusals.push(format!("{context}: http filter '{}': {e}", f.name));
+                }
+            }
+        }
+    }
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    refusals.sort();
+    Err(refusals.join("; "))
 }
 
 /// Build the compiled HTTP handler for every chain (`filter_chains[i]` and

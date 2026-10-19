@@ -66,7 +66,7 @@ and did not is worse than no limit at all.
 ## Architecture
 
 ```
-   clients (OpenAI / Anthropic SDKs, unchanged base URL)
+   clients (OpenAI / Anthropic SDKs, base URL set to the proxy)
         │
         ▼
  ┌─ listener + filter chain ────────────────────────────────┐
@@ -114,8 +114,11 @@ provider on failover. That has been a real key-disclosure bug here twice.
 ## What it does today
 
 - **Speaks your provider's API.** OpenAI Chat Completions, OpenAI Responses, and
-  Anthropic Messages. Point an existing client at llm-proxy by changing its base
-  URL; requests and responses pass through unchanged.
+  Anthropic Messages. Point an existing client at llm-proxy by setting its base
+  URL to the proxy and its API key to a virtual key. Bodies pass through; the
+  proxy replaces the credential, and rewrites the model name only where a
+  `models` entry maps it. There is no translation between API dialects. See
+  [Connect your application](docs/site/src/content/docs/getting-started/connect-your-application.md).
 
 - **Streams properly.** Server-sent events are forwarded as they arrive, and the
   proxy never injects frames of its own into a stream. An unclean end of stream
@@ -158,7 +161,9 @@ provider on failover. That has been a real key-disclosure bug here twice.
 - **Mints and revokes keys at runtime.** A bearer-gated admin write API creates
   tenants, mints and revokes virtual keys, and sets per-tenant policies and
   budgets, against an in-memory, embedded (redb), or shared (Redis) control-plane
-  store. Revocation takes effect on the auth path without a restart.
+  store. A revocation through the API applies at once on that replica and within
+  one policy poll on the others, without a restart. Keys listed in the config
+  file change only on restart.
 
 - **Fails over between providers.** A route can name an ordered list; if the
   primary fails, the next is tried, with retries, retry budgets, and per-try
@@ -474,10 +479,10 @@ is not scheduled. Its Envoy differential rig work and corpus scorecard were clos
 
 Stated plainly, because a feature list without this is not much use:
 
-- **HTTP/1.1 upstream reuse is one idle connection at a time.** Both protocols
-  are cached per (cluster, address, protocol), but h1 keeps a single idle
-  keep-alive connection where h2 keeps a bounded set. Concurrent h1 load past
-  that still dials — and, where TLS is configured, handshakes — per request. Set
+- **HTTP/1.1 upstream reuse is bounded and not multiplexed.** Both protocols
+  are cached per (cluster, address, protocol) on each worker thread. h1 keeps
+  up to 8 idle keep-alive connections per key, and each one carries one request
+  at a time. Concurrent h1 load past that still dials — and, where TLS is configured, handshakes — per request. Set
   `protocol: http2` where the provider supports it. There is no fallback: an
   HTTP/2 provider is offered `h2` and nothing else, so a backend that cannot
   speak it fails the TLS handshake rather than downgrading, which rules out most
@@ -487,10 +492,13 @@ Stated plainly, because a feature list without this is not much use:
   compares the proxy with Envoy at 5k requests per second
   (`internal-docs/MILESTONES.md`, v0.3.2 section). Static config plus SIGHUP
   remains supported; SIGHUP is refused when `dynamic_resources` is set.
-- **File-sourced credentials and certificates are read once.** `api_key_file`,
-  `hmac_secret_file`, `cert_file`/`key_file` take effect on restart or SIGHUP —
-  nothing watches them. Changing the control-plane store spec or its poll
-  interval needs a restart even with SIGHUP.
+- **Nothing watches files, and some auth settings need a restart.** A `SIGHUP`
+  reload reads `api_key_file` and the TLS `cert_file`/`key_file` again. It does
+  not apply changes to `auth.keys`, the HMAC secret, the auth store, or the
+  OTLP `tracing`/`metrics` blocks; those take a restart. Changing the HMAC
+  secret and sending `SIGHUP` refuses every key until a restart (a known
+  defect). See the reload table in
+  [Reload configuration](docs/site/src/content/docs/operations/config-reload.md).
 - **Authorization covers models only.** There is no per-provider
   authorization. An authenticated tenant with no stored model policy is refused
   with 403 unless `auth.enforce.tenants_without_policy` is `allow`.
@@ -577,9 +585,9 @@ Release gates, work packages, and architecture decision records are in
 
 ## Contributing and security
 
-Vulnerability reports: see [SECURITY.md](SECURITY.md). Please report privately
-rather than in a public issue — note that the private contact is not filled in
-yet.
+Vulnerability reports: see [SECURITY.md](SECURITY.md). Do not report a
+suspected vulnerability in a public issue. The private reporting channel is not
+published yet.
 
 ## Licence
 

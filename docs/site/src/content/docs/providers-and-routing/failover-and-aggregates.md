@@ -1,134 +1,171 @@
 ---
 title: Failover and aggregates
-summary: What a route's `fallbacks` list actually does — the aggregate
-  cluster it lowers to, the same-dialect requirement, and how retry budget
-  and member order interact.
-last_updated: 2026-10-13
+description: "Try more providers in order when one fails, with fallbacks and model entries that list several providers."
+summary: How to use a route's `fallbacks` list or a `models` entry with several
+  providers, which failures move a request to the next provider, and how
+  retry count and the same-dialect rule affect a chain.
+lastUpdated: 2026-10-18
 related:
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/timeouts-and-retries/
-  - ../configuration/configuration-file/
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/timeouts-and-retries
+  - configuration/configuration-file
 ---
 
 # Failover and aggregates
 
-A route's `fallbacks` list names providers tried, in order, when the primary
-fails. This is implemented and tested end to end, not a warned-and-dropped
-field.
+Use `fallbacks` to try additional providers in order. Every provider in the
+chain must use the same API dialect. Use this feature when one provider can
+fail or reach a rate limit, and a second provider can serve the same model
+name.
 
-## What `fallbacks` lowers to
+## Enable failover
 
-A route with `fallbacks` gets an extra cluster: an `envoy.clusters.aggregate`
-named `fallback:route-<index>`, whose member list is the primary provider's
-cluster followed by each fallback's cluster, in the order listed. The route's
-own `cluster` action then points at the aggregate instead of the primary
-directly (`crates/proxy-simple-config/src/lower.rs`'s `lower_route`, proven
-by `one_fallback_emits_an_aggregate_with_members_in_order` and
-`route_with_fallback_targets_the_aggregate_not_the_primary` in
-`crates/proxy-simple-config/tests/fallbacks.rs`). A route with no `fallbacks`
-is unaffected: it still targets `provider:<name>` directly, and no aggregate
-cluster is emitted at all.
+Add a `fallbacks` list to a route. The route's `provider` is the primary.
+The proxy tries it first. Each entry in `fallbacks` is tried in the order
+you write it.
 
-Each member cluster keeps its own TLS, credentials, and `Host` header — see
-[Providers and clusters](../../providers-and-routing/providers-and-clusters/).
-An end-to-end router test proves the isolation directly: after a failover
-from a provider with a closed port to a live one, the live provider's
-upstream request carries the live provider's API key and never the failed
-primary's (`credential_isolation_across_failover` in
-`crates/proxy-http/tests/router_aggregate.rs`).
+```yaml
+version: 0
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+  together:
+    type: openai-compatible
+    base_url: https://api.together.xyz
+    api_key: ${TOGETHER_API_KEY}
+routes:
+  - model: "gpt-4o*"
+    provider: openai
+    fallbacks: [together]
+```
 
-## When a request moves to the next member
+A `models` entry does the same. The first provider is the primary. Each
+later provider is a fallback.
 
-A member is tried once. The router advances to the next member in the list
-only on an outcome the retry engine treats as certainly unserved: a
-connection failure, a `refused-stream`, a reset before any response byte, or
-a response with status 429, 500, 502, or 503
-(`crates/proxy-simple-config/src/lower.rs`'s `lower_route`, which hardcodes
-the route's `retry_on` to `connect-failure,refused-stream,reset,
-retriable-status-codes` with that exact status list). See
+```yaml
+models:
+  chat-default:
+    providers: [openai, together]
+```
+
+Source for the fields: `schema/llmproxy-v0.schema.json`, `$defs/Route`
+(`fallbacks`, `retries`) and `$defs/ModelDef` (`providers`). A route with
+no `fallbacks` sends the request to its one provider and has no chain.
+
+## When a request moves to the next provider
+
+The proxy tries each provider once for a request. It moves to the next
+provider only on an outcome that shows the provider did not serve the request:
+
+- A connection failure.
+- An HTTP/2 `refused-stream`.
+- A reset before any response byte.
+- A response with status 429, 500, 502, or 503.
+
+The route's retry triggers are fixed to this list, and you cannot change them
+in the `llmproxy` dialect. See
 [Timeouts and retries](../../providers-and-routing/timeouts-and-retries/) for
-the full trigger table — the same one applies here, since a fallback attempt
-*is* a retry, just one that lands on a different member.
+the full trigger table. A fallback attempt is a retry that lands on a
+different provider, so the same table applies.
 
-Once the client has started receiving a stream from a member, that response
-is final. No later member is ever tried after the first response byte has
-reached the client — a partially-streamed reply cannot be silently replaced
-by a different provider's answer.
+After the client starts to receive a stream, that response is final. The
+proxy never tries a later provider after the first response byte reaches the
+client. A partial reply is never replaced by the answer of a different
+provider.
 
-Member selection is strict order, not blended traffic: a member is skipped
-only once it has actually been tried and failed in this request (or, on a
-config-reload race, is momentarily missing from the cluster registry). This
-is a deliberate divergence from the reference implementation's own aggregate
-cluster, which can
-bleed a fraction of traffic across a partially-healthy member boundary — for
-LLM provider fallback that would mean a silent slice of traffic landing on
-the fallback provider's own billing and rate limits while the primary is
-only partially degraded, which nobody wants
-(`crates/proxy-cluster/src/manager.rs`'s `ClusterHandle::select_aggregate_member`
-doc comment). Nested aggregates are not supported: a fallback chain is one
-level of failover, never a fallback of a fallback chain.
+If every provider fails, the client gets the last provider's response
+unchanged. The proxy does not make up its own `503` in that case.
 
-## `retries.attempts` and the fallback chain interact through one budget
+Selection is strict order. The proxy does not send a share of traffic to the
+fallback while the primary is partly healthy. This differs from Envoy's
+aggregate cluster, which can send a share of traffic across a partly healthy
+member boundary. For LLM providers, that share would reach the fallback's
+billing and rate limits while the primary still works. The dialect has no
+setting to change this. Nested chains are not supported: a chain is one level
+of failover.
 
-`routes[].retries.attempts` (default `1`, max `5`) is not a separate budget
-from failover — both draw on the same underlying retry count. Reaching the
-last of *N* chain members needs at least *N*-1 retries, so lowering raises
-the emitted retry count to whichever is larger: your configured `attempts`,
-or the number needed to reach every fallback
-(`crates/proxy-simple-config/src/lower.rs:903-910`). A three-member chain
-(primary plus two fallbacks) with `retries: { attempts: 1 }` — not enough on
-its own — still gets `num_retries: 2` in the lowered config, proven by
-`num_retries_is_raised_to_reach_every_member` in
-`crates/proxy-simple-config/tests/fallbacks.rs`.
+## Credentials stay with each provider
 
-The corollary is easy to miss: **`retries: { attempts: 0 }` does not disable
-failover** when `fallbacks` is set. It only removes any *extra* retries
-beyond what reaching the last fallback already requires — the `.max()` in the
-formula above always wins in favor of finishing the chain. `attempts: 0`
-disables retries outright only on a route with no `fallbacks` at all, where
-there is no chain to protect.
+Each provider in the chain keeps its own TLS settings, credentials, and
+`Host` header. When a request fails over, the fallback request carries the
+fallback provider's API key. It does not carry the primary's key. See
+[Providers and clusters](../../providers-and-routing/providers-and-clusters/)
+for the reason.
 
-One more consequence of sharing a single budget: once a route has any
-`fallbacks`, `retries.attempts` no longer buys extra attempts against the
-*same* primary provider. The very first failed attempt marks the primary as
-tried for this request, so the next retry moves straight to the first
-fallback rather than repeating the primary — same-provider retries stay
-useful only on a route with no `fallbacks` configured.
+## `retries.attempts` and the chain use one retry count
 
-## Same wire dialect only
+`routes[].retries.attempts` (default `1`, maximum `5`) is not a separate
+budget from failover. Both use the same retry count. To reach the last of
+*N* providers, a request needs at least *N*-1 retries. The proxy uses the
+larger of two numbers: your `attempts` value, or the number needed to reach
+every fallback.
 
-Every provider in a chain must speak the same wire dialect as the primary.
-An OpenAI-shaped provider falling back to another OpenAI-shaped provider
-(including `openai-compatible`) is supported. A chain mixing OpenAI-shaped
-and Anthropic-shaped providers is a **load error**, not a best-effort
-attempt or a warning: the primary's request body would not be valid for the
-fallback's API, and the fallback's response would be scanned for tokens by
-the wrong dialect's parser — silently wrong billing numbers, not just a
-broken request
-(`cross_dialect_fallback_is_rejected` in
-`crates/proxy-simple-config/tests/fallbacks.rs`). See
-[Getting started](../../getting-started/quickstart/) for the exact error text
-this produces.
+For example, a chain of three providers (a primary and two fallbacks) with
+`retries: { attempts: 1 }` gets 2 retries.
 
-## Fallback in the `models` catalogue
+Two results follow from this:
 
-`models.<name>.providers` is an ordered list. The first provider is the
-primary and later providers are fallbacks. An entry with more than one
-provider lowers to an ordered aggregate cluster named `fallback:model-<name>`
-that retries `count - 1` times, the same way `routes[].fallbacks` does. Every
-provider in the list must speak the same dialect as the first; a different
-dialect is a load error at `models.<name>.providers[<n>]` (`lower_model` in
-`crates/proxy-simple-config/src/lower.rs`, and
-`models_multiple_providers_lower_to_ordered_fallback` in
-`crates/proxy-simple-config/tests/dialect.rs`). See
-[Configuration file](../../configuration/configuration-file/) for the retry
-conditions and the fields a `models` entry accepts.
+- **`retries: { attempts: 0 }` does not disable failover** on a route that
+  has `fallbacks`. It removes only the extra retries beyond those that reach
+  the last fallback. On a route with no `fallbacks`, `attempts: 0` turns
+  retries off.
+- On a route with `fallbacks`, `retries.attempts` does not repeat the
+  primary. The first failed attempt marks the primary as tried for this
+  request. The next retry goes to the first fallback. A retry against the
+  same provider is possible only on a route with no `fallbacks`.
+
+## Use the same API dialect
+
+Every provider in a chain must use the same API dialect as the primary. An
+OpenAI-shaped provider can fall back to another OpenAI-shaped provider,
+including `openai-compatible`. A chain that mixes OpenAI-shaped and
+Anthropic-shaped providers is a load error. It is not a warning.
+
+The reason is accuracy. The primary's request body is not valid for the
+fallback's API. The proxy would also read the fallback's response with the
+wrong dialect's parser, so token counts and billing would be wrong. For
+`models` entries, the load error names the path `models.<name>.providers[<n>]`.
+See [Getting started](../../getting-started/quickstart/) for the error text.
+
+## Failover in the `models` catalogue
+
+`models.<name>.providers` is an ordered list. A list with more than one
+provider gets the same retry count as `routes[].fallbacks`: the number of
+providers minus 1. A `models` entry has no `retries` field. See
+[Configuration file](../../configuration/configuration-file/) for the fields
+a `models` entry accepts.
 
 ## Bootstrap configuration
 
-The same mechanism is available directly: define an
-`envoy.clusters.aggregate` cluster with `lb_policy: CLUSTER_PROVIDED` and a
-`cluster_type.typed_config.clusters` member list, then point a route's
-`cluster` at it. The same-dialect restriction above is specific to this
-configuration format's usage-metering filter — a raw bootstrap configuration
-has no such check, since it has no concept of a wire dialect to protect.
+The Envoy-mode equivalent is an `envoy.clusters.aggregate` cluster. Set
+`lb_policy: CLUSTER_PROVIDED` and a `cluster_type.typed_config.clusters`
+member list, then point a route's `cluster` at the aggregate.
+
+The same-dialect rule applies to the `llmproxy` dialect only, because that
+format checks the dialect of the usage-metering filter. A raw bootstrap
+configuration has no such check.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- A route with `fallbacks` lowers to an `envoy.clusters.aggregate` cluster
+  named `fallback:route-<index>`. A `models` entry with several providers
+  lowers to `fallback:model-<name>`. Members are the primary's cluster
+  followed by each fallback's cluster. Code: `lower_route` and `lower_model`
+  in `crates/proxy-simple-config/src/lower.rs`. Tests:
+  `one_fallback_emits_an_aggregate_with_members_in_order` and
+  `route_with_fallback_targets_the_aggregate_not_the_primary` in
+  `crates/proxy-simple-config/tests/fallbacks.rs`;
+  `models_multiple_providers_lower_to_ordered_fallback` in
+  `crates/proxy-simple-config/tests/dialect.rs`.
+- Lowering sets `retry_on` to `connect-failure,refused-stream,reset,
+  retriable-status-codes` with the status list 429, 500, 502, 503.
+- Lowering raises `num_retries` to reach every member. Test:
+  `num_retries_is_raised_to_reach_every_member`.
+- Strict member order: `ClusterHandle::select_aggregate_member` in
+  `crates/proxy-cluster/src/manager.rs`.
+- Credential isolation: `credential_isolation_across_failover` in
+  `crates/proxy-http/tests/router_aggregate.rs`.
+- Cross-dialect rejection: `cross_dialect_fallback_is_rejected` in
+  `crates/proxy-simple-config/tests/fallbacks.rs`.

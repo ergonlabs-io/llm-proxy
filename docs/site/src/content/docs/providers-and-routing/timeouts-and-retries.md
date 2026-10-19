@@ -1,21 +1,42 @@
 ---
 title: Timeouts and retries
+description: "Set request and idle timeouts, and configure when llm-proxy retries a failed provider request."
 summary: The timeouts a route and a listener have, exactly which failures
   trigger a retry, and what bounds a slow or silent provider.
-last_updated: 2026-10-14
+lastUpdated: 2026-10-18
 related:
-  - ../providers-and-routing/providers-and-clusters/
-  - ../providers-and-routing/failover-and-aggregates/
-  - ../configuration/configuration-file/
-  - ../observability/access-logs/
-  - ../operations/tls/
+  - providers-and-routing/providers-and-clusters
+  - providers-and-routing/failover-and-aggregates
+  - configuration/configuration-file
+  - observability/access-logs
+  - operations/tls
 ---
 
 # Timeouts and retries
 
-A route has two independent timeouts, and they bound different things. This
-page covers both, the listener's stream limits, and exactly what triggers a
-same-provider retry.
+Use these settings to bound a slow or silent provider and to control which
+failures the proxy retries. A route has two independent timeouts, and they
+bound different things. The `llmproxy` dialect enables retries by default
+(`routes[].retries.attempts`, default `1`). You set timeouts with the fields
+below.
+
+```yaml
+listen:
+  address: 0.0.0.0:8080
+  stream_idle_timeout: 2m
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    connect_timeout: 3s
+routes:
+  - model: "gpt-*"
+    provider: openai
+    idle_timeout: 60s
+    retries: { attempts: 2 }
+```
+
+This page covers both route timeouts, the listener's stream limits, and
+exactly what triggers a same-provider retry.
 
 ## The wait for a provider's first response byte: `listen.stream_idle_timeout`
 
@@ -40,18 +61,10 @@ the request instead of moving to a fallback.
 request, however active the stream is. Before response headers the proxy
 answers `504` (`UMSDR`). After headers the stream ends without a clean finish.
 
-Proof: `a_provider_that_never_answers_is_cut_and_its_permit_released`,
-`a_stream_that_keeps_producing_outlives_the_idle_timeout`,
-`a_stream_that_goes_quiet_mid_body_is_cut` and
-`max_stream_duration_cuts_a_stream_that_is_still_producing` in
-`crates/proxy-http/tests/stream_timeouts.rs`.
-
 ## `connect_timeout`: bounds establishing the connection
 
 Set per provider (`providers.<name>.connect_timeout`, default `5s`). Bounds
-TCP/TLS connection establishment only, enforced with a real
-`tokio::time::timeout` around the connect call
-(`crates/proxy-cluster/src/pool.rs`). A connect failure or a connect timeout
+TCP/TLS connection establishment only. A connect failure or a connect timeout
 both count as the same S3 outcome for retry purposes — see the trigger table
 below.
 
@@ -65,7 +78,7 @@ steadily-streaming response never trips it; only a genuine stall does. There
 is deliberately no *total* duration timeout by default
 (`listen.max_stream_duration` is opt-in) — LLM generations are long-lived, so
 an idle-based guard is the correct one for the response direction.
-`idle_timeout: 0s` turns the idle timeout off for that route, including the listener's `stream_idle_timeout` for the response body. Proof: `route_idle_timeout_zero_disables_the_idle_timeout_for_the_route` in `crates/proxy/tests/route_idle_timeout_e2e.rs`.
+`idle_timeout: 0s` turns the idle timeout off for that route, including the listener's `stream_idle_timeout` for the response body.
 
 ## What triggers a same-provider retry
 
@@ -85,15 +98,10 @@ raw bootstrap configuration's `retry_on`:
 | Circuit-breaker / queue overflow | Yes (synthesized as a 503) |
 | Anything after the client has started receiving the stream | Never |
 
-The exact tokens lowering emits are `connect-failure,refused-stream,reset,
-retriable-status-codes` with a status list of `[429, 500, 502, 503]`
-(`crates/proxy-simple-config/src/lower.rs`'s `lower_route`) — notably *not*
-the broad `5xx` or `gateway-error` tokens, so a `501` or a `504` a
-provider itself returns is passed straight through, not retried. This is
-the same trigger table the retry engine uses everywhere, pinned by
-`crates/proxy-http/src/retry.rs`'s unit tests (for example
-`gateway_error_is_502_503_504_or_no_response_only`, which is why 504 needs
-the `gateway-error` token this configuration format never sets).
+The dialect uses the retry tokens `connect-failure`, `refused-stream`,
+`reset`, and `retriable-status-codes`, with the status list `429, 500, 502,
+503`. It does not use the broad `5xx` or `gateway-error` tokens. A `501` or a
+`504` that a provider returns passes straight through and is not retried.
 
 Every request that the listener accepts can be retried. A request body larger than the
 listener's request body limit is rejected with `413` before it reaches the router, so the
@@ -115,10 +123,6 @@ most 64 KiB of the body of an earlier failed attempt before it drops that
 attempt, so a provider that never ends an error body cannot hold the retry or
 grow proxy memory.
 
-Proof: `exhausting_every_member_returns_the_last_upstream_response` and
-`a_failed_attempt_with_an_endless_body_is_abandoned_not_drained` in
-`crates/proxy-http/tests/router_aggregate.rs`.
-
 Backoff between retries is fully jittered exponential: attempt *n* waits a
 duration drawn uniformly from `[0, min((2ⁿ-1) × 25ms, 250ms)]` — fixed
 defaults in this configuration format (there is no field to change
@@ -138,13 +142,10 @@ flag that tells the two cases apart:
 | The provider closes the connection, or the connection fails | `503` | `UC` |
 | The provider sends bytes that are not valid HTTP | `502` | `UPE` |
 
-Only a protocol error gives `502`. A reset gives `503`
-(`codec_error_reply`, `crates/proxy-http/src/router.rs:2823-2848`).
-The tests are `an_upstream_that_closes_before_headers_records_503_and_the_uc_flag`
-and `a_garbled_upstream_response_records_and_renders_the_upe_flag`
-(`crates/proxy-http/tests/response_flags.rs`).
-Before this change, a failed send gave `502` with `UC`. Update any client
-or alert that matches on `502` for this case.
+Only a protocol error gives `502`. A reset gives `503`. Match on `503` with
+the flag `UC` or `UR` for a failed or closed provider connection. An older
+release answered `502` with `UC` for a failed send. Update any client or
+alert that still matches on `502` for this case.
 
 ## Downstream timeouts: how long a client has
 
@@ -162,8 +163,7 @@ detail.
 | Total life | `listen.max_stream_duration` | none | Before response headers: `504` (flag `UMSDR`). After: the stream ends without a clean finish. |
 
 Set a request timeout to `0s` to disable it. The defaults above are the
-`llmproxy` dialect defaults
-(`crates/proxy-simple-config/src/model.rs:183-184`). A raw bootstrap
+`llmproxy` dialect defaults. A raw bootstrap
 configuration has both HTTP timeouts disabled until it sets them. The
 handshake default of `10s` applies in both front-ends.
 
@@ -224,15 +224,42 @@ equivalent in this configuration format's schema, both `bool`, both default
 | `include_request_attempt_count` | Sets `x-envoy-attempt-count` on the request forwarded upstream, to this attempt's own number (`1` on the first try, `2` on the first retry, and so on). |
 | `include_attempt_count_in_response` | Sets `x-envoy-attempt-count` on the response sent to the downstream client, to the *total* number of attempts the request took. |
 
-Both flags are denormalized onto every route under the vhost at config-lower
-time (`RouteEntry::include_request_attempt_count`/
-`include_attempt_count_in_response` in `crates/proxy-config/src/ir.rs`) and
-proven end to end by `crates/proxy-http/tests/router_retry.rs`:
-`attempt_count_request_header_is_1_on_the_first_attempt`,
-`attempt_count_request_header_increments_on_retry`,
-`attempt_count_response_header_carries_the_total_attempts_made`, and
-`attempt_count_headers_are_absent_when_both_flags_are_off` for the default
-case. A retry that lands on a `fallbacks` member (see
+Both flags are off by default. A retry that lands on a `fallbacks` member (see
 [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/))
 increments the same counter — a fallback attempt is a retry against a
 different member, not a separate count.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- Dialect retry tokens and the fixed status list: `lower_route` in
+  `crates/proxy-simple-config/src/lower.rs`. Dialect timeout defaults:
+  `crates/proxy-simple-config/src/model.rs`. The retry engine's trigger set:
+  unit tests in `crates/proxy-http/src/retry.rs`, for example
+  `gateway_error_is_502_503_504_or_no_response_only` (504 needs the
+  `gateway-error` token, which the dialect never sets).
+- Connect timeout: `crates/proxy-cluster/src/pool.rs`.
+- Stream timeouts, in `crates/proxy-http/tests/stream_timeouts.rs`:
+  `a_provider_that_never_answers_is_cut_and_its_permit_released`,
+  `a_stream_that_keeps_producing_outlives_the_idle_timeout`,
+  `a_stream_that_goes_quiet_mid_body_is_cut`, and
+  `max_stream_duration_cuts_a_stream_that_is_still_producing`. Route idle
+  timeout `0s`: `route_idle_timeout_zero_disables_the_idle_timeout_for_the_route`
+  in `crates/proxy/tests/route_idle_timeout_e2e.rs`.
+- Last response returned when retries end, and the 64 KiB drain limit:
+  `exhausting_every_member_returns_the_last_upstream_response` and
+  `a_failed_attempt_with_an_endless_body_is_abandoned_not_drained` in
+  `crates/proxy-http/tests/router_aggregate.rs`.
+- Reset and close flags: `codec_error_reply` in
+  `crates/proxy-http/src/router.rs`. Tests in
+  `crates/proxy-http/tests/response_flags.rs`:
+  `an_upstream_that_closes_before_headers_records_503_and_the_uc_flag` and
+  `a_garbled_upstream_response_records_and_renders_the_upe_flag`.
+- Attempt-count flags: `RouteEntry::include_request_attempt_count` and
+  `include_attempt_count_in_response` in `crates/proxy-config/src/ir.rs`.
+  Tests in `crates/proxy-http/tests/router_retry.rs`:
+  `attempt_count_request_header_is_1_on_the_first_attempt`,
+  `attempt_count_request_header_increments_on_retry`,
+  `attempt_count_response_header_carries_the_total_attempts_made`, and
+  `attempt_count_headers_are_absent_when_both_flags_are_off`.
