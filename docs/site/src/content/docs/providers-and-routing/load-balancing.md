@@ -1,10 +1,10 @@
 ---
 title: Load balancing
 description: "How a cluster picks one of its endpoints. A dialect provider has one endpoint; balancing needs an Envoy bootstrap."
-summary: Which `lb_policy` values a cluster can actually run, why two are
+summary: Which `lb_policy` values a cluster can run, why two are
   rejected at load time rather than approximated, and why load balancing has
   nothing to choose between in the plain configuration format.
-lastUpdated: 2026-10-13
+lastUpdated: 2026-10-18
 related:
   - providers-and-routing/providers-and-clusters
   - providers-and-routing/failover-and-aggregates
@@ -13,44 +13,44 @@ related:
 
 # Load balancing
 
-Load balancing picks a host among a cluster's endpoints. This page is about
-the engine's `lb_policy` support in general — see
+Load balancing picks one host among a cluster's endpoints. Use it when one
+cluster has several endpoints and you want to spread requests across them.
+
+To enable it, write a cluster with several endpoints and an `lb_policy` in an
+Envoy bootstrap configuration. The `llmproxy` dialect gives each provider
+exactly one endpoint, so it has no load-balancing setting. See
 [Providers and clusters](../../providers-and-routing/providers-and-clusters/)
-first if you have not read it, because it changes what this page even means
-for this configuration format.
+for the reason. The
+[worked example](#bootstrap-configuration-a-worked-weighted-example) at the
+end of this page shows the Envoy form.
 
 ## In this configuration format, there is nothing to balance
 
 Every `providers.<name>` entry lowers to a cluster with exactly one endpoint
 — the host and port parsed from `base_url`. Lowering hardcodes that
-cluster's `lb_policy` to `ROUND_ROBIN`
-(`crates/proxy-simple-config/src/lower.rs`'s `lower_provider`), but with one
+cluster's `lb_policy` to `ROUND_ROBIN`, but with one
 host, round robin (or any other policy) always returns the same host. There
 is no field in this schema version to give one provider a second endpoint,
 so a policy choice here has no observable effect. Real load balancing across
 more than one endpoint is only reachable through a bootstrap configuration,
 covered below.
 
-## What a cluster's `lb_policy` actually does (bootstrap configuration)
+## What a cluster's `lb_policy` does (bootstrap configuration)
 
 | `lb_policy` | Status | Notes |
 |---|---|---|
 | `ROUND_ROBIN` | Implemented | A plain rotating cursor when every candidate host has equal weight; smooth weighted round robin (nginx's algorithm) when weights differ, so a 5:1 weight split interleaves as `A A A B A A`, not batched as `A A A A A B`. |
 | `LEAST_REQUEST` | Implemented | Power-of-two-choices: draws `choice_count` candidates (2 by default) uniformly and picks whichever has fewer active requests. See "What `LEAST_REQUEST` counts" below. When every host has the same count, including when all are idle, the pick is uniform random. |
 | `RANDOM` | Implemented | Uniform pick over the candidate set. |
-| `RING_HASH` | **Rejected at load** | Session affinity only holds if every proxy in a fleet hashes identically; that bit-exact parity is unproven here, and there is no differential test harness yet to prove it. Configuring it is a load error naming the policy, not a silent substitution of another one. |
-| `MAGLEV` | **Rejected at load** | Same reason as `RING_HASH`: no bit-exact parity, no differential harness, rejected rather than approximated. |
+| `RING_HASH` | **Rejected at load** | Session affinity only holds if every proxy in a fleet hashes identically. The proxy does not guarantee that bit-exact parity with Envoy, so it rejects the policy. Configuring it is a load error that names the policy. The proxy never substitutes another policy. |
+| `MAGLEV` | **Rejected at load** | Same reason as `RING_HASH`: the proxy rejects the policy and does not approximate it. |
 | `CLUSTER_PROVIDED` | Reserved | Only legal on an `envoy.clusters.aggregate` cluster — see [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/). Required there (an aggregate has no hosts of its own to run a policy over) and rejected everywhere else, since there is no other cluster-provided host-picking implemented. |
 
-Rejection happens at config load, with the policy named in the error, both
-for a raw bootstrap configuration's `lb_policy` field and for the equivalent check
-`proxy-cluster` runs at cluster-build time
-(`crates/proxy-config/src/lower.rs`'s `convert_cluster`;
-`ring_hash_is_rejected_at_build_time` and `maglev_is_rejected_at_build_time`
-in `crates/proxy-cluster/src/load_balancer.rs`). The project's strict-config rule forbids silently substituting one
-policy for another, so a config asking for session affinity that cannot be honored
-fails loudly instead of serving traffic under a policy that quietly breaks
-that affinity.
+Rejection happens at config load, with the policy named in the error. The
+cluster build makes the same check. The strict-config rule forbids silent
+substitution of one policy for another. A config that asks for session
+affinity that the proxy cannot honor fails at load. It does not serve traffic
+under a policy that breaks that affinity.
 
 ## What `LEAST_REQUEST` counts
 
@@ -74,39 +74,21 @@ in-flight requests keep their count and decrement the right counter. A new
 address starts at 0. A request counts from the moment the attempt starts, so
 a long SSE stream keeps its host loaded until the stream ends.
 
-Proof: `Host::begin_request` and `ActiveRequestGuard` in
-`crates/proxy-cluster/src/lib.rs`; the attempt guard in
-`crates/proxy-http/src/router.rs`; the tests
-`streaming_requests_are_counted_and_spread_by_least_request`,
-`downstream_dropping_a_streaming_response_releases_the_count`,
-`a_failed_attempt_leaves_no_count_and_the_retry_is_counted`,
-`an_accepted_upgrade_holds_the_count_for_the_tunnel_lifetime`,
-`a_declined_upgrade_holds_the_count_until_the_response_body_ends`, and
-`a_hedge_counts_each_attempted_host_once_and_releases_both` in
-`crates/proxy-http/tests/router_least_request.rs`; and
-`health_transition_rebuild_shares_the_in_flight_counter`,
-`ejection_rebuild_shares_the_in_flight_counter`, and
-`carry_over_shares_the_in_flight_counter_with_the_old_snapshot` in
-`crates/proxy-cluster`.
-
 ## What every policy shares: priority spillover and the panic threshold
 
 Two behaviors sit above the policy choice and apply identically regardless
-of which of the three implemented policies a cluster runs
-(`crates/proxy-cluster/src/load_balancer.rs`'s `HostPicker`):
+of which of the three implemented policies a cluster runs:
 
 - **Priority spillover.** Traffic prefers priority 0 hosts and only spills to
   priority 1 as priority 0's healthy fraction drops, using a 1.4x
   overprovisioning factor: at 50% of priority 0 healthy, priority 0 still
   gets `min(100, 50 × 1.4) = 70%` of traffic, and the remaining 30% spills to
-  priority 1 — verified at exactly that 70/30 split over 100,000 picks by
-  `half_healthy_priority_zero_spills_thirty_percent_to_priority_one`.
+  priority 1.
 - **Healthy-panic threshold.** If fewer than 50% of the hosts at the selected
   priority are healthy, selection widens to every host at that priority
   (healthy and unhealthy) rather than narrowing to an ever-smaller healthy
   set that would concentrate load dangerously. Exactly 50% healthy does
-  **not** panic — the check is strictly less than 50%
-  (`panic_threshold_boundary_exactly_50_percent_does_not_panic`).
+  **not** panic — the check is strictly less than 50%.
 
 Both need more than one endpoint and, for priority spillover, more than one
 priority to have any visible effect — reachable in a bootstrap configuration,
@@ -129,9 +111,7 @@ gives the semantics of each:
   LLM streaming keeps a request "active" far longer than time-to-headers.
 - `max_connections` counts the open upstream sockets of one cluster, across
   every worker and every host. The dial claims a slot before it opens the
-  socket, so an over-budget cluster never opens it
-  (`crates/proxy-cluster/src/pool.rs`'s `ConnectPool::new_stream`, proven by
-  `max_connections_is_enforced_at_dial_and_released_on_drop`). An idle pooled
+  socket, so an over-budget cluster never opens it. An idle pooled
   connection holds its slot. The slot returns when the socket closes, not when
   the cache entry goes. The sweep, the peer, and the removal of an endpoint all
   close sockets. See
@@ -141,16 +121,12 @@ gives the semantics of each:
   it can acquire a pending slot. A full pending queue produces the same
   immediate overload response.
 - `max_retries` limits the retries in flight at one time. The router asks for a
-  retry slot before each retry (`sleep_backoff_and_reserve_retry` in
-  `crates/proxy-http/src/router.rs`). A request that cannot get one stops
-  retrying and the access log shows the `URX` flag
-  (`retry_limit_exceeded_renders_the_urx_response_flag`).
+  retry slot before each retry. A request that cannot get one stops retrying
+  and the access log shows the `URX` flag.
 
 An exhausted `max_requests`, `max_connections`, or `max_pending_requests`
 budget produces the same outcome: `503`, the `UO` response flag, and an
-`x-envoy-overloaded: true` response header
-(`max_requests_zero_records_and_renders_the_uo_flag` in
-`crates/proxy-http/tests/response_flags.rs`).
+`x-envoy-overloaded: true` response header.
 
 ## Bootstrap configuration: a worked weighted example
 
@@ -179,3 +155,40 @@ candidates to choose from — is not expressible in the plain configuration
 format at all; see
 [Providers and clusters](../../providers-and-routing/providers-and-clusters/)
 for why.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- Dialect lowering sets `ROUND_ROBIN`: `lower_provider` in
+  `crates/proxy-simple-config/src/lower.rs`. Load-time rejection of
+  `RING_HASH` and `MAGLEV`: `convert_cluster` in
+  `crates/proxy-config/src/lower.rs`. Build-time tests:
+  `ring_hash_is_rejected_at_build_time` and
+  `maglev_is_rejected_at_build_time` in
+  `crates/proxy-cluster/src/load_balancer.rs`.
+- Spillover and panic threshold: `HostPicker` in the same file. Tests:
+  `half_healthy_priority_zero_spills_thirty_percent_to_priority_one` (70/30
+  split over 100,000 picks) and
+  `panic_threshold_boundary_exactly_50_percent_does_not_panic`.
+- `LEAST_REQUEST` count: `Host::begin_request` and `ActiveRequestGuard` in
+  `crates/proxy-cluster/src/lib.rs`, and the attempt guard in
+  `crates/proxy-http/src/router.rs`. Tests in
+  `crates/proxy-http/tests/router_least_request.rs`:
+  `streaming_requests_are_counted_and_spread_by_least_request`,
+  `downstream_dropping_a_streaming_response_releases_the_count`,
+  `a_failed_attempt_leaves_no_count_and_the_retry_is_counted`,
+  `an_accepted_upgrade_holds_the_count_for_the_tunnel_lifetime`,
+  `a_declined_upgrade_holds_the_count_until_the_response_body_ends`, and
+  `a_hedge_counts_each_attempted_host_once_and_releases_both`. Counter
+  sharing across snapshot rebuilds, in `crates/proxy-cluster`:
+  `health_transition_rebuild_shares_the_in_flight_counter`,
+  `ejection_rebuild_shares_the_in_flight_counter`, and
+  `carry_over_shares_the_in_flight_counter_with_the_old_snapshot`.
+- Circuit breakers: `ConnectPool::new_stream` in
+  `crates/proxy-cluster/src/pool.rs` (test
+  `max_connections_is_enforced_at_dial_and_released_on_drop`);
+  `sleep_backoff_and_reserve_retry` in `crates/proxy-http/src/router.rs`
+  (test `retry_limit_exceeded_renders_the_urx_response_flag`);
+  `max_requests_zero_records_and_renders_the_uo_flag` in
+  `crates/proxy-http/tests/response_flags.rs`.

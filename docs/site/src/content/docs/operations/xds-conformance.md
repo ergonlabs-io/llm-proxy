@@ -1,11 +1,9 @@
 ---
 title: xDS conformance
-description: "How the Envoy-mode xDS client is checked against Envoy behavior. Contributor and advanced material."
-summary: An opt-in, docker-based check that runs the real ADS client
-  against go-control-plane, the reference xDS implementation, instead of
-  our own test harness. What it checks, its current status, and how to
-  run it.
-lastUpdated: 2026-09-07
+description: "Check the Envoy-mode xDS client against go-control-plane, a reference xDS server. Advanced and contributor material."
+summary: An opt-in, docker-based check that runs the real ADS client against
+  go-control-plane. What it checks, what it does not check, and how to run it.
+lastUpdated: 2026-10-18
 related:
   - operations/config-reload
   - configuration/configuration-file
@@ -13,122 +11,92 @@ related:
 
 # xDS conformance
 
-llm-proxy can receive its cluster and listener configuration dynamically,
-over xDS/ADS, from bootstrap `dynamic_resources`
-(`crates/proxy-config/src/lower.rs`'s `convert_dynamic_resources`,
-`crates/proxy/src/main.rs`'s ADS client wiring). `make
-xds-conformance` runs the real client, `proxy_xds::AdsClient`, against a real
-**go-control-plane** server — the reference xDS implementation, the same one
-a production Envoy talks to — instead of `testing/controlplane`'s own
-scripted stand-in.
+Use this check to verify the Envoy-mode xDS client against an independent
+server. It is for contributors and for operators who change the xDS client or
+who want evidence that it speaks the protocol correctly. You do not need it to
+run the proxy.
 
-## Why a separate check
+In Envoy mode, llm-proxy can receive its cluster and listener configuration
+over xDS/ADS from bootstrap `dynamic_resources`. The `llmproxy` dialect has no
+`dynamic_resources`. The command `make xds-conformance` runs the real ADS
+client against a real **go-control-plane** server. go-control-plane is the
+reference xDS implementation that Envoy deployments use.
 
-`testing/controlplane`'s puppet server is written by this project, for this
-project. It cannot catch a case where our client and our test server agree
-with each other about the protocol and are both wrong — the two sides were
-never independent. go-control-plane is: an unrelated implementation that
-real Envoy deployments already trust, so agreement with it is evidence about
-the protocol itself, not just about internal consistency.
-
-## Why it is not part of `make ci`
-
-It needs `docker` and a working daemon, and `make ci` is meant to stay
-hermetic. So this is an opt-in target with a stated cadence instead: run it
-before the v0.3.2 ship gate is declared closed (`internal-docs/MILESTONES.md`'s
-v0.3.2 section names this target as the gate's verification).
-
-An opt-in target nobody runs reads as coverage it does not provide — the
-Makefile records this reasoning directly above the target, next to the
-warning that this project has already lost a whole work package's worth of
-coverage to exactly that pattern once (`local_openai_smoke.rs`, an `#[ignore]`d
-end-to-end smoke test that had not run since the feature it protected
-landed).
-
-## What it checks
-
-1. The client connects and opens `StreamAggregatedResources` against a real
-   go-control-plane server.
-2. The `node.id` the client sends is one go-control-plane's snapshot cache
-   actually routes on — an unrecognized node ID produces an explicit, named
-   rejection rather than a silent hang, which is the same class of bug an
-   earlier increment already found once (the client sending no node
-   identity at all).
-3. The client receives a CDS (cluster) response and accepts it.
-4. go-control-plane observes that acceptance as an ACK, not a NACK.
-5. The same exchange over TLS: go-control-plane terminates TLS with
-   `grpc-go`'s own credentials, and the client dials it through the channel
-   the binary builds from the ADS cluster's `UpstreamTlsContext`
-   (`proxy_core::ads_transport::ads_channel`). A server certificate from a
-   CA the client does not trust fails the stream before any request is sent.
-
-## What it does not check
-
-- **LDS, RDS, EDS, or SDS.** The fixture serves one CDS resource only. RDS,
-  EDS, and SDS are separate work packages.
-- **Reconnect, resync, or backoff.** The fixture drives exactly one stream;
-  it does not drop the connection or assert on retry timing.
-- **The real `llm-proxy` binary's own wiring** — bootstrap parsing and
-  applying a received snapshot to the running cluster manager. The fixture
-  drives `proxy_xds::AdsClient` directly so a failure here localizes to the
-  wire protocol itself, not to the binary's own plumbing around it.
-
-## What its first run found
-
-On the fixture's first real run against go-control-plane (2026-09-06),
-**both scenarios timed out.** The client opened the stream — go-control-plane's
-own log showed it — then never sent its first request, and so never got a
-response.
-
-The cause was an ordering problem in `AdsClient::run_once`
-(`crates/proxy-xds/src/client.rs`): it awaited the stream handle from
-`stream_aggregated_resources` before sending the first request. `tonic`'s
-generated client does not return that handle until it has received the
-server's response headers, and go-control-plane (built on `grpc-go`) does
-not send response headers until it has read a first message from the
-client. Each side waited on the other.
-
-Our own scripted test server (`testing/controlplane`) never surfaced this,
-because it sends response headers as soon as its handler starts, before
-reading anything from the client — a different, more permissive behavior
-than a real `grpc-go` server. This is exactly the failure mode this target
-exists to catch: two implementations we control agreeing with each other
-and both being wrong.
-
-`run_once` now queues every initial request into the outbound channel
-**before** it opens the stream, so the requests are waiting for `tonic` to
-send the moment the connection is live. See
-`testing/xds-conformance/README.md` for the full account.
-
-## Running it
+## Run the check
 
 ```sh
 make xds-conformance
 ```
 
-Needs `docker` on `PATH` and a running daemon. If docker is missing, the
-target fails loudly — exit 1, with the reason printed — rather than skipping
-silently. Every wait inside the fixture is bounded by a timeout, so an
-unreachable registry, a container that never becomes ready, or a client that
-never gets a response all fail as a named, readable error instead of hanging
-the run.
+The check needs `docker` on `PATH` and a running daemon. If docker is
+missing, the target fails with exit code 1 and prints the reason. It does not
+skip silently. Every wait in the check has a timeout. An unreachable registry,
+a container that never becomes ready, or a client that gets no response each
+fail with a named error instead of a hang.
 
-To iterate on the fixture itself, without the `Makefile` wrapper:
+To iterate on the check without the `Makefile` wrapper:
 
 ```sh
 cd testing/xds-conformance
 cargo test --test go_control_plane -- --ignored --nocapture --test-threads=1
 ```
 
-`testing/xds-conformance` is its own Cargo workspace, not a member of the
-root one, so `cargo build --workspace` and `make ci` at the repo root never
-see it. It depends on `proxy-xds`, `proxy-api`, `proxy-config`, and `proxy-core` by path —
-the real crates, not a copy.
+`make ci` does not run this check. It needs docker, and `make ci` stays
+hermetic. Run it when you change the xDS client or its transport.
+
+## Why a separate check
+
+The repository also has a scripted test server (`testing/controlplane`). This
+project wrote it, so the client and the server can agree with each other and
+both be wrong. go-control-plane is an unrelated implementation. Agreement with
+it is evidence about the protocol itself.
+
+## What it checks
+
+1. The client connects and opens `StreamAggregatedResources`.
+2. The `node.id` that the client sends is one that the go-control-plane
+   snapshot cache routes on. An unknown node ID produces a named rejection,
+   not a hang.
+3. The client receives a CDS (cluster) response and accepts it.
+4. go-control-plane sees that acceptance as an ACK, not a NACK.
+5. The same exchange works over TLS. go-control-plane terminates TLS with
+   `grpc-go` credentials. The client dials through the channel that the
+   binary builds from the ADS cluster's `UpstreamTlsContext`. A server
+   certificate from a CA that the client does not trust fails the stream
+   before the client sends a request.
+
+## What it does not check
+
+- **LDS, RDS, EDS, or SDS.** The check serves one CDS resource.
+- **Reconnect, resync, or backoff.** The check drives one stream. It does not
+  drop the connection or measure retry timing.
+- **The `llm-proxy` binary.** The check drives the client library directly,
+  so a failure points at the wire protocol and not at bootstrap parsing or at
+  applying a snapshot to the running cluster manager.
 
 ## The pinned reference version
 
-**go-control-plane `v0.13.4`.** Pinned deliberately: an unpinned reference
-implementation would make a future red run ambiguous between "we regressed"
-and "upstream changed", which defeats the point of an independent check. If
-this version is ever bumped, `testing/xds-conformance/README.md` lists the
-three places that must move together.
+The check pins **go-control-plane `v0.13.4`**. A fixed version means a red run
+shows a regression in llm-proxy and not a change upstream.
+`testing/xds-conformance/README.md` lists the three places that change
+together when you update the version.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- The check lives in `testing/xds-conformance`. It is its own Cargo
+  workspace, so `cargo build --workspace` and `make ci` at the repository root
+  do not build it. It depends on `proxy-xds`, `proxy-api`, `proxy-config`,
+  and `proxy-core` by path.
+- Dynamic resources are lowered by `convert_dynamic_resources` in
+  `crates/proxy-config/src/lower.rs`. The binary wires the client in
+  `crates/proxy/src/main.rs`. The TLS channel comes from
+  `proxy_core::ads_transport::ads_channel`.
+- The first run of this check found a deadlock in `AdsClient::run_once`
+  (`crates/proxy-xds/src/client.rs`). `tonic` returns the stream handle only
+  after it receives response headers. `grpc-go` sends headers only after it
+  reads a first client message. The client now queues its initial requests
+  before it opens the stream. The scripted server did not show this, because
+  it sends headers at once. `testing/xds-conformance/README.md` has the full
+  account.

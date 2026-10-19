@@ -4,7 +4,7 @@ description: "Let a client send model \"auto\" and have the proxy replace it wit
 summary: How the reserved model name `auto` resolves to a real model for each
   tenant, what the provider and the logs see, and the Envoy-mode filter and
   its ordering rules.
-lastUpdated: 2026-10-13
+lastUpdated: 2026-10-18
 related:
   - configuration/configuration-file
   - providers-and-routing/failover-and-aggregates
@@ -19,20 +19,19 @@ name that the operator chose for the caller's tenant. The client does not
 choose a provider. The operator chooses the model, and the routes choose the
 provider.
 
+Use `auto` when the operator, not the client, must decide which model a
+tenant gets. To enable it in the `llmproxy` dialect, add a top-level `auto`
+block with a `default` model. See [Simple config](#simple-config).
+
 `auto` is a model alias, not a provider selector. The resolver picks a model
 name. The `routes` and `models` entries then pick the provider and the
-failover chain for that name
-(`crates/proxy-filters/src/model_resolver_filter.rs`, module doc).
+failover chain for that name.
 
 ## What a request sees
 
-A request whose `model` is not `auto` is not changed
-(`a_concrete_model_is_routed_unchanged` in
-`crates/proxy-simple-config/tests/model_resolver_routing.rs`).
+A request whose `model` is not `auto` is not changed.
 
-For a request whose `model` is `auto`, the proxy does these steps
-(`ModelResolverFilterInstance::resolve`,
-`crates/proxy-filters/src/model_resolver_filter.rs`):
+For a request whose `model` is `auto`, the proxy does these steps:
 
 1. It looks up the authenticated tenant in the rules.
 2. If the tenant has no rule, it uses the default model. A request with no
@@ -42,16 +41,15 @@ For a request whose `model` is `auto`, the proxy does these steps
 
 The refusal body is `no model is configured for `auto``. The
 `%RESPONSE_CODE_DETAILS%` value is `auto_model_not_configured`. No provider
-is dialled
-(`auto_with_no_rule_is_refused_with_400_and_dials_nothing`).
+is dialled.
 
 The resolver runs at the end of the request body, because the model is read
 from the body. It decides once for each request.
 
 ## Simple config
 
-Use the top-level `auto` key
-(`schema/llmproxy-v0.schema.json`, property `auto` and `$defs/AutoModel`).
+Use the top-level `auto` key. The schema is `schema/llmproxy-v0.schema.json`
+(property `auto` and `$defs/AutoModel`).
 
 ```yaml
 version: 0
@@ -74,9 +72,8 @@ auto:
 With this file, a request for `auto` goes to the `openai` provider as
 `gpt-4o-mini`.
 
-The `providers` and `routes` fields follow the schema
-(`$defs/Provider`, `$defs/Route`). The example is not run end to end. The
-`auto` block is proven by the tests cited on this page.
+The `providers` and `routes` fields follow the schema (`$defs/Provider`,
+`$defs/Route`).
 
 ### Per-tenant models
 
@@ -106,8 +103,7 @@ Tenant `acme` gets `claude-sonnet`. Every other tenant gets `gpt-4o-mini`.
 
 ### Load errors
 
-The proxy checks the block at load time (`validate_auto`,
-`crates/proxy-simple-config/src/parse.rs`). Each error names its field path.
+The proxy checks the block at load time. Each error names its field path.
 
 | Field path | Cause |
 |---|---|
@@ -125,12 +121,9 @@ is an ordinary model name.
 ## What the provider and the logs see
 
 **Provider.** The proxy replaces the `model` in the request body after it
-picks the cluster (`rewrite_cluster_provider_model`,
-`crates/proxy-http/src/router.rs`). The provider gets the resolved name. If
+picks the cluster. The provider gets the resolved name. If
 the cluster maps that name to an upstream model, the provider gets the
-upstream model. The provider never gets `auto`
-(`auto_resolved_to_an_unmapped_alias_reaches_its_provider_as_the_alias` and
-`auto_resolved_to_a_mapped_alias_reaches_its_provider_as_the_upstream_model`).
+upstream model. The provider never gets `auto`.
 
 **Client.** The proxy sends the provider's response to the client without
 change. The `model` field in the response is the model that the provider
@@ -141,18 +134,13 @@ holds the resolved name. It is `-` in a text log, and `null` in a usage
 record, when nothing was resolved. See
 [Access logs](../../observability/access-logs/).
 
-**Price and budgets.** The proxy prices and authorizes the resolved model
-(`StreamInfo::routing_model`, `crates/proxy-http/src/stream_info.rs`; used
-by `usage_filter.rs`, `spend_limit_filter.rs` and `model_authz_filter.rs`).
+**Price and budgets.** The proxy prices and authorizes the resolved model.
 
 ## Envoy mode
 
 The filter is `llmproxy.model_resolver`. Its `typed_config` type is
-`llmproxy.filters.v0.ModelResolver`
-(`crates/proxy-api/vendor/llmproxy/filters/v0/model_resolver.proto`). The
-simple config lowers `auto` to this filter
-(`model_resolver_typed_config`,
-`crates/proxy-simple-config/src/lower.rs`).
+`llmproxy.filters.v0.ModelResolver`. The `llmproxy` dialect lowers `auto` to
+this filter.
 
 ```yaml
 http_filters:
@@ -178,12 +166,11 @@ http_filters:
 | `rules.tenants[].tenant` | Required and unique. Matches the tenant that `llmproxy.auth` wrote. |
 | `rules.tenants[].model` | Required. Must not be `auto` and must not contain `*`. |
 
-Exactly one resolver branch must be set. Today the only branch is `rules`.
+Exactly one resolver branch must be set. The only branch is `rules`.
 
 ### Filter order
 
-The proxy checks the order at load time (`check_lane_h_filter_order`,
-`crates/proxy-config/src/lower.rs`). A wrong order is a load error.
+The proxy checks the order at load time. A wrong order is a load error.
 
 - `llmproxy.auth` must come before `llmproxy.model_resolver`.
 - `llmproxy.body_rewrite` must come before `llmproxy.model_resolver`.
@@ -191,9 +178,7 @@ The proxy checks the order at load time (`check_lane_h_filter_order`,
 - `llmproxy.body_rewrite` is required. Without it the load fails.
 
 `llmproxy.model_authz` authorizes the resolved model, not `auto`. The
-resolver never widens a grant
-(`a_resolved_model_is_authorized_instead_of_the_trigger`,
-`crates/proxy-filters/src/model_authz_filter.rs`). The simple config does not
+resolver never widens a grant. The simple config does not
 emit `model_authz`, so this applies in Envoy mode only.
 
 ## Limits of this feature
@@ -203,3 +188,25 @@ emit `model_authz`, so this applies in Envoy mode only.
   `rules` is the only branch.
 - The rule key is the tenant only. The resolver does not read the user, the
   prompt, or a header.
+
+## Implementation notes
+
+This section is for maintainers.
+
+- Resolver: `ModelResolverFilterInstance::resolve` in
+  `crates/proxy-filters/src/model_resolver_filter.rs`. Proto:
+  `crates/proxy-api/vendor/llmproxy/filters/v0/model_resolver.proto`.
+- Dialect lowering: `model_resolver_typed_config` in
+  `crates/proxy-simple-config/src/lower.rs`. Load checks: `validate_auto` in
+  `crates/proxy-simple-config/src/parse.rs`. Envoy filter order:
+  `check_lane_h_filter_order` in `crates/proxy-config/src/lower.rs`.
+- Body rewrite: `rewrite_cluster_provider_model` in
+  `crates/proxy-http/src/router.rs`. Pricing model:
+  `StreamInfo::routing_model` in `crates/proxy-http/src/stream_info.rs`.
+- Tests: `a_concrete_model_is_routed_unchanged` in
+  `crates/proxy-simple-config/tests/model_resolver_routing.rs`;
+  `auto_with_no_rule_is_refused_with_400_and_dials_nothing`;
+  `auto_resolved_to_an_unmapped_alias_reaches_its_provider_as_the_alias`;
+  `auto_resolved_to_a_mapped_alias_reaches_its_provider_as_the_upstream_model`;
+  `a_resolved_model_is_authorized_instead_of_the_trigger` in
+  `crates/proxy-filters/src/model_authz_filter.rs`.
