@@ -36,6 +36,11 @@ zeroize = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+default = []
+# Entry points the cargo-fuzz crate (fuzz/) calls into; see `src/server/fuzzing.rs`.
+fuzzing = []
+
 [dev-dependencies]
 # `ledger::testing`: a real ledger writer over an encrypted spool in a temp
 # dir, so `/ledger/*` tests read and acknowledge real committed entries.

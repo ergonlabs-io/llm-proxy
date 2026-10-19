@@ -27,7 +27,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [usage_extract, body_prefix_scan, dialect_config]
+        target:
+          - usage_extract
+          - body_prefix_scan
+          - dialect_config
+          - model_wildcard
+          - vhost_domain
+          - route_model_glob
+          - access_log_format
+          - admin_body
+          - virtual_key_auth
+          - router_body
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

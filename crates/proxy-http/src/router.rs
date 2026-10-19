@@ -105,6 +105,11 @@ impl Drop for HedgedResponse {
     }
 }
 
+// Compiled under `test` too, so `make tq` keeps the seam building even though
+// only the nightly-only fuzz crate enables the feature.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzzing;
 mod guarded;
 mod timing;
 // Rust note: `pub(crate)` (not private) so `access_logging::LoggingBody`, a

@@ -42,6 +42,11 @@ serde_json = { workspace = true }
 # than unit-testing the projection.
 h2 = "0.4"
 
+[features]
+default = []
+# Entry points the cargo-fuzz crate (fuzz/) calls into; see `src/router/fuzzing.rs`.
+fuzzing = []
+
 [dev-dependencies]
 # Rust note: these power the hyper capability spike
 # (tests/hyper_spike.rs) only -- the real data-plane dependency surface above

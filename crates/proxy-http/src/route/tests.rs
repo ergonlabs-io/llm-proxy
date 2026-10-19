@@ -521,6 +521,43 @@ fn header_regex_match() {
     ));
 }
 
+/// Found by the `route_model_glob` fuzz target: the dialect publishes a
+/// non-ASCII body model onto `x-llmproxy-model`, and its route never matched.
+#[test]
+fn header_matchers_match_a_utf8_value_beyond_ascii() {
+    let fx = Fixture::new(
+        r#"
+                  name: rt
+                  virtual_hosts:
+                    - name: v1
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/", headers: [{ name: "x-m", string_match: { safe_regex: { regex: "a.*b" } } }] }
+                          route: { cluster: regex }
+                        - match: { prefix: "/", headers: [{ name: "x-m", string_match: { prefix: "caf" } }] }
+                          route: { cluster: prefix }
+"#,
+    );
+    let cluster = |value: &[u8]| {
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-m", http::HeaderValue::from_bytes(value).unwrap());
+        match match_route(fx.table(), &req("h", "/", &hdrs)) {
+            RouteMatch::Found { route, .. } => match &route.action {
+                RouteActionIR::Forward(f) => match &f.target {
+                    ForwardTarget::Cluster(c) => Some(c.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    assert_eq!(cluster("aéb".as_bytes()).as_deref(), Some("regex"));
+    assert_eq!(cluster("café".as_bytes()).as_deref(), Some("prefix"));
+    // Not UTF-8: matches nothing.
+    assert_eq!(cluster(&[b'a', 0xff, b'b']), None);
+}
+
 #[test]
 fn header_present_true_and_false() {
     let fx = Fixture::new(

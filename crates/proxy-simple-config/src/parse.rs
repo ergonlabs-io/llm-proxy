@@ -631,7 +631,7 @@ fn validate_auto(config: &SimpleConfig) -> Result<(), ConfigError> {
 /// Matches `name` against a `routes[].model` or `models` key glob: `*`
 /// matches any run of characters, the same grammar `lower::model_glob_matcher`
 /// emits as a header matcher.
-fn glob_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or_default();
     let Some(mut rest) = name.strip_prefix(first) else {
