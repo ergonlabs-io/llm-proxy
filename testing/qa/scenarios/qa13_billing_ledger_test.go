@@ -223,11 +223,14 @@ func (p *qa13Proxy) drain() []qa13Entry {
 			}
 		}
 		all = append(all, fresh...)
-		if len(entries) == 0 {
-			p.t.Fatalf("nothing left to acknowledge and not admitting\n--- proxy log ---\n%s", p.proc.Log())
+		// With nothing new to read, repeat the last acknowledgement: the
+		// documented loop acknowledges until `admitting` is true, and a
+		// repeat retries a reserve the previous one could not put back.
+		through := acked
+		if len(entries) > 0 {
+			through = entries[len(entries)-1].Cursor
 		}
 		var ack qa13Ack
-		through := entries[len(entries)-1].Cursor
 		status, body := p.adminTry("POST", fmt.Sprintf("/ledger/ack?through=%d", through), &ack)
 		if status != http.StatusOK || ack.AcknowledgedThrough != through {
 			p.t.Fatalf("full-range ack through=%d: status %d: %s\n--- proxy log ---\n%s", through, status, body, p.proc.Log())

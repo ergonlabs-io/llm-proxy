@@ -606,6 +606,15 @@ impl MetadataSpool {
             return Err(Error::InvalidAcknowledgement);
         }
         if through_sequence <= self.state.acknowledged {
+            // Nothing new to delete, but an earlier acknowledgement may have
+            // spent the reserve and failed to put it back. With everything
+            // acknowledged, a repeat is the consumer's only way to reopen
+            // admissions, so it retries the reserve. With the reserve held,
+            // admissions are already open or wait for space a repeat cannot
+            // free.
+            if !self.headroom {
+                return self.restore_headroom();
+            }
             return Ok(());
         }
         let result = match self.acknowledge_prefix(through_sequence) {
@@ -728,6 +737,10 @@ impl MetadataSpool {
     fn restore_headroom(&mut self) -> Result<()> {
         if !self.headroom {
             self.quota.arm(self.database_cap);
+            #[cfg(test)]
+            if self.hooks.take_refused_restore() {
+                self.quota.arm(0);
+            }
             let zeros = vec![0u8; self.headroom_bytes()];
             let result = self.write_headroom(Some(&zeros));
             match self.settle(result) {

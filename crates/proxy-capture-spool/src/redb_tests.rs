@@ -1431,3 +1431,38 @@ fn a_refused_acknowledgement_falls_back_to_shorter_prefixes() {
     assert!(spool.stats().unwrap().headroom_reserved);
     spool.append(b"admitted again").unwrap();
 }
+
+/// Putting the reserve back after an acknowledgement at the ceiling can be
+/// refused too, which leaves admissions closed with nothing left to
+/// acknowledge. Repeating the last acknowledgement retries the reserve, so the
+/// consumer's "acknowledge until admitting" loop reopens admissions.
+#[test]
+fn a_repeated_acknowledgement_retries_a_reserve_that_did_not_fit() {
+    let temp = TempDir::new().unwrap();
+    let config = test_config(&temp);
+    let hooks = Arc::new(Hooks::default());
+    let mut spool =
+        MetadataSpool::open_with_hooks(config.clone(), key(), [], hooks.clone()).unwrap();
+    assert!(spool
+        .append_batch(&[PAYLOAD; 8])
+        .unwrap()
+        .iter()
+        .all(Result::is_ok));
+    spool.commit().unwrap();
+
+    // The whole-range acknowledgement is refused, so the reserve is spent;
+    // the acknowledgement then succeeds but the reserve does not fit back.
+    hooks.refuse_acknowledgements(1);
+    hooks.refuse_restores(1);
+    spool.acknowledge(8).unwrap();
+    let stats = spool.stats().unwrap();
+    assert_eq!(stats.acknowledged_through_sequence, 8);
+    assert_eq!(stats.retained_records, 0);
+    assert!(!stats.headroom_reserved);
+    assert!(matches!(spool.append(b"refused"), Err(Error::Full)));
+
+    spool.acknowledge(8).unwrap();
+    assert!(spool.stats().unwrap().headroom_reserved);
+    spool.append(b"admitted").unwrap();
+    spool.commit().unwrap();
+}

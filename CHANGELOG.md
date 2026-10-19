@@ -73,6 +73,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   ignored. Provider `api_key_file` and credential files are still re-read on
   each reload.
 
+### Fixed
+
+- Billing ledger: when an acknowledgement at the disk cap could not put the
+  spool's acknowledgement reserve back, admissions stayed closed with nothing
+  left to acknowledge, so the documented "acknowledge until `admitting` is
+  `true`" loop never ended and a restart was needed. Repeating the last
+  acknowledgement now retries the reserve.
+
 ## [0.5.0] - 2026-10-18
 
 ### Added

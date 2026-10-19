@@ -38,6 +38,7 @@ struct Control {
     fail: Option<Fault>,
     pause: Option<(Fault, PathBuf)>,
     refused_acknowledgements: usize,
+    refused_restores: usize,
 }
 impl Hooks {
     /// The next `n` acknowledgement transactions hit the disk ceiling.
@@ -48,6 +49,17 @@ impl Hooks {
         let mut control = self.control.lock().unwrap();
         let refuse = control.refused_acknowledgements > 0;
         control.refused_acknowledgements = control.refused_acknowledgements.saturating_sub(1);
+        refuse
+    }
+    /// The next `n` attempts to put the acknowledgement reserve back hit the
+    /// disk ceiling.
+    pub fn refuse_restores(&self, n: usize) {
+        self.control.lock().unwrap().refused_restores = n;
+    }
+    pub fn take_refused_restore(&self) -> bool {
+        let mut control = self.control.lock().unwrap();
+        let refuse = control.refused_restores > 0;
+        control.refused_restores = control.refused_restores.saturating_sub(1);
         refuse
     }
     pub fn fail(&self, at: Fault) {
