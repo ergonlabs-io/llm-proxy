@@ -105,30 +105,31 @@ fn parse_collection(item: &DynamicMessage, at: &str) -> Result<Collection, Confi
         .get_field_by_name("record")
         .and_then(|v| v.as_enum_number())
         .unwrap_or(0);
-    let record =
-        match (number, member.is_empty()) {
-            (0, true) => Record::Always,
-            (1, false) => Record::IfTrue(member),
-            (2, false) => Record::UnlessFalse(member),
-            (0, false) => {
-                return Err(invalid(
-                    format!("{at}.record_member"),
-                    "is only read by RECORD_IF_TRUE and RECORD_UNLESS_FALSE",
-                ))
-            }
-            (1 | 2, true) => {
-                return Err(invalid(
-                    format!("{at}.record_member"),
-                    "is required by RECORD_IF_TRUE and RECORD_UNLESS_FALSE",
-                ))
-            }
-            (other, _) => return Err(invalid(
+    let record = match (number, member.is_empty()) {
+        (0, true) => Record::Always,
+        (1, false) => Record::IfTrue(member),
+        (2, false) => Record::UnlessFalse(member),
+        (0, false) => {
+            return Err(invalid(
+                format!("{at}.record_member"),
+                "is only read by RECORD_IF_TRUE and RECORD_UNLESS_FALSE",
+            ))
+        }
+        (1 | 2, true) => {
+            return Err(invalid(
+                format!("{at}.record_member"),
+                "is required by RECORD_IF_TRUE and RECORD_UNLESS_FALSE",
+            ))
+        }
+        (other, _) => {
+            return Err(invalid(
                 format!("{at}.record"),
                 format!(
                     "unknown value {other}; expected ALWAYS, RECORD_IF_TRUE or RECORD_UNLESS_FALSE"
                 ),
-            )),
-        };
+            ))
+        }
+    };
     let ttl = item
         .get_field_by_name("owner_ttl_seconds")
         .and_then(|v| v.as_u64())
@@ -698,18 +699,15 @@ mod tests {
             "opaque_members": ["metadata"],
         });
         let rules = parse_config(&config(ok)).expect("valid");
-        assert_eq!(
-            rules.collection(1).owner_ttl,
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(
-            rules.collection(1).record,
-            Record::IfTrue("store".into())
-        );
+        assert_eq!(rules.collection(1).owner_ttl, Some(Duration::from_secs(60)));
+        assert_eq!(rules.collection(1).record, Record::IfTrue("store".into()));
 
         for (json, path) in [
             (json!({}), "typed_config"),
-            (json!({"collections": ["files"]}), "typed_config.collections[0]"),
+            (
+                json!({"collections": ["files"]}),
+                "typed_config.collections[0]",
+            ),
             (
                 json!({"collection": [{"path": "/v1/a", "endpoints": ["x/y"]}]}),
                 "typed_config.collection[0]",
