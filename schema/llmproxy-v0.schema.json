@@ -109,7 +109,6 @@
         "tenants": {
           "description": "Tenant -> check, replacing `default` for that tenant. A tenant is the `tenant` an `auth.keys` entry (or a minted key) authenticates as. Requires an `auth` block.",
           "type": "object",
-          "propertyNames": { "minLength": 1 },
           "additionalProperties": { "$ref": "#/$defs/GuardrailCheck" }
         }
       }
@@ -124,7 +123,7 @@
           "$ref": "#/$defs/HttpGuardrail"
         },
         "failure_mode": {
-          "description": "What happens when the check errors, times out, or the body is longer than `max_body_bytes`. `closed` refuses the request: 503 for an error or a timeout, 413 for a long body. `open` admits it unchecked, counts it as `failure_mode_allowed`, and logs a warning at most once a minute naming the check's host (never the body). Required: there is no default.",
+          "description": "What happens when the check errors, times out, or the body is longer than `max_body_bytes`. `closed` refuses the request: 503 for an error or a timeout, 413 for a long body. `open` admits it unchecked, counts it as `failure_mode_allowed`, and logs a warning at most once a minute naming the check's host and port (never the body). Required: there is no default.",
           "enum": ["closed", "open"]
         }
       }

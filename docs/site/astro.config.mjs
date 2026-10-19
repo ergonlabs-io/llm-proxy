@@ -81,6 +81,7 @@ export default defineConfig({
 						{ label: 'Manage configured virtual keys', slug: 'authentication/managing-secrets' },
 						{ label: 'Tenant provider credentials', slug: 'authentication/tenant-provider-credentials' },
 						{ label: 'External authorization', slug: 'authentication/external-authorization' },
+						{ label: 'Request guardrails', slug: 'authentication/guardrails' },
 					],
 				},
 				{

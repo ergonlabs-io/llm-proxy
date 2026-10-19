@@ -33,6 +33,7 @@ The configuration format for llm-proxy. This file is the single source of truth 
 | `pricing` | [Pricing](#pricing) | no | none | Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused. |
 | `auto` | [AutoModel](#automodel) | no | none | Resolution of the reserved model name `auto`. A request whose `model` is `auto` is routed as the model this block selects: the tenant's entry in `tenants`, otherwise `default`. With no matching entry and no `default`, the request is refused with 400. Any other model name is routed unchanged. The provider's response is passed through unchanged, so its `model` field names the model the provider served, not `auto`. Access logs and usage records show both `auto` and the resolved model. While this block is set, `auto` is reserved: a `models` key or `routes[].model` of exactly `auto` is a load error. Absent means `auto` is an ordinary model name. Examples: `{"default": "gpt-4o-mini", "tenants": {"acme": "claude-sonnet"}}`. |
 | `ledger` | [Ledger](#ledger) | no | none | The billing ledger: one durable, encrypted entry for every request dialled to a provider, including requests charged zero. An entry carries the request record, the amount charged to spend (or the list price on a route with no budget), the scopes charged, and an `instance_id`, a per-start `epoch` and a gapless `seq`. Each request reserves ledger capacity before it is dialled. When none is available (every slot held, the writer failed, or the spool at `max_disk_bytes`), `on_unavailable` decides what happens. Entries are committed in groups. A crash loses every entry not yet committed: normally the entries of about the last `group_commit_interval`, but while the spool is at `max_disk_bytes` the proxy holds entries in memory until an acknowledgement frees space, and a crash loses all of them. The bound in every case is `max_reservations` entries, since a slot is held until its entry commits. Committed entries are never evicted. The proxy needs a node id unique to this replica and stable across restarts (`--service-node`); it is the entries' `instance_id`. Absent means no ledger. Examples: `{"directory": "/var/lib/llm-proxy/ledger", "encryption_key_file": "/etc/llm-proxy/ledger.key", "encryption_key_id": "ledger-2026", "max_disk_bytes": 10737418240}`. |
+| `guardrails` | [Guardrails](#guardrails) | no | none | Body-aware request checks. Each request with a body is sent to a check before any provider is dialled: its tenant's entry in `tenants`, otherwise `default`. The check receives the request body with the tenant and the requested and resolved model, and answers allow or deny. A denied request is refused with 403 and the check's reason; it is not dialled, not charged, not counted against a limit, and gets no ledger entry. The check only allows or denies; it never changes the request. Sending a request body to a check discloses every prompt to that service: point `url` only at a service trusted with them. Only a request that authentication and model authorization admit is sent. A request with an empty body is not checked. Each check adds one round trip to every checked request. Outcomes are counted in `llmproxy_guardrail_checks_total` and logged by `%LLM_GUARDRAIL%`. Absent means no request is checked. Examples: `{"default": {"http": {"url": "http://127.0.0.1:9000/check", "timeout": "500ms", "max_body_bytes": 1048576}, "failure_mode": "closed"}}`. |
 
 Any other field is a load error.
 
@@ -227,6 +228,17 @@ Used at: `ledger`.
 | `group_commit_max_entries` | integer; minimum 1, maximum 4096 | no | `512` | A group of entries is committed when it reaches this size or `group_commit_interval`, whichever comes first. |
 | `group_commit_interval` | [Duration](#duration) | no | `50ms` | The longest an entry waits to be committed while the spool has space. It bounds what a crash loses only then: at `max_disk_bytes` entries are held in memory until an acknowledgement, and a crash loses all of them. Bounded to 1ms-1s. |
 | `on_unavailable` | one of `reject`, `admit` | no | `reject` | What a request gets when no ledger capacity is available. `reject`: a local 503 naming the reason (`queue_full`, `writer_failed` or `disk_full`), counted in `llmproxy_ledger_rejected_total`; no request reaches a provider unledgered, so ledger health becomes availability. `admit`: the request is served without an entry, counted in `llmproxy_ledger_unledgered_total` and warned about at most once every 5 seconds. |
+
+Any other field is a load error.
+
+## `Guardrails`
+
+Used at: `guardrails`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `default` | [GuardrailCheck](#guardrailcheck) | yes | none | The check for a tenant with no entry in `tenants`, and for a request with no authenticated tenant. Required: there is no unchecked default. |
+| `tenants` | map of [GuardrailCheck](#guardrailcheck) | no | none | Tenant -> check, replacing `default` for that tenant. A tenant is the `tenant` an `auth.keys` entry (or a minted key) authenticates as. Requires an `auth` block. |
 
 Any other field is a load error.
 
@@ -443,6 +455,17 @@ One retired ledger encryption key.
 
 Any other field is a load error.
 
+## `GuardrailCheck`
+
+Used at: `guardrails.default`, `guardrails.tenants.<name>`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `http` | [HttpGuardrail](#httpguardrail) | yes | none | An external HTTP check. The proxy sends `POST <url>` with a JSON object: `tenant`, `requested_model` and `resolved_model` (each a string or null) and `body`, the request body as text, or `body_base64` instead when the body is not UTF-8. The service answers 200 with `{"decision": "allow"}` or `{"decision": "deny", "reason": "..."}`. Any other answer is an error. The first 256 bytes of the reason are returned to the client. |
+| `failure_mode` | one of `closed`, `open` | yes | none | What happens when the check errors, times out, or the body is longer than `max_body_bytes`. `closed` refuses the request: 503 for an error or a timeout, 413 for a long body. `open` admits it unchecked, counts it as `failure_mode_allowed`, and logs a warning at most once a minute naming the check's host and port (never the body). Required: there is no default. |
+
+Any other field is a load error.
+
 ## `AuthStorePersistent`
 
 Used at: `auth.store.persistent`.
@@ -521,6 +544,18 @@ Used at: `pricing.price_list.entries[]`.
 
 Any other field is a load error.
 
+## `HttpGuardrail`
+
+Used at: `guardrails.default.http`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | string; pattern `^https?://[^/?#@\s:][^/?#@\s]*([/?#].*)?$` | yes | none | An absolute `http` or `https` URL with no user information. `https` verifies the server against the platform's root certificates. A token in the path or query is never logged. Examples: `http://127.0.0.1:9000/check`. |
+| `timeout` | [Duration](#duration) | yes | none | Bounds the whole check: connect, request and response. At least `1ms`. |
+| `max_body_bytes` | integer; minimum 1 | yes | none | A request body longer than this is not sent to the check; `failure_mode` decides the request. |
+
+Any other field is a load error.
+
 ## `PricingTier`
 
 Used at: `pricing.price_list.entries[].tiers[]`.
@@ -553,7 +588,7 @@ Type: string; pattern `^[0-9]+(ms|s|m|h)$`.
 
 A duration: integer plus unit — `ms` (milliseconds), `s` (seconds), `m` (minutes), or `h` (hours).
 
-Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `auth.stored_output_owner_ttl`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `providers.<name>.oauth2_jwt_bearer.assertion_lifetime`, `providers.<name>.oauth2_jwt_bearer.refresh_before`, `providers.<name>.oauth2_jwt_bearer.timeout`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.traces.max_age`, `observability.traces.segment_max_age`, `observability.tracing.export_deadline`, `observability.traces.s3.upload_timeout`.
+Used at: `listen.request_headers_timeout`, `listen.request_timeout`, `listen.stream_idle_timeout`, `listen.max_stream_duration`, `auth.max_policy_staleness`, `auth.stored_output_owner_ttl`, `providers.<name>.connect_timeout`, `routes[].idle_timeout`, `ledger.group_commit_interval`, `providers.<name>.oauth2_jwt_bearer.assertion_lifetime`, `providers.<name>.oauth2_jwt_bearer.refresh_before`, `providers.<name>.oauth2_jwt_bearer.timeout`, `observability.metrics.export_interval`, `observability.metrics.export_deadline`, `observability.traces.max_age`, `observability.traces.segment_max_age`, `observability.tracing.export_deadline`, `observability.traces.s3.upload_timeout`, `guardrails.default.http.timeout`.
 
 Examples: `500ms`, `30s`, `5m`, `1h`.
 

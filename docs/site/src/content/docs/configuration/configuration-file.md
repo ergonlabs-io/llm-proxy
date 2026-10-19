@@ -32,6 +32,7 @@ Each block builds on the one before it.
 | [`providers`](../reference/#provider) | Names each upstream LLM API and holds its credentials. | Nothing |
 | [`routes`](../reference/#route) and [`models`](../reference/#modeldef) | Choose a provider (or an ordered list of providers) for each requested model name. | `providers` |
 | [`auto`](../reference/#automodel) | Resolves the reserved model name `auto` to a real model. | `routes` or `models`; `auth` for per-tenant entries |
+| `guardrails` | Sends each request body to an HTTP check that allows or denies it. See [Request guardrails](../../authentication/guardrails/). | `auth` for per-tenant entries |
 | [`auth`](../reference/#auth) | Checks who the caller is, and which models the caller may use. | Nothing |
 | [`limits`](../reference/#limit) | Limits requests, tokens and concurrent streams. | `auth` for the `tenant` key |
 | [`pricing`](../reference/#pricing) | Gives each completed request a price. | `providers` (the `type` of each provider) |
