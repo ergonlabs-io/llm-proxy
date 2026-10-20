@@ -131,12 +131,22 @@ fn assert_h2_head_limits(
             }
         }
 
-        let got = send(&mut client, &sized(max_bytes * 8)).await;
-        assert_eq!(
-            got,
-            Err(Reason::ENHANCE_YOUR_CALM),
-            "a list far over h2's list size closes the connection"
-        );
+        // The proxy sends GOAWAY and closes while the client may still be
+        // writing this list's CONTINUATION frames. When the close wins, the
+        // client's write fails before it reads the GOAWAY, so the error is a
+        // broken pipe or reset with no h2 reason. Either way the connection is
+        // closed, which is the behavior under test.
+        match send_raw(&mut client, &sized(max_bytes * 8)).await {
+            Err(e) if e.reason() == Some(Reason::ENHANCE_YOUR_CALM) => {}
+            Err(e)
+                if e.get_io().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                }) => {}
+            other => panic!("a list far over h2's list size closes the connection, got {other:?}"),
+        }
         if let Ok(head) = received.recv_timeout(QUIET) {
             panic!("a list far over the limit reached the upstream:\n{head}");
         }
@@ -206,6 +216,17 @@ async fn connect(addr: SocketAddr) -> SendRequest<Bytes> {
 /// Send one POST with `fields` and the body. `Ok` is the response status;
 /// `Err` is the reason the stream or connection was closed.
 async fn send(client: &mut SendRequest<Bytes>, fields: &[(String, String)]) -> Result<u16, Reason> {
+    send_raw(client, fields)
+        .await
+        .map_err(|e| e.reason().unwrap_or_else(|| panic!("no reason: {e}")))
+}
+
+/// [`send`] without mapping the error to its h2 reason, for a case where the
+/// connection closing can surface as an I/O error instead.
+async fn send_raw(
+    client: &mut SendRequest<Bytes>,
+    fields: &[(String, String)],
+) -> Result<u16, h2::Error> {
     let mut req = http::Request::builder()
         .method("POST")
         .uri(format!("http://{AUTHORITY}{PATH}"));
@@ -215,21 +236,15 @@ async fn send(client: &mut SendRequest<Bytes>, fields: &[(String, String)]) -> R
     let req = req.body(()).expect("valid request");
     let ready = tokio::time::timeout(IO_TIMEOUT, client.clone().ready())
         .await
-        .expect("client ready in time")
-        .map_err(|e| e.reason().expect("ready error has a reason"))?;
+        .expect("client ready in time")?;
     *client = ready;
-    let (response, mut body) = client
-        .send_request(req, false)
-        .map_err(|e| e.reason().expect("send error has a reason"))?;
+    let (response, mut body) = client.send_request(req, false)?;
     // The stream may already be reset; the response carries the reason.
     let _ = body.send_data(Bytes::from_static(BODY.as_bytes()), true);
     let response = tokio::time::timeout(IO_TIMEOUT, response)
         .await
         .expect("response or reset in time");
-    match response {
-        Ok(response) => Ok(response.status().as_u16()),
-        Err(e) => Err(e.reason().unwrap_or_else(|| panic!("no reason: {e}"))),
-    }
+    response.map(|response| response.status().as_u16())
 }
 
 // ---------------------------------------------------------------- upstream --
