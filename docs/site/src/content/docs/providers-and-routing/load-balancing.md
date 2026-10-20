@@ -1,10 +1,11 @@
 ---
 title: Load balancing
-description: "How a cluster picks one of its endpoints. A dialect provider has one endpoint; balancing needs an Envoy bootstrap."
+description: "How a cluster picks one of its endpoints, and how a models alias spreads requests across its providers. A dialect provider has one endpoint; balancing across endpoints needs an Envoy bootstrap."
 summary: Which `lb_policy` values a cluster can run, why two are
-  rejected at load time rather than approximated, and why load balancing has
-  nothing to choose between in the plain configuration format.
-lastUpdated: 2026-10-18
+  rejected at load time rather than approximated, and why a provider in the
+  plain configuration format has no endpoint to choose between. It also
+  points to weights, which balance across the providers of a `models` alias.
+lastUpdated: 2026-10-20
 related:
   - providers-and-routing/providers-and-clusters
   - providers-and-routing/failover-and-aggregates
@@ -18,13 +19,43 @@ cluster has several endpoints and you want to spread requests across them.
 
 To enable it, write a cluster with several endpoints and an `lb_policy` in an
 Envoy bootstrap configuration. The `llmproxy` dialect gives each provider
-exactly one endpoint, so it has no load-balancing setting. See
-[Providers and clusters](../../providers-and-routing/providers-and-clusters/)
-for the reason. The
+exactly one endpoint, so it has no setting for balancing across endpoints.
+To spread requests across the providers of a `models` alias, use `weight`.
+See [Balancing across the providers of a model](#balancing-across-the-providers-of-a-model).
+For the reason for the endpoint rule, see
+[Providers and clusters](../../providers-and-routing/providers-and-clusters/).
+The
 [worked example](#bootstrap-configuration-a-worked-weighted-example) at the
 end of this page shows the Envoy form.
 
-## In this configuration format, there is nothing to balance
+## Balancing across the providers of a model
+
+A `models.<name>.providers` list can pick its first provider in proportion
+to a `weight` on each entry. This balances across providers. It does not
+balance across the endpoints of one provider. The `lb_policy` table below
+does not apply to it.
+
+```yaml
+models:
+  chat-default:
+    providers:
+      - { provider: openai, weight: 3 }
+      - { provider: together, weight: 1 }
+```
+
+The proxy draws the first provider once for each request. The draw is
+uniform and random, and it keeps no per-worker state. The split is the same
+on every worker. Replicas do not coordinate. The split matches the weights
+over many requests, not over a few. Weight `0` makes an entry a fallback
+only. A provider ejected by its `outlier_detection` gets no first picks
+until the ejection ends. The next entry in list order that is not ejected
+takes its share. The proxy does not support cost-aware selection.
+
+For the rules for `weight`, the load errors, the fallback chain, and
+`outlier_detection`, see
+[Failover and aggregates](../../providers-and-routing/failover-and-aggregates/#weighted-selection-in-the-models-catalogue).
+
+## Inside a provider, there is nothing to balance
 
 Every `providers.<name>` entry lowers to a cluster with exactly one endpoint
 — the host and port parsed from `base_url`. Lowering hardcodes that
@@ -167,6 +198,11 @@ This section is for maintainers.
   `ring_hash_is_rejected_at_build_time` and
   `maglev_is_rejected_at_build_time` in
   `crates/proxy-cluster/src/load_balancer.rs`.
+- Weighted selection across the providers of a `models` alias: `lower_model`
+  and `check_model_weights` in `crates/proxy-simple-config/`, with the tests
+  listed in
+  [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/#implementation-notes).
+  The weighted route uses Envoy `weighted_clusters`, not `lb_policy`.
 - Spillover and panic threshold: `HostPicker` in the same file. Tests:
   `half_healthy_priority_zero_spills_thirty_percent_to_priority_one` (70/30
   split over 100,000 picks) and

@@ -63,6 +63,20 @@ type OpenAI struct {
 	// recorded) before the response is written, so a scenario can keep a
 	// request in flight at the upstream (QA-8).
 	NonStreamingDelay time.Duration
+
+	// failStatus, when non-zero, answers every request with that status and
+	// a JSON error body instead of a completion (QA-15). Set it with
+	// SetFailStatus; it is read under mu because the proxy's requests arrive
+	// on server goroutines while the scenario changes it.
+	failStatus int
+}
+
+// SetFailStatus makes every later request fail with status (0 restores
+// normal responses). The request is still recorded first.
+func (m *OpenAI) SetFailStatus(status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failStatus = status
 }
 
 func NewOpenAI() *OpenAI {
@@ -112,6 +126,16 @@ func (m *OpenAI) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	m.record(r, body)
+
+	m.mu.Lock()
+	failStatus := m.failStatus
+	m.mu.Unlock()
+	if failStatus != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(failStatus)
+		_, _ = w.Write([]byte(`{"error":{"message":"mock: forced failure","type":"server_error"}}`))
+		return
+	}
 
 	if streaming, _ := body["stream"].(bool); streaming {
 		m.serveStream(w, body)

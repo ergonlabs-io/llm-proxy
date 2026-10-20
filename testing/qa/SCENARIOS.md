@@ -21,6 +21,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
 | QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17 (`qa13_billing_ledger_test.go`); approved through the billing-ledger backlog acceptance (owner, 2026-10-17) |
 | QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
+| QA-15 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa15_weighted_providers_test.go`); approved through the WP-118 backlog acceptance (owner, 2026-10-17) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -538,3 +539,17 @@ line. Segments are sealed by SIGTERM and read as gzip JSON lines.
 **Why black box.** The Rust tests drive the tee, the exporter and the binary
 separately; this one checks the documented surface end to end: the dialect
 block, the admin opt-in, the on-disk layout and the line a consumer reads.
+
+## QA-15 — Weighted alias splits by weight and skips an ejected provider
+
+**Property.** A `models` alias with `weight: 3` and `weight: 1` on its two
+providers sends about three requests to the first for each one to the
+second (400 requests, tolerance stated in the test). Each provider receives
+only its own key and its own upstream model ID. When the second provider
+starts failing, its first failure ejects it (`outlier_detection`) and the
+request fails over, so the client still gets 200; after that the ejected
+provider receives no requests.
+
+**Why black box.** The Rust tests pin the lowering, the draw-to-provider
+mapping and the aggregate's health preference separately; this one checks
+the documented dialect fields together on the real binary with two workers.
