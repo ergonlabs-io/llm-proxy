@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use crate::model::*;
 use crate::parse::parse_host_port;
 
+mod chargeback;
 mod jwt;
 
 /// The request header the route table matches models against. Populated
@@ -2435,13 +2436,19 @@ fn lower_auth(
         }
         seen_ids.insert(&key.id, i);
         seen_digests.insert(&key.digest, i);
+        chargeback::check_key_tags(&key.tags, &format!("{path}.tags"))?;
 
-        virtual_keys.push(json!({
+        let mut virtual_key = json!({
             "key_id": key.id,
             "tenant": key.tenant,
             "digest_hex": key.digest,
             "revoked": key.revoked,
-        }));
+        });
+        // Absent when empty, so keys without tags lower byte-identically.
+        if !key.tags.is_empty() {
+            virtual_key["tags"] = json!(key.tags);
+        }
+        virtual_keys.push(virtual_key);
     }
 
     let jwt_providers = jwt::lower_jwt_providers(auth, warnings)?;
@@ -2508,6 +2515,10 @@ fn lower_auth(
     // byte-identically.
     if !jwt_providers.is_empty() {
         typed_config["jwt_providers"] = json!(jwt_providers);
+    }
+    // Same rule: absent adds no field.
+    if let Some(tags) = &auth.chargeback_tags {
+        typed_config["chargeback_tags"] = chargeback::lower_policy(tags)?;
     }
     // Only an explicit `store:` adds a member. Absent means no store field at
     // all, which is what keeps configs written before this field lowering

@@ -541,6 +541,40 @@ pub struct Auth {
     /// JWT/OIDC providers (ADR-0014). Tried in order after virtual keys.
     #[serde(default)]
     pub jwt: Vec<JwtProviderDef>,
+    /// Which chargeback tags requests may carry into usage records and
+    /// ledger entries. Absent means none: key tags are not copied and the
+    /// tag header is never read.
+    #[serde(default)]
+    pub chargeback_tags: Option<ChargebackTagsDef>,
+}
+
+/// `auth.chargeback_tags`: the operator's tag allow-list and caps.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChargebackTagsDef {
+    /// The tag keys that may be attributed. At least one.
+    pub allowed: Vec<AllowedTagDef>,
+    /// Read tags from the `x-cost-tags` request header. Absent means false:
+    /// the header is never read.
+    #[serde(default)]
+    pub from_header: bool,
+    /// Most tags on one request, 1 to 32. Absent means 8.
+    #[serde(default)]
+    pub max_tags: Option<u32>,
+    /// Longest tag value in bytes, 1 to 256. Absent means 64.
+    #[serde(default)]
+    pub max_value_bytes: Option<u32>,
+}
+
+/// One entry in `auth.chargeback_tags.allowed`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedTagDef {
+    pub key: String,
+    /// The values the key may take. Absent means any value; an empty list is
+    /// an error.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
 }
 
 /// `auth.enforce`: opt-out switches for the controls that read the admin
@@ -725,6 +759,10 @@ pub struct AuthKey {
     pub digest: String,
     #[serde(default)]
     pub revoked: bool,
+    /// Chargeback tags for requests this key authenticates (key metadata).
+    /// `auth.chargeback_tags` decides which are attributed.
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

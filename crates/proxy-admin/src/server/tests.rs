@@ -3488,6 +3488,7 @@ mod admin_rate_limit;
 mod budget_scope;
 mod capture_spool;
 mod credentials;
+mod key_tags;
 mod ledger;
 mod limits;
 mod object_owners;

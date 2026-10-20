@@ -1679,6 +1679,7 @@ mod tests {
 
     use crate::spend::{Charge, MicroUsd, Period, SpendAccumulator};
     use proxy_credentials::CredentialSource;
+    use proxy_observability::chargeback::ChargebackTags;
 
     // ------------------------------------------------------------------
     // Unit tests: no Redis needed. `Client::open` only parses the URL, so
@@ -1784,6 +1785,45 @@ mod tests {
     /// applies, dedups a replay, and leaves both keys expiring at the
     /// period's end plus the retention; the batched reads see the same rows.
     /// The fake cannot show this, since it runs no Lua.
+    /// Key tags through the Lua scripts: the put script accepts a version-3
+    /// (tagged) row and a later rewrite of it, and the revoke script's
+    /// `cjson` round trip keeps the tags. Clearing them writes no `tags`
+    /// field, so `cjson` never sees an empty object it would turn into `[]`.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_key_tags_survive_put_and_revoke_scripts() {
+        let store = test_store("key-tags");
+        let tags: ChargebackTags = [("team".to_string(), "infra".to_string())].into();
+        let mut row = StoredKey {
+            key_id: KeyId::new("key-a"),
+            digest: [1; 32],
+            tenant: TenantId::new("tenant-a"),
+            revoked: false,
+            tags: tags.clone(),
+        };
+        store.put_key(&row).unwrap();
+        row.tags = ChargebackTags::new();
+        store.put_key(&row).unwrap();
+        assert!(store.load().unwrap().keys[0].tags.is_empty());
+        store.revoke_key(&row.key_id).unwrap();
+        assert!(store.load().unwrap().keys[0].tags.is_empty());
+
+        let mut tagged = row.clone();
+        tagged.key_id = KeyId::new("key-b");
+        tagged.revoked = false;
+        tagged.tags = tags.clone();
+        store.put_key(&tagged).unwrap();
+        store.revoke_key(&tagged.key_id).unwrap();
+        let loaded = store.load().unwrap();
+        let back = loaded
+            .keys
+            .iter()
+            .find(|k| k.key_id == tagged.key_id)
+            .unwrap();
+        assert!(back.revoked);
+        assert_eq!(back.tags, tags);
+    }
+
     /// Window rows against a real Redis: the script adds, dedups a replay and
     /// an older seq per node, and both keys expire at window end plus grace.
     #[test]

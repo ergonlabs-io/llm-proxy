@@ -99,6 +99,16 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
         ),
         ("#/$defs/AuthKey", "AuthKey", parser_fields::<AuthKey>),
         (
+            "#/$defs/ChargebackTags",
+            "ChargebackTagsDef",
+            parser_fields::<ChargebackTagsDef>,
+        ),
+        (
+            "#/$defs/ChargebackAllowedTag",
+            "AllowedTagDef",
+            parser_fields::<AllowedTagDef>,
+        ),
+        (
             "#/$defs/AuthJwtProvider",
             "JwtProviderDef",
             parser_fields::<JwtProviderDef>,

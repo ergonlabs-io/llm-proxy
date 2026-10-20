@@ -3243,6 +3243,8 @@ pub struct MintedKey {
     pub key_id: KeyId,
     pub tenant: TenantId,
     pub plaintext: String,
+    /// The key's chargeback tags after the mint.
+    pub tags: ChargebackTags,
 }
 
 impl std::fmt::Debug for MintedKey {
@@ -3250,6 +3252,7 @@ impl std::fmt::Debug for MintedKey {
         f.debug_struct("MintedKey")
             .field("key_id", &self.key_id)
             .field("tenant", &self.tenant)
+            .field("tags", &self.tags)
             .field("plaintext", &"<redacted>")
             .finish()
     }
@@ -4199,19 +4202,23 @@ impl ControlPlane {
     /// section and every other write method below: a reader must never
     /// observe a republish that predates the write it is meant to reflect.
     pub fn mint_key(&self, tenant: &TenantId, key_id: &KeyId) -> Result<MintedKey, StoreError> {
-        self.mint_key_with_tags(tenant, key_id, &ChargebackTags::new())
+        self.mint_key_with_tags(tenant, key_id, None)
     }
 
     /// [`Self::mint_key`] with chargeback tags as the key's metadata,
-    /// validated by `chargeback::validate_key_tags`.
+    /// validated by `chargeback::validate_key_tags`. `None` keeps the tags a
+    /// re-minted (rotated) key already has, so a rotation that does not
+    /// mention tags does not drop its attribution; a new key gets none.
     pub fn mint_key_with_tags(
         &self,
         tenant: &TenantId,
         key_id: &KeyId,
-        tags: &ChargebackTags,
+        tags: Option<&ChargebackTags>,
     ) -> Result<MintedKey, StoreError> {
-        proxy_observability::chargeback::validate_key_tags(tags)
-            .map_err(|e| StoreError::InvalidInput(format!("tags: {e}")))?;
+        if let Some(tags) = tags {
+            proxy_observability::chargeback::validate_key_tags(tags)
+                .map_err(|e| StoreError::InvalidInput(format!("tags: {e}")))?;
+        }
         crate::auth::check_principal_id("tenant", tenant.as_str())
             .and_then(|()| crate::auth::check_principal_id("key_id", key_id.as_str()))
             .map_err(StoreError::InvalidInput)?;
@@ -4233,6 +4240,15 @@ impl ControlPlane {
                 ));
             }
         }
+        let tags = match tags {
+            Some(tags) => tags.clone(),
+            None => snapshot
+                .keys
+                .iter()
+                .find(|(_, record)| &record.key_id == key_id)
+                .map(|(_, record)| (*record.tags).clone())
+                .unwrap_or_default(),
+        };
         drop(snapshot);
         let rng = ring::rand::SystemRandom::new();
         let plaintext = crate::auth::generate_plaintext_key(&rng);
@@ -4249,6 +4265,7 @@ impl ControlPlane {
             key_id: key_id.clone(),
             tenant: tenant.clone(),
             plaintext,
+            tags,
         })
     }
 
@@ -6279,6 +6296,151 @@ mod tests {
                 .policies
                 .contains_key(key_budget_subject(&key).as_str()));
         }
+    }
+
+    fn chargeback(pairs: &[(&str, &str)]) -> ChargebackTags {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn snapshot_tags(cp: &ControlPlane, key: &KeyId) -> ChargebackTags {
+        cp.list_keys()
+            .into_iter()
+            .find(|listing| &listing.key_id == key)
+            .map(|listing| (*listing.tags).clone())
+            .expect("key is listed")
+    }
+
+    /// Key metadata tags survive a reopen of the durable store, a rotation
+    /// that does not mention them, a replacement, and a revoke.
+    #[test]
+    fn redb_key_tags_survive_reopen_rotation_and_revoke() {
+        let path = temp_db_path("key-tags-survive-reopen");
+        let tenant = TenantId::new("tenant-a");
+        let key = KeyId::new("key-a");
+        let open = || {
+            ControlPlane::new(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                HmacSecret::new(b"secret"),
+                KeySet::new(),
+            )
+            .unwrap()
+        };
+        {
+            let cp = open();
+            let minted = cp
+                .mint_key_with_tags(&tenant, &key, Some(&chargeback(&[("team", "infra")])))
+                .unwrap();
+            assert_eq!(minted.tags, chargeback(&[("team", "infra")]));
+        }
+        let cp = open();
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("team", "infra")]));
+        let rotated = cp.mint_key(&tenant, &key).unwrap();
+        assert_eq!(rotated.tags, chargeback(&[("team", "infra")]));
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("team", "infra")]));
+        cp.set_key_tags(&key, &chargeback(&[("project", "ads")]))
+            .unwrap();
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("project", "ads")]));
+        cp.revoke_key(&key).unwrap();
+        let loaded = cp.store().load().unwrap();
+        let row = loaded.keys.iter().find(|k| k.key_id == key).unwrap();
+        assert!(row.revoked);
+        assert_eq!(row.tags, chargeback(&[("project", "ads")]));
+        assert!(matches!(
+            cp.set_key_tags(&key, &ChargebackTags::new()),
+            Err(StoreError::Conflict(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Only a row that carries tags is stamped version 3, so a store with no
+    /// tagged key still opens in a build from before tags; that build's key
+    /// row reader accepted versions 1 and 2 only, so it refuses a tagged row
+    /// rather than reading it without its tags.
+    #[test]
+    fn key_rows_are_stamped_version_3_only_when_tagged() {
+        let mut key = StoredKey {
+            key_id: KeyId::new("k"),
+            digest: [7; 32],
+            tenant: TenantId::new("t"),
+            revoked: false,
+            tags: ChargebackTags::new(),
+        };
+        let untagged = encode_json(&EncodedKeyRow::from_stored(&key));
+        let text = String::from_utf8(untagged.clone()).unwrap();
+        assert!(text.contains(r#""schema_version":2"#), "{text}");
+        assert!(
+            !text.contains("tags"),
+            "an empty map is not written: {text}"
+        );
+
+        key.tags = chargeback(&[("team", "infra")]);
+        let tagged = encode_json(&EncodedKeyRow::from_stored(&key));
+        let text = String::from_utf8(tagged.clone()).unwrap();
+        assert!(text.contains(r#""schema_version":3"#), "{text}");
+        let back = decode_json::<EncodedKeyRow>(&tagged)
+            .unwrap()
+            .into_stored(KeyId::new("k"));
+        assert_eq!(back.tags, key.tags);
+
+        // The pre-tags reader was `read_schema_version` (1 or 2).
+        #[derive(serde::Deserialize)]
+        struct PreTagsRow {
+            #[serde(deserialize_with = "read_schema_version")]
+            #[allow(dead_code)]
+            schema_version: u32,
+        }
+        assert!(decode_json::<PreTagsRow>(&untagged).is_ok());
+        assert!(decode_json::<PreTagsRow>(&tagged).is_err());
+    }
+
+    /// A key defined in configuration has its tags there: a store row would
+    /// win the key_id collision and shadow a later revocation in the config.
+    #[test]
+    fn set_key_tags_refuses_config_keys_and_invalid_tags() {
+        let secret = HmacSecret::new(b"secret");
+        let mut bootstrap = KeySet::new();
+        bootstrap.insert(
+            &secret,
+            "llmp_config-key",
+            KeyRecord {
+                key_id: KeyId::new("config-key"),
+                tenant: TenantId::new("tenant-a"),
+                revoked: false,
+                tags: Arc::new(chargeback(&[("team", "infra")])),
+            },
+        );
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            bootstrap,
+        )
+        .unwrap();
+        let key = KeyId::new("config-key");
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("team", "infra")]));
+        assert!(matches!(
+            cp.set_key_tags(&key, &chargeback(&[("team", "ads")])),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(cp.store().load().unwrap().keys.is_empty());
+
+        let tenant = TenantId::new("tenant-a");
+        let store_key = KeyId::new("store-key");
+        cp.mint_key(&tenant, &store_key).unwrap();
+        assert!(matches!(
+            cp.set_key_tags(&store_key, &chargeback(&[("team", "a b")])),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cp.mint_key_with_tags(&tenant, &store_key, Some(&chargeback(&[("Team", "x")]))),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cp.set_key_tags(&KeyId::new("absent"), &ChargebackTags::new()),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]

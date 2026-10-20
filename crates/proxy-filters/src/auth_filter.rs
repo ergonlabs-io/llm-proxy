@@ -1661,6 +1661,8 @@ mod tests {
     use proxy_http::stream_info::StreamInfo;
 
     use crate::control::test_snapshot_handle;
+
+    mod chargeback;
     use proxy_http::filter::SharedFactoryState;
 
     // --- config-message scaffolding ------------------------------------------
