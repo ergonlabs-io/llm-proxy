@@ -145,6 +145,38 @@ pub struct Usage {
     /// The output count was estimated from the streamed text. Same default.
     #[serde(default)]
     pub output_estimated: bool,
+    // The fields below were added under schema version 1 (ADR-0010 decision
+    // 6). Older records lack them and read as `None`; older readers ignore
+    // them. A modality token count is a subset of `input_tokens` or
+    // `output_tokens`, never added to a total, and is `Some` only when it
+    // is above 0.
+    /// Image tokens inside `input_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_image_tokens: Option<u64>,
+    /// Image tokens inside `output_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_image_tokens: Option<u64>,
+    /// Audio tokens inside `input_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_audio_tokens: Option<u64>,
+    /// Audio tokens inside `output_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_audio_tokens: Option<u64>,
+    /// Images the response returned. `None` when no image count was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<u64>,
+    /// The images' `size`, as the rate card matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<String>,
+    /// The images' `quality`, as the rate card matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_quality: Option<String>,
+    /// Unicode characters in the request `input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_characters: Option<u64>,
+    /// Audio duration the provider reported, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_milliseconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +227,15 @@ pub struct AttemptRecord {
     pub bytes_response: u64,
     pub usage: Option<Usage>,
     pub cost: Option<Cost>,
+    /// The endpoint class label (`chat_completions`, `image_generation`, ...).
+    /// `Some` when the record has usage or the endpoint is not `unmetered`.
+    /// Added under schema version 1: absent in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// What the rate-card entry that priced `usage` prices: `tokens`,
+    /// `images`, `characters` or `audio_seconds`. `None` when nothing priced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_basis: Option<String>,
     /// `null` when the attempt never reached the credential step. Absent in
     /// records from a build before tenant credentials; see [`CredentialSource`].
     #[serde(default)]
@@ -246,6 +287,15 @@ pub struct RequestRecord {
     pub bytes_response: u64,
     pub usage: Option<Usage>,
     pub cost: Option<Cost>,
+    /// The endpoint class label (`chat_completions`, `image_generation`, ...).
+    /// `Some` when the record has usage or the endpoint is not `unmetered`.
+    /// Added under schema version 1: absent in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// What the rate-card entry that priced `usage` prices: `tokens`,
+    /// `images`, `characters` or `audio_seconds`. `None` when nothing priced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_basis: Option<String>,
     /// Number of retained summaries (schema-v1 compatibility).
     pub attempt_count: u16,
     /// All physical dispatches, including summaries omitted at the retention limit.
@@ -711,6 +761,79 @@ pub(crate) mod tests {
             serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(back.upstream_response_id, None);
         assert_eq!(back.upstream_usage, None);
+    }
+
+    fn meter_usage() -> Usage {
+        Usage {
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            completeness: UsageCompleteness::Complete,
+            provenance: "provider".into(),
+            input_estimated: false,
+            output_estimated: false,
+            input_image_tokens: None,
+            output_image_tokens: None,
+            input_audio_tokens: None,
+            output_audio_tokens: None,
+            images: Some(2),
+            image_size: Some("1024x1024".into()),
+            image_quality: None,
+            input_characters: None,
+            audio_milliseconds: None,
+        }
+    }
+
+    /// New fields round-trip; unset ones are omitted from the JSON; a record
+    /// written before they existed still parses with them unset.
+    #[test]
+    fn media_fields_round_trip_are_omitted_when_none_and_default_on_read() {
+        let mut r = record();
+        r.usage = Some(meter_usage());
+        r.endpoint = Some("image_generation".into());
+        r.price_basis = Some("images".into());
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let back: RequestRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, r);
+
+        let value = serde_json::to_value(&r).unwrap();
+        let usage = value["usage"].as_object().unwrap();
+        assert_eq!(usage["images"], 2);
+        assert_eq!(usage["image_size"], "1024x1024");
+        for absent in [
+            "input_image_tokens",
+            "output_image_tokens",
+            "input_audio_tokens",
+            "output_audio_tokens",
+            "image_quality",
+            "input_characters",
+            "audio_milliseconds",
+        ] {
+            assert!(!usage.contains_key(absent), "{absent} should be omitted");
+        }
+        assert_eq!(value["endpoint"], "image_generation");
+        assert_eq!(value["price_basis"], "images");
+
+        // A plain record omits endpoint and price_basis entirely.
+        let plain = serde_json::to_value(record()).unwrap();
+        assert!(!plain.as_object().unwrap().contains_key("endpoint"));
+        assert!(!plain.as_object().unwrap().contains_key("price_basis"));
+
+        // An old record: strip every new field and parse it.
+        let mut old = value;
+        let object = old.as_object_mut().unwrap();
+        object.remove("endpoint");
+        object.remove("price_basis");
+        let usage = object.get_mut("usage").unwrap().as_object_mut().unwrap();
+        usage.remove("images");
+        usage.remove("image_size");
+        let back: RequestRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(back.endpoint, None);
+        assert_eq!(back.price_basis, None);
+        let usage = back.usage.unwrap();
+        assert_eq!(usage.images, None);
+        assert_eq!(usage.image_size, None);
     }
 
     #[test]

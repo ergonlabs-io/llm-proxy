@@ -251,6 +251,19 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "ds_tx=%COMMON_DURATION(DS_TX_BEG:DS_TX_END:us)%\"\n",
 );
 
+/// JSON access-log keys for the modality token subsets, the count meters and
+/// the price basis (ADR-0010). Each renders `-` when the value is absent.
+const MEDIA_FIELDS: [(&str, &str); 8] = [
+    ("llm_input_image_tokens", "%LLM_INPUT_IMAGE_TOKENS%"),
+    ("llm_output_image_tokens", "%LLM_OUTPUT_IMAGE_TOKENS%"),
+    ("llm_input_audio_tokens", "%LLM_INPUT_AUDIO_TOKENS%"),
+    ("llm_output_audio_tokens", "%LLM_OUTPUT_AUDIO_TOKENS%"),
+    ("llm_images", "%LLM_IMAGES%"),
+    ("llm_input_characters", "%LLM_INPUT_CHARACTERS%"),
+    ("llm_audio_ms", "%LLM_AUDIO_MS%"),
+    ("llm_price_basis", "%LLM_PRICE_BASIS%"),
+];
+
 /// The request phases both dialect access-log formats carry, as
 /// `(name, %COMMON_DURATION% operator)`, in microseconds and in request order:
 ///
@@ -3063,6 +3076,11 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 // twin because raw JSON would break that line's quoting.
                 "llm_upstream_usage": "%LLM_UPSTREAM_USAGE%",
             });
+            // Added in a loop: one more `json!` entry hits the macro's
+            // recursion limit.
+            for (key, operator) in MEDIA_FIELDS {
+                format[key] = json!(operator);
+            }
             for (phase, operator) in TIMING_PHASES {
                 format[format!("{phase}_us")] = json!(operator);
             }

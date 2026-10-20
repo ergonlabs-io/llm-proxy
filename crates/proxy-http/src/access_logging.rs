@@ -571,6 +571,13 @@ impl LoggingBody {
         #[cfg(not(unix))]
         let capture_allowed = ctx.stream_info.borrow().metadata_enabled;
         let endpoint = ctx.stream_info.borrow().llm.endpoint;
+        // The whole usage (tokens and meters), not just `llm_tokens` below: a
+        // request that reported only a count meter has no tokens but is still
+        // usage, and must not read as "no usage" in the record or ledger.
+        let (llm_usage, llm_price_basis) = {
+            let info = ctx.stream_info.borrow();
+            (info.llm.usage.clone(), info.llm.price_basis)
+        };
 
         // Rust note: `stream_info`'s snapshot has to be pulled out of the
         // `RefCell` and its borrow dropped before `LogContext` is built --
@@ -793,25 +800,53 @@ impl LoggingBody {
                     .map(|d| d.as_millis().min(u64::MAX as u128) as u64),
                 bytes_request: bytes_received,
                 bytes_response: self.bytes_sent,
-                usage: llm_tokens.map(|t| proxy_observability::records::Usage {
-                    input_tokens: t.input,
-                    cache_read_tokens: t.cached,
-                    cache_write_tokens: t.cache_creation,
-                    output_tokens: t.output,
-                    // No usage filter completeness means the usage came from
-                    // somewhere that only writes finished responses.
-                    completeness: llm_completeness
-                        .0
-                        .unwrap_or(proxy_observability::records::UsageCompleteness::Complete),
-                    provenance: if llm_completeness.1 || llm_completeness.2 {
-                        "estimate"
-                    } else {
-                        "provider"
+                usage: llm_usage.as_ref().map(|u| {
+                    // Zero buckets for a meter-only request: the meters carry it.
+                    let t = u.tokens_or_zero();
+                    // A modality count is `Some` only above 0 (ADR-0010 decision 6).
+                    let nonzero = |n: u64| (n > 0).then_some(n);
+                    proxy_observability::records::Usage {
+                        input_tokens: t.input_tokens,
+                        cache_read_tokens: t.cached_tokens,
+                        cache_write_tokens: t.cache_creation_tokens,
+                        output_tokens: t.output_tokens,
+                        // No usage filter completeness means the usage came from
+                        // somewhere that only writes finished responses.
+                        completeness: llm_completeness
+                            .0
+                            .unwrap_or(proxy_observability::records::UsageCompleteness::Complete),
+                        provenance: if llm_completeness.1 || llm_completeness.2 {
+                            "estimate"
+                        } else {
+                            "provider"
+                        }
+                        .to_owned(),
+                        input_estimated: llm_completeness.1,
+                        output_estimated: llm_completeness.2,
+                        input_image_tokens: nonzero(t.input_image_tokens),
+                        output_image_tokens: nonzero(t.output_image_tokens),
+                        input_audio_tokens: nonzero(t.input_audio_tokens),
+                        output_audio_tokens: nonzero(t.output_audio_tokens),
+                        images: u.meters.images,
+                        image_size: u
+                            .meters
+                            .image_size
+                            .as_deref()
+                            .map(proxy_observability::records::bounded_field),
+                        image_quality: u
+                            .meters
+                            .image_quality
+                            .as_deref()
+                            .map(proxy_observability::records::bounded_field),
+                        input_characters: u.meters.input_characters,
+                        audio_milliseconds: u.meters.audio_milliseconds,
                     }
-                    .to_owned(),
-                    input_estimated: llm_completeness.1,
-                    output_estimated: llm_completeness.2,
                 }),
+                // Named when the record has usage or the endpoint is a known
+                // one; only an unclassified path with no usage stays `None`.
+                endpoint: (llm_usage.is_some() || endpoint != crate::endpoint::Endpoint::Unmetered)
+                    .then(|| endpoint.label().to_owned()),
+                price_basis: llm_price_basis.map(|b| b.as_str().to_owned()),
                 // A numeric amount without its immutable rate-card version
                 // is not an auditable cost. Keep the whole cost null rather
                 // than inventing an "unknown" version.
@@ -873,6 +908,8 @@ impl LoggingBody {
                         bytes_request: attempt.bytes_request,
                         bytes_response: attempt.bytes_response,
                         usage: None,
+                        endpoint: None,
+                        price_basis: None,
                         cost: None,
                         credential_source: attempt.credential_source,
                     })
@@ -886,6 +923,8 @@ impl LoggingBody {
                     .find(|a| a.attempt_index == index)
                 {
                     attempt.usage = record.usage.clone();
+                    attempt.endpoint = record.endpoint.clone();
+                    attempt.price_basis = record.price_basis.clone();
                     attempt.cost = record.cost.clone();
                     if attempt.termination == proxy_observability::records::Termination::Unknown {
                         attempt.termination = termination;
@@ -1143,6 +1182,30 @@ impl LoggingBody {
                 }
             }),
             llm_rate_card_version: usage_attribution.3.as_deref(),
+            llm_media: proxy_observability::access_log::LlmMedia {
+                images: llm_usage.as_ref().and_then(|u| u.meters.images),
+                input_characters: llm_usage.as_ref().and_then(|u| u.meters.input_characters),
+                audio_milliseconds: llm_usage.as_ref().and_then(|u| u.meters.audio_milliseconds),
+                // `-` unless the provider reported tokens; then the number,
+                // including 0.
+                input_image_tokens: llm_usage
+                    .as_ref()
+                    .and_then(|u| u.tokens)
+                    .map(|t| t.input_image_tokens),
+                output_image_tokens: llm_usage
+                    .as_ref()
+                    .and_then(|u| u.tokens)
+                    .map(|t| t.output_image_tokens),
+                input_audio_tokens: llm_usage
+                    .as_ref()
+                    .and_then(|u| u.tokens)
+                    .map(|t| t.input_audio_tokens),
+                output_audio_tokens: llm_usage
+                    .as_ref()
+                    .and_then(|u| u.tokens)
+                    .map(|t| t.output_audio_tokens),
+                price_basis: llm_price_basis.map(crate::stream_info::PriceBasis::as_str),
+            },
             request_method: Some(&ctx.request.method),
             request_path: Some(&ctx.request.path),
             request_authority: ctx.request.authority.as_deref(),
@@ -1671,6 +1734,7 @@ mod tests {
             llm_usage_completeness: None,
             llm_cost_kind: None,
             llm_rate_card_version: None,
+            llm_media: Default::default(),
             request_method: None,
             request_path: None,
             request_authority: None,
@@ -1790,6 +1854,133 @@ mod tests {
             LoggingBody::new(body, ctx).collect().await.unwrap();
             assert_eq!(records.try_recv().unwrap().policy_generation, pinned);
         }
+    }
+
+    /// A request that reported only a count meter (no tokens) is still
+    /// usage: the record carries it with zero buckets, and the ledger entry
+    /// is the same record, so an invoice line can say "2 images".
+    #[tokio::test]
+    async fn meter_only_usage_reaches_the_record_and_the_ledger_entry() {
+        use crate::stream_info::{LlmMeters, PriceBasis};
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+        ctx.request_record_sink = Some(Arc::new(sink));
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.metadata_enabled = true;
+            let selected = info.begin_attempt("images", "host", None).unwrap();
+            info.selected_attempt = Some(selected);
+            info.upstream_cluster = Some("images".into());
+            info.llm.endpoint = Endpoint::ImageGeneration;
+            info.llm.price_basis = Some(PriceBasis::Images);
+            info.llm.usage = Some(LlmUsage {
+                tokens: None,
+                meters: LlmMeters {
+                    images: Some(2),
+                    image_size: Some("1024x1024".into()),
+                    image_quality: Some("high".into()),
+                    ..Default::default()
+                },
+            });
+        }
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|never: std::convert::Infallible| match never {}),
+        );
+        LoggingBody::new(body, ctx).collect().await.unwrap();
+        let record = records.try_recv().unwrap();
+        let usage = record.usage.as_ref().expect("meter-only usage is usage");
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.output_tokens
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(usage.images, Some(2));
+        assert_eq!(usage.image_size.as_deref(), Some("1024x1024"));
+        assert_eq!(usage.image_quality.as_deref(), Some("high"));
+        assert_eq!(usage.input_characters, None);
+        assert_eq!(usage.input_image_tokens, None);
+        assert_eq!(record.endpoint.as_deref(), Some("image_generation"));
+        assert_eq!(record.price_basis.as_deref(), Some("images"));
+        // The selected attempt carries the same facts.
+        assert_eq!(record.attempts[0].usage, record.usage);
+        assert_eq!(record.attempts[0].price_basis.as_deref(), Some("images"));
+    }
+
+    /// Modality tokens are recorded only when above 0.
+    #[tokio::test]
+    async fn modality_tokens_are_recorded_only_when_above_zero() {
+        let capture = Arc::new(CaptureSink::default());
+        let mut ctx = flags_ctx(&capture);
+        let (sink, mut records) = proxy_observability::records::BoundedRecordSink::new(1);
+        ctx.request_record_sink = Some(Arc::new(sink));
+        {
+            let mut info = ctx.stream_info.borrow_mut();
+            info.metadata_enabled = true;
+            info.llm.usage = Some(LlmUsage::from_tokens(LlmTokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                input_image_tokens: 6,
+                output_audio_tokens: 0,
+                ..Default::default()
+            }));
+        }
+        let body = local_boxed(
+            Full::new(Bytes::from_static(b"hi"))
+                .map_err(|never: std::convert::Infallible| match never {}),
+        );
+        LoggingBody::new(body, ctx).collect().await.unwrap();
+        let usage = records.try_recv().unwrap().usage.unwrap();
+        assert_eq!(usage.input_image_tokens, Some(6));
+        assert_eq!(usage.output_audio_tokens, None);
+        assert_eq!(usage.images, None);
+    }
+
+    /// The new operators reach the real access-log line from `StreamInfo`.
+    #[tokio::test]
+    async fn media_operators_reach_the_text_access_log_line() {
+        use crate::stream_info::{LlmMeters, PriceBasis};
+        let fmt = "%LLM_IMAGES% %LLM_INPUT_CHARACTERS% %LLM_AUDIO_MS% %LLM_INPUT_IMAGE_TOKENS% \
+                   %LLM_OUTPUT_IMAGE_TOKENS% %LLM_INPUT_AUDIO_TOKENS% %LLM_OUTPUT_AUDIO_TOKENS% \
+                   %LLM_PRICE_BASIS%";
+        assert_eq!(
+            render_with_stream_info(fmt, |_| {}).await,
+            "- - - - - - - -"
+        );
+        let line = render_with_stream_info(fmt, |info| {
+            info.llm.price_basis = Some(PriceBasis::Characters);
+            info.llm.usage = Some(LlmUsage {
+                tokens: Some(LlmTokenUsage {
+                    input_image_tokens: 3,
+                    ..Default::default()
+                }),
+                meters: LlmMeters {
+                    images: Some(1),
+                    input_characters: Some(42),
+                    audio_milliseconds: Some(1500),
+                    ..Default::default()
+                },
+            });
+        })
+        .await;
+        assert_eq!(line, "1 42 1500 3 0 0 0 characters");
+        // Meter-only: the token subsets render `-`, the meter renders.
+        let line = render_with_stream_info(fmt, |info| {
+            info.llm.usage = Some(LlmUsage {
+                tokens: None,
+                meters: LlmMeters {
+                    images: Some(2),
+                    ..Default::default()
+                },
+            });
+        })
+        .await;
+        assert_eq!(line, "2 - - - - - - -");
     }
 
     #[tokio::test]

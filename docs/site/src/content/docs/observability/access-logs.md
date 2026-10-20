@@ -121,6 +121,8 @@ The fixed JSON format of the `llmproxy` config file has these keys:
 | `upstream_host` | `%UPSTREAM_HOST%` |
 | `selected_provider` | `%UPSTREAM_CLUSTER%` |
 | `llm_input_tokens`, `llm_cached_tokens`, `llm_cache_creation_tokens`, `llm_output_tokens`, `llm_total_tokens` | The matching `%LLM_*_TOKENS%` operators |
+| `llm_input_image_tokens`, `llm_output_image_tokens`, `llm_input_audio_tokens`, `llm_output_audio_tokens` | The matching `%LLM_*_IMAGE_TOKENS%` and `%LLM_*_AUDIO_TOKENS%` operators |
+| `llm_images`, `llm_input_characters`, `llm_audio_ms`, `llm_price_basis` | `%LLM_IMAGES%`, `%LLM_INPUT_CHARACTERS%`, `%LLM_AUDIO_MS%`, `%LLM_PRICE_BASIS%` |
 | `llm_ttft_ms`, `llm_tpot_ms`, `llm_max_stall_ms`, `llm_response_chunks` | `%LLM_TTFT%`, `%LLM_TPOT%`, `%LLM_MAX_STALL%`, `%LLM_RESPONSE_CHUNKS%` |
 | `llm_key_id`, `llm_tenant`, `llm_user_id` | `%LLM_KEY_ID%`, `%LLM_TENANT%`, `%LLM_USER_ID%` |
 | `llm_requested_model`, `llm_resolved_model`, `llm_selected_model` | `%LLM_REQUESTED_MODEL%`, `%LLM_RESOLVED_MODEL%`, `%LLM_SELECTED_MODEL%` |
@@ -174,6 +176,11 @@ writes it as literal text.
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
 | `%DOWNSTREAM_REMOTE_ADDRESS%` | The client's socket address. |
 | `%LLM_INPUT_TOKENS%` / `%LLM_CACHED_TOKENS%` / `%LLM_CACHE_CREATION_TOKENS%` / `%LLM_OUTPUT_TOKENS%` / `%LLM_TOTAL_TOKENS%` | Token counts from the provider's own usage report. `-` when the provider reported none. It is never `0` in that case. |
+| `%LLM_INPUT_IMAGE_TOKENS%` / `%LLM_OUTPUT_IMAGE_TOKENS%` / `%LLM_INPUT_AUDIO_TOKENS%` / `%LLM_OUTPUT_AUDIO_TOKENS%` | Image or audio tokens that the provider counted inside the input or output tokens. They are part of those counts, not extra tokens. `-` when the provider reported no tokens. `0` when it reported tokens and none were of this kind. |
+| `%LLM_IMAGES%` | The number of images the response returned. `-` when no image count was observed. |
+| `%LLM_INPUT_CHARACTERS%` | The number of Unicode characters in the request `input`. `-` when they were not counted. |
+| `%LLM_AUDIO_MS%` | The audio duration the provider reported, in milliseconds. `-` when it reported none. |
+| `%LLM_PRICE_BASIS%` | What the rate-card entry for this request prices: `tokens`, `images`, `characters`, or `audio_seconds`. `-` when no entry priced the request. |
 | `%LLM_LIST_COST%` | Configured list cost in integer nanodollars, captured once when final response usage is available. `-` when usage, the requested model, actual provider, or a rate-card entry is unknown; this is distinct from a configured zero price. |
 | `%LLM_TTFT%` | Time to first token (response headers to first body byte), in milliseconds. |
 | `%LLM_TPOT%` | Mean time per output token: `(duration - ttft) / output_tokens`, in fractional milliseconds. `-` if usage, TTFT, or duration is missing, or output tokens is zero. |

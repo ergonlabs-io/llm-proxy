@@ -1367,6 +1367,8 @@ pub mod testing {
             bytes_request: 0,
             bytes_response: 0,
             usage: None,
+            endpoint: None,
+            price_basis: None,
             cost: None,
             attempt_count: 0,
             physical_attempt_count: 0,
