@@ -7,10 +7,12 @@
 //!
 //! - the top-level `usage` object, as raw text, up to [`MAX_USAGE_OBJECT_BYTES`];
 //! - a few top-level string scalars (`size`, `quality`, `model`, `type`), each
-//!   up to [`MAX_SCALAR_BYTES`];
+//!   up to [`MAX_SCALAR_BYTES`], and the top-level number `duration`;
 //! - the count of elements of the top-level `data` array that closed.
 //!
 //! Memory is O(one usage object + a few short scalars), whatever the body size.
+//! Transcription and speech responses are small, but they use the same
+//! scanners so every media endpoint is counted one way.
 //! The bytes come from the provider, so nothing here panics on any input; a
 //! shape it does not recognise yields no facts, never invented ones. This is a
 //! fuzz target (`fuzz/fuzz_targets/media_scan.rs`).
@@ -43,6 +45,10 @@ pub struct MediaFacts {
     pub model: Option<String>,
     /// The top-level `type`, which names a stream event.
     pub event_type: Option<String>,
+    /// The top-level `duration`, in seconds, of a `verbose_json`
+    /// transcription, as whole milliseconds rounded up. `None` when absent or
+    /// not a non-negative number.
+    pub duration_ms: Option<u64>,
     /// The top-level object closed: absent facts are proven absent.
     pub complete: bool,
 }
@@ -55,6 +61,7 @@ enum Key {
     Quality,
     Model,
     Type,
+    Duration,
     Other,
 }
 
@@ -66,6 +73,7 @@ fn classify_key(key: &[u8]) -> Key {
         b"quality" => Key::Quality,
         b"model" => Key::Model,
         b"type" => Key::Type,
+        b"duration" => Key::Duration,
         _ => Key::Other,
     }
 }
@@ -226,10 +234,24 @@ impl MediaJsonScanner {
             }
             State::InLiteral => {
                 if is_ws(byte) || matches!(byte, b',' | b'}') {
+                    if self.current == Key::Duration {
+                        self.facts.duration_ms = std::str::from_utf8(&self.scalar)
+                            .ok()
+                            .and_then(|text| text.parse::<f64>().ok())
+                            .and_then(seconds_to_millis);
+                    }
                     self.state = State::AfterValue;
                     self.feed(byte);
                 } else if !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'+' | b'.' | b'E') {
                     self.state = State::Invalid;
+                } else if self.current == Key::Duration {
+                    if self.scalar.len() < MAX_SCALAR_BYTES {
+                        self.scalar.push(byte);
+                    } else {
+                        // Too long to be a duration; dropped, never cut.
+                        self.scalar.clear();
+                        self.current = Key::Other;
+                    }
                 }
             }
             State::Nested => self.nested(byte),
@@ -286,6 +308,10 @@ impl MediaJsonScanner {
                 match self.current {
                     Key::Usage => self.facts.usage = None,
                     Key::Data => self.facts.data_elements = None,
+                    Key::Duration => {
+                        self.scalar.clear();
+                        self.scalar.push(byte);
+                    }
                     _ => {}
                 }
                 self.state = State::InLiteral;
@@ -422,6 +448,7 @@ impl MediaJsonScanner {
             Key::Quality => self.facts.quality = value,
             Key::Model => self.facts.model = value,
             Key::Type => self.facts.event_type = value,
+            Key::Duration => self.facts.duration_ms = None,
             Key::Usage => self.facts.usage = None,
             Key::Data => self.facts.data_elements = None,
             Key::Other => {}
@@ -436,6 +463,7 @@ impl MediaJsonScanner {
             Key::Quality => self.facts.quality = None,
             Key::Model => self.facts.model = None,
             Key::Type => self.facts.event_type = None,
+            Key::Duration => self.facts.duration_ms = None,
             _ => {}
         }
     }
@@ -444,6 +472,19 @@ impl MediaJsonScanner {
         self.facts.complete = true;
         self.state = State::Done;
     }
+}
+
+/// Seconds as whole milliseconds, rounded up. The product is first rounded
+/// to the microsecond, so a decimal like `0.1` is 100 ms and not the 101 its
+/// binary float would round up to. `None` for a negative or non-finite value.
+pub fn seconds_to_millis(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds.is_sign_negative() {
+        return None;
+    }
+    // Rust note: `as u64` on an `f64` saturates, so an absurd duration
+    // becomes `u64::MAX` microseconds rather than wrapping.
+    let micros = (seconds * 1_000_000.0).round() as u64;
+    Some(micros.div_ceil(1000))
 }
 
 fn is_ws(byte: u8) -> bool {
@@ -463,7 +504,9 @@ fn decode_json_string(raw: &[u8]) -> Option<String> {
 pub struct MediaStreamFacts {
     /// `*.completed` events that closed.
     pub completed: u64,
-    /// The `usage` of the last completed event that carried one.
+    /// The `usage` of the last event that carried one: an image stream's
+    /// `*.completed`, speech's `speech.audio.done`, or transcription's
+    /// `transcript.text.done`.
     pub usage: Option<String>,
     pub usage_oversized: bool,
     /// From the last completed event that carried them.
@@ -545,6 +588,10 @@ impl MediaSseScanner {
     fn end_line(&mut self) {
         if let Some(frame) = self.frame.take() {
             let facts = frame.finish();
+            if facts.complete && (facts.usage.is_some() || facts.usage_oversized) {
+                self.facts.usage = facts.usage.clone();
+                self.facts.usage_oversized = facts.usage_oversized;
+            }
             if facts.complete
                 && facts
                     .event_type
@@ -552,10 +599,6 @@ impl MediaSseScanner {
                     .is_some_and(|t| t.ends_with(".completed"))
             {
                 self.facts.completed = self.facts.completed.saturating_add(1);
-                if facts.usage.is_some() || facts.usage_oversized {
-                    self.facts.usage = facts.usage;
-                    self.facts.usage_oversized = facts.usage_oversized;
-                }
                 if facts.size.is_some() {
                     self.facts.size = facts.size;
                 }

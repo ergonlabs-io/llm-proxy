@@ -24,6 +24,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-15 | Image generation under a tenant budget is charged per image and ledgered; unpriced is $0 and loud; batch refused | passing — since 2026-10-20 (`qa15_image_metering_test.go`); approved through the v0.6.0 ship gate clauses 1 and 2 (owner, 2026-10-18) |
 | QA-16 | Chargeback tags reach ledger entries, bounded metrics, survive a restart | passing — since 2026-10-20 (`qa16_chargeback_tags_test.go`); approved through the chargeback-tags backlog acceptance (owner, 2026-10-20) |
 | QA-17 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa17_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
+| QA-18 | Speech under a tenant budget is charged per character and ledgered; non-2xx charges nothing; transcription charged per second; uncountable shapes refused | passing — since 2026-10-20 (`qa18_speech_metering_test.go`); approved through the v0.6.0 ship gate clause 1 (owner, 2026-10-18) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -583,6 +584,26 @@ refused with `403` and never reaches the provider.
 binary from Rust; this checks the v0.6.0 ship gate from the outside: the
 dialect rate card, the admin budget, the ledger read API, and the log line
 an operator reads.
+
+## QA-18 — Speech under a tenant budget is charged and ledgered
+
+**Property.** With a rate card that prices `tts-1` per character
+(`basis: characters`) and `whisper-1` per second (`basis: audio_seconds`), a
+ledger and a tenant spend budget, `POST /v1/audio/speech` is served and its
+ledger entry carries `charged_micro_usd` = ceil(11 characters x the card's
+price), the tenant among `charged_scopes`, `usage.input_characters: 11`,
+`endpoint: speech` and `price_basis: characters`. The input holds a JSON
+escape, so the count is of characters after unescaping, not bytes. A speech
+request the provider answers with 400 is charged 0. A
+`multipart/form-data` transcription is routed on its `model` field and
+charged its reported 2.5 s. A transcription with `response_format: text`
+and a form with no `model` are refused with `403` under the budget and never
+reach the provider. The model policy is off, so no `model_authz` refusal can
+stand in for the spend refusal.
+
+**Why black box.** `ledger_e2e.rs` and `unmetered_endpoint_e2e.rs` drive the
+binary from Rust; this checks the v0.6.0 ship gate from the outside: the
+dialect rate card, the admin budget, form routing, and the ledger read API.
 
 ## QA-17 — Weighted alias splits by weight and skips an ejected provider
 

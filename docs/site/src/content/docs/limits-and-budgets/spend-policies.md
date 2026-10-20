@@ -51,13 +51,27 @@ unbilled traffic.
 
 ## Endpoints a budget cannot count
 
-The proxy can count the cost of six endpoints: chat completions,
-completions, Responses, Messages, embeddings and image generation
-(`POST .../images/generations`). It cannot count the cost of other
-endpoints, such as image edits, audio, batches and files. A budget that
-applies to a request for one of these endpoints refuses it with
-`403` and the response-code detail `endpoint_not_metered`. The request does
-not reach the provider.
+The proxy can count the cost of ten endpoints: chat completions,
+completions, Responses, Messages, embeddings, image generation, image edits,
+speech, transcription and translation. It cannot count the cost of other
+endpoints, such as batches and files. A budget that applies to a request for
+one of these endpoints refuses it with `403` and the response-code detail
+`endpoint_not_metered`. The request does not reach the provider.
+
+A budget also refuses, in the same way, a speech, transcription, translation
+or image edit request whose cost the proxy cannot count from its shape. It
+decides this when it has read the request body:
+
+| Endpoint | Refused under a budget when |
+|---|---|
+| Image edits | the form has no `model` field |
+| Speech | the body has no `model`, or no string `input` |
+| Transcription | the form has no `model`, or `response_format` is `text`, `srt` or `vtt` (those responses carry no usage) |
+| Translation | the form has no `model`, or `response_format` is not `verbose_json` |
+
+A field that the client sends twice, sends as a file, or sends with a
+`Content-Transfer-Encoding` does not count as sent: the provider could read it
+differently.
 
 - The proxy finds the endpoint from the request method and path, before any
   path rewrite. It compares whole path segments, so
@@ -84,10 +98,9 @@ Each refusal increments
 `endpoint` is one of `image_generation`, `image_edit`, `speech`,
 `transcription`, `translation` and `unmetered` (every other path). The access
 log shows the detail in `%RESPONSE_CODE_DETAILS%` (`response_code_details` in
-the `--config` formats). The design, and the phase that will meter image
-edits and audio, are in ADR-0010.
+the `--config` formats). The design is in ADR-0010.
 
-## Image generation
+## Image generation and edits
 
 A rate-card entry has a `basis`. The default, `tokens`, prices the token
 buckets as before. `images` prices the number of images that the response
@@ -122,10 +135,55 @@ provider's prices):
   budget the proxy also logs a warning once per model.
 - A cut image response is charged for the images that were complete and the
   tokens that were reported. The proxy does not estimate it from its size.
-- A token limit still refuses image generation: the proxy cannot count its
-  tokens for every model.
+- Image edits (`POST .../images/edits`) are priced the same way. The request
+  is a `multipart/form-data` upload; the proxy reads its `model`, `size` and
+  `quality` fields and does not keep the image.
+- A token limit still refuses image generation and edits: the proxy cannot
+  count their tokens for every model.
 
-A card that uses `basis`, `image_prices` or a modality rate is stored at rate
+## Speech and transcription
+
+Two more bases price audio (the rates here are examples, not a provider's
+prices):
+
+```yaml
+- provider_type: openai
+  model: example-speech-model
+  basis: characters
+  nanodollars_per_character: 15000      # 15 USD per million characters
+- provider_type: openai
+  model: example-transcription-model
+  basis: audio_seconds
+  nanodollars_per_second: 100000        # 0.006 USD per minute
+```
+
+- `characters` prices the characters of the speech request's `input`. A
+  character is one Unicode code point after JSON unescaping. The charge is the
+  characters times the rate, rounded up to a whole micro-USD. It is charged
+  only when the response status is 2xx, once, at the entry of the provider
+  that served the request. A speech response that is cut is still charged for
+  its characters.
+- `audio_seconds` prices the audio duration that a transcription or
+  translation response reports: `usage.seconds` of a `duration` usage, else
+  `usage.prompt_audio_seconds`, else the top-level `duration` of a
+  `verbose_json` response. The proxy prices it per millisecond and rounds up to
+  a whole nanodollar. It does not apply a minimum duration.
+- Models that report tokens, such as `gpt-4o-mini-tts` with
+  `stream_format: sse` or `gpt-4o-transcribe`, use `basis: tokens`, with the
+  audio token rates above. A response that reports no unit of its entry's
+  basis is unpriced: it is charged $0 and the proxy logs a warning once per
+  model.
+- Transcription and translation requests are `multipart/form-data` uploads.
+  The proxy routes them on their `model` field, as it does a JSON body, and
+  writes a provider's model mapping into that field.
+- A token limit still refuses speech, transcription and translation.
+
+`examples/llmproxy-media.yaml` is a complete card for these endpoints. It
+states which provider facts are assumptions until they are checked against a
+recorded response.
+
+A card that uses `basis`, `image_prices`, `nanodollars_per_character`,
+`nanodollars_per_second` or a modality rate is stored at rate
 card schema version 2. An older replica ignores a version 2 card and keeps its
 last card. Upgrade every replica before you publish such a card with
 `PUT /pricing`. A card that uses none of these fields keeps its version and its

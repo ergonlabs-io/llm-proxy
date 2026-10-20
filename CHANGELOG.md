@@ -67,6 +67,41 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
     (it keeps its last card). Upgrade every replica before publishing such a
     card with `PUT /pricing`. A card that uses none of them keeps its version
     and its charges.
+- Speech, transcription, translation and image edits are metered under a
+  spend budget (ADR-0010 phase 3, WP-125). They are no longer refused with
+  `endpoint_not_metered` under a tenant or key budget when their cost can be
+  counted; they are charged at the rate card of the provider that served
+  them. A token limit still refuses them all. Batch stays refused.
+  - Two more rate-card bases. `characters` prices the characters of a speech
+    request's `input` (`nanodollars_per_character`): Unicode code points after
+    JSON unescaping, charged only for a 2xx response, rounded up to a whole
+    micro-USD. `audio_seconds` prices the duration a transcription or
+    translation response reports (`nanodollars_per_second`): `usage.seconds`
+    of a `duration` usage, `usage.prompt_audio_seconds`, or the `verbose_json`
+    `duration`, per millisecond, rounded up to a whole nanodollar. Image edits
+    use the `images` and `tokens` bases like generations.
+  - `multipart/form-data` requests (transcription, translation, image edits)
+    are routed on their `model` field, authorized against model policies, and
+    have a provider's model mapping written into that field. The scanner reads
+    the whole buffered form, keeps only the text fields it needs, and treats a
+    field sent twice, as a file, or with a transfer encoding as not sent. A
+    provider with a `request_fields` policy still refuses a form.
+  - Under a budget, a request whose shape cannot be counted is refused with
+    `403` `endpoint_not_metered` once its body is read: a form or speech body
+    with no provable `model`, speech with no string `input`, a transcription
+    whose `response_format` is `text`, `srt` or `vtt`, and a translation that
+    is not `verbose_json`.
+  - Speech, transcription and image-edit stream usage is read from any event
+    that carries it (`speech.audio.done`, `transcript.text.done`), and image
+    edit streams count `image_edit.completed` events.
+  - `examples/llmproxy-media.yaml` is a media rate card. It marks three
+    provider facts as assumptions until a recorded response pins them: the
+    character rule, `speech.audio.done` usage, and the cached image rate.
+  - New fuzz target `multipart_scan`. The scheduled fuzz workflow now also runs
+    `media_scan`, which WP-124 added but did not schedule.
+  - Upgrade note: a card that uses `characters` or `audio_seconds` is stored at
+    rate-card schema version 2, like the other media fields. A card that uses
+    none of them keeps its version and its charges.
 - Chargeback tags (WP-117): operator allow-listed `key=value` tags on usage
   records (`tags`) and billing-ledger entries (`record.tags`), to attribute
   spend to a project, team or cost centre. Configure them with

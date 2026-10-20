@@ -1191,13 +1191,26 @@ impl RouterHandler {
                 info.llm.endpoint,
             )
         };
-        let body_bytes = match reconcile_request_body(
-            &original_body,
-            routed_model.as_deref(),
-            force_include_usage,
-            max_output_tokens,
-            endpoint,
-        ) {
+        // A form (transcription, image edit) is routed from the body_rewrite
+        // filter's whole-body form scan, and is checked against the same scan.
+        let form_boundary = head
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::multipart::form_data_boundary);
+        let reconciled = match form_boundary.as_deref() {
+            Some(boundary) => {
+                reconcile_form_body(&original_body, boundary, routed_model.as_deref())
+            }
+            None => reconcile_request_body(
+                &original_body,
+                routed_model.as_deref(),
+                force_include_usage,
+                max_output_tokens,
+                endpoint,
+            ),
+        };
+        let body_bytes = match reconciled {
             Ok(None) => original_body,
             Ok(Some(reconciled)) => {
                 if let Ok(length) = HeaderValue::from_str(&reconciled.len().to_string()) {
@@ -1731,12 +1744,22 @@ impl RouterHandler {
                 // itself is what the operator refuses for that provider, and
                 // failing over from a 400 would quietly send the same body to
                 // another provider that never saw the refusal.
-                let attempt_body_bytes = match prepare_attempt_body(
-                    attempt_entry.provider_runtime(),
-                    requested_model.as_deref(),
-                    resolved_model.as_deref(),
-                    &body_bytes,
-                ) {
+                let prepared = match form_boundary.as_deref() {
+                    Some(boundary) => prepare_form_attempt_body(
+                        attempt_entry.provider_runtime(),
+                        requested_model.as_deref(),
+                        resolved_model.as_deref(),
+                        &body_bytes,
+                        boundary,
+                    ),
+                    None => prepare_attempt_body(
+                        attempt_entry.provider_runtime(),
+                        requested_model.as_deref(),
+                        resolved_model.as_deref(),
+                        &body_bytes,
+                    ),
+                };
+                let attempt_body_bytes = match prepared {
                     Ok(body) => body,
                     Err(BodyRefusal::FieldNotPermitted(field)) => {
                         tracing::warn!(cluster = %attempt_cluster, field = %field, "request field not permitted by cluster policy");
@@ -3081,18 +3104,7 @@ fn prepare_attempt_body(
     let policy = runtime
         .map(|runtime| &runtime.request_field_policy)
         .filter(|policy| !policy.is_empty());
-    let upstream_model = requested_model.and_then(|requested| {
-        let routing_model = resolved_model.unwrap_or(requested);
-        runtime
-            .and_then(|runtime| {
-                runtime
-                    .model_rewrites
-                    .iter()
-                    .find(|mapping| provider_model_pattern_matches(&mapping.pattern, routing_model))
-                    .map(|mapping| mapping.upstream_model.as_str())
-            })
-            .or(resolved_model)
-    });
+    let upstream_model = upstream_model_for(runtime, requested_model, resolved_model);
 
     let mut must_strip = false;
     if let Some(policy) = policy {
@@ -3140,6 +3152,88 @@ fn prepare_attempt_body(
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|err| BodyRefusal::Invalid(format!("request body could not be serialized: {err}")))
+}
+
+/// The model to write into the body for the selected cluster: its mapping for
+/// the routing model, else the resolver's choice. `None` leaves the body's
+/// model as the client sent it.
+fn upstream_model_for<'a>(
+    runtime: Option<&'a proxy_config::ir::ProviderRuntimeConfig>,
+    requested_model: Option<&str>,
+    resolved_model: Option<&'a str>,
+) -> Option<&'a str> {
+    requested_model.and_then(|requested| {
+        let routing_model = resolved_model.unwrap_or(requested);
+        runtime
+            .and_then(|runtime| {
+                runtime
+                    .model_rewrites
+                    .iter()
+                    .find(|mapping| provider_model_pattern_matches(&mapping.pattern, routing_model))
+                    .map(|mapping| mapping.upstream_model.as_str())
+            })
+            .or(resolved_model)
+    })
+}
+
+/// [`reconcile_request_body`] for a `multipart/form-data` body. The routed
+/// model must be the one this scan of the whole body reads, as it is for
+/// JSON. A form has no output-token or usage-reporting field, so nothing else
+/// is checked and the body is never replaced here.
+fn reconcile_form_body(
+    body: &[u8],
+    boundary: &str,
+    requested_model: Option<&str>,
+) -> Result<Option<Bytes>, Refusal> {
+    let Some(requested) = requested_model else {
+        return Ok(None);
+    };
+    if crate::multipart::scan(body, boundary).model.value() == Some(requested) {
+        Ok(None)
+    } else {
+        Err(Refusal::body("request model disagrees with routed model"))
+    }
+}
+
+/// [`prepare_attempt_body`] for a `multipart/form-data` body: the cluster's
+/// model mapping is spliced into the `model` field in place, and every other
+/// byte, the file included, is forwarded as sent. A request field policy names
+/// JSON keys, so a form under one is refused, as it was before forms were
+/// routed.
+fn prepare_form_attempt_body(
+    runtime: Option<&proxy_config::ir::ProviderRuntimeConfig>,
+    requested_model: Option<&str>,
+    resolved_model: Option<&str>,
+    body: &Bytes,
+    boundary: &str,
+) -> Result<Bytes, BodyRefusal> {
+    if runtime.is_some_and(|runtime| !runtime.request_field_policy.is_empty()) {
+        return Err(BodyRefusal::Invalid(
+            "a request field policy applies only to JSON request bodies".to_string(),
+        ));
+    }
+    let (Some(requested), Some(upstream)) = (
+        requested_model,
+        upstream_model_for(runtime, requested_model, resolved_model),
+    ) else {
+        return Ok(body.clone());
+    };
+    let facts = crate::multipart::scan(body, boundary);
+    let (Some(model), Some(range)) = (facts.model.value(), facts.model_range.clone()) else {
+        return Err(BodyRefusal::Invalid(
+            "request body has no model field".to_string(),
+        ));
+    };
+    if model != requested {
+        return Err(BodyRefusal::Invalid(
+            "request model disagrees with routed model".to_string(),
+        ));
+    }
+    crate::multipart::replace_range(body, range, upstream)
+        .map(Bytes::from)
+        .ok_or_else(|| {
+            BodyRefusal::Invalid("the provider model cannot be written into a form".to_string())
+        })
 }
 
 fn path_segment(value: &str) -> String {
@@ -4621,6 +4715,66 @@ mod tests {
         };
 
         assert!(err.contains("disagrees"), "unexpected error: {err}");
+    }
+
+    fn transcription_form(model: &str) -> Bytes {
+        Bytes::from(format!(
+            "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
+             --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\n\
+             ID3 audio bytes\r\n--b--\r\n"
+        ))
+    }
+
+    #[test]
+    fn a_form_body_is_reconciled_against_its_own_scan() {
+        let body = transcription_form("whisper-1");
+        assert_eq!(reconcile_form_body(&body, "b", Some("whisper-1")), Ok(None));
+        assert_eq!(reconcile_form_body(&body, "b", None), Ok(None));
+        let err = reconcile_form_body(&body, "b", Some("other")).unwrap_err();
+        assert!(err.message.contains("disagrees"), "{}", err.message);
+        // A form whose model the scan cannot prove does not carry the routed one.
+        let doubled = Bytes::from(format!(
+            "--b\r\nContent-Disposition: form-data; name=model\r\n\r\nwhisper-1\r\n{}",
+            std::str::from_utf8(&transcription_form("whisper-1")).unwrap()
+        ));
+        assert!(reconcile_form_body(&doubled, "b", Some("whisper-1")).is_err());
+    }
+
+    #[test]
+    fn a_form_body_gets_the_providers_model_spliced_in_and_nothing_else() {
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "transcribe".to_string(),
+                upstream_model: "whisper-large-v3".to_string(),
+            }],
+            Default::default(),
+        );
+        let body = transcription_form("transcribe");
+        let rewritten =
+            prepare_form_attempt_body(Some(&runtime), Some("transcribe"), None, &body, "b")
+                .unwrap_or_else(|_| panic!("rewrite refused"));
+        assert_eq!(rewritten, transcription_form("whisper-large-v3"));
+        // No mapping for this member: forwarded as sent, not copied.
+        let unmapped = prepare_form_attempt_body(
+            Some(&runtime_with(Vec::new(), Default::default())),
+            Some("transcribe"),
+            None,
+            &body,
+            "b",
+        )
+        .unwrap_or_else(|_| panic!("refused"));
+        assert_eq!(unmapped.as_ptr(), body.as_ptr());
+        // A request field policy names JSON keys, so a form under one is refused.
+        assert!(matches!(
+            prepare_form_attempt_body(
+                Some(&runtime_with(Vec::new(), policy(&["user"], &[]))),
+                Some("transcribe"),
+                None,
+                &body,
+                "b"
+            ),
+            Err(BodyRefusal::Invalid(_))
+        ));
     }
 
     fn runtime_with(

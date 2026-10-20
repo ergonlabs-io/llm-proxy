@@ -143,6 +143,12 @@ pub struct RequestFacts {
     pub stream_format: Option<String>,
     /// Unicode scalar values in the top-level string `input`, unescaped.
     pub input_characters: Option<u64>,
+    /// The scan read the whole body and every fact above is unambiguous, so
+    /// a fact that is `None` is proven absent. `false` means absence is
+    /// unknown: the body was not scanned, the scan stopped at its cap, or a
+    /// fact was sent twice or encoded so the provider might read it
+    /// differently (ADR-0010 decision 1, "Two admission points").
+    pub complete: bool,
 }
 
 /// The immutable list-price observation for one completed request.

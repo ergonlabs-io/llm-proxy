@@ -9,7 +9,8 @@
 //! - the facts do not depend on how the body was chunked;
 //! - the splice point lies inside the held prefix;
 //! - on a body any JSON decoder accepts, the scanner agrees with serde_json
-//!   on the routing `model` (last key wins, a non-string clears it), and the
+//!   on the routing `model` (last key wins, a non-string clears it) and on
+//!   the character count of a string `input` (the speech meter), and the
 //!   spliced body is still a JSON object.
 #![no_main]
 
@@ -49,12 +50,24 @@ fuzz_target!(|data: &[u8]| {
     let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(body) else {
         return;
     };
-    assert_eq!(whole.outcome, ScanOutcome::Complete, "valid object not Complete");
+    assert_eq!(
+        whole.outcome,
+        ScanOutcome::Complete,
+        "valid object not Complete"
+    );
     let expected_model = object.get("model").and_then(|m| m.as_str());
     assert_eq!(
         whole.model.as_deref(),
         expected_model,
         "routing model disagrees with the decoder"
+    );
+    let expected_characters = object
+        .get("input")
+        .and_then(|i| i.as_str())
+        .map(|i| i.chars().count() as u64);
+    assert_eq!(
+        whole.input_characters, expected_characters,
+        "input character count disagrees with the decoder"
     );
     if let Some(inject) = include_usage_injection(&whole) {
         let at = whole.splice_at.expect("injection implies a splice point");

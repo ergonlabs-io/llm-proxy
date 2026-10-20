@@ -5,6 +5,11 @@
 //! client value when no model is proven; scan failures pass through unchanged.
 //! The versioned filter config retains one-release support for the legacy
 //! `RuntimeFeatureFlag` carrier.
+//!
+//! A `multipart/form-data` body (transcription, translation, image edits) is
+//! read by `proxy_http::multipart` instead, once the whole body is in, and
+//! is never modified here. It publishes the same routing header and facts
+//! (ADR-0010 decision 4).
 
 use bytes::{Bytes, BytesMut};
 use http::header::CONTENT_LENGTH;
@@ -15,11 +20,14 @@ use std::sync::Arc;
 use proxy_config::ConfigError;
 use proxy_http::filter::{
     DecoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus, FilterInstanceFactory,
-    HttpFilter, HttpFilterFactory, PerRouteConfig, RequestHeaders,
+    FilterTrailersStatus, HttpFilter, HttpFilterFactory, PerRouteConfig, RequestHeaders,
+    RequestTrailers,
 };
+use proxy_http::multipart::{self, MultipartFacts};
+use proxy_http::stream_info::RequestFacts;
 
 use crate::body_rewrite::{
-    include_usage_injection, BodyPrefixScanner, ScanState, DEFAULT_PREFIX_CAP,
+    include_usage_injection, BodyPrefixScanner, ScanOutcome, ScanState, DEFAULT_PREFIX_CAP,
 };
 use crate::usage::Dialect;
 
@@ -291,6 +299,13 @@ enum State {
         /// unparsable" — either way there is nothing sound to fix up.
         content_length: Option<u64>,
     },
+    /// A form body, scanned whole at the end of the stream. Chunks pass
+    /// through as they arrive; `pending` holds a copy only when the body
+    /// comes in more than one chunk.
+    Form {
+        boundary: String,
+        pending: BytesMut,
+    },
     PassThrough,
 }
 
@@ -341,6 +356,47 @@ impl BodyRewriteFilterInstance {
             .unwrap_or(self.config)
     }
 
+    /// Publish what a body scan proved: the routing model onto stream info
+    /// and the routing header (removing any client value when none was
+    /// proven), and the other request facts. The route cache is cleared
+    /// unconditionally, so a match against the old header is never reused
+    /// (S2.8).
+    fn publish(&self, cb: &mut dyn DecoderCallbacks, model: Option<String>, facts: RequestFacts) {
+        // Rust note: scoped so the `RefMut` guard drops before
+        // `modify_decoded_headers` below -- `stream_info()` must not be held
+        // across another call on `cb` (see its doc).
+        {
+            let mut info = cb.stream_info();
+            info.requested_model = model.clone();
+            info.request_facts = facts;
+        }
+        cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
+            apply_model_header(&mut headers.headers, model.as_deref());
+        });
+        cb.clear_route_cache();
+        // Resolved only now: the per-route override must come from the route
+        // the model header just published selects, not the one matched before
+        // the body was read.
+        self.publish_max_output_tokens(cb);
+    }
+
+    /// Publish a whole form's facts. The model is proven only when the scan
+    /// read every part and found one plain `model` field.
+    fn publish_form(&self, cb: &mut dyn DecoderCallbacks, facts: MultipartFacts) {
+        let complete = facts.complete();
+        let model = facts.model.value().map(str::to_owned);
+        let value = |field: &multipart::Field| field.value().map(str::to_owned);
+        let request_facts = RequestFacts {
+            size: value(&facts.size),
+            quality: value(&facts.quality),
+            response_format: value(&facts.response_format),
+            stream_format: None,
+            input_characters: None,
+            complete,
+        };
+        self.publish(cb, model, request_facts);
+    }
+
     /// Publish the effective output-token cap for the router to enforce
     /// (by refusal) against the whole buffered body. Every dialect and path, unlike the
     /// usage splice: a cap is a spend control, not a protocol feature. Must
@@ -369,6 +425,18 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // (see its doc); this parameter IS the live request head.
         let path = headers.uri.path();
         self.takes_usage_option = !(path.ends_with("/responses") || path.ends_with("/messages"));
+        let form_boundary = headers
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(multipart::form_data_boundary);
+        if let (false, Some(boundary)) = (end_stream, form_boundary) {
+            self.state = State::Form {
+                boundary,
+                pending: BytesMut::new(),
+            };
+            return FilterHeadersStatus::Continue;
+        }
         if end_stream || !is_json_content_type(&headers.headers) {
             apply_model_header(&mut headers.headers, None);
             cb.clear_route_cache();
@@ -407,20 +475,43 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // all, this is a one-line no-op: `data` is left exactly as the
         // caller gave it, and we return before touching anything else --
         // this is the "PassThrough costs nothing" half of the module doc.
-        let State::Scanning {
-            mut scanner,
-            mut pending,
-            content_length,
-        } = std::mem::replace(&mut self.state, State::PassThrough)
-        else {
-            // Not scanning: a body not declared as JSON (the provider may still
-            // parse it as JSON, so the cap still applies; the router decides from
-            // the bytes). The manager refreshed its route snapshot from the head
-            // `decode_headers` just edited, so the route resolved here is the one
-            // the router will use.
-            self.publish_max_output_tokens(cb);
-            return FilterDataStatus::Continue;
-        };
+        let (mut scanner, mut pending, content_length) =
+            match std::mem::replace(&mut self.state, State::PassThrough) {
+                State::Scanning {
+                    scanner,
+                    pending,
+                    content_length,
+                } => (scanner, pending, content_length),
+                State::Form {
+                    boundary,
+                    mut pending,
+                } => {
+                    if !end_stream {
+                        pending.extend_from_slice(data);
+                        self.state = State::Form { boundary, pending };
+                        return FilterDataStatus::Continue;
+                    }
+                    // Decode is fully buffered, so the whole form usually
+                    // arrives in this one chunk and is scanned in place.
+                    let facts = if pending.is_empty() {
+                        multipart::scan(data, &boundary)
+                    } else {
+                        pending.extend_from_slice(data);
+                        multipart::scan(&pending, &boundary)
+                    };
+                    self.publish_form(cb, facts);
+                    return FilterDataStatus::Continue;
+                }
+                State::PassThrough => {
+                    // Not scanning: a body not declared as JSON (the provider may
+                    // still parse it as JSON, so the cap still applies; the router
+                    // decides from the bytes). The manager refreshed its route
+                    // snapshot from the head `decode_headers` just edited, so the
+                    // route resolved here is the one the router will use.
+                    self.publish_max_output_tokens(cb);
+                    return FilterDataStatus::Continue;
+                }
+            };
 
         pending.extend_from_slice(data);
         let scan_state = scanner.push(data);
@@ -489,43 +580,51 @@ impl HttpFilter for BodyRewriteFilterInstance {
             }
         }
 
-        // Consumer B: unconditional -- publish the scanned
-        // `model`, or remove any client-supplied value when none was found
-        // (`CapExceeded` with no `model` seen yet means
-        // absence is NOT proven, so this deliberately still clears the
-        // header and lets routing fall through to the `*` backstop, rather
-        // than trusting a client-supplied value). `clear_route_cache()`
-        // (S2.8) always follows, so a route match against the OLD header
-        // value is never reused.
-        let model = facts.model.clone();
-        // Publish the same extracted `model` onto
-        // `StreamInfo::requested_model` for `model_authz_filter` to read --
-        // reuses this scan rather than adding a second body buffer. Rust note: scoped so
-        // the `RefMut` guard drops before `modify_decoded_headers` below --
-        // `stream_info()` must not be held across another call on `cb` (see
-        // its doc), same pattern `auth_filter`/`token_limit_filter` use.
-        {
-            let mut info = cb.stream_info();
-            info.requested_model = model.clone();
-            // From the same scan: the image attributes that select a price
-            // row when the response does not echo them.
-            info.request_facts.size = facts.size.clone();
-            info.request_facts.quality = facts.quality.clone();
-        }
-        cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
-            apply_model_header(&mut headers.headers, model.as_deref());
-        });
-        cb.clear_route_cache();
-        // Resolved only now: the per-route override must come from the route
-        // the model header just published selects, not the one matched before
-        // the body was read.
-        self.publish_max_output_tokens(cb);
+        // Consumer B: unconditional -- publish the scanned `model`, or remove
+        // any client-supplied value when none was found (`CapExceeded` with
+        // no `model` seen yet means absence is NOT proven, so this
+        // deliberately still clears the header and lets routing fall through
+        // to the `*` backstop, rather than trusting a client-supplied value).
+        // `model_authz_filter` reads the same `requested_model`, so the scan
+        // is reused rather than adding a second body buffer.
+        //
+        // A fact that only counts when it is the last word on its key (the
+        // speech `input`, the response and stream formats that admission
+        // decides on) is kept only when the whole object was read: past the
+        // cap, a later duplicate key could replace it.
+        let complete = facts.outcome == ScanOutcome::Complete;
+        let request_facts = RequestFacts {
+            // The image attributes select a price row when the response does
+            // not echo them.
+            size: facts.size.clone(),
+            quality: facts.quality.clone(),
+            response_format: facts.response_format.clone().filter(|_| complete),
+            stream_format: facts.stream_format.clone().filter(|_| complete),
+            input_characters: facts.input_characters.filter(|_| complete),
+            complete,
+        };
+        self.publish(cb, facts.model.clone(), request_facts);
 
         *data = pending.freeze();
         // `self.state` is already `PassThrough` from the `mem::replace`
         // above; every later `decode_data` call on this stream now takes
         // the early-return path.
         FilterDataStatus::Continue
+    }
+
+    /// A form that ends in trailers never sends `end_stream` on data, so it
+    /// is scanned here.
+    fn decode_trailers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _trailers: &mut RequestTrailers,
+    ) -> FilterTrailersStatus {
+        if let State::Form { boundary, pending } =
+            std::mem::replace(&mut self.state, State::PassThrough)
+        {
+            self.publish_form(cb, multipart::scan(&pending, &boundary));
+        }
+        FilterTrailersStatus::Continue
     }
 }
 
@@ -1059,6 +1158,7 @@ mod tests {
                 State::PassThrough => {
                     decided = true;
                 }
+                State::Form { .. } => unreachable!("a JSON body is never scanned as a form"),
             }
             out.extend_from_slice(&data);
         }
@@ -1120,6 +1220,90 @@ mod tests {
             cb.route_cache_cleared.get(),
             1,
             "a decision was reached, so the route cache must be invalidated exactly once"
+        );
+    }
+
+    /// A form body (transcription, image edits) routes and is metered like a
+    /// JSON one: its model is published to the header and stream info, with
+    /// the shape facts, a spoofed header is replaced, and the bytes, in one
+    /// chunk or several, are forwarded untouched.
+    #[test]
+    fn a_form_body_publishes_its_model_and_facts_and_passes_through() {
+        let form = b"--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\n\
+                     ID3 bytes\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n\
+                     whisper-1\r\n--b\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n\
+                     verbose_json\r\n--b--\r\n";
+        for chunks in [vec![&form[..]], vec![&form[..20], &form[20..]]] {
+            let headers = request_headers_with(
+                Some("multipart/form-data; boundary=b"),
+                Some(form.len() as u64),
+                &[(MODEL_HEADER_NAME, "spoofed")],
+            );
+            let (out, cb) = run(Dialect::OpenAi, headers, &chunks);
+            assert_eq!(out, form);
+            assert_eq!(model_header(&cb), Some("whisper-1"));
+            let info = cb.stream_info.borrow();
+            assert_eq!(info.requested_model.as_deref(), Some("whisper-1"));
+            assert_eq!(
+                info.request_facts.response_format.as_deref(),
+                Some("verbose_json")
+            );
+            assert!(info.request_facts.complete);
+        }
+        // A form whose model cannot be proven (sent twice) publishes none.
+        let doubled = [
+            &b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ncheap\r\n"[..],
+            &form[..],
+        ]
+        .concat();
+        let headers = request_headers_with(
+            Some("multipart/form-data; boundary=b"),
+            None,
+            &[(MODEL_HEADER_NAME, "spoofed")],
+        );
+        let (_, cb) = run(Dialect::OpenAi, headers, &[&doubled]);
+        assert_eq!(model_header(&cb), None);
+        assert!(!cb.stream_info.borrow().request_facts.complete);
+    }
+
+    /// The speech `input` count and the formats are kept only when the scan
+    /// read the whole object: past the cap a later duplicate could replace
+    /// them.
+    #[test]
+    fn last_word_facts_need_a_complete_scan() {
+        let body = br#"{"model":"tts-1","input":"hello","voice":"alloy"}"#;
+        let headers = request_headers(Some("application/json"), None);
+        let (_, cb) = run(Dialect::OpenAi, headers, &[body]);
+        let facts = cb.stream_info.borrow().request_facts.clone();
+        assert_eq!(facts.input_characters, Some(5));
+        assert!(facts.complete);
+
+        let mut long = br#"{"model":"tts-1","input":"hello","pad":""#.to_vec();
+        long.extend(std::iter::repeat_n(b'x', DEFAULT_PREFIX_CAP));
+        long.extend_from_slice(br#"","input":"a much longer replacement"}"#);
+        let headers = request_headers(Some("application/json"), None);
+        let (_, cb) = run(Dialect::OpenAi, headers, &[&long]);
+        let facts = cb.stream_info.borrow().request_facts.clone();
+        assert_eq!(facts.input_characters, None);
+        assert!(!facts.complete);
+        // The same holds for a format admission decides on: an early
+        // `json` could be replaced by a later `text` past the cap.
+        let mut formats = br#"{"model":"whisper-1","response_format":"json","pad":""#.to_vec();
+        formats.extend(std::iter::repeat_n(b'x', DEFAULT_PREFIX_CAP));
+        formats.extend_from_slice(br#"","response_format":"text"}"#);
+        let formats_headers = request_headers(Some("application/json"), None);
+        let (_, formats_cb) = run(Dialect::OpenAi, formats_headers, &[&formats]);
+        assert_eq!(
+            formats_cb
+                .stream_info
+                .borrow()
+                .request_facts
+                .response_format,
+            None
+        );
+        assert_eq!(
+            cb.stream_info.borrow().requested_model.as_deref(),
+            Some("tts-1")
         );
     }
 

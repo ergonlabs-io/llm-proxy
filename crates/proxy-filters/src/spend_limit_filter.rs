@@ -14,8 +14,10 @@
 //! completed request (AGENTS.md "Fail-open controls").
 //!
 //! A budget that binds a request refuses it with 403 `endpoint_not_metered`
-//! when its endpoint cannot be counted (images, audio, batches, files and
-//! every unknown path; ADR-0010 decision 1, [`crate::unmetered`]). Free
+//! when its endpoint cannot be counted (batches, files and every unknown
+//! path; ADR-0010 decision 1, [`crate::unmetered`]), and, at the end of the
+//! body, when a speech, transcription, translation or image edit request has
+//! a shape that cannot be counted (decision 5). Free
 //! endpoints (`GET .../models`, `GET .../usage`,
 //! `POST .../messages/count_tokens`) pass without a missing-usage warning.
 
@@ -35,7 +37,7 @@ use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders,
-    ResponseHeaders, ResponseTrailers,
+    RequestTrailers, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::LlmSpendCharge;
 use proxy_observability::records::{ChargeScope, ChargedScope};
@@ -471,6 +473,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             tenant_budget_scope: None,
             budget_applies: false,
             recorded: false,
+            body_checked: false,
         })
     }
 }
@@ -684,6 +687,9 @@ struct SpendLimitFilterInstance {
     /// observing `end_stream` -- mirrors `token_limit_filter`'s identical
     /// flag.
     recorded: bool,
+    /// The body-time shape check ran (ADR-0010 decision 1, "Two admission
+    /// points"); `decode_data` and `decode_trailers` can both end a body.
+    body_checked: bool,
 }
 
 impl SpendLimitFilterInstance {
@@ -848,12 +854,44 @@ impl SpendLimitFilterInstance {
     }
 }
 
+impl SpendLimitFilterInstance {
+    /// Refuse a budgeted request whose body shape cannot be counted
+    /// (ADR-0010 decision 5), with the same 403 as an unmetered endpoint.
+    /// Only the endpoints whose countability depends on the body are
+    /// checked, and only where a budget binds the request.
+    fn admit_body(&mut self, cb: &mut dyn DecoderCallbacks) {
+        if self.body_checked || !self.budget_applies || !unmetered::needs_body_facts(self.endpoint)
+        {
+            return;
+        }
+        self.body_checked = true;
+        let countable = {
+            let info = cb.stream_info();
+            unmetered::countable_under_spend(
+                self.endpoint,
+                info.requested_model.is_some(),
+                &info.request_facts,
+            )
+        };
+        if !countable {
+            // Nothing was dialled, so there is nothing to record.
+            self.recorded = true;
+            unmetered::refuse(
+                cb,
+                self.endpoint,
+                unmetered::Control::Spend,
+                self.unmetered.as_deref(),
+            );
+        }
+    }
+}
+
 impl HttpFilter for SpendLimitFilterInstance {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
         _headers: &mut RequestHeaders,
-        _end_stream: bool,
+        end_stream: bool,
     ) -> FilterHeadersStatus {
         self.endpoint = cb.stream_info().llm.endpoint;
         // Rust note: `stream_info()` hands back a `RefMut` guard that must
@@ -949,6 +987,11 @@ impl HttpFilter for SpendLimitFilterInstance {
                 unmetered::Control::Spend,
                 self.unmetered.as_deref(),
             );
+            return FilterHeadersStatus::Continue;
+        }
+        // A body that never comes proves nothing the shape check needs.
+        if end_stream && self.budget_applies && unmetered::needs_body_facts(self.endpoint) {
+            self.admit_body(cb);
             return FilterHeadersStatus::Continue;
         }
         let now = Utc::now();
@@ -1066,6 +1109,30 @@ impl HttpFilter for SpendLimitFilterInstance {
         }
 
         FilterHeadersStatus::Continue
+    }
+
+    /// The shape check runs once the body_rewrite filter has published the
+    /// body's facts, at the end of the body.
+    fn decode_data(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _data: &mut bytes::Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        if end_stream {
+            self.admit_body(cb);
+        }
+        FilterDataStatus::Continue
+    }
+
+    /// A request that ends in trailers never sends `end_stream` on data.
+    fn decode_trailers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        _trailers: &mut RequestTrailers,
+    ) -> FilterTrailersStatus {
+        self.admit_body(cb);
+        FilterTrailersStatus::Continue
     }
 
     fn encode_headers(
@@ -1579,6 +1646,7 @@ mod tests {
                 tenant_budget_scope: None,
                 budget_applies: false,
                 recorded: false,
+                body_checked: false,
             }
         }
     }

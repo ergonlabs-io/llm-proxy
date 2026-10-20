@@ -1247,15 +1247,24 @@ pub struct PriceEntryDef {
     /// Per-image rows; present only for a `basis: images` entry.
     #[serde(default)]
     pub image_prices: Option<Vec<ImagePriceDef>>,
+    /// The price of one input character; present only for a
+    /// `basis: characters` entry.
+    #[serde(default)]
+    pub nanodollars_per_character: Option<u64>,
+    /// The price of one second of audio; present only for a
+    /// `basis: audio_seconds` entry.
+    #[serde(default)]
+    pub nanodollars_per_second: Option<u64>,
 }
 
-/// What a rate-card entry prices. `characters` and `audio_seconds` are not
-/// accepted yet, so they fail at parse time as unknown variants.
+/// What a rate-card entry prices (ADR-0010 decision 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceBasisDef {
     Tokens,
     Images,
+    Characters,
+    AudioSeconds,
 }
 
 #[derive(Debug, Deserialize)]

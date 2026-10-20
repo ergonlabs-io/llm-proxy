@@ -114,3 +114,10 @@ path = "fuzz_targets/media_scan.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "multipart_scan"
+path = "fuzz_targets/multipart_scan.rs"
+test = false
+doc = false
+bench = false
