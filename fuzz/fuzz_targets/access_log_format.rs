@@ -23,8 +23,8 @@ use std::time::{Duration, SystemTime};
 
 use libfuzzer_sys::fuzz_target;
 use proxy_observability::access_log::{
-    parse_format, render, DurationPrecision, FormatOp, FormatString, HeaderSpec, LlmTokens,
-    LogContext, TimePoint, TimePoints,
+    parse_format, render, DurationPrecision, FormatOp, FormatString, HeaderSpec, LlmMedia,
+    LlmTokens, LogContext, TimePoint, TimePoints,
 };
 
 /// A value no format can name: the target skips inputs that contain it.
@@ -132,6 +132,14 @@ fn print(format: &FormatString) -> String {
             FormatOp::LlmUsageCompleteness => "LLM_USAGE_COMPLETENESS",
             FormatOp::LlmCostKind => "LLM_COST_KIND",
             FormatOp::LlmRateCardVersion => "LLM_RATE_CARD_VERSION",
+            FormatOp::LlmImages => "LLM_IMAGES",
+            FormatOp::LlmInputCharacters => "LLM_INPUT_CHARACTERS",
+            FormatOp::LlmAudioMs => "LLM_AUDIO_MS",
+            FormatOp::LlmInputImageTokens => "LLM_INPUT_IMAGE_TOKENS",
+            FormatOp::LlmOutputImageTokens => "LLM_OUTPUT_IMAGE_TOKENS",
+            FormatOp::LlmInputAudioTokens => "LLM_INPUT_AUDIO_TOKENS",
+            FormatOp::LlmOutputAudioTokens => "LLM_OUTPUT_AUDIO_TOKENS",
+            FormatOp::LlmPriceBasis => "LLM_PRICE_BASIS",
         };
         let _ = write!(out, "%{bare}%");
     }
@@ -186,6 +194,16 @@ fn context<'a>(
         llm_usage_completeness: Some("complete"),
         llm_cost_kind: Some("list"),
         llm_rate_card_version: Some("v1"),
+        llm_media: LlmMedia {
+            images: Some(2),
+            input_characters: Some(30),
+            audio_milliseconds: Some(1500),
+            input_image_tokens: Some(4),
+            output_image_tokens: Some(5),
+            input_audio_tokens: Some(6),
+            output_audio_tokens: Some(7),
+            price_basis: Some("images"),
+        },
         time_points,
         request_method: Some("POST"),
         request_path: Some("/v1/chat/completions"),

@@ -1223,6 +1223,7 @@ mod tests {
             llm_usage_completeness: None,
             llm_cost_kind: None,
             llm_rate_card_version: None,
+            llm_media: Default::default(),
 
             request_method: None,
             request_path: None,
