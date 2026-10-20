@@ -91,6 +91,7 @@ export default defineConfig({
 						{ label: 'Read current usage', slug: 'limits-and-budgets/current-usage' },
 						{ label: 'Spend policies', slug: 'limits-and-budgets/spend-policies' },
 						{ label: 'Billing ledger', slug: 'limits-and-budgets/billing-ledger' },
+						{ label: 'Chargeback tags', slug: 'limits-and-budgets/chargeback-tags' },
 						// { label: 'Tenants', slug: 'limits-and-budgets/tenants' },
 					],
 				},

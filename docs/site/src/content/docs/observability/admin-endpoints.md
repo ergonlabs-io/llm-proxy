@@ -168,13 +168,14 @@ model and examples.
 
 | Route | Method | Success | What it does |
 |---|---|---|---|
-| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`, `limits`. Sorted by tenant, then key id. |
-| `/keys` | POST | `201` | Mints a key. Body: `tenant`, `key_id`. The answer holds the key text `key` once. |
+| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`, `limits`, `tags`. Sorted by tenant, then key id. |
+| `/keys` | POST | `201` | Mints a key. Body: `tenant`, `key_id`, optional `tags`. The answer holds the key text `key` once, and the key's `tags`. |
 | `/keys/{id}` | DELETE | `204` | Revokes a key. |
 | `/keys/{id}/budget` | PUT | `204` | Sets or clears a key budget. |
 | `/keys/{id}/policy` | PUT | `204` | Sets the model allow-list of one key. The key can only narrow its tenant grant. See "Key model policy". |
 | `/keys/{id}/limits` | PUT | `204` | Sets or clears the rate limits of one key. The key can only narrow its tenant limits. See "Tenant and key limits". |
-| `/keys/{id}/spend` | GET | `200` | Reads the spend of a key. |
+| `/keys/{id}/tags` | PUT | `204` | Replaces the chargeback tags of one key. Body: `tags`. See [Chargeback tags](../../limits-and-budgets/chargeback-tags/). |
+| `/keys/{id}/spend` | GET | `200` | Reads the spend of a key, with the key's `tags`. |
 | `/tenants` | POST | `201` | Creates a tenant. Body: `tenant`. |
 | `/tenants/{id}` | DELETE | `204` | Deletes a tenant and revokes every key that authenticates as it. Minted keys are revoked and their rows stay. Config-file `auth.keys` entries for the tenant are revoked by a revoked store row with the same key id. That row wins on every replica that shares the store, and across restarts. Revoked key ids are permanent. The next request with any of those keys gets `401`. |
 | `/tenants/{id}/policy` | PUT | `204` | Sets the model-access policy. Body: `access` (`all` or `{"only": [...]}`) and optional `deny`. An invalid pattern gives `400`. |
