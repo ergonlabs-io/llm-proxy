@@ -1297,7 +1297,10 @@ impl TokenLimitFilterInstance {
         // call (see its doc).
         let (usage, dialled): (Option<LlmTokenUsage>, bool) = {
             let info = cb.stream_info();
-            (info.llm.usage, info.upstream_cluster.is_some())
+            (
+                info.llm.usage.as_ref().and_then(|usage| usage.tokens),
+                info.upstream_cluster.is_some(),
+            )
         };
 
         // `None` must stay unrecorded -- inventing a zero-cost record would
@@ -1733,7 +1736,7 @@ impl HttpFilter for TokenLimitFilterInstance {
             (info.auth.tenant.clone(), info.auth.key_id.clone())
         };
 
-        self.endpoint = Endpoint::classify(&headers.method, headers.uri.path());
+        self.endpoint = cb.stream_info().llm.endpoint;
         if !can_count(self.endpoint) {
             let client: Option<std::net::IpAddr> = cb.stream_info().client_address;
             if self.binds_tokens(tenant.as_deref(), key_id.as_deref(), client, headers) {
@@ -2119,6 +2122,19 @@ mod tests {
     /// A `DecoderCallbacks` + `EncoderCallbacks` double sharing one
     /// `StreamInfo`, mirroring `usage_filter`/`body_rewrite_filter`'s test
     /// doubles. Every method this filter doesn't use panics loudly.
+    /// What `FilterChainHandler::handle` does before any filter runs:
+    /// classify the request once into stream info (ADR-0010 decision 1).
+    fn decode(
+        filter: &mut dyn HttpFilter,
+        cb: &mut TestCallbacks,
+        headers: &mut RequestHeaders,
+        end_stream: bool,
+    ) -> FilterHeadersStatus {
+        cb.stream_info.borrow_mut().llm.endpoint =
+            proxy_http::endpoint::Endpoint::classify(&headers.method, headers.uri.path());
+        filter.decode_headers(cb, headers, end_stream)
+    }
+
     struct TestCallbacks {
         route: Option<Arc<RouteEntry>>,
         stream_info: RefCell<StreamInfo>,
@@ -2140,7 +2156,8 @@ mod tests {
         }
 
         fn set_usage(&self, usage: LlmTokenUsage) {
-            self.stream_info.borrow_mut().llm.usage = Some(usage);
+            self.stream_info.borrow_mut().llm.usage =
+                Some(proxy_http::LlmUsage::from_tokens(usage));
         }
 
         /// Stand in for the auth filter, which runs earlier in config
@@ -2400,7 +2417,7 @@ mod tests {
             cb.set_authenticated_tenant(tenant);
         }
         let mut head = request_headers(credential);
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
             cb.set_dialled();
@@ -2449,7 +2466,7 @@ mod tests {
         let mut filter = filter_with(Arc::clone(store));
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         let mut head = request_headers(Some("Bearer sk-1"));
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
         if cb.local_reply.is_some() {
             return cb.local_reply;
         }
@@ -2544,7 +2561,7 @@ mod tests {
         let mut filter = filter_with(Arc::clone(&store));
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         let mut head = request_headers(Some("Bearer sk-1"));
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         assert!(
             cb.local_reply.is_some(),
@@ -2576,7 +2593,7 @@ mod tests {
         // request's usage pushes the total over budget.
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
         let mut head = request_headers(Some("Bearer sk-1"));
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
         assert!(
             cb.local_reply.is_none(),
             "must be admitted while budget is empty"
@@ -2711,7 +2728,7 @@ mod tests {
         filter.usage_missing_warner = Arc::clone(warner);
         let mut cb = TestCallbacks::new(Some(route_named(route)));
         let mut head = request_headers(credential);
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
             cb.set_dialled();
@@ -2966,7 +2983,7 @@ mod tests {
     ) -> Option<(StatusCode, HeaderMap, String)> {
         let mut cb = TestCallbacks::new(Some(route_named(route)));
         let mut head = request_headers(credential);
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut *filter, &mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
             cb.set_dialled();
@@ -3276,7 +3293,12 @@ mod tests {
         // The next epoch-aligned window starts with nothing counted.
         let mut filter = filter_at(Arc::clone(&store), next_minute_clock);
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
-        filter.decode_headers(&mut cb, &mut request_headers(Some("Bearer sk-1")), true);
+        decode(
+            &mut filter,
+            &mut cb,
+            &mut request_headers(Some("Bearer sk-1")),
+            true,
+        );
         assert!(cb.local_reply.is_none(), "the window must have rolled over");
     }
 
@@ -3308,8 +3330,12 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         let mut cb = TestCallbacks::new(Some(route_named("r1")));
-        let status =
-            filter.decode_headers(&mut cb, &mut request_headers(Some("Bearer sk-1")), true);
+        let status = decode(
+            &mut filter,
+            &mut cb,
+            &mut request_headers(Some("Bearer sk-1")),
+            true,
+        );
 
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert!(
@@ -3351,7 +3377,7 @@ mod tests {
             uri: uri.parse().expect("valid test URI"),
             headers,
         };
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
         cb.local_reply
     }
 
@@ -3613,7 +3639,7 @@ mod tests {
             uri: "/v1/usage".parse().unwrap(),
             headers: HeaderMap::new(),
         };
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
         let (status, _, body) = cb.local_reply.expect("refused as unmetered");
         assert_eq!(
             status,
@@ -3689,7 +3715,7 @@ mod tests {
         cb.set_authenticated_tenant(tenant);
         cb.stream_info.borrow_mut().auth.key_id = Some(key.to_string());
         let mut head = request_headers(Some("Bearer llmp_test"));
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut *filter, &mut cb, &mut head, true);
         (filter, cb)
     }
 
@@ -3978,7 +4004,12 @@ mod tests {
             let mut filter = self.factory.create_filter();
             let mut cb = TestCallbacks::new(Some(route_named(route)));
             cb.set_authenticated_tenant(tenant);
-            filter.decode_headers(&mut cb, &mut request_headers(Some("Bearer llmp_x")), true);
+            decode(
+                &mut *filter,
+                &mut cb,
+                &mut request_headers(Some("Bearer llmp_x")),
+                true,
+            );
             assert!(cb.local_reply.is_none(), "setup request must be admitted");
             cb.set_usage(usage(tokens));
             filter.encode_headers(&mut cb, &mut response_headers(), true);
@@ -3997,7 +4028,7 @@ mod tests {
                 uri: "/v1/usage".parse().unwrap(),
                 headers: HeaderMap::new(),
             };
-            let held = filter.decode_headers(&mut cb, &mut head, true)
+            let held = decode(&mut *filter, &mut cb, &mut head, true)
                 == FilterHeadersStatus::StopIteration;
             if held {
                 assert!(cb.local_reply.is_none(), "a held request has no reply yet");
@@ -4010,7 +4041,7 @@ mod tests {
                     .expect("a held usage request has a read pending");
                 runtime.block_on(pending);
                 assert!(filter.poll_pending().is_none(), "one read per hold");
-                filter.decode_headers(&mut cb, &mut head, true);
+                decode(&mut *filter, &mut cb, &mut head, true);
             }
             (
                 held,
@@ -4128,7 +4159,7 @@ mod tests {
             headers: HeaderMap::new(),
         };
 
-        let status = filter.decode_headers(&mut cb, &mut head, true);
+        let status = decode(&mut *filter, &mut cb, &mut head, true);
 
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert_eq!(cb.local_reply.unwrap().0, StatusCode::UNAUTHORIZED);
@@ -4294,7 +4325,7 @@ mod tests {
                 HeaderValue::from_str(value).unwrap(),
             );
         }
-        filter.decode_headers(&mut cb, &mut head, false);
+        decode(&mut *filter, &mut cb, &mut head, false);
         if cb.local_reply.is_none() {
             if let Some(model) = req.model {
                 cb.stream_info.borrow_mut().requested_model = Some(model.to_string());

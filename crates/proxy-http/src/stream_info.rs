@@ -13,6 +13,12 @@ use proxy_observability::ResponseFlag;
 /// cache reads and writes have different prices; input tokens exclude cached
 /// tokens, so [`total`](Self::total) sums the buckets. This type stays here
 /// because `proxy-filters` depends on `proxy-http`.
+///
+/// The four modality fields are subsets, not further buckets: image and audio
+/// tokens a provider reported inside `input_tokens` or `output_tokens`
+/// (ADR-0010 decision 2). They never add to [`total`](Self::total). A rate
+/// card prices them at a modality rate only when the dialled entry has one;
+/// otherwise they stay in their text bucket at the text rate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LlmTokenUsage {
     /// Standard (non-cached) input tokens, at the base input rate.
@@ -24,6 +30,119 @@ pub struct LlmTokenUsage {
     pub cache_creation_tokens: u64,
     /// Output/completion tokens.
     pub output_tokens: u64,
+    /// Image tokens inside `input_tokens`.
+    pub input_image_tokens: u64,
+    /// Image tokens inside `output_tokens`.
+    pub output_image_tokens: u64,
+    /// Audio tokens inside `input_tokens`.
+    pub input_audio_tokens: u64,
+    /// Audio tokens inside `output_tokens`.
+    pub output_audio_tokens: u64,
+}
+
+/// Count meters: what a request consumed in units other than tokens
+/// (ADR-0010 decision 2). Each is `None` when it was not observed, never a
+/// fabricated zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmMeters {
+    /// Images returned: elements of the top-level `data` array of a JSON
+    /// response, or `*.completed` stream events.
+    pub images: Option<u64>,
+    /// The images' `size` attribute: the response echo, else the request
+    /// body. An opaque string, matched exactly against the rate card.
+    pub image_size: Option<String>,
+    /// The images' `quality` attribute, from the same sources as `image_size`.
+    pub image_quality: Option<String>,
+    /// Unicode scalar values in the request's JSON `input` field.
+    pub input_characters: Option<u64>,
+    /// Audio duration the provider reported, in milliseconds.
+    pub audio_milliseconds: Option<u64>,
+}
+
+impl LlmMeters {
+    /// No count meter was observed. The image attributes are not meters:
+    /// they only select a price.
+    pub fn is_empty(&self) -> bool {
+        self.images.is_none()
+            && self.input_characters.is_none()
+            && self.audio_milliseconds.is_none()
+    }
+}
+
+/// Everything one request consumed: the token buckets and the count meters.
+/// It is the one input to pricing, so a meter cannot be observed and then
+/// left uncharged (ADR-0010 decision 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LlmUsage {
+    /// `None` when the response reported no token usage at all. A response
+    /// that reported zero tokens is `Some` with zero buckets.
+    pub tokens: Option<LlmTokenUsage>,
+    pub meters: LlmMeters,
+}
+
+impl LlmUsage {
+    /// Usage of a response that reported tokens and no count meter.
+    pub fn from_tokens(tokens: LlmTokenUsage) -> Self {
+        Self {
+            tokens: Some(tokens),
+            meters: LlmMeters::default(),
+        }
+    }
+
+    /// Nothing was observed: no token bucket and no count meter. A stored
+    /// [`LlmStats::usage`] is never empty; it is `None` instead.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_none() && self.meters.is_empty()
+    }
+
+    /// The token buckets, zero when none were reported.
+    pub fn tokens_or_zero(&self) -> LlmTokenUsage {
+        self.tokens.unwrap_or_default()
+    }
+}
+
+/// Which meters a rate-card entry prices (ADR-0010 decision 3). An entry
+/// prices only the meters of its basis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum PriceBasis {
+    /// The token buckets, today's behaviour and the default.
+    #[default]
+    Tokens,
+    /// The `images` meter.
+    Images,
+    /// The `input_characters` meter.
+    Characters,
+    /// The `audio_milliseconds` meter, priced per second.
+    AudioSeconds,
+}
+
+impl PriceBasis {
+    /// The config spelling, also used in logs and records.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tokens => "tokens",
+            Self::Images => "images",
+            Self::Characters => "characters",
+            Self::AudioSeconds => "audio_seconds",
+        }
+    }
+}
+
+/// Facts the body-rewrite filter read from the request body's bounded prefix
+/// scan, beyond the model (ADR-0010 decision 4). Each is `None` when the body
+/// did not prove it inside the scan cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFacts {
+    /// Top-level `size`, a string.
+    pub size: Option<String>,
+    /// Top-level `quality`, a string.
+    pub quality: Option<String>,
+    /// Top-level `response_format`, a string.
+    pub response_format: Option<String>,
+    /// Top-level `stream_format`, a string.
+    pub stream_format: Option<String>,
+    /// Unicode scalar values in the top-level string `input`, unescaped.
+    pub input_characters: Option<u64>,
 }
 
 /// The immutable list-price observation for one completed request.
@@ -96,7 +215,18 @@ impl GenAiSystem {
 /// `None`, never zero, because these values feed billing.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LlmStats {
-    pub usage: Option<LlmTokenUsage>,
+    /// What the request consumed, written by the usage filter. `None` when
+    /// nothing was observed; never an empty [`LlmUsage`].
+    pub usage: Option<LlmUsage>,
+    /// The request's endpoint class, classified once from the client-facing
+    /// method and path when the stream enters the filter chain (ADR-0010
+    /// decisions 1 and 6). Filters read it here rather than classifying their
+    /// own request headers. The default, `Unmetered`, is what a stream that
+    /// never entered the chain gets, and it is refused under every control.
+    pub endpoint: crate::endpoint::Endpoint,
+    /// The basis of the rate-card entry that priced `usage`; `None` when no
+    /// entry priced it.
+    pub price_basis: Option<PriceBasis>,
     /// Filled once, alongside final usage, after the response stream ends.
     pub list_cost: Option<LlmListCost>,
     /// Written by the spend filter when it charged this request; `None` when
@@ -351,6 +481,10 @@ pub struct StreamInfo {
     /// authorize a request against a tenant's model allow-list, and fails
     /// closed on `None` -- see that filter's module doc.
     pub requested_model: Option<String>,
+    /// The other facts the body_rewrite filter's prefix scan read (image
+    /// attributes and the phase-3 shape facts), published with
+    /// `requested_model` from the same scan.
+    pub request_facts: RequestFacts,
     /// Set by the body_rewrite filter when it is configured to force usage
     /// reporting for this request's dialect; read by the router, which
     /// enforces it against the whole buffered body.
@@ -441,6 +575,7 @@ impl Default for StreamInfo {
             tenant_credentials: None,
             credential_source: None,
             requested_model: None,
+            request_facts: RequestFacts::default(),
             force_include_usage: false,
             max_output_tokens: None,
             resolved_model: None,

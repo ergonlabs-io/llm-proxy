@@ -667,7 +667,7 @@ impl SpendLimitFilterInstance {
         let (usage, cluster, model, selected_model, served_model, credential_source) = {
             let info = cb.stream_info();
             (
-                info.llm.usage,
+                info.llm.usage.clone(),
                 info.upstream_cluster.clone(),
                 info.routing_model().map(str::to_owned),
                 info.selected_model.clone(),
@@ -687,6 +687,7 @@ impl SpendLimitFilterInstance {
             return;
         };
 
+        let usage = usage.tokens_or_zero();
         let usage = TokenUsage {
             input_tokens: usage.input_tokens,
             cached_tokens: usage.cached_tokens,
@@ -805,10 +806,10 @@ impl HttpFilter for SpendLimitFilterInstance {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        headers: &mut RequestHeaders,
+        _headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
-        self.endpoint = Endpoint::classify(&headers.method, headers.uri.path());
+        self.endpoint = cb.stream_info().llm.endpoint;
         // Rust note: `stream_info()` hands back a `RefMut` guard that must
         // not be held across another call on `cb` -- cloning the
         // `Option<String>` out and letting the guard drop at the end of this
@@ -1308,6 +1309,19 @@ mod tests {
         })
     }
 
+    /// What `FilterChainHandler::handle` does before any filter runs:
+    /// classify the request once into stream info (ADR-0010 decision 1).
+    fn decode(
+        filter: &mut dyn HttpFilter,
+        cb: &mut TestCallbacks,
+        headers: &mut RequestHeaders,
+        end_stream: bool,
+    ) -> FilterHeadersStatus {
+        cb.stream_info.borrow_mut().llm.endpoint =
+            proxy_http::endpoint::Endpoint::classify(&headers.method, headers.uri.path());
+        filter.decode_headers(cb, headers, end_stream)
+    }
+
     struct TestCallbacks {
         route: Option<Arc<RouteEntry>>,
         stream_info: RefCell<StreamInfo>,
@@ -1356,7 +1370,8 @@ mod tests {
         }
 
         fn set_usage(&self, usage: LlmTokenUsage) {
-            self.stream_info.borrow_mut().llm.usage = Some(usage);
+            self.stream_info.borrow_mut().llm.usage =
+                Some(proxy_http::LlmUsage::from_tokens(usage));
         }
 
         fn set_upstream(&self, cluster: &str, model: &str) {
@@ -1664,7 +1679,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant(tenant);
         let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
             if let Some((cluster, model)) = cluster_and_model {
@@ -1708,7 +1723,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         if let Some((status, _)) = cb.local_reply.clone() {
             return Some(status);
         }
@@ -2020,7 +2035,7 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_tenant_mode();
         cb.set_credential_source(Some(CredentialSource::Tenant));
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         cb.set_upstream("cluster-a", "evil\nWARN forged line");
         cb.set_usage(usage(5));
 
@@ -2089,7 +2104,7 @@ mod tests {
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
             cb.set_tenant("tenant-a");
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             cb.set_upstream("cluster-a", "gpt-5");
             cb.stream_info.borrow_mut().llm.served_model = served.map(str::to_owned);
             cb.set_usage(usage(5000));
@@ -2138,7 +2153,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         // No `set_tenant` call -- StreamInfo::auth.tenant stays `None`.
         let mut head = request_headers();
-        let status = filter.decode_headers(&mut cb, &mut head, true);
+        let status = decode(&mut filter, &mut cb, &mut head, true);
 
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert!(cb.local_reply.is_none(), "no tenant must never be denied");
@@ -2158,7 +2173,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.stream_info.borrow_mut().auth.tenant = Some("tenant-a".into());
-        let status = filter.decode_headers(&mut cb, &mut request_headers(), true);
+        let status = decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert_eq!(status, FilterHeadersStatus::StopIteration);
         assert_eq!(cb.local_reply.as_ref().unwrap().0, StatusCode::FORBIDDEN);
     }
@@ -2183,11 +2198,11 @@ mod tests {
         let mut second_cb = TestCallbacks::new();
         second_cb.set_tenant("tenant-a");
         assert_eq!(
-            first.decode_headers(&mut first_cb, &mut request_headers(), true),
+            decode(&mut first, &mut first_cb, &mut request_headers(), true),
             FilterHeadersStatus::Continue
         );
         assert_eq!(
-            second.decode_headers(&mut second_cb, &mut request_headers(), true),
+            decode(&mut second, &mut second_cb, &mut request_headers(), true),
             FilterHeadersStatus::Continue
         );
         for (filter, cb) in [(&mut first, &mut first_cb), (&mut second, &mut second_cb)] {
@@ -2280,7 +2295,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
         cb.stream_info.borrow_mut().auth.key_id = Some(second.as_str().to_string());
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(cb.local_reply.is_none());
         cb.set_upstream("cluster-a", "m");
         cb.set_usage(usage(2));
@@ -2387,7 +2402,7 @@ mod tests {
             } else {
                 cb.stream_info.borrow_mut().auth.tenant = None;
             }
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert_eq!(cb.local_reply.unwrap().0, StatusCode::FORBIDDEN);
         }
     }
@@ -2657,7 +2672,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
         let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         assert!(
             cb.local_reply.is_some(),
@@ -2690,7 +2705,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-zero");
         let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         assert!(
             cb.local_reply.is_some(),
@@ -2964,7 +2979,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert_eq!(
             cb.local_reply.as_ref().map(|(status, _)| *status),
             Some(StatusCode::TOO_MANY_REQUESTS),
@@ -2977,7 +2992,7 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_tenant_mode();
         cb.set_credential_source(Some(CredentialSource::Tenant));
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(
             cb.local_reply.is_none(),
             "a tenant-mode request must not be checked against a platform-scoped budget"
@@ -3007,7 +3022,7 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_tenant_mode();
         cb.set_credential_source(Some(CredentialSource::Tenant));
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert_eq!(
             cb.local_reply.as_ref().map(|(status, _)| *status),
             Some(StatusCode::TOO_MANY_REQUESTS),
@@ -3017,7 +3032,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(
             cb.local_reply.is_none(),
             "a platform-mode request must not be checked against a tenant-scoped budget"
@@ -3062,7 +3077,7 @@ mod tests {
                 cb.set_tenant_mode();
                 cb.set_credential_source(Some(CredentialSource::Tenant));
             }
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert!(cb.local_reply.is_none(), "both ceilings dwarf this cost");
             cb.set_upstream("cluster-a", "m");
             cb.set_usage(usage(2));
@@ -3135,7 +3150,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
         cb.set_credential_source(None);
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(cb.local_reply.is_none());
         cb.set_upstream("cluster-a", "m");
         cb.set_usage(usage(2));
@@ -3192,7 +3207,7 @@ mod tests {
             cb.set_tenant("tenant-a");
             cb.set_tenant_mode();
             cb.set_credential_source(Some(CredentialSource::Tenant));
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert_eq!(
                 cb.local_reply.as_ref().map(|(status, _)| *status),
                 Some(StatusCode::TOO_MANY_REQUESTS),
@@ -3203,7 +3218,7 @@ mod tests {
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
             cb.set_tenant("tenant-a");
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert!(
                 cb.local_reply.is_none(),
                 "key={key_micros} tenant={tenant_micros}: neither tenant-scoped budget may \

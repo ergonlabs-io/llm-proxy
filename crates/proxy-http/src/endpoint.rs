@@ -16,7 +16,10 @@ use http::Method;
 ///
 /// `Unmetered` covers every path the classifier does not know, so an endpoint
 /// a provider adds later is unmetered until it is designed in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The `Default` is `Unmetered`: a stream that was never classified is refused
+/// under every control, never admitted as a text endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Endpoint {
     /// `POST .../chat/completions`.
     ChatCompletions,
@@ -43,6 +46,7 @@ pub enum Endpoint {
     Free,
     /// Everything else: batches, files, retrievals of stored objects, and any
     /// path not listed above.
+    #[default]
     Unmetered,
 }
 

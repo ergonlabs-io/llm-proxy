@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
-use http::{HeaderMap, Method};
+use http::HeaderMap;
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
@@ -22,7 +22,7 @@ use proxy_http::filter::{
     RequestHeaders, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::GenAiSystem;
-use proxy_http::{LlmListCost, LlmTokenUsage};
+use proxy_http::{LlmListCost, LlmTokenUsage, LlmUsage};
 use proxy_observability::records::UsageCompleteness;
 use proxy_observability::stats::{instruments, Handle, Instrument, Registry, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -945,6 +945,7 @@ fn llm_token_usage(usage: TokenUsage) -> LlmTokenUsage {
         cached_tokens: usage.cached_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
         output_tokens: usage.output_tokens,
+        ..LlmTokenUsage::default()
     }
 }
 
@@ -1536,8 +1537,8 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
 /// (`usage.prompt_tokens`, no output tokens), so it is read with the OpenAI
 /// parser even behind a cluster whose dialect is Anthropic: that parser would
 /// look for `input_tokens` and meter nothing.
-fn dialect_for_request(method: &Method, path: &str) -> Option<Dialect> {
-    match Endpoint::classify(method, path) {
+fn dialect_for_request(endpoint: Endpoint) -> Option<Dialect> {
+    match endpoint {
         Endpoint::Responses => Some(Dialect::OpenAiResponses),
         Endpoint::Messages => Some(Dialect::Anthropic),
         Endpoint::Embeddings => Some(Dialect::OpenAi),
@@ -1695,7 +1696,7 @@ impl UsageFilterInstance {
         // `None` must stay `None` here — never write `Some(0, 0)` for a
         // response that reported no usage at all (this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
-        stream_info.llm.usage = usage.map(llm_token_usage);
+        stream_info.llm.usage = usage.map(|usage| LlmUsage::from_tokens(llm_token_usage(usage)));
         // The card is evaluated only after the terminal usage extractor has
         // seen the complete response. In particular, an SSE stream's partial
         // chunks cannot create a provisional price that later changes.
@@ -1759,12 +1760,11 @@ impl UsageFilterInstance {
 impl HttpFilter for UsageFilterInstance {
     fn decode_headers(
         &mut self,
-        _cb: &mut dyn DecoderCallbacks,
-        headers: &mut RequestHeaders,
+        cb: &mut dyn DecoderCallbacks,
+        _headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
-        // `Uri::path` already excludes the query string.
-        self.request_dialect = dialect_for_request(&headers.method, headers.uri.path());
+        self.request_dialect = dialect_for_request(cb.stream_info().llm.endpoint);
         FilterHeadersStatus::Continue
     }
 
@@ -1895,6 +1895,7 @@ mod rate_card_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Method;
 
     use bytes::Bytes;
     use http::{HeaderValue, StatusCode};
@@ -1916,6 +1917,19 @@ mod tests {
     /// (`Rc<RefCell<StreamInfo>>`), so `stream_info()` returns a `RefMut`
     /// guard rather than a plain `&mut`. The double mirrors that shape; no
     /// `Rc` is needed here since nothing else holds a handle.
+    /// What `FilterChainHandler::handle` does before any filter runs:
+    /// classify the request once into stream info (ADR-0010 decision 1).
+    fn decode(
+        filter: &mut dyn HttpFilter,
+        cb: &mut TestCallbacks,
+        headers: &mut RequestHeaders,
+        end_stream: bool,
+    ) -> FilterHeadersStatus {
+        cb.stream_info.borrow_mut().llm.endpoint =
+            proxy_http::endpoint::Endpoint::classify(&headers.method, headers.uri.path());
+        filter.decode_headers(cb, headers, end_stream)
+    }
+
     struct TestCallbacks {
         stream_info: std::cell::RefCell<StreamInfo>,
         per_route_config: Option<Arc<dyn PerRouteConfig>>,
@@ -2119,7 +2133,11 @@ mod tests {
             assert_eq!(status, FilterDataStatus::Continue);
         }
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
     }
@@ -2143,7 +2161,11 @@ mod tests {
             assert_eq!(status, FilterDataStatus::Continue);
         }
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(cb.llm().response_chunks, stream.len() as u64);
@@ -2167,7 +2189,11 @@ mod tests {
         let mut data2 = Bytes::copy_from_slice(delta);
         filter.encode_data(&mut cb, &mut data2, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 15);
     }
@@ -2210,7 +2236,11 @@ mod tests {
             Bytes::from_static(br#"{"usage":{"prompt_tokens":1,"completion_tokens":2}}"#);
         filter.encode_data(&mut cb, &mut data, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 1);
         assert_eq!(usage.output_tokens, 2);
     }
@@ -2246,7 +2276,11 @@ mod tests {
         let mut cb = TestCallbacks::new();
         run_json(&mut filter, &mut cb, oversized_json_chunks(false));
 
-        let usage = cb.llm().usage.expect("usage recovered from the tail");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage recovered from the tail");
         assert_eq!((usage.input_tokens, usage.output_tokens), (11, 13));
         assert_eq!(filter.stats.oversized_unrecoverable(), 0);
         if let BodyMode::Json(body) = &filter.mode {
@@ -2284,7 +2318,13 @@ mod tests {
         let mut tail =
             Bytes::from_static(br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#);
         filter.encode_data(&mut cb, &mut tail, true);
-        assert_eq!(cb.llm().usage.map(|u| u.input_tokens), Some(1));
+        assert_eq!(
+            cb.llm()
+                .usage
+                .and_then(|u| u.tokens)
+                .map(|u| u.input_tokens),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2322,7 +2362,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.stream_info.borrow_mut().upstream_usage_dialect =
             Some(proxy_config::ir::UsageDialect::OpenAi);
-        filter.decode_headers(&mut cb, &mut request(method, uri), true);
+        decode(&mut filter, &mut cb, &mut request(method, uri), true);
         filter.encode_headers(&mut cb, &mut response_headers(content_type), false);
         filter.encode_data(&mut cb, &mut Bytes::from_static(body), true);
         cb.llm()
@@ -2336,7 +2376,7 @@ mod tests {
             "application/json",
             br#"{"usage":{"input_tokens":20,"output_tokens":4,"input_tokens_details":{"cached_tokens":5}}}"#,
         );
-        let usage = llm.usage.expect("responses usage");
+        let usage = llm.usage.and_then(|u| u.tokens).expect("responses usage");
         assert_eq!(
             (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
             (15, 5, 4)
@@ -2352,7 +2392,10 @@ mod tests {
             "text/event-stream",
             b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}\n\n",
         );
-        let usage = llm.usage.expect("responses sse usage");
+        let usage = llm
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("responses sse usage");
         assert_eq!((usage.input_tokens, usage.output_tokens), (8, 3));
     }
 
@@ -2364,7 +2407,7 @@ mod tests {
             "application/json",
             br#"{"usage":{"input_tokens":6,"output_tokens":2,"cache_read_input_tokens":4}}"#,
         );
-        let usage = llm.usage.expect("anthropic usage");
+        let usage = llm.usage.and_then(|u| u.tokens).expect("anthropic usage");
         assert_eq!(
             (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
             (6, 4, 2)
@@ -2383,7 +2426,7 @@ mod tests {
             "application/json",
             br#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,-0.2]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":12,"total_tokens":12}}"#,
         );
-        let usage = llm.usage.expect("embeddings usage");
+        let usage = llm.usage.and_then(|u| u.tokens).expect("embeddings usage");
         assert_eq!(
             (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
             (12, 0, 0)
@@ -2398,14 +2441,23 @@ mod tests {
     fn post_embeddings_on_an_anthropic_cluster_reads_openai_usage() {
         let mut filter = filter_for(Dialect::Anthropic);
         let mut cb = TestCallbacks::new();
-        filter.decode_headers(&mut cb, &mut request(Method::POST, "/v1/embeddings"), true);
+        decode(
+            &mut filter,
+            &mut cb,
+            &mut request(Method::POST, "/v1/embeddings"),
+            true,
+        );
         filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
         filter.encode_data(
             &mut cb,
             &mut Bytes::from_static(br#"{"data":[],"usage":{"prompt_tokens":7,"total_tokens":7}}"#),
             true,
         );
-        let usage = cb.llm().usage.expect("embeddings usage");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("embeddings usage");
         assert_eq!((usage.input_tokens, usage.output_tokens), (7, 0));
         // The provider label still follows the cluster.
         assert_eq!(cb.llm().system, Some(GenAiSystem::Anthropic));
@@ -2418,7 +2470,12 @@ mod tests {
     fn embeddings_usage_after_a_body_larger_than_the_json_bound_is_read_from_the_tail() {
         let mut filter = filter_for(Dialect::OpenAi);
         let mut cb = TestCallbacks::new();
-        filter.decode_headers(&mut cb, &mut request(Method::POST, "/v1/embeddings"), true);
+        decode(
+            &mut filter,
+            &mut cb,
+            &mut request(Method::POST, "/v1/embeddings"),
+            true,
+        );
         filter.encode_headers(&mut cb, &mut response_headers("application/json"), false);
         let vector = format!("[{}0.5]", "0.125,".repeat(1024));
         let mut sent = 0;
@@ -2444,7 +2501,11 @@ mod tests {
         sent += head.len();
         assert!(sent > MAX_JSON_BODY_BYTES, "the body must pass the bound");
         filter.encode_data(&mut cb, &mut Bytes::from(head), true);
-        let usage = cb.llm().usage.expect("usage read from the tail window");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage read from the tail window");
         assert_eq!((usage.input_tokens, usage.output_tokens), (4096, 0));
     }
 
@@ -2699,7 +2760,7 @@ mod tests {
         assert_eq!(stats.upstream_id_oversized(), 1);
         assert_eq!(stats.upstream_usage_oversized(), 1);
         // Token counts are unaffected by dropping the raw text.
-        assert_eq!(llm.usage.unwrap().input_tokens, 2);
+        assert_eq!(llm.usage.and_then(|u| u.tokens).unwrap().input_tokens, 2);
     }
 
     #[test]
@@ -2766,7 +2827,7 @@ mod tests {
         let llm = abort_after(&mut filter, 40, &[CHAT_ID, CHAT_MORE]);
         assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
         // 40 request bytes -> 10 input tokens; 12 streamed bytes -> 3 output.
-        let usage = llm.usage.expect("estimated usage");
+        let usage = llm.usage.and_then(|u| u.tokens).expect("estimated usage");
         assert_eq!((usage.input_tokens, usage.output_tokens), (10, 3));
         assert!(llm.input_estimated && llm.output_estimated);
         // Same card path as a complete record: 10 * 10 + 3 * 100.
@@ -2785,7 +2846,7 @@ mod tests {
             "x".repeat(40)
         );
         let llm = abort_after(&mut filter, 4000, &[start, &delta]);
-        let usage = llm.usage.expect("usage");
+        let usage = llm.usage.and_then(|u| u.tokens).expect("usage");
         assert_eq!(usage.input_tokens, 25, "exact, not 4000 / 4");
         assert_eq!(usage.output_tokens, 10, "the larger of 1 and 40 / 4");
         assert!(!llm.input_estimated && llm.output_estimated);
@@ -2799,7 +2860,7 @@ mod tests {
         let stats = Arc::clone(&filter.stats);
         let usage_frame = "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":50}}\n\n";
         let llm = abort_after(&mut filter, 4000, &[CHAT_ID, usage_frame]);
-        let usage = llm.usage.unwrap();
+        let usage = llm.usage.and_then(|u| u.tokens).unwrap();
         assert_eq!((usage.input_tokens, usage.output_tokens), (5, 50));
         assert!(!llm.input_estimated && !llm.output_estimated);
         assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
@@ -2919,7 +2980,11 @@ mod tests {
         );
         filter.encode_data(&mut cb, &mut data, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.cached_tokens, 80);
         assert_eq!(usage.cache_creation_tokens, 7);
@@ -2944,7 +3009,11 @@ mod tests {
         );
         filter.encode_data(&mut cb, &mut data, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(
             usage.input_tokens, 20,
             "prompt_tokens net of the cached part"
@@ -3149,7 +3218,11 @@ mod tests {
             Bytes::from_static(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#);
         filter.encode_data(&mut cb, &mut data, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 3);
         assert_eq!(usage.output_tokens, 4);
     }
@@ -3174,7 +3247,11 @@ mod tests {
             Bytes::from_static(br#"{"usage":{"prompt_tokens":7,"completion_tokens":9}}"#);
         filter.encode_data(&mut cb, &mut data, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 9);
     }
@@ -3194,7 +3271,11 @@ mod tests {
         let mut data = Bytes::from_static(br#"{"usage":{"input_tokens":7,"output_tokens":9}}"#);
         filter.encode_data(&mut cb, &mut data, true);
 
-        let usage = cb.llm().usage.expect("usage should be found");
+        let usage = cb
+            .llm()
+            .usage
+            .and_then(|u| u.tokens)
+            .expect("usage should be found");
         assert_eq!(usage.input_tokens, 7);
         assert_eq!(usage.output_tokens, 9);
     }
@@ -3259,7 +3340,14 @@ mod tests {
         filter.encode_headers(&mut cb, &mut headers, false);
         let mut data = Bytes::from_static(br#"{"usage":{"input_tokens":2,"output_tokens":3}}"#);
         filter.encode_data(&mut cb, &mut data, true);
-        assert_eq!(cb.llm().usage.expect("legacy filter runs").input_tokens, 2);
+        assert_eq!(
+            cb.llm()
+                .usage
+                .and_then(|u| u.tokens)
+                .expect("legacy filter runs")
+                .input_tokens,
+            2
+        );
     }
 
     #[test]

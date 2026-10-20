@@ -256,9 +256,8 @@ pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestS
 /// operation label. `responses` is deliberately the documented custom value
 /// for OpenAI's Responses API: semconv 1.41 has no well-known value for it,
 /// and calling Responses "chat" would be a false label.
-fn gen_ai_operation(method: &str, path: &str) -> Option<&'static str> {
-    let method = http::Method::from_bytes(method.as_bytes()).ok()?;
-    match Endpoint::classify(&method, path) {
+fn gen_ai_operation(endpoint: Endpoint) -> Option<&'static str> {
+    match endpoint {
         Endpoint::ChatCompletions | Endpoint::Messages => Some("chat"),
         Endpoint::Completions => Some("text_completion"),
         Endpoint::Responses => Some("responses"),
@@ -571,6 +570,7 @@ impl LoggingBody {
             && terminal.as_ref().is_none_or(|r| r.is_ok());
         #[cfg(not(unix))]
         let capture_allowed = ctx.stream_info.borrow().metadata_enabled;
+        let endpoint = ctx.stream_info.borrow().llm.endpoint;
 
         // Rust note: `stream_info`'s snapshot has to be pulled out of the
         // `RefCell` and its borrow dropped before `LogContext` is built --
@@ -615,12 +615,17 @@ impl LoggingBody {
             // conversion; note this is a `Option<LlmTokenUsage>`, not a
             // struct with zeroed fields, so "no usage reported" stays `None`
             // all the way through to `render` (`-`, never `0`).
-            let llm_tokens = info.llm.usage.map(|u| LlmTokens {
-                input: u.input_tokens,
-                cached: u.cached_tokens,
-                cache_creation: u.cache_creation_tokens,
-                output: u.output_tokens,
-            });
+            let llm_tokens = info
+                .llm
+                .usage
+                .as_ref()
+                .and_then(|u| u.tokens)
+                .map(|u| LlmTokens {
+                    input: u.input_tokens,
+                    cached: u.cached_tokens,
+                    cache_creation: u.cache_creation_tokens,
+                    output: u.output_tokens,
+                });
             (
                 info.response_flags().to_vec(),
                 info.upstream_host.clone(),
@@ -982,7 +987,7 @@ impl LoggingBody {
         // an honest absence, not a reason to invent a label. Failed/truncated
         // responses are excluded; see `GEN_AI_CLIENT_OPERATION_DURATION` for
         // why the client duration is success-only too.
-        let gen_ai_operation_name = gen_ai_operation(&ctx.request.method, &ctx.request.path);
+        let gen_ai_operation_name = gen_ai_operation(endpoint);
         if response_flags.is_empty() && (200..300).contains(&ctx.response_code) {
             if let (Some(latency_stats), Some(operation), Some(model), Some(provider)) = (
                 ctx.latency_stats.as_ref(),
@@ -1379,7 +1384,7 @@ mod tests {
 
     use super::*;
     use crate::handler::local_boxed;
-    use crate::stream_info::LlmTokenUsage;
+    use crate::stream_info::{LlmTokenUsage, LlmUsage};
 
     /// An in-memory sink for asserting on rendered lines, standing in for
     /// `FileSink`/`StdoutSink` -- same trait, no I/O.
@@ -1721,12 +1726,13 @@ mod tests {
     #[tokio::test]
     async fn llm_stats_reach_the_rendered_access_log_line() {
         let llm = crate::stream_info::LlmStats {
-            usage: Some(LlmTokenUsage {
+            usage: Some(LlmUsage::from_tokens(LlmTokenUsage {
                 input_tokens: 11,
                 cached_tokens: 22,
                 cache_creation_tokens: 33,
                 output_tokens: 44,
-            }),
+                ..Default::default()
+            })),
             list_cost: None,
             served_model: None,
             system: None,
@@ -1806,12 +1812,13 @@ mod tests {
             selected.borrow_mut().served_model = Some("upstream-model-2024-07-18".into());
             info.selected_attempt = Some(selected);
             info.upstream_cluster = Some("fallback".into());
-            info.llm.usage = Some(LlmTokenUsage {
+            info.llm.usage = Some(LlmUsage::from_tokens(LlmTokenUsage {
                 input_tokens: 10,
                 cached_tokens: 2,
                 cache_creation_tokens: 3,
                 output_tokens: 4,
-            });
+                ..Default::default()
+            }));
             info.llm.list_cost = Some(crate::stream_info::LlmListCost {
                 nanodollars: 987_654,
                 micro_usd: 988,
@@ -2007,7 +2014,7 @@ mod tests {
         {
             let mut info = ctx.stream_info.borrow_mut();
             info.upstream_cluster = upstream_cluster.map(str::to_string);
-            info.llm.usage = usage;
+            info.llm.usage = usage.map(LlmUsage::from_tokens);
             info.auth.tenant = tenant.map(str::to_string);
         }
         let body = local_boxed(
@@ -2030,6 +2037,7 @@ mod tests {
                 cached_tokens: 10,
                 cache_creation_tokens: 0,
                 output_tokens: 7,
+                ..Default::default()
             }),
         )
         .await;
@@ -2075,6 +2083,7 @@ mod tests {
                 cached_tokens: 10,
                 cache_creation_tokens: 0,
                 output_tokens: 7,
+                ..Default::default()
             }),
         )
         .await;
@@ -2120,6 +2129,7 @@ mod tests {
                 cached_tokens: 0,
                 cache_creation_tokens: 0,
                 output_tokens: 3,
+                ..Default::default()
             }),
         )
         .await;
@@ -2160,6 +2170,7 @@ mod tests {
                 cached_tokens: 0,
                 cache_creation_tokens: 0,
                 output_tokens: 1,
+                ..Default::default()
             }),
         )
         .await;
@@ -2233,12 +2244,13 @@ mod tests {
         // formula is proven precisely, against a scripted `LogContext`, in
         // `proxy_observability::access_log`'s own tests.
         let llm = crate::stream_info::LlmStats {
-            usage: Some(LlmTokenUsage {
+            usage: Some(LlmUsage::from_tokens(LlmTokenUsage {
                 input_tokens: 1,
                 cached_tokens: 0,
                 cache_creation_tokens: 0,
                 output_tokens: 10,
-            }),
+                ..Default::default()
+            })),
             list_cost: None,
             served_model: None,
             system: None,
@@ -2349,6 +2361,8 @@ mod tests {
         let mut ctx = flags_ctx(&capture);
         ctx.request.method = "POST".to_string();
         ctx.request.path = "/v1/chat/completions".to_string();
+        // What `FilterChainHandler::handle` classifies from that path.
+        ctx.stream_info.borrow_mut().llm.endpoint = Endpoint::ChatCompletions;
         ctx.start_instant = Instant::now() - std::time::Duration::from_secs(1);
         ctx.latency_stats = Some(Arc::new(GenAiLatencyStats::new(
             registry.clone(),
@@ -2359,12 +2373,13 @@ mod tests {
             info.requested_model = Some("gpt-4o".to_string());
             info.llm.system = Some(crate::stream_info::GenAiSystem::OpenAi);
             info.llm.time_to_first_body_byte = Some(std::time::Duration::from_millis(100));
-            info.llm.usage = Some(LlmTokenUsage {
+            info.llm.usage = Some(LlmUsage::from_tokens(LlmTokenUsage {
                 input_tokens: 1,
                 cached_tokens: 0,
                 cache_creation_tokens: 0,
                 output_tokens: 5,
-            });
+                ..Default::default()
+            }));
         }
 
         let body = local_boxed(
@@ -2403,6 +2418,8 @@ mod tests {
         let mut ctx = flags_ctx(&capture);
         ctx.request.method = "POST".to_string();
         ctx.request.path = "/v1/chat/completions".to_string();
+        // What `FilterChainHandler::handle` classifies from that path.
+        ctx.stream_info.borrow_mut().llm.endpoint = Endpoint::ChatCompletions;
         ctx.token_stats = Some(Arc::new(crate::stat_handles::GenAiTokenStats::new(
             registry.clone(),
             handles,
@@ -2422,12 +2439,13 @@ mod tests {
             info.llm.served_model = Some("gpt-4o-2024-08-06".to_string());
             info.llm.upstream_response_id = Some("chatcmpl-123".to_string());
             info.llm.system = Some(crate::stream_info::GenAiSystem::OpenAi);
-            info.llm.usage = Some(LlmTokenUsage {
+            info.llm.usage = Some(LlmUsage::from_tokens(LlmTokenUsage {
                 input_tokens: 10,
                 cached_tokens: 80,
                 cache_creation_tokens: 30,
                 output_tokens: 7,
-            });
+                ..Default::default()
+            }));
         }
 
         let body = local_boxed(
@@ -2806,6 +2824,7 @@ mod tests {
 
     #[test]
     fn gen_ai_operation_labels_each_served_target_and_nothing_else() {
+        let post = http::Method::POST;
         for (path, expected) in [
             ("/v1/chat/completions", Some("chat")),
             ("/v1/messages", Some("chat")),
@@ -2814,10 +2833,16 @@ mod tests {
             ("/v1/embeddings", Some("embeddings")),
             ("/v1/models", None),
             ("/v1/messages/batches", None),
+            ("/v1/images/generations", None),
         ] {
-            assert_eq!(gen_ai_operation("POST", path), expected, "{path}");
+            assert_eq!(
+                gen_ai_operation(Endpoint::classify(&post, path)),
+                expected,
+                "{path}"
+            );
         }
         // Listing stored completions is not a generation.
-        assert_eq!(gen_ai_operation("GET", "/v1/chat/completions"), None);
+        let get_completions = Endpoint::classify(&http::Method::GET, "/v1/chat/completions");
+        assert_eq!(gen_ai_operation(get_completions), None);
     }
 }

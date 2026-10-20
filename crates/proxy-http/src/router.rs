@@ -1145,12 +1145,13 @@ impl RouterHandler {
         // authorized and metered on come from a bounded prefix scan; the
         // provider decodes the whole body. Reconcile the two once, here, so
         // every attempt forwards a body that says what the proxy believed.
-        let (routed_model, force_include_usage, max_output_tokens) = {
+        let (routed_model, force_include_usage, max_output_tokens, endpoint) = {
             let info = dcb.stream_info();
             (
                 info.requested_model.clone(),
                 info.force_include_usage,
                 info.max_output_tokens,
+                info.llm.endpoint,
             )
         };
         let body_bytes = match reconcile_request_body(
@@ -1158,7 +1159,7 @@ impl RouterHandler {
             routed_model.as_deref(),
             force_include_usage,
             max_output_tokens,
-            Endpoint::classify(&head.method, head.uri.path()),
+            endpoint,
         ) {
             Ok(None) => original_body,
             Ok(Some(reconciled)) => {

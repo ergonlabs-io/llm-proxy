@@ -748,6 +748,11 @@ impl StreamHandler for FilterChainHandler {
                 // `DS_RX_BEG` and `%DURATION%` share one start.
                 info.request_started_at = start_instant;
                 info.ledger_refusal = ledger_refusal;
+                // Classified once, from the client-facing method and path
+                // before any filter or route rewrites them (ADR-0010
+                // decision 1). Every filter reads this, never its own copy.
+                info.llm.endpoint =
+                    crate::endpoint::Endpoint::classify(&req.head.method, req.head.uri.path());
             }
             if let Some(sink) = &self.request_record_sink {
                 #[cfg(unix)]
