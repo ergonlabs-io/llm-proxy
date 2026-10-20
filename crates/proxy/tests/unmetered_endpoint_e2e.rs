@@ -1,6 +1,8 @@
 //! Endpoints a spend budget or token limit cannot count are refused where
 //! one binds the request, and proxied silently where none does (ADR-0010
-//! decision 1, phase 1).
+//! decision 1). Since phase 3 a spend budget counts image, speech and
+//! transcription requests of a countable shape (decision 5) and refuses the
+//! others at the end of the body; a token limit still refuses them all.
 //!
 //! This drives the real `llm-proxy` binary through `--config` with no model
 //! policy, so no `model_authz` 403 can stand in for the refusal: a request
@@ -43,7 +45,11 @@ struct Call {
     path: &'static str,
     body: &'static str,
     endpoint: &'static str,
+    content_type: &'static str,
 }
+
+const JSON: &str = "application/json";
+const FORM: &str = "multipart/form-data; boundary=b";
 
 /// Metered under a spend budget since ADR-0010 phase 2, still refused under
 /// a token limit (open decision A).
@@ -52,33 +58,83 @@ const IMAGE_GENERATION: Call = Call {
     path: "/v1/images/generations",
     body: r#"{"model":"gpt-image-1","prompt":"a cat"}"#,
     endpoint: "image_generation",
+    content_type: JSON,
 };
 
-const IMAGE_EDITS: &[Call] = &[Call {
-    method: "POST",
-    path: "/v1/images/edits",
-    body: r#"{"model":"gpt-image-1","prompt":"a hat"}"#,
-    endpoint: "image_edit",
-}];
-
-const AUDIO: &[Call] = &[
+/// Metered under a spend budget since ADR-0010 phase 3, in the shapes that
+/// can be counted. The upload endpoints send real forms.
+const PHASE_3_COUNTABLE: &[Call] = &[
     Call {
         method: "POST",
         path: "/v1/audio/speech",
         body: r#"{"model":"tts-1","input":"hello","voice":"alloy"}"#,
         endpoint: "speech",
+        content_type: JSON,
     },
     Call {
         method: "POST",
         path: "/v1/audio/transcriptions",
-        body: r#"{"model":"whisper-1"}"#,
+        body: "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n\
+               --b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\n\
+               ID3 audio\r\n--b--\r\n",
         endpoint: "transcription",
+        content_type: FORM,
     },
     Call {
         method: "POST",
         path: "/v1/audio/translations",
-        body: r#"{"model":"whisper-1"}"#,
+        body: "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\n\
+               ID3 audio\r\n--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n\
+               --b\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\nverbose_json\r\n--b--\r\n",
         endpoint: "translation",
+        content_type: FORM,
+    },
+    Call {
+        method: "POST",
+        path: "/v1/images/edits",
+        body: "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-image-1\r\n\
+               --b\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n\r\n\
+               PNG bytes\r\n--b--\r\n",
+        endpoint: "image_edit",
+        content_type: FORM,
+    },
+];
+
+/// Phase-3 requests whose shape cannot be counted (ADR-0010 decision 5).
+const UNCOUNTABLE: &[Call] = &[
+    // `text` carries no usage.
+    Call {
+        method: "POST",
+        path: "/v1/audio/transcriptions",
+        body: "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n\
+               --b\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\ntext\r\n--b--\r\n",
+        endpoint: "transcription",
+        content_type: FORM,
+    },
+    // A form without `model` cannot be priced.
+    Call {
+        method: "POST",
+        path: "/v1/audio/transcriptions",
+        body: "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.mp3\"\r\n\r\n\
+               ID3 audio\r\n--b--\r\n",
+        endpoint: "transcription",
+        content_type: FORM,
+    },
+    // A translation reports its duration only in `verbose_json`.
+    Call {
+        method: "POST",
+        path: "/v1/audio/translations",
+        body: "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--b--\r\n",
+        endpoint: "translation",
+        content_type: FORM,
+    },
+    // No `input`, no characters to charge.
+    Call {
+        method: "POST",
+        path: "/v1/audio/speech",
+        body: r#"{"model":"tts-1","voice":"alloy"}"#,
+        endpoint: "speech",
+        content_type: JSON,
     },
 ];
 
@@ -90,32 +146,100 @@ const BATCH_AND_FILES: &[Call] = &[
         path: "/v1/batches",
         body: r#"{"model":"gpt-4o-mini","input_file_id":"file_1","endpoint":"/v1/chat/completions","completion_window":"24h"}"#,
         endpoint: "unmetered",
+        content_type: JSON,
     },
     Call {
         method: "POST",
         path: "/v1/files",
         body: r#"{"model":"gpt-4o-mini","purpose":"batch"}"#,
         endpoint: "unmetered",
+        content_type: JSON,
     },
     Call {
         method: "GET",
         path: "/v1/batches/batch_1",
         body: "",
         endpoint: "unmetered",
+        content_type: JSON,
     },
 ];
 
+/// Image generation, image edits, speech and transcription are metered
+/// under a spend budget, so a tenant or key budget dials them, but a token
+/// limit cannot count their tokens for every model and still refuses them
+/// (open decision A).
 #[test]
-fn image_edits_are_refused_under_every_binding_control() {
-    refused_under_every_binding_control("images", IMAGE_EDITS);
+fn media_endpoints_pass_a_budget_and_are_refused_under_a_token_limit() {
+    let dir = scratch_dir("media");
+    let upstream = Upstream::spawn();
+    let proxy = Proxy::start(&dir, &config_text(&dir, upstream.addr, CATCH_ALL, ""));
+    let key = mint_key(&proxy);
+    create_tenant(&proxy);
+    let calls: Vec<&Call> = std::iter::once(&IMAGE_GENERATION)
+        .chain(PHASE_3_COUNTABLE)
+        .collect();
+    let budget = r#"{"budget":{"max_usd":"100","period":"daily"}}"#;
+    for path in [
+        format!("/tenants/{TENANT}/budget"),
+        format!("/keys/{KEY_ID}/budget"),
+    ] {
+        put_ok(&proxy, &path, budget);
+        for call in &calls {
+            let response = send(&proxy, &key, call);
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{} under {path}:\n{response}",
+                call.path
+            );
+        }
+        put_ok(&proxy, &path, r#"{"budget":null}"#);
+    }
+    assert_eq!(upstream.hits(), 2 * calls.len());
+
+    let limits = format!("/tenants/{TENANT}/limits");
+    put_ok(
+        &proxy,
+        &limits,
+        r#"{"limits":{"tokens_per_minute":1000000}}"#,
+    );
+    for call in &calls {
+        assert_refused(
+            &send(&proxy, &key, call),
+            &format!("{} under a tenant token limit", call.path),
+        );
+    }
+    assert_eq!(
+        upstream.hits(),
+        2 * calls.len(),
+        "the refusals were not dialled"
+    );
+    let scrape = scrape(&proxy);
+    for call in &calls {
+        assert_eq!(
+            refusals(&scrape, call.endpoint, "token_limit"),
+            1,
+            "{}",
+            call.path
+        );
+        assert_eq!(
+            refusals(&scrape, call.endpoint, "spend"),
+            0,
+            "{}",
+            call.path
+        );
+    }
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Image generation is metered under a spend budget, so a tenant or key
-/// budget dials it, but a token limit cannot count its tokens for every
-/// model and still refuses it.
+/// A speech, transcription or translation request whose shape cannot be
+/// counted is refused under a tenant or key budget at the end of its body,
+/// before it is dialled, with the same 403 as an unmetered endpoint. With
+/// the budget cleared the same requests are proxied, so the refusal came
+/// from the budget.
 #[test]
-fn image_generation_passes_a_budget_and_is_refused_under_a_token_limit() {
-    let dir = scratch_dir("image-generation");
+fn uncountable_shapes_are_refused_under_a_budget() {
+    let dir = scratch_dir("uncountable");
     let upstream = Upstream::spawn();
     let proxy = Proxy::start(&dir, &config_text(&dir, upstream.addr, CATCH_ALL, ""));
     let key = mint_key(&proxy);
@@ -126,36 +250,38 @@ fn image_generation_passes_a_budget_and_is_refused_under_a_token_limit() {
         format!("/keys/{KEY_ID}/budget"),
     ] {
         put_ok(&proxy, &path, budget);
-        let response = send(&proxy, &key, &IMAGE_GENERATION);
-        assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "image generation under {path}:\n{response}"
-        );
+        for call in UNCOUNTABLE {
+            assert_refused(
+                &send(&proxy, &key, call),
+                &format!("{} {} under {path}", call.path, call.body),
+            );
+        }
         put_ok(&proxy, &path, r#"{"budget":null}"#);
     }
-    assert_eq!(upstream.hits(), 2);
-
-    let limits = format!("/tenants/{TENANT}/limits");
-    put_ok(
-        &proxy,
-        &limits,
-        r#"{"limits":{"tokens_per_minute":1000000}}"#,
+    assert_eq!(
+        upstream.hits(),
+        0,
+        "no refused request reached the provider"
     );
-    assert_refused(
-        &send(&proxy, &key, &IMAGE_GENERATION),
-        "image generation under a tenant token limit",
+    assert_eq!(
+        proxy.access_log_refusals(2 * UNCOUNTABLE.len()),
+        2 * UNCOUNTABLE.len()
     );
-    assert_eq!(upstream.hits(), 2, "the refusal was not dialled");
     let scrape = scrape(&proxy);
-    assert_eq!(refusals(&scrape, "image_generation", "token_limit"), 1);
-    assert_eq!(refusals(&scrape, "image_generation", "spend"), 0);
+    for (endpoint, count) in [("transcription", 4), ("translation", 2), ("speech", 2)] {
+        assert_eq!(refusals(&scrape, endpoint, "spend"), count, "{endpoint}");
+    }
+    for call in UNCOUNTABLE {
+        let response = send(&proxy, &key, call);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "{} without a budget:\n{response}",
+            call.path
+        );
+    }
+    assert_eq!(upstream.hits(), UNCOUNTABLE.len());
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn audio_is_refused_under_every_binding_control() {
-    refused_under_every_binding_control("audio", AUDIO);
 }
 
 #[test]
@@ -175,8 +301,8 @@ fn without_a_budget_or_limit_every_endpoint_is_proxied_silently() {
     let log_mark = proxy.stderr_len();
 
     let calls: Vec<&Call> = std::iter::once(&IMAGE_GENERATION)
-        .chain(IMAGE_EDITS)
-        .chain(AUDIO)
+        .chain(PHASE_3_COUNTABLE)
+        .chain(UNCOUNTABLE)
         .chain(BATCH_AND_FILES)
         .collect();
     for call in &calls {
@@ -242,18 +368,21 @@ fn free_endpoints_pass_under_a_budget_and_a_limit_without_warning() {
             path: "/v1/models",
             body: "",
             endpoint: "free",
+            content_type: JSON,
         },
         Call {
             method: "GET",
             path: "/v1/usage",
             body: "",
             endpoint: "free",
+            content_type: JSON,
         },
         Call {
             method: "POST",
             path: "/v1/messages/count_tokens",
             body: r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#,
             endpoint: "free",
+            content_type: JSON,
         },
     ] {
         let response = send(&proxy, &key, &call);
@@ -275,6 +404,7 @@ fn free_endpoints_pass_under_a_budget_and_a_limit_without_warning() {
             path: "/v1/chat/completions",
             body: r#"{"model":"no-such-model","messages":[{"role":"user","content":"hi"}]}"#,
             endpoint: "chat_completions",
+            content_type: JSON,
         },
     );
     assert!(
@@ -290,6 +420,7 @@ fn free_endpoints_pass_under_a_budget_and_a_limit_without_warning() {
             path: "/v1/batches",
             body: r#"{"input_file_id":"file_1","completion_window":"24h"}"#,
             endpoint: "unmetered",
+            content_type: JSON,
         },
     );
     assert_refused(&batch, "a model-less batch with no `*` route");
@@ -332,6 +463,7 @@ fn a_model_scoped_token_limit_refuses_an_image_for_a_model_in_scope() {
             path: "/v1/images/generations",
             body: r#"{"model":"other-image-model","prompt":"a cat"}"#,
             endpoint: "image_generation",
+            content_type: JSON,
         },
     );
     assert!(
@@ -670,7 +802,7 @@ fn send(proxy: &Proxy, key: &str, call: &Call) -> String {
         proxy.listen,
         call.path,
         Some(&format!("Bearer {key}")),
-        "application/json",
+        call.content_type,
         call.body,
     )
 }

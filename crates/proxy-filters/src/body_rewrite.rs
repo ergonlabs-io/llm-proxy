@@ -23,6 +23,16 @@ pub struct BodyFacts {
     /// echo them (ADR-0010 decision 2).
     pub size: Option<String>,
     pub quality: Option<String>,
+    /// The `response_format` and `stream_format` fields' string values, read
+    /// the same way. They decide whether a speech or transcription response
+    /// can be counted (ADR-0010 decision 5).
+    pub response_format: Option<String>,
+    pub stream_format: Option<String>,
+    /// Unicode scalar values in the `input` field's string value, unescaped:
+    /// the `input_characters` meter that speech is billed by. Counted over
+    /// the bytes already held, so the string is never copied. `None` when
+    /// `input` is absent or not a string.
+    pub input_characters: Option<u64>,
     /// The `stream` field's boolean value, if a `stream` key with a literal
     /// `true`/`false` value was seen inside the window.
     pub stream: Option<bool>,
@@ -77,6 +87,9 @@ enum KeyKind {
     Model,
     Size,
     Quality,
+    ResponseFormat,
+    StreamFormat,
+    Input,
     Stream,
     StreamOptions,
     Other,
@@ -87,6 +100,9 @@ fn classify_key(key: &[u8]) -> KeyKind {
         b"model" => KeyKind::Model,
         b"size" => KeyKind::Size,
         b"quality" => KeyKind::Quality,
+        b"response_format" => KeyKind::ResponseFormat,
+        b"stream_format" => KeyKind::StreamFormat,
+        b"input" => KeyKind::Input,
         b"stream" => KeyKind::Stream,
         b"stream_options" => KeyKind::StreamOptions,
         _ => KeyKind::Other,
@@ -166,11 +182,15 @@ pub struct BodyPrefixScanner {
     /// field suffices.
     str_escaped: bool,
 
-    // Captured string values: `model`, `size`, `quality`.
+    // Captured string values: `model`, `size`, `quality`, `response_format`,
+    // `stream_format` and `input`.
     capture_start: usize,
     model_range: Option<(usize, usize)>,
     size_range: Option<(usize, usize)>,
     quality_range: Option<(usize, usize)>,
+    response_format_range: Option<(usize, usize)>,
+    stream_format_range: Option<(usize, usize)>,
+    input_range: Option<(usize, usize)>,
 
     // `stream` value.
     literal_start: usize,
@@ -203,6 +223,9 @@ impl BodyPrefixScanner {
             model_range: None,
             size_range: None,
             quality_range: None,
+            response_format_range: None,
+            stream_format_range: None,
+            input_range: None,
             literal_start: 0,
             literal_capturing: false,
             stream_literal_range: None,
@@ -261,6 +284,11 @@ impl BodyPrefixScanner {
         let model = decode(self.model_range);
         let size = decode(self.size_range);
         let quality = decode(self.quality_range);
+        let response_format = decode(self.response_format_range);
+        let stream_format = decode(self.stream_format_range);
+        let input_characters = self
+            .input_range
+            .map(|(start, end)| count_json_string_chars(&self.held[start..end]));
         let stream =
             self.stream_literal_range
                 .and_then(|(start, end)| match &self.held[start..end] {
@@ -272,6 +300,9 @@ impl BodyPrefixScanner {
             model,
             size,
             quality,
+            response_format,
+            stream_format,
+            input_characters,
             stream,
             saw_stream_options: self.saw_stream_options,
             splice_at: self.splice_at,
@@ -291,6 +322,9 @@ impl BodyPrefixScanner {
             KeyKind::Model => Some(&mut self.model_range),
             KeyKind::Size => Some(&mut self.size_range),
             KeyKind::Quality => Some(&mut self.quality_range),
+            KeyKind::ResponseFormat => Some(&mut self.response_format_range),
+            KeyKind::StreamFormat => Some(&mut self.stream_format_range),
+            KeyKind::Input => Some(&mut self.input_range),
             KeyKind::Stream | KeyKind::StreamOptions | KeyKind::Other => None,
         }
     }
@@ -522,6 +556,49 @@ fn decode_json_string(raw: &[u8]) -> Option<String> {
     serde_json::from_slice(&quoted).ok()
 }
 
+/// Unicode scalar values in a JSON string's raw content (the bytes between
+/// the quotes, escapes intact), as the provider's decoder would count them
+/// after unescaping. An escape is one character, except a `\uD8xx\uDCxx`
+/// surrogate pair, which is one. Raw bytes are counted by their UTF-8 lead
+/// bytes. The tokenizer has proven the escapes well formed; a malformed one
+/// still counts as one character, never a panic.
+///
+/// Rust note: counting UTF-8 lead bytes (`byte & 0xC0 != 0x80`) gives the
+/// `char` count of valid UTF-8 without decoding or allocating it.
+fn count_json_string_chars(raw: &[u8]) -> u64 {
+    let hex4 = |at: usize| -> Option<u32> {
+        let digits = std::str::from_utf8(raw.get(at..at + 4)?).ok()?;
+        u32::from_str_radix(digits, 16).ok()
+    };
+    let mut count = 0u64;
+    let mut i = 0;
+    while i < raw.len() {
+        let byte = raw[i];
+        if byte == b'\\' {
+            if raw.get(i + 1) == Some(&b'u') {
+                let high = hex4(i + 2);
+                i += 6;
+                let is_high = high.is_some_and(|h| (0xD800..0xDC00).contains(&h));
+                let low_follows = raw.get(i) == Some(&b'\\')
+                    && raw.get(i + 1) == Some(&b'u')
+                    && hex4(i + 2).is_some_and(|l| (0xDC00..0xE000).contains(&l));
+                if is_high && low_follows {
+                    i += 6;
+                }
+            } else {
+                i += 2;
+            }
+            count += 1;
+            continue;
+        }
+        if byte & 0xC0 != 0x80 {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
+}
+
 /// The exact bytes to splice at `facts.splice_at`, or `None` to pass the
 /// body through untouched.
 ///
@@ -610,6 +687,47 @@ mod tests {
         );
         assert_eq!(facts.size, None);
         assert_eq!(facts.quality.as_deref(), Some("high"));
+    }
+
+    /// The speech `input` is counted in Unicode scalar values after
+    /// unescaping: not bytes, not UTF-16 units. That is the assumed provider
+    /// rule (ADR-0010, "unverified"); serde_json's decoding is the reference.
+    #[test]
+    fn input_is_counted_in_unicode_scalar_values() {
+        for (input, expected) in [
+            (r#""hello""#, 5),
+            ("\"h\u{e9}llo \u{1F600}\"", 7),
+            (r#""h\u00e9llo \ud83d\ude00""#, 7),
+            (r#""line\nbreak \"quoted\" \\ \/""#, 23),
+            (r#""lone \ud83d high""#, 11),
+            (r#""""#, 0),
+        ] {
+            let body = format!(r#"{{"model":"tts-1","input":{input},"voice":"alloy"}}"#);
+            let facts = scan(body.as_bytes(), DEFAULT_PREFIX_CAP);
+            assert_eq!(facts.input_characters, Some(expected), "{input}");
+            if let Ok(decoded) = serde_json::from_str::<String>(input) {
+                assert_eq!(decoded.chars().count() as u64, expected, "{input}");
+            }
+        }
+        // Not a string: embeddings and Responses send arrays.
+        let facts = scan(br#"{"input":["a","b"],"model":"m"}"#, DEFAULT_PREFIX_CAP);
+        assert_eq!(facts.input_characters, None);
+    }
+
+    #[test]
+    fn response_and_stream_format_are_read_like_model() {
+        let facts = scan(
+            br#"{"model":"tts","response_format":"mp3","stream_format":"sse"}"#,
+            DEFAULT_PREFIX_CAP,
+        );
+        assert_eq!(facts.response_format.as_deref(), Some("mp3"));
+        assert_eq!(facts.stream_format.as_deref(), Some("sse"));
+        // Chat's `response_format` is an object: not a format name.
+        let facts = scan(
+            br#"{"response_format":{"type":"json_object"}}"#,
+            DEFAULT_PREFIX_CAP,
+        );
+        assert_eq!(facts.response_format, None);
     }
 
     #[test]
@@ -865,6 +983,9 @@ mod tests {
                         model: None,
                         size: None,
                         quality: None,
+                        response_format: None,
+                        stream_format: None,
+                        input_characters: None,
                         stream,
                         saw_stream_options,
                         splice_at: Some(1),

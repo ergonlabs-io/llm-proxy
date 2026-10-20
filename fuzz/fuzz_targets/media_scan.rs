@@ -9,12 +9,13 @@
 //! - the facts do not depend on how the body was chunked;
 //! - the kept `usage` and scalars stay within their bounds;
 //! - on a body serde_json accepts as an object, the scanner agrees with it on
-//!   the number of top-level `data` elements and on any `size` it kept.
+//!   the number of top-level `data` elements, on any `size` it kept, and on
+//!   a numeric top-level `duration`.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use proxy_filters::media_scan::{
-    MediaJsonScanner, MediaSseScanner, MAX_SCALAR_BYTES, MAX_USAGE_OBJECT_BYTES,
+    seconds_to_millis, MediaJsonScanner, MediaSseScanner, MAX_SCALAR_BYTES, MAX_USAGE_OBJECT_BYTES,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -45,6 +46,9 @@ fuzz_target!(|data: &[u8]| {
             .and_then(|d| d.as_array())
             .map(|d| d.len() as u64);
         assert_eq!(whole.data_elements, data);
+        if let Some(seconds) = object.get("duration").and_then(|d| d.as_f64()) {
+            assert_eq!(whole.duration_ms, seconds_to_millis(seconds));
+        }
         // A kept `size` is the decoded value; one too long to keep is
         // dropped, never cut.
         if let Some(size) = &whole.size {

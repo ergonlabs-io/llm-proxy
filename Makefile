@@ -455,7 +455,8 @@ ui-dev: ## Run the admin UI dev server on http://localhost:5173 (VITE_ADMIN_URL 
 # then add the minimized input as a regression test in the owning crate.
 
 FUZZ_TARGETS := usage_extract body_prefix_scan dialect_config model_wildcard vhost_domain \
-	route_model_glob access_log_format admin_body virtual_key_auth router_body
+	route_model_glob access_log_format admin_body virtual_key_auth router_body media_scan \
+	multipart_scan
 FUZZ_SECONDS ?= 300
 FUZZ_TOOLCHAIN ?= nightly
 

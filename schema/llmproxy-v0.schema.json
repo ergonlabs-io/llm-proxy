@@ -1186,19 +1186,39 @@
           "if": { "properties": { "basis": { "const": "images" } }, "required": ["basis"] },
           "then": {
             "required": ["image_prices"],
-            "not": { "anyOf": [{ "required": ["tier_mode"] }, { "required": ["tiers"] }] }
+            "not": { "anyOf": [{ "required": ["tier_mode"] }, { "required": ["tiers"] }, { "required": ["nanodollars_per_character"] }, { "required": ["nanodollars_per_second"] }] }
           }
         },
         {
-          "if": { "not": { "properties": { "basis": { "const": "images" } }, "required": ["basis"] } },
+          "if": { "properties": { "basis": { "const": "characters" } }, "required": ["basis"] },
+          "then": {
+            "required": ["nanodollars_per_character"],
+            "not": { "anyOf": [{ "required": ["tier_mode"] }, { "required": ["tiers"] }, { "required": ["image_prices"] }, { "required": ["nanodollars_per_second"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "basis": { "const": "audio_seconds" } }, "required": ["basis"] },
+          "then": {
+            "required": ["nanodollars_per_second"],
+            "not": { "anyOf": [{ "required": ["tier_mode"] }, { "required": ["tiers"] }, { "required": ["image_prices"] }, { "required": ["nanodollars_per_character"] }] }
+          }
+        },
+        {
+          "if": { "not": { "anyOf": [
+            { "properties": { "basis": { "const": "images" } }, "required": ["basis"] },
+            { "properties": { "basis": { "const": "characters" } }, "required": ["basis"] },
+            { "properties": { "basis": { "const": "audio_seconds" } }, "required": ["basis"] }
+          ] } },
           "then": {
             "required": ["tier_mode", "tiers"],
-            "not": { "required": ["image_prices"] }
+            "not": { "anyOf": [{ "required": ["image_prices"] }, { "required": ["nanodollars_per_character"] }, { "required": ["nanodollars_per_second"] }] }
           }
         }
       ],
       "properties": {
-        "basis": { "enum": ["tokens", "images"], "default": "tokens", "description": "What the entry prices. `tokens`: text, and optionally image and audio, tokens, priced by `tier_mode` and `tiers`. `images`: each generated image, priced by `image_prices`. An `images` entry sets neither `tier_mode` nor `tiers`, and cannot set `cached_input_unpriced` or `cache_write_unpriced` to true, because it prices no tokens." },
+        "basis": { "enum": ["tokens", "images", "characters", "audio_seconds"], "default": "tokens", "description": "What the entry prices. `tokens`: text, and optionally image and audio, tokens, priced by `tier_mode` and `tiers`. `images`: each image a generation or edit returned, priced by `image_prices`. `characters`: each character of a speech request's `input`, priced by `nanodollars_per_character`; it is charged only when the response status is 2xx. `audio_seconds`: the audio duration a transcription or translation response reports, priced by `nanodollars_per_second`. An entry that is not `tokens` sets neither `tier_mode` nor `tiers`, and cannot set `cached_input_unpriced` or `cache_write_unpriced` to true, because it prices no tokens. Each entry prices only its own basis; a request that reports none of it is unpriced: it costs zero and is logged, like an unpriced model." },
+        "nanodollars_per_character": { "type": "integer", "minimum": 0, "description": "Required for `basis: characters`, and not allowed otherwise. The price of one character of the speech request's `input`, in nanodollars (15 USD per million characters is `15000`). A character is one Unicode code point after JSON unescaping. The request is charged this price times its characters, rounded up to a whole micro-USD." },
+        "nanodollars_per_second": { "type": "integer", "minimum": 0, "description": "Required for `basis: audio_seconds`, and not allowed otherwise. The price of one second of audio, in nanodollars (0.006 USD per minute is `100000`). The duration comes from the response: `usage.seconds` of a `duration` usage, else `usage.prompt_audio_seconds`, else the top-level `duration` of a `verbose_json` response. It is priced per millisecond and rounded up to a whole nanodollar, with no minimum duration." },
         "image_prices": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/ImagePrice" }, "description": "Required for `basis: images`, and not allowed otherwise. The most specific matching row prices each image: a row naming both `size` and `quality` first, then one naming one, then one naming neither. A request matches a row when each attribute the row names equals the value in the response, or in the request body when the response does not echo it. Values are plain strings matched exactly. A request that matches no row is unpriced: it costs zero and is logged, like an unpriced model. Two rows of the same specificity that one request could match are a load error: identical `size` and `quality` pairs, or a row naming only `size` beside a row naming only `quality`." },
         "cached_input_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cached input remain unpriced." },
         "cache_write_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cache creation remain unpriced." },

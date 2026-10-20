@@ -30,6 +30,10 @@ const CHARGE_MICRO_USD: u64 = 14;
 /// An example value, not a provider's rate.
 const IMAGE_NANODOLLARS: u64 = 40_000_000;
 
+/// The per-character price for `tts-1` in `billing_config`. Example value,
+/// chosen so the charge is not a whole micro-USD.
+const SPEECH_NANODOLLARS_PER_CHARACTER: u64 = 15_001;
+
 #[test]
 fn served_requests_are_committed_and_a_restart_opens_a_later_epoch() {
     let dir = TempLedgerDir::new();
@@ -159,12 +163,12 @@ fn spend_and_ledger_counters_agree_and_entries_are_pulled_and_acknowledged() {
     assert_eq!(after["entries"].as_array().unwrap().len(), 0, "{after}");
 }
 
-/// ADR-0010 phase 2: an image generation under a tenant spend budget is
-/// admitted, charged at the dialled provider's per-image price for the
-/// images the response returned, and its ledger entry carries that charge
-/// and the images it bought.
+/// ADR-0010 phases 2 and 3: an image generation and a speech request under a
+/// tenant spend budget are admitted and charged at the dialled provider's
+/// entry (per image returned; per input character, rounded up to a whole
+/// micro-USD), and each ledger entry carries its charge and what it bought.
 #[test]
-fn an_image_generation_under_a_tenant_budget_is_charged_and_ledgered() {
+fn media_requests_under_a_tenant_budget_are_charged_and_ledgered() {
     let dir = TempLedgerDir::new();
     let ledger = dir.config(1024, OnUnavailable::Reject);
     let config = billing_config(&ledger, mock_upstream(), "reject", 1024);
@@ -214,6 +218,36 @@ fn an_image_generation_under_a_tenant_budget_is_charged_and_ledgered() {
         r#""image_size":"1024x1024""#,
         r#""endpoint":"image_generation""#,
         r#""price_basis":"images""#,
+    ] {
+        assert!(text.contains(needle), "no {needle} in {entry}");
+    }
+
+    // Speech: the response is audio, so the only meter is the request's
+    // `input` characters ("hello wörld" is 11 characters, 12 bytes).
+    let response = http(
+        proxy.listen,
+        "POST",
+        "/v1/audio/speech",
+        Some(&key),
+        r#"{"model":"tts-1","input":"hello w\u00f6rld","voice":"alloy"}"#,
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let speech_charge = (11 * SPEECH_NANODOLLARS_PER_CHARACTER).div_ceil(1000);
+    assert_eq!(speech_charge, 166);
+    let scrape =
+        proxy.scrape_until(|s| counter(s, "envoy_llmproxy_ledger_entries_committed_total") == 2);
+    assert_eq!(
+        counter(&scrape, "envoy_llmproxy_spend_charged_micro_usd_total"),
+        charge + speech_charge
+    );
+    let page = proxy.admin_json("GET", "/ledger/entries");
+    let entry = &page["entries"].as_array().unwrap()[1];
+    assert_eq!(entry["charged_micro_usd"], speech_charge, "{entry}");
+    let text = entry.to_string();
+    for needle in [
+        r#""input_characters":11"#,
+        r#""endpoint":"speech""#,
+        r#""price_basis":"characters""#,
     ] {
         assert!(text.contains(needle), "no {needle} in {entry}");
     }
@@ -363,6 +397,10 @@ pricing:
         basis: images
         image_prices:
           - {{ size: "1024x1024", nanodollars_per_image: {IMAGE_NANODOLLARS} }}
+      - provider_type: openai
+        model: tts-1
+        basis: characters
+        nanodollars_per_character: {SPEECH_NANODOLLARS_PER_CHARACTER}
 ledger:
   directory: {directory}
   encryption_key_file: {key}
@@ -703,14 +741,16 @@ fn mock_upstream_with_delay(delay: Duration) -> SocketAddr {
                 std::thread::sleep(delay);
                 let image = r#"{"created":1,"data":[{"b64_json":"QUJD"},{"b64_json":"REVG"}]}"#;
                 let chat = r#"{"id":"x","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}"#;
-                let body = if head.starts_with("post /v1/images/generations") {
-                    image
+                let (content_type, body) = if head.starts_with("post /v1/images/generations") {
+                    ("application/json", image)
+                } else if head.starts_with("post /v1/audio/speech") {
+                    ("audio/mpeg", "ID3 mp3 frames")
                 } else {
-                    chat
+                    ("application/json", chat)
                 };
                 let _ = stream.write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     )

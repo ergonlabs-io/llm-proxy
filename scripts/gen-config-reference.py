@@ -226,10 +226,21 @@ class Renderer:
         return fields
 
     def condition(self, node, path):
-        """`if` blocks of the form `type == X` or its negation."""
+        """`if` blocks of the form `type == X`, its negation, or the
+        negation of an `anyOf` of such tests on one field."""
         negated = False
         if set(node) == {"not"}:
             node, negated = node["not"], True
+        if negated and set(node) == {"anyOf"}:
+            fields, values = set(), []
+            for i, branch in enumerate(node["anyOf"]):
+                field, value = self.const_test(branch, f"{path}/not/anyOf/{i}")
+                fields.add(field)
+                values.append(code(value))
+            if len(fields) != 1 or len(values) < 2:
+                raise SchemaError(f"{path}: no rendering for this `if`")
+            listed = ", ".join(values[:-1]) + " or " + values[-1]
+            return f"When {code(fields.pop())} is not {listed}"
         props = node.get("properties", {})
         if set(node) != {"properties", "required"} or len(props) != 1:
             raise SchemaError(f"{path}: no rendering for this `if`")
@@ -238,6 +249,12 @@ class Renderer:
             raise SchemaError(f"{path}: no rendering for this `if`")
         verb = "is not" if negated else "is"
         return f"When {code(field)} {verb} {code(sub['const'])}"
+
+    def const_test(self, node, path):
+        """The (field, value) of an `if` of the form `field == value`."""
+        self.condition(node, path)
+        (field, sub), = node["properties"].items()
+        return field, sub["const"]
 
     def rules(self, node, path):
         out = []

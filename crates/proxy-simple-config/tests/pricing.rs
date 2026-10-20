@@ -353,20 +353,25 @@ fn empty_size_or_quality_is_rejected() {
 }
 
 #[test]
-fn phase_three_bases_and_unknown_image_price_keys_fail_to_parse() {
-    for basis in ["characters", "audio_seconds"] {
-        let config = BASE.replace(
-            "        tier_mode: whole_request",
-            &format!("        basis: {basis}\n        tier_mode: whole_request"),
-        );
-        let error = parse_simple_config(&config).expect_err("not accepted yet");
-        assert!(error.to_string().contains("basis"), "{error}");
-    }
+fn unknown_bases_and_unknown_image_price_keys_fail_to_parse() {
+    let config = BASE.replace(
+        "        tier_mode: whole_request",
+        "        basis: bytes\n        tier_mode: whole_request",
+    );
+    let error = parse_simple_config(&config).expect_err("unknown basis");
+    assert!(error.to_string().contains("basis"), "{error}");
     let config = images_card(
         "        image_prices:\n          - { nanodollars_per_image: 1, resolution: x }\n",
     );
     let error = parse_simple_config(&config).expect_err("strict row");
     assert!(error.to_string().contains("resolution"), "{error}");
+}
+
+fn unit_card(basis: &str, entry_body: &str) -> String {
+    let head = BASE.split("      - provider_type").next().unwrap();
+    format!(
+        "{head}      - provider_type: openai\n        model: audio-model\n        basis: {basis}\n{entry_body}"
+    )
 }
 
 fn schema_errors(config: &str) -> Vec<(String, String)> {
@@ -385,6 +390,20 @@ fn schema_accepts_valid_rate_card_shapes_and_rejects_invalid_ones() {
         "            output_nanodollars_per_token: 10000\n            audio_input_nanodollars_per_token: 3",
     );
     assert_eq!(schema_errors(&with_modality), vec![]);
+    assert_eq!(
+        schema_errors(&unit_card(
+            "characters",
+            "        nanodollars_per_character: 15000\n"
+        )),
+        vec![]
+    );
+    assert_eq!(
+        schema_errors(&unit_card(
+            "audio_seconds",
+            "        nanodollars_per_second: 100000\n"
+        )),
+        vec![]
+    );
 
     let rows = "        image_prices:\n          - nanodollars_per_image: 1\n";
     let invalid = [
@@ -400,10 +419,23 @@ fn schema_accepts_valid_rate_card_shapes_and_rejects_invalid_ones() {
             "        tier_mode: whole_request",
             &format!("{rows}        tier_mode: whole_request"),
         ),
-        // unknown / phase-3 basis
+        // unknown basis, and a unit basis on a token entry
+        BASE.replace(
+            "        tier_mode: whole_request",
+            "        basis: bytes\n        tier_mode: whole_request",
+        ),
         BASE.replace(
             "        tier_mode: whole_request",
             "        basis: characters\n        tier_mode: whole_request",
+        ),
+        // unit bases: missing rate, another basis's rate, a token field
+        unit_card("characters", ""),
+        unit_card("audio_seconds", "        nanodollars_per_character: 1\n"),
+        unit_card("audio_seconds", "        nanodollars_per_second: 1\n        tier_mode: graduated\n"),
+        unit_card("characters", "        nanodollars_per_character: -1\n"),
+        BASE.replace(
+            "        tier_mode: whole_request",
+            "        nanodollars_per_second: 1\n        tier_mode: whole_request",
         ),
         // strict row, empty attribute, negative price
         images_card("        image_prices:\n          - { nanodollars_per_image: 1, other: x }\n"),
@@ -420,4 +452,86 @@ fn schema_accepts_valid_rate_card_shapes_and_rejects_invalid_ones() {
             "invalid case {index} was accepted by the schema:\n{config}"
         );
     }
+}
+
+/// ADR-0010 phase 3: a `characters` or `audio_seconds` entry lowers to its
+/// one rate and no token keys, which the usage filter parses into a priced
+/// entry (the end-to-end charge is `ledger_e2e`'s).
+#[test]
+fn unit_basis_entries_lower_to_their_one_rate() {
+    for (basis, field) in [
+        ("characters", "nanodollars_per_character"),
+        ("audio_seconds", "nanodollars_per_second"),
+    ] {
+        let entry = &carrier(&unit_card(basis, &format!("        {field}: 15000\n")))["price_list"]
+            ["entries"][0];
+        assert_eq!(
+            entry,
+            &serde_json::json!({
+                "cached_input_unpriced": false,
+                "cache_write_unpriced": false,
+                "provider_type": "openai",
+                "model": "audio-model",
+                "basis": basis,
+                field: 15000,
+            }),
+            "{basis}"
+        );
+    }
+}
+
+/// Each unit basis requires its own rate and refuses every field another
+/// basis prices with, each with its full dotted path (invariant 1).
+#[test]
+fn unit_basis_entries_reject_missing_and_foreign_fields() {
+    let token_tier = "        tiers:\n          - input_nanodollars_per_token: 1\n            cached_input_nanodollars_per_token: 1\n            cache_write_nanodollars_per_token: 1\n            output_nanodollars_per_token: 1\n";
+    for (basis, body, field) in [
+        ("characters", "", "nanodollars_per_character"),
+        ("audio_seconds", "", "nanodollars_per_second"),
+        (
+            "characters",
+            "        nanodollars_per_character: 1\n        nanodollars_per_second: 1\n",
+            "nanodollars_per_second",
+        ),
+        (
+            "audio_seconds",
+            "        nanodollars_per_second: 1\n        image_prices:\n          - nanodollars_per_image: 1\n",
+            "image_prices",
+        ),
+        (
+            "characters",
+            "        nanodollars_per_character: 1\n        tier_mode: graduated\n",
+            "tier_mode",
+        ),
+        (
+            "audio_seconds",
+            &format!("        nanodollars_per_second: 1\n{token_tier}"),
+            "tiers",
+        ),
+        (
+            "characters",
+            "        nanodollars_per_character: 1\n        cache_write_unpriced: true\n",
+            "cache_write_unpriced",
+        ),
+        (
+            "images",
+            "        image_prices:\n          - nanodollars_per_image: 1\n        nanodollars_per_character: 1\n",
+            "nanodollars_per_character",
+        ),
+    ] {
+        assert_eq!(
+            error_path(&unit_card(basis, body)),
+            format!("pricing.price_list.entries[0].{field}"),
+            "{basis}: {body}"
+        );
+    }
+    // A rate on a tokens entry.
+    let config = BASE.replace(
+        "        tier_mode: whole_request",
+        "        nanodollars_per_second: 1\n        tier_mode: whole_request",
+    );
+    assert_eq!(
+        error_path(&config),
+        "pricing.price_list.entries[0].nanodollars_per_second"
+    );
 }

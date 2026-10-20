@@ -136,3 +136,10 @@ mkdir -p "$corpus/media_scan"
 printf '\007{"created":1,"data":[{"b64_json":"QUJD","revised_prompt":"a \\"cat\\""}],"size":"1024x1024","quality":"high","usage":{"input_tokens":50,"input_tokens_details":{"text_tokens":40,"image_tokens":10},"output_tokens":4160,"total_tokens":4210}}' > "$corpus/media_scan/seed-json"
 printf '\003{"data":["a",{"url":"u"},null],"\\u0073ize":"512x512"}' > "$corpus/media_scan/seed-escaped"
 printf '\005event: image_generation.partial_image\ndata: {"type":"image_generation.partial_image","b64_json":"QQ"}\n\nevent: image_generation.completed\r\ndata: {"type":"image_generation.completed","b64_json":"QUJD","size":"1024x1536","quality":"medium","usage":{"input_tokens":7,"output_tokens":100}}\r\n\r\n' > "$corpus/media_scan/seed-sse"
+
+# multipart_scan: byte 0 = mode (even: raw body with boundary `b`; odd: field
+# pairs split on 0xFF, each pair's first byte picking the field name).
+mkdir -p "$corpus/multipart_scan"
+printf '\000--b\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n--b\r\nContent-Disposition: form-data; name="file"; filename="a.mp3"\r\nContent-Type: audio/mpeg\r\n\r\nID3\r\n--b\r\nContent-Disposition: form-data; name=response_format\r\n\r\nverbose_json\r\n--b--\r\n' > "$corpus/multipart_scan/seed-transcription"
+printf '\002--b\r\nContent-Disposition: form-data; name="model"\r\nContent-Transfer-Encoding: base64\r\n\r\nYQ==\r\n--b--' > "$corpus/multipart_scan/seed-encoded"
+printf '\001\000gpt-image-1\377\005PNG\377\002\061\060\062\064x1024\377\000twice' > "$corpus/multipart_scan/seed-built"

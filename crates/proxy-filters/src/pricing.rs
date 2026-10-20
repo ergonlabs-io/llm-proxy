@@ -2,9 +2,10 @@
 //! integer nanodollars; an unpriced request is `None`, not zero.
 //!
 //! An entry declares its basis (ADR-0010 decision 3): `tokens` prices the
-//! token buckets, `images` prices the images meter. An entry prices only the
-//! meters of its basis, so one request is never charged twice for the same
-//! work.
+//! token buckets, `images` the images meter, `characters` the input
+//! characters, and `audio_seconds` the audio duration. An entry prices only
+//! the meters of its basis, so one request is never charged twice for the
+//! same work.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -103,6 +104,11 @@ pub struct PriceEntry {
     pub basis: PriceBasis,
     /// Empty unless `basis` is `images`.
     pub image_prices: Vec<ImagePrice>,
+    /// Set exactly when `basis` is `characters`.
+    pub nanodollars_per_character: Option<u64>,
+    /// Set exactly when `basis` is `audio_seconds`. Applied to milliseconds,
+    /// rounded up to a whole nanodollar.
+    pub nanodollars_per_second: Option<u64>,
 }
 
 impl PriceEntry {
@@ -111,6 +117,8 @@ impl PriceEntry {
     pub fn uses_media_fields(&self) -> bool {
         self.basis != PriceBasis::Tokens
             || !self.image_prices.is_empty()
+            || self.nanodollars_per_character.is_some()
+            || self.nanodollars_per_second.is_some()
             || self.tiers.iter().any(Tier::has_modality_rate)
     }
 }
@@ -200,6 +208,12 @@ impl PriceList {
                     push_option_str(&mut bytes, row.size.as_deref());
                     push_option_str(&mut bytes, row.quality.as_deref());
                     bytes.extend_from_slice(&row.nanodollars_per_image.to_le_bytes());
+                }
+                // Only the bases that have them, so an image card keeps the
+                // version it had before these rates existed.
+                if e.nanodollars_per_character.is_some() || e.nanodollars_per_second.is_some() {
+                    push_option_u64(&mut bytes, e.nanodollars_per_character);
+                    push_option_u64(&mut bytes, e.nanodollars_per_second);
                 }
             }
             bytes.push(0xff);
@@ -328,7 +342,9 @@ impl PriceList {
     ///
     /// `None` when there is no entry, or the request observed none of the
     /// entry's basis meters (no token usage for a `tokens` entry, no images
-    /// for an `images` entry, or no image row matching its attributes). Such
+    /// for an `images` entry or no image row matching its attributes, no
+    /// input characters for `characters`, no audio duration for
+    /// `audio_seconds`). Such
     /// a request is unpriced, exactly like an unpriced model (ADR-0010
     /// decision 3).
     pub fn price(&self, provider_type: &str, model: &str, usage: &LlmUsage) -> Option<Priced> {
@@ -360,8 +376,24 @@ impl PriceList {
                     underpriced_modality: false,
                 })
             }
-            // Not configurable yet: the card parser refuses these bases.
-            PriceBasis::Characters | PriceBasis::AudioSeconds => None,
+            PriceBasis::Characters => {
+                let characters = usage.meters.input_characters?;
+                Some(Priced {
+                    nanodollars: characters.saturating_mul(entry.nanodollars_per_character?),
+                    basis: PriceBasis::Characters,
+                    underpriced_modality: false,
+                })
+            }
+            PriceBasis::AudioSeconds => {
+                let milliseconds = usage.meters.audio_milliseconds?;
+                Some(Priced {
+                    nanodollars: milliseconds
+                        .saturating_mul(entry.nanodollars_per_second?)
+                        .div_ceil(1000),
+                    basis: PriceBasis::AudioSeconds,
+                    underpriced_modality: false,
+                })
+            }
         }
     }
 }
@@ -618,6 +650,8 @@ mod tests {
             tiers,
             basis: PriceBasis::Tokens,
             image_prices: Vec::new(),
+            nanodollars_per_character: None,
+            nanodollars_per_second: None,
         }
     }
     fn usage(input: u64, cached: u64, write: u64, output: u64) -> LlmTokenUsage {

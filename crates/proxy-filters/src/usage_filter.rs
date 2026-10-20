@@ -31,7 +31,7 @@ use crate::auth_filter;
 use crate::control::{
     ControlPlane, RateCardDelivery, StoredRateCard, RATE_CARD_SCHEMA_V1, RATE_CARD_SCHEMA_V2,
 };
-use crate::media_scan::{MediaJsonScanner, MediaSseScanner};
+use crate::media_scan::{seconds_to_millis, MediaJsonScanner, MediaSseScanner};
 use crate::pricing::{
     image_prices_conflict, ImagePrice, PriceEntry, PriceList, Priced, Tier, TierBasis, TierMode,
 };
@@ -1085,17 +1085,24 @@ struct PriceEntryWire {
     cache_write_unpriced: bool,
     provider_type: String,
     model: String,
-    /// `tokens` (the default) or `images` (ADR-0010 decision 3).
+    /// `tokens` (the default), `images`, `characters` or `audio_seconds`
+    /// (ADR-0010 decision 3).
     #[serde(default)]
     basis: Option<String>,
-    /// Required for `tokens`, refused for `images`.
+    /// Required for `tokens`, refused for every other basis.
     #[serde(default)]
     tier_mode: Option<String>,
     #[serde(default)]
     tiers: Option<Vec<TierWire>>,
-    /// Required for `images`, refused for `tokens`.
+    /// Required for `images`, refused for every other basis.
     #[serde(default)]
     image_prices: Option<Vec<ImagePriceWire>>,
+    /// Required for `characters`, refused for every other basis.
+    #[serde(default)]
+    nanodollars_per_character: Option<u64>,
+    /// Required for `audio_seconds`, refused for every other basis.
+    #[serde(default)]
+    nanodollars_per_second: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1224,6 +1231,10 @@ struct PriceEntryJsonView {
     tiers: Option<Vec<TierJsonView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_prices: Option<Vec<ImagePriceJsonView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nanodollars_per_character: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nanodollars_per_second: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1295,7 +1306,9 @@ impl From<PricingContext> for PricingJsonView {
                             })
                             .collect()
                     }),
-                    image_prices: (!tokens).then(|| {
+                    nanodollars_per_character: entry.nanodollars_per_character,
+                    nanodollars_per_second: entry.nanodollars_per_second,
+                    image_prices: (entry.basis == PriceBasis::Images).then(|| {
                         entry
                             .image_prices
                             .iter()
@@ -1367,14 +1380,42 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
     let basis = match entry.basis.as_deref() {
         None | Some("tokens") => PriceBasis::Tokens,
         Some("images") => PriceBasis::Images,
+        Some("characters") => PriceBasis::Characters,
+        Some("audio_seconds") => PriceBasis::AudioSeconds,
         Some(other) => {
             return Err(invalid_config(format!(
-                "{} must be tokens or images, got `{other}`",
+                "{} must be tokens, images, characters or audio_seconds, got `{other}`",
                 at("basis")
             )));
         }
     };
-    if basis == PriceBasis::Images {
+    // Each basis's own price field, refused on every other basis.
+    for (set, field, owner) in [
+        (
+            entry.image_prices.is_some(),
+            "image_prices",
+            PriceBasis::Images,
+        ),
+        (
+            entry.nanodollars_per_character.is_some(),
+            "nanodollars_per_character",
+            PriceBasis::Characters,
+        ),
+        (
+            entry.nanodollars_per_second.is_some(),
+            "nanodollars_per_second",
+            PriceBasis::AudioSeconds,
+        ),
+    ] {
+        if set && basis != owner {
+            return Err(invalid_config(format!(
+                "{} applies only to basis {}",
+                at(field),
+                owner.as_str()
+            )));
+        }
+    }
+    if basis != PriceBasis::Tokens {
         for (set, field) in [
             (entry.tier_mode.is_some(), "tier_mode"),
             (entry.tiers.is_some(), "tiers"),
@@ -1383,11 +1424,49 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
         ] {
             if set {
                 return Err(invalid_config(format!(
-                    "{} does not apply to basis images",
-                    at(field)
+                    "{} does not apply to basis {}",
+                    at(field),
+                    basis.as_str()
                 )));
             }
         }
+    }
+    let unit_entry = |nanodollars_per_character, nanodollars_per_second| PriceEntry {
+        cached_input_unpriced: false,
+        cache_write_unpriced: false,
+        provider_type: entry.provider_type.clone(),
+        model: entry.model.clone(),
+        tier_basis: TierBasis::InputTokens,
+        // Unused for a unit basis; fixed so the version hash is stable.
+        tier_mode: TierMode::WholeRequest,
+        tiers: Vec::new(),
+        basis,
+        image_prices: Vec::new(),
+        nanodollars_per_character,
+        nanodollars_per_second,
+    };
+    match basis {
+        PriceBasis::Characters => {
+            let Some(rate) = entry.nanodollars_per_character else {
+                return Err(invalid_config(format!(
+                    "{} is required for basis characters",
+                    at("nanodollars_per_character")
+                )));
+            };
+            return Ok(unit_entry(Some(rate), None));
+        }
+        PriceBasis::AudioSeconds => {
+            let Some(rate) = entry.nanodollars_per_second else {
+                return Err(invalid_config(format!(
+                    "{} is required for basis audio_seconds",
+                    at("nanodollars_per_second")
+                )));
+            };
+            return Ok(unit_entry(None, Some(rate)));
+        }
+        PriceBasis::Tokens | PriceBasis::Images => {}
+    }
+    if basis == PriceBasis::Images {
         let rows: Vec<ImagePrice> = entry
             .image_prices
             .unwrap_or_default()
@@ -1430,13 +1509,9 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
             tiers: Vec::new(),
             basis,
             image_prices: rows,
+            nanodollars_per_character: None,
+            nanodollars_per_second: None,
         });
-    }
-    if entry.image_prices.is_some() {
-        return Err(invalid_config(format!(
-            "{} applies only to basis images",
-            at("image_prices")
-        )));
     }
     let tiers = entry.tiers.unwrap_or_default();
     if tiers.is_empty() {
@@ -1527,6 +1602,8 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
             .collect(),
         basis,
         image_prices: Vec::new(),
+        nanodollars_per_character: None,
+        nanodollars_per_second: None,
     })
 }
 
@@ -1662,6 +1739,7 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
             endpoint: Endpoint::Unmetered,
             request_size: None,
             request_quality: None,
+            request_input_characters: None,
             stats: Arc::clone(&self.stats),
             mode: BodyMode::Inert,
             headers_at: None,
@@ -1746,6 +1824,9 @@ struct UsageFilterInstance {
     /// body-rewrite filter published them.
     request_size: Option<String>,
     request_quality: Option<String>,
+    /// The speech request's `input` characters, the request-side meter
+    /// (ADR-0010 decision 2). Read at `encode_headers`.
+    request_input_characters: Option<u64>,
     stats: Arc<UsageStats>,
     pricing: Option<PricingContext>,
     mode: BodyMode,
@@ -1814,9 +1895,16 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect, endpoint: Endpoint) -> B
 /// look for `input_tokens` and meter nothing.
 fn dialect_for_request(endpoint: Endpoint) -> Option<Dialect> {
     match endpoint {
-        // The Images API reports usage in the Responses shape
-        // (`input_tokens`, `input_tokens_details.image_tokens`, ...).
-        Endpoint::Responses | Endpoint::ImageGeneration => Some(Dialect::OpenAiResponses),
+        // The Images and Audio APIs report usage in the Responses shape
+        // (`input_tokens`, `input_tokens_details.image_tokens`, transcription's
+        // `input_token_details.audio_tokens`, ...). A duration-only usage
+        // object carries none of those keys, so it reads as no tokens.
+        Endpoint::Responses
+        | Endpoint::ImageGeneration
+        | Endpoint::ImageEdit
+        | Endpoint::Speech
+        | Endpoint::Transcription
+        | Endpoint::Translation => Some(Dialect::OpenAiResponses),
         Endpoint::Messages => Some(Dialect::Anthropic),
         Endpoint::Embeddings => Some(Dialect::OpenAi),
         _ => None,
@@ -1836,6 +1924,19 @@ fn is_media(endpoint: Endpoint) -> bool {
             | Endpoint::Transcription
             | Endpoint::Translation
     )
+}
+
+/// Audio duration from a transcription `usage` object, in milliseconds: the
+/// `seconds` of a `{"type":"duration"}` usage, else `prompt_audio_seconds`.
+/// The field names come from the API shape, never from a provider name.
+fn audio_milliseconds_from_usage(usage: &str) -> Option<u64> {
+    let usage: serde_json::Value = serde_json::from_str(usage).ok()?;
+    let seconds = if usage.get("type").and_then(serde_json::Value::as_str) == Some("duration") {
+        usage.get("seconds")
+    } else {
+        usage.get("prompt_audio_seconds")
+    };
+    seconds?.as_f64().and_then(seconds_to_millis)
 }
 
 /// A [`TokenUsage`] and its modality subsets as stream info's
@@ -1898,7 +1999,7 @@ impl UsageFilterInstance {
     fn compute_usage(&self) -> Option<LlmUsage> {
         let dialect = self.parse_dialect();
         let parts = |raw: Option<&str>| raw.and_then(|raw| usage_object_parts(dialect, raw));
-        let (tokens, meters) = match &self.mode {
+        let (tokens, mut meters) = match &self.mode {
             BodyMode::Sse(scanner) => (
                 scanner.usage().map(|u| (u, scanner.modality())),
                 LlmMeters::default(),
@@ -1927,6 +2028,20 @@ impl UsageFilterInstance {
             }
             BodyMode::Inert => (None, LlmMeters::default()),
         };
+        meters.audio_milliseconds = match &self.mode {
+            BodyMode::MediaJson(scanner) => {
+                let facts = scanner.facts();
+                self.audio_meter(facts.usage.as_deref(), facts.duration_ms)
+            }
+            BodyMode::MediaSse(scanner) => self.audio_meter(scanner.facts().usage.as_deref(), None),
+            BodyMode::Sse(_) | BodyMode::Json(_) | BodyMode::Inert => None,
+        };
+        // A request-side meter: charged only when the response the client got
+        // was 2xx, once, at the entry of the cluster dialled last. Speech's
+        // response is audio, so this is often its only meter.
+        if self.endpoint == Endpoint::Speech && self.response_ok {
+            meters.input_characters = self.request_input_characters;
+        }
         let usage = LlmUsage {
             tokens: tokens.map(|(usage, modality)| llm_tokens(usage, modality)),
             meters,
@@ -1934,16 +2049,35 @@ impl UsageFilterInstance {
         (!usage.is_empty()).then_some(usage)
     }
 
-    /// The `images` meter and its attributes. Only image generation counts
-    /// images in this phase; the attributes come from the response echo, then
-    /// from the request body (ADR-0010 decision 2).
+    /// The `audio_milliseconds` meter of a transcription or translation: the
+    /// provider's duration usage (`{"type":"duration","seconds":..}`), else
+    /// `usage.prompt_audio_seconds`, else the top-level `duration` of a
+    /// `verbose_json` response (ADR-0010 decision 2).
+    fn audio_meter(&self, usage: Option<&str>, duration_ms: Option<u64>) -> Option<u64> {
+        if !matches!(
+            self.endpoint,
+            Endpoint::Transcription | Endpoint::Translation
+        ) {
+            return None;
+        }
+        usage
+            .and_then(audio_milliseconds_from_usage)
+            .or(duration_ms)
+    }
+
+    /// The `images` meter and its attributes, for image generation and
+    /// edits; the attributes come from the response echo, then from the
+    /// request body (ADR-0010 decision 2).
     fn image_meters(
         &self,
         images: Option<u64>,
         size: &Option<String>,
         quality: &Option<String>,
     ) -> LlmMeters {
-        if self.endpoint != Endpoint::ImageGeneration {
+        if !matches!(
+            self.endpoint,
+            Endpoint::ImageGeneration | Endpoint::ImageEdit
+        ) {
             return LlmMeters::default();
         }
         let Some(images) = images else {
@@ -2176,10 +2310,14 @@ impl HttpFilter for UsageFilterInstance {
         let dialect = cluster_dialect.or(route_dialect).unwrap_or(self.dialect);
         self.dialect = dialect;
         self.mode = classify_body(&headers.headers, self.parse_dialect(), self.endpoint);
-        if self.endpoint == Endpoint::ImageGeneration {
+        if matches!(
+            self.endpoint,
+            Endpoint::ImageGeneration | Endpoint::ImageEdit | Endpoint::Speech
+        ) {
             let info = cb.stream_info();
             self.request_size = info.request_facts.size.clone();
             self.request_quality = info.request_facts.quality.clone();
+            self.request_input_characters = info.request_facts.input_characters;
         }
 
         // A response with no body at all (e.g. a 204, or a HEAD reply) — there's
@@ -2264,7 +2402,9 @@ impl HttpFilter for UsageFilterInstance {
         if self.finalized || self.headers_at.is_none() || !self.response_ok {
             return;
         }
-        if matches!(self.mode, BodyMode::Inert) {
+        // An unread body is not usage, except that a cut speech response
+        // still consumed its request's characters.
+        if matches!(self.mode, BodyMode::Inert) && self.endpoint != Endpoint::Speech {
             return;
         }
         let (dialled, request_bytes) = {
@@ -2297,7 +2437,7 @@ mod tests {
     use std::sync::Arc;
 
     use proxy_http::filter::{BufferedBody, PerRouteConfig};
-    use proxy_http::stream_info::StreamInfo;
+    use proxy_http::stream_info::{RequestFacts, StreamInfo};
 
     // --- test scaffolding ---------------------------------------------------
 
@@ -2436,6 +2576,7 @@ mod tests {
             endpoint: Endpoint::Unmetered,
             request_size: None,
             request_quality: None,
+            request_input_characters: None,
             stats: Arc::new(UsageStats::default()),
             pricing: None,
             mode: BodyMode::Inert,
@@ -2482,6 +2623,8 @@ mod tests {
                     }],
                     basis: PriceBasis::Tokens,
                     image_prices: Vec::new(),
+                    nanodollars_per_character: None,
+                    nanodollars_per_second: None,
                 })
                 .collect(),
             BTreeMap::from([("provider:openai".to_string(), "openai".to_string())]),
@@ -3875,6 +4018,32 @@ mod tests {
         chunks: Vec<Bytes>,
         end: bool,
     ) -> (proxy_http::LlmStats, Arc<UsageStats>) {
+        let request_facts = RequestFacts {
+            size: facts.0.map(str::to_owned),
+            quality: facts.1.map(str::to_owned),
+            ..RequestFacts::default()
+        };
+        drive_with(
+            pricing,
+            path,
+            request_facts,
+            StatusCode::OK,
+            content_type,
+            chunks,
+            end,
+        )
+    }
+
+    /// [`drive`] with the whole request facts and the response status.
+    fn drive_with(
+        pricing: PricingContext,
+        path: &str,
+        facts: RequestFacts,
+        status: StatusCode,
+        content_type: &str,
+        chunks: Vec<Bytes>,
+        end: bool,
+    ) -> (proxy_http::LlmStats, Arc<UsageStats>) {
         let mut filter = UsageFilterInstance {
             pricing: Some(pricing),
             ..filter_for(Dialect::OpenAi)
@@ -3885,8 +4054,7 @@ mod tests {
             let mut info = cb.stream_info.borrow_mut();
             info.upstream_cluster = Some("provider:openai".into());
             info.requested_model = Some("img".into());
-            info.request_facts.size = facts.0.map(str::to_owned);
-            info.request_facts.quality = facts.1.map(str::to_owned);
+            info.request_facts = facts;
             info.bytes_received = 4000;
         }
         decode(
@@ -3895,7 +4063,9 @@ mod tests {
             &mut request(Method::POST, path),
             false,
         );
-        filter.encode_headers(&mut cb, &mut response_headers(content_type), false);
+        let mut headers = response_headers(content_type);
+        headers.status = status;
+        filter.encode_headers(&mut cb, &mut headers, false);
         let last = chunks.len().saturating_sub(1);
         for (i, mut chunk) in chunks.into_iter().enumerate() {
             filter.encode_data(&mut cb, &mut chunk, end && i == last);
@@ -4237,9 +4407,55 @@ mod tests {
         .contains("image_prices[1]"));
         assert!(
             card_error(serde_json::json!([{"provider_type": "openai", "model": "m",
-            "basis": "characters", "image_prices": []}]))
-            .contains("entries[0].basis must be tokens or images")
+            "basis": "bytes", "nanodollars_per_character": 1}]))
+            .contains("entries[0].basis must be tokens, images, characters or audio_seconds")
         );
+        // Each unit basis requires its own rate and refuses every other
+        // basis's fields.
+        let unit = |entry: serde_json::Value| {
+            let mut full = serde_json::json!({"provider_type": "openai", "model": "m"});
+            full.as_object_mut()
+                .unwrap()
+                .extend(entry.as_object().unwrap().clone());
+            card_error(serde_json::json!([full]))
+        };
+        for (entry, error) in [
+            (
+                serde_json::json!({"basis": "characters"}),
+                "entries[0].nanodollars_per_character is required for basis characters",
+            ),
+            (
+                serde_json::json!({"basis": "audio_seconds"}),
+                "entries[0].nanodollars_per_second is required for basis audio_seconds",
+            ),
+            (
+                serde_json::json!({"basis": "characters", "image_prices": []}),
+                "entries[0].image_prices applies only to basis images",
+            ),
+            (
+                serde_json::json!({"basis": "audio_seconds", "nanodollars_per_second": 1,
+                    "nanodollars_per_character": 1}),
+                "entries[0].nanodollars_per_character applies only to basis characters",
+            ),
+            (
+                serde_json::json!({"basis": "characters", "nanodollars_per_character": 1,
+                    "tier_mode": "whole_request"}),
+                "entries[0].tier_mode does not apply to basis characters",
+            ),
+            (
+                serde_json::json!({"basis": "audio_seconds", "nanodollars_per_second": 1,
+                    "cache_write_unpriced": true}),
+                "entries[0].cache_write_unpriced does not apply to basis audio_seconds",
+            ),
+            (
+                serde_json::json!({"tier_mode": "whole_request", "tiers": [token_tier(1, 1)],
+                    "nanodollars_per_second": 1}),
+                "entries[0].nanodollars_per_second applies only to basis audio_seconds",
+            ),
+        ] {
+            let got = unit(entry.clone());
+            assert!(got.contains(error), "{entry}: {got}");
+        }
         assert!(
             card_error(serde_json::json!([{"provider_type": "openai", "model": "m",
             "tier_mode": "whole_request", "tiers": [token_tier(1, 1)],
@@ -4256,5 +4472,218 @@ mod tests {
                 "entries[0].tiers[1].audio_input_nanodollars_per_token must be set on every tier"
             )
         );
+    }
+
+    // ---- ADR-0010 phase 3: speech, transcription, image edits ----------
+
+    /// The drive helpers price model `img` on `provider:openai`.
+    fn unit_card(basis: &str, field: &str, rate: u64) -> PricingContext {
+        card(serde_json::json!([{
+            "provider_type": "openai", "model": "img", "basis": basis, field: rate}]))
+    }
+
+    fn speech_facts(characters: u64) -> RequestFacts {
+        RequestFacts {
+            input_characters: Some(characters),
+            complete: true,
+            ..RequestFacts::default()
+        }
+    }
+
+    /// Speech is charged ceil(characters x rate): the request's characters
+    /// at the dialled entry, rounded up to a whole micro-USD, only when the
+    /// response was 2xx. A cut audio response still consumed its input.
+    #[test]
+    fn speech_is_charged_its_input_characters_only_on_a_2xx_response() {
+        let audio = || vec![Bytes::from_static(b"ID3\x04\x00 mp3 frames")];
+        let (llm, _) = drive_with(
+            unit_card("characters", "nanodollars_per_character", 15),
+            "/v1/audio/speech",
+            speech_facts(1001),
+            StatusCode::OK,
+            "audio/mpeg",
+            audio(),
+            true,
+        );
+        let usage = llm.usage.expect("the request-side meter");
+        assert_eq!(usage.meters.input_characters, Some(1001));
+        assert_eq!(usage.tokens, None);
+        assert_eq!(llm.price_basis, Some(PriceBasis::Characters));
+        let cost = llm.list_cost.expect("priced");
+        assert_eq!(cost.nanodollars, 15_015);
+        assert_eq!(cost.micro_usd, 16, "15.015 micro-USD rounds up");
+
+        let (llm, _) = drive_with(
+            unit_card("characters", "nanodollars_per_character", 15),
+            "/v1/audio/speech",
+            speech_facts(1001),
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            vec![Bytes::from_static(br#"{"error":{"message":"bad voice"}}"#)],
+            true,
+        );
+        assert_eq!(llm.usage, None, "a non-2xx speech response charges nothing");
+        assert_eq!(llm.list_cost, None);
+
+        let (llm, stats) = drive_with(
+            unit_card("characters", "nanodollars_per_character", 15),
+            "/v1/audio/speech",
+            speech_facts(1001),
+            StatusCode::OK,
+            "audio/mpeg",
+            audio(),
+            false,
+        );
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(15_015));
+        assert_eq!(stats.estimated(), 0, "no byte estimate from audio");
+    }
+
+    /// Transcription and translation are charged their audio duration in
+    /// milliseconds at a per-second rate, rounded up to a whole nanodollar,
+    /// from each place a response reports it.
+    #[test]
+    fn transcription_is_charged_its_reported_audio_duration() {
+        let rate = 100_000; // 0.006 USD per minute
+        for (path, body, ms) in [
+            (
+                "/v1/audio/transcriptions",
+                r#"{"text":"hi","usage":{"type":"duration","seconds":2.5}}"#,
+                2500,
+            ),
+            (
+                "/v1/audio/translations",
+                r#"{"task":"translate","language":"english","duration":0.1,"text":"hi","segments":[]}"#,
+                100,
+            ),
+            (
+                "/v1/audio/transcriptions",
+                r#"{"model":"m","text":"hi","usage":{"prompt_audio_seconds":3,"prompt_tokens":4}}"#,
+                3000,
+            ),
+            (
+                "/v1/audio/transcriptions",
+                r#"{"text":"hi","usage":{"type":"duration","seconds":1.0005}}"#,
+                1001,
+            ),
+        ] {
+            let (llm, _) = drive_with(
+                unit_card("audio_seconds", "nanodollars_per_second", rate),
+                path,
+                RequestFacts::default(),
+                StatusCode::OK,
+                "application/json",
+                vec![Bytes::from(body)],
+                true,
+            );
+            let usage = llm.usage.expect(body);
+            assert_eq!(usage.meters.audio_milliseconds, Some(ms), "{body}");
+            assert_eq!(
+                llm.list_cost.map(|c| c.nanodollars),
+                Some((ms * rate).div_ceil(1000)),
+                "{body}"
+            );
+        }
+        // A token-reporting model under a per-second entry observed no
+        // duration: unpriced, not charged zero as a price.
+        let (llm, _) = drive_with(
+            unit_card("audio_seconds", "nanodollars_per_second", rate),
+            "/v1/audio/transcriptions",
+            RequestFacts::default(),
+            StatusCode::OK,
+            "application/json",
+            vec![Bytes::from_static(
+                br#"{"text":"hi","usage":{"type":"tokens","input_tokens":14,"input_token_details":{"text_tokens":0,"audio_tokens":14},"output_tokens":45,"total_tokens":59}}"#,
+            )],
+            true,
+        );
+        let usage = llm.usage.expect("tokens");
+        assert_eq!(usage.meters.audio_milliseconds, None);
+        assert_eq!(usage.tokens.map(|t| t.input_audio_tokens), Some(14));
+        assert_eq!(llm.list_cost, None);
+    }
+
+    /// The unverified provider shapes (ADR-0010, "How providers bill"), as
+    /// the provider documents them. No recorded response exists yet, so these
+    /// pin the documented shape, and the example rate card marks each as an
+    /// assumption until one is recorded.
+    #[test]
+    fn documented_stream_usage_shapes_are_read() {
+        let tokens = card(serde_json::json!([{
+            "provider_type": "openai", "model": "img",
+            "tier_mode": "whole_request", "tiers": [token_tier(600, 12_000)]}]));
+        // `gpt-4o-mini-tts` with `stream_format: sse`: usage only on
+        // `speech.audio.done`.
+        let (llm, _) = drive_with(
+            tokens.clone(),
+            "/v1/audio/speech",
+            speech_facts(5),
+            StatusCode::OK,
+            "text/event-stream",
+            vec![Bytes::from_static(
+                b"data: {\"type\":\"speech.audio.delta\",\"audio\":\"AAAA\"}\n\n\
+                  data: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":14,\"output_tokens\":101,\"total_tokens\":115}}\n\n",
+            )],
+            true,
+        );
+        let usage = llm.usage.expect("speech.audio.done usage");
+        let read = usage.tokens.expect("tokens");
+        assert_eq!((read.input_tokens, read.output_tokens), (14, 101));
+        assert_eq!(usage.meters.input_characters, Some(5));
+        assert_eq!(
+            llm.list_cost.map(|c| c.nanodollars),
+            Some(14 * 600 + 101 * 12_000),
+            "a tokens entry prices only the tokens"
+        );
+        // Streamed transcription: usage on `transcript.text.done`.
+        let (llm, _) = drive_with(
+            unit_card("audio_seconds", "nanodollars_per_second", 1000),
+            "/v1/audio/transcriptions",
+            RequestFacts::default(),
+            StatusCode::OK,
+            "text/event-stream",
+            vec![Bytes::from_static(
+                b"data: {\"type\":\"transcript.text.delta\",\"delta\":\"hi\"}\n\n\
+                  data: {\"type\":\"transcript.text.done\",\"text\":\"hi\",\"usage\":{\"type\":\"duration\",\"seconds\":4}}\n\n",
+            )],
+            true,
+        );
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(4000));
+    }
+
+    /// An image edit is charged like a generation: elements of `data[]`, or
+    /// `image_edit.completed` events, with the size from the form when the
+    /// response does not echo it.
+    #[test]
+    fn an_image_edit_is_charged_per_image() {
+        let form_facts = RequestFacts {
+            size: Some("1024x1024".into()),
+            complete: true,
+            ..RequestFacts::default()
+        };
+        let (llm, _) = drive_with(
+            per_image_card(),
+            "/v1/images/edits",
+            form_facts.clone(),
+            StatusCode::OK,
+            "application/json",
+            image_response(2, 1 << 10, false, false),
+            true,
+        );
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(2 * 20_000_000));
+        let (llm, _) = drive_with(
+            per_image_card(),
+            "/v1/images/edits",
+            form_facts,
+            StatusCode::OK,
+            "text/event-stream",
+            vec![Bytes::from_static(
+                b"data: {\"type\":\"image_edit.partial_image\",\"b64_json\":\"QQ\"}\n\n\
+                  data: {\"type\":\"image_edit.completed\",\"b64_json\":\"QUJD\",\"quality\":\"high\"}\n\n",
+            )],
+            true,
+        );
+        assert_eq!(llm.usage.as_ref().and_then(|u| u.meters.images), Some(1));
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(70_000_000));
     }
 }

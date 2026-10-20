@@ -22,6 +22,7 @@ use std::sync::Arc;
 use http::StatusCode;
 use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::DecoderCallbacks;
+use proxy_http::stream_info::RequestFacts;
 use proxy_observability::stats::{instruments, Registry, WorkerId};
 
 /// The response-code detail of every refusal. It names no control, because
@@ -47,11 +48,65 @@ impl Control {
     }
 }
 
-/// Whether a spend budget can count `endpoint`: the five text endpoints, and
-/// image generation, metered in tokens or images (ADR-0010 phase 2). Image
-/// edits and audio join in phase 3.
+/// Whether a spend budget can count `endpoint`: the five text endpoints,
+/// image generation and edits (tokens or images), speech (characters or
+/// tokens), and transcription and translation (audio duration or tokens)
+/// (ADR-0010 phase 3). Batch and every unknown path stay out.
 pub(crate) fn metered_under_spend(endpoint: Endpoint) -> bool {
-    endpoint.reports_text_tokens() || endpoint == Endpoint::ImageGeneration
+    endpoint.reports_text_tokens()
+        || matches!(
+            endpoint,
+            Endpoint::ImageGeneration
+                | Endpoint::ImageEdit
+                | Endpoint::Speech
+                | Endpoint::Transcription
+                | Endpoint::Translation
+        )
+}
+
+/// The endpoints whose countability under a spend budget depends on the
+/// body, so it is decided at the end of the body (ADR-0010 decision 1, "Two
+/// admission points").
+pub(crate) fn needs_body_facts(endpoint: Endpoint) -> bool {
+    matches!(
+        endpoint,
+        Endpoint::ImageEdit | Endpoint::Speech | Endpoint::Transcription | Endpoint::Translation
+    )
+}
+
+/// Whether the request's shape can be counted under a spend budget
+/// (ADR-0010 decision 5). `model_proven` says the body scan proved the
+/// model: without it the request cannot be priced, and this check does not
+/// rely on `model_authz`, which may not be configured.
+///
+/// - Image edits: the images are counted from the response.
+/// - Speech: the `input` characters, proven by a scan that read the whole
+///   body.
+/// - Transcription: a `response_format` whose response carries usage
+///   (`json`, the default when absent, `verbose_json`, `diarized_json`).
+///   `text`, `srt` and `vtt` carry none.
+/// - Translation: only `verbose_json` carries usage (`duration`).
+///
+/// Every other endpoint is decided at headers and passes here.
+pub(crate) fn countable_under_spend(
+    endpoint: Endpoint,
+    model_proven: bool,
+    facts: &RequestFacts,
+) -> bool {
+    let response_format = facts.response_format.as_deref();
+    match endpoint {
+        Endpoint::ImageEdit => model_proven,
+        Endpoint::Speech => model_proven && facts.input_characters.is_some(),
+        Endpoint::Transcription => {
+            model_proven
+                && match response_format {
+                    None => facts.complete,
+                    Some(format) => matches!(format, "json" | "verbose_json" | "diarized_json"),
+                }
+        }
+        Endpoint::Translation => model_proven && response_format == Some("verbose_json"),
+        _ => true,
+    }
 }
 
 /// Whether a token limit can count `endpoint`. Token limits count tokens

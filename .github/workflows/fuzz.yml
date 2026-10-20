@@ -5,8 +5,8 @@
 # fuzz/artifacts/<target>/ for minimization (see the fuzzing section of the
 # Makefile).
 #
-# Budget: 10 targets x (300 s fuzzing + build) is roughly 80 runner-minutes per
-# run. Twice a week keeps that near 700 minutes a month, inside the free tier
+# Budget: 12 targets x (300 s fuzzing + build) is roughly 96 runner-minutes per
+# run. Twice a week keeps that near 830 minutes a month, inside the free tier
 # for a private repository, and runs often enough that the corpus caches are
 # not evicted (GitHub drops caches unused for 7 days).
 name: Fuzz
@@ -52,6 +52,8 @@ jobs:
           - admin_body
           - virtual_key_auth
           - router_body
+          - media_scan
+          - multipart_scan
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

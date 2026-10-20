@@ -640,7 +640,9 @@ Used at: `pricing.price_list.entries[]`.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `basis` | one of `tokens`, `images` | no | `tokens` | What the entry prices. `tokens`: text, and optionally image and audio, tokens, priced by `tier_mode` and `tiers`. `images`: each generated image, priced by `image_prices`. An `images` entry sets neither `tier_mode` nor `tiers`, and cannot set `cached_input_unpriced` or `cache_write_unpriced` to true, because it prices no tokens. |
+| `basis` | one of `tokens`, `images`, `characters`, `audio_seconds` | no | `tokens` | What the entry prices. `tokens`: text, and optionally image and audio, tokens, priced by `tier_mode` and `tiers`. `images`: each image a generation or edit returned, priced by `image_prices`. `characters`: each character of a speech request's `input`, priced by `nanodollars_per_character`; it is charged only when the response status is 2xx. `audio_seconds`: the audio duration a transcription or translation response reports, priced by `nanodollars_per_second`. An entry that is not `tokens` sets neither `tier_mode` nor `tiers`, and cannot set `cached_input_unpriced` or `cache_write_unpriced` to true, because it prices no tokens. Each entry prices only its own basis; a request that reports none of it is unpriced: it costs zero and is logged, like an unpriced model. |
+| `nanodollars_per_character` | integer; minimum 0 | no | none | Required for `basis: characters`, and not allowed otherwise. The price of one character of the speech request's `input`, in nanodollars (15 USD per million characters is `15000`). A character is one Unicode code point after JSON unescaping. The request is charged this price times its characters, rounded up to a whole micro-USD. |
+| `nanodollars_per_second` | integer; minimum 0 | no | none | Required for `basis: audio_seconds`, and not allowed otherwise. The price of one second of audio, in nanodollars (0.006 USD per minute is `100000`). The duration comes from the response: `usage.seconds` of a `duration` usage, else `usage.prompt_audio_seconds`, else the top-level `duration` of a `verbose_json` response. It is priced per millisecond and rounded up to a whole nanodollar, with no minimum duration. |
 | `image_prices` | array of [ImagePrice](#imageprice); minimum items 1 | no | none | Required for `basis: images`, and not allowed otherwise. The most specific matching row prices each image: a row naming both `size` and `quality` first, then one naming one, then one naming neither. A request matches a row when each attribute the row names equals the value in the response, or in the request body when the response does not echo it. Values are plain strings matched exactly. A request that matches no row is unpriced: it costs zero and is logged, like an unpriced model. Two rows of the same specificity that one request could match are a load error: identical `size` and `quality` pairs, or a row naming only `size` beside a row naming only `quality`. |
 | `cached_input_unpriced` | boolean | no | `false` | Requests reporting cached input remain unpriced. |
 | `cache_write_unpriced` | boolean | no | `false` | Requests reporting cache creation remain unpriced. |
@@ -653,8 +655,10 @@ Any other field is a load error.
 
 Rules:
 
-- When `basis` is `images`: `image_prices` must be set. None of `tier_mode`, `tiers` is set.
-- When `basis` is not `images`: `tier_mode`, `tiers` must be set. `image_prices` is not set.
+- When `basis` is `images`: `image_prices` must be set. None of `tier_mode`, `tiers`, `nanodollars_per_character`, `nanodollars_per_second` is set.
+- When `basis` is `characters`: `nanodollars_per_character` must be set. None of `tier_mode`, `tiers`, `image_prices`, `nanodollars_per_second` is set.
+- When `basis` is `audio_seconds`: `nanodollars_per_second` must be set. None of `tier_mode`, `tiers`, `image_prices`, `nanodollars_per_character` is set.
+- When `basis` is not `images`, `characters` or `audio_seconds`: `tier_mode`, `tiers` must be set. None of `image_prices`, `nanodollars_per_character`, `nanodollars_per_second` is set.
 
 ## `HttpGuardrail`
 

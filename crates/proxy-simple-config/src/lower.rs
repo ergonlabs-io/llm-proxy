@@ -775,6 +775,12 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
                             .collect(),
                     ),
                 );
+            } else if let Some(rate) = entry.nanodollars_per_character {
+                object.insert("basis".into(), json!("characters"));
+                object.insert("nanodollars_per_character".into(), json!(rate));
+            } else if let Some(rate) = entry.nanodollars_per_second {
+                object.insert("basis".into(), json!("audio_seconds"));
+                object.insert("nanodollars_per_second".into(), json!(rate));
             } else {
                 object.insert(
                     "tier_mode".into(),
@@ -893,9 +899,12 @@ fn validate_price_list(list: &PriceListDef) -> Result<(), ConfigError> {
                 reason: format!("duplicate (provider_type, model), first used at entries[{first}]"),
             });
         }
-        match entry.basis.unwrap_or(PriceBasisDef::Tokens) {
+        let basis = entry.basis.unwrap_or(PriceBasisDef::Tokens);
+        validate_basis_fields(entry, basis, &path)?;
+        match basis {
             PriceBasisDef::Tokens => validate_token_entry(entry, &path)?,
             PriceBasisDef::Images => validate_image_entry(entry, &path)?,
+            PriceBasisDef::Characters | PriceBasisDef::AudioSeconds => {}
         }
     }
     Ok(())
@@ -908,13 +917,79 @@ fn invalid(field_path: String, reason: impl Into<String>) -> ConfigError {
     }
 }
 
-fn validate_token_entry(entry: &PriceEntryDef, path: &str) -> Result<(), ConfigError> {
-    if entry.image_prices.is_some() {
-        return Err(invalid(
-            format!("{path}.image_prices"),
-            "only a `basis: images` entry has image_prices",
-        ));
+fn basis_name(basis: PriceBasisDef) -> &'static str {
+    match basis {
+        PriceBasisDef::Tokens => "tokens",
+        PriceBasisDef::Images => "images",
+        PriceBasisDef::Characters => "characters",
+        PriceBasisDef::AudioSeconds => "audio_seconds",
     }
+}
+
+/// Each basis has its own price field, required on that basis and refused on
+/// every other: a set-but-ignored price is a silently ignored field
+/// (invariant 1). A non-token basis prices no tokens, so the token fields are
+/// refused on it too.
+fn validate_basis_fields(
+    entry: &PriceEntryDef,
+    basis: PriceBasisDef,
+    path: &str,
+) -> Result<(), ConfigError> {
+    for (set, field, owner) in [
+        (
+            entry.image_prices.is_some(),
+            "image_prices",
+            PriceBasisDef::Images,
+        ),
+        (
+            entry.nanodollars_per_character.is_some(),
+            "nanodollars_per_character",
+            PriceBasisDef::Characters,
+        ),
+        (
+            entry.nanodollars_per_second.is_some(),
+            "nanodollars_per_second",
+            PriceBasisDef::AudioSeconds,
+        ),
+    ] {
+        if set && basis != owner {
+            return Err(invalid(
+                format!("{path}.{field}"),
+                format!("only a `basis: {}` entry has {field}", basis_name(owner)),
+            ));
+        }
+        if !set && basis == owner && owner != PriceBasisDef::Images {
+            return Err(invalid(
+                format!("{path}.{field}"),
+                format!("required on a `basis: {}` entry", basis_name(owner)),
+            ));
+        }
+    }
+    if matches!(
+        basis,
+        PriceBasisDef::Characters | PriceBasisDef::AudioSeconds
+    ) {
+        for (set, name) in [
+            (entry.tier_mode.is_some(), "tier_mode"),
+            (!entry.tiers.is_empty(), "tiers"),
+            (entry.cached_input_unpriced, "cached_input_unpriced"),
+            (entry.cache_write_unpriced, "cache_write_unpriced"),
+        ] {
+            if set {
+                return Err(invalid(
+                    format!("{path}.{name}"),
+                    format!(
+                        "not allowed on a `basis: {}` entry, which prices no tokens",
+                        basis_name(basis)
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_token_entry(entry: &PriceEntryDef, path: &str) -> Result<(), ConfigError> {
     if entry.tier_mode.is_none() {
         return Err(ConfigError::InvalidValue {
             field_path: format!("{path}.tier_mode"),
