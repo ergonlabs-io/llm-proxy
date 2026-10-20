@@ -29,7 +29,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,126 +57,140 @@ const FRAME_TEXT: &str = "abcd";
 
 #[test]
 fn an_abandoned_stream_is_recorded_partial_estimated_and_charged() {
-    let dir = scratch_dir("abort");
-    let proxy = Proxy::start(&dir, NO_TIMERS);
-    let key = mint_key(&proxy);
+    in_one_token_window("abort", || {
+        let minute = token_window_minute();
+        let dir = scratch_dir("abort");
+        let proxy = Proxy::start(&dir, NO_TIMERS);
+        let key = mint_key(&proxy);
 
-    // Clean stream first: complete, provider counts, charged once.
-    let clean_body = chat_body("clean");
-    let response = post_to_end(proxy.listen, &key, &clean_body);
-    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
-    let clean = proxy.wait_for_records(1).remove(0);
-    assert_eq!(clean["usage"]["completeness"], "complete", "{clean}");
-    assert_eq!(clean["usage"]["provenance"], "provider", "{clean}");
-    assert_eq!(clean["usage"]["input_estimated"], false, "{clean}");
-    assert_eq!(clean["usage"]["output_estimated"], false, "{clean}");
-    assert_eq!(clean["cost"]["kind"], "list", "{clean}");
-    assert_eq!(
-        clean["cost"]["amount"],
-        11 * INPUT_NANO + 5 * OUTPUT_NANO,
-        "{clean}"
-    );
-    assert_eq!(clean["upstream_response_id"], "chatcmpl-clean", "{clean}");
-    assert_eq!(
-        clean["upstream_usage"],
-        serde_json::json!({"prompt_tokens": 11, "completion_tokens": 5}),
-        "the provider's usage object is embedded as JSON, not a string"
-    );
-    let clean_micros = (11 * INPUT_NANO + 5 * OUTPUT_NANO) / 1000;
-    assert_eq!(
-        proxy.spend_micros(),
-        clean_micros,
-        "a clean stream is charged exactly once"
-    );
-    assert_eq!(
-        proxy.window_tokens(&key),
-        11 + 5,
-        "a clean stream moves the token window exactly once"
-    );
-    let clean_line = proxy.wait_for_chat_log_lines(1).remove(0);
-    assert_eq!(
-        clean_line["llm_usage_completeness"], "complete",
-        "{clean_line}"
-    );
-    assert_eq!(clean_line["response_flags"], "-", "{clean_line}");
+        // Clean stream first: complete, provider counts, charged once.
+        let clean_body = chat_body("clean");
+        let response = post_to_end(proxy.listen, &key, &clean_body);
+        assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+        let clean = proxy.wait_for_records(1).remove(0);
+        assert_eq!(clean["usage"]["completeness"], "complete", "{clean}");
+        assert_eq!(clean["usage"]["provenance"], "provider", "{clean}");
+        assert_eq!(clean["usage"]["input_estimated"], false, "{clean}");
+        assert_eq!(clean["usage"]["output_estimated"], false, "{clean}");
+        assert_eq!(clean["cost"]["kind"], "list", "{clean}");
+        assert_eq!(
+            clean["cost"]["amount"],
+            11 * INPUT_NANO + 5 * OUTPUT_NANO,
+            "{clean}"
+        );
+        assert_eq!(clean["upstream_response_id"], "chatcmpl-clean", "{clean}");
+        assert_eq!(
+            clean["upstream_usage"],
+            serde_json::json!({"prompt_tokens": 11, "completion_tokens": 5}),
+            "the provider's usage object is embedded as JSON, not a string"
+        );
+        let clean_micros = (11 * INPUT_NANO + 5 * OUTPUT_NANO) / 1000;
+        assert_eq!(
+            proxy.spend_micros(),
+            clean_micros,
+            "a clean stream is charged exactly once"
+        );
+        let Some(clean_window) = proxy.window_tokens(&key, minute) else {
+            return false;
+        };
+        assert_eq!(
+            clean_window,
+            11 + 5,
+            "a clean stream moves the token window exactly once"
+        );
+        let clean_line = proxy.wait_for_chat_log_lines(1).remove(0);
+        assert_eq!(
+            clean_line["llm_usage_completeness"], "complete",
+            "{clean_line}"
+        );
+        assert_eq!(clean_line["response_flags"], "-", "{clean_line}");
 
-    // Abandoned stream: read the first frames, then drop the connection.
-    let abort_body = chat_body("abort");
-    abort_after_two_frames(proxy.listen, &key, &abort_body);
-    let partial = proxy.wait_for_records(2).remove(1);
-    assert_eq!(partial["usage"]["completeness"], "partial", "{partial}");
-    assert_eq!(partial["usage"]["provenance"], "estimate", "{partial}");
-    assert_eq!(partial["usage"]["input_estimated"], true, "{partial}");
-    assert_eq!(partial["usage"]["output_estimated"], true, "{partial}");
-    assert_eq!(
-        partial["upstream_response_id"], "chatcmpl-abort",
-        "{partial}"
-    );
-    assert!(partial["upstream_usage"].is_null(), "{partial}");
-    // The client left: the remote side closed, unlike a drain-deadline cut.
-    assert_eq!(
-        partial["error_category"], "downstream_remote_disconnect",
-        "{partial}"
-    );
+        // Abandoned stream: read the first frames, then drop the connection.
+        let abort_body = chat_body("abort");
+        abort_after_two_frames(proxy.listen, &key, &abort_body);
+        let partial = proxy.wait_for_records(2).remove(1);
+        assert_eq!(partial["usage"]["completeness"], "partial", "{partial}");
+        assert_eq!(partial["usage"]["provenance"], "estimate", "{partial}");
+        assert_eq!(partial["usage"]["input_estimated"], true, "{partial}");
+        assert_eq!(partial["usage"]["output_estimated"], true, "{partial}");
+        assert_eq!(
+            partial["upstream_response_id"], "chatcmpl-abort",
+            "{partial}"
+        );
+        assert!(partial["upstream_usage"].is_null(), "{partial}");
+        // The client left: the remote side closed, unlike a drain-deadline cut.
+        assert_eq!(
+            partial["error_category"], "downstream_remote_disconnect",
+            "{partial}"
+        );
 
-    // 4 bytes per token, rounded up, from the request size and the frames the
-    // proxy had streamed. The client read two frames; the proxy may have
-    // forwarded more before it noticed the disconnect.
-    let input = partial["usage"]["input_tokens"].as_u64().unwrap();
-    let output = partial["usage"]["output_tokens"].as_u64().unwrap();
-    // The request size is the body the proxy forwarded (`bytes_request`), which
-    // is larger than what the client sent when the proxy adds usage reporting.
-    assert!(partial["bytes_request"].as_u64().unwrap() >= abort_body.len() as u64);
-    assert_eq!(
-        input,
-        partial["bytes_request"].as_u64().unwrap().div_ceil(4),
-        "{partial}"
-    );
-    assert!(
-        output >= 2,
-        "at least the two frames the client read: {partial}"
-    );
-    assert_eq!(partial["cost"]["kind"], "estimate", "{partial}");
-    let estimate_nano = input * INPUT_NANO + output * OUTPUT_NANO;
-    assert_eq!(partial["cost"]["amount"], estimate_nano, "{partial}");
+        // 4 bytes per token, rounded up, from the request size and the frames the
+        // proxy had streamed. The client read two frames; the proxy may have
+        // forwarded more before it noticed the disconnect.
+        let input = partial["usage"]["input_tokens"].as_u64().unwrap();
+        let output = partial["usage"]["output_tokens"].as_u64().unwrap();
+        // The request size is the body the proxy forwarded (`bytes_request`), which
+        // is larger than what the client sent when the proxy adds usage reporting.
+        assert!(partial["bytes_request"].as_u64().unwrap() >= abort_body.len() as u64);
+        assert_eq!(
+            input,
+            partial["bytes_request"].as_u64().unwrap().div_ceil(4),
+            "{partial}"
+        );
+        assert!(
+            output >= 2,
+            "at least the two frames the client read: {partial}"
+        );
+        assert_eq!(partial["cost"]["kind"], "estimate", "{partial}");
+        let estimate_nano = input * INPUT_NANO + output * OUTPUT_NANO;
+        assert_eq!(partial["cost"]["amount"], estimate_nano, "{partial}");
 
-    assert_eq!(
-        proxy.spend_micros(),
-        clean_micros + estimate_nano / 1000,
-        "the abandoned stream's estimate is charged to the tenant"
-    );
-    assert_eq!(
-        proxy.window_tokens(&key),
-        11 + 5 + input + output,
-        "the abandoned stream's estimate moves the token window once"
-    );
-    let line = proxy.wait_for_chat_log_lines(2).remove(1);
-    assert_eq!(line["llm_usage_completeness"], "partial", "{line}");
-    assert_eq!(line["llm_cost_kind"], "estimate", "{line}");
-    assert_eq!(line["llm_output_tokens"], output.to_string(), "{line}");
-    assert_eq!(line["response_flags"], "DC", "{line}");
+        assert_eq!(
+            proxy.spend_micros(),
+            clean_micros + estimate_nano / 1000,
+            "the abandoned stream's estimate is charged to the tenant"
+        );
+        let Some(window) = proxy.window_tokens(&key, minute) else {
+            return false;
+        };
+        assert_eq!(
+            window,
+            11 + 5 + input + output,
+            "the abandoned stream's estimate moves the token window once"
+        );
+        let line = proxy.wait_for_chat_log_lines(2).remove(1);
+        assert_eq!(line["llm_usage_completeness"], "partial", "{line}");
+        assert_eq!(line["llm_cost_kind"], "estimate", "{line}");
+        assert_eq!(line["llm_output_tokens"], output.to_string(), "{line}");
+        assert_eq!(line["response_flags"], "DC", "{line}");
 
-    let stats = http_get(proxy.admin, "/stats/prometheus", None);
-    assert!(
-        stats.contains("envoy_llmproxy_usage_partial_total{") && stats.contains("} 1\n"),
-        "partial counter missing from export:\n{stats}"
-    );
-    drop(proxy);
-    let _ = std::fs::remove_dir_all(&dir);
+        let stats = http_get(proxy.admin, "/stats/prometheus", None);
+        assert!(
+            stats.contains("envoy_llmproxy_usage_partial_total{") && stats.contains("} 1\n"),
+            "partial counter missing from export:\n{stats}"
+        );
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+        true
+    });
 }
 
 /// The provider resets the connection after two frames (no terminating
 /// chunk): the stream ends with an upstream error, not a client hang-up.
 #[test]
 fn an_upstream_reset_mid_stream_is_recorded_partial_and_charged_once() {
-    let dir = scratch_dir("reset");
-    let proxy = Proxy::start(&dir, NO_TIMERS);
-    let key = mint_key(&proxy);
-    let response = post_to_end(proxy.listen, &key, &chat_body("reset"));
-    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
-    assert_cut_charged_once(&proxy, &key, "UC");
-    drop(proxy);
-    let _ = std::fs::remove_dir_all(&dir);
+    in_one_token_window("reset", || {
+        let minute = token_window_minute();
+        let dir = scratch_dir("reset");
+        let proxy = Proxy::start(&dir, NO_TIMERS);
+        let key = mint_key(&proxy);
+        let response = post_to_end(proxy.listen, &key, &chat_body("reset"));
+        assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+        let in_window = assert_cut_charged_once(&proxy, &key, "UC", minute);
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+        in_window
+    });
 }
 
 /// The provider sends two frames and then nothing, so a timer cuts the stream
@@ -206,17 +220,21 @@ fn a_timeout_mid_stream_is_recorded_partial_and_charged_once() {
         ),
     ];
     for (tag, timers, flag) in cases {
-        let dir = scratch_dir(tag);
-        let proxy = Proxy::start(&dir, timers);
-        let key = mint_key(&proxy);
-        let response = post_to_end(proxy.listen, &key, &chat_body("stall"));
-        assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "{tag}: got:\n{response}"
-        );
-        assert_cut_charged_once(&proxy, &key, flag);
-        drop(proxy);
-        let _ = std::fs::remove_dir_all(&dir);
+        in_one_token_window(tag, || {
+            let minute = token_window_minute();
+            let dir = scratch_dir(tag);
+            let proxy = Proxy::start(&dir, timers);
+            let key = mint_key(&proxy);
+            let response = post_to_end(proxy.listen, &key, &chat_body("stall"));
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{tag}: got:\n{response}"
+            );
+            let in_window = assert_cut_charged_once(&proxy, &key, flag, minute);
+            drop(proxy);
+            let _ = std::fs::remove_dir_all(&dir);
+            in_window
+        });
     }
 }
 
@@ -351,8 +369,10 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
 
 /// The only request on `proxy` was cut after exactly two frames: its record,
 /// access log line, spend and token window all carry the same partial
-/// estimate, charged once, and the log names the cut with `flag`.
-fn assert_cut_charged_once(proxy: &Proxy, key: &str, flag: &str) {
+/// estimate, charged once, and the log names the cut with `flag`. Returns
+/// `false`, with the token window unchecked, when that window rolled over
+/// since `minute` (see `in_one_token_window`).
+fn assert_cut_charged_once(proxy: &Proxy, key: &str, flag: &str, minute: u64) -> bool {
     let record = proxy.wait_for_records(1).remove(0);
     assert_eq!(record["usage"]["completeness"], "partial", "{record}");
     assert_eq!(record["usage"]["provenance"], "estimate", "{record}");
@@ -381,11 +401,44 @@ fn assert_cut_charged_once(proxy: &Proxy, key: &str, flag: &str) {
         estimate_nano / 1000,
         "the cut stream's estimate is charged to the tenant once"
     );
+    let Some(window) = proxy.window_tokens(key, minute) else {
+        return false;
+    };
     assert_eq!(
-        proxy.window_tokens(key),
+        window,
         input + output,
         "the cut stream's estimate moves the token window once"
     );
+    true
+}
+
+/// The minute the tenant's `tokens_per_minute` window counts now. That
+/// window is fixed to the minute, not sliding, and `GET /v1/usage` reports
+/// only the current one.
+fn token_window_minute() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs()
+        / 60
+}
+
+/// Run `case` until it completes inside one token window, at most three
+/// times. A case returns `false` when a minute boundary fell between its
+/// charge and its `GET /v1/usage` read: the charge then sits in the previous
+/// window and the read reports the new one as empty. Waiting cannot bring the
+/// count back, so the run proved nothing and the case runs again. A load
+/// that stretches a case also stretches the gap between charge and read,
+/// which is how this surfaced. A case takes seconds, so a rerun crosses a
+/// boundary again only if it runs for most of a minute.
+fn in_one_token_window(what: &str, mut case: impl FnMut() -> bool) {
+    for _ in 0..3 {
+        if case() {
+            return;
+        }
+        eprintln!("{what}: the token window rolled over mid-case; running it again");
+    }
+    panic!("{what}: three runs each crossed a token-window boundary");
 }
 
 /// The record and the access log name the user bound to the presented key
@@ -645,8 +698,10 @@ impl Proxy {
     }
 
     /// Tokens in the tenant's current token-limit window, from the tenant's
-    /// own `GET /v1/usage` (answered by the limiter, never proxied).
-    fn window_tokens(&self, key: &str) -> u64 {
+    /// own `GET /v1/usage` (answered by the limiter, never proxied), or
+    /// `None` when that window is no longer the one of `minute`: a charge
+    /// made since `minute` may then sit in the previous window.
+    fn window_tokens(&self, key: &str, minute: u64) -> Option<u64> {
         let response = http_get(self.listen, "/v1/usage", Some(&format!("Bearer {key}")));
         let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b);
         // Chunked or not: the chunk-size lines fall outside the braces.
@@ -663,7 +718,9 @@ impl Proxy {
             .iter()
             .filter_map(|r| r["used"].as_f64())
             .sum();
-        used as u64
+        // The proxy read its window before answering, so if the minute is
+        // still `minute` now, it was `minute` then.
+        (token_window_minute() == minute).then_some(used as u64)
     }
 
     /// The tenant's charged spend, in micro-dollars, from the admin API.
