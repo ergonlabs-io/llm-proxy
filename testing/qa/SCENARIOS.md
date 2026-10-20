@@ -23,6 +23,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
 | QA-15 | Image generation under a tenant budget is charged per image and ledgered; unpriced is $0 and loud; batch refused | passing — since 2026-10-20 (`qa15_image_metering_test.go`); approved through the v0.6.0 ship gate clauses 1 and 2 (owner, 2026-10-18) |
 | QA-16 | Chargeback tags reach ledger entries, bounded metrics, survive a restart | passing — since 2026-10-20 (`qa16_chargeback_tags_test.go`); approved through the chargeback-tags backlog acceptance (owner, 2026-10-20) |
+| QA-17 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa17_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -582,3 +583,17 @@ refused with `403` and never reaches the provider.
 binary from Rust; this checks the v0.6.0 ship gate from the outside: the
 dialect rate card, the admin budget, the ledger read API, and the log line
 an operator reads.
+
+## QA-17 — Weighted alias splits by weight and skips an ejected provider
+
+**Property.** A `models` alias with `weight: 3` and `weight: 1` on its two
+providers sends about three requests to the first for each one to the
+second (400 requests, tolerance stated in the test). Each provider receives
+only its own key and its own upstream model ID. When the second provider
+starts failing, its first failure ejects it (`outlier_detection`) and the
+request fails over, so the client still gets 200; after that the ejected
+provider receives no requests.
+
+**Why black box.** The Rust tests pin the lowering, the draw-to-provider
+mapping and the aggregate's health preference separately; this one checks
+the documented dialect fields together on the real binary with two workers.

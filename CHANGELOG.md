@@ -126,6 +126,22 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   formats now carry. The check only allows or denies; it never changes the
   request.
 
+- Weighted selection among a `models` alias's providers. Set
+  `models.<name>.providers[i].weight` on every entry (object form) and each
+  request starts at a provider picked in proportion to weight; the other
+  entries stay its fallbacks in list order, so failover, credentials, upstream
+  model IDs and the rate card follow the provider actually dialled. `0` makes
+  an entry fallback-only. The pick is random per request, the same on every
+  worker, and not shared across replicas. It lowers to Envoy
+  `weighted_clusters` over one aggregate per weighted provider. Weighting
+  never changes the model; cost-aware selection is still not supported.
+  Aliases without weights lower exactly as before.
+- `providers.<name>.outlier_detection` (`consecutive_5xx`,
+  `base_ejection_time`, `max_ejection_time`): passive health checking of a
+  provider. An ejected provider gets no requests from a `models` alias while
+  another of its providers is not ejected, and gets them again when the
+  ejection ends.
+
 ### Security
 
 - Spend budgets and token limits no longer let images, audio, batches and
@@ -163,6 +179,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- **Behavior change:** an aggregate cluster now passes over a member none of
+  whose hosts is healthy (ejected by outlier detection or failing active
+  health checks) while a later member has a healthy host, as Envoy does.
+  Before, such a member's own panic pick kept receiving requests. With every
+  member unhealthy, the chain runs in order as before. This affects
+  bootstrap configurations whose aggregate members set `outlier_detection` or
+  `health_checks`; `--config` providers had neither until this release.
 - **Behavior change:** request heads are now limited to 60 KiB and 100
   headers, Envoy's defaults. On HTTP/1 a larger head gets `431` and closes
   the connection before any filter runs; before, only hyper's own limits

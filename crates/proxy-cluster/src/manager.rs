@@ -975,13 +975,21 @@ impl ClusterHandle {
     /// refusing to recurse makes a member cycle structurally impossible
     /// rather than something this loop has to detect.
     ///
+    /// A member none of whose hosts is healthy (every host ejected by S6
+    /// outlier detection or failing active health checks) is passed over
+    /// while a later member still has a healthy host. As in Envoy, where such
+    /// a member contributes no healthy load to the combined priority set.
+    /// When no remaining member has a healthy host, the walk runs again
+    /// without that preference, so the first member's own S7 panic pick
+    /// serves the request and the retry chain still reaches every member.
+    ///
     /// Deliberate divergence from Envoy: each member's own `HostPicker`
     /// still applies that member's full S7 logic (panic threshold, priority
     /// spillover, overprovisioning) *within* that member, but this loop does
     /// **not** implement Envoy's cross-member combined priority set, where a
     /// member at partial health bleeds a *fraction* of traffic across the
-    /// member boundary. This is strict member-order failover: a member is
-    /// skipped only when it yields no host at all. For LLM provider
+    /// member boundary. This is strict member-order failover: a member with
+    /// any healthy host keeps all of its traffic. For LLM provider
     /// fallback that's the wanted semantic -- nobody wants a silent 40% of
     /// traffic quietly landing on the fallback provider (with its own
     /// billing and rate limits) just because the primary is partially
@@ -994,23 +1002,41 @@ impl ClusterHandle {
         ctx: &LoadBalancerContext,
     ) -> Option<HostSelection> {
         let registry = self.registry.load();
+        self.walk_aggregate_members(&registry, members, ctx, true)
+            .or_else(|| self.walk_aggregate_members(&registry, members, ctx, false))
+    }
+
+    /// One pass of [`Self::select_aggregate_member`]. With `require_healthy`, a member with no healthy host is
+    /// skipped.
+    fn walk_aggregate_members(
+        &self,
+        registry: &HashMap<ClusterName, Arc<ManagedCluster>>,
+        members: &[ClusterName],
+        ctx: &LoadBalancerContext,
+        require_healthy: bool,
+    ) -> Option<HostSelection> {
         for name in members {
             if ctx.attempted_clusters.contains(name) {
                 continue;
             }
+            // The second pass revisits members the first already warned about, so only the first warns.
             let Some(member) = registry.get(name) else {
-                tracing::warn!(
-                    cluster = %name,
-                    "aggregate member not found in cluster registry (config-reload race?), skipping"
-                );
+                if require_healthy {
+                    tracing::warn!(
+                        cluster = %name,
+                        "aggregate member not found in cluster registry (config-reload race?), skipping"
+                    );
+                }
                 continue;
             };
             if member.is_aggregate() {
-                tracing::warn!(
-                    cluster = %name,
-                    "aggregate member is itself an aggregate cluster; nested aggregates are not \
-                     supported yet, skipping"
-                );
+                if require_healthy {
+                    tracing::warn!(
+                        cluster = %name,
+                        "aggregate member is itself an aggregate cluster; nested aggregates are not \
+                         supported yet, skipping"
+                    );
+                }
                 continue;
             }
             // Tenant mode (ADR-0007): a member is eligible only if it holds a tenant credential slot for a
@@ -1027,6 +1053,9 @@ impl ClusterHandle {
                 }
             }
             let host_set = member.host_set.load();
+            if require_healthy && !host_set.has_healthy_host() {
+                continue;
+            }
             if let Some(host) = member.host_picker.pick(&host_set, ctx) {
                 return Some(HostSelection {
                     host,
@@ -1780,6 +1809,89 @@ mod tests {
             entry.select_host(&ctx_exhausted).is_none(),
             "every member already attempted -- no host to serve"
         );
+    }
+
+    /// An aggregate `"providers"` over `["a", "b"]` whose members each have one host and eject it after a single
+    /// 5xx, with the S6 default 30 s ejection.
+    async fn aggregate_over_ejectable_a_and_b() -> ClusterManager {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            "a".to_string(),
+            cluster_config_with_outlier("a", vec![endpoint("10.0.0.1", 80)], 1),
+        );
+        snapshot.insert(
+            "b".to_string(),
+            cluster_config_with_outlier("b", vec![endpoint("10.0.0.2", 80)], 1),
+        );
+        snapshot.insert(
+            "providers".to_string(),
+            aggregate_config("providers", &["a", "b"]),
+        );
+        manager.update_from_snapshot(&snapshot).await;
+        manager
+    }
+
+    /// Ejects the only host of member `name` through the router's report seam.
+    fn eject_only_host(manager: &ClusterManager, name: &str, addr: SocketAddr) {
+        manager
+            .cluster(name)
+            .unwrap()
+            .report_outlier_result(addr, RequestResult::Http5xx);
+    }
+
+    /// A member whose every host is ejected yields a host through its own S7 panic pick, so without the healthy
+    /// preference the aggregate would keep dialling it. The pick must pass over it while `b` is healthy, and
+    /// return to it once the ejection expires.
+    #[tokio::test(start_paused = true)]
+    async fn aggregate_passes_over_an_ejected_member_until_it_recovers() {
+        let manager = aggregate_over_ejectable_a_and_b().await;
+        let entry = manager.cluster("providers").unwrap();
+        let a = SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80);
+        let ctx = LoadBalancerContext::default();
+        assert_eq!(entry.select_host(&ctx).unwrap().member.unwrap().name, "a");
+
+        eject_only_host(&manager, "a", a);
+        for _ in 0..10 {
+            let sel = entry.select_host(&ctx).expect("b is healthy");
+            assert_eq!(sel.member.unwrap().name, "b", "ejected `a` was picked");
+        }
+
+        // Past the 30 s base ejection, the un-eject timer restores `a`.
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(
+            entry.select_host(&ctx).unwrap().member.unwrap().name,
+            "a",
+            "a recovered member must take its traffic back"
+        );
+    }
+
+    /// With every member ejected there is no healthy member to prefer, so the walk falls back to member order
+    /// and panic picks. The retry chain still reaches every member once, then ends.
+    #[tokio::test]
+    async fn aggregate_with_every_member_ejected_still_walks_the_whole_chain() {
+        let manager = aggregate_over_ejectable_a_and_b().await;
+        let entry = manager.cluster("providers").unwrap();
+        eject_only_host(
+            &manager,
+            "a",
+            SocketAddr::new(IpAddr::from([10, 0, 0, 1]), 80),
+        );
+        eject_only_host(
+            &manager,
+            "b",
+            SocketAddr::new(IpAddr::from([10, 0, 0, 2]), 80),
+        );
+
+        let mut ctx = LoadBalancerContext::default();
+        let first = entry.select_host(&ctx).expect("panic pick serves a");
+        assert_eq!(first.member.unwrap().name, "a");
+        ctx.attempted_clusters.push("a".to_string());
+        let second = entry.select_host(&ctx).expect("panic pick serves b");
+        assert_eq!(second.member.unwrap().name, "b");
+        ctx.attempted_clusters.push("b".to_string());
+        assert!(entry.select_host(&ctx).is_none(), "chain exhausted");
     }
 
     /// `cluster_config` with a tenant credential slot for `provider`.

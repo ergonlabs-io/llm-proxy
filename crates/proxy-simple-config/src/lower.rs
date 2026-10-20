@@ -478,11 +478,9 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     // `model_catalog_order` puts them in exact > longest-prefix > `*`
     // precedence order rather than the catalogue's alphabetical key order.
     for (name, model) in model_catalog_order(config) {
-        let (route, aggregate_cluster) = lower_model(config, name, model)?;
+        let (route, aggregate_clusters) = lower_model(config, name, model)?;
         routes.push(route);
-        if let Some(aggregate_cluster) = aggregate_cluster {
-            clusters.push(aggregate_cluster);
-        }
+        clusters.extend(aggregate_clusters);
     }
     // A bare `*` catalogue entry (the empty-prefix tier) is just
     // as much a catch-all as a `routes:` rule with `model: "*"` -- it also
@@ -1182,6 +1180,9 @@ fn lower_provider(
             .connect_timeout
             .unwrap_or(SimpleDuration(std::time::Duration::from_secs(5))),
     );
+    if let Some(outlier_detection) = &provider.outlier_detection {
+        cluster["outlier_detection"] = lower_outlier_detection(name, outlier_detection)?;
+    }
     if !up.tls && provider.ca_file.is_some() {
         warnings.push(warning(
             format!("providers.{name}.ca_file"),
@@ -1388,6 +1389,55 @@ fn lower_provider(
 
 /// The cluster a provider's token endpoint is dialled through. Named apart
 /// from `provider:` clusters so no provider name can collide with it.
+/// `providers.<name>.outlier_detection` -> the provider cluster's S6
+/// `outlier_detection`, consecutive-5xx detector only. A provider cluster has
+/// one host, so `max_ejection_percent` is 100: Envoy's default 10% rounds to
+/// zero ejectable hosts and would make the setting do nothing. The
+/// statistical detectors stay unenforced; they need five or more hosts.
+fn lower_outlier_detection(
+    name: &str,
+    od: &crate::model::OutlierDetectionDef,
+) -> Result<Value, ConfigError> {
+    let path = format!("providers.{name}.outlier_detection");
+    let consecutive_5xx = od.consecutive_5xx.unwrap_or(5);
+    if consecutive_5xx == 0 {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.consecutive_5xx"),
+            reason: "must be at least 1".to_string(),
+        });
+    }
+    let mut value = json!({
+        "consecutive_5xx": consecutive_5xx,
+        "enforcing_consecutive_5xx": 100,
+        "enforcing_consecutive_gateway_failure": 0,
+        "enforcing_success_rate": 0,
+        "enforcing_failure_percentage": 0,
+        "max_ejection_percent": 100,
+    });
+    let base = od
+        .base_ejection_time
+        .unwrap_or(SimpleDuration(std::time::Duration::from_secs(30)));
+    if base.0.is_zero() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.base_ejection_time"),
+            reason: "must be greater than 0".to_string(),
+        });
+    }
+    if let Some(configured) = od.base_ejection_time {
+        value["base_ejection_time"] = json!(configured.to_string());
+    }
+    if let Some(max) = od.max_ejection_time {
+        if max.0 < base.0 {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{path}.max_ejection_time"),
+                reason: format!("must not be less than base_ejection_time ({base})"),
+            });
+        }
+        value["max_ejection_time"] = json!(max.to_string());
+    }
+    Ok(value)
+}
+
 fn token_cluster_name(provider_name: &str) -> String {
     format!("oauth2-token:{provider_name}")
 }
@@ -2368,14 +2418,25 @@ pub(crate) fn model_catalog_order(config: &SimpleConfig) -> Vec<(&String, &Model
     exact
 }
 
-/// `models.<name>` -> one route and, for a multi-provider alias, one ordered
-/// aggregate cluster. Each retry against the aggregate advances to the next
+/// `models.<name>` -> one route and, for a multi-provider alias, its
+/// aggregate clusters. Each retry against an aggregate advances to the next
 /// provider, so callers select an alias, never a provider.
+///
+/// Without weights there is one ordered aggregate, `fallback:model-<name>`.
+/// With weights the route splits by Envoy `weighted_clusters` (S1.5) over one
+/// aggregate per entry whose weight is above 0, `fallback:model-<name>@<provider>`,
+/// whose members are that provider followed by every other entry in list
+/// order. The split is drawn once per request, so its retries stay inside the
+/// picked aggregate and walk the rest of the list as fallbacks. Each member is
+/// still a provider cluster carrying its own credentials, Host, upstream model
+/// ID and usage dialect (AGENTS.md invariant 6), so the pick only decides
+/// which provider of this alias is tried first. Health-awareness comes from
+/// the aggregate itself, which passes over a member with no healthy host.
 fn lower_model(
     config: &SimpleConfig,
     name: &str,
     model: &ModelDef,
-) -> Result<(Value, Option<Value>), ConfigError> {
+) -> Result<(Value, Vec<Value>), ConfigError> {
     // `validate_semantics` already guarantees `providers` is non-empty and
     // `providers[0]` names a real provider.
     let entry = &model.providers[0];
@@ -2415,11 +2476,8 @@ fn lower_model(
         members.push(format!("provider:{candidate_name}"));
     }
     let member_count = members.len();
-    let (route_cluster, aggregate_cluster) = if member_count == 1 {
-        (format!("provider:{provider_name}"), None)
-    } else {
-        let aggregate_name = format!("fallback:model-{name}");
-        let aggregate = json!({
+    let aggregate = |aggregate_name: &str, members: &[String]| {
+        json!({
             "name": aggregate_name,
             "lb_policy": "CLUSTER_PROVIDED",
             "cluster_type": {
@@ -2429,12 +2487,40 @@ fn lower_model(
                     "clusters": members,
                 }
             }
-        });
-        (aggregate_name, Some(aggregate))
+        })
+    };
+    // `validate_semantics` guarantees weights are on every entry or none.
+    let weighted = model.providers.iter().any(|entry| entry.weight().is_some());
+    let (route_target, aggregate_clusters) = if member_count == 1 {
+        (json!(format!("provider:{provider_name}")), Vec::new())
+    } else if !weighted {
+        let aggregate_name = format!("fallback:model-{name}");
+        let cluster = aggregate(&aggregate_name, &members);
+        (json!(aggregate_name), vec![cluster])
+    } else {
+        let mut split = Vec::new();
+        let mut clusters = Vec::new();
+        for (index, entry) in model.providers.iter().enumerate() {
+            let weight = entry.weight().unwrap_or(0);
+            if weight == 0 {
+                continue;
+            }
+            let aggregate_name = format!("fallback:model-{name}@{}", entry.provider());
+            let mut chain = vec![members[index].clone()];
+            chain.extend(
+                members
+                    .iter()
+                    .enumerate()
+                    .filter(|&(other, _)| other != index)
+                    .map(|(_, member)| member.clone()),
+            );
+            clusters.push(aggregate(&aggregate_name, &chain));
+            split.push(json!({ "name": aggregate_name, "weight": weight }));
+        }
+        (json!({ "clusters": split }), clusters)
     };
 
     let mut action = json!({
-        "cluster": route_cluster,
         // Same LLM-safe S4 defaults as `lower_route`: no total timeout,
         // idle-based guard. `models:` entries don't (yet) carry their own
         // `idle_timeout` override, so this is always the 90s default.
@@ -2442,6 +2528,12 @@ fn lower_model(
         "idle_timeout": "90s",
         "host_rewrite_literal": up.host,
     });
+    let target_key = if weighted && member_count > 1 {
+        "weighted_clusters"
+    } else {
+        "cluster"
+    };
+    action[target_key] = route_target;
     if member_count > 1 {
         action["retry_policy"] = json!({
             "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
@@ -2468,7 +2560,7 @@ fn lower_model(
     }
     route["typed_per_filter_config"] = typed_per_filter_config;
 
-    Ok((route, aggregate_cluster))
+    Ok((route, aggregate_clusters))
 }
 
 // -------------------------------------------------------------------- auth --
