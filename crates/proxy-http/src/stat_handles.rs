@@ -289,8 +289,8 @@ impl RouterStats {
         record_tenant_credential_request(&self.registry, self.worker, provider, outcome);
     }
 
-    /// Counts one request refused because `cluster`'s minted token was
-    /// missing or expired.
+    /// Counts one provider credential that could not be applied for
+    /// `cluster`; `outcome` says whether the request failed over.
     pub fn record_provider_credential(&self, cluster: &str, outcome: &'static str) {
         proxy_observability::stats::record_provider_credential_request(
             &self.registry,

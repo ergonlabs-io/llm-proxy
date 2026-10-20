@@ -561,7 +561,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["token_url", "issuer", "private_key_file", "scopes"],
-          "description": "Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, requests to this provider get a local 503 with the body `provider token unavailable`; they do not fall back to the next provider, and `llmproxy_provider_credential_requests_total` counts them with `outcome=unavailable`. Valid only for `vertex`.",
+          "description": "Mint and refresh the access token with the OAuth2 JWT-bearer grant (RFC 7523). The proxy signs an RS256 assertion with the key, exchanges it at `token_url`, and mints the next token `refresh_before` its expiry. With no unexpired token, a request to this provider moves to the next provider in its fallback chain, and `llmproxy_provider_credential_requests_total` counts it with `outcome=unavailable_failover`. With no next provider, the request gets a local 503 with the body `provider token unavailable`, counted with `outcome=unavailable`. Valid only for `vertex`.",
           "properties": {
             "token_url": {
               "type": "string",
@@ -905,7 +905,7 @@
           "description": "Where matching requests go. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`."
         },
         "fallbacks": {
-          "description": "Tried in order when the primary provider fails (connection failure, or a 429, 500, 502 or 503 response — and never after the first response byte of a stream has been sent to the client). Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
+          "description": "Tried in order when the primary provider fails (connection failure, or a 429, 500, 502 or 503 response — and never after the first response byte of a stream has been sent to the client), or when the primary's credential cannot be applied (no unexpired minted token, a failed Bedrock signature). A credential failure moves to the next provider without using a retry. Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
           "type": "array",
           "items": { "$ref": "#/$defs/ProviderModelRef" }
         },

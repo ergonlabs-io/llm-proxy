@@ -196,6 +196,11 @@ impl TokenEndpoint {
 
 /// A provider that records each request and answers `200 {}`.
 fn spawn_provider() -> (SocketAddr, mpsc::Receiver<Seen>) {
+    spawn_provider_answering("{}")
+}
+
+/// A provider that records each request and answers `200` with `body`.
+fn spawn_provider_answering(body: &'static str) -> (SocketAddr, mpsc::Receiver<Seen>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider");
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
@@ -206,7 +211,7 @@ fn spawn_provider() -> (SocketAddr, mpsc::Receiver<Seen>) {
             std::thread::spawn(move || {
                 if let Some(request) = read_request(&mut stream) {
                     let _ = tx.send(request);
-                    respond(&mut stream, 200, "{}");
+                    respond(&mut stream, 200, body);
                 }
             });
         }
@@ -253,6 +258,20 @@ impl Proxy {
             .status()
             .expect("kill -HUP");
         assert!(status.success());
+    }
+
+    /// The admin listener's Prometheus text.
+    fn prometheus(&self, admin: u16) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", admin)).expect("connect admin");
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        stream
+            .write_all(
+                b"GET /stats/prometheus HTTP/1.1\r\nHost: admin.local\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
     }
 
     /// One Messages request; returns the status line and body.
@@ -321,10 +340,21 @@ impl Drop for Scratch {
 }
 
 fn config(port: u16, provider: SocketAddr, token: SocketAddr, key: &Path) -> String {
+    config_with_admin(port, free_port(), provider, token, key)
+}
+
+fn config_with_admin(
+    port: u16,
+    admin: u16,
+    provider: SocketAddr,
+    token: SocketAddr,
+    key: &Path,
+) -> String {
     format!(
         r#"
 version: 0
 listen: "127.0.0.1:{port}"
+admin: "127.0.0.1:{admin}"
 providers:
   vertex:
     type: vertex
@@ -389,17 +419,22 @@ fn a_request_reaches_the_provider_with_the_minted_bearer() {
     }
 }
 
-/// With no token minted, a request is refused locally with a finite reason
-/// and never reaches the provider unauthenticated.
+/// With no token minted and no fallback provider, a request is refused
+/// locally with a finite reason and never reaches the provider
+/// unauthenticated. A fallback would take it instead; see
+/// [`with_no_token_a_request_fails_over_to_the_fallback_provider`].
 #[test]
-fn with_no_token_a_request_fails_closed_without_reaching_the_provider() {
+fn with_no_token_and_no_fallback_a_request_fails_closed_without_reaching_the_provider() {
     let pem = test_key_pem("a");
     let scratch = Scratch::new("fail-closed");
     let key = scratch.write("key.pem", &pem);
     let tokens = TokenEndpoint::spawn(vec![(500, r#"{"error":"server_error"}"#.to_string())]);
     let (provider, received) = spawn_provider();
-    let port = free_port();
-    let path = scratch.write("llmproxy.yaml", &config(port, provider, tokens.addr, &key));
+    let (port, admin) = (free_port(), free_port());
+    let path = scratch.write(
+        "llmproxy.yaml",
+        &config_with_admin(port, admin, provider, tokens.addr, &key),
+    );
     let proxy = Proxy::spawn(&path, port, scratch.0.join("proxy.log"));
 
     let (status, body) = proxy.send();
@@ -419,6 +454,175 @@ fn with_no_token_a_request_fails_closed_without_reaching_the_provider() {
         log.contains("server_error"),
         "the endpoint's error code is logged:\n{log}"
     );
+    assert!(
+        log.contains(
+            "no unexpired OAuth2 token is published for this provider; refusing the request"
+        ),
+        "the refusal is logged:\n{log}"
+    );
+    let stats = proxy.prometheus(admin);
+    assert!(
+        stats.contains(
+            r#"llmproxy_provider_credential_requests_total{cluster="provider:vertex",outcome="unavailable"} 1"#
+        ),
+        "the refusal is counted:\n{stats}"
+    );
+    assert!(
+        !stats.contains(r#"outcome="unavailable_failover""#),
+        "{stats}"
+    );
+}
+
+const FALLBACK_KEY: &str = "fallback-provider-key";
+/// An Anthropic Messages answer with 2 input and 4 output tokens.
+const FALLBACK_ANSWER: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-fallback","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":4}}"#;
+
+/// The Vertex provider fails over to an Anthropic one. Each has its own
+/// price, so the access log shows whose rate card was charged.
+fn failover_config(
+    port: u16,
+    admin: u16,
+    vertex: SocketAddr,
+    fallback: SocketAddr,
+    token: SocketAddr,
+    key: &Path,
+    access_log: &Path,
+) -> String {
+    format!(
+        r#"
+version: 0
+listen: "127.0.0.1:{port}"
+admin: "127.0.0.1:{admin}"
+providers:
+  vertex:
+    type: vertex
+    base_url: "http://{vertex}"
+    project: project-a
+    location: us-central1
+    publisher: anthropic
+    oauth2_jwt_bearer:
+      token_url: "http://{token}/token"
+      issuer: "svc@example.test"
+      private_key_file: "{}"
+      scopes: ["scope.a"]
+  fallback:
+    type: anthropic
+    base_url: "http://{fallback}"
+    api_key: "{FALLBACK_KEY}"
+routes: []
+models:
+  claude-*:
+    providers:
+      - {{ provider: vertex, model: claude-upstream, dialect: anthropic }}
+      - {{ provider: fallback, model: claude-fallback }}
+pricing:
+  price_list:
+    version: fallback-card
+    effective_from: "2026-01-01T00:00:00Z"
+    entries:
+      - provider_type: vertex
+        model: claude-upstream
+        tier_mode: whole_request
+        tiers:
+          - {{ input_nanodollars_per_token: 1000000000, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: 1000000000 }}
+      - provider_type: anthropic
+        model: claude-fallback
+        tier_mode: whole_request
+        tiers:
+          - {{ input_nanodollars_per_token: 2000000000, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: 3000000000 }}
+observability:
+  force_usage_reporting: true
+  access_logs:
+    output: "{}"
+    format: text
+"#,
+        key.display(),
+        access_log.display()
+    )
+}
+
+/// With no token minted, the request fails over to the next provider
+/// (owner decision 2026-10-20). The fallback carries only its own key, the
+/// request is charged at the fallback's price, and the failover is counted
+/// and logged, so a broken key behind a healthy fallback stays visible.
+#[test]
+fn with_no_token_a_request_fails_over_to_the_fallback_provider() {
+    let pem = test_key_pem("a");
+    let scratch = Scratch::new("failover");
+    let key = scratch.write("key.pem", &pem);
+    let tokens = TokenEndpoint::spawn(vec![(500, r#"{"error":"server_error"}"#.to_string())]);
+    let (vertex, vertex_received) = spawn_provider();
+    let (fallback, fallback_received) = spawn_provider_answering(FALLBACK_ANSWER);
+    let (port, admin) = (free_port(), free_port());
+    let access_log = scratch.0.join("access.log");
+    let path = scratch.write(
+        "llmproxy.yaml",
+        &failover_config(
+            port,
+            admin,
+            vertex,
+            fallback,
+            tokens.addr,
+            &key,
+            &access_log,
+        ),
+    );
+    let proxy = Proxy::spawn(&path, port, scratch.0.join("proxy.log"));
+
+    let (status, body) = proxy.send();
+    assert!(status.contains(" 200 "), "status {status}: {body}");
+    assert!(
+        vertex_received
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "a request without a token must not reach the Vertex provider"
+    );
+    let seen = fallback_received
+        .recv_timeout(WAIT)
+        .expect("the fallback got the request");
+    assert_eq!(seen.header("x-api-key"), Some(FALLBACK_KEY));
+    // Invariant 6 negative assertion: nothing of the Vertex credential.
+    assert_eq!(seen.header("authorization"), None, "{seen:?}");
+    assert!(
+        seen.body.contains(r#""model":"claude-fallback""#),
+        "{seen:?}"
+    );
+
+    // 2 input tokens at $2 plus 4 output tokens at $3: the fallback's
+    // price. The Vertex price would be 6000000000.
+    let deadline = Instant::now() + WAIT;
+    let line = loop {
+        let text = std::fs::read_to_string(&access_log).unwrap_or_default();
+        if let Some(line) = text.lines().next() {
+            break line.to_string();
+        }
+        assert!(Instant::now() < deadline, "no access-log line");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    for field in [
+        r#"selected_provider="provider:fallback""#,
+        r#"selected_model="claude-fallback""#,
+        r#"llm_list_cost_nanodollars="16000000000""#,
+        r#"rate_card_version="fallback-card+"#,
+    ] {
+        assert!(line.contains(field), "{field} missing from: {line}");
+    }
+
+    let stats = proxy.prometheus(admin);
+    assert!(
+        stats.contains(
+            r#"llmproxy_provider_credential_requests_total{cluster="provider:vertex",outcome="unavailable_failover"} 1"#
+        ),
+        "the failover is counted:\n{stats}"
+    );
+    assert!(!stats.contains(r#"outcome="unavailable"}"#), "{stats}");
+    let log = proxy.log_text();
+    let warning = log
+        .lines()
+        .find(|line| line.contains("failed over to the next provider"))
+        .unwrap_or_else(|| panic!("the failover is logged:\n{log}"));
+    assert!(warning.contains("provider:vertex"), "{warning}");
+    assert!(!log.contains(FALLBACK_KEY), "the log leaked a key:\n{log}");
 }
 
 /// A SIGHUP after the key file is replaced re-reads the key, mints with the

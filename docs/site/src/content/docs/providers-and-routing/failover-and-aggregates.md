@@ -61,12 +61,19 @@ provider only on an outcome that shows the provider did not serve the request:
 - An HTTP/2 `refused-stream`.
 - A reset before any response byte.
 - A response with status 429, 500, 502, or 503.
+- The provider's credential cannot be applied: no unexpired minted OAuth2
+  token, or a failed Bedrock signature. Nothing is sent to that provider.
 
 The route's retry triggers are fixed to this list, and you cannot change them
 in the `llmproxy` dialect. See
 [Timeouts and retries](../../providers-and-routing/timeouts-and-retries/) for
 the full trigger table. A fallback attempt is a retry that lands on a
-different provider, so the same table applies.
+different provider, so the same table applies. A credential failure is the
+exception: it moves to the next provider without using a retry, because the
+failed provider received nothing. The proxy counts it in
+`llmproxy_provider_credential_requests_total` with an `outcome` that ends in
+`_failover`, and logs a warning that names the provider's cluster, at most
+once a minute per cluster on each worker.
 
 After the client starts to receive a stream, that response is final. The
 proxy never tries a later provider after the first response byte reaches the
@@ -74,7 +81,10 @@ client. A partial reply is never replaced by the answer of a different
 provider.
 
 If every provider fails, the client gets the last provider's response
-unchanged. The proxy does not make up its own `503` in that case.
+unchanged. The proxy does not make up its own `503` in that case. If the
+last provider's credential cannot be applied, there is no response to
+return, and the client gets a local `503` (`provider token unavailable` or
+`provider credential failure`).
 
 Selection is strict order. The proxy does not send a share of traffic to the
 fallback while the primary is partly healthy. This differs from Envoy's
@@ -167,5 +177,8 @@ This section is for maintainers.
   `crates/proxy-cluster/src/manager.rs`.
 - Credential isolation: `credential_isolation_across_failover` in
   `crates/proxy-http/tests/router_aggregate.rs`.
+- Failover on a credential failure: `crates/proxy-http/tests/router_credential_failover.rs`
+  (Bedrock signing) and `with_no_token_a_request_fails_over_to_the_fallback_provider`
+  in `crates/proxy/tests/oauth2_token_e2e.rs` (OAuth2 token, rate card).
 - Cross-dialect rejection: `cross_dialect_fallback_is_rejected` in
   `crates/proxy-simple-config/tests/fallbacks.rs`.

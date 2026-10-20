@@ -364,7 +364,7 @@ impl TerminalHttpFilter for RouterHandler {
                     .as_ref()
                     .map(|(name, version)| (name.as_str(), *version))
                     .unwrap_or(("unknown", 0));
-                let Some(suppressed) = local_503_log::admit(
+                let Some(suppressed) = log_throttle::local_503(
                     listener,
                     info.upstream_cluster.as_deref(),
                     info.response_flags(),
@@ -390,27 +390,33 @@ impl TerminalHttpFilter for RouterHandler {
     }
 }
 
-/// Repeat suppression for the "local 503 response" warning (AGENTS.md
-/// "Fail-open controls"). A sweep that trips a circuit breaker turns every
-/// request into a local 503, and one line per 503 makes the log the
-/// incident. Only this warning is throttled: access logs and stats still see
-/// every 503.
+/// Repeat suppression for router warnings that can fire on every request
+/// (AGENTS.md "Fail-open controls"). A sweep that trips a circuit breaker
+/// turns every request into a local 503, and a broken provider key fails
+/// every request sent to that provider; one line per request makes the log
+/// the incident. Only the warnings are throttled: access logs and stats
+/// still see every request.
 ///
 /// State is per worker thread, like the upstream connection caches, so the
-/// 503 path takes no lock and the healthy path never touches it. The cost is
-/// one line per key per worker per interval instead of one per process.
-mod local_503_log {
+/// failure paths take no lock and the healthy path never touches it. The
+/// cost is one line per key per worker per interval instead of one per
+/// process.
+mod log_throttle {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
+    use std::thread::LocalKey;
     use std::time::Duration;
 
     use proxy_observability::ResponseFlag;
     use tokio::time::Instant;
 
-    /// One line per key per worker in this window; the next line reports
-    /// how many were dropped.
-    pub(super) const INTERVAL: Duration = Duration::from_secs(10);
+    /// One "local 503 response" line per key per worker in this window; the
+    /// next line reports how many were dropped.
+    const LOCAL_503_INTERVAL: Duration = Duration::from_secs(10);
+    /// One credential-failure line per cluster per worker in this window.
+    /// Matches the OAuth2 mint-failure warning's window.
+    const CREDENTIAL_INTERVAL: Duration = Duration::from_secs(60);
 
     /// Keys are bounded by config (listeners x clusters x flag sets), but a
     /// long run of reloads can retire names. Past this many entries, entries
@@ -423,28 +429,55 @@ mod local_503_log {
         suppressed: u64,
     }
 
+    type Windows = RefCell<HashMap<u64, Window>>;
+
     thread_local! {
-        // Keyed by a hash of (listener, cluster, flags) so a lookup does not
-        // allocate. A collision only merges two keys' suppression.
-        static WINDOWS: RefCell<HashMap<u64, Window>> = RefCell::new(HashMap::new());
+        // Keyed by a hash so a lookup does not allocate. A collision only
+        // merges two keys' suppression.
+        static LOCAL_503: Windows = RefCell::new(HashMap::new());
+        static CREDENTIAL: Windows = RefCell::new(HashMap::new());
     }
 
     /// Returns `Some(suppressed)` when this 503 should be logged, where
     /// `suppressed` counts the 503s for the same key that were not logged
     /// since the previous line. Returns `None` when this one is suppressed.
-    pub(super) fn admit(
+    pub(super) fn local_503(
         listener: &str,
         cluster: Option<&str>,
         flags: &[ResponseFlag],
         now: Instant,
     ) -> Option<u64> {
+        admit(
+            &LOCAL_503,
+            hash(&(listener, cluster, flags)),
+            LOCAL_503_INTERVAL,
+            now,
+        )
+    }
+
+    /// [`local_503`] for a provider credential that could not be applied,
+    /// keyed by the cluster alone: a failover and a refusal on the same
+    /// cluster are the same broken credential.
+    pub(super) fn credential_failure(cluster: &str, now: Instant) -> Option<u64> {
+        admit(&CREDENTIAL, hash(&cluster), CREDENTIAL_INTERVAL, now)
+    }
+
+    fn hash(key: &impl Hash) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (listener, cluster, flags).hash(&mut hasher);
-        let key = hasher.finish();
-        WINDOWS.with(|windows| {
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn admit(
+        table: &'static LocalKey<Windows>,
+        key: u64,
+        interval: Duration,
+        now: Instant,
+    ) -> Option<u64> {
+        table.with(|windows| {
             let mut windows = windows.borrow_mut();
             if let Some(window) = windows.get_mut(&key) {
-                if now.duration_since(window.opened) < INTERVAL {
+                if now.duration_since(window.opened) < interval {
                     window.suppressed += 1;
                     return None;
                 }
@@ -453,7 +486,7 @@ mod local_503_log {
                 return Some(suppressed);
             }
             if windows.len() >= MAX_KEYS {
-                windows.retain(|_, w| now.duration_since(w.opened) < INTERVAL);
+                windows.retain(|_, w| now.duration_since(w.opened) < interval);
             }
             windows.insert(
                 key,
@@ -831,13 +864,17 @@ impl RouterHandler {
                 CredentialSource::Tenant
             }
         };
+        // An upgrade makes one pick and never fails over (see above), so a
+        // credential failure answers here even on an aggregate member.
         if let Err(err) = provider_credentials
             .apply(&mut attempt_head, &self.captured_body)
             .await
         {
+            let failure = CredentialFailure::from(&err);
+            failure.record(attempt_cluster, false, &self.stats);
             dcb.stream_info()
                 .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
-            return credential_failure_reply(attempt_cluster, attempt_entry, &err, &self.stats);
+            return failure.reply();
         }
         dcb.stream_info().credential_source = Some(source);
         if let AttemptCredentials::Tenant(slot, _) = &credentials {
@@ -1246,6 +1283,11 @@ impl RouterHandler {
         // (every aggregate member already tried), the client gets this real
         // response instead of a synthesized `503 no healthy upstream`.
         let mut held_failed_response: Option<HeldFailedResponse> = None;
+        // An aggregate member whose credential could not be applied. It is
+        // counted and logged at the next pick, once the router knows whether
+        // another member takes the request; with none left, its local 503 is
+        // the answer.
+        let mut credential_failure: Option<(String, CredentialFailure)> = None;
 
         // Rust note: this `async` block (no `move`) captures `dcb` (a `&mut
         // dyn DecoderCallbacks`) by unique reborrow, not by value -- so once
@@ -1274,6 +1316,9 @@ impl RouterHandler {
                 // untouched by which member ends up dialed).
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
+                    if let Some((failed_cluster, failure)) = credential_failure.take() {
+                        failure.record(&failed_cluster, false, &self.stats);
+                    }
                     tracing::debug!(response_flag = "UO", cluster = %cluster_name, "circuit breaker: max_requests exceeded");
                     dcb.stream_info()
                         .set_response_flag(ResponseFlag::UpstreamOverflow);
@@ -1286,7 +1331,19 @@ impl RouterHandler {
                 };
                 // A hedge moves the original attempt's guard into its local
                 // task; ordinary response handling retains it here.
-                let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
+                let selected = select_host_for_request(entry.as_ref(), &mut ctx);
+                if let Some((failed_cluster, failure)) = credential_failure.take() {
+                    failure.record(&failed_cluster, selected.is_ok(), &self.stats);
+                    if selected.is_err() {
+                        // Every member left failed its credential or has no
+                        // host: answer with the credential failure, as a
+                        // plain cluster does.
+                        dcb.stream_info()
+                            .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
+                        return failure.reply();
+                    }
+                }
+                let sel = match selected {
                     Ok(sel) => sel,
                     Err(NoHost::Ineligible(provider)) => {
                         self.stats.record_tenant_credential(
@@ -1724,14 +1781,23 @@ impl RouterHandler {
                     .apply(&mut attempt_head, &attempt_body_bytes)
                     .await
                 {
+                    let failure = CredentialFailure::from(&err);
+                    self.stats
+                        .record_attempt_duration_since(attempt_cluster, attempt_dispatched_at);
+                    // Nothing was sent. `attempt_head` is dropped with
+                    // whatever the failed credential wrote into it, and the
+                    // next attempt starts again from `head`, so the fallback
+                    // carries only its own credential (AGENTS.md invariant 6).
+                    // Not a retry: no retry policy, budget or backoff applies,
+                    // as when an aggregate skips a member with no host.
+                    if sel.member.is_some() {
+                        credential_failure = Some((attempt_cluster.to_string(), failure));
+                        continue;
+                    }
+                    failure.record(attempt_cluster, false, &self.stats);
                     dcb.stream_info()
                         .set_response_flag(ResponseFlag::UpstreamConnectionFailure);
-                    return credential_failure_reply(
-                        attempt_cluster,
-                        attempt_entry,
-                        &err,
-                        &self.stats,
-                    );
+                    return failure.reply();
                 }
                 dcb.stream_info().credential_source = Some(source);
                 if let AttemptCredentials::Tenant(slot, _) = &credentials {
@@ -3418,38 +3484,85 @@ fn codec_error_reply(
     local_reply(status, "upstream connection failure")
 }
 
-/// The local reply for a credential that could not be applied. Both cases fail closed with a 503 and are not
-/// retried or failed over: credentials are applied after host selection, and an aggregate skips a member only
-/// when it yields no host (ADR-0005, amendment 2026-10-17).
-fn credential_failure_reply(
-    cluster: &str,
-    entry: &dyn ClusterEntry,
-    err: &CredentialProviderError,
-    stats: &RouterStats,
-) -> HttpResponseParts {
-    match err {
-        CredentialProviderError::TokenUnavailable => {
-            stats.record_provider_credential(cluster, instruments::PROVIDER_CREDENTIAL_UNAVAILABLE);
-            // Every request to the provider fails this way until a mint lands, so warn once a minute.
-            if let Some(suppressed) = entry.minted_credential().and_then(|m| m.note_refusal()) {
-                tracing::warn!(
-                    cluster,
-                    suppressed,
-                    "no unexpired OAuth2 token is published for this provider; refusing the request"
-                );
-            }
-            local_reply(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "provider token unavailable",
-            )
+/// A provider credential that could not be applied to one attempt. Fails
+/// closed: the request is never sent without the credential. On an
+/// aggregate member the request fails over to the next member instead of
+/// answering (owner decision 2026-10-20, `envoy-divergences.md` row 43); a
+/// plain cluster, or an aggregate with no member left, answers a local `503`.
+#[derive(Clone, Copy)]
+enum CredentialFailure {
+    /// No unexpired minted OAuth2 token is published for the cluster.
+    TokenUnavailable,
+    /// Any other error: a Bedrock signing failure, a value that is not a
+    /// valid header.
+    Failed,
+}
+
+impl From<&CredentialProviderError> for CredentialFailure {
+    fn from(err: &CredentialProviderError) -> Self {
+        match err {
+            CredentialProviderError::TokenUnavailable => Self::TokenUnavailable,
+            CredentialProviderError::Failed => Self::Failed,
         }
-        CredentialProviderError::Failed => {
-            tracing::warn!(cluster, error = %err, "provider credential application failed");
-            local_reply(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "provider credential failure",
-            )
+    }
+}
+
+impl CredentialFailure {
+    /// Counts and logs this failure on `cluster` once the router knows what
+    /// happened to the request: `failed_over` when another member took it.
+    /// Failover can hide a broken key behind a healthy fallback, so both
+    /// outcomes are counted and warned (AGENTS.md "Fail-open controls").
+    /// The warning names the cluster, never the credential, and is
+    /// throttled per cluster; a healthy request never reaches this.
+    fn record(self, cluster: &str, failed_over: bool, stats: &RouterStats) {
+        let (outcome, reason) = match (self, failed_over) {
+            (Self::TokenUnavailable, false) => (
+                instruments::PROVIDER_CREDENTIAL_UNAVAILABLE,
+                "no unexpired OAuth2 token is published for this provider",
+            ),
+            (Self::TokenUnavailable, true) => (
+                instruments::PROVIDER_CREDENTIAL_UNAVAILABLE_FAILOVER,
+                "no unexpired OAuth2 token is published for this provider",
+            ),
+            (Self::Failed, false) => (
+                instruments::PROVIDER_CREDENTIAL_FAILED,
+                "provider credential could not be applied",
+            ),
+            (Self::Failed, true) => (
+                instruments::PROVIDER_CREDENTIAL_FAILED_FAILOVER,
+                "provider credential could not be applied",
+            ),
+        };
+        stats.record_provider_credential(cluster, outcome);
+        let Some(suppressed) =
+            log_throttle::credential_failure(cluster, tokio::time::Instant::now())
+        else {
+            return;
+        };
+        if failed_over {
+            tracing::warn!(
+                cluster,
+                outcome,
+                suppressed,
+                "{reason}; failed over to the next provider"
+            );
+        } else {
+            tracing::warn!(
+                cluster,
+                outcome,
+                suppressed,
+                "{reason}; refusing the request"
+            );
         }
+    }
+
+    /// The local reply when no member is left to fail over to.
+    fn reply(self) -> HttpResponseParts {
+        let reason = match self {
+            Self::TokenUnavailable => "provider token unavailable",
+            Self::Failed => "provider credential failure",
+        };
+        local_reply(StatusCode::SERVICE_UNAVAILABLE, reason)
     }
 }
 

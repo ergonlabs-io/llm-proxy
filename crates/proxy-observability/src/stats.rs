@@ -895,10 +895,13 @@ pub mod instruments {
         attribute_keys: &["provider", "outcome"],
         buckets: None,
     };
-    /// Requests refused because the selected cluster's minted credential had
-    /// no unexpired token (ADR-0005, amendment 2026-10-17). `cluster` comes
-    /// from config, so its values are bounded by config; `outcome` is
-    /// `unavailable`.
+    /// Requests whose provider credential could not be applied for the
+    /// cluster they were sent to (ADR-0005, amendment 2026-10-17). One count
+    /// per failed cluster: a request that fails on two aggregate members
+    /// counts twice. `cluster` comes from config, so its values are bounded by
+    /// config. `outcome` names the error and what the router did next: the
+    /// `*_failover` values mean the next aggregate member took the request, so
+    /// a broken key behind a healthy fallback stays visible here.
     pub const PROVIDER_CREDENTIAL_REQUESTS: Instrument = Instrument {
         name: "llmproxy_provider_credential_requests_total",
         kind: InstrumentKind::Counter,
@@ -906,8 +909,15 @@ pub mod instruments {
         attribute_keys: &["cluster", "outcome"],
         buckets: None,
     };
-    /// Refused with `503 provider token unavailable`.
+    /// No unexpired minted token; refused with `503 provider token unavailable`.
     pub const PROVIDER_CREDENTIAL_UNAVAILABLE: &str = "unavailable";
+    /// Any other credential error (a Bedrock signing failure, a value that is
+    /// not a valid header); refused with `503 provider credential failure`.
+    pub const PROVIDER_CREDENTIAL_FAILED: &str = "failed";
+    /// No unexpired minted token; the next aggregate member took the request.
+    pub const PROVIDER_CREDENTIAL_UNAVAILABLE_FAILOVER: &str = "unavailable_failover";
+    /// Any other credential error; the next aggregate member took the request.
+    pub const PROVIDER_CREDENTIAL_FAILED_FAILOVER: &str = "failed_failover";
     /// Oversized JSON responses (past the usage filter's body cap) whose
     /// `usage` could not be recovered, so the request went unmetered: no
     /// usage, no cost, nothing counted by spend or token limits. `scope` is
@@ -1469,8 +1479,8 @@ pub fn record_tenant_credential_request(
     registry.incr(worker, handle, 1);
 }
 
-/// Counts one request refused for want of a minted provider token. Only
-/// the refusal path calls it, so a healthy request never resolves a series.
+/// Counts one provider credential that could not be applied. Only the
+/// failure path calls it, so a healthy request never resolves a series.
 pub fn record_provider_credential_request(
     registry: &Registry,
     worker: WorkerId,

@@ -104,6 +104,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- **Behavior change:** when a provider's credential cannot be applied (no
+  unexpired minted OAuth2 token, a failed Bedrock signature, or another
+  credential error), the request now moves to the next provider in its
+  fallback chain instead of getting a local `503`. Nothing is sent to the
+  failed provider, the fallback request carries only the fallback's
+  credential, and the request is charged at the fallback's rate card. The
+  move does not use a retry. A request with no next provider still gets the
+  `503`. `llmproxy_provider_credential_requests_total` gains the outcomes
+  `unavailable_failover`, `failed_failover` and `failed` (before, only
+  `unavailable` was counted), and each failure logs a warning naming the
+  provider's cluster, at most once a minute per cluster on each worker.
+  Alert on the `_failover` outcomes: the client sees no error when a broken
+  key sits behind a healthy fallback. Upgrade (WebSocket) requests do not
+  fail over. See `internal-docs/envoy-divergences.md` row 43.
 - **Behavior change:** request heads are now limited to 60 KiB and 100
   headers, Envoy's defaults. On HTTP/1 a larger head gets `431` and closes
   the connection before any filter runs; before, only hyper's own limits
