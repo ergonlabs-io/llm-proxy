@@ -196,19 +196,16 @@
     <button class="chip" data-prio="P3">P3 · later<span class="n" id="n-P3"></span></button>
   </div>
   <p class="now">
-    <b>State 2026-10-19.</b> Current milestone: <b>v0.6.0 Metering completeness</b> (approved 2026-10-18).
+    <b>State 2026-10-20.</b> Current milestone: <b>v0.6.0 Metering completeness</b> (approved 2026-10-18).
     The latest release is tag v0.5.0 (Billing ledger and trace export, 2026-10-18).
-    <b>v0.6.0:</b> WP-111 is done (ADR-0010 phase 1: endpoints that cannot be metered are refused under a budget
-    or token limit) and WP-115 is done (OTel GenAI semconv 1.41.0). Open: WP-124 (meter image generation),
-    WP-125 (meter speech, transcription and image edits) and WP-117 (chargeback tags). ADR-0010 is accepted;
-    batch waits on its own ADR.
-    <b>In progress, unscheduled:</b> none. WP-41 and WP-10 closed 2026-10-19 (h2spec: 291 of 292 cases pass, the one
-    failure filed as envoy-divergences row 41). WP-29 closed 2026-10-19: every fuzz target runs twice a week in CI
-    (.github/workflows/fuzz.yml).
-    <b>Also merged 2026-10-19, outside the gate:</b> WP-112 (JWT/OIDC in the dialect, ADR-0014) and WP-114
-    (guardrail filter). WP-113 closed as not needed. <b>Next candidates:</b> WP-118 (weighted balancing) and
-    WP-116 (latency benchmark).
-    <b>Test count:</b> not re-run for this refresh; run <code>make tq-count</code> for a number.
+    <b>v0.6.0:</b> done: WP-111 (ADR-0010 phase 1), WP-115 (OTel GenAI semconv 1.41.0), WP-124 (image generation
+    metered in provider units) and WP-117 (chargeback tags from key metadata and the opt-in x-cost-tags header).
+    Open: WP-125 (meter speech, transcription and image edits), the last card in the gate. Batch waits on its own ADR.
+    <b>Also merged, outside the gate:</b> WP-112 (JWT/OIDC, ADR-0014), WP-114 (guardrail filter), WP-118 (weighted,
+    health-aware alias balancing) and WP-120 (fail over on provider credential failure; owner decision 2026-10-20).
+    <b>Next candidates:</b> WP-125 (closes the v0.6.0 gate), then WP-116 (latency benchmark) and WP-127 (JWT claims
+    to chargeback tags).
+    <b>Test count:</b> 3536 (make ci, 2026-10-20).
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
 </header>
