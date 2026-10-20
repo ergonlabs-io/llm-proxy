@@ -157,7 +157,17 @@ pub struct StoredRateCard {
     pub version: String,
     /// The pricing document, as compact JSON.
     pub card_json: String,
+    /// [`RATE_CARD_SCHEMA_V1`], or [`RATE_CARD_SCHEMA_V2`] for a card that
+    /// uses a field added by ADR-0010 (a price basis, modality rates, image
+    /// prices). An older replica skips a v2 row and keeps its last card,
+    /// rather than misreading one (ADR-0010 decision 3, "Mixed fleets").
+    pub schema_version: u16,
 }
+
+/// A rate card that uses only the original token fields.
+pub const RATE_CARD_SCHEMA_V1: u16 = 1;
+/// A rate card that uses a field added by ADR-0010.
+pub const RATE_CARD_SCHEMA_V2: u16 = 2;
 
 // Rust note: hand-written, not derived. A derived `Debug` would print the
 // whole document, which for the shipped OpenRouter card is a quarter of a
@@ -168,6 +178,7 @@ impl std::fmt::Debug for StoredRateCard {
         f.debug_struct("StoredRateCard")
             .field("chain", &self.chain)
             .field("version", &self.version)
+            .field("schema_version", &self.schema_version)
             .field("card_json_len", &self.card_json.len())
             .finish()
     }
@@ -2096,8 +2107,9 @@ pub(crate) fn decode_tenant_credential_row(
     })
 }
 
-/// Only version this build understands for a rate card row.
-pub(crate) const RATE_CARD_SCHEMA_VERSION: u16 = 1;
+/// The newest rate card row version this build understands; it reads every
+/// version from [`RATE_CARD_SCHEMA_V1`] up to this one.
+pub(crate) const RATE_CARD_SCHEMA_VERSION: u16 = RATE_CARD_SCHEMA_V2;
 
 /// One `rate_cards` row as the persistent stores keep it. The chain is the
 /// table key (redb) or hash field (Redis), so it is not repeated in the value,
@@ -2117,7 +2129,7 @@ pub(crate) struct EncodedRateCardRow {
 impl From<&StoredRateCard> for EncodedRateCardRow {
     fn from(card: &StoredRateCard) -> Self {
         EncodedRateCardRow {
-            schema_version: RATE_CARD_SCHEMA_VERSION,
+            schema_version: card.schema_version,
             version: card.version.clone(),
             card: card.card_json.clone(),
         }
@@ -2150,7 +2162,7 @@ pub(crate) fn decode_rate_card_row(chain: &str, value: &[u8]) -> Option<StoredRa
             return None;
         }
     };
-    if row.schema_version != RATE_CARD_SCHEMA_VERSION {
+    if !(RATE_CARD_SCHEMA_V1..=RATE_CARD_SCHEMA_VERSION).contains(&row.schema_version) {
         tracing::warn!(
             chain,
             schema_version = row.schema_version,
@@ -2164,6 +2176,7 @@ pub(crate) fn decode_rate_card_row(chain: &str, value: &[u8]) -> Option<StoredRa
         chain: chain.to_string(),
         version: row.version,
         card_json: row.card,
+        schema_version: row.schema_version,
     })
 }
 
@@ -9839,6 +9852,7 @@ mod tests {
             chain: chain.to_string(),
             version: format!("version-{marker}"),
             card_json: format!(r#"{{"marker":"{marker}"}}"#),
+            schema_version: crate::control::RATE_CARD_SCHEMA_V1,
         }
     }
 
@@ -10121,8 +10135,9 @@ mod tests {
             .unwrap();
 
         // Written raw, bypassing `put_rate_card`: a hand-edited row, and the
-        // shape of one a NEWER build would write.
-        let future = br#"{"schema_version":2,"version":"v9","card":"FUTURE-CARD-CONTENT"}"#;
+        // shape of one a NEWER build would write (one past
+        // `RATE_CARD_SCHEMA_VERSION`, which is 2).
+        let future = br#"{"schema_version":3,"version":"v9","card":"FUTURE-CARD-CONTENT"}"#;
         {
             let txn = store.db.begin_write().unwrap();
             {

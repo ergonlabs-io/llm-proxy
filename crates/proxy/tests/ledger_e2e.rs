@@ -26,6 +26,9 @@ const ADMIN_TOKEN: &str = "ledger-e2e-admin-token";
 /// The mock's usage (6 input, 4 output tokens) at the prices in
 /// `billing_config`: 6 * 1000 + 4 * 2000 nanodollars, 14 micro-USD.
 const CHARGE_MICRO_USD: u64 = 14;
+/// The per-image price for `gpt-image-1` at 1024x1024 in `billing_config`.
+/// An example value, not a provider's rate.
+const IMAGE_NANODOLLARS: u64 = 40_000_000;
 
 #[test]
 fn served_requests_are_committed_and_a_restart_opens_a_later_epoch() {
@@ -156,6 +159,66 @@ fn spend_and_ledger_counters_agree_and_entries_are_pulled_and_acknowledged() {
     assert_eq!(after["entries"].as_array().unwrap().len(), 0, "{after}");
 }
 
+/// ADR-0010 phase 2: an image generation under a tenant spend budget is
+/// admitted, charged at the dialled provider's per-image price for the
+/// images the response returned, and its ledger entry carries that charge
+/// and the images it bought.
+#[test]
+fn an_image_generation_under_a_tenant_budget_is_charged_and_ledgered() {
+    let dir = TempLedgerDir::new();
+    let ledger = dir.config(1024, OnUnavailable::Reject);
+    let config = billing_config(&ledger, mock_upstream(), "reject", 1024);
+    let proxy = Proxy::start(dir.root.path(), &config, Some(NODE));
+    let key = proxy.mint_key();
+    let budget = http(
+        proxy.admin(),
+        "PUT",
+        "/tenants/t1/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"100","period":"daily"}}"#,
+    );
+    assert!(budget.starts_with("HTTP/1.1 204"), "{budget}");
+
+    let response = http(
+        proxy.listen,
+        "POST",
+        "/v1/images/generations",
+        Some(&key),
+        r#"{"model":"gpt-image-1","prompt":"a cat","n":2,"size":"1024x1024"}"#,
+    );
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let charge = 2 * IMAGE_NANODOLLARS / 1000;
+    let scrape =
+        proxy.scrape_until(|s| counter(s, "envoy_llmproxy_ledger_entries_committed_total") == 1);
+    assert_eq!(
+        counter(&scrape, "envoy_llmproxy_spend_charged_micro_usd_total"),
+        charge
+    );
+    let page = proxy.admin_json("GET", "/ledger/entries");
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{page}");
+    let entry = &entries[0];
+    assert_eq!(entry["charged_micro_usd"], charge, "{entry}");
+    assert!(
+        entry["charged_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|scope| scope["scope"] == "tenant"),
+        "the tenant budget was charged: {entry}"
+    );
+    let text = entry.to_string();
+    for needle in [
+        r#""images":2"#,
+        r#""image_size":"1024x1024""#,
+        r#""endpoint":"image_generation""#,
+        r#""price_basis":"images""#,
+    ] {
+        assert!(text.contains(needle), "no {needle} in {entry}");
+    }
+}
+
 /// Under `admit`, a request with no slot is served unledgered. Its charge is
 /// in the spend counter and not in the ledger, so the two counters differ by
 /// exactly the charges of the unledgered requests.
@@ -234,6 +297,11 @@ pricing:
             cached_input_nanodollars_per_token: 1000
             cache_write_nanodollars_per_token: 1000
             output_nanodollars_per_token: 2000
+      - provider_type: openai
+        model: gpt-image-1
+        basis: images
+        image_prices:
+          - {{ size: "1024x1024", nanodollars_per_image: {IMAGE_NANODOLLARS} }}
 ledger:
   directory: {directory}
   encryption_key_file: {key}
@@ -561,7 +629,13 @@ fn mock_upstream_with_delay(delay: Duration) -> SocketAddr {
                     }
                 }
                 std::thread::sleep(delay);
-                let body = r#"{"id":"x","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}"#;
+                let image = r#"{"created":1,"data":[{"b64_json":"QUJD"},{"b64_json":"REVG"}]}"#;
+                let chat = r#"{"id":"x","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}"#;
+                let body = if head.starts_with("post /v1/images/generations") {
+                    image
+                } else {
+                    chat
+                };
                 let _ = stream.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\

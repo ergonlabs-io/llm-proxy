@@ -23,6 +23,41 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- Image generation is metered under a spend budget (ADR-0010 phase 2, WP-124).
+  `POST .../images/generations` is no longer refused with
+  `endpoint_not_metered` under a tenant or key budget; it is charged at the
+  rate card of the provider that served it. A token limit still refuses it.
+  - A rate-card entry has a `basis`: `tokens` (the default, the behaviour
+    before) or `images`. An `images` entry prices the images the response
+    returned with `image_prices` rows (`size`, `quality`,
+    `nanodollars_per_image`); the most specific matching row wins, and two
+    rows that can match the same request at the same specificity are a load
+    error.
+  - A tier can set `image_input_nanodollars_per_token`,
+    `image_output_nanodollars_per_token`, `audio_input_nanodollars_per_token`
+    and `audio_output_nanodollars_per_token`, on every tier of an entry or on
+    none. Image and audio tokens are then charged at their own rate. Without
+    one they are charged at the text rate, as before, and counted in the new
+    `llmproxy_usage_underpriced_modality_requests_total`; under a budget the
+    spend filter also warns once per model.
+  - Image responses are read by a bounded structural scanner, so a
+    multi-megabyte base64 body is counted without being held. A cut image
+    response is charged the images that closed and the tokens reported, never
+    an estimate from its byte count. An image whose card has no matching row
+    is unpriced: charged $0 and warned about, like an unpriced model.
+  - Request records and ledger entries carry `endpoint`, `price_basis`, the
+    image and audio token subsets, `images`, `image_size` and
+    `image_quality` (optional fields; schema versions stay 1). New access-log
+    operators `%LLM_IMAGES%`, `%LLM_INPUT_CHARACTERS%`, `%LLM_AUDIO_MS%`,
+    `%LLM_INPUT_IMAGE_TOKENS%`, `%LLM_OUTPUT_IMAGE_TOKENS%`,
+    `%LLM_INPUT_AUDIO_TOKENS%`, `%LLM_OUTPUT_AUDIO_TOKENS%` and
+    `%LLM_PRICE_BASIS%`, with matching `llm_*` keys in the `--config` JSON
+    access log.
+  - Upgrade note: a card that uses `basis`, `image_prices` or a modality rate
+    is stored at rate-card schema version 2, which an older replica ignores
+    (it keeps its last card). Upgrade every replica before publishing such a
+    card with `PUT /pricing`. A card that uses none of them keeps its version
+    and its charges.
 - The OpenTelemetry GenAI client metrics `gen_ai.client.token.usage`
   (histogram, `{token}`, labelled by `gen_ai.token.type`) and
   `gen_ai.client.operation.duration` (histogram, seconds), for successful LLM

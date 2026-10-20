@@ -58,6 +58,7 @@ becomes `envoy_llm_client_token_usage`.
 | `llmproxy_provider_credential_requests_total` | counter | `cluster`, `outcome` | Requests refused with `503 provider token unavailable` because the provider's minted OAuth2 token was missing or expired: `outcome="unavailable"`. | Not shown |
 | `llmproxy_usage_partial_total` | counter | `scope` | Streams that ended before the provider's final usage (client abort, upstream death). Each is recorded with `completeness: partial` and metered from an estimate. `scope` is the listener `stat_prefix`. Prometheus only. | Not shown |
 | `llmproxy_usage_estimated_total` | counter | `scope` | Partial records whose token counts, and so cost, include an estimate. Prometheus only. | Not shown |
+| `llmproxy_usage_underpriced_modality_requests_total` | counter | `scope` | Priced requests whose image or audio tokens had no modality rate on their rate-card entry, so they were charged at the text rate. Prometheus only. | Not shown |
 | `llmproxy_usage_upstream_usage_oversized_total` | counter | `scope` | Responses whose `usage` object was over 4096 bytes, so the record carries no `upstream_usage`. Prometheus only. | Not shown |
 | `llmproxy_usage_upstream_id_oversized_total` | counter | `scope` | Responses whose provider response id was over 256 bytes, so the record carries no `upstream_response_id`. Prometheus only. | Not shown |
 

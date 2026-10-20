@@ -18,6 +18,11 @@ pub struct BodyFacts {
     /// The `model` field's string value, if a `model` key with a string
     /// value was seen inside the window.
     pub model: Option<String>,
+    /// The `size` and `quality` fields' string values, read the same way as
+    /// `model`. They select an image price row when the response does not
+    /// echo them (ADR-0010 decision 2).
+    pub size: Option<String>,
+    pub quality: Option<String>,
     /// The `stream` field's boolean value, if a `stream` key with a literal
     /// `true`/`false` value was seen inside the window.
     pub stream: Option<bool>,
@@ -70,6 +75,8 @@ pub enum ScanState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyKind {
     Model,
+    Size,
+    Quality,
     Stream,
     StreamOptions,
     Other,
@@ -78,6 +85,8 @@ enum KeyKind {
 fn classify_key(key: &[u8]) -> KeyKind {
     match key {
         b"model" => KeyKind::Model,
+        b"size" => KeyKind::Size,
+        b"quality" => KeyKind::Quality,
         b"stream" => KeyKind::Stream,
         b"stream_options" => KeyKind::StreamOptions,
         _ => KeyKind::Other,
@@ -115,9 +124,10 @@ enum State {
     AfterKey,
     /// Just consumed `:`; expecting the value's first byte.
     BeforeValue,
-    /// Inside the `model` key's string value (content is retained via a
-    /// byte-range into the held prefix, not a separate buffer).
-    InModelString,
+    /// Inside a captured key's string value (`model`, `size` or `quality`;
+    /// content is retained via a byte-range into the held prefix, not a
+    /// separate buffer).
+    InCapturedString,
     /// Inside some other key's string value (not retained).
     InSkipString,
     /// Inside a bare literal value (`true`/`false`/`null`/a number).
@@ -156,9 +166,11 @@ pub struct BodyPrefixScanner {
     /// field suffices.
     str_escaped: bool,
 
-    // `model` value.
-    model_start: usize,
+    // Captured string values: `model`, `size`, `quality`.
+    capture_start: usize,
     model_range: Option<(usize, usize)>,
+    size_range: Option<(usize, usize)>,
+    quality_range: Option<(usize, usize)>,
 
     // `stream` value.
     literal_start: usize,
@@ -187,8 +199,10 @@ impl BodyPrefixScanner {
             key_start: 0,
             current_key: KeyKind::Other,
             str_escaped: false,
-            model_start: 0,
+            capture_start: 0,
             model_range: None,
+            size_range: None,
+            quality_range: None,
             literal_start: 0,
             literal_capturing: false,
             stream_literal_range: None,
@@ -241,9 +255,12 @@ impl BodyPrefixScanner {
             self.decide(ScanOutcome::NotJson);
         }
         let outcome = self.outcome.expect("decide() always sets outcome");
-        let model = self
-            .model_range
-            .and_then(|(start, end)| decode_json_string(&self.held[start..end]));
+        let decode = |range: Option<(usize, usize)>| {
+            range.and_then(|(start, end)| decode_json_string(&self.held[start..end]))
+        };
+        let model = decode(self.model_range);
+        let size = decode(self.size_range);
+        let quality = decode(self.quality_range);
         let stream =
             self.stream_literal_range
                 .and_then(|(start, end)| match &self.held[start..end] {
@@ -253,6 +270,8 @@ impl BodyPrefixScanner {
                 });
         BodyFacts {
             model,
+            size,
+            quality,
             stream,
             saw_stream_options: self.saw_stream_options,
             splice_at: self.splice_at,
@@ -264,6 +283,16 @@ impl BodyPrefixScanner {
     /// of the body has been pushed.
     pub fn held(&self) -> &[u8] {
         &self.held
+    }
+
+    /// Where the current key's string value is recorded, if it is captured.
+    fn captured_range(&mut self) -> Option<&mut Option<(usize, usize)>> {
+        match self.current_key {
+            KeyKind::Model => Some(&mut self.model_range),
+            KeyKind::Size => Some(&mut self.size_range),
+            KeyKind::Quality => Some(&mut self.quality_range),
+            KeyKind::Stream | KeyKind::StreamOptions | KeyKind::Other => None,
+        }
     }
 
     fn decide(&mut self, outcome: ScanOutcome) {
@@ -356,17 +385,19 @@ impl BodyPrefixScanner {
                     if is_json_ws(byte) {
                         return None;
                     }
-                    if self.current_key == KeyKind::Model && byte != b'"' {
-                        // A non-string `model` replaces an earlier string one
-                        // under last-key-wins, so no model is known.
-                        self.model_range = None;
+                    if byte != b'"' {
+                        // A non-string value replaces an earlier string one
+                        // under last-key-wins, so that fact is not known.
+                        if let Some(range) = self.captured_range() {
+                            *range = None;
+                        }
                     }
                     match byte {
                         b'"' => {
                             self.str_escaped = false;
-                            if self.current_key == KeyKind::Model {
-                                self.model_start = idx + 1;
-                                self.state = State::InModelString;
+                            if self.captured_range().is_some() {
+                                self.capture_start = idx + 1;
+                                self.state = State::InCapturedString;
                             } else {
                                 self.state = State::InSkipString;
                             }
@@ -388,7 +419,7 @@ impl BodyPrefixScanner {
                         _ => return Some(ScanOutcome::NotJson),
                     }
                 }
-                State::InModelString => {
+                State::InCapturedString => {
                     if self.str_escaped {
                         self.str_escaped = false;
                         return None;
@@ -398,7 +429,10 @@ impl BodyPrefixScanner {
                         return None;
                     }
                     if byte == b'"' {
-                        self.model_range = Some((self.model_start, idx));
+                        let range = Some((self.capture_start, idx));
+                        if let Some(slot) = self.captured_range() {
+                            *slot = range;
+                        }
                         self.state = State::AfterValue;
                         return None;
                     }
@@ -559,6 +593,23 @@ mod tests {
             Some(1),
             "splice goes right after the opening brace"
         );
+    }
+
+    #[test]
+    fn image_size_and_quality_are_read_like_model() {
+        let body =
+            br#"{"model":"gpt-image-1","prompt":"a {cat}","size":"1024x1024","quality":"high"}"#;
+        let facts = scan(body, DEFAULT_PREFIX_CAP);
+        assert_eq!(facts.size.as_deref(), Some("1024x1024"));
+        assert_eq!(facts.quality.as_deref(), Some("high"));
+        // Last key wins; a non-string value clears the fact; nested keys are
+        // not top-level facts.
+        let facts = scan(
+            br#"{"size":"256x256","size":512,"quality":"\u0068igh","extra":{"quality":"low"}}"#,
+            DEFAULT_PREFIX_CAP,
+        );
+        assert_eq!(facts.size, None);
+        assert_eq!(facts.quality.as_deref(), Some("high"));
     }
 
     #[test]
@@ -812,6 +863,8 @@ mod tests {
                 for &saw_stream_options in &saw_stream_options_values {
                     let facts = BodyFacts {
                         model: None,
+                        size: None,
+                        quality: None,
                         stream,
                         saw_stream_options,
                         splice_at: Some(1),

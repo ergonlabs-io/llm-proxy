@@ -107,3 +107,10 @@ path = "fuzz_targets/router_body.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "media_scan"
+path = "fuzz_targets/media_scan.rs"
+test = false
+doc = false
+bench = false

@@ -42,6 +42,7 @@ pub mod guardrail_filter;
 pub mod jwks_refresh;
 pub mod jwt_auth;
 pub mod local_ratelimit;
+pub mod media_scan;
 pub mod model_authz_filter;
 pub mod model_resolver_filter;
 pub mod object_ownership;

@@ -22,19 +22,25 @@ use proxy_http::filter::{
     RequestHeaders, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::GenAiSystem;
-use proxy_http::{LlmListCost, LlmTokenUsage, LlmUsage};
+use proxy_http::{LlmListCost, LlmTokenUsage, LlmUsage, PriceBasis};
 use proxy_observability::records::UsageCompleteness;
 use proxy_observability::stats::{instruments, Handle, Instrument, Registry, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use crate::auth_filter;
-use crate::control::{ControlPlane, RateCardDelivery, StoredRateCard};
-use crate::pricing::{PriceEntry, PriceList, Tier, TierBasis, TierMode};
+use crate::control::{
+    ControlPlane, RateCardDelivery, StoredRateCard, RATE_CARD_SCHEMA_V1, RATE_CARD_SCHEMA_V2,
+};
+use crate::media_scan::{MediaJsonScanner, MediaSseScanner};
+use crate::pricing::{
+    image_prices_conflict, ImagePrice, PriceEntry, PriceList, Priced, Tier, TierBasis, TierMode,
+};
 use crate::usage::{
     extract_json_served_model, extract_json_upstream, extract_json_upstream_from_tail,
-    extract_json_usage, extract_json_usage_from_tail, Dialect, SseUsageScanner, TokenUsage,
-    UpstreamEvidence,
+    extract_json_usage_parts, extract_json_usage_parts_from_tail, usage_object_parts, Dialect,
+    Modality, SseUsageScanner, TokenUsage, UpstreamEvidence,
 };
+use proxy_http::LlmMeters;
 
 /// Canonical type URL for the owned usage configuration.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Usage";
@@ -199,7 +205,7 @@ impl PricingRegistry {
         &self,
         cluster: Option<&str>,
         model: Option<&str>,
-        usage: &TokenUsage,
+        usage: &LlmUsage,
     ) -> Option<u64> {
         let pricing = self.snapshot()?;
         Self::cost_micro_usd_for(Some(&pricing), cluster, model, usage)
@@ -209,7 +215,7 @@ impl PricingRegistry {
         pricing: Option<&PricingContext>,
         cluster: Option<&str>,
         model: Option<&str>,
-        usage: &TokenUsage,
+        usage: &LlmUsage,
     ) -> Option<u64> {
         pricing?
             .list
@@ -224,27 +230,22 @@ impl PricingRegistry {
         nanodollars.saturating_add(999) / 1000
     }
 
-    /// As [`Self::cost_micro_usd_for`], priced at the provider-reported model
-    /// when the card lists it (see `PriceList::model_to_price`). The spend
-    /// filter charges through this so its charge matches the usage filter's
-    /// logged cost.
-    pub(crate) fn cost_micro_usd_served(
+    /// Price `usage` at the provider-reported model when the card lists it
+    /// (see `PriceList::model_to_price`). The spend filter charges through
+    /// this so its charge matches the usage filter's logged cost.
+    pub(crate) fn price_served(
         pricing: Option<&PricingContext>,
         cluster: Option<&str>,
         sent_model: Option<&str>,
         served_model: Option<&str>,
-        usage: &TokenUsage,
-    ) -> Option<u64> {
-        let model = match (pricing, cluster, sent_model) {
-            (Some(pricing), Some(cluster), Some(sent)) => Some(
-                pricing
-                    .list
-                    .model_to_price(cluster, sent, served_model, usage)
-                    .0,
-            ),
-            _ => sent_model,
-        };
-        Self::cost_micro_usd_for(pricing, cluster, model, usage)
+        usage: &LlmUsage,
+    ) -> Option<Priced> {
+        let (pricing, cluster, sent) = (pricing?, cluster?, sent_model?);
+        let model = pricing
+            .list
+            .model_to_price(cluster, sent, served_model, usage)
+            .0;
+        pricing.list.price_for_cluster(cluster, model, usage)
     }
 
     /// Why a request the rate card could not price was left unpriced, in words
@@ -253,6 +254,7 @@ impl PricingRegistry {
         pricing: Option<&PricingContext>,
         cluster: Option<&str>,
         model: Option<&str>,
+        usage: &LlmUsage,
     ) -> String {
         let Some(pricing) = pricing else {
             return "no rate card is installed on this chain".to_string();
@@ -266,12 +268,29 @@ impl PricingRegistry {
         let Some(provider) = pricing.list.provider_for(cluster) else {
             return format!("the rate card's providers map does not name cluster `{cluster}`");
         };
-        if pricing.list.lookup(provider, model).is_none() {
+        let Some(entry) = pricing.list.lookup(provider, model) else {
             return format!(
                 "the rate card has no entry for provider type `{provider}` and this model"
             );
+        };
+        match entry.basis {
+            PriceBasis::Tokens if usage.tokens.is_none() => {
+                "the rate card prices this model by token, and the response reported no token \
+                 usage"
+                    .to_string()
+            }
+            PriceBasis::Tokens => {
+                "the rate card cannot price the cache tokens this request reported".to_string()
+            }
+            PriceBasis::Images if usage.meters.images.is_none() => {
+                "the rate card prices this model by image, and the response returned no images"
+                    .to_string()
+            }
+            // The attribute values come from the provider or the client, so
+            // they are not logged; the operator can read them in the record.
+            _ => "the rate card has no image_prices row matching this request's size and quality"
+                .to_string(),
         }
-        "the rate card cannot price the cache tokens this request reported".to_string()
     }
 
     fn install(&self, card: PricingContext) {
@@ -420,11 +439,7 @@ impl PricingRegistry {
                 let Some(configured) = configured else {
                     return Ok(());
                 };
-                let row = StoredRateCard {
-                    chain: self.chain.clone(),
-                    version: configured.list.version().to_string(),
-                    card_json: configured.to_wire_json(),
-                };
+                let row = configured.stored_row(&self.chain);
                 store
                     .seed_rate_card(&row)
                     .map_err(|error| ConfigError::InvalidValue {
@@ -579,11 +594,7 @@ impl PricingRegistry {
         let has_store = store.is_some();
         let (persisted, note) = match store {
             Some(store) => {
-                let row = StoredRateCard {
-                    chain: self.chain.clone(),
-                    version: version.clone(),
-                    card_json: card.to_wire_json(),
-                };
+                let row = card.stored_row(&self.chain);
                 store
                     .put_rate_card(&row)
                     .map_err(|e| PublishError::Store(e.to_string()))?;
@@ -769,6 +780,10 @@ pub struct UsageStats {
     partial: ExportedCounter,
     /// Partial records whose token counts include an estimate.
     estimated: ExportedCounter,
+    /// Priced requests whose image or audio tokens had no modality rate on
+    /// their entry, so they were charged at the text rate (ADR-0010
+    /// decision 3).
+    underpriced_modality: ExportedCounter,
 }
 
 /// One Prometheus-exported counter that also keeps an in-process total, so
@@ -857,6 +872,11 @@ impl UsageStats {
                 &instruments::USAGE_ESTIMATED,
                 scope,
             ),
+            underpriced_modality: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_UNDERPRICED_MODALITY,
+                scope,
+            ),
             exported,
             repriced_handle,
             ..Default::default()
@@ -877,6 +897,10 @@ impl UsageStats {
 
     pub fn estimated(&self) -> u64 {
         self.estimated.get()
+    }
+
+    pub fn underpriced_modality(&self) -> u64 {
+        self.underpriced_modality.get()
     }
 
     pub fn upstream_id_oversized(&self) -> u64 {
@@ -926,6 +950,17 @@ impl UsageStats {
              this warning repeats at most once per minute."
         );
     }
+}
+
+/// The provider's `usage` object as sent, from a media scanner's capture.
+/// Media responses carry no response id.
+fn media_upstream(usage: Option<&str>, oversized: bool) -> UpstreamEvidence {
+    let mut evidence = UpstreamEvidence::default();
+    if let Some(usage) = usage {
+        evidence.set_usage(usage);
+    }
+    evidence.usage_oversized |= oversized;
+    evidence
 }
 
 /// Convert a [`TokenUsage`] into the [`LlmTokenUsage`] that `StreamInfo`
@@ -1050,8 +1085,27 @@ struct PriceEntryWire {
     cache_write_unpriced: bool,
     provider_type: String,
     model: String,
-    tier_mode: String,
-    tiers: Vec<TierWire>,
+    /// `tokens` (the default) or `images` (ADR-0010 decision 3).
+    #[serde(default)]
+    basis: Option<String>,
+    /// Required for `tokens`, refused for `images`.
+    #[serde(default)]
+    tier_mode: Option<String>,
+    #[serde(default)]
+    tiers: Option<Vec<TierWire>>,
+    /// Required for `images`, refused for `tokens`.
+    #[serde(default)]
+    image_prices: Option<Vec<ImagePriceWire>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImagePriceWire {
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    quality: Option<String>,
+    nanodollars_per_image: u64,
 }
 
 #[derive(Deserialize)]
@@ -1063,6 +1117,14 @@ struct TierWire {
     cached_input_nanodollars_per_token: u64,
     cache_write_nanodollars_per_token: u64,
     output_nanodollars_per_token: u64,
+    #[serde(default)]
+    image_input_nanodollars_per_token: Option<u64>,
+    #[serde(default)]
+    image_output_nanodollars_per_token: Option<u64>,
+    #[serde(default)]
+    audio_input_nanodollars_per_token: Option<u64>,
+    #[serde(default)]
+    audio_output_nanodollars_per_token: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1094,6 +1156,21 @@ impl PricingContext {
     /// keeping the caller's text, means every source (configuration, a `PUT`,
     /// the legacy carrier) stores the same compact shape, and anything stored
     /// parses back to this exact card.
+    /// The store row for this card. A card that uses an ADR-0010 field is
+    /// written at schema version 2, which an older replica skips.
+    fn stored_row(&self, chain: &str) -> StoredRateCard {
+        StoredRateCard {
+            chain: chain.to_string(),
+            version: self.list.version().to_string(),
+            card_json: self.to_wire_json(),
+            schema_version: if self.list.uses_media_fields() {
+                RATE_CARD_SCHEMA_V2
+            } else {
+                RATE_CARD_SCHEMA_V1
+            },
+        }
+    }
+
     fn to_wire_json(&self) -> String {
         let view = PricingJsonView::from(self.clone());
         serde_json::json!({
@@ -1130,14 +1207,23 @@ struct PriceListJsonView {
     entries: Vec<PriceEntryJsonView>,
 }
 
+/// The ADR-0010 fields are left out while they hold their defaults, so a card
+/// that uses none renders, stores and reads back exactly as before, and an
+/// older replica can still parse it.
 #[derive(Serialize)]
 struct PriceEntryJsonView {
     cached_input_unpriced: bool,
     cache_write_unpriced: bool,
     provider_type: String,
     model: String,
-    tier_mode: &'static str,
-    tiers: Vec<TierJsonView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    basis: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier_mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tiers: Option<Vec<TierJsonView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_prices: Option<Vec<ImagePriceJsonView>>,
 }
 
 #[derive(Serialize)]
@@ -1147,6 +1233,23 @@ struct TierJsonView {
     cached_input_nanodollars_per_token: u64,
     cache_write_nanodollars_per_token: u64,
     output_nanodollars_per_token: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_input_nanodollars_per_token: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_output_nanodollars_per_token: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_input_nanodollars_per_token: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_output_nanodollars_per_token: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ImagePriceJsonView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<String>,
+    nanodollars_per_image: u64,
 }
 
 impl From<PricingContext> for PricingJsonView {
@@ -1157,26 +1260,53 @@ impl From<PricingContext> for PricingJsonView {
             .list
             .entries()
             .iter()
-            .map(|entry| PriceEntryJsonView {
-                cached_input_unpriced: entry.cached_input_unpriced,
-                cache_write_unpriced: entry.cache_write_unpriced,
-                provider_type: entry.provider_type.clone(),
-                model: entry.model.clone(),
-                tier_mode: match entry.tier_mode {
-                    TierMode::WholeRequest => "whole_request",
-                    TierMode::Graduated => "graduated",
-                },
-                tiers: entry
-                    .tiers
-                    .iter()
-                    .map(|tier| TierJsonView {
-                        up_to: tier.up_to,
-                        input_nanodollars_per_token: tier.input_nanodollars_per_token,
-                        cached_input_nanodollars_per_token: tier.cached_input_nanodollars_per_token,
-                        cache_write_nanodollars_per_token: tier.cache_write_nanodollars_per_token,
-                        output_nanodollars_per_token: tier.output_nanodollars_per_token,
-                    })
-                    .collect(),
+            .map(|entry| {
+                let tokens = entry.basis == PriceBasis::Tokens;
+                PriceEntryJsonView {
+                    cached_input_unpriced: entry.cached_input_unpriced,
+                    cache_write_unpriced: entry.cache_write_unpriced,
+                    provider_type: entry.provider_type.clone(),
+                    model: entry.model.clone(),
+                    basis: (!tokens).then(|| entry.basis.as_str()),
+                    tier_mode: tokens.then_some(match entry.tier_mode {
+                        TierMode::WholeRequest => "whole_request",
+                        TierMode::Graduated => "graduated",
+                    }),
+                    tiers: tokens.then(|| {
+                        entry
+                            .tiers
+                            .iter()
+                            .map(|tier| TierJsonView {
+                                up_to: tier.up_to,
+                                input_nanodollars_per_token: tier.input_nanodollars_per_token,
+                                cached_input_nanodollars_per_token: tier
+                                    .cached_input_nanodollars_per_token,
+                                cache_write_nanodollars_per_token: tier
+                                    .cache_write_nanodollars_per_token,
+                                output_nanodollars_per_token: tier.output_nanodollars_per_token,
+                                image_input_nanodollars_per_token: tier
+                                    .image_input_nanodollars_per_token,
+                                image_output_nanodollars_per_token: tier
+                                    .image_output_nanodollars_per_token,
+                                audio_input_nanodollars_per_token: tier
+                                    .audio_input_nanodollars_per_token,
+                                audio_output_nanodollars_per_token: tier
+                                    .audio_output_nanodollars_per_token,
+                            })
+                            .collect()
+                    }),
+                    image_prices: (!tokens).then(|| {
+                        entry
+                            .image_prices
+                            .iter()
+                            .map(|row| ImagePriceJsonView {
+                                size: row.size.clone(),
+                                quality: row.quality.clone(),
+                                nanodollars_per_image: row.nanodollars_per_image,
+                            })
+                            .collect()
+                    }),
+                }
             })
             .collect();
         Self {
@@ -1211,63 +1341,7 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
         .into();
     let mut entries = Vec::with_capacity(wire.price_list.entries.len());
     for (entry_index, entry) in wire.price_list.entries.into_iter().enumerate() {
-        if entry.provider_type.is_empty() || entry.model.is_empty() || entry.tiers.is_empty() {
-            return Err(invalid_config(format!(
-                "price_list.entries[{entry_index}] requires provider_type, model, and tiers"
-            )));
-        }
-        let tier_mode = match entry.tier_mode.as_str() {
-            "whole_request" => TierMode::WholeRequest,
-            "graduated" => TierMode::Graduated,
-            other => {
-                return Err(invalid_config(format!(
-                    "price_list.entries[{entry_index}].tier_mode must be whole_request or graduated, got `{other}`"
-                )));
-            }
-        };
-        let mut previous = None;
-        for (tier_index, tier) in entry.tiers.iter().enumerate() {
-            if tier.up_to.is_none() && tier_index + 1 != entry.tiers.len() {
-                return Err(invalid_config(format!(
-                    "price_list.entries[{entry_index}].tiers[{tier_index}] open-ended tier must be last"
-                )));
-            }
-            if tier
-                .up_to
-                .is_some_and(|up_to| previous.is_some_and(|p| up_to <= p))
-            {
-                return Err(invalid_config(format!(
-                    "price_list.entries[{entry_index}].tiers[{tier_index}].up_to must strictly increase"
-                )));
-            }
-            if tier.up_to.is_some() {
-                previous = tier.up_to;
-            }
-        }
-        if entry.tiers.last().is_some_and(|tier| tier.up_to.is_some()) {
-            return Err(invalid_config(format!(
-                "price_list.entries[{entry_index}].tiers requires a final open-ended tier"
-            )));
-        }
-        entries.push(PriceEntry {
-            cached_input_unpriced: entry.cached_input_unpriced,
-            cache_write_unpriced: entry.cache_write_unpriced,
-            provider_type: entry.provider_type,
-            model: entry.model,
-            tier_basis: TierBasis::InputTokens,
-            tier_mode,
-            tiers: entry
-                .tiers
-                .into_iter()
-                .map(|tier| Tier {
-                    up_to: tier.up_to,
-                    input_nanodollars_per_token: tier.input_nanodollars_per_token,
-                    cached_input_nanodollars_per_token: tier.cached_input_nanodollars_per_token,
-                    cache_write_nanodollars_per_token: tier.cache_write_nanodollars_per_token,
-                    output_nanodollars_per_token: tier.output_nanodollars_per_token,
-                })
-                .collect(),
-        });
+        entries.push(parse_entry(entry_index, entry)?);
     }
     Ok(PricingContext {
         list: Arc::new(PriceList::new(
@@ -1277,6 +1351,182 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
             wire.providers.into_iter().collect(),
         )),
         catalog: wire.catalog.map(Arc::new),
+    })
+}
+
+/// Parse one price entry. An entry prices only the meters of its basis, so a
+/// field that belongs to the other basis is refused rather than ignored
+/// (AGENTS.md invariant 1).
+fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, ConfigError> {
+    let at = |field: &str| format!("price_list.entries[{entry_index}].{field}");
+    if entry.provider_type.is_empty() || entry.model.is_empty() {
+        return Err(invalid_config(format!(
+            "price_list.entries[{entry_index}] requires provider_type and model"
+        )));
+    }
+    let basis = match entry.basis.as_deref() {
+        None | Some("tokens") => PriceBasis::Tokens,
+        Some("images") => PriceBasis::Images,
+        Some(other) => {
+            return Err(invalid_config(format!(
+                "{} must be tokens or images, got `{other}`",
+                at("basis")
+            )));
+        }
+    };
+    if basis == PriceBasis::Images {
+        for (set, field) in [
+            (entry.tier_mode.is_some(), "tier_mode"),
+            (entry.tiers.is_some(), "tiers"),
+            (entry.cached_input_unpriced, "cached_input_unpriced"),
+            (entry.cache_write_unpriced, "cache_write_unpriced"),
+        ] {
+            if set {
+                return Err(invalid_config(format!(
+                    "{} does not apply to basis images",
+                    at(field)
+                )));
+            }
+        }
+        let rows: Vec<ImagePrice> = entry
+            .image_prices
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| ImagePrice {
+                size: row.size,
+                quality: row.quality,
+                nanodollars_per_image: row.nanodollars_per_image,
+            })
+            .collect();
+        if rows.is_empty() {
+            return Err(invalid_config(format!(
+                "{} requires at least one row for basis images",
+                at("image_prices")
+            )));
+        }
+        for (row_index, row) in rows.iter().enumerate() {
+            if row.size.as_deref() == Some("") || row.quality.as_deref() == Some("") {
+                return Err(invalid_config(format!(
+                    "{}[{row_index}] size and quality must not be empty",
+                    at("image_prices")
+                )));
+            }
+        }
+        if let Some((first, second)) = image_prices_conflict(&rows) {
+            return Err(invalid_config(format!(
+                "{}[{second}] can match the same request as image_prices[{first}] at the same \
+                 specificity, so the price would be ambiguous",
+                at("image_prices")
+            )));
+        }
+        return Ok(PriceEntry {
+            cached_input_unpriced: false,
+            cache_write_unpriced: false,
+            provider_type: entry.provider_type,
+            model: entry.model,
+            tier_basis: TierBasis::InputTokens,
+            // Unused for basis images; fixed so the version hash is stable.
+            tier_mode: TierMode::WholeRequest,
+            tiers: Vec::new(),
+            basis,
+            image_prices: rows,
+        });
+    }
+    if entry.image_prices.is_some() {
+        return Err(invalid_config(format!(
+            "{} applies only to basis images",
+            at("image_prices")
+        )));
+    }
+    let tiers = entry.tiers.unwrap_or_default();
+    if tiers.is_empty() {
+        return Err(invalid_config(format!(
+            "price_list.entries[{entry_index}] requires provider_type, model, and tiers"
+        )));
+    }
+    let tier_mode = match entry.tier_mode.as_deref() {
+        Some("whole_request") => TierMode::WholeRequest,
+        Some("graduated") => TierMode::Graduated,
+        other => {
+            return Err(invalid_config(format!(
+                "price_list.entries[{entry_index}].tier_mode must be whole_request or graduated, got `{}`",
+                other.unwrap_or_default()
+            )));
+        }
+    };
+    let mut previous = None;
+    for (tier_index, tier) in tiers.iter().enumerate() {
+        if tier.up_to.is_none() && tier_index + 1 != tiers.len() {
+            return Err(invalid_config(format!(
+                "price_list.entries[{entry_index}].tiers[{tier_index}] open-ended tier must be last"
+            )));
+        }
+        if tier
+            .up_to
+            .is_some_and(|up_to| previous.is_some_and(|p| up_to <= p))
+        {
+            return Err(invalid_config(format!(
+                "price_list.entries[{entry_index}].tiers[{tier_index}].up_to must strictly increase"
+            )));
+        }
+        if tier.up_to.is_some() {
+            previous = tier.up_to;
+        }
+    }
+    if tiers.last().is_some_and(|tier| tier.up_to.is_some()) {
+        return Err(invalid_config(format!(
+            "price_list.entries[{entry_index}].tiers requires a final open-ended tier"
+        )));
+    }
+    // A modality rate on some bands and not others would price the same
+    // token at a modality rate in one band and the text rate in the next.
+    type Field = fn(&TierWire) -> Option<u64>;
+    let modality: [(&str, Field); 4] = [
+        ("image_input_nanodollars_per_token", |t| {
+            t.image_input_nanodollars_per_token
+        }),
+        ("image_output_nanodollars_per_token", |t| {
+            t.image_output_nanodollars_per_token
+        }),
+        ("audio_input_nanodollars_per_token", |t| {
+            t.audio_input_nanodollars_per_token
+        }),
+        ("audio_output_nanodollars_per_token", |t| {
+            t.audio_output_nanodollars_per_token
+        }),
+    ];
+    for (name, field) in modality {
+        let set = field(&tiers[0]).is_some();
+        if let Some(tier_index) = tiers.iter().position(|t| field(t).is_some() != set) {
+            return Err(invalid_config(format!(
+                "price_list.entries[{entry_index}].tiers[{tier_index}].{name} must be set on \
+                 every tier of the entry or on none"
+            )));
+        }
+    }
+    Ok(PriceEntry {
+        cached_input_unpriced: entry.cached_input_unpriced,
+        cache_write_unpriced: entry.cache_write_unpriced,
+        provider_type: entry.provider_type,
+        model: entry.model,
+        tier_basis: TierBasis::InputTokens,
+        tier_mode,
+        tiers: tiers
+            .into_iter()
+            .map(|tier| Tier {
+                up_to: tier.up_to,
+                input_nanodollars_per_token: tier.input_nanodollars_per_token,
+                cached_input_nanodollars_per_token: tier.cached_input_nanodollars_per_token,
+                cache_write_nanodollars_per_token: tier.cache_write_nanodollars_per_token,
+                output_nanodollars_per_token: tier.output_nanodollars_per_token,
+                image_input_nanodollars_per_token: tier.image_input_nanodollars_per_token,
+                image_output_nanodollars_per_token: tier.image_output_nanodollars_per_token,
+                audio_input_nanodollars_per_token: tier.audio_input_nanodollars_per_token,
+                audio_output_nanodollars_per_token: tier.audio_output_nanodollars_per_token,
+            })
+            .collect(),
+        basis,
+        image_prices: Vec::new(),
     })
 }
 
@@ -1409,6 +1659,9 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
             dialect: self.dialect,
             pricing: self.registry.snapshot(),
             request_dialect: None,
+            endpoint: Endpoint::Unmetered,
+            request_size: None,
+            request_quality: None,
             stats: Arc::clone(&self.stats),
             mode: BodyMode::Inert,
             headers_at: None,
@@ -1433,6 +1686,12 @@ enum BodyMode {
     /// `application/json`: accumulate the body, up to [`MAX_JSON_BODY_BYTES`],
     /// then keep only the last [`JSON_TAIL_WINDOW_BYTES`].
     Json(JsonBody),
+    /// A media endpoint's JSON body (ADR-0010 decision 4): scanned
+    /// structurally, never held, because its base64 images overflow
+    /// [`MAX_JSON_BODY_BYTES`].
+    MediaJson(MediaJsonScanner),
+    /// A media endpoint's event stream, each `data:` line scanned the same way.
+    MediaSse(MediaSseScanner),
     /// Anything else (including "haven't seen headers yet"): do nothing.
     Inert,
 }
@@ -1480,6 +1739,13 @@ struct UsageFilterInstance {
     /// serving `/v1/messages` from an OpenAI-dialect cluster is still that
     /// cluster's provider.
     request_dialect: Option<Dialect>,
+    /// The request's endpoint class, from stream info at `decode_headers`.
+    endpoint: Endpoint,
+    /// The request body's `size` and `quality`, the fallback when the
+    /// response does not echo them. Read at `encode_headers`, after the
+    /// body-rewrite filter published them.
+    request_size: Option<String>,
+    request_quality: Option<String>,
     stats: Arc<UsageStats>,
     pricing: Option<PricingContext>,
     mode: BodyMode,
@@ -1511,7 +1777,7 @@ struct UsageFilterInstance {
 /// Pick a [`BodyMode`] from the response's `content-type`, matching only the
 /// media type (before any `;` parameters), ASCII-case-insensitively. Absent
 /// or unrecognized content types get [`BodyMode::Inert`] — we do not guess.
-fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
+fn classify_body(headers: &HeaderMap, dialect: Dialect, endpoint: Endpoint) -> BodyMode {
     let Some(value) = headers.get(http::header::CONTENT_TYPE) else {
         return BodyMode::Inert;
     };
@@ -1520,10 +1786,19 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
     };
     let media_type = value.split(';').next().unwrap_or("").trim();
 
+    let media = is_media(endpoint);
     if media_type.eq_ignore_ascii_case("text/event-stream") {
-        BodyMode::Sse(SseUsageScanner::new(dialect))
+        if media {
+            BodyMode::MediaSse(MediaSseScanner::new())
+        } else {
+            BodyMode::Sse(SseUsageScanner::new(dialect))
+        }
     } else if media_type.eq_ignore_ascii_case("application/json") {
-        BodyMode::Json(JsonBody::default())
+        if media {
+            BodyMode::MediaJson(MediaJsonScanner::new())
+        } else {
+            BodyMode::Json(JsonBody::default())
+        }
     } else {
         BodyMode::Inert
     }
@@ -1539,10 +1814,39 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect) -> BodyMode {
 /// look for `input_tokens` and meter nothing.
 fn dialect_for_request(endpoint: Endpoint) -> Option<Dialect> {
     match endpoint {
-        Endpoint::Responses => Some(Dialect::OpenAiResponses),
+        // The Images API reports usage in the Responses shape
+        // (`input_tokens`, `input_tokens_details.image_tokens`, ...).
+        Endpoint::Responses | Endpoint::ImageGeneration => Some(Dialect::OpenAiResponses),
         Endpoint::Messages => Some(Dialect::Anthropic),
         Endpoint::Embeddings => Some(Dialect::OpenAi),
         _ => None,
+    }
+}
+
+/// Endpoints whose bodies are base64 media or audio, not generated text. They
+/// are scanned structurally, and a cut response is never estimated from its
+/// byte count: that would charge hundreds of thousands of output tokens for
+/// one image (ADR-0010 decision 2, "Cut responses").
+fn is_media(endpoint: Endpoint) -> bool {
+    matches!(
+        endpoint,
+        Endpoint::ImageGeneration
+            | Endpoint::ImageEdit
+            | Endpoint::Speech
+            | Endpoint::Transcription
+            | Endpoint::Translation
+    )
+}
+
+/// A [`TokenUsage`] and its modality subsets as stream info's
+/// [`LlmTokenUsage`].
+fn llm_tokens(usage: TokenUsage, modality: Modality) -> LlmTokenUsage {
+    LlmTokenUsage {
+        input_image_tokens: modality.input_image_tokens,
+        output_image_tokens: modality.output_image_tokens,
+        input_audio_tokens: modality.input_audio_tokens,
+        output_audio_tokens: modality.output_audio_tokens,
+        ..llm_token_usage(usage)
     }
 }
 
@@ -1588,17 +1892,68 @@ impl UsageFilterInstance {
         }
     }
 
-    /// Compute the final usage (if any) for the current body mode, without
-    /// consuming `self.mode` — cheap enough (an `Option<TokenUsage>` and a
-    /// JSON parse of an already-bounded buffer) that borrowing is simplest.
-    fn compute_usage(&self) -> Option<TokenUsage> {
-        match &self.mode {
-            BodyMode::Sse(scanner) => scanner.usage(),
-            BodyMode::Json(body) if body.overflowed => {
-                extract_json_usage_from_tail(self.parse_dialect(), &body.buf)
+    /// Compute the usage (if any) observed so far for the current body mode,
+    /// without consuming `self.mode`: the token buckets with their modality
+    /// subsets, and the count meters. `None` when nothing was observed.
+    fn compute_usage(&self) -> Option<LlmUsage> {
+        let dialect = self.parse_dialect();
+        let parts = |raw: Option<&str>| raw.and_then(|raw| usage_object_parts(dialect, raw));
+        let (tokens, meters) = match &self.mode {
+            BodyMode::Sse(scanner) => (
+                scanner.usage().map(|u| (u, scanner.modality())),
+                LlmMeters::default(),
+            ),
+            BodyMode::Json(body) if body.overflowed => (
+                extract_json_usage_parts_from_tail(dialect, &body.buf),
+                LlmMeters::default(),
+            ),
+            BodyMode::Json(body) => (
+                extract_json_usage_parts(dialect, &body.buf),
+                LlmMeters::default(),
+            ),
+            BodyMode::MediaJson(scanner) => {
+                let facts = scanner.facts();
+                (
+                    parts(facts.usage.as_deref()),
+                    self.image_meters(facts.data_elements, &facts.size, &facts.quality),
+                )
             }
-            BodyMode::Json(body) => extract_json_usage(self.parse_dialect(), &body.buf),
-            BodyMode::Inert => None,
+            BodyMode::MediaSse(scanner) => {
+                let facts = scanner.facts();
+                (
+                    parts(facts.usage.as_deref()),
+                    self.image_meters(Some(facts.completed), &facts.size, &facts.quality),
+                )
+            }
+            BodyMode::Inert => (None, LlmMeters::default()),
+        };
+        let usage = LlmUsage {
+            tokens: tokens.map(|(usage, modality)| llm_tokens(usage, modality)),
+            meters,
+        };
+        (!usage.is_empty()).then_some(usage)
+    }
+
+    /// The `images` meter and its attributes. Only image generation counts
+    /// images in this phase; the attributes come from the response echo, then
+    /// from the request body (ADR-0010 decision 2).
+    fn image_meters(
+        &self,
+        images: Option<u64>,
+        size: &Option<String>,
+        quality: &Option<String>,
+    ) -> LlmMeters {
+        if self.endpoint != Endpoint::ImageGeneration {
+            return LlmMeters::default();
+        }
+        let Some(images) = images else {
+            return LlmMeters::default();
+        };
+        LlmMeters {
+            images: Some(images),
+            image_size: size.clone().or_else(|| self.request_size.clone()),
+            image_quality: quality.clone().or_else(|| self.request_quality.clone()),
+            ..LlmMeters::default()
         }
     }
 
@@ -1609,6 +1964,8 @@ impl UsageFilterInstance {
             BodyMode::Sse(scanner) => scanner.served_model(),
             BodyMode::Json(body) if body.overflowed => None,
             BodyMode::Json(body) => extract_json_served_model(&body.buf),
+            BodyMode::MediaJson(scanner) => scanner.facts().model.clone(),
+            BodyMode::MediaSse(scanner) => scanner.facts().model.clone(),
             BodyMode::Inert => None,
         }
     }
@@ -1620,6 +1977,14 @@ impl UsageFilterInstance {
             BodyMode::Sse(scanner) => scanner.upstream(),
             BodyMode::Json(body) if body.overflowed => extract_json_upstream_from_tail(&body.buf),
             BodyMode::Json(body) => extract_json_upstream(&body.buf),
+            BodyMode::MediaJson(scanner) => {
+                let facts = scanner.facts();
+                media_upstream(facts.usage.as_deref(), facts.usage_oversized)
+            }
+            BodyMode::MediaSse(scanner) => {
+                let facts = scanner.facts();
+                media_upstream(facts.usage.as_deref(), facts.usage_oversized)
+            }
             BodyMode::Inert => UpstreamEvidence::default(),
         }
     }
@@ -1644,16 +2009,31 @@ impl UsageFilterInstance {
     /// Estimate what a stream that ended before the provider's final usage
     /// consumed, from what was actually seen (see [`BYTES_PER_TOKEN_ESTIMATE`]).
     /// Provider figures that did arrive are kept as they are.
-    fn estimate_partial_usage(&self, request_bytes: u64) -> (Option<TokenUsage>, Estimated) {
+    ///
+    /// A media response is not estimated: it is charged the token figures
+    /// already reported and the images completed so far, or nothing.
+    fn estimate_partial_usage(&self, request_bytes: u64) -> (Option<LlmUsage>, Estimated) {
         let seen = self.compute_usage();
+        if is_media(self.endpoint) {
+            // A cut before any image closed observed nothing. Zero images is
+            // not a finding then, so the request stays without usage and the
+            // spend filter's missing-usage warning names it.
+            let seen = seen.and_then(|mut seen| {
+                if seen.meters.images == Some(0) {
+                    seen.meters.images = None;
+                }
+                (!seen.is_empty()).then_some(seen)
+            });
+            return (seen, Estimated::default());
+        }
         let streamed_bytes = match &self.mode {
             BodyMode::Sse(scanner) => scanner.streamed_text_bytes(),
             // A cut-off JSON body cannot be parsed, so its size stands in for
             // the generated text.
             BodyMode::Json(body) => body.seen,
-            BodyMode::Inert => 0,
+            BodyMode::MediaJson(_) | BodyMode::MediaSse(_) | BodyMode::Inert => 0,
         };
-        let mut usage = seen.unwrap_or_default();
+        let mut usage = seen.and_then(|seen| seen.tokens).unwrap_or_default();
         let mut estimated = Estimated::default();
         let input_seen = usage.input_tokens + usage.cached_tokens + usage.cache_creation_tokens > 0;
         if !input_seen {
@@ -1668,8 +2048,8 @@ impl UsageFilterInstance {
             usage.output_tokens = output_estimate;
             estimated.output = true;
         }
-        let nothing = usage == TokenUsage::default();
-        (if nothing { None } else { Some(usage) }, estimated)
+        let nothing = usage == LlmTokenUsage::default();
+        ((!nothing).then(|| LlmUsage::from_tokens(usage)), estimated)
     }
 
     /// Write usage, cost, timing and the provider's own evidence into
@@ -1677,7 +2057,7 @@ impl UsageFilterInstance {
     fn write_stats(
         &mut self,
         cb: &mut dyn EncoderCallbacks,
-        usage: Option<TokenUsage>,
+        usage: Option<LlmUsage>,
         completeness: UsageCompleteness,
         estimated: Estimated,
     ) {
@@ -1696,11 +2076,10 @@ impl UsageFilterInstance {
         // `None` must stay `None` here — never write `Some(0, 0)` for a
         // response that reported no usage at all (this number
         // feeds billing, and a wrong zero is worse than an honest "unknown").
-        stream_info.llm.usage = usage.map(|usage| LlmUsage::from_tokens(llm_token_usage(usage)));
         // The card is evaluated only after the terminal usage extractor has
         // seen the complete response. In particular, an SSE stream's partial
         // chunks cannot create a provisional price that later changes.
-        stream_info.llm.list_cost = usage.and_then(|usage| {
+        let priced = usage.as_ref().and_then(|usage| {
             let pricing = self.pricing.as_ref()?;
             let cluster = stream_info.upstream_cluster.as_deref()?;
             let provider_type = pricing.list.provider_for(cluster)?;
@@ -1713,20 +2092,28 @@ impl UsageFilterInstance {
             let (model, repriced) =
                 pricing
                     .list
-                    .model_to_price(cluster, sent_model, served_model.as_deref(), &usage);
-            let cost = pricing
-                .list
-                .list_cost_nanodollars(provider_type, model, &usage)
-                .map(|nanodollars| LlmListCost {
-                    nanodollars,
-                    micro_usd: PricingRegistry::charge_micro_usd(nanodollars),
-                    rate_card_version: pricing.list.version().as_str().to_string(),
-                });
-            if repriced && cost.is_some() {
+                    .model_to_price(cluster, sent_model, served_model.as_deref(), usage);
+            let priced = pricing.list.price(provider_type, model, usage)?;
+            if repriced {
                 self.stats.note_served_model_repriced();
             }
-            cost
+            if priced.underpriced_modality {
+                // Counted on every request; the spend filter warns where a
+                // budget applies.
+                self.stats.underpriced_modality.incr();
+            }
+            Some((
+                priced,
+                LlmListCost {
+                    nanodollars: priced.nanodollars,
+                    micro_usd: PricingRegistry::charge_micro_usd(priced.nanodollars),
+                    rate_card_version: pricing.list.version().as_str().to_string(),
+                },
+            ))
         });
+        stream_info.llm.price_basis = priced.as_ref().map(|(priced, _)| priced.basis);
+        stream_info.llm.list_cost = priced.map(|(_, cost)| cost);
+        stream_info.llm.usage = usage;
         stream_info.llm.served_model = served_model;
         stream_info.llm.completeness = Some(completeness);
         stream_info.llm.input_estimated = estimated.input;
@@ -1764,7 +2151,8 @@ impl HttpFilter for UsageFilterInstance {
         _headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
-        self.request_dialect = dialect_for_request(cb.stream_info().llm.endpoint);
+        self.endpoint = cb.stream_info().llm.endpoint;
+        self.request_dialect = dialect_for_request(self.endpoint);
         FilterHeadersStatus::Continue
     }
 
@@ -1787,7 +2175,12 @@ impl HttpFilter for UsageFilterInstance {
             .map(Self::resolve_cluster_dialect);
         let dialect = cluster_dialect.or(route_dialect).unwrap_or(self.dialect);
         self.dialect = dialect;
-        self.mode = classify_body(&headers.headers, self.parse_dialect());
+        self.mode = classify_body(&headers.headers, self.parse_dialect(), self.endpoint);
+        if self.endpoint == Endpoint::ImageGeneration {
+            let info = cb.stream_info();
+            self.request_size = info.request_facts.size.clone();
+            self.request_quality = info.request_facts.quality.clone();
+        }
 
         // A response with no body at all (e.g. a 204, or a HEAD reply) — there's
         // nothing more to observe, so finalize right here.
@@ -1824,6 +2217,8 @@ impl HttpFilter for UsageFilterInstance {
             // wrong (not just missing) token count, and this number feeds
             // billing. The tail is read only for a whole `usage` object.
             BodyMode::Json(body) => body.push(data),
+            BodyMode::MediaJson(scanner) => scanner.push(data),
+            BodyMode::MediaSse(scanner) => scanner.push(data),
             BodyMode::Inert => {}
         }
 
@@ -2038,6 +2433,9 @@ mod tests {
         UsageFilterInstance {
             dialect,
             request_dialect: None,
+            endpoint: Endpoint::Unmetered,
+            request_size: None,
+            request_quality: None,
             stats: Arc::new(UsageStats::default()),
             pricing: None,
             mode: BodyMode::Inert,
@@ -2077,7 +2475,13 @@ mod tests {
                         cached_input_nanodollars_per_token: 1,
                         cache_write_nanodollars_per_token: 20,
                         output_nanodollars_per_token: output,
+                        image_input_nanodollars_per_token: None,
+                        image_output_nanodollars_per_token: None,
+                        audio_input_nanodollars_per_token: None,
+                        audio_output_nanodollars_per_token: None,
                     }],
+                    basis: PriceBasis::Tokens,
+                    image_prices: Vec::new(),
                 })
                 .collect(),
             BTreeMap::from([("provider:openai".to_string(), "openai".to_string())]),
@@ -3423,6 +3827,434 @@ mod tests {
         assert_eq!(
             value["catalog"]["unsupported"]["model-x"],
             "non-integer nanodollar rate"
+        );
+    }
+
+    // --- ADR-0010 phase 2: image generation and modality rates -------------
+
+    /// A card in the wire shape, for the `openai` provider type on cluster
+    /// `provider:openai`.
+    fn card(entries: serde_json::Value) -> PricingContext {
+        parse_card_json(
+            &serde_json::json!({
+                "price_list": {"version": "media", "effective_from": "2026-01-01T00:00:00Z",
+                               "entries": entries},
+                "providers": {"provider:openai": "openai"},
+            })
+            .to_string(),
+        )
+        .expect("the card parses")
+    }
+
+    fn card_error(entries: serde_json::Value) -> String {
+        match parse_card_json(
+            &serde_json::json!({
+                "price_list": {"effective_from": "2026-01-01T00:00:00Z", "entries": entries},
+                "providers": {},
+            })
+            .to_string(),
+        ) {
+            Err(ConfigError::InvalidValue { reason, .. }) => reason,
+            other => panic!("expected a load error, got {other:?}"),
+        }
+    }
+
+    fn token_tier(input: u64, output: u64) -> serde_json::Value {
+        serde_json::json!({"input_nanodollars_per_token": input,
+            "cached_input_nanodollars_per_token": 0, "cache_write_nanodollars_per_token": 0,
+            "output_nanodollars_per_token": output})
+    }
+
+    /// Drive one request through the filter as the chain does: classified
+    /// endpoint, published request facts, a dialled OpenAI cluster.
+    fn drive(
+        pricing: PricingContext,
+        path: &str,
+        facts: (Option<&str>, Option<&str>),
+        content_type: &str,
+        chunks: Vec<Bytes>,
+        end: bool,
+    ) -> (proxy_http::LlmStats, Arc<UsageStats>) {
+        let mut filter = UsageFilterInstance {
+            pricing: Some(pricing),
+            ..filter_for(Dialect::OpenAi)
+        };
+        let stats = Arc::clone(&filter.stats);
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("img".into());
+            info.request_facts.size = facts.0.map(str::to_owned);
+            info.request_facts.quality = facts.1.map(str::to_owned);
+            info.bytes_received = 4000;
+        }
+        decode(
+            &mut filter,
+            &mut cb,
+            &mut request(Method::POST, path),
+            false,
+        );
+        filter.encode_headers(&mut cb, &mut response_headers(content_type), false);
+        let last = chunks.len().saturating_sub(1);
+        for (i, mut chunk) in chunks.into_iter().enumerate() {
+            filter.encode_data(&mut cb, &mut chunk, end && i == last);
+        }
+        if !end {
+            filter.on_stream_complete(&mut cb);
+        }
+        (cb.llm(), stats)
+    }
+
+    fn image_response(images: usize, b64_len: usize, echo: bool, usage: bool) -> Vec<Bytes> {
+        let b64 = "A".repeat(b64_len);
+        let data: Vec<String> = (0..images)
+            .map(|_| format!(r#"{{"b64_json":"{b64}"}}"#))
+            .collect();
+        let echo = if echo {
+            r#","size":"1024x1024","quality":"high""#
+        } else {
+            ""
+        };
+        let usage = if usage {
+            r#","usage":{"input_tokens":50,"input_tokens_details":{"text_tokens":40,"image_tokens":10},"output_tokens":4000,"output_tokens_details":{"text_tokens":100,"image_tokens":3900},"total_tokens":4050}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"created":1,"data":[{}]{echo}{usage}}}"#,
+            data.join(",")
+        )
+        .into_bytes()
+        .chunks(64 << 10)
+        .map(Bytes::copy_from_slice)
+        .collect()
+    }
+
+    fn per_image_card() -> PricingContext {
+        card(serde_json::json!([{
+        "provider_type": "openai", "model": "img", "basis": "images",
+        "image_prices": [
+            {"nanodollars_per_image": 10_000_000},
+            {"size": "1024x1024", "nanodollars_per_image": 20_000_000},
+            {"size": "1024x1024", "quality": "high", "nanodollars_per_image": 70_000_000}
+        ]}]))
+    }
+
+    /// A per-image card prices the elements of `data[]` at the most specific
+    /// matching row, reading the attributes from the response echo, then
+    /// from the request body, and a multi-megabyte body is scanned, not held.
+    #[test]
+    fn a_per_image_card_prices_data_elements_at_the_most_specific_row() {
+        let images = Endpoint::classify(&Method::POST, "/v1/images/generations");
+        assert_eq!(images, Endpoint::ImageGeneration);
+        let path = "/v1/images/generations";
+        for (echo, facts, expected) in [
+            // Both attributes echoed: the two-attribute row.
+            (true, (None, None), 2 * 70_000_000),
+            // No echo: the request's size alone selects the size-only row.
+            (false, (Some("1024x1024"), Some("low")), 2 * 20_000_000),
+            // Nothing matches a specific row: the catch-all.
+            (false, (Some("512x512"), None), 2 * 10_000_000),
+        ] {
+            let (llm, _) = drive(
+                per_image_card(),
+                path,
+                facts,
+                "application/json",
+                image_response(2, 3 << 20, echo, false),
+                true,
+            );
+            let usage = llm.usage.clone().expect("images are usage");
+            assert_eq!(usage.meters.images, Some(2));
+            assert_eq!(usage.tokens, None, "this response reported no tokens");
+            assert_eq!(
+                llm.list_cost.map(|c| c.nanodollars),
+                Some(expected),
+                "{echo} {facts:?}"
+            );
+            assert_eq!(llm.price_basis, Some(PriceBasis::Images));
+        }
+        // No row matches and no catch-all: unpriced, never a guess.
+        let strict = card(serde_json::json!([{
+            "provider_type": "openai", "model": "img", "basis": "images",
+            "image_prices": [{"size": "1024x1024", "nanodollars_per_image": 1}]}]));
+        let (llm, _) = drive(
+            strict,
+            path,
+            (Some("256x256"), None),
+            "application/json",
+            image_response(1, 10, false, false),
+            true,
+        );
+        assert_eq!(llm.usage.and_then(|u| u.meters.images), Some(1));
+        assert_eq!(llm.list_cost, None);
+        assert_eq!(llm.price_basis, None);
+    }
+
+    /// gpt-image usage is priced per modality: image tokens split out of the
+    /// text buckets at their own rates.
+    #[test]
+    fn gpt_image_usage_is_priced_per_modality() {
+        let mut tier = token_tier(5, 1);
+        tier["image_input_nanodollars_per_token"] = 10.into();
+        tier["image_output_nanodollars_per_token"] = 40.into();
+        let tokens_card = card(serde_json::json!([{
+            "provider_type": "openai", "model": "img",
+            "tier_mode": "whole_request", "tiers": [tier]}]));
+        let (llm, stats) = drive(
+            tokens_card,
+            "/v1/images/generations",
+            (None, None),
+            "application/json",
+            image_response(1, 1 << 20, true, true),
+            true,
+        );
+        let tokens = llm.usage.as_ref().and_then(|u| u.tokens).expect("tokens");
+        assert_eq!((tokens.input_tokens, tokens.input_image_tokens), (50, 10));
+        assert_eq!(
+            (tokens.output_tokens, tokens.output_image_tokens),
+            (4000, 3900)
+        );
+        assert_eq!(
+            llm.list_cost.map(|c| c.nanodollars),
+            Some(40 * 5 + 10 * 10 + 100 + 3900 * 40)
+        );
+        assert_eq!(llm.price_basis, Some(PriceBasis::Tokens));
+        assert_eq!(stats.underpriced_modality(), 0);
+    }
+
+    /// A cut image response is charged what closed before the cut: the
+    /// images completed so far, never an estimate from the base64 bytes.
+    #[test]
+    fn a_cut_image_response_is_not_byte_estimated() {
+        let mut chunks = image_response(3, 1 << 20, true, true);
+        // Cut inside the third image: two images closed, no usage yet.
+        chunks.truncate(chunks.len() * 5 / 6);
+        let (llm, stats) = drive(
+            per_image_card(),
+            "/v1/images/generations",
+            (Some("1024x1024"), None),
+            "application/json",
+            chunks.clone(),
+            false,
+        );
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
+        let usage = llm.usage.expect("the closed images");
+        assert_eq!(usage.meters.images, Some(2));
+        assert_eq!(usage.tokens, None, "no token estimate from base64 bytes");
+        assert!(!llm.input_estimated && !llm.output_estimated);
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(2 * 20_000_000));
+        assert_eq!(stats.estimated(), 0);
+
+        // Cut before any image closed: nothing to charge, not an estimate.
+        let (llm, _) = drive(
+            per_image_card(),
+            "/v1/images/generations",
+            (None, None),
+            "application/json",
+            vec![Bytes::from_static(
+                br#"{"created":1,"data":[{"b64_json":"AAAA"#,
+            )],
+            false,
+        );
+        assert_eq!(llm.usage, None);
+        assert_eq!(llm.list_cost, None);
+    }
+
+    /// An image stream counts `*.completed` events, not partial images.
+    #[test]
+    fn an_image_stream_counts_completed_events() {
+        let b64 = "B".repeat(2 << 20);
+        let stream = format!(
+            "data: {{\"type\":\"image_generation.partial_image\",\"b64_json\":\"{b64}\"}}\n\n\
+             data: {{\"type\":\"image_generation.completed\",\"b64_json\":\"{b64}\",\"size\":\"1024x1024\",\"quality\":\"high\"}}\n\n"
+        );
+        let chunks = stream
+            .into_bytes()
+            .chunks(50_000)
+            .map(Bytes::copy_from_slice)
+            .collect();
+        let (llm, _) = drive(
+            per_image_card(),
+            "/v1/images/generations",
+            (None, None),
+            "text/event-stream",
+            chunks,
+            true,
+        );
+        assert_eq!(llm.usage.and_then(|u| u.meters.images), Some(1));
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(70_000_000));
+    }
+
+    /// A chat response that reports audio tokens, under a card with no audio
+    /// rate, charges exactly what it charged before modality rates existed,
+    /// and is counted. With an audio rate, those tokens move to it.
+    #[test]
+    fn chat_audio_without_an_audio_rate_charges_todays_amount_and_is_counted() {
+        let body = br#"{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"audio_tokens":60},"completion_tokens":50,"completion_tokens_details":{"audio_tokens":30}}}"#;
+        let chat = |tier: serde_json::Value| {
+            drive(
+                card(
+                    serde_json::json!([{"provider_type": "openai", "model": "img",
+                    "tier_mode": "whole_request", "tiers": [tier]}]),
+                ),
+                "/v1/chat/completions",
+                (None, None),
+                "application/json",
+                vec![Bytes::from_static(body)],
+                true,
+            )
+        };
+        let (llm, stats) = chat(token_tier(2, 3));
+        assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(100 * 2 + 50 * 3));
+        assert_eq!(stats.underpriced_modality(), 1);
+        let tokens = llm.usage.and_then(|u| u.tokens).unwrap();
+        assert_eq!(
+            (tokens.input_audio_tokens, tokens.output_audio_tokens),
+            (60, 30)
+        );
+
+        let mut tier = token_tier(2, 3);
+        tier["audio_input_nanodollars_per_token"] = 7.into();
+        tier["audio_output_nanodollars_per_token"] = 11.into();
+        let (llm, stats) = chat(tier);
+        assert_eq!(
+            llm.list_cost.map(|c| c.nanodollars),
+            Some(40 * 2 + 60 * 7 + 20 * 3 + 30 * 11)
+        );
+        assert_eq!(stats.underpriced_modality(), 0);
+    }
+
+    /// The shipped example card, priced with this build, has the version and
+    /// the charge the build before ADR-0010 gave it (values recorded from
+    /// that build), and is stored at schema version 1.
+    #[test]
+    fn an_existing_card_keeps_its_version_and_charge_across_the_upgrade() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/llmproxy-openrouter.yaml"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the example ships"))
+                .expect("the example is JSON");
+        let body = serde_json::json!({
+            "price_list": config["pricing"]["price_list"],
+            "providers": {"provider:openrouter": "openrouter"},
+        })
+        .to_string();
+        let pricing = parse_card_json(&body).expect("the example parses");
+        assert_eq!(
+            pricing.version(),
+            "openrouter-2026-10-09T04:01:00.459203+00:00+6b5605a2f7a5"
+        );
+        let usage = LlmUsage::from_tokens(LlmTokenUsage {
+            input_tokens: 1234,
+            cached_tokens: 567,
+            output_tokens: 89,
+            ..LlmTokenUsage::default()
+        });
+        assert_eq!(
+            pricing
+                .list
+                .list_cost_for_cluster("provider:openrouter", "aion-labs/aion-2.0", &usage),
+            Some(1_243_000)
+        );
+        let row = pricing.stored_row("chain");
+        assert_eq!(row.schema_version, RATE_CARD_SCHEMA_V1);
+        // Writing `basis: tokens` explicitly is still the default.
+        let mut explicit = config["pricing"]["price_list"].clone();
+        explicit["entries"][0]["basis"] = "tokens".into();
+        let explicit = parse_card_json(
+            &serde_json::json!({"price_list": explicit,
+                "providers": {"provider:openrouter": "openrouter"}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(explicit.version(), pricing.version());
+        // The rendered wire document parses back to the same card.
+        assert_eq!(
+            parse_card_json(&pricing.to_wire_json()).unwrap().version(),
+            pricing.version()
+        );
+    }
+
+    /// A card using an ADR-0010 field is stored at schema version 2, has a
+    /// version of its own, and round-trips through the wire document.
+    #[test]
+    fn a_media_card_is_stored_at_schema_version_2_and_round_trips() {
+        let media = per_image_card();
+        assert_eq!(
+            media.stored_row("chain").schema_version,
+            RATE_CARD_SCHEMA_V2
+        );
+        let reparsed = parse_card_json(&media.to_wire_json()).unwrap();
+        assert_eq!(reparsed.version(), media.version());
+        let mut tier = token_tier(1, 1);
+        tier["image_input_nanodollars_per_token"] = 2.into();
+        let modality = card(
+            serde_json::json!([{"provider_type": "openai", "model": "img",
+            "tier_mode": "whole_request", "tiers": [tier]}]),
+        );
+        let plain = card(
+            serde_json::json!([{"provider_type": "openai", "model": "img",
+            "tier_mode": "whole_request", "tiers": [token_tier(1, 1)]}]),
+        );
+        assert_ne!(modality.version(), plain.version());
+        assert_eq!(modality.stored_row("c").schema_version, RATE_CARD_SCHEMA_V2);
+        assert_eq!(plain.stored_row("c").schema_version, RATE_CARD_SCHEMA_V1);
+        assert_eq!(
+            parse_card_json(&modality.to_wire_json()).unwrap().version(),
+            modality.version()
+        );
+    }
+
+    /// An entry prices only the meters of its basis, so a field of the other
+    /// basis is a load error, never ignored.
+    #[test]
+    fn a_field_of_the_other_basis_or_an_ambiguous_row_fails_to_load() {
+        let images = |extra: serde_json::Value| {
+            let mut entry = serde_json::json!({"provider_type": "openai", "model": "img",
+                "basis": "images", "image_prices": [{"nanodollars_per_image": 1}]});
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            card_error(serde_json::json!([entry]))
+        };
+        assert!(images(serde_json::json!({"tiers": [token_tier(1, 1)]}))
+            .contains("entries[0].tiers does not apply to basis images"));
+        assert!(images(serde_json::json!({"tier_mode": "whole_request"}))
+            .contains("entries[0].tier_mode"));
+        assert!(images(serde_json::json!({"cached_input_unpriced": true}))
+            .contains("entries[0].cached_input_unpriced"));
+        assert!(images(serde_json::json!({"image_prices": []})).contains("at least one row"));
+        assert!(images(serde_json::json!({"image_prices": [
+            {"size": "1", "nanodollars_per_image": 1}, {"quality": "q", "nanodollars_per_image": 2}]}))
+        .contains("image_prices[1] can match the same request as image_prices[0]"));
+        assert!(images(serde_json::json!({"image_prices": [
+            {"nanodollars_per_image": 1}, {"nanodollars_per_image": 2}]}))
+        .contains("image_prices[1]"));
+        assert!(
+            card_error(serde_json::json!([{"provider_type": "openai", "model": "m",
+            "basis": "characters", "image_prices": []}]))
+            .contains("entries[0].basis must be tokens or images")
+        );
+        assert!(
+            card_error(serde_json::json!([{"provider_type": "openai", "model": "m",
+            "tier_mode": "whole_request", "tiers": [token_tier(1, 1)],
+            "image_prices": [{"nanodollars_per_image": 1}]}]))
+            .contains("entries[0].image_prices applies only to basis images")
+        );
+        let mut banded = token_tier(1, 1);
+        banded["up_to"] = 10.into();
+        banded["audio_input_nanodollars_per_token"] = 3.into();
+        assert!(
+            card_error(serde_json::json!([{"provider_type": "openai", "model": "m",
+            "tier_mode": "graduated", "tiers": [banded, token_tier(2, 2)]}]))
+            .contains(
+                "entries[0].tiers[1].audio_input_nanodollars_per_token must be set on every tier"
+            )
         );
     }
 }

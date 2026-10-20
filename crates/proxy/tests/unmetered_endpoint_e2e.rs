@@ -45,20 +45,21 @@ struct Call {
     endpoint: &'static str,
 }
 
-const IMAGES: &[Call] = &[
-    Call {
-        method: "POST",
-        path: "/v1/images/generations",
-        body: r#"{"model":"gpt-image-1","prompt":"a cat"}"#,
-        endpoint: "image_generation",
-    },
-    Call {
-        method: "POST",
-        path: "/v1/images/edits",
-        body: r#"{"model":"gpt-image-1","prompt":"a hat"}"#,
-        endpoint: "image_edit",
-    },
-];
+/// Metered under a spend budget since ADR-0010 phase 2, still refused under
+/// a token limit (open decision A).
+const IMAGE_GENERATION: Call = Call {
+    method: "POST",
+    path: "/v1/images/generations",
+    body: r#"{"model":"gpt-image-1","prompt":"a cat"}"#,
+    endpoint: "image_generation",
+};
+
+const IMAGE_EDITS: &[Call] = &[Call {
+    method: "POST",
+    path: "/v1/images/edits",
+    body: r#"{"model":"gpt-image-1","prompt":"a hat"}"#,
+    endpoint: "image_edit",
+}];
 
 const AUDIO: &[Call] = &[
     Call {
@@ -105,8 +106,51 @@ const BATCH_AND_FILES: &[Call] = &[
 ];
 
 #[test]
-fn images_are_refused_under_every_binding_control() {
-    refused_under_every_binding_control("images", IMAGES);
+fn image_edits_are_refused_under_every_binding_control() {
+    refused_under_every_binding_control("images", IMAGE_EDITS);
+}
+
+/// Image generation is metered under a spend budget, so a tenant or key
+/// budget dials it, but a token limit cannot count its tokens for every
+/// model and still refuses it.
+#[test]
+fn image_generation_passes_a_budget_and_is_refused_under_a_token_limit() {
+    let dir = scratch_dir("image-generation");
+    let upstream = Upstream::spawn();
+    let proxy = Proxy::start(&dir, &config_text(&dir, upstream.addr, CATCH_ALL, ""));
+    let key = mint_key(&proxy);
+    create_tenant(&proxy);
+    let budget = r#"{"budget":{"max_usd":"100","period":"daily"}}"#;
+    for path in [
+        format!("/tenants/{TENANT}/budget"),
+        format!("/keys/{KEY_ID}/budget"),
+    ] {
+        put_ok(&proxy, &path, budget);
+        let response = send(&proxy, &key, &IMAGE_GENERATION);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "image generation under {path}:\n{response}"
+        );
+        put_ok(&proxy, &path, r#"{"budget":null}"#);
+    }
+    assert_eq!(upstream.hits(), 2);
+
+    let limits = format!("/tenants/{TENANT}/limits");
+    put_ok(
+        &proxy,
+        &limits,
+        r#"{"limits":{"tokens_per_minute":1000000}}"#,
+    );
+    assert_refused(
+        &send(&proxy, &key, &IMAGE_GENERATION),
+        "image generation under a tenant token limit",
+    );
+    assert_eq!(upstream.hits(), 2, "the refusal was not dialled");
+    let scrape = scrape(&proxy);
+    assert_eq!(refusals(&scrape, "image_generation", "token_limit"), 1);
+    assert_eq!(refusals(&scrape, "image_generation", "spend"), 0);
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -130,7 +174,11 @@ fn without_a_budget_or_limit_every_endpoint_is_proxied_silently() {
     create_tenant(&proxy);
     let log_mark = proxy.stderr_len();
 
-    let calls: Vec<&Call> = IMAGES.iter().chain(AUDIO).chain(BATCH_AND_FILES).collect();
+    let calls: Vec<&Call> = std::iter::once(&IMAGE_GENERATION)
+        .chain(IMAGE_EDITS)
+        .chain(AUDIO)
+        .chain(BATCH_AND_FILES)
+        .collect();
     for call in &calls {
         let response = send(&proxy, &key, call);
         assert!(
@@ -267,7 +315,7 @@ fn a_model_scoped_token_limit_refuses_an_image_for_a_model_in_scope() {
     create_tenant(&proxy);
 
     assert_refused(
-        &send(&proxy, &key, &IMAGES[0]),
+        &send(&proxy, &key, &IMAGE_GENERATION),
         "an image in the rule's scope",
     );
     assert_eq!(upstream.hits(), 0);
