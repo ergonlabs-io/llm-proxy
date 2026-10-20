@@ -592,12 +592,19 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "jwt_providers",
             "tenant_credentials",
             "max_policy_staleness_seconds",
+            "chargeback_tags",
         ],
+        "llmproxy.filters.v0.ChargebackTags" => {
+            &["allowed", "from_header", "max_tags", "max_value_bytes"]
+        }
+        "llmproxy.filters.v0.AllowedTag" => &["key", "values"],
         "llmproxy.filters.v0.TenantCredentials" => {
             &["encryption_key_file", "encryption_key_id", "previous_keys"]
         }
         "llmproxy.filters.v0.PreviousCredentialKey" => &["id", "file"],
-        "llmproxy.filters.v0.VirtualKey" => &["key_id", "tenant", "digest_hex", "revoked"],
+        "llmproxy.filters.v0.VirtualKey" => {
+            &["key_id", "tenant", "digest_hex", "revoked", "tags"]
+        }
         "llmproxy.filters.v0.JwtProvider" => &[
             "tenant_claim",
             "issuer",

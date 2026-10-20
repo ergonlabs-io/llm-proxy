@@ -160,10 +160,11 @@ impl Rows {
     fn sample() -> Rows {
         let key_row = |tenant: &str, revoked: bool, fill: u8| {
             encode_json(&EncodedKeyRow {
-                schema_version: SPEND_SCHEMA_VERSION,
+                schema_version: crate::control::SPEND_SCHEMA_VERSION,
                 digest: [fill; 32],
                 tenant: tenant.into(),
                 revoked,
+                tags: Default::default(),
             })
         };
         Rows {
@@ -713,6 +714,7 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
         digest: [1; 32],
         tenant: tenant.clone(),
         revoked: false,
+        tags: Default::default(),
     };
     let period = PeriodKey::for_test("2026-10");
     let node = FlushToken {

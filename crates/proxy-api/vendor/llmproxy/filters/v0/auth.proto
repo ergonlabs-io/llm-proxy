@@ -121,6 +121,46 @@ message Authentication {
   // snapshot already ages up to 1.25 x the interval between polls. The age is
   // exported as `llmproxy_policy_snapshot_age_seconds`.
   uint32 max_policy_staleness_seconds = 9;
+
+  // Chargeback tags: which key=value pairs a request's usage record and
+  // ledger entry may carry. UNSET means no tags are attributed: key
+  // metadata tags are not copied and the `x-cost-tags` header is never read.
+  ChargebackTags chargeback_tags = 10;
+}
+
+// The operator's chargeback-tag policy. Tags come from key metadata (set on a
+// virtual key by the admin API, or `VirtualKey.tags`) and, when
+// `from_header` is true, from the `x-cost-tags` request header
+// (`project=search,team=infra`). A tag key set by key metadata is never taken
+// from the header. Tags that fail the allow-list or a cap are dropped and
+// counted in `llmproxy_chargeback_tags_dropped{reason}`; a malformed header is
+// dropped whole and never fails the request. Tags are never a metric label.
+message ChargebackTags {
+  // Required, at least one entry. The tag keys that may be attributed.
+  repeated AllowedTag allowed = 1;
+
+  // Read the `x-cost-tags` request header. False (unset) means the header is
+  // never read and is forwarded unchanged. When true, the header is removed
+  // before the request goes upstream.
+  bool from_header = 2;
+
+  // Most tags on one request, 1 to 32. 0 (unset) means 8. Key-metadata tags
+  // fill the cap before header tags.
+  uint32 max_tags = 3;
+
+  // Longest tag value in bytes, 1 to 256. 0 (unset) means 64.
+  uint32 max_value_bytes = 4;
+}
+
+// One allow-listed tag key.
+message AllowedTag {
+  // Required. 1 to 64 bytes of lowercase letters, digits, `_`, `.` and `-`,
+  // starting with a letter.
+  string key = 1;
+
+  // The values the key may take. Empty means any value that passes the value
+  // alphabet (ASCII letters, digits, `_ . : / @ + -`) and `max_value_bytes`.
+  repeated string values = 2;
 }
 
 // Where the proxy finds the keys that seal tenant provider credentials at rest.
@@ -233,6 +273,11 @@ message VirtualKey {
   // simply typed the wrong thing. The DOWNSTREAM response is identical for
   // both -- the difference reaches the access log, never the caller.
   bool revoked = 4;
+
+  // Chargeback tags for requests this key authenticates (key metadata). At
+  // most 32; keys and values follow `AllowedTag`, values up to 256 bytes.
+  // `Authentication.chargeback_tags` still decides which are attributed.
+  map<string, string> tags = 5;
 }
 
 // One JWT issuer accepted by the filter, verified

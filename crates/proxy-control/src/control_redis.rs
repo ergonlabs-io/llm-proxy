@@ -61,7 +61,7 @@ use crate::control::{
     EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
     EncodedTenantCredentialRow, FlushToken, LimitPolicy, SpendDelta, StoreError,
     StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, WindowDelta, WindowRow,
-    SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
+    TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
 };
 use crate::control::{decode_trace_export_row, encode_trace_export_row};
 use crate::model_authz::ModelAccess;
@@ -416,7 +416,7 @@ local next = cjson.decode(ARGV[2])
 if raw then
   local previous = cjson.decode(raw)
   local version = previous['schema_version'] or 1
-  if version ~= 1 and version ~= 2 then return -3 end
+  if version ~= 1 and version ~= 2 and version ~= 3 then return -3 end
   if previous['tenant'] ~= next['tenant'] then return -1 end
   if previous['revoked'] then
     if not next['revoked'] then return -2 end
@@ -1011,12 +1011,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let mut keys = Vec::with_capacity(keys_raw.len());
         for (key_id, bytes) in keys_raw {
             let row: EncodedKeyRow = decode_json(&bytes)?;
-            keys.push(StoredKey {
-                key_id: KeyId::new(key_id),
-                digest: row.digest,
-                tenant: TenantId::new(row.tenant),
-                revoked: row.revoked,
-            });
+            keys.push(row.into_stored(KeyId::new(key_id)));
         }
 
         let mut policies = HashMap::new();
@@ -1204,12 +1199,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     }
 
     fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
-        let row = EncodedKeyRow {
-            schema_version: SPEND_SCHEMA_VERSION,
-            digest: rec.digest,
-            tenant: rec.tenant.as_str().into(),
-            revoked: rec.revoked,
-        };
+        let row = EncodedKeyRow::from_stored(rec);
         let result: i64 = self.with_connection(Lane::Control, |conn| {
             Script::new(PUT_KEY_LUA)
                 .key(self.keys_key())
@@ -2023,6 +2013,7 @@ mod tests {
             digest: [1; 32],
             tenant: tenant.clone(),
             revoked: false,
+            tags: Default::default(),
         };
         store.put_key(&row).unwrap();
         let budget = TenantBudget {
@@ -2403,6 +2394,7 @@ mod tests {
                 digest: [7u8; 32],
                 tenant: tenant.clone(),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         store.set_policy(&tenant, &ModelAccess::All).unwrap();

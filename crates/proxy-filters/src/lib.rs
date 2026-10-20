@@ -36,6 +36,7 @@
 pub mod auth_filter;
 pub mod body_rewrite;
 pub mod body_rewrite_filter;
+pub mod chargeback_tags;
 pub mod cors;
 pub mod ext_authz;
 pub mod guardrail_filter;

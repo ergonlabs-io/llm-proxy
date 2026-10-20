@@ -10,6 +10,7 @@ pub mod capture_policy;
 mod capture_tests;
 #[cfg(unix)]
 pub mod capture_transport;
+pub mod chargeback;
 pub mod flags;
 pub mod ledger;
 #[cfg(all(test, unix))]

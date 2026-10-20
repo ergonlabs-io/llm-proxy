@@ -54,6 +54,7 @@ use http::HeaderMap;
 
 use crate::control::ControlPlaneSnapshot;
 use proxy_credentials::TenantCredentialSet;
+use proxy_observability::chargeback::ChargebackTags;
 
 /// Scheme prefix this authenticator recognizes on the `authorization`
 /// header. Anything else (no header, a different scheme, a bare token) is
@@ -251,6 +252,10 @@ pub struct Principal {
     /// request keeps the consent it was admitted with. `false` when the
     /// snapshot has no opt-in row for the tenant.
     pub trace_export: bool,
+    /// Chargeback tags the admin set on the key (key metadata), unfiltered:
+    /// the auth filter's tag policy decides which are attributed. Empty for
+    /// a JWT principal (ADR-0014), which carries no key metadata.
+    pub key_tags: Arc<ChargebackTags>,
 }
 
 impl fmt::Debug for Principal {
@@ -542,6 +547,9 @@ pub struct KeyRecord {
     pub key_id: KeyId,
     pub tenant: TenantId,
     pub revoked: bool,
+    /// Chargeback tags the admin set on this key. An `Arc` so authentication
+    /// clones a pointer.
+    pub tags: Arc<ChargebackTags>,
 }
 
 impl fmt::Debug for KeyRecord {
@@ -550,6 +558,7 @@ impl fmt::Debug for KeyRecord {
             .field("key_id", &self.key_id)
             .field("tenant", &self.tenant)
             .field("revoked", &self.revoked)
+            .field("tags", &self.tags)
             .finish()
     }
 }
@@ -788,6 +797,7 @@ impl Authenticator for VirtualKeyAuthenticator {
                 tenant_credentials: snapshot.tenant_credentials.get(&record.tenant).cloned(),
                 policy_generation: snapshot.generation,
                 trace_export: snapshot.trace_export.contains(&record.tenant),
+                key_tags: record.tags.clone(),
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
@@ -949,6 +959,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             },
             "llmp_correct-key",
         );
@@ -977,6 +988,7 @@ mod tests {
                 key_id: KeyId::new("key-t"),
                 tenant: TenantId::new("tenant-t"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
         keys.insert(
@@ -986,6 +998,7 @@ mod tests {
                 key_id: KeyId::new("key-u"),
                 tenant: TenantId::new("tenant-u"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
         let set = TenantCredentialSet::new(HashMap::from([(
@@ -1051,6 +1064,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             },
             "llmp_the-configured-key",
         );
@@ -1076,6 +1090,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             },
             "llmp_the-configured-key",
         );
@@ -1100,6 +1115,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             },
             "llmp_the-configured-key",
         );
@@ -1130,6 +1146,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: true,
+                tags: Default::default(),
             },
             "llmp_revoked-key",
         );
@@ -1161,6 +1178,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
         let auth = VirtualKeyAuthenticator::new(
@@ -1191,6 +1209,7 @@ mod tests {
             key_id: KeyId::new("key-1"),
             tenant: TenantId::new("tenant-a"),
             revoked: false,
+            tags: Default::default(),
         };
         let mut keys = KeySet::new();
         keys.insert(&secret, plaintext_key, record);
@@ -1264,6 +1283,7 @@ mod tests {
                 key_id: KeyId::new("key-1"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             },
             "llmp_almost-the-right-key-A",
         );
