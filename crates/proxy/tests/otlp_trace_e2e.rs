@@ -82,6 +82,21 @@ fn drain_available_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
     lines
 }
 
+/// Every stderr line of a process that has already exited. The reader thread
+/// ends at EOF, so this returns once it has forwarded everything; the timeout
+/// only guards against a pipe some other process still holds open.
+fn stderr_after_exit(rx: &mpsc::Receiver<String>) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut lines = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
 /// Kills and reaps the child process on drop (AGENTS.md "Running The Product").
 struct ChildGuard(Child);
 
@@ -1468,6 +1483,12 @@ async fn prometheus_scrape_works_with_no_otlp_configured() {
 async fn a_clean_shutdown_delivers_a_final_trace_batch() {
     let (fallback_addr, _) = spawn_capturing_mock_upstream();
     let (spans, metrics, collector_addr) = spawn_delayed_collector(Duration::from_millis(1_500));
+    // The final flush is the only export, so a collector that is not yet
+    // listening would turn into "0 spans" with nothing in the proxy at fault.
+    assert!(
+        wait_for_connectable(("127.0.0.1", collector_addr.port()), STARTUP_TIMEOUT),
+        "mock OTLP collector never became connectable"
+    );
     let listener_port = free_port();
     let config_path = write_config(
         listener_port,
@@ -1499,7 +1520,18 @@ async fn a_clean_shutdown_delivers_a_final_trace_batch() {
     // and await the collector's delayed acknowledgement of the remaining spans.
     signal_term(&mut child);
     assert!(wait_for_exit(&mut child, Duration::from_secs(15)));
-    assert_eq!(spans.lock().unwrap().len(), 3);
+    // A clean drain exits 0. An abandoned flush, a second-signal fast exit or a
+    // crash also ends with no spans delivered, so the status and stderr are what
+    // tell those apart from a lost batch.
+    let status = child.0.try_wait();
+    let delivered = spans.lock().unwrap().len();
+    if delivered != 3 || !matches!(status, Ok(Some(s)) if s.success()) {
+        panic!(
+            "expected a clean exit and 3 delivered spans, got exit {status:?} and {delivered} \
+             spans; proxy stderr: {:#?}",
+            stderr_after_exit(&stderr_rx)
+        );
+    }
     assert!(metrics.lock().unwrap().is_empty());
 }
 
