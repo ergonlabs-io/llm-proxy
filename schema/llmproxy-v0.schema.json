@@ -43,7 +43,7 @@
       }
     },
     "models": {
-      "description": "Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. The providers are tried in order: `providers[0]` serves the request, and each later entry is a fallback with the same retry rules as `routes[].fallbacks`. Weighted or cost-aware selection among them is not supported.",
+      "description": "Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. The providers are tried in order: `providers[0]` serves the request, and each later entry is a fallback with the same retry rules as `routes[].fallbacks`. With `weight` set on every entry, the first provider is picked in proportion to weight instead, and the other entries stay the fallback chain. Weighting spreads load across providers that serve the same model; it never changes the model. Cost-aware selection is not supported.",
       "default": {},
       "type": "object",
       "patternProperties": {
@@ -700,6 +700,29 @@
               "description": "Top-level body keys removed before the request is sent to this provider."
             }
           }
+        },
+        "outlier_detection": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Passive health checking. After `consecutive_5xx` consecutive failed attempts, the provider is ejected: a `models` entry passes it over, as primary or fallback, while another of its providers is not ejected, and serves from it again when the ejection ends. With every provider of the entry ejected, requests go to them in list order as without ejection. Ejection is per proxy process; replicas do not share it. Absent means the provider is never ejected.",
+          "properties": {
+            "consecutive_5xx": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 5,
+              "description": "Consecutive failed attempts that eject the provider. A failure is a 5xx response or a local failure (connection refused, reset, or timeout). A 429 or any other response ends the run."
+            },
+            "base_ejection_time": {
+              "$ref": "#/$defs/Duration",
+              "default": "30s",
+              "description": "Length of the first ejection. Each later ejection of the provider lasts this value times the number of ejections so far, up to `max_ejection_time`. Must be greater than 0."
+            },
+            "max_ejection_time": {
+              "$ref": "#/$defs/Duration",
+              "description": "Upper bound on one ejection. Default: the larger of `300s` and `base_ejection_time`. Must not be less than `base_ejection_time`."
+            }
+          }
         }
       },
       "not": {
@@ -853,7 +876,7 @@
         "providers": {
           "type": "array",
           "minItems": 1,
-          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. `providers[0]` serves the request; each later entry is a fallback, tried in order on a connection failure or a 429, 500, 502 or 503 response, never after the first response byte of a stream. Every entry must speak the same dialect as `providers[0]`; a mismatch is a load error.",
+          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. `providers[0]` serves the request; each later entry is a fallback, tried in order on a connection failure or a 429, 500, 502 or 503 response, never after the first response byte of a stream. With `weight` on every entry, each request picks its first provider in proportion to weight, and the other entries are its fallbacks in list order. A provider ejected by its `outlier_detection` is passed over while another entry has a provider that is not ejected. Every entry must speak the same dialect as `providers[0]`; a mismatch is a load error.",
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/ProviderModelRef" },
@@ -891,6 +914,13 @@
           "description": "Wire format this provider entry speaks. Optional (and derived from the provider's `type`) for `openai`/`anthropic`/`openai-compatible`/`azure-openai`, whose wire format the type alone determines. REQUIRED for `vertex`/`bedrock`, which serve more than one wire format under a single provider type -- e.g. Vertex hosts Anthropic-shaped Claude, Google-shaped Gemini, and OpenAI-shaped Kimi. Omitting it there is a load error naming the field, never a guess: the wrong parser can partially match the wrong body shape and bill usage against a number nobody computed. The shorthand string form cannot express this field at all, so an ambiguous-type provider used here must use this object form.",
           "enum": ["openai", "anthropic"],
           "examples": ["anthropic"]
+        },
+        "weight": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Share of this model's requests that start at this provider. Set it on every entry of `providers` or on none; a mix is a load error, and the shorthand string form cannot carry it. The first provider of each request is picked once, in proportion to weight, from the entries whose weight is above 0. The remaining entries are that request's fallbacks, in list order, with the same retry rules as without weights. `0` makes an entry a fallback only. The weights must not all be 0, and a provider must not appear twice in a weighted list. A provider ejected by its `outlier_detection` gets no first picks until the ejection ends: its share goes to the next entry in list order that is not ejected. The pick is random per request, so the split matches the weights over many requests, not over a few. It is the same on every worker and is not coordinated across replicas. Absent on every entry means `providers[0]` serves and the rest are fallbacks.",
+          "examples": [3, 1, 0]
         }
       }
     },

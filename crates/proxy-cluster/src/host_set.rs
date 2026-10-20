@@ -71,6 +71,12 @@ impl HostSet {
         self.by_priority.values().flatten().cloned().collect()
     }
 
+    /// Whether any host at any priority is healthy (not ejected, not failing active health checks). Does not
+    /// allocate, unlike [`Self::all_hosts`], because an aggregate asks this of members on every pick.
+    pub fn has_healthy_host(&self) -> bool {
+        self.by_priority.values().flatten().any(|h| h.is_healthy())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_priority.values().all(Vec::is_empty)
     }

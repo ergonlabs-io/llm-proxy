@@ -6,8 +6,8 @@ use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
 use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
-    is_valid_provider_name, Listen, ListenerSpec, ModelProviderRef, OAuth2JwtBearerDef, Provider,
-    ProviderModelRef, ProviderType, SimpleConfig, SimpleDuration, RESERVED_KEYS,
+    is_valid_provider_name, Listen, ListenerSpec, ModelDef, ModelProviderRef, OAuth2JwtBearerDef,
+    Provider, ProviderModelRef, ProviderType, SimpleConfig, SimpleDuration, RESERVED_KEYS,
 };
 
 /// Parse dialect YAML from a file.
@@ -442,6 +442,7 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                 return Err(ConfigError::InvalidValue { field_path, reason });
             }
         }
+        check_model_weights(name, model, &path)?;
     }
 
     // Validate model entries first so dialect lookup cannot mask a more
@@ -1115,6 +1116,70 @@ fn check_provider_ref(
                 "unknown provider `{}` (defined providers: {known})",
                 reference.provider
             ),
+        });
+    }
+    Ok(())
+}
+
+/// Largest `models.<name>.providers[i].weight`. Bounds the cumulative weight
+/// of a list well inside `u32`, which Envoy's `WeightedCluster` sums into.
+const MAX_MODEL_WEIGHT: u32 = 1_000_000;
+
+/// `models.<name>.providers[i].weight`: on every entry or on none, within
+/// bounds, not all zero, and no provider listed twice. Half-weighted lists are
+/// refused rather than read as weight 0 or weight 1, because either guess
+/// moves traffic the operator did not ask to move (AGENTS.md invariant 1).
+fn check_model_weights(name: &str, model: &ModelDef, path: &str) -> Result<(), ConfigError> {
+    if model.providers.iter().all(|entry| entry.weight().is_none()) {
+        return Ok(());
+    }
+    let mut total: u64 = 0;
+    for (i, entry) in model.providers.iter().enumerate() {
+        let entry_path = format!("{path}.providers[{i}]");
+        let Some(weight) = entry.weight() else {
+            let reason = match entry {
+                ModelProviderRef::Shorthand(_) => format!(
+                    "`models.{name}` sets `weight` on another entry, so every entry needs one; \
+                     the shorthand string form cannot carry `weight` -- use the object form \
+                     ({{ provider, weight }})"
+                ),
+                ModelProviderRef::Full(_) => format!(
+                    "`models.{name}` sets `weight` on another entry, so every entry needs one \
+                     (use 0 for a fallback-only provider)"
+                ),
+            };
+            return Err(ConfigError::InvalidValue {
+                field_path: entry_path,
+                reason,
+            });
+        };
+        if weight > MAX_MODEL_WEIGHT {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{entry_path}.weight"),
+                reason: format!("must be at most {MAX_MODEL_WEIGHT}"),
+            });
+        }
+        if let Some(first) = model.providers[..i]
+            .iter()
+            .position(|earlier| earlier.provider() == entry.provider())
+        {
+            return Err(ConfigError::InvalidValue {
+                field_path: entry_path,
+                reason: format!(
+                    "provider `{}` is already providers[{first}]; a weighted list names each \
+                     provider once",
+                    entry.provider()
+                ),
+            });
+        }
+        total += u64::from(weight);
+    }
+    if total == 0 {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.providers"),
+            reason: "every weight is 0, so no provider could be picked first; give at least one \
+                     entry a weight above 0"
+                .to_string(),
         });
     }
     Ok(())

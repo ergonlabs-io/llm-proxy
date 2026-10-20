@@ -474,6 +474,32 @@ pub struct Provider {
     /// so it holds across fallback.
     #[serde(default)]
     pub request_fields: Option<RequestFields>,
+    /// Passive health checking of this provider: after `consecutive_5xx`
+    /// consecutive failures the provider is ejected, and aggregates pass it
+    /// over until the ejection expires. Lowers to the provider cluster's S6
+    /// `outlier_detection`. Absent means no ejection.
+    #[serde(default)]
+    pub outlier_detection: Option<OutlierDetectionDef>,
+}
+
+/// `providers.<name>.outlier_detection`: the consecutive-failure detector of
+/// Envoy's S6 outlier detection, sized for a provider cluster with one
+/// upstream host.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutlierDetectionDef {
+    /// Consecutive 5xx responses or local failures (connect failure, reset,
+    /// timeout) that eject the provider. A 429 does not count. Default 5.
+    #[serde(default)]
+    pub consecutive_5xx: Option<u32>,
+    /// Ejection length for the first ejection; each later ejection of the
+    /// same provider lasts this times the ejection count. Default 30s.
+    #[serde(default)]
+    pub base_ejection_time: Option<SimpleDuration>,
+    /// Upper bound on one ejection. Default the larger of 300s and
+    /// `base_ejection_time`.
+    #[serde(default)]
+    pub max_ejection_time: Option<SimpleDuration>,
 }
 
 /// `providers.<name>.request_fields`: a generic top-level body-field policy.
@@ -778,10 +804,11 @@ impl ProviderType {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
-    /// Tried in priority order. A multi-provider model lowers to an ordered
-    /// aggregate cluster, and each retry advances to the next provider (see
-    /// `lower_model`). Every entry is validated; a bad one fails the load
-    /// (AGENTS.md invariant 1).
+    /// Tried in priority order, or, with `weight` on every entry, starting
+    /// at a provider picked in proportion to weight. A multi-provider model
+    /// lowers to aggregate clusters, and each retry advances to the next
+    /// provider (see `lower_model`). Every entry is validated; a bad one
+    /// fails the load (AGENTS.md invariant 1).
     pub providers: Vec<ModelProviderRef>,
     /// Upper bound on the output tokens a request for this model may ask for.
     /// A request asking for more is refused with 400; the body is never
@@ -827,6 +854,14 @@ impl ModelProviderRef {
             ModelProviderRef::Full(p) => p.dialect,
         }
     }
+
+    /// The shorthand string form cannot carry a `weight` either.
+    pub fn weight(&self) -> Option<u32> {
+        match self {
+            ModelProviderRef::Shorthand(_) => None,
+            ModelProviderRef::Full(p) => p.weight,
+        }
+    }
 }
 
 /// The object form of a [`ModelProviderRef`]: needed whenever `dialect` must
@@ -853,6 +888,13 @@ pub struct ModelProvider {
     /// ambiguous-type provider used in `models:` must use this object form.
     #[serde(default)]
     pub dialect: Option<Dialect>,
+    /// Share of this alias's requests that start at this provider. Set on
+    /// every entry or on none. With weights, each request picks its first
+    /// provider in proportion to weight, once, and the other entries stay its
+    /// fallback chain in list order. `0` makes an entry fallback-only. Lowers
+    /// to Envoy `weighted_clusters` (S1.5); see `lower_model`.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// A provider entry's wire format, for provider types whose dialect the type
