@@ -32,6 +32,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- `make bench-added-latency` measures the latency the proxy adds to one
+  request over a direct call to the mock upstream: p50 and p99 for direct,
+  proxy with controls off, and proxy with each control group added in turn
+  (auth, limits, spend, ledger), in alternated rounds, compared on minimums.
+  It fails a run whose controls did not engage. README "Measured capacity"
+  has a new "Added latency with controls on" table, measured under load:
+  0.23 ms p50 and 0.97 ms p99 added with controls on. Method and configs:
+  `internal-docs/capacity/added-latency.md` (WP-116).
+
 - Image generation is metered under a spend budget (ADR-0010 phase 2, WP-124).
   `POST .../images/generations` is no longer refused with
   `endpoint_not_metered` under a tenant or key budget; it is charged at the

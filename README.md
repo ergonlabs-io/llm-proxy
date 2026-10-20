@@ -454,6 +454,26 @@ gate p99 ≤ 6900 ms and TTFT p99 ≤ 1000 ms. 80,507 requests over 20 levels on
 Full method, the not-harness-bound argument, and what is *not* saturated:
 `internal-docs/capacity/README.md`. Reproduce with `make sweep`.
 
+### Added latency with controls on
+
+What the proxy adds to one non-streaming request over a direct call to the
+same mock upstream, with auth, token and request limits, a spend budget and
+the billing ledger on. Minimum of 5 alternated rounds, open loop at 200
+requests/s, M1 Pro MacBook Pro. **Measured under load** (1-minute load average
+5-50 on 8 cores, from other builds): a quiet-machine run is still to come.
+
+| | p50 | p99 |
+|---|---|---|
+| Direct to the mock (baseline) | 0.29 ms | 2.45 ms |
+| Proxy, controls off: added | +0.17 ms | +1.18 ms |
+| Proxy, controls on: added | +0.23 ms | +0.97 ms |
+
+Against a mock, added latency is a floor: a real provider adds far more
+latency and variance than this. On this box, controls on and controls off
+differ by less than the spread between rounds. Method, exact configs, a row
+per control group, and raw results: `internal-docs/capacity/added-latency.md`.
+Reproduce with `make bench-added-latency`.
+
 ## Roadmap
 
 | Release | Theme | |
