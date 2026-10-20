@@ -196,16 +196,14 @@
     <button class="chip" data-prio="P3">P3 · later<span class="n" id="n-P3"></span></button>
   </div>
   <p class="now">
-    <b>State 2026-10-20.</b> Current milestone: <b>v0.6.0 Metering completeness</b> (approved 2026-10-18).
-    The latest release is tag v0.5.0 (Billing ledger and trace export, 2026-10-18).
-    <b>v0.6.0:</b> every gate card is done and merged: WP-111, WP-115, WP-124 (images), WP-125 (speech, transcription,
-    image edits) and WP-117 (chargeback tags). The tag waits only for <code>make ci</code> on the release commit.
-    Batch waits on its own ADR.
-    <b>Also merged, outside the gate:</b> WP-112 (JWT/OIDC, ADR-0014), WP-114 (guardrail filter), WP-118 (weighted,
+    <b>State 2026-10-20.</b> The latest release is tag <b>v0.6.0</b> (Metering completeness, 2026-10-20): images,
+    speech, transcription and image edits metered in provider units (ADR-0010 phases 2 and 3), chargeback tags and
+    OTel GenAI semconv 1.41.0. No milestone is current; the next one waits for an owner plan. Batch waits on its own ADR.
+    <b>Also in v0.6.0, outside the gate:</b> WP-112 (JWT/OIDC, ADR-0014), WP-114 (guardrail filter), WP-118 (weighted,
     health-aware alias balancing) and WP-120 (fail over on provider credential failure; owner decision 2026-10-20).
     <b>In progress:</b> WP-116 (added-latency benchmark): <code>make bench-added-latency</code> and the published page are
     merged; numbers were taken under load, so a quiet-machine run is still needed before it closes.
-    <b>Next candidates:</b> cut the v0.6.0 tag, then WP-126 (JWT principals carry BYOK credentials) and WP-127
+    <b>Next candidates:</b> WP-126 (JWT principals carry BYOK credentials) and WP-127
     (JWT claims to chargeback tags).
     <b>Test count:</b> 3554 (make ci, 2026-10-20).
   </p>

@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-20
+
 ### Breaking
 
 - Billing-ledger entries are now `schema_version: 2`, which adds
