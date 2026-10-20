@@ -51,7 +51,6 @@ pub struct MintedCredential {
     /// Consecutive failed mints. Only the refresher (one task) takes the lock.
     failures: Mutex<u32>,
     mint_warnings: WarnLimiter,
-    refusal_warnings: WarnLimiter,
 }
 
 /// Why one mint failed. Carries no key, assertion or token.
@@ -98,7 +97,6 @@ impl MintedCredential {
             current: ArcSwapOption::empty(),
             failures: Mutex::new(0),
             mint_warnings: WarnLimiter::new(),
-            refusal_warnings: WarnLimiter::new(),
         }
     }
 
@@ -114,13 +112,6 @@ impl MintedCredential {
         let token = self.current.load();
         let token = token.as_ref()?;
         (now < token.expires_at).then(|| token.bearer.clone())
-    }
-
-    /// Records one request refused for want of a token. Returns the number of
-    /// refusals suppressed since the last warning when the caller should warn
-    /// now: at most once a minute per cluster.
-    pub fn note_refusal(&self) -> Option<u64> {
-        self.refusal_warnings.check()
     }
 }
 
