@@ -134,6 +134,22 @@ pub enum FormatOp {
     /// there is no cost.
     LlmCostKind,
     LlmRateCardVersion,
+    /// `%LLM_IMAGES%` -- images the response returned. `-` when no image count was observed.
+    LlmImages,
+    /// `%LLM_INPUT_CHARACTERS%` -- Unicode characters in the request `input`. `-` when not counted.
+    LlmInputCharacters,
+    /// `%LLM_AUDIO_MS%` -- audio duration the provider reported, in milliseconds. `-` when none.
+    LlmAudioMs,
+    /// `%LLM_INPUT_IMAGE_TOKENS%` -- image tokens inside the input tokens. `-` when the provider reported no tokens.
+    LlmInputImageTokens,
+    /// `%LLM_OUTPUT_IMAGE_TOKENS%` -- image tokens inside the output tokens. `-` when the provider reported no tokens.
+    LlmOutputImageTokens,
+    /// `%LLM_INPUT_AUDIO_TOKENS%` -- audio tokens inside the input tokens. `-` when the provider reported no tokens.
+    LlmInputAudioTokens,
+    /// `%LLM_OUTPUT_AUDIO_TOKENS%` -- audio tokens inside the output tokens. `-` when the provider reported no tokens.
+    LlmOutputAudioTokens,
+    /// `%LLM_PRICE_BASIS%` -- what the rate card entry prices: `tokens`, `images`, `characters` or `audio_seconds`. `-` when there is no priced usage.
+    LlmPriceBasis,
 }
 
 /// The unit `%COMMON_DURATION%` renders in. Envoy truncates toward zero, so
@@ -534,6 +550,38 @@ fn build_op(
             bare(name, args, truncate, input)?;
             FormatOp::LlmRateCardVersion
         }
+        "LLM_IMAGES" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmImages
+        }
+        "LLM_INPUT_CHARACTERS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmInputCharacters
+        }
+        "LLM_AUDIO_MS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmAudioMs
+        }
+        "LLM_INPUT_IMAGE_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmInputImageTokens
+        }
+        "LLM_OUTPUT_IMAGE_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmOutputImageTokens
+        }
+        "LLM_INPUT_AUDIO_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmInputAudioTokens
+        }
+        "LLM_OUTPUT_AUDIO_TOKENS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmOutputAudioTokens
+        }
+        "LLM_PRICE_BASIS" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::LlmPriceBasis
+        }
         other => {
             return Err(err(format!(
                 "unknown access-log format operator `%{other}%` in format string `{input}`"
@@ -559,6 +607,25 @@ pub struct LlmTokens {
     pub cached: u64,
     pub cache_creation: u64,
     pub output: u64,
+}
+
+/// Count meters, modality token subsets and the price basis of one request,
+/// for the `%LLM_IMAGES%` family of operators. Each is `None` when it was not
+/// observed; a count of `0` is only ever a reported zero. Mirrors
+/// `proxy_http::LlmUsage` for the same layering reason as [`LlmTokens`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmMedia<'a> {
+    pub images: Option<u64>,
+    pub input_characters: Option<u64>,
+    pub audio_milliseconds: Option<u64>,
+    /// The four modality token counts are `Some` only when the provider
+    /// reported tokens at all, so they render `-` for a meter-only request.
+    pub input_image_tokens: Option<u64>,
+    pub output_image_tokens: Option<u64>,
+    pub input_audio_tokens: Option<u64>,
+    pub output_audio_tokens: Option<u64>,
+    /// `PriceBasis::as_str()` of the rate-card entry that priced the request.
+    pub price_basis: Option<&'a str>,
 }
 
 impl LlmTokens {
@@ -739,6 +806,8 @@ pub struct LogContext<'a> {
     /// `list` / `estimate`; `None` when there is no cost.
     pub llm_cost_kind: Option<&'a str>,
     pub llm_rate_card_version: Option<&'a str>,
+    /// Meters, modality tokens and price basis (ADR-0010).
+    pub llm_media: LlmMedia<'a>,
 
     /// The request's `%COMMON_DURATION%` time points.
     pub time_points: TimePoints,
@@ -954,6 +1023,49 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::LlmUsageCompleteness => out.push_str(ctx.llm_usage_completeness.unwrap_or("-")),
         FormatOp::LlmCostKind => out.push_str(ctx.llm_cost_kind.unwrap_or("-")),
         FormatOp::LlmRateCardVersion => out.push_str(ctx.llm_rate_card_version.unwrap_or("-")),
+        FormatOp::LlmImages => match ctx.llm_media.images {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmInputCharacters => match ctx.llm_media.input_characters {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmAudioMs => match ctx.llm_media.audio_milliseconds {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmInputImageTokens => match ctx.llm_media.input_image_tokens {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmOutputImageTokens => match ctx.llm_media.output_image_tokens {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmInputAudioTokens => match ctx.llm_media.input_audio_tokens {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmOutputAudioTokens => match ctx.llm_media.output_audio_tokens {
+            Some(n) => {
+                let _ = write!(out, "{}", n);
+            }
+            None => out.push('-'),
+        },
+        FormatOp::LlmPriceBasis => out.push_str(ctx.llm_media.price_basis.unwrap_or("-")),
         FormatOp::LlmListCost => match ctx.llm_list_cost_nanodollars {
             Some(cost) => {
                 let _ = write!(out, "{cost}");
@@ -1294,6 +1406,7 @@ mod tests {
             llm_usage_completeness: None,
             llm_cost_kind: None,
             llm_rate_card_version: None,
+            llm_media: LlmMedia::default(),
 
             request_method: Some("POST"),
             request_path: Some("/v1/chat/completions"),
@@ -1301,6 +1414,39 @@ mod tests {
             request_scheme: Some("https"),
             time_points: TimePoints::default(),
         }
+    }
+
+    #[test]
+    fn media_operators_render_values_and_dash_when_absent() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        for (op, expect) in [
+            ("%LLM_IMAGES%", "3"),
+            ("%LLM_INPUT_CHARACTERS%", "120"),
+            ("%LLM_AUDIO_MS%", "2500"),
+            ("%LLM_INPUT_IMAGE_TOKENS%", "11"),
+            ("%LLM_OUTPUT_IMAGE_TOKENS%", "0"),
+            ("%LLM_INPUT_AUDIO_TOKENS%", "13"),
+            ("%LLM_OUTPUT_AUDIO_TOKENS%", "14"),
+            ("%LLM_PRICE_BASIS%", "images"),
+        ] {
+            let fs = parse(op);
+            assert_eq!(render(&fs, &c), "-", "{op} absent");
+            c.llm_media = LlmMedia {
+                images: Some(3),
+                input_characters: Some(120),
+                audio_milliseconds: Some(2500),
+                input_image_tokens: Some(11),
+                output_image_tokens: Some(0),
+                input_audio_tokens: Some(13),
+                output_audio_tokens: Some(14),
+                price_basis: Some("images"),
+            };
+            assert_eq!(render(&fs, &c), expect, "{op} present");
+            c.llm_media = LlmMedia::default();
+        }
+        assert!(parse_format("%LLM_IMAGES(x)%").is_err());
+        assert!(parse_format("%LLM_NOT_AN_OPERATOR%").is_err());
     }
 
     #[test]

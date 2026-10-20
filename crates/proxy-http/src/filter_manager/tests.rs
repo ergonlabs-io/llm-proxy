@@ -3588,12 +3588,15 @@ impl HttpFilter for StampsUsageOnEndStreamFilter {
         end_stream: bool,
     ) -> FilterDataStatus {
         if end_stream {
-            cb.stream_info().llm.usage = Some(crate::stream_info::LlmTokenUsage {
-                input_tokens: 42,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                output_tokens: 0,
-            });
+            cb.stream_info().llm.usage = Some(crate::stream_info::LlmUsage::from_tokens(
+                crate::stream_info::LlmTokenUsage {
+                    input_tokens: 42,
+                    cached_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 0,
+                    ..Default::default()
+                },
+            ));
         }
         FilterDataStatus::Continue
     }
@@ -3773,12 +3776,15 @@ struct StampsUsageOnStreamCompleteFilter;
 
 impl HttpFilter for StampsUsageOnStreamCompleteFilter {
     fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
-        cb.stream_info().llm.usage = Some(crate::stream_info::LlmTokenUsage {
-            input_tokens: 7,
-            cached_tokens: 0,
-            cache_creation_tokens: 0,
-            output_tokens: 0,
-        });
+        cb.stream_info().llm.usage = Some(crate::stream_info::LlmUsage::from_tokens(
+            crate::stream_info::LlmTokenUsage {
+                input_tokens: 7,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 0,
+                ..Default::default()
+            },
+        ));
     }
 }
 
@@ -4553,12 +4559,15 @@ impl HttpFilter for StampsUsageAndClusterFilter {
         if end_stream {
             let info = &mut *cb.stream_info();
             info.upstream_cluster = Some("provider:openai".to_string());
-            info.llm.usage = Some(crate::stream_info::LlmTokenUsage {
-                input_tokens: 11,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                output_tokens: 7,
-            });
+            info.llm.usage = Some(crate::stream_info::LlmUsage::from_tokens(
+                crate::stream_info::LlmTokenUsage {
+                    input_tokens: 11,
+                    cached_tokens: 0,
+                    cache_creation_tokens: 0,
+                    output_tokens: 7,
+                    ..Default::default()
+                },
+            ));
         }
         FilterDataStatus::Continue
     }

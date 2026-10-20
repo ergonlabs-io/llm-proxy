@@ -30,7 +30,7 @@ The configuration format for llm-proxy. This file is the single source of truth 
 | `routes` | array of [Route](#route); minimum items 0 | yes | none | Ordered routing rules, evaluated top to bottom — the FIRST rule whose `model` pattern matches the request wins (there is no specificity reordering; put specific patterns above broad ones). Requests matching no rule and no `models` entry get a 404 with a JSON error body listing known models. |
 | `limits` | array of [Limit](#limit) | no | none | Rate limits and quotas. Every field is enforced as written. Each entry becomes one rule; a request must pass every rule that applies to it, and the first rule it exceeds rejects it with a 429 carrying `x-ratelimit-*` headers before the request is forwarded. Rule buckets are independent of the route. Token and request windows are one minute and epoch-aligned (they reset on the wall-clock minute, not a minute after first use). Token counts are extracted from provider responses, streaming included, and an admitted request already in flight is never truncated. Token and request counts reconcile with the store `auth.store` selects about once a second: with `auth.store: shared` replicas share them (and the fleet can admit a little over a limit between reconciles); with `in_memory` or `persistent`, or with no `auth:` block, each replica counts alone. Concurrent sessions follow the same rule: with `auth.store: shared` replicas share them through lease rows, and a replica that stops holds its slots for at most 5 seconds. |
 | `observability` | [Observability](#observability) | no | none | Access logging, OTLP metric export, and OTLP trace export. Access log lines include token counts and TTFT/TPOT. Metrics are always served on the admin endpoint at `/stats` and `/stats/prometheus`, with no configuration here; `metrics` adds OTLP export of the same instruments. |
-| `pricing` | [Pricing](#pricing) | no | none | Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused. |
+| `pricing` | [Pricing](#pricing) | no | none | Versioned LLM model rate card. Each completed request is priced in integer nanodollars using the meters of each entry's `basis`: all four text token buckets (plus optional image and audio token rates) for `tokens`, or a price per generated image for `images`. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused. |
 | `auto` | [AutoModel](#automodel) | no | none | Resolution of the reserved model name `auto`. A request whose `model` is `auto` is routed as the model this block selects: the tenant's entry in `tenants`, otherwise `default`. With no matching entry and no `default`, the request is refused with 400. Any other model name is routed unchanged. The provider's response is passed through unchanged, so its `model` field names the model the provider served, not `auto`. Access logs and usage records show both `auto` and the resolved model. While this block is set, `auto` is reserved: a `models` key or `routes[].model` of exactly `auto` is a load error. Absent means `auto` is an ordinary model name. Examples: `{"default": "gpt-4o-mini", "tenants": {"acme": "claude-sonnet"}}`. |
 | `ledger` | [Ledger](#ledger) | no | none | The billing ledger: one durable, encrypted entry for every request dialled to a provider, including requests charged zero. An entry carries the request record, the amount charged to spend (or the list price on a route with no budget), the scopes charged, and an `instance_id`, a per-start `epoch` and a gapless `seq`. Each request reserves ledger capacity before it is dialled. When none is available (every slot held, the writer failed, or the spool at `max_disk_bytes`), `on_unavailable` decides what happens. Entries are committed in groups. A crash loses every entry not yet committed: normally the entries of about the last `group_commit_interval`, but while the spool is at `max_disk_bytes` the proxy holds entries in memory until an acknowledgement frees space, and a crash loses all of them. The bound in every case is `max_reservations` entries, since a slot is held until its entry commits. Committed entries are never evicted. The proxy needs a node id unique to this replica and stable across restarts (`--service-node`); it is the entries' `instance_id`. Absent means no ledger. Examples: `{"directory": "/var/lib/llm-proxy/ledger", "encryption_key_file": "/etc/llm-proxy/ledger.key", "encryption_key_id": "ledger-2026", "max_disk_bytes": 10737418240}`. |
 | `guardrails` | [Guardrails](#guardrails) | no | none | Body-aware request checks. Each request with a body is sent to a check before any provider is dialled: its tenant's entry in `tenants`, otherwise `default`. The check receives the request body with the tenant and the requested and resolved model, and answers allow or deny. A denied request is refused with 403 and the check's reason; it is not dialled, not charged, not counted against a limit, and gets no ledger entry. The check only allows or denies; it never changes the request. Sending a request body to a check discloses every prompt to that service: point `url` only at a service trusted with them. Only a request that authentication and model authorization admit is sent. A request with an empty body is not checked. Each check adds one round trip to every checked request. Outcomes are counted in `llmproxy_guardrail_checks_total` and logged by `%LLM_GUARDRAIL%`. Absent means no request is checked. Examples: `{"default": {"http": {"url": "http://127.0.0.1:9000/check", "timeout": "500ms", "max_body_bytes": 1048576}, "failure_mode": "closed"}}`. |
@@ -596,14 +596,21 @@ Used at: `pricing.price_list.entries[]`.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
+| `basis` | one of `tokens`, `images` | no | `tokens` | What the entry prices. `tokens`: text, and optionally image and audio, tokens, priced by `tier_mode` and `tiers`. `images`: each generated image, priced by `image_prices`. An `images` entry sets neither `tier_mode` nor `tiers`, and cannot set `cached_input_unpriced` or `cache_write_unpriced` to true, because it prices no tokens. |
+| `image_prices` | array of [ImagePrice](#imageprice); minimum items 1 | no | none | Required for `basis: images`, and not allowed otherwise. The most specific matching row prices each image: a row naming both `size` and `quality` first, then one naming one, then one naming neither. A request matches a row when each attribute the row names equals the value in the response, or in the request body when the response does not echo it. Values are plain strings matched exactly. A request that matches no row is unpriced: it costs zero and is logged, like an unpriced model. Two rows of the same specificity that one request could match are a load error: identical `size` and `quality` pairs, or a row naming only `size` beside a row naming only `quality`. |
 | `cached_input_unpriced` | boolean | no | `false` | Requests reporting cached input remain unpriced. |
 | `cache_write_unpriced` | boolean | no | `false` | Requests reporting cache creation remain unpriced. |
 | `provider_type` | string; minimum length 1 | yes | none | The provider type the price applies to, for example `openai` or `anthropic`. Matches the `type` of the provider that served the request, set or inferred from its name. |
 | `model` | string; minimum length 1 | yes | none | The model name, matched exactly and case-sensitively against the selected model: the upstream model name for the provider that served the request, or the requested model when no mapping applies. |
-| `tier_mode` | one of `whole_request`, `graduated` | yes | none | How `tiers` price a request. `whole_request`: the band selected by the input context size prices every token of the request. `graduated`: each context token costs the rate of the band that holds its position, and output tokens cost the rate of the band the whole context selects. No default, because the two modes give different prices. |
-| `tiers` | array of [PricingTier](#pricingtier); minimum items 1 | yes | none | The price bands, in increasing `up_to` order; exactly one band, the last, leaves `up_to` out. |
+| `tier_mode` | one of `whole_request`, `graduated` | no | none | Required for `basis: tokens`, and not allowed for `images`. How `tiers` price a request. `whole_request`: the band selected by the input context size prices every token of the request. `graduated`: each context token costs the rate of the band that holds its position, and output tokens cost the rate of the band the whole context selects. No default, because the two modes give different prices. |
+| `tiers` | array of [PricingTier](#pricingtier); minimum items 1 | no | none | Required for `basis: tokens`, and not allowed for `images`. The price bands, in increasing `up_to` order; exactly one band, the last, leaves `up_to` out. |
 
 Any other field is a load error.
+
+Rules:
+
+- When `basis` is `images`: `image_prices` must be set. None of `tier_mode`, `tiers` is set.
+- When `basis` is not `images`: `tier_mode`, `tiers` must be set. `image_prices` is not set.
 
 ## `HttpGuardrail`
 
@@ -631,6 +638,18 @@ One RSA public key, as in a JWKS document.
 
 Any other field is a load error.
 
+## `ImagePrice`
+
+Used at: `pricing.price_list.entries[].image_prices[]`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `size` | string; minimum length 1 | no | none | The image size this row applies to, for example `1024x1024`. Matched exactly as written. Leave it out to match any size. |
+| `quality` | string; minimum length 1 | no | none | The image quality this row applies to, for example `high`. Matched exactly as written. Leave it out to match any quality. |
+| `nanodollars_per_image` | integer; minimum 0 | yes | none | The price of one image, in nanodollars (0.04 USD is `40000000`). |
+
+Any other field is a load error.
+
 ## `PricingTier`
 
 Used at: `pricing.price_list.entries[].tiers[]`.
@@ -642,6 +661,10 @@ Used at: `pricing.price_list.entries[].tiers[]`.
 | `cached_input_nanodollars_per_token` | integer; minimum 0 | yes | none | The price of one cache-read token, in nanodollars. |
 | `cache_write_nanodollars_per_token` | integer; minimum 0 | yes | none | The price of one cache-write token, in nanodollars. |
 | `output_nanodollars_per_token` | integer; minimum 0 | yes | none | The price of one output token, in nanodollars. |
+| `image_input_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one image input token, in nanodollars. Set it on every band of the entry or on none. |
+| `image_output_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one image output token, in nanodollars. Set it on every band of the entry or on none. |
+| `audio_input_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one audio input token, in nanodollars. Set it on every band of the entry or on none. |
+| `audio_output_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one audio output token, in nanodollars. Set it on every band of the entry or on none. |
 
 Any other field is a load error.
 

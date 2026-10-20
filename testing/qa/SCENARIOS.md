@@ -21,6 +21,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
 | QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17 (`qa13_billing_ledger_test.go`); approved through the billing-ledger backlog acceptance (owner, 2026-10-17) |
 | QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
+| QA-15 | Image generation under a tenant budget is charged per image and ledgered; unpriced is $0 and loud; batch refused | passing — since 2026-10-20 (`qa15_image_metering_test.go`); approved through the v0.6.0 ship gate clauses 1 and 2 (owner, 2026-10-18) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -538,3 +539,21 @@ line. Segments are sealed by SIGTERM and read as gzip JSON lines.
 **Why black box.** The Rust tests drive the tee, the exporter and the binary
 separately; this one checks the documented surface end to end: the dialect
 block, the admin opt-in, the on-disk layout and the line a consumer reads.
+
+## QA-15 — Image generation under a tenant budget is charged and ledgered
+
+**Property.** With a per-image rate card (`basis: images`), a ledger and a
+tenant spend budget, `POST /v1/images/generations` for a priced model is
+served, and its ledger entry carries a non-zero `charged_micro_usd` (two
+images at the card's price), the tenant among `charged_scopes`, and a record
+that says what was bought: `usage.images: 2`, `usage.image_size`,
+`endpoint: image_generation`, `price_basis: images`. The upstream body is
+several MB of base64, so the usage filter must count it without holding it.
+An image model the card does not price is still served, charged $0, and
+named in the unpriced warning. `POST /v1/batches` under the same budget is
+refused with `403` and never reaches the provider.
+
+**Why black box.** `ledger_e2e.rs` and `unmetered_endpoint_e2e.rs` drive the
+binary from Rust; this checks the v0.6.0 ship gate from the outside: the
+dialect rate card, the admin budget, the ledger read API, and the log line
+an operator reads.

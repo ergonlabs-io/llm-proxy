@@ -2094,6 +2094,7 @@ mod tests {
             chain: "chain-a".into(),
             version: format!("v-{marker}"),
             card_json: format!(r#"{{"marker":"{marker}"}}"#),
+            schema_version: crate::control::RATE_CARD_SCHEMA_V1,
         };
         let base = store.policy_generation().unwrap();
 

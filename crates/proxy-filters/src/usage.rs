@@ -79,9 +79,30 @@ pub const MAX_SSE_LINE_BYTES: usize = 1 << 20; // 1 MiB
 ///   `openai_scanner_does_not_misread_anthropic_events` test covers this.
 /// - `usage` present but not a JSON object (e.g. a string) → `None`.
 pub fn extract_json_usage(dialect: Dialect, body: &[u8]) -> Option<TokenUsage> {
+    extract_json_usage_parts(dialect, body).map(|(usage, _)| usage)
+}
+
+/// As [`extract_json_usage`], with the [`Modality`] subsets the same `usage`
+/// object reported.
+pub fn extract_json_usage_parts(dialect: Dialect, body: &[u8]) -> Option<(TokenUsage, Modality)> {
     let json_body: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = json_body.get("usage")?;
-    usage_from_object(dialect, usage)
+    usage_parts(dialect, usage)
+}
+
+/// Read one raw `usage` object (as JSON text) into its token buckets and
+/// modality subsets. `None` when it is not JSON or carries none of this
+/// dialect's token keys.
+pub fn usage_object_parts(dialect: Dialect, usage: &str) -> Option<(TokenUsage, Modality)> {
+    let usage: serde_json::Value = serde_json::from_str(usage).ok()?;
+    usage_parts(dialect, &usage)
+}
+
+fn usage_parts(dialect: Dialect, usage: &serde_json::Value) -> Option<(TokenUsage, Modality)> {
+    Some((
+        usage_from_object(dialect, usage)?,
+        read_modality(dialect, usage),
+    ))
 }
 
 /// Extract usage from the last bytes of a response body too large to hold
@@ -98,9 +119,17 @@ pub fn extract_json_usage(dialect: Dialect, body: &[u8]) -> Option<TokenUsage> {
 /// that requires a non-standard response and the object must still parse as
 /// this dialect's token counts, otherwise the answer is `None`, never a guess.
 pub fn extract_json_usage_from_tail(dialect: Dialect, tail: &[u8]) -> Option<TokenUsage> {
+    extract_json_usage_parts_from_tail(dialect, tail).map(|(usage, _)| usage)
+}
+
+/// As [`extract_json_usage_from_tail`], with the [`Modality`] subsets.
+pub fn extract_json_usage_parts_from_tail(
+    dialect: Dialect,
+    tail: &[u8],
+) -> Option<(TokenUsage, Modality)> {
     let span = tail_usage_span(tail)?;
     let usage: serde_json::Value = serde_json::from_slice(span).ok()?;
-    usage_from_object(dialect, &usage)
+    usage_parts(dialect, &usage)
 }
 
 /// The byte span of the top-level `usage` object inside a body tail, found by
@@ -228,7 +257,7 @@ impl UpstreamEvidence {
         true
     }
 
-    fn set_usage(&mut self, raw: &str) {
+    pub(crate) fn set_usage(&mut self, raw: &str) {
         let raw = raw.trim();
         // Only an object is a usage record; `null` (OpenAI sends it on every
         // content chunk when usage is requested) must not replace a real one.
@@ -571,6 +600,66 @@ fn read_tokens(dialect: Dialect, usage: &serde_json::Value) -> RawTokens {
     }
 }
 
+/// Image and audio tokens a `usage` object reported inside its input and
+/// output counts (ADR-0010 decision 2). Subsets, not extra buckets: a rate
+/// card prices them at a modality rate only when its entry has one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Modality {
+    pub input_image_tokens: u64,
+    pub output_image_tokens: u64,
+    pub input_audio_tokens: u64,
+    pub output_audio_tokens: u64,
+}
+
+/// Read the modality subsets of one `usage` object. The field names come from
+/// the API shape, never from a provider name:
+/// - chat completions: `prompt_tokens_details.audio_tokens` and
+///   `completion_tokens_details.audio_tokens`;
+/// - the Responses and Images shape: `input_tokens_details.image_tokens`,
+///   `output_tokens_details.image_tokens`, and transcription's
+///   `input_token_details.audio_tokens`.
+///
+/// An absent or unreadable field is 0, which prices those tokens at the text
+/// rate as before.
+fn read_modality(dialect: Dialect, usage: &serde_json::Value) -> Modality {
+    let at = |object: &str, key: &str| {
+        token_count(usage.get(object).and_then(|d| d.get(key))).unwrap_or(0)
+    };
+    match dialect {
+        Dialect::OpenAi => Modality {
+            input_audio_tokens: at("prompt_tokens_details", "audio_tokens"),
+            output_audio_tokens: at("completion_tokens_details", "audio_tokens"),
+            ..Modality::default()
+        },
+        Dialect::OpenAiResponses => Modality {
+            input_image_tokens: at("input_tokens_details", "image_tokens"),
+            output_image_tokens: at("output_tokens_details", "image_tokens"),
+            input_audio_tokens: at("input_token_details", "audio_tokens"),
+            ..Modality::default()
+        },
+        Dialect::Anthropic => Modality::default(),
+    }
+}
+
+/// Merge one frame's modality subsets: a field is set only when the frame's
+/// usage carried it, as [`merge_usage`] does for the buckets.
+fn merge_modality(target: &mut Modality, dialect: Dialect, usage: &serde_json::Value) {
+    if read_tokens(dialect, usage).is_empty() {
+        return;
+    }
+    let frame = read_modality(dialect, usage);
+    for (into, from) in [
+        (&mut target.input_image_tokens, frame.input_image_tokens),
+        (&mut target.output_image_tokens, frame.output_image_tokens),
+        (&mut target.input_audio_tokens, frame.input_audio_tokens),
+        (&mut target.output_audio_tokens, frame.output_audio_tokens),
+    ] {
+        if from > 0 {
+            *into = from;
+        }
+    }
+}
+
 /// Read a complete `usage` object into a [`TokenUsage`], defaulting missing
 /// (but recognized) buckets to `0`.
 ///
@@ -657,6 +746,8 @@ pub struct SseUsageScanner {
     partial: Vec<u8>,
     /// Best usage known so far.
     usage: Option<TokenUsage>,
+    /// The modality subsets of that usage.
+    modality: Modality,
     /// The first model name any frame reported; later frames never replace it.
     served_model: Option<String>,
     /// The provider's response id (first frame that names one) and last
@@ -677,6 +768,7 @@ impl SseUsageScanner {
             dialect,
             partial: Vec::new(),
             usage: None,
+            modality: Modality::default(),
             served_model: None,
             upstream: UpstreamEvidence::default(),
             id_decided: false,
@@ -709,6 +801,7 @@ impl SseUsageScanner {
             let line: Vec<u8> = self.partial.drain(..=newline_pos).collect();
             merge_line(
                 &mut self.usage,
+                &mut self.modality,
                 &mut self.served_model,
                 &mut self.upstream,
                 &mut self.id_decided,
@@ -736,6 +829,26 @@ impl SseUsageScanner {
         if !self.partial.is_empty() {
             merge_line(
                 &mut result,
+                &mut Modality::default(),
+                &mut None,
+                &mut UpstreamEvidence::default(),
+                &mut true,
+                &mut 0,
+                self.dialect,
+                &self.partial,
+            );
+        }
+        result
+    }
+
+    /// The modality subsets of [`Self::usage`], folding in an unterminated
+    /// final line the same way.
+    pub fn modality(&self) -> Modality {
+        let mut result = self.modality;
+        if !self.partial.is_empty() {
+            merge_line(
+                &mut None,
+                &mut result,
                 &mut None,
                 &mut UpstreamEvidence::default(),
                 &mut true,
@@ -758,6 +871,7 @@ impl SseUsageScanner {
         let mut result = None;
         merge_line(
             &mut None,
+            &mut Modality::default(),
             &mut result,
             &mut UpstreamEvidence::default(),
             &mut true,
@@ -778,6 +892,7 @@ impl SseUsageScanner {
         let mut evidence = self.upstream.clone();
         merge_line(
             &mut None,
+            &mut Modality::default(),
             &mut None,
             &mut evidence,
             &mut self.id_decided.clone(),
@@ -922,8 +1037,10 @@ fn merge_usage(target: &mut Option<TokenUsage>, dialect: Dialect, usage: &serde_
 /// merge any usage it carries into `target`. Shared by [`SseUsageScanner::push`]
 /// (per newline-terminated line) and [`SseUsageScanner::usage`] (the final
 /// unterminated line at end-of-stream).
+#[allow(clippy::too_many_arguments)]
 fn merge_line(
     target: &mut Option<TokenUsage>,
+    modality: &mut Modality,
     served_model: &mut Option<String>,
     upstream: &mut UpstreamEvidence,
     id_decided: &mut bool,
@@ -948,6 +1065,7 @@ fn merge_line(
     };
     if let Some(usage) = frame_usage_object(dialect, &value) {
         merge_usage(target, dialect, usage);
+        merge_modality(modality, dialect, usage);
     }
     *text_bytes = text_bytes.saturating_add(frame_text_bytes(dialect, &value));
     // Second pass for the raw text. The typed parse above cannot give back the

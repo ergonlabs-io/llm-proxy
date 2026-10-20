@@ -175,6 +175,7 @@ fn an_unrelated_write_does_not_reinstall_the_card() {
         chain: CHAIN.into(),
         version: "v".into(),
         card_json: context(&card_json("v1", 10)).to_wire_json(),
+        schema_version: crate::control::RATE_CARD_SCHEMA_V1,
     })
     .unwrap();
     cp_b.poll_once().unwrap();
@@ -502,6 +503,7 @@ fn a_future_dated_card_is_refused_on_put_at_boot_and_from_the_store() {
         chain: CHAIN.into(),
         version: "future".into(),
         card_json: context(&future_card).to_wire_json(),
+        schema_version: crate::control::RATE_CARD_SCHEMA_V1,
     })
     .unwrap();
     cp.poll_once().unwrap();
@@ -533,6 +535,7 @@ fn a_card_dated_ahead_of_this_clock_is_deferred_quietly_and_installed_once_reach
         chain: CHAIN.into(),
         version: "ahead".into(),
         card_json: context(&json).to_wire_json(),
+        schema_version: crate::control::RATE_CARD_SCHEMA_V1,
     };
 
     let (capture, guard) = Capture::start();
@@ -576,6 +579,7 @@ fn a_stored_card_a_little_ahead_of_this_clock_is_still_installed() {
         chain: CHAIN.into(),
         version: "soon".into(),
         card_json: context(&json).to_wire_json(),
+        schema_version: crate::control::RATE_CARD_SCHEMA_V1,
     })
     .unwrap();
     cp.poll_once().unwrap();
@@ -598,6 +602,7 @@ fn an_unusable_stored_card_keeps_the_previous_card_and_warns() {
         chain: CHAIN.into(),
         version: "bad".into(),
         card_json: "{not a card".into(),
+        schema_version: crate::control::RATE_CARD_SCHEMA_V1,
     })
     .unwrap();
     cp.poll_once().unwrap();
@@ -699,12 +704,13 @@ fn dollar_enforcement_agrees_with_graduated_pricing_of_cache_tokens() {
     .to_string();
     let r = registry();
     r.publish_json(&card).unwrap();
-    let usage = TokenUsage {
+    let usage = LlmUsage::from_tokens(LlmTokenUsage {
         input_tokens: 500,
         cached_tokens: 800,
         cache_creation_tokens: 0,
         output_tokens: 10,
-    };
+        ..LlmTokenUsage::default()
+    });
     // 980,000 nanodollars, rounded up to micro-dollars.
     assert_eq!(
         r.cost_micro_usd(Some("provider:openai"), Some("gpt-5"), &usage),
@@ -859,6 +865,7 @@ fn a_concurrent_publish_from_another_replica_wins_on_the_publishing_replica() {
             chain: CHAIN.into(),
             version: card_b.list.version().to_string(),
             card_json: card_b.to_wire_json(),
+            schema_version: crate::control::RATE_CARD_SCHEMA_V1,
         },
         pending: std::sync::atomic::AtomicBool::new(true),
     };

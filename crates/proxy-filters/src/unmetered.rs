@@ -47,10 +47,11 @@ impl Control {
     }
 }
 
-/// Whether a spend budget can count `endpoint`. Phase 1 meters the five text
-/// endpoints; images and audio join in later phases (ADR-0010 "Phasing").
+/// Whether a spend budget can count `endpoint`: the five text endpoints, and
+/// image generation, metered in tokens or images (ADR-0010 phase 2). Image
+/// edits and audio join in phase 3.
 pub(crate) fn metered_under_spend(endpoint: Endpoint) -> bool {
-    endpoint.reports_text_tokens()
+    endpoint.reports_text_tokens() || endpoint == Endpoint::ImageGeneration
 }
 
 /// Whether a token limit can count `endpoint`. Token limits count tokens

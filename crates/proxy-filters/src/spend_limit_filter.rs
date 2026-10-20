@@ -48,7 +48,6 @@ use crate::spend::{
     self, Charge, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy, SpendAccumulator,
 };
 use crate::unmetered::{self, RefusalCounter};
-use crate::usage::TokenUsage;
 use crate::usage_filter::PricingRegistry;
 
 /// Type URL this filter is registered under.
@@ -541,6 +540,9 @@ const MAX_UNPRICED_MODEL_CHARS: usize = 128;
 struct UnpricedWarner {
     chain: String,
     seen: Mutex<UnpricedSeen>,
+    /// Models already warned about for modality tokens charged at the text
+    /// rate (ADR-0010 decision 3). Separate from `seen`: a model can be both.
+    underpriced: Mutex<UnpricedSeen>,
 }
 
 #[derive(Default)]
@@ -554,19 +556,26 @@ impl UnpricedWarner {
         UnpricedWarner {
             chain,
             seen: Mutex::new(UnpricedSeen::default()),
+            underpriced: Mutex::new(UnpricedSeen::default()),
         }
     }
 
-    /// `reason` runs only when a line is actually written.
-    fn note(&self, model: Option<&str>, cluster: Option<&str>, reason: impl FnOnce() -> String) {
+    /// The bounded model name, when this is the first time `seen` meets it.
+    /// Past the cap, says so once and remembers nothing more.
+    fn first_time(
+        &self,
+        seen: &Mutex<UnpricedSeen>,
+        model: Option<&str>,
+        cap_message: &'static str,
+    ) -> Option<String> {
         let name: String = model
             .unwrap_or("(no model)")
             .chars()
             .take(MAX_UNPRICED_MODEL_CHARS)
             .collect();
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.models.contains(&name) {
-            return;
+            return None;
         }
         if seen.models.len() >= MAX_UNPRICED_MODELS_REMEMBERED {
             let first_time = !seen.cap_reported;
@@ -576,15 +585,52 @@ impl UnpricedWarner {
                 tracing::warn!(
                     chain = %self.chain,
                     remembered = MAX_UNPRICED_MODELS_REMEMBERED,
-                    "spend_limit: more distinct unpriced model names than this chain remembers; \
-                     further ones are still charged $0 against dollar budgets and counted in \
-                     unpriced_requests, but are no longer named here"
+                    "{cap_message}"
                 );
             }
-            return;
+            return None;
         }
         seen.models.insert(name.clone());
-        drop(seen);
+        Some(name)
+    }
+
+    /// A request under a dollar budget reported image or audio tokens its
+    /// entry has no modality rate for. It was charged at the text rate, so the
+    /// budget counted less than the provider bills: loud, once per model.
+    fn note_underpriced(&self, model: Option<&str>, cluster: Option<&str>) {
+        let Some(name) = self.first_time(
+            &self.underpriced,
+            model,
+            "spend_limit: more distinct underpriced model names than this chain remembers; \
+             further ones are still counted in llmproxy_usage_underpriced_modality_requests_total, \
+             but are no longer named here",
+        ) else {
+            return;
+        };
+        // Debug formatting for the client-chosen name, as in `note`.
+        tracing::warn!(
+            chain = %self.chain,
+            model = ?name,
+            cluster = ?cluster,
+            "spend_limit: a request under a dollar budget reported image or audio tokens that \
+             its rate-card entry has no modality rate for, so they were charged at the text \
+             rate, below the provider's price. Add the image_* or audio_* rates to the entry \
+             (PUT /pricing). Counted in llmproxy_usage_underpriced_modality_requests_total; \
+             logged once per model."
+        );
+    }
+
+    /// `reason` runs only when a line is actually written.
+    fn note(&self, model: Option<&str>, cluster: Option<&str>, reason: impl FnOnce() -> String) {
+        let Some(name) = self.first_time(
+            &self.seen,
+            model,
+            "spend_limit: more distinct unpriced model names than this chain remembers; \
+             further ones are still charged $0 against dollar budgets and counted in \
+             unpriced_requests, but are no longer named here",
+        ) else {
+            return;
+        };
         // Debug formatting for the client-chosen name, so control characters
         // in it cannot forge a log line. Nothing credential-shaped is in this
         // line: the chain, cluster and model names and the reason.
@@ -667,7 +713,7 @@ impl SpendLimitFilterInstance {
         let (usage, cluster, model, selected_model, served_model, credential_source) = {
             let info = cb.stream_info();
             (
-                info.llm.usage,
+                info.llm.usage.clone(),
                 info.upstream_cluster.clone(),
                 info.routing_model().map(str::to_owned),
                 info.selected_model.clone(),
@@ -687,25 +733,25 @@ impl SpendLimitFilterInstance {
             return;
         };
 
-        let usage = TokenUsage {
-            input_tokens: usage.input_tokens,
-            cached_tokens: usage.cached_tokens,
-            cache_creation_tokens: usage.cache_creation_tokens,
-            output_tokens: usage.output_tokens,
-        };
         // Price at the same model the usage filter priced the logged cost at,
         // so the spend charge and the record agree when a provider served a
         // different model than the one sent.
         let sent_model = selected_model.as_deref().or(model.as_deref());
-        let charge = PricingRegistry::cost_micro_usd_served(
+        let priced = PricingRegistry::price_served(
             self.pricing_snapshot.as_ref(),
             cluster.as_deref(),
             sent_model,
             served_model.as_deref(),
             &usage,
-        )
-        .map_or(Charge::Unpriced, |micros| {
-            Charge::Priced(MicroUsd::from_micros(micros))
+        );
+        if self.budget_applies && priced.is_some_and(|priced| priced.underpriced_modality) {
+            self.unpriced_warner
+                .note_underpriced(sent_model, cluster.as_deref());
+        }
+        let charge = priced.map_or(Charge::Unpriced, |priced| {
+            Charge::Priced(MicroUsd::from_micros(PricingRegistry::charge_micro_usd(
+                priced.nanodollars,
+            )))
         });
 
         // A configured dollar budget just counted this request as $0 because
@@ -722,6 +768,7 @@ impl SpendLimitFilterInstance {
                         self.pricing_snapshot.as_ref(),
                         cluster.as_deref(),
                         priced_model,
+                        &usage,
                     )
                 });
         }
@@ -805,10 +852,10 @@ impl HttpFilter for SpendLimitFilterInstance {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        headers: &mut RequestHeaders,
+        _headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
-        self.endpoint = Endpoint::classify(&headers.method, headers.uri.path());
+        self.endpoint = cb.stream_info().llm.endpoint;
         // Rust note: `stream_info()` hands back a `RefMut` guard that must
         // not be held across another call on `cb` -- cloning the
         // `Option<String>` out and letting the guard drop at the end of this
@@ -1308,6 +1355,19 @@ mod tests {
         })
     }
 
+    /// What `FilterChainHandler::handle` does before any filter runs:
+    /// classify the request once into stream info (ADR-0010 decision 1).
+    fn decode(
+        filter: &mut dyn HttpFilter,
+        cb: &mut TestCallbacks,
+        headers: &mut RequestHeaders,
+        end_stream: bool,
+    ) -> FilterHeadersStatus {
+        cb.stream_info.borrow_mut().llm.endpoint =
+            proxy_http::endpoint::Endpoint::classify(&headers.method, headers.uri.path());
+        filter.decode_headers(cb, headers, end_stream)
+    }
+
     struct TestCallbacks {
         route: Option<Arc<RouteEntry>>,
         stream_info: RefCell<StreamInfo>,
@@ -1356,7 +1416,8 @@ mod tests {
         }
 
         fn set_usage(&self, usage: LlmTokenUsage) {
-            self.stream_info.borrow_mut().llm.usage = Some(usage);
+            self.stream_info.borrow_mut().llm.usage =
+                Some(proxy_http::LlmUsage::from_tokens(usage));
         }
 
         fn set_upstream(&self, cluster: &str, model: &str) {
@@ -1664,7 +1725,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant(tenant);
         let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         if cb.local_reply.is_none() {
             if let Some((cluster, model)) = cluster_and_model {
@@ -1708,7 +1769,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         if let Some((status, _)) = cb.local_reply.clone() {
             return Some(status);
         }
@@ -1914,6 +1975,48 @@ mod tests {
         assert!(lines[1].contains("second"));
     }
 
+    /// ADR-0010 decision 3: audio tokens under an entry with no audio rate
+    /// are charged at the text rate, today's amount, and that under-pricing
+    /// is loud once per model where a budget applies.
+    #[test]
+    fn modality_tokens_without_a_modality_rate_charge_todays_amount_and_warn_once() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let mut card = Card::default();
+        card.insert("cluster-a", "voice", 1_000_000);
+        let harness = filter_with(&cp, card, Period::Monthly);
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        let mut charges = Vec::new();
+        for _ in 0..3 {
+            let mut filter = harness.new_instance();
+            let mut cb = TestCallbacks::new();
+            cb.set_tenant("tenant-a");
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
+            cb.set_upstream("cluster-a", "voice");
+            cb.set_usage(LlmTokenUsage {
+                input_tokens: 10,
+                input_audio_tokens: 6,
+                ..Default::default()
+            });
+            filter.encode_headers(&mut cb, &mut response_headers(), false);
+            filter.encode_data(&mut cb, &mut Bytes::new(), true);
+            let charge = cb.stream_info.borrow().llm.spend_charge.clone();
+            charges.push(charge.expect("charged").micro_usd);
+        }
+        drop(guard);
+
+        // One micro-dollar per input token; the audio tokens are inside the
+        // ten, at the text rate.
+        assert_eq!(charges, [10, 10, 10]);
+        let lines: Vec<String> = capture
+            .rendered_at_or_above(tracing::Level::WARN)
+            .into_iter()
+            .filter(|line| line.contains("no modality rate"))
+            .collect();
+        assert_eq!(lines.len(), 1, "once per model: {lines:?}");
+        assert!(lines[0].contains("voice") && lines[0].contains("cluster-a"));
+    }
+
     /// AGENTS.md "Fail-open controls": warn only where the control was meant
     /// to apply. No budget means the $0 charge bypassed nothing.
     #[test]
@@ -2020,7 +2123,7 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_tenant_mode();
         cb.set_credential_source(Some(CredentialSource::Tenant));
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         cb.set_upstream("cluster-a", "evil\nWARN forged line");
         cb.set_usage(usage(5));
 
@@ -2089,7 +2192,7 @@ mod tests {
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
             cb.set_tenant("tenant-a");
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             cb.set_upstream("cluster-a", "gpt-5");
             cb.stream_info.borrow_mut().llm.served_model = served.map(str::to_owned);
             cb.set_usage(usage(5000));
@@ -2138,7 +2241,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         // No `set_tenant` call -- StreamInfo::auth.tenant stays `None`.
         let mut head = request_headers();
-        let status = filter.decode_headers(&mut cb, &mut head, true);
+        let status = decode(&mut filter, &mut cb, &mut head, true);
 
         assert_eq!(status, FilterHeadersStatus::Continue);
         assert!(cb.local_reply.is_none(), "no tenant must never be denied");
@@ -2158,7 +2261,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.stream_info.borrow_mut().auth.tenant = Some("tenant-a".into());
-        let status = filter.decode_headers(&mut cb, &mut request_headers(), true);
+        let status = decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert_eq!(status, FilterHeadersStatus::StopIteration);
         assert_eq!(cb.local_reply.as_ref().unwrap().0, StatusCode::FORBIDDEN);
     }
@@ -2183,11 +2286,11 @@ mod tests {
         let mut second_cb = TestCallbacks::new();
         second_cb.set_tenant("tenant-a");
         assert_eq!(
-            first.decode_headers(&mut first_cb, &mut request_headers(), true),
+            decode(&mut first, &mut first_cb, &mut request_headers(), true),
             FilterHeadersStatus::Continue
         );
         assert_eq!(
-            second.decode_headers(&mut second_cb, &mut request_headers(), true),
+            decode(&mut second, &mut second_cb, &mut request_headers(), true),
             FilterHeadersStatus::Continue
         );
         for (filter, cb) in [(&mut first, &mut first_cb), (&mut second, &mut second_cb)] {
@@ -2280,7 +2383,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
         cb.stream_info.borrow_mut().auth.key_id = Some(second.as_str().to_string());
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(cb.local_reply.is_none());
         cb.set_upstream("cluster-a", "m");
         cb.set_usage(usage(2));
@@ -2387,7 +2490,7 @@ mod tests {
             } else {
                 cb.stream_info.borrow_mut().auth.tenant = None;
             }
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert_eq!(cb.local_reply.unwrap().0, StatusCode::FORBIDDEN);
         }
     }
@@ -2657,7 +2760,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
         let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         assert!(
             cb.local_reply.is_some(),
@@ -2690,7 +2793,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-zero");
         let mut head = request_headers();
-        filter.decode_headers(&mut cb, &mut head, true);
+        decode(&mut filter, &mut cb, &mut head, true);
 
         assert!(
             cb.local_reply.is_some(),
@@ -2964,7 +3067,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert_eq!(
             cb.local_reply.as_ref().map(|(status, _)| *status),
             Some(StatusCode::TOO_MANY_REQUESTS),
@@ -2977,7 +3080,7 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_tenant_mode();
         cb.set_credential_source(Some(CredentialSource::Tenant));
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(
             cb.local_reply.is_none(),
             "a tenant-mode request must not be checked against a platform-scoped budget"
@@ -3007,7 +3110,7 @@ mod tests {
         cb.set_tenant("tenant-a");
         cb.set_tenant_mode();
         cb.set_credential_source(Some(CredentialSource::Tenant));
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert_eq!(
             cb.local_reply.as_ref().map(|(status, _)| *status),
             Some(StatusCode::TOO_MANY_REQUESTS),
@@ -3017,7 +3120,7 @@ mod tests {
         let mut filter = harness.new_instance();
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(
             cb.local_reply.is_none(),
             "a platform-mode request must not be checked against a tenant-scoped budget"
@@ -3062,7 +3165,7 @@ mod tests {
                 cb.set_tenant_mode();
                 cb.set_credential_source(Some(CredentialSource::Tenant));
             }
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert!(cb.local_reply.is_none(), "both ceilings dwarf this cost");
             cb.set_upstream("cluster-a", "m");
             cb.set_usage(usage(2));
@@ -3135,7 +3238,7 @@ mod tests {
         let mut cb = TestCallbacks::new();
         cb.set_tenant("tenant-a");
         cb.set_credential_source(None);
-        filter.decode_headers(&mut cb, &mut request_headers(), true);
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
         assert!(cb.local_reply.is_none());
         cb.set_upstream("cluster-a", "m");
         cb.set_usage(usage(2));
@@ -3192,7 +3295,7 @@ mod tests {
             cb.set_tenant("tenant-a");
             cb.set_tenant_mode();
             cb.set_credential_source(Some(CredentialSource::Tenant));
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert_eq!(
                 cb.local_reply.as_ref().map(|(status, _)| *status),
                 Some(StatusCode::TOO_MANY_REQUESTS),
@@ -3203,7 +3306,7 @@ mod tests {
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
             cb.set_tenant("tenant-a");
-            filter.decode_headers(&mut cb, &mut request_headers(), true);
+            decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert!(
                 cb.local_reply.is_none(),
                 "key={key_micros} tenant={tenant_micros}: neither tenant-scoped budget may \

@@ -148,6 +148,7 @@ fn sample_rate_card(chain: &str) -> StoredRateCard {
         chain: chain.into(),
         version: format!("version-{chain}"),
         card_json: format!(r#"{{"chain":"{chain}"}}"#),
+        schema_version: crate::control::RATE_CARD_SCHEMA_V1,
     }
 }
 

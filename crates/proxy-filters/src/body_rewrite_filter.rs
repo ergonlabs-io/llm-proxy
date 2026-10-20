@@ -278,7 +278,9 @@ impl FilterInstanceFactory for BodyRewriteInstanceFactory {
 /// chunks after the decision) from holding on to anything.
 enum State {
     Scanning {
-        scanner: BodyPrefixScanner,
+        /// Boxed: the scanner is far larger than `PassThrough`, which every
+        /// stream reaches once its body is scanned.
+        scanner: Box<BodyPrefixScanner>,
         /// Every byte fed to `scanner` so far, kept so the eventual splice
         /// has something to splice into and so the tail past `cap` (see the
         /// module doc's memory-bound note) can still be forwarded.
@@ -386,7 +388,7 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // (see `DecoderCallbacks::modify_decoded_headers`'s doc); the real
         // fix-up happens in `decode_data`, once a decision is made.
         self.state = State::Scanning {
-            scanner: BodyPrefixScanner::new(DEFAULT_PREFIX_CAP),
+            scanner: Box::new(BodyPrefixScanner::new(DEFAULT_PREFIX_CAP)),
             pending: BytesMut::new(),
             content_length,
         };
@@ -503,7 +505,12 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // `stream_info()` must not be held across another call on `cb` (see
         // its doc), same pattern `auth_filter`/`token_limit_filter` use.
         {
-            cb.stream_info().requested_model = model.clone();
+            let mut info = cb.stream_info();
+            info.requested_model = model.clone();
+            // From the same scan: the image attributes that select a price
+            // row when the response does not echo them.
+            info.request_facts.size = facts.size.clone();
+            info.request_facts.quality = facts.quality.clone();
         }
         cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
             apply_model_header(&mut headers.headers, model.as_deref());

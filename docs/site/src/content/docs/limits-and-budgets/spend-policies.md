@@ -51,9 +51,10 @@ unbilled traffic.
 
 ## Endpoints a budget cannot count
 
-The proxy can count the cost of five endpoints: chat completions,
-completions, Responses, Messages and embeddings. It cannot count the cost of
-other endpoints, such as images, audio, batches and files. A budget that
+The proxy can count the cost of six endpoints: chat completions,
+completions, Responses, Messages, embeddings and image generation
+(`POST .../images/generations`). It cannot count the cost of other
+endpoints, such as image edits, audio, batches and files. A budget that
 applies to a request for one of these endpoints refuses it with
 `403` and the response-code detail `endpoint_not_metered`. The request does
 not reach the provider.
@@ -83,8 +84,52 @@ Each refusal increments
 `endpoint` is one of `image_generation`, `image_edit`, `speech`,
 `transcription`, `translation` and `unmetered` (every other path). The access
 log shows the detail in `%RESPONSE_CODE_DETAILS%` (`response_code_details` in
-the `--config` formats). The design, and the phases that will meter images and
-audio, are in ADR-0010.
+the `--config` formats). The design, and the phase that will meter image
+edits and audio, are in ADR-0010.
+
+## Image generation
+
+A rate-card entry has a `basis`. The default, `tokens`, prices the token
+buckets as before. `images` prices the number of images that the response
+returned, with `image_prices` rows (the rates here are examples, not a
+provider's prices):
+
+```yaml
+- provider_type: openai
+  model: example-image-model
+  basis: images
+  image_prices:
+    - { nanodollars_per_image: 70000000 }
+    - { size: "1024x1024", quality: high, nanodollars_per_image: 90000000 }
+```
+
+- The proxy counts the elements of the top-level `data` array of a JSON
+  response, or the `*.completed` events of a stream. It reads the response
+  as it passes and does not keep the images.
+- `size` and `quality` come from the response, or from the request body when
+  the response does not show them. The most specific row that matches wins:
+  both attributes, then one, then none. Two rows that can match the same
+  request at the same specificity are a load error.
+- If no row matches, or the response returned no images, the request is
+  unpriced: it is charged $0 and the proxy logs a warning once per model.
+- Models that bill images in tokens, such as `gpt-image-1`, use
+  `basis: tokens`. Each tier can set `image_input_nanodollars_per_token`,
+  `image_output_nanodollars_per_token`, `audio_input_nanodollars_per_token`
+  and `audio_output_nanodollars_per_token`. Set each one on every tier of the
+  entry or on none. When one is set, those tokens are charged at it. When it
+  is not set, they are charged at the text rate, as before, and the request is
+  counted in `llmproxy_usage_underpriced_modality_requests_total`. Under a
+  budget the proxy also logs a warning once per model.
+- A cut image response is charged for the images that were complete and the
+  tokens that were reported. The proxy does not estimate it from its size.
+- A token limit still refuses image generation: the proxy cannot count its
+  tokens for every model.
+
+A card that uses `basis`, `image_prices` or a modality rate is stored at rate
+card schema version 2. An older replica ignores a version 2 card and keeps its
+last card. Upgrade every replica before you publish such a card with
+`PUT /pricing`. A card that uses none of these fields keeps its version and its
+charges.
 
 ## Cut streams and estimated charges
 

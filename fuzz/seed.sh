@@ -130,3 +130,9 @@ i=0
         i=$((i + 1))
     done
 done
+
+# media_scan: byte 0 = chunk size, then an image response body (JSON or SSE).
+mkdir -p "$corpus/media_scan"
+printf '\007{"created":1,"data":[{"b64_json":"QUJD","revised_prompt":"a \\"cat\\""}],"size":"1024x1024","quality":"high","usage":{"input_tokens":50,"input_tokens_details":{"text_tokens":40,"image_tokens":10},"output_tokens":4160,"total_tokens":4210}}' > "$corpus/media_scan/seed-json"
+printf '\003{"data":["a",{"url":"u"},null],"\\u0073ize":"512x512"}' > "$corpus/media_scan/seed-escaped"
+printf '\005event: image_generation.partial_image\ndata: {"type":"image_generation.partial_image","b64_json":"QQ"}\n\nevent: image_generation.completed\r\ndata: {"type":"image_generation.completed","b64_json":"QUJD","size":"1024x1536","quality":"medium","usage":{"input_tokens":7,"output_tokens":100}}\r\n\r\n' > "$corpus/media_scan/seed-sse"

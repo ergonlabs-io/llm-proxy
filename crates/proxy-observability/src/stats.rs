@@ -1046,6 +1046,17 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Priced requests whose image or audio tokens had no modality rate on
+    /// their rate-card entry, so they were charged at the text rate: never
+    /// less than before modality rates existed, but under the provider's
+    /// price (ADR-0010 decision 3). `scope` as above.
+    pub const USAGE_UNDERPRICED_MODALITY: Instrument = Instrument {
+        name: "llmproxy_usage_underpriced_modality_requests_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// The tenant's own secret was applied to the attempt.
     pub const TENANT_CREDENTIAL_APPLIED: &str = "applied";
     /// Refused with `403 tenant_credential_missing`: no slot on the cluster,

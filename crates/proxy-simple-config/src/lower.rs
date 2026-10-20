@@ -251,6 +251,19 @@ const ACCESS_LOG_TEXT_FORMAT: &str = concat!(
     "ds_tx=%COMMON_DURATION(DS_TX_BEG:DS_TX_END:us)%\"\n",
 );
 
+/// JSON access-log keys for the modality token subsets, the count meters and
+/// the price basis (ADR-0010). Each renders `-` when the value is absent.
+const MEDIA_FIELDS: [(&str, &str); 8] = [
+    ("llm_input_image_tokens", "%LLM_INPUT_IMAGE_TOKENS%"),
+    ("llm_output_image_tokens", "%LLM_OUTPUT_IMAGE_TOKENS%"),
+    ("llm_input_audio_tokens", "%LLM_INPUT_AUDIO_TOKENS%"),
+    ("llm_output_audio_tokens", "%LLM_OUTPUT_AUDIO_TOKENS%"),
+    ("llm_images", "%LLM_IMAGES%"),
+    ("llm_input_characters", "%LLM_INPUT_CHARACTERS%"),
+    ("llm_audio_ms", "%LLM_AUDIO_MS%"),
+    ("llm_price_basis", "%LLM_PRICE_BASIS%"),
+];
+
 /// The request phases both dialect access-log formats carry, as
 /// `(name, %COMMON_DURATION% operator)`, in microseconds and in request order:
 ///
@@ -726,23 +739,57 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
         .entries
         .iter()
         .map(|entry| {
-            json!({
+            let mut value = json!({
                 "cached_input_unpriced": entry.cached_input_unpriced,
                 "cache_write_unpriced": entry.cache_write_unpriced,
                 "provider_type": entry.provider_type,
                 "model": entry.model,
-                "tier_mode": match entry.tier_mode.expect("validated") {
-                    TierModeDef::WholeRequest => "whole_request",
-                    TierModeDef::Graduated => "graduated",
-                },
-                "tiers": entry.tiers.iter().map(|tier| json!({
-                    "up_to": tier.up_to,
-                    "input_nanodollars_per_token": tier.input_nanodollars_per_token,
-                    "cached_input_nanodollars_per_token": tier.cached_input_nanodollars_per_token,
-                    "cache_write_nanodollars_per_token": tier.cache_write_nanodollars_per_token,
-                    "output_nanodollars_per_token": tier.output_nanodollars_per_token,
-                })).collect::<Vec<_>>(),
-            })
+            });
+            // Rust note: `as_object_mut` borrows the JSON map so keys can be
+            // added conditionally. Optional keys are emitted only when set so
+            // an existing token card lowers to byte-identical JSON, and its
+            // version hash does not change across an upgrade.
+            let object = value.as_object_mut().expect("json! object");
+            if entry.basis == Some(PriceBasisDef::Images) {
+                object.insert("basis".into(), json!("images"));
+                object.insert(
+                    "image_prices".into(),
+                    Value::Array(
+                        entry
+                            .image_prices
+                            .iter()
+                            .flatten()
+                            .map(|row| {
+                                let mut row_value = serde_json::Map::new();
+                                if let Some(size) = &row.size {
+                                    row_value.insert("size".into(), json!(size));
+                                }
+                                if let Some(quality) = &row.quality {
+                                    row_value.insert("quality".into(), json!(quality));
+                                }
+                                row_value.insert(
+                                    "nanodollars_per_image".into(),
+                                    json!(row.nanodollars_per_image),
+                                );
+                                Value::Object(row_value)
+                            })
+                            .collect(),
+                    ),
+                );
+            } else {
+                object.insert(
+                    "tier_mode".into(),
+                    json!(match entry.tier_mode.expect("validated") {
+                        TierModeDef::WholeRequest => "whole_request",
+                        TierModeDef::Graduated => "graduated",
+                    }),
+                );
+                object.insert(
+                    "tiers".into(),
+                    Value::Array(entry.tiers.iter().map(lower_tier).collect()),
+                );
+            }
+            value
         })
         .collect();
     let providers: serde_json::Map<String, Value> = config
@@ -764,6 +811,45 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
         },
         "providers": providers,
     })
+}
+
+fn lower_tier(tier: &TierDef) -> Value {
+    let mut value = json!({
+        "up_to": tier.up_to,
+        "input_nanodollars_per_token": tier.input_nanodollars_per_token,
+        "cached_input_nanodollars_per_token": tier.cached_input_nanodollars_per_token,
+        "cache_write_nanodollars_per_token": tier.cache_write_nanodollars_per_token,
+        "output_nanodollars_per_token": tier.output_nanodollars_per_token,
+    });
+    let object = value.as_object_mut().expect("json! object");
+    for (key, rate) in tier_modality_rates(tier) {
+        if let Some(rate) = rate {
+            object.insert(key.into(), json!(rate));
+        }
+    }
+    value
+}
+
+/// The four optional per-modality tier rates, keyed by their wire names.
+fn tier_modality_rates(tier: &TierDef) -> [(&'static str, Option<u64>); 4] {
+    [
+        (
+            "image_input_nanodollars_per_token",
+            tier.image_input_nanodollars_per_token,
+        ),
+        (
+            "image_output_nanodollars_per_token",
+            tier.image_output_nanodollars_per_token,
+        ),
+        (
+            "audio_input_nanodollars_per_token",
+            tier.audio_input_nanodollars_per_token,
+        ),
+        (
+            "audio_output_nanodollars_per_token",
+            tier.audio_output_nanodollars_per_token,
+        ),
+    ]
 }
 
 fn pricing_file_path(path: &str) -> String {
@@ -808,45 +894,153 @@ fn validate_price_list(list: &PriceListDef) -> Result<(), ConfigError> {
                 reason: format!("duplicate (provider_type, model), first used at entries[{first}]"),
             });
         }
-        if entry.tier_mode.is_none() {
-            return Err(ConfigError::InvalidValue {
-                field_path: format!("{path}.tier_mode"),
-                reason: "required; whole_request and graduated have different money semantics"
-                    .into(),
-            });
+        match entry.basis.unwrap_or(PriceBasisDef::Tokens) {
+            PriceBasisDef::Tokens => validate_token_entry(entry, &path)?,
+            PriceBasisDef::Images => validate_image_entry(entry, &path)?,
         }
-        if entry.tiers.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field_path: format!("{path}.tiers"),
-                reason: "at least one tier is required".into(),
-            });
+    }
+    Ok(())
+}
+
+fn invalid(field_path: String, reason: impl Into<String>) -> ConfigError {
+    ConfigError::InvalidValue {
+        field_path,
+        reason: reason.into(),
+    }
+}
+
+fn validate_token_entry(entry: &PriceEntryDef, path: &str) -> Result<(), ConfigError> {
+    if entry.image_prices.is_some() {
+        return Err(invalid(
+            format!("{path}.image_prices"),
+            "only a `basis: images` entry has image_prices",
+        ));
+    }
+    if entry.tier_mode.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.tier_mode"),
+            reason: "required; whole_request and graduated have different money semantics".into(),
+        });
+    }
+    if entry.tiers.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.tiers"),
+            reason: "at least one tier is required".into(),
+        });
+    }
+    let mut previous = None;
+    let mut open_ended = 0;
+    for (tier_index, tier) in entry.tiers.iter().enumerate() {
+        if let Some(up_to) = tier.up_to {
+            if previous.is_some_and(|previous| up_to <= previous) {
+                return Err(ConfigError::InvalidValue {
+                    field_path: format!("{path}.tiers[{tier_index}].up_to"),
+                    reason: "must strictly increase".into(),
+                });
+            }
+            previous = Some(up_to);
+        } else {
+            open_ended += 1;
         }
-        let mut previous = None;
-        let mut open_ended = 0;
-        for (tier_index, tier) in entry.tiers.iter().enumerate() {
-            if let Some(up_to) = tier.up_to {
-                if previous.is_some_and(|previous| up_to <= previous) {
-                    return Err(ConfigError::InvalidValue {
-                        field_path: format!("{path}.tiers[{tier_index}].up_to"),
-                        reason: "must strictly increase".into(),
-                    });
-                }
-                previous = Some(up_to);
-            } else {
-                open_ended += 1;
+    }
+    if open_ended != 1 {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.tiers"),
+            reason: "exactly one open-ended tier is required".into(),
+        });
+    }
+    if entry.tiers.last().is_some_and(|tier| tier.up_to.is_some()) {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.tiers[{}].up_to", entry.tiers.len() - 1),
+            reason: "the open-ended tier must be last".into(),
+        });
+    }
+    // Each modality rate is all-or-none across tiers: a tier missing it would
+    // price those tokens at the text rate in one band and not in another.
+    for (field_index, (field, _)) in tier_modality_rates(&entry.tiers[0]).iter().enumerate() {
+        let set: Vec<bool> = entry
+            .tiers
+            .iter()
+            .map(|tier| tier_modality_rates(tier)[field_index].1.is_some())
+            .collect();
+        if set.iter().any(|&s| s) && !set.iter().all(|&s| s) {
+            let tier_index = set.iter().position(|&s| !s).expect("some tier lacks it");
+            return Err(invalid(
+                format!("{path}.tiers[{tier_index}].{field}"),
+                "must be set on every tier of the entry or on none",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_entry(entry: &PriceEntryDef, path: &str) -> Result<(), ConfigError> {
+    if entry.tier_mode.is_some() {
+        return Err(invalid(
+            format!("{path}.tier_mode"),
+            "not allowed on a `basis: images` entry",
+        ));
+    }
+    if !entry.tiers.is_empty() {
+        return Err(invalid(
+            format!("{path}.tiers"),
+            "not allowed on a `basis: images` entry",
+        ));
+    }
+    // An entry prices only the meters of its basis; a set-but-ignored flag
+    // would be a silently ignored field.
+    for (flag, name) in [
+        (entry.cached_input_unpriced, "cached_input_unpriced"),
+        (entry.cache_write_unpriced, "cache_write_unpriced"),
+    ] {
+        if flag {
+            return Err(invalid(
+                format!("{path}.{name}"),
+                "not allowed on a `basis: images` entry, which prices only images",
+            ));
+        }
+    }
+    let Some(rows) = entry
+        .image_prices
+        .as_deref()
+        .filter(|rows| !rows.is_empty())
+    else {
+        return Err(invalid(
+            format!("{path}.image_prices"),
+            "required and non-empty on a `basis: images` entry",
+        ));
+    };
+    for (index, row) in rows.iter().enumerate() {
+        for (name, value) in [("size", &row.size), ("quality", &row.quality)] {
+            if value.as_deref() == Some("") {
+                return Err(invalid(
+                    format!("{path}.image_prices[{index}].{name}"),
+                    "must not be empty",
+                ));
             }
         }
-        if open_ended != 1 {
-            return Err(ConfigError::InvalidValue {
-                field_path: format!("{path}.tiers"),
-                reason: "exactly one open-ended tier is required".into(),
-            });
-        }
-        if entry.tiers.last().is_some_and(|tier| tier.up_to.is_some()) {
-            return Err(ConfigError::InvalidValue {
-                field_path: format!("{path}.tiers[{}].up_to", entry.tiers.len() - 1),
-                reason: "the open-ended tier must be last".into(),
-            });
+        // Two rows of equal specificity that one request could match are
+        // ambiguous: identical pairs, or a size-only row with a quality-only
+        // row. Rows of different specificity are fine (most specific wins).
+        for (earlier, other) in rows[..index].iter().enumerate() {
+            let clash = match ((&row.size, &row.quality), (&other.size, &other.quality)) {
+                ((a_size, a_quality), (b_size, b_quality))
+                    if a_size == b_size && a_quality == b_quality =>
+                {
+                    true
+                }
+                ((Some(_), None), (None, Some(_))) | ((None, Some(_)), (Some(_), None)) => true,
+                _ => false,
+            };
+            if clash {
+                return Err(invalid(
+                    format!("{path}.image_prices[{index}]"),
+                    format!(
+                        "ambiguous with image_prices[{earlier}]: a request could match both at \
+                         the same specificity"
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -2882,6 +3076,11 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 // twin because raw JSON would break that line's quoting.
                 "llm_upstream_usage": "%LLM_UPSTREAM_USAGE%",
             });
+            // Added in a loop: one more `json!` entry hits the macro's
+            // recursion limit.
+            for (key, operator) in MEDIA_FIELDS {
+                format[key] = json!(operator);
+            }
             for (phase, operator) in TIMING_PHASES {
                 format[format!("{phase}_us")] = json!(operator);
             }
