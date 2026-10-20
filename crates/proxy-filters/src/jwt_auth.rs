@@ -437,6 +437,9 @@ impl Authenticator for JwtAuthenticator {
             tenant_credentials: None,
             policy_generation: None,
             trace_export,
+            // A JWT carries no key metadata: its requests get header tags
+            // only (a claims-to-tags mapping is not built).
+            key_tags: Default::default(),
         })
     }
 }
@@ -1203,6 +1206,7 @@ GdGIML90cFtpXr13uutgIg==
                     tenant_credentials: None,
                     policy_generation: None,
                     trace_export: false,
+                    key_tags: Default::default(),
                 })
             }
         }

@@ -312,6 +312,10 @@
           "default": [],
           "description": "JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. JWT callers always use the operator's provider keys, never a tenant's stored provider credentials, so lowering warns when `tenant_credentials` is also set. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning.",
           "items": { "$ref": "#/$defs/AuthJwtProvider" }
+        },
+        "chargeback_tags": {
+          "$ref": "#/$defs/ChargebackTags",
+          "description": "Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A tag key that key metadata sets is never taken from the header, so a client cannot override the admin. A JWT caller has no key metadata and gets header tags only. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget."
         }
       },
       "oneOf": [
@@ -495,6 +499,67 @@
           "type": "boolean",
           "default": false,
           "description": "A revoked key is refused, distinguished from an unknown key in the access log's response-code details (`auth_revoked_key` vs `auth_unknown_key`) but NOT on the wire -- both produce an identical 401, so a caller can't learn from the response alone whether a key they guessed was ever valid."
+        },
+        "tags": {
+          "type": "object",
+          "default": {},
+          "description": "Chargeback tags for requests this key authenticates (key metadata). At most 32. Keys follow `chargeback_tags.allowed[].key`; values are 1 to 256 bytes of ASCII letters, digits, `_`, `.`, `:`, `/`, `@`, `+` and `-`. `auth.chargeback_tags` decides which are attributed. A change applies on restart, like any change to `keys`.",
+          "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9_.:/@+-]{1,256}$" },
+          "examples": [{ "team": "infra", "project": "search" }]
+        }
+      }
+    },
+    "ChargebackTags": {
+      "type": "object",
+      "description": "The operator's chargeback-tag allow-list and caps. Tags that fail it are dropped and counted by reason: `not_allowed` (key not listed, or value not one of its `values`), `too_long` (over `max_value_bytes`), `over_count` (over `max_tags`; key-metadata tags fill the cap first), `malformed` (the header did not parse; all its tags are dropped and the request is still served) and `overridden` (the header set a key that key metadata sets).",
+      "additionalProperties": false,
+      "required": ["allowed"],
+      "properties": {
+        "allowed": {
+          "type": "array",
+          "minItems": 1,
+          "description": "The tag keys that may be attributed.",
+          "items": { "$ref": "#/$defs/ChargebackAllowedTag" }
+        },
+        "from_header": {
+          "type": "boolean",
+          "default": false,
+          "description": "Read tags from the `x-cost-tags` request header, written as comma-separated `key=value` pairs (`project=search,team=infra`). The header is removed before the request goes upstream. False means the header is never read and is forwarded unchanged."
+        },
+        "max_tags": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 8,
+          "description": "Most tags on one request."
+        },
+        "max_value_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "default": 64,
+          "description": "Longest tag value, in bytes. A longer value is dropped as `too_long`."
+        }
+      }
+    },
+    "ChargebackAllowedTag": {
+      "type": "object",
+      "description": "One allow-listed tag key.",
+      "additionalProperties": false,
+      "required": ["key"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+          "description": "1 to 64 bytes of lowercase letters, digits, `_`, `.` and `-`, starting with a letter.",
+          "examples": ["project"]
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9_.:/@+-]{1,256}$" },
+          "description": "The values the key may take. Absent means any value of 1 to `max_value_bytes` bytes of ASCII letters, digits, `_`, `.`, `:`, `/`, `@`, `+` and `-`.",
+          "examples": [["infra", "search"]]
         }
       }
     },

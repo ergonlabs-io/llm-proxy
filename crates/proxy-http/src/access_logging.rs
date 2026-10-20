@@ -874,6 +874,9 @@ impl LoggingBody {
                 credential_source: ctx.stream_info.borrow().credential_source,
                 // Stamped by the delivery path that writes the record.
                 record_seq: None,
+                // The auth filter's resolved chargeback tags: allow-listed,
+                // capped and already bounded, so they are copied as they are.
+                tags: ctx.stream_info.borrow().auth.tags.clone(),
                 attempts: attempts
                     .into_iter()
                     .map(|attempt| proxy_observability::records::AttemptRecord {

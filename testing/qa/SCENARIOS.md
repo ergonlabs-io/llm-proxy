@@ -22,6 +22,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17 (`qa13_billing_ledger_test.go`); approved through the billing-ledger backlog acceptance (owner, 2026-10-17) |
 | QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
 | QA-15 | Image generation under a tenant budget is charged per image and ledgered; unpriced is $0 and loud; batch refused | passing — since 2026-10-20 (`qa15_image_metering_test.go`); approved through the v0.6.0 ship gate clauses 1 and 2 (owner, 2026-10-18) |
+| QA-16 | Chargeback tags reach ledger entries, bounded metrics, survive a restart | passing — since 2026-10-20 (`qa16_chargeback_tags_test.go`); approved through the chargeback-tags backlog acceptance (owner, 2026-10-20) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -526,6 +527,30 @@ refused. A run on 2026-10-17 under load hit it on the first full-range ack.
 Entries lost to the crash window (the last `group_commit_interval`) are not
 counted exactly: the client cannot see which served requests had committed.
 The case logs served versus committed for the killed epoch.
+
+## QA-16 — Chargeback tags on ledger entries
+
+Approved through the chargeback-tags acceptance. `qa16_chargeback_tags_test.go` drives a
+dialect config with `auth.chargeback_tags` (`from_header: true`, `team`
+limited to two values, `project` open), a persistent auth store, a ledger and
+a Go mock OpenAI upstream, through the listener and the admin API only.
+
+`crates/proxy/tests/ledger_e2e.rs` proves one key's tags reach its entry.
+QA-16 adds:
+
+- **Two tenants on one chain.** A key with `team=infra` metadata sends
+  `team=search, project=alpha`: its entry has `team=infra` (the key wins) and
+  `project=alpha`. The other tenant's untagged key gets only its own header's
+  tags. A not-allowed key, a value outside `values`, and a malformed header
+  are each served and leave the entry untagged.
+- **The header never reaches the provider.** No request the mock records has
+  `x-cost-tags`.
+- **Bounded metrics.** 200 requests with distinct tag values leave the number
+  of `/stats/prometheus` samples unchanged, and no tag value is in the scrape.
+- **Tag changes and restart.** `PUT /keys/{id}/tags` applies to the next
+  request; after SIGTERM and a restart over the same persistent store, the
+  key's requests still carry its tags (store row version 3) and `GET /keys`
+  shows them. Every entry is `schema_version: 2`.
 
 ## QA-14 — Trace export captures an opted-in tenant only
 

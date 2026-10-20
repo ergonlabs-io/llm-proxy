@@ -312,12 +312,19 @@ pub struct RequestRecord {
     /// records from older builds.
     #[serde(default)]
     pub record_seq: Option<u64>,
+    /// Chargeback tags the request was attributed with: allow-listed key
+    /// metadata and, when the operator enables it, the client's tag header
+    /// (`crate::chargeback`). Added under schema version 1: absent in older
+    /// records, read as empty.
+    #[serde(default)]
+    pub tags: crate::chargeback::ChargebackTags,
 }
 
 impl RequestRecord {
     pub fn retained_bytes(&self) -> usize {
         let mut total = std::mem::size_of::<Self>()
-            + self.attempts.capacity() * std::mem::size_of::<AttemptRecord>();
+            + self.attempts.capacity() * std::mem::size_of::<AttemptRecord>()
+            + self.tags.len() * 2 * std::mem::size_of::<String>();
         total =
             total.saturating_add(self.response_flags.capacity() * std::mem::size_of::<String>());
         let mut add = |value: &String| total = total.saturating_add(value.capacity());
@@ -355,6 +362,10 @@ impl RequestRecord {
         let mut raw_usage_bytes = self.upstream_usage.as_ref().map_or(0, |u| u.get().len());
         for flag in &self.response_flags {
             add(flag);
+        }
+        for (key, value) in &self.tags {
+            add(key);
+            add(value);
         }
         if let Some(usage) = &self.usage {
             add(&usage.provenance);
@@ -440,7 +451,13 @@ impl RequestRecord {
 
 /// Version of the [`LedgerEntry`] shape, separate from [`SCHEMA_VERSION`]:
 /// the ledger is the invoice source (ADR-0009) and changes on its own terms.
-pub const LEDGER_SCHEMA_VERSION: u16 = 1;
+///
+/// - 1: the shape ADR-0009 decision 3 describes.
+/// - 2: adds `record.tags` (chargeback tags). Nothing else changes, so a
+///   version-1 reader that ignores unknown fields still reads it, and an
+///   entry written as version 1 reads here with no tags. Entries keep the
+///   version they were written with; the spool may hold both after an upgrade.
+pub const LEDGER_SCHEMA_VERSION: u16 = 2;
 
 /// One billing-ledger entry: the terminal [`RequestRecord`] of a request that
 /// was dialled to an upstream, plus what it was charged (ADR-0009 decision 3).

@@ -61,7 +61,7 @@ use crate::control::{
     EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
     EncodedTenantCredentialRow, FlushToken, LimitPolicy, SpendDelta, StoreError,
     StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, WindowDelta, WindowRow,
-    SPEND_SCHEMA_VERSION, TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
+    TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
 };
 use crate::control::{decode_trace_export_row, encode_trace_export_row};
 use crate::model_authz::ModelAccess;
@@ -416,7 +416,7 @@ local next = cjson.decode(ARGV[2])
 if raw then
   local previous = cjson.decode(raw)
   local version = previous['schema_version'] or 1
-  if version ~= 1 and version ~= 2 then return -3 end
+  if version ~= 1 and version ~= 2 and version ~= 3 then return -3 end
   if previous['tenant'] ~= next['tenant'] then return -1 end
   if previous['revoked'] then
     if not next['revoked'] then return -2 end
@@ -1011,12 +1011,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let mut keys = Vec::with_capacity(keys_raw.len());
         for (key_id, bytes) in keys_raw {
             let row: EncodedKeyRow = decode_json(&bytes)?;
-            keys.push(StoredKey {
-                key_id: KeyId::new(key_id),
-                digest: row.digest,
-                tenant: TenantId::new(row.tenant),
-                revoked: row.revoked,
-            });
+            keys.push(row.into_stored(KeyId::new(key_id)));
         }
 
         let mut policies = HashMap::new();
@@ -1204,12 +1199,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     }
 
     fn put_key(&self, rec: &StoredKey) -> Result<(), StoreError> {
-        let row = EncodedKeyRow {
-            schema_version: SPEND_SCHEMA_VERSION,
-            digest: rec.digest,
-            tenant: rec.tenant.as_str().into(),
-            revoked: rec.revoked,
-        };
+        let row = EncodedKeyRow::from_stored(rec);
         let result: i64 = self.with_connection(Lane::Control, |conn| {
             Script::new(PUT_KEY_LUA)
                 .key(self.keys_key())
@@ -1689,6 +1679,7 @@ mod tests {
 
     use crate::spend::{Charge, MicroUsd, Period, SpendAccumulator};
     use proxy_credentials::CredentialSource;
+    use proxy_observability::chargeback::ChargebackTags;
 
     // ------------------------------------------------------------------
     // Unit tests: no Redis needed. `Client::open` only parses the URL, so
@@ -1794,6 +1785,45 @@ mod tests {
     /// applies, dedups a replay, and leaves both keys expiring at the
     /// period's end plus the retention; the batched reads see the same rows.
     /// The fake cannot show this, since it runs no Lua.
+    /// Key tags through the Lua scripts: the put script accepts a version-3
+    /// (tagged) row and a later rewrite of it, and the revoke script's
+    /// `cjson` round trip keeps the tags. Clearing them writes no `tags`
+    /// field, so `cjson` never sees an empty object it would turn into `[]`.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_key_tags_survive_put_and_revoke_scripts() {
+        let store = test_store("key-tags");
+        let tags: ChargebackTags = [("team".to_string(), "infra".to_string())].into();
+        let mut row = StoredKey {
+            key_id: KeyId::new("key-a"),
+            digest: [1; 32],
+            tenant: TenantId::new("tenant-a"),
+            revoked: false,
+            tags: tags.clone(),
+        };
+        store.put_key(&row).unwrap();
+        row.tags = ChargebackTags::new();
+        store.put_key(&row).unwrap();
+        assert!(store.load().unwrap().keys[0].tags.is_empty());
+        store.revoke_key(&row.key_id).unwrap();
+        assert!(store.load().unwrap().keys[0].tags.is_empty());
+
+        let mut tagged = row.clone();
+        tagged.key_id = KeyId::new("key-b");
+        tagged.revoked = false;
+        tagged.tags = tags.clone();
+        store.put_key(&tagged).unwrap();
+        store.revoke_key(&tagged.key_id).unwrap();
+        let loaded = store.load().unwrap();
+        let back = loaded
+            .keys
+            .iter()
+            .find(|k| k.key_id == tagged.key_id)
+            .unwrap();
+        assert!(back.revoked);
+        assert_eq!(back.tags, tags);
+    }
+
     /// Window rows against a real Redis: the script adds, dedups a replay and
     /// an older seq per node, and both keys expire at window end plus grace.
     #[test]
@@ -2023,6 +2053,7 @@ mod tests {
             digest: [1; 32],
             tenant: tenant.clone(),
             revoked: false,
+            tags: Default::default(),
         };
         store.put_key(&row).unwrap();
         let budget = TenantBudget {
@@ -2404,6 +2435,7 @@ mod tests {
                 digest: [7u8; 32],
                 tenant: tenant.clone(),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         store.set_policy(&tenant, &ModelAccess::All).unwrap();

@@ -1376,6 +1376,7 @@ pub mod testing {
             attempts_truncated: false,
             credential_source: None,
             record_seq: None,
+            tags: Default::default(),
         }
     }
 

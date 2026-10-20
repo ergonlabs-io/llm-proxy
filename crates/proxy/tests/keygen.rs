@@ -168,6 +168,7 @@ fn printed_key_and_digest_authenticate_together_end_to_end() {
             key_id: KeyId::new("alice-laptop"),
             tenant: TenantId::new("acme-corp"),
             revoked: false,
+            tags: Default::default(),
         },
     );
 

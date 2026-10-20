@@ -577,6 +577,9 @@ struct AuthConfig {
     /// What the per-serve [`ControlPlane`] is built from, as one-way digests.
     /// See [`BootInputs`].
     boot_inputs: BootInputs,
+    /// `typed_config.chargeback_tags`; `None` attributes no tags. Not a boot
+    /// input: each chain build applies its own, so a reload changes it.
+    tag_policy: Option<proxy_observability::chargeback::TagPolicy>,
 }
 
 /// The singleton key under which each chain records the [`BootInputs`] its
@@ -973,6 +976,10 @@ fn parse_tenant_values(
 /// secret bytes + bootstrap key set + store selection + poll interval the
 /// filter needs at request time. Strict mode: every field either maps in or
 /// errors with its dotted path (AGENTS.md invariant 1).
+/// One bootstrap key as [`BootInputs::virtual_keys`] digests it:
+/// `(key_id, tenant, digest, revoked, tags as "key=value")`.
+type BootKeyEntry = (String, String, Vec<u8>, bool, Vec<String>);
+
 fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
     let store_spec = parse_store(config)?;
@@ -986,8 +993,9 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     // the duplicate-detection rule.
     let mut seen_key_ids: HashMap<String, usize> = HashMap::new();
     let mut seen_digests: HashMap<Vec<u8>, usize> = HashMap::new();
-    // Every entry, for `BootInputs::virtual_keys`.
-    let mut key_entries: Vec<(String, String, Vec<u8>, bool)> = Vec::new();
+    // Every entry, for `BootInputs::virtual_keys`. Tags are flattened to
+    // `key=value` strings, sorted (the map is ordered).
+    let mut key_entries: Vec<BootKeyEntry> = Vec::new();
 
     // Absent `virtual_keys` and an empty `virtual_keys` are indistinguishable
     // here (both yield `&[]`), and that's correct: the proto doc says empty
@@ -1052,6 +1060,11 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let tags = crate::chargeback_tags::parse_key_tags(
+            msg,
+            &format!("typed_config.virtual_keys[{i}]"),
+        )?;
+
         if let Some(&first) = seen_key_ids.get(&key_id) {
             return Err(invalid(
                 format!("typed_config.virtual_keys[{i}].key_id"),
@@ -1070,7 +1083,13 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         }
         seen_key_ids.insert(key_id.clone(), i);
         seen_digests.insert(digest.clone(), i);
-        key_entries.push((key_id.clone(), tenant.clone(), digest.clone(), revoked));
+        key_entries.push((
+            key_id.clone(),
+            tenant.clone(),
+            digest.clone(),
+            revoked,
+            tags.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        ));
 
         key_set.insert_digest(
             digest,
@@ -1078,6 +1097,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
                 key_id: KeyId::new(key_id),
                 tenant: TenantId::new(tenant),
                 revoked,
+                tags: Arc::new(tags),
             },
         );
     }
@@ -1104,14 +1124,18 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     key_entries.sort();
     let boot_inputs = BootInputs {
         hmac_secret: digest_parts([secret_bytes.as_slice()]),
+        // Bootstrap tags live in the per-serve control plane's key set, so a
+        // reload that changes them is refused like any other key change.
         virtual_keys: digest_parts(key_entries.iter().flat_map(
-            |(key_id, tenant, digest, revoked)| {
+            |(key_id, tenant, digest, revoked, tags)| {
                 [
                     key_id.as_bytes(),
                     tenant.as_bytes(),
                     digest.as_slice(),
                     if *revoked { b"revoked" } else { b"live" },
                 ]
+                .into_iter()
+                .chain(tags.iter().map(String::as_bytes))
             },
         )),
         store: store_digest(&store_spec),
@@ -1128,6 +1152,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         jwt_providers: parse_jwt_providers(config)?,
         credential_ring,
         boot_inputs,
+        tag_policy: crate::chargeback_tags::parse_policy(config)?,
     })
 }
 
@@ -1160,6 +1185,7 @@ impl HttpFilterFactory for AuthFilterFactory {
             jwt_providers,
             credential_ring,
             boot_inputs,
+            tag_policy,
         } = parse_config(config)?;
 
         // A reload is refused before publish when these differ (see
@@ -1446,18 +1472,28 @@ impl HttpFilterFactory for AuthFilterFactory {
             ));
         }
         let chain = Arc::new(AuthenticatorChain::new(authenticators));
-        Ok(Box::new(AuthFilterInstanceFactory { chain }))
+        let tagging = tag_policy.map(|policy| {
+            Arc::new(crate::chargeback_tags::Tagging::new(
+                policy,
+                ctx.shared
+                    .get("", crate::usage_filter::STATS_REGISTRY_KEY)
+                    .and_then(|any| any.downcast::<proxy_observability::stats::Registry>().ok()),
+            ))
+        });
+        Ok(Box::new(AuthFilterInstanceFactory { chain, tagging }))
     }
 }
 
 struct AuthFilterInstanceFactory {
     chain: Arc<AuthenticatorChain>,
+    tagging: Option<Arc<crate::chargeback_tags::Tagging>>,
 }
 
 impl FilterInstanceFactory for AuthFilterInstanceFactory {
     fn create_filter(&self) -> Box<dyn HttpFilter> {
         Box::new(AuthFilterInstance {
             chain: Arc::clone(&self.chain),
+            tagging: self.tagging.clone(),
         })
     }
 }
@@ -1467,6 +1503,9 @@ impl FilterInstanceFactory for AuthFilterInstanceFactory {
 /// `token_limit_filter`) authentication has no encode-side half.
 struct AuthFilterInstance {
     chain: Arc<AuthenticatorChain>,
+    /// `typed_config.chargeback_tags`; `None` attributes no tags and never
+    /// reads the tag header.
+    tagging: Option<Arc<crate::chargeback_tags::Tagging>>,
 }
 
 impl AuthFilterInstance {
@@ -1497,6 +1536,13 @@ impl HttpFilter for AuthFilterInstance {
     ) -> FilterHeadersStatus {
         match self.chain.authenticate(&headers.headers) {
             AuthOutcome::Authenticated(principal) => {
+                // Tags are resolved only for an authenticated request, and
+                // from this principal's own key metadata, so a request can
+                // carry only tags its own tenant's key or its own header set.
+                let tags = match &self.tagging {
+                    Some(tagging) => tagging.resolve(&principal.key_tags, &mut headers.headers),
+                    None => Default::default(),
+                };
                 // Rust note: `stream_info()` returns a `RefMut` guard over the
                 // stream's single `StreamInfo` (see its doc); it must not be
                 // held across another call on `cb`, so this block ends (and
@@ -1511,6 +1557,7 @@ impl HttpFilter for AuthFilterInstance {
                         policy_generation: principal.policy_generation,
                         trace_export: principal.trace_export,
                         denied: false,
+                        tags,
                     };
                     // Hand-off of the set the key was verified against, so the
                     // router never reads the snapshot itself. A request keeps
@@ -1618,6 +1665,8 @@ mod tests {
     use proxy_http::stream_info::StreamInfo;
 
     use crate::control::test_snapshot_handle;
+
+    mod chargeback;
     use proxy_http::filter::SharedFactoryState;
 
     // --- config-message scaffolding ------------------------------------------
@@ -2359,6 +2408,7 @@ mod tests {
                 key_id: KeyId::new(key_id),
                 tenant: TenantId::new(tenant),
                 revoked,
+                tags: Default::default(),
             },
         );
         let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
@@ -2367,6 +2417,7 @@ mod tests {
         ));
         AuthFilterInstance {
             chain: Arc::new(AuthenticatorChain::new(vec![authenticator])),
+            tagging: None,
         }
     }
 
@@ -2409,6 +2460,7 @@ mod tests {
             chain: Arc::new(AuthenticatorChain::new(vec![Box::new(
                 VirtualKeyAuthenticator::new(HmacSecret::new(b"secret"), cp.handle()),
             )])),
+            tagging: None,
         };
         let admit = |filter: &mut AuthFilterInstance| {
             let mut cb = TestCallbacks::new(Some(route_named("r1")));
@@ -2452,6 +2504,7 @@ mod tests {
             chain: Arc::new(AuthenticatorChain::new(vec![Box::new(
                 VirtualKeyAuthenticator::new(HmacSecret::new(b"secret"), cp.handle()),
             )])),
+            tagging: None,
         };
         let opted_in = |filter: &mut AuthFilterInstance, key: &str| {
             let mut cb = TestCallbacks::new(Some(route_named("r1")));
@@ -2488,6 +2541,7 @@ mod tests {
                 key_id: KeyId::new("key-t"),
                 tenant: TenantId::new("tenant-t"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
         keys.insert(
@@ -2497,6 +2551,7 @@ mod tests {
                 key_id: KeyId::new("key-u"),
                 tenant: TenantId::new("tenant-u"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
         let set = TenantCredentialSet::new(std::collections::HashMap::from([(
@@ -2525,6 +2580,7 @@ mod tests {
         ));
         AuthFilterInstance {
             chain: Arc::new(AuthenticatorChain::new(vec![authenticator])),
+            tagging: None,
         }
     }
 
@@ -2748,6 +2804,7 @@ mod tests {
                 tenant_credentials: None,
                 policy_generation: None,
                 trace_export: false,
+                key_tags: Default::default(),
             })
         }
     }

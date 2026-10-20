@@ -307,6 +307,10 @@ pub struct AuthInfo {
     /// its request record names the reserved tenant `unauthenticated`
     /// (ADR-0011 decision 3). `false` when no auth filter ran.
     pub denied: bool,
+    /// Chargeback tags the auth filter accepted for this request
+    /// (`proxy_observability::chargeback`). Empty when no tag policy is
+    /// configured. Record and ledger data only, never a metric label.
+    pub tags: proxy_observability::chargeback::ChargebackTags,
 }
 
 /// Physical upstream attempt snapshots. A new entry is created at dispatch,

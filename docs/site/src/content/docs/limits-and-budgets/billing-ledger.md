@@ -76,7 +76,7 @@ The entry exists whether or not request capture is on.
 | Field | Type | What it holds |
 |---|---|---|
 | `cursor` | integer | The position of the entry in the spool. Use it for `after` and `through`. It rises across restarts. |
-| `schema_version` | integer | The entry format version. The value is `1`. |
+| `schema_version` | integer | The entry format version. Version `2` adds `record.tags`. Version `1` entries can still be in the spool after an upgrade; they have no `record.tags`. |
 | `instance_id` | string | The node id of the proxy that wrote the entry. |
 | `epoch` | integer | The start time of that proxy process, in milliseconds. |
 | `seq` | integer | The number of the entry in its epoch. It starts at 0 and has no gaps. |
@@ -101,7 +101,8 @@ Each item in `charged_scopes` has `scope` (`tenant` or `key`), `id`, and
 The deduplication key is `record.event_id`. It is inside `record`, not at the
 top of the entry. The `record` also holds its own `instance_id` and
 `request_id`, the tenant, the user, the models, the provider, the status, the
-usage, and the cost.
+usage, the cost, and the chargeback tags (`tags`). See
+[Chargeback tags](../chargeback-tags/).
 
 ## Configure the ledger
 
@@ -303,7 +304,7 @@ The answer has this shape. The values are an example.
   "entries": [
     {
       "cursor": 1,
-      "schema_version": 1,
+      "schema_version": 2,
       "instance_id": "proxy-a",
       "epoch": 1760000000000,
       "seq": 0,
@@ -313,7 +314,7 @@ The answer has this shape. The values are an example.
       ],
       "rate_card_version": "2026-01",
       "policy_generation": 3,
-      "record": { "event_id": "..." }
+      "record": { "event_id": "...", "tags": { "team": "infra" } }
     }
   ],
   "next_after": 1,

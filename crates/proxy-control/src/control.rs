@@ -25,6 +25,7 @@ use crate::tenant_credential_crypto::{
     self as credential_crypto, CryptoError, KeyRing, TenantSecret,
 };
 use proxy_credentials::{CredentialSource, TenantCredential, TenantCredentialSet};
+use proxy_observability::chargeback::ChargebackTags;
 use zeroize::Zeroizing;
 // Spend owns period-key and calendar-alignment logic; this module only stores
 // and retrieves the resulting keys.
@@ -70,6 +71,9 @@ pub struct StoredKey {
     pub digest: [u8; 32],
     pub tenant: TenantId,
     pub revoked: bool,
+    /// Chargeback tags the admin set on the key (key metadata). Empty when
+    /// none; validated by `chargeback::validate_key_tags` before a write.
+    pub tags: ChargebackTags,
 }
 
 // Rust note: hand-written, not derived -- same convention `auth.rs`'s module
@@ -84,6 +88,7 @@ impl std::fmt::Debug for StoredKey {
             .field("key_id", &self.key_id)
             .field("tenant", &self.tenant)
             .field("revoked", &self.revoked)
+            .field("tags", &self.tags)
             .finish()
     }
 }
@@ -1638,12 +1643,62 @@ const OBJECT_EXPIRY_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::n
 pub(crate) struct EncodedKeyRow {
     #[serde(
         default = "legacy_schema_version",
-        deserialize_with = "read_schema_version"
+        deserialize_with = "read_key_row_schema_version"
     )]
     pub(crate) schema_version: u32,
     pub(crate) digest: [u8; 32],
     pub(crate) tenant: String,
     pub(crate) revoked: bool,
+    /// Key metadata tags. Absent in rows below [`KEY_TAGS_SCHEMA_VERSION`]
+    /// and in rows written without tags. Skipped when empty: Redis's Lua
+    /// `cjson` re-encodes an empty object as `[]` on revoke, which would not
+    /// decode back into a map.
+    #[serde(default, skip_serializing_if = "ChargebackTags::is_empty")]
+    pub(crate) tags: ChargebackTags,
+}
+
+/// The key-row version that adds `tags`. A row is stamped with it only when
+/// it carries tags, so a store without tagged keys still opens in a build
+/// from before tags. A build from before tags refuses a tagged row instead of
+/// reading it without its tags and losing them on its next rewrite (a
+/// revoke): the downgrade fails loudly rather than dropping attribution.
+pub(crate) const KEY_TAGS_SCHEMA_VERSION: u32 = 3;
+
+fn read_key_row_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if matches!(version, 1 | SPEND_SCHEMA_VERSION | KEY_TAGS_SCHEMA_VERSION) {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported key row schema version {version}"
+        )))
+    }
+}
+
+impl EncodedKeyRow {
+    pub(crate) fn from_stored(key: &StoredKey) -> Self {
+        Self {
+            schema_version: if key.tags.is_empty() {
+                SPEND_SCHEMA_VERSION
+            } else {
+                KEY_TAGS_SCHEMA_VERSION
+            },
+            digest: key.digest,
+            tenant: key.tenant.as_str().to_owned(),
+            revoked: key.revoked,
+            tags: key.tags.clone(),
+        }
+    }
+
+    pub(crate) fn into_stored(self, key_id: KeyId) -> StoredKey {
+        StoredKey {
+            key_id,
+            digest: self.digest,
+            tenant: TenantId::new(self.tenant),
+            revoked: self.revoked,
+            tags: self.tags,
+        }
+    }
 }
 
 /// [`ModelAccess`] as `serde_json` sees it. A local mirror rather than
@@ -2411,12 +2466,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         for entry in keys_table.iter().map_err(store_err)? {
             let (key, value) = entry.map_err(store_err)?;
             let row: EncodedKeyRow = decode_json(value.value())?;
-            keys.push(StoredKey {
-                key_id: KeyId::new(key.value()),
-                digest: row.digest,
-                tenant: TenantId::new(row.tenant),
-                revoked: row.revoked,
-            });
+            keys.push(row.into_stored(KeyId::new(key.value())));
         }
 
         let policies_table = txn.open_table(POLICIES_TABLE).map_err(store_err)?;
@@ -2650,25 +2700,13 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             let previous = match keys_table.get(rec.key_id.as_str()).map_err(store_err)? {
                 Some(guard) => {
                     let previous: EncodedKeyRow = decode_json(guard.value())?;
-                    validate_key_update(
-                        &StoredKey {
-                            key_id: rec.key_id.clone(),
-                            digest: previous.digest,
-                            tenant: TenantId::new(previous.tenant.clone()),
-                            revoked: previous.revoked,
-                        },
-                        rec,
-                    )?;
-                    Some(previous.tenant)
+                    let previous = previous.into_stored(rec.key_id.clone());
+                    validate_key_update(&previous, rec)?;
+                    Some(previous.tenant.as_str().to_owned())
                 }
                 None => None,
             };
-            let row = EncodedKeyRow {
-                schema_version: SPEND_SCHEMA_VERSION,
-                digest: rec.digest,
-                tenant: rec.tenant.as_str().to_string(),
-                revoked: rec.revoked,
-            };
+            let row = EncodedKeyRow::from_stored(rec);
             keys_table
                 .insert(rec.key_id.as_str(), encode_json(&row).as_slice())
                 .map_err(store_err)?;
@@ -3218,6 +3256,8 @@ pub struct MintedKey {
     pub key_id: KeyId,
     pub tenant: TenantId,
     pub plaintext: String,
+    /// The key's chargeback tags after the mint.
+    pub tags: ChargebackTags,
 }
 
 impl std::fmt::Debug for MintedKey {
@@ -3225,6 +3265,7 @@ impl std::fmt::Debug for MintedKey {
         f.debug_struct("MintedKey")
             .field("key_id", &self.key_id)
             .field("tenant", &self.tenant)
+            .field("tags", &self.tags)
             .field("plaintext", &"<redacted>")
             .finish()
     }
@@ -3256,6 +3297,8 @@ pub struct KeyListing {
     pub limits: Option<LimitPolicy>,
     /// The key's own model allow-list, or `None` when it inherits its tenant.
     pub model_access: Option<ModelAccess>,
+    /// Chargeback tags set on the key (key metadata); empty when none.
+    pub tags: Arc<ChargebackTags>,
 }
 
 // Rust note: hand-written, not derived, matching every other `Debug` in this
@@ -3271,6 +3314,7 @@ impl std::fmt::Debug for KeyListing {
             .field("budget", &self.budget)
             .field("limits", &self.limits)
             .field("model_access", &self.model_access)
+            .field("tags", &self.tags)
             .finish()
     }
 }
@@ -4152,6 +4196,7 @@ impl ControlPlane {
                 budget: snapshot.key_budgets.get(&record.key_id).copied(),
                 limits: snapshot.key_limits.get(&record.key_id).copied(),
                 model_access: snapshot.key_policies.get(&record.key_id).cloned(),
+                tags: record.tags.clone(),
             })
             .collect();
         keys.sort_by(|a, b| {
@@ -4170,6 +4215,23 @@ impl ControlPlane {
     /// section and every other write method below: a reader must never
     /// observe a republish that predates the write it is meant to reflect.
     pub fn mint_key(&self, tenant: &TenantId, key_id: &KeyId) -> Result<MintedKey, StoreError> {
+        self.mint_key_with_tags(tenant, key_id, None)
+    }
+
+    /// [`Self::mint_key`] with chargeback tags as the key's metadata,
+    /// validated by `chargeback::validate_key_tags`. `None` keeps the tags a
+    /// re-minted (rotated) key already has, so a rotation that does not
+    /// mention tags does not drop its attribution; a new key gets none.
+    pub fn mint_key_with_tags(
+        &self,
+        tenant: &TenantId,
+        key_id: &KeyId,
+        tags: Option<&ChargebackTags>,
+    ) -> Result<MintedKey, StoreError> {
+        if let Some(tags) = tags {
+            proxy_observability::chargeback::validate_key_tags(tags)
+                .map_err(|e| StoreError::InvalidInput(format!("tags: {e}")))?;
+        }
         crate::auth::check_principal_id("tenant", tenant.as_str())
             .and_then(|()| crate::auth::check_principal_id("key_id", key_id.as_str()))
             .map_err(StoreError::InvalidInput)?;
@@ -4191,6 +4253,15 @@ impl ControlPlane {
                 ));
             }
         }
+        let tags = match tags {
+            Some(tags) => tags.clone(),
+            None => snapshot
+                .keys
+                .iter()
+                .find(|(_, record)| &record.key_id == key_id)
+                .map(|(_, record)| (*record.tags).clone())
+                .unwrap_or_default(),
+        };
         drop(snapshot);
         let rng = ring::rand::SystemRandom::new();
         let plaintext = crate::auth::generate_plaintext_key(&rng);
@@ -4200,13 +4271,63 @@ impl ControlPlane {
             digest,
             tenant: tenant.clone(),
             revoked: false,
+            tags: tags.clone(),
         })?;
         self.rebuild();
         Ok(MintedKey {
             key_id: key_id.clone(),
             tenant: tenant.clone(),
             plaintext,
+            tags,
         })
+    }
+
+    /// Replaces the chargeback tags of the store key `key_id` (an empty map
+    /// clears them), then republishes. The tags apply to requests
+    /// authenticated after the republish.
+    ///
+    /// A key defined in configuration is refused (`Conflict`): a store row
+    /// for it would win the `key_id` collision in [`Self::merge`] and shadow
+    /// a later revocation in the configuration. Its tags are set there. A
+    /// revoked key is refused too; the store's own check also catches a
+    /// revoke that races this write.
+    pub fn set_key_tags(&self, key_id: &KeyId, tags: &ChargebackTags) -> Result<(), StoreError> {
+        proxy_observability::chargeback::validate_key_tags(tags)
+            .map_err(|e| StoreError::InvalidInput(format!("tags: {e}")))?;
+        if self
+            .bootstrap_keys
+            .iter()
+            .any(|(_, record)| &record.key_id == key_id)
+        {
+            return Err(StoreError::Conflict(
+                "key is defined in the configuration; set its tags there".into(),
+            ));
+        }
+        let snapshot = self.published.load();
+        let Some((digest, record)) = snapshot
+            .keys
+            .iter()
+            .find(|(_, record)| &record.key_id == key_id)
+        else {
+            return Err(StoreError::NotFound);
+        };
+        if record.revoked {
+            return Err(StoreError::Conflict("key is revoked".into()));
+        }
+        let digest: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| StoreError::InvalidInput("key digest is not 32 bytes".into()))?;
+        let next = StoredKey {
+            key_id: key_id.clone(),
+            digest,
+            tenant: record.tenant.clone(),
+            revoked: false,
+            tags: tags.clone(),
+        };
+        drop(snapshot);
+        self.store.put_key(&next)?;
+        self.rebuild();
+        Ok(())
     }
 
     /// Revokes `key_id`, then republishes so the revocation takes effect on
@@ -4290,6 +4411,7 @@ impl ControlPlane {
                 digest,
                 tenant: tenant.clone(),
                 revoked: true,
+                tags: (*record.tags).clone(),
             })?;
             revoked += 1;
         }
@@ -4761,6 +4883,7 @@ impl ControlPlane {
                         key_id: record.key_id.clone(),
                         tenant: record.tenant.clone(),
                         revoked: record.revoked,
+                        tags: record.tags.clone(),
                     },
                 ),
             );
@@ -4786,6 +4909,7 @@ impl ControlPlane {
                         key_id: stored.key_id,
                         tenant: stored.tenant,
                         revoked: stored.revoked,
+                        tags: Arc::new(stored.tags),
                     },
                 ),
             );
@@ -5779,6 +5903,7 @@ mod tests {
                 digest: digest_bytes(secret_bytes, "llmp_store-seeded-key"),
                 tenant: TenantId::new("tenant-store"),
                 revoked: false,
+                tags: Default::default(),
             })
             .expect("put_key must succeed against an in-memory store");
         cp.rebuild();
@@ -5808,6 +5933,7 @@ mod tests {
                 digest: digest_bytes(secret_bytes, "llmp_revoked-store-key"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: true,
+                tags: Default::default(),
             })
             .unwrap();
 
@@ -5844,6 +5970,7 @@ mod tests {
                 key_id: KeyId::new("bootstrap-1"),
                 tenant: TenantId::new("tenant-bootstrap"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
 
@@ -5884,6 +6011,7 @@ mod tests {
                 key_id: KeyId::new("k1"),
                 tenant: TenantId::new("tenant-bootstrap"),
                 revoked: false,
+                tags: Default::default(),
             },
         );
 
@@ -5894,6 +6022,7 @@ mod tests {
                 digest: digest_bytes(secret_bytes, "llmp_store-value"),
                 tenant: TenantId::new("tenant-store"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
 
@@ -5960,6 +6089,7 @@ mod tests {
                 digest: digest_bytes(secret_bytes, "llmp_still-good-key"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         let store = ToggleStore {
@@ -6179,6 +6309,151 @@ mod tests {
                 .policies
                 .contains_key(key_budget_subject(&key).as_str()));
         }
+    }
+
+    fn chargeback(pairs: &[(&str, &str)]) -> ChargebackTags {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn snapshot_tags(cp: &ControlPlane, key: &KeyId) -> ChargebackTags {
+        cp.list_keys()
+            .into_iter()
+            .find(|listing| &listing.key_id == key)
+            .map(|listing| (*listing.tags).clone())
+            .expect("key is listed")
+    }
+
+    /// Key metadata tags survive a reopen of the durable store, a rotation
+    /// that does not mention them, a replacement, and a revoke.
+    #[test]
+    fn redb_key_tags_survive_reopen_rotation_and_revoke() {
+        let path = temp_db_path("key-tags-survive-reopen");
+        let tenant = TenantId::new("tenant-a");
+        let key = KeyId::new("key-a");
+        let open = || {
+            ControlPlane::new(
+                Box::new(RedbControlPlaneStore::open(&path).unwrap()),
+                HmacSecret::new(b"secret"),
+                KeySet::new(),
+            )
+            .unwrap()
+        };
+        {
+            let cp = open();
+            let minted = cp
+                .mint_key_with_tags(&tenant, &key, Some(&chargeback(&[("team", "infra")])))
+                .unwrap();
+            assert_eq!(minted.tags, chargeback(&[("team", "infra")]));
+        }
+        let cp = open();
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("team", "infra")]));
+        let rotated = cp.mint_key(&tenant, &key).unwrap();
+        assert_eq!(rotated.tags, chargeback(&[("team", "infra")]));
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("team", "infra")]));
+        cp.set_key_tags(&key, &chargeback(&[("project", "ads")]))
+            .unwrap();
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("project", "ads")]));
+        cp.revoke_key(&key).unwrap();
+        let loaded = cp.store().load().unwrap();
+        let row = loaded.keys.iter().find(|k| k.key_id == key).unwrap();
+        assert!(row.revoked);
+        assert_eq!(row.tags, chargeback(&[("project", "ads")]));
+        assert!(matches!(
+            cp.set_key_tags(&key, &ChargebackTags::new()),
+            Err(StoreError::Conflict(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Only a row that carries tags is stamped version 3, so a store with no
+    /// tagged key still opens in a build from before tags; that build's key
+    /// row reader accepted versions 1 and 2 only, so it refuses a tagged row
+    /// rather than reading it without its tags.
+    #[test]
+    fn key_rows_are_stamped_version_3_only_when_tagged() {
+        let mut key = StoredKey {
+            key_id: KeyId::new("k"),
+            digest: [7; 32],
+            tenant: TenantId::new("t"),
+            revoked: false,
+            tags: ChargebackTags::new(),
+        };
+        let untagged = encode_json(&EncodedKeyRow::from_stored(&key));
+        let text = String::from_utf8(untagged.clone()).unwrap();
+        assert!(text.contains(r#""schema_version":2"#), "{text}");
+        assert!(
+            !text.contains("tags"),
+            "an empty map is not written: {text}"
+        );
+
+        key.tags = chargeback(&[("team", "infra")]);
+        let tagged = encode_json(&EncodedKeyRow::from_stored(&key));
+        let text = String::from_utf8(tagged.clone()).unwrap();
+        assert!(text.contains(r#""schema_version":3"#), "{text}");
+        let back = decode_json::<EncodedKeyRow>(&tagged)
+            .unwrap()
+            .into_stored(KeyId::new("k"));
+        assert_eq!(back.tags, key.tags);
+
+        // The pre-tags reader was `read_schema_version` (1 or 2).
+        #[derive(serde::Deserialize)]
+        struct PreTagsRow {
+            #[serde(deserialize_with = "read_schema_version")]
+            #[allow(dead_code)]
+            schema_version: u32,
+        }
+        assert!(decode_json::<PreTagsRow>(&untagged).is_ok());
+        assert!(decode_json::<PreTagsRow>(&tagged).is_err());
+    }
+
+    /// A key defined in configuration has its tags there: a store row would
+    /// win the key_id collision and shadow a later revocation in the config.
+    #[test]
+    fn set_key_tags_refuses_config_keys_and_invalid_tags() {
+        let secret = HmacSecret::new(b"secret");
+        let mut bootstrap = KeySet::new();
+        bootstrap.insert(
+            &secret,
+            "llmp_config-key",
+            KeyRecord {
+                key_id: KeyId::new("config-key"),
+                tenant: TenantId::new("tenant-a"),
+                revoked: false,
+                tags: Arc::new(chargeback(&[("team", "infra")])),
+            },
+        );
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::default()),
+            HmacSecret::new(b"secret"),
+            bootstrap,
+        )
+        .unwrap();
+        let key = KeyId::new("config-key");
+        assert_eq!(snapshot_tags(&cp, &key), chargeback(&[("team", "infra")]));
+        assert!(matches!(
+            cp.set_key_tags(&key, &chargeback(&[("team", "ads")])),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(cp.store().load().unwrap().keys.is_empty());
+
+        let tenant = TenantId::new("tenant-a");
+        let store_key = KeyId::new("store-key");
+        cp.mint_key(&tenant, &store_key).unwrap();
+        assert!(matches!(
+            cp.set_key_tags(&store_key, &chargeback(&[("team", "a b")])),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cp.mint_key_with_tags(&tenant, &store_key, Some(&chargeback(&[("Team", "x")]))),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            cp.set_key_tags(&KeyId::new("absent"), &ChargebackTags::new()),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]
@@ -6478,6 +6753,7 @@ mod tests {
                     key_id: KeyId::new("config-a"),
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
+                    tags: Default::default(),
                 },
             );
             keys
@@ -7192,6 +7468,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_a"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
 
@@ -7216,6 +7493,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_a"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
 
@@ -7700,6 +7978,7 @@ mod tests {
                     digest: digest_bytes(b"secret", "llmp_a"),
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
+                    tags: Default::default(),
                 })
                 .unwrap();
             // `store` (and its `redb::Database`) is dropped here -- there is
@@ -7730,6 +8009,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_a"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         store
@@ -7738,6 +8018,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_b"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         store
@@ -7746,6 +8027,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_c"),
                 tenant: TenantId::new("tenant-b"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
 
@@ -7787,6 +8069,7 @@ mod tests {
                     digest: digest_bytes(b"secret", "llmp_a"),
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
+                    tags: Default::default(),
                 })
                 .unwrap();
             store
@@ -7795,6 +8078,7 @@ mod tests {
                     digest: digest_bytes(b"secret", "llmp_b"),
                     tenant: TenantId::new("tenant-b"),
                     revoked: false,
+                    tags: Default::default(),
                 })
                 .unwrap();
             store.revoke_key(&KeyId::new("k2")).unwrap();
@@ -7905,6 +8189,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_a"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         writer.revoke_key(&KeyId::new("k1")).unwrap();
@@ -8002,6 +8287,7 @@ mod tests {
                 digest: digest_bytes(secret_bytes, "llmp_still-good-key"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         let store = ToggleStore {
@@ -8101,6 +8387,7 @@ mod tests {
                 digest: digest_bytes(secret_bytes, "llmp_good-key"),
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         let cp = ControlPlane::new(
@@ -8226,6 +8513,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_a"),
                 tenant: tenant.clone(),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         expected += 1;
@@ -8306,6 +8594,7 @@ mod tests {
                 digest: digest_bytes(b"secret", "llmp_a"),
                 tenant: tenant.clone(),
                 revoked: false,
+                tags: Default::default(),
             })
             .unwrap();
         expected += 1;
@@ -10131,6 +10420,7 @@ mod tests {
                 digest: [1; 32],
                 tenant: TenantId::new("tenant-a"),
                 revoked: true,
+                tags: Default::default(),
             })
             .unwrap();
 

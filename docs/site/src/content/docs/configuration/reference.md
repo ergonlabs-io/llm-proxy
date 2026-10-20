@@ -77,6 +77,7 @@ Downstream authentication. Exactly one of `hmac_secret` / `hmac_secret_file` is 
 | `max_policy_staleness` | [Duration](#duration) | no | `4m` | How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`. |
 | `stored_output_owner_ttl` | [Duration](#duration) | no | `720h` | How long the proxy keeps the owner of a stored response (`/v1/responses`) or a stored chat completion (`/v1/chat/completions` with `store: true`). These are created by inference requests, so their owners expire rather than accumulate. After the TTL the object is refused to every tenant, its creator included, until `PUT /tenants/{id}/objects/{object_id}` assigns it again; set it to at least the provider's retention. Whole seconds, at least `1s`. A load error with `enforce.object_ownership: false`, which omits the filter that reads it. |
 | `jwt` | array of [AuthJwtProvider](#authjwtprovider) | no | `[]` | JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. JWT callers always use the operator's provider keys, never a tenant's stored provider credentials, so lowering warns when `tenant_credentials` is also set. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning. |
+| `chargeback_tags` | [ChargebackTags](#chargebacktags) | no | none | Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A tag key that key metadata sets is never taken from the header, so a client cannot override the admin. A JWT caller has no key metadata and gets header tags only. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget. |
 
 Any other field is a load error.
 
@@ -266,6 +267,7 @@ One virtual key. The plaintext key never appears in configuration -- only a keye
 | `tenant` | string; minimum length 1 | yes | none | The tenant (account/team) this key authenticates as. Several keys may share a tenant; that's the normal case -- revoking one leaked key must not revoke the whole account. Examples: `acme`. |
 | `digest` | string; pattern `^[0-9a-f]{64}$` | yes | none | Lowercase hex of `HMAC-SHA256(hmac_secret, <plaintext key>)`, exactly 64 characters -- the plaintext is shown to the operator once, at creation, and is never recoverable from configuration. Generate both together with `llm-proxy --mode keygen --tenant <tenant> --key-id <id>` (reads the same secret via `--hmac-secret-file`/`$LLMPROXY_AUTH_SECRET`, and prints a ready-to-paste `id`/`tenant`/`digest` block). If you have no `llm-proxy` binary handy, `openssl` computes the same digest (note `printf %s`, not a here-string -- `<<<` appends a trailing newline that changes the digest): `printf %s "llmp_yourkey" \| openssl dgst -sha256 -hmac "$LLMPROXY_AUTH_SECRET" -hex` Examples: `3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a`. |
 | `revoked` | boolean | no | `false` | A revoked key is refused, distinguished from an unknown key in the access log's response-code details (`auth_revoked_key` vs `auth_unknown_key`) but NOT on the wire -- both produce an identical 401, so a caller can't learn from the response alone whether a key they guessed was ever valid. |
+| `tags` | map of string | no | `{}` | Chargeback tags for requests this key authenticates (key metadata). At most 32. Keys follow `chargeback_tags.allowed[].key`; values are 1 to 256 bytes of ASCII letters, digits, `_`, `.`, `:`, `/`, `@`, `+` and `-`. `auth.chargeback_tags` decides which are attributed. A change applies on restart, like any change to `keys`. Examples: `{"team": "infra", "project": "search"}`. |
 
 Any other field is a load error.
 
@@ -330,6 +332,21 @@ One JWT issuer. Every field is required.
 | `jwks` | [AuthJwtJwks](#authjwtjwks) | yes | none | Where the issuer's signing keys come from: exactly one of `discovery_url` or `keys`. |
 | `tenant` | [AuthJwtTenant](#authjwttenant) | yes | none | Which claim names the tenant, and which claim values are admitted as which tenant. |
 | `user` | [AuthJwtUser](#authjwtuser) | yes | none | Which claim names the user. |
+
+Any other field is a load error.
+
+## `ChargebackTags`
+
+Used at: `auth.chargeback_tags`.
+
+The operator's chargeback-tag allow-list and caps. Tags that fail it are dropped and counted by reason: `not_allowed` (key not listed, or value not one of its `values`), `too_long` (over `max_value_bytes`), `over_count` (over `max_tags`; key-metadata tags fill the cap first), `malformed` (the header did not parse; all its tags are dropped and the request is still served) and `overridden` (the header set a key that key metadata sets).
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `allowed` | array of [ChargebackAllowedTag](#chargebackallowedtag); minimum items 1 | yes | none | The tag keys that may be attributed. |
+| `from_header` | boolean | no | `false` | Read tags from the `x-cost-tags` request header, written as comma-separated `key=value` pairs (`project=search,team=infra`). The header is removed before the request goes upstream. False means the header is never read and is forwarded unchanged. |
+| `max_tags` | integer; minimum 1, maximum 32 | no | `8` | Most tags on one request. |
+| `max_value_bytes` | integer; minimum 1, maximum 256 | no | `64` | Longest tag value, in bytes. A longer value is dropped as `too_long`. |
 
 Any other field is a load error.
 
@@ -567,6 +584,19 @@ Which claim names the user.
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `claim` | string; minimum length 1 | yes | none | The claim whose string value names the user, for example Entra's `oid` or `sub`. A token without it is refused. The user id is `jwt:<issuer>:<tenant>:<value>`; per-user key policy, budget and limits apply when a key with that id is minted under the same tenant (`POST /keys`), and only narrow the tenant. Examples: `oid`. |
+
+Any other field is a load error.
+
+## `ChargebackAllowedTag`
+
+Used at: `auth.chargeback_tags.allowed[]`.
+
+One allow-listed tag key.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `key` | string; pattern `^[a-z][a-z0-9_.-]{0,63}$` | yes | none | 1 to 64 bytes of lowercase letters, digits, `_`, `.` and `-`, starting with a letter. Examples: `project`. |
+| `values` | array of string; minimum items 1 | no | none | The values the key may take. Absent means any value of 1 to `max_value_bytes` bytes of ASCII letters, digits, `_`, `.`, `:`, `/`, `@`, `+` and `-`. Examples: `["infra", "search"]`. |
 
 Any other field is a load error.
 

@@ -47,6 +47,7 @@ use proxy_http::filter::SharedFactoryState;
 use proxy_observability::capture_transport::{
     query_spool_records, query_spool_stats, AgentTransportConfig, InspectError,
 };
+use proxy_observability::chargeback::{validate_key_tags, ChargebackTags};
 use proxy_observability::ledger::{Ledger, LedgerQueryError, MAX_PAGE_ENTRIES};
 use proxy_observability::records::LedgerEntry;
 use proxy_observability::stats::{envoy_render, prometheus_render, Registry};
@@ -80,6 +81,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/keys/{id}/budget",
     "/keys/{id}/limits",
     "/keys/{id}/policy",
+    "/keys/{id}/tags",
     "/keys/{id}/spend",
     "/tenants",
     "/tenants/{id}",
@@ -98,6 +100,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/keys/{id}/budget",
     "/chains/{stat_prefix}/keys/{id}/limits",
     "/chains/{stat_prefix}/keys/{id}/policy",
+    "/chains/{stat_prefix}/keys/{id}/tags",
     "/chains/{stat_prefix}/keys/{id}/spend",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
@@ -705,6 +708,9 @@ async fn handle(
         WriteRoute::KeyLimits(id) | WriteRoute::ScopedKeyLimits(_, id) => {
             handle_set_key_limits(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
+        WriteRoute::KeyTags(id) | WriteRoute::ScopedKeyTags(_, id) => {
+            handle_set_key_tags(&control_plane, id, &body)
+        }
         WriteRoute::KeyPolicy(id) | WriteRoute::ScopedKeyPolicy(_, id) => {
             handle_set_key_policy(factory_state, stat_prefix_opt, &control_plane, id, &body)
         }
@@ -861,6 +867,8 @@ enum WriteRoute<'a> {
     KeyBudget(&'a str),
     KeyLimits(&'a str),
     KeyPolicy(&'a str),
+    /// `PUT /keys/{id}/tags`: replaces the key's chargeback tags.
+    KeyTags(&'a str),
     KeySpend(&'a str),
     Tenants,
     TenantById(&'a str),
@@ -885,6 +893,7 @@ enum WriteRoute<'a> {
     ScopedKeyBudget(&'a str, &'a str),
     ScopedKeyLimits(&'a str, &'a str),
     ScopedKeyPolicy(&'a str, &'a str),
+    ScopedKeyTags(&'a str, &'a str),
     ScopedKeySpend(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
@@ -907,9 +916,10 @@ impl<'a> WriteRoute<'a> {
         match self {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
-            WriteRoute::KeyBudget(_) | WriteRoute::KeyLimits(_) | WriteRoute::KeyPolicy(_) => {
-                Method::PUT
-            }
+            WriteRoute::KeyBudget(_)
+            | WriteRoute::KeyLimits(_)
+            | WriteRoute::KeyPolicy(_)
+            | WriteRoute::KeyTags(_) => Method::PUT,
             WriteRoute::KeySpend(_) => Method::GET,
             // The gated list read: GET on the collection path.
             WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => Method::GET,
@@ -940,7 +950,8 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::ScopedKeyById(..) | WriteRoute::ScopedTenantById(..) => Method::DELETE,
             WriteRoute::ScopedKeyBudget(..)
             | WriteRoute::ScopedKeyLimits(..)
-            | WriteRoute::ScopedKeyPolicy(..) => Method::PUT,
+            | WriteRoute::ScopedKeyPolicy(..)
+            | WriteRoute::ScopedKeyTags(..) => Method::PUT,
             WriteRoute::ScopedKeySpend(..) => Method::GET,
             WriteRoute::ScopedTenantPolicy(..) => Method::PUT,
             WriteRoute::ScopedTenantBudget(..) | WriteRoute::ScopedTenantLimits(..) => Method::PUT,
@@ -968,6 +979,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::KeyBudget(_)
             | WriteRoute::KeyLimits(_)
             | WriteRoute::KeyPolicy(_)
+            | WriteRoute::KeyTags(_)
             | WriteRoute::KeySpend(_)
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
@@ -992,6 +1004,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedKeyBudget(s, _)
             | WriteRoute::ScopedKeyLimits(s, _)
             | WriteRoute::ScopedKeyPolicy(s, _)
+            | WriteRoute::ScopedKeyTags(s, _)
             | WriteRoute::ScopedKeySpend(s, _)
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
@@ -1033,6 +1046,7 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["keys", id, "budget"] => Some(WriteRoute::KeyBudget(id)),
         ["keys", id, "limits"] => Some(WriteRoute::KeyLimits(id)),
         ["keys", id, "policy"] => Some(WriteRoute::KeyPolicy(id)),
+        ["keys", id, "tags"] => Some(WriteRoute::KeyTags(id)),
         ["keys", id, "spend"] => Some(WriteRoute::KeySpend(id)),
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
@@ -1088,6 +1102,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "keys", id, "policy"] => {
             Some(WriteRoute::ScopedKeyPolicy(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "keys", id, "tags"] => {
+            Some(WriteRoute::ScopedKeyTags(stat_prefix, id))
         }
         ["chains", stat_prefix, "keys", id, "spend"] => {
             Some(WriteRoute::ScopedKeySpend(stat_prefix, id))
@@ -2049,6 +2066,23 @@ struct MintKeyRequest {
     _schema_version: (),
     tenant: String,
     key_id: String,
+    /// Chargeback tags stored as the key's metadata. Absent keeps a
+    /// re-minted key's tags; a new key then has none.
+    #[serde(default)]
+    tags: Option<ChargebackTags>,
+}
+
+/// `PUT /keys/{id}/tags`. `tags` is required: `{}` clears them.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyTagsRequest {
+    #[serde(
+        default,
+        rename = "schema_version",
+        deserialize_with = "read_api_schema_version"
+    )]
+    _schema_version: (),
+    tags: ChargebackTags,
 }
 
 #[derive(serde::Deserialize)]
@@ -2222,6 +2256,7 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                     "credential_source": budget.credential_source.as_str(),
                 })),
                 "limits": listing.limits.map(render_limits),
+                "tags": &*listing.tags,
             })
         })
         .collect();
@@ -2263,7 +2298,12 @@ fn render_model_access(access: &ModelAccess) -> serde_json::Value {
 }
 
 fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<Bytes>> {
-    let MintKeyRequest { tenant, key_id, .. } = match parse_json_body(body) {
+    let MintKeyRequest {
+        tenant,
+        key_id,
+        tags,
+        ..
+    } = match parse_json_body(body) {
         Ok(request) => request,
         Err(response) => return response,
     };
@@ -2280,7 +2320,15 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
         return bad_request(&reason);
     }
 
-    match control_plane.mint_key(&TenantId::new(tenant), &KeyId::new(key_id)) {
+    if let Some(Err(reason)) = tags.as_ref().map(validate_key_tags) {
+        return bad_request(&format!("invalid `tags`: {reason}"));
+    }
+
+    match control_plane.mint_key_with_tags(
+        &TenantId::new(tenant),
+        &KeyId::new(key_id),
+        tags.as_ref(),
+    ) {
         Ok(minted) => {
             tracing::info!(
                 endpoint = "/keys",
@@ -2296,11 +2344,44 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
                     "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
                     "key_id": minted.key_id.as_str(),
                     "tenant": minted.tenant.as_str(),
+                    "tags": &minted.tags,
                     "key": minted.plaintext,
                 }),
             )
         }
         Err(err) => store_error_response("/keys", err),
+    }
+}
+
+/// `PUT /keys/{id}/tags` and its scoped form: replaces a store key's chargeback tags (key metadata). The auth
+/// filter's tag policy decides at request time which of them are attributed; a key tag always wins over the
+/// client's tag header. A key defined in the configuration, or a revoked key, answers 409.
+fn handle_set_key_tags(
+    control_plane: &ControlPlane,
+    key_id: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if key_id.is_empty() {
+        return bad_request("key_id must not be empty");
+    }
+    let KeyTagsRequest { tags, .. } = match parse_json_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if let Err(reason) = validate_key_tags(&tags) {
+        return bad_request(&format!("invalid `tags`: {reason}"));
+    }
+    match control_plane.set_key_tags(&KeyId::new(key_id), &tags) {
+        Ok(()) => {
+            tracing::info!(
+                endpoint = "/keys/{id}/tags",
+                key_id,
+                tags = tags.len(),
+                "admin: set a key's chargeback tags"
+            );
+            no_content()
+        }
+        Err(err) => store_error_response("/keys/{id}/tags", err),
     }
 }
 
@@ -3271,6 +3352,15 @@ fn handle_get_key_spend(
         return store_error_response("/keys/{id}/spend", StoreError::NotFound);
     };
     let budget = snapshot.key_budgets.get(&key_id).copied();
+    // The key's chargeback tags (key metadata), so a consumer of the key's
+    // spend can attribute it without a second call. Spend is not split by
+    // tag: there is no tag budget level.
+    let tags = snapshot
+        .keys
+        .iter()
+        .find(|(_, record)| record.key_id == key_id)
+        .map(|(_, record)| record.tags.clone())
+        .unwrap_or_default();
     let period = budget
         .map(|budget| budget.period)
         .unwrap_or_else(|| accumulator.default_period());
@@ -3290,6 +3380,7 @@ fn handle_get_key_spend(
             "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
             "key_id": key_id.as_str(),
             "tenant": tenant.as_str(),
+            "tags": &*tags,
             "period": period_key.as_str(),
             "period_started_at": period_start.to_rfc3339(),
             "period_ends_at": period_end.to_rfc3339(),

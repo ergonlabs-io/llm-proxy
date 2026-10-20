@@ -13,6 +13,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Breaking
 
+- Billing-ledger entries are now `schema_version: 2`, which adds
+  `record.tags`. Nothing else in the entry changes, and version-1 entries
+  already in the spool are still returned as version 1. Update a consumer
+  that accepts only version 1.
+- A key with chargeback tags is stored as auth-store row version 3. A build
+  from before this release refuses to load a store that holds one, instead of
+  dropping the tags. Clear key tags (`PUT /keys/{id}/tags` with `{"tags":{}}`)
+  before a downgrade.
+
 - The OpenTelemetry semantic-conventions version moves from 1.27.0 to 1.41.0,
   the last release that holds the GenAI conventions in the core repository.
   On `gen_ai.server.time_to_first_token` and
@@ -58,6 +67,21 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
     (it keeps its last card). Upgrade every replica before publishing such a
     card with `PUT /pricing`. A card that uses none of them keeps its version
     and its charges.
+- Chargeback tags (WP-117): operator allow-listed `key=value` tags on usage
+  records (`tags`) and billing-ledger entries (`record.tags`), to attribute
+  spend to a project, team or cost centre. Configure them with
+  `auth.chargeback_tags` (`allowed`, optional per-key `values`, `max_tags`,
+  `max_value_bytes`, `from_header`); Envoy mode has the same fields on
+  `llmproxy.auth` (`Authentication.chargeback_tags`). Tags come from key
+  metadata, set with `POST /keys` (`tags`), the new `PUT /keys/{id}/tags`, or
+  `auth.keys[].tags`, and, when `from_header: true`, from the `x-cost-tags`
+  request header, which is then removed before the request goes upstream. A
+  tag key set by key metadata always beats the header. JWT callers get header
+  tags only. Dropped tags are counted in
+  `llmproxy_chargeback_tags_dropped_total{reason}`; a malformed header never
+  fails the request; tag values are never metric labels. `GET /keys` and
+  `GET /keys/{id}/spend` show a key's tags. There is no tag budget.
+
 - The OpenTelemetry GenAI client metrics `gen_ai.client.token.usage`
   (histogram, `{token}`, labelled by `gen_ai.token.type`) and
   `gen_ai.client.operation.duration` (histogram, seconds), for successful LLM

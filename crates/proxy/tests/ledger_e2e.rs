@@ -261,6 +261,67 @@ fn under_admit_the_counters_differ_by_exactly_the_unledgered_charges() {
     assert_eq!(charged - written, unledgered * CHARGE_MICRO_USD);
 }
 
+/// Chargeback tags in the real binary: an allow-listed key-metadata tag and
+/// header tag reach the ledger entry's record, the key's tag beats the
+/// header's, a malformed header is served and counted, and no tag value
+/// becomes a metric series.
+#[test]
+fn chargeback_tags_reach_the_ledger_entry_and_never_a_metric_label() {
+    let dir = TempLedgerDir::new();
+    let ledger = dir.config(1024, OnUnavailable::Reject);
+    let config = billing_config(&ledger, mock_upstream(), "reject", 1024).replace(
+        "  hmac_secret: \"ledger-e2e-hmac-secret\"\n",
+        "  hmac_secret: \"ledger-e2e-hmac-secret\"\n  chargeback_tags:\n    from_header: true\n    \
+         allowed:\n      - key: team\n      - key: project\n",
+    );
+    let proxy = Proxy::start(dir.root.path(), &config, Some(NODE));
+    let key =
+        proxy.mint_key_with(r#"{"tenant":"t1","key_id":"ledger-e2e-key","tags":{"team":"infra"}}"#);
+    let tagged = |header: &str| {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        http_with(
+            proxy.listen,
+            "POST",
+            "/v1/chat/completions",
+            Some(&key),
+            &format!("x-cost-tags: {header}\r\n"),
+            body,
+        )
+    };
+    assert!(tagged("team=search, project=p-unique-1").starts_with("HTTP/1.1 200"));
+    let malformed = tagged("project");
+    assert!(malformed.starts_with("HTTP/1.1 200"), "{malformed}");
+
+    let scrape =
+        proxy.scrape_until(|s| counter(s, "envoy_llmproxy_ledger_entries_committed_total") == 2);
+    let page = proxy.admin_json("GET", "/ledger/entries?limit=10");
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e["schema_version"] == 2), "{page}");
+    assert_eq!(
+        entries[0]["record"]["tags"],
+        serde_json::json!({"project": "p-unique-1", "team": "infra"})
+    );
+    assert_eq!(
+        entries[1]["record"]["tags"],
+        serde_json::json!({"team": "infra"})
+    );
+    for reason in ["overridden", "malformed"] {
+        assert_eq!(
+            counter(
+                &scrape,
+                &format!("envoy_llmproxy_chargeback_tags_dropped_total{{reason=\"{reason}\"}}")
+            ),
+            1,
+            "{scrape}"
+        );
+    }
+    assert!(!scrape.contains("p-unique-1"), "a tag value became a label");
+    // The key-scoped usage read names the key's tags.
+    let spend = proxy.admin_json("GET", "/keys/ledger-e2e-key/spend");
+    assert_eq!(spend["tags"], serde_json::json!({"team": "infra"}));
+}
+
 // ------------------------------------------------------------------ helpers --
 
 /// A ledger, an admin listener, an `auth` block (so the spend filter charges
@@ -504,13 +565,12 @@ impl Proxy {
     /// `POST /keys` for tenant `t1`, granted every model; returns the
     /// plaintext key.
     fn mint_key(&self) -> String {
-        let response = http(
-            self.admin(),
-            "POST",
-            "/keys",
-            Some(ADMIN_TOKEN),
-            r#"{"tenant":"t1","key_id":"ledger-e2e-key"}"#,
-        );
+        self.mint_key_with(r#"{"tenant":"t1","key_id":"ledger-e2e-key"}"#)
+    }
+
+    /// [`Self::mint_key`] with the `POST /keys` body given.
+    fn mint_key_with(&self, body: &str) -> String {
+        let response = http(self.admin(), "POST", "/keys", Some(ADMIN_TOKEN), body);
         assert!(response.starts_with("HTTP/1.1 201"), "{response}");
         let key = json_body(&response)["key"].as_str().unwrap().to_owned();
         let tenant = http(
@@ -564,6 +624,18 @@ impl Drop for Proxy {
 
 /// One HTTP/1.1 request with `Connection: close`; the raw response.
 fn http(addr: SocketAddr, method: &str, path: &str, bearer: Option<&str>, body: &str) -> String {
+    http_with(addr, method, path, bearer, "", body)
+}
+
+/// [`http`] with `extra` header lines, each ending in CRLF.
+fn http_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    extra: &str,
+    body: &str,
+) -> String {
     let auth = bearer
         .map(|b| format!("Authorization: Bearer {b}\r\n"))
         .unwrap_or_default();
@@ -572,7 +644,7 @@ fn http(addr: SocketAddr, method: &str, path: &str, bearer: Option<&str>, body: 
     stream
         .write_all(
             format!(
-                "{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n{auth}\
+                "{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n{auth}{extra}\
                  Content-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
                 body.len()
