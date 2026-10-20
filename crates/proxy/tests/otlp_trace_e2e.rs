@@ -9,7 +9,7 @@ use common::free_port;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1647,22 +1647,19 @@ fn collector_saw_upstream_rq_at_least(
     })
 }
 
-/// Hangs on the first trace export and answers later ones; `done` counts completions.
+/// Hangs every trace export that arrives while `hang` is set, and answers
+/// every export that arrives after [`HangingTraceCollector::release`].
 #[derive(Clone)]
-struct HangFirstTraceCollector {
-    done: Arc<AtomicU32>,
-    received: Arc<AtomicU32>,
+struct HangingTraceCollector {
+    hang: Arc<AtomicBool>,
     spans: Arc<Mutex<Vec<Span>>>,
-    metrics: Arc<Mutex<Vec<ResourceMetrics>>>,
 }
 
-impl HangFirstTraceCollector {
+impl HangingTraceCollector {
     fn new() -> (Self, SocketAddr) {
-        let collector = HangFirstTraceCollector {
-            done: Arc::new(AtomicU32::new(0)),
-            received: Arc::new(AtomicU32::new(0)),
+        let collector = HangingTraceCollector {
+            hang: Arc::new(AtomicBool::new(true)),
             spans: Arc::new(Mutex::new(Vec::new())),
-            metrics: Arc::new(Mutex::new(Vec::new())),
         };
         let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         let server = collector.clone();
@@ -1676,29 +1673,29 @@ impl HangFirstTraceCollector {
         (collector, addr)
     }
 
-    fn completed_exports(&self) -> u32 {
-        self.done.load(Ordering::SeqCst)
+    fn release(&self) {
+        self.hang.store(false, Ordering::SeqCst);
+    }
+
+    fn span_count(&self) -> usize {
+        self.spans.lock().expect("mutex poisoned").len()
     }
 }
 
 #[tonic::async_trait]
-impl TraceService for HangFirstTraceCollector {
+impl TraceService for HangingTraceCollector {
     async fn export(
         &self,
         request: tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
-        let ordinal = self.received.fetch_add(1, Ordering::SeqCst);
-        // The FIRST export parks forever -- exactly the "accepted the
-        // connection, went silent" collector. Every later export completes
-        // normally, so the exporter's next tick must succeed once the deadline
-        // has bounded the hung one. (The discriminator is `received`'s ordinal,
-        // not `done`: the hung call never completes, so gating on `done == 0`
-        // would make EVERY subsequent export hang too, and the test would then
-        // measure "exporter never recovers" rather than "one bounded stall".)
-        if ordinal == 0 {
+        // An export that arrives while `hang` is set parks forever: the
+        // "accepted the connection, went silent" collector. The flag is read
+        // once, on arrival, so `release` never lets a parked batch through
+        // late. Every batch sent before `release` is lost, however the
+        // exporter split the spans into batches.
+        if self.hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
-        self.done.fetch_add(1, Ordering::SeqCst);
         let mut spans = self.spans.lock().expect("mutex poisoned");
         for resource_spans in request.into_inner().resource_spans {
             for scope_spans in resource_spans.scope_spans {
@@ -1710,41 +1707,58 @@ impl TraceService for HangFirstTraceCollector {
 }
 
 #[tonic::async_trait]
-impl MetricsService for HangFirstTraceCollector {
+impl MetricsService for HangingTraceCollector {
     async fn export(
         &self,
-        request: tonic::Request<ExportMetricsServiceRequest>,
+        _request: tonic::Request<ExportMetricsServiceRequest>,
     ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
-        self.done.fetch_add(1, Ordering::SeqCst);
-        let mut metrics = self.metrics.lock().expect("mutex poisoned");
-        metrics.extend(request.into_inner().resource_metrics);
         Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
     }
 }
 
+/// Reads one series' sample from a Prometheus scrape; an absent series reads
+/// as 0.
+fn scrape_value(scrape: &str, series: &str) -> i64 {
+    scrape
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(series)?
+                .strip_prefix(' ')?
+                .parse::<i64>()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+const TRACE_FAILURES: &str = r#"envoy_llmproxy_otel_export_failures{signal="traces"}"#;
+const SPANS_DROPPED: &str = "envoy_llmproxy_otel_spans_dropped";
+
 /// A hung TRACE collector must be bounded by `TracingConfig::export_deadline`,
-/// the hung batch's spans must be counted into `llmproxy_otel_spans_dropped`,
-/// the failure into `llmproxy_otel_export_failures{signal="traces"}`, and
+/// the hung batches' spans must be counted into `llmproxy_otel_spans_dropped`,
+/// the failures into `llmproxy_otel_export_failures{signal="traces"}`, and
 /// forwarding must continue throughout.
 ///
-/// This is the P2 review finding as an executable test: before the deadline
-/// existed, the first hung export parked the trace exporter forever, every
-/// later batch buffered behind it, the bounded sink filled, and the proxy sat
-/// there silently losing spans with NOTHING reporting the loss. Now the hung
-/// attempt costs one timeout, the discarded batch's span count (1 server + 2
-/// client = 3 here) lands in the ledger the trace exporter itself publishes,
-/// and the failure counter names the signal. All three assertions are read
-/// from `/stats/prometheus`, which also proves the counters are scrape-visible
-/// with no OTLP metric export configured (the review's Prometheus-only case).
+/// Before the deadline existed, the first hung export parked the trace
+/// exporter forever, every later batch buffered behind it, the bounded sink
+/// filled, and the proxy lost spans with nothing reporting the loss. Now each
+/// hung attempt costs one timeout, and the discarded spans land in the ledger
+/// the trace exporter publishes. All assertions read `/stats/prometheus`,
+/// which also proves the counters are scrape-visible with no OTLP metric
+/// export configured.
 ///
-/// Timeline note: the exporter's first flush attempt happens at the fixed 5s
-/// batch tick, the deadline bounds it at 1s, and the poll below allows well
-/// over that -- the 40s ceiling is CI headroom, not the expected case.
+/// The test does not depend on how the exporter splits the request's 3 spans
+/// (1 server + 2 client) into batches. The exporter's interval ticks once
+/// immediately, so its first flush carries only the spans emitted before the
+/// task was first polled, and the rest go in a later batch. The collector
+/// therefore hangs every export until `release`: every batch of the first
+/// request is lost, and the drop counter must account for all 3 spans. Each
+/// lost batch costs at most one 5s tick plus the 1s deadline; the 40s ceiling
+/// on the poll is CI headroom, not the expected case.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped() {
     let (fallback_addr, _captured) = spawn_capturing_mock_upstream();
     let primary_addr = dead_addr();
-    let (collector, collector_addr) = HangFirstTraceCollector::new();
+    let (collector, collector_addr) = HangingTraceCollector::new();
     assert!(
         wait_for_connectable(("127.0.0.1", collector_addr.port()), STARTUP_TIMEOUT),
         "mock trace collector never became connectable"
@@ -1787,31 +1801,14 @@ async fn a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped() {
         "expected the retried request to eventually succeed against `fallback`, got:\n{response}"
     );
 
-    // Poll the admin server for BOTH counters to appear. `flush` publishes the
-    // ledger after every flush attempt, including the one that timed out, so
-    // both series move together within one batch interval of the timeout.
+    // Poll until every span of the request is counted as dropped. `flush`
+    // publishes the ledger after every attempt, including one that timed out.
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     let mut scrape;
     loop {
         scrape = get(admin_addr, "/stats/prometheus", "admin.local");
-        let failures = scrape
-            .lines()
-            .find_map(|l| {
-                l.strip_prefix(r#"envoy_llmproxy_otel_export_failures{signal="traces"} "#)?
-                    .parse::<i64>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        let drops = scrape
-            .lines()
-            .find_map(|l| {
-                l.strip_prefix("envoy_llmproxy_otel_spans_dropped ")?
-                    .parse::<i64>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        if failures >= 1 && drops >= 3 {
+        if scrape_value(&scrape, TRACE_FAILURES) >= 1 && scrape_value(&scrape, SPANS_DROPPED) >= 3 {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -1819,47 +1816,30 @@ async fn a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    let failures = scrape
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix(r#"envoy_llmproxy_otel_export_failures{signal="traces"} "#)?
-                .parse::<i64>()
-                .ok()
-        })
-        .unwrap_or(0);
-    let drops = scrape
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("envoy_llmproxy_otel_spans_dropped ")?
-                .parse::<i64>()
-                .ok()
-        })
-        .unwrap_or(0);
+    let failures = scrape_value(&scrape, TRACE_FAILURES);
+    let drops = scrape_value(&scrape, SPANS_DROPPED);
 
     assert!(
         failures >= 1,
         "the hung export must be counted as a failure under signal=\"traces\". scrape:\n{scrape}"
     );
-    assert!(
-        drops >= 3,
-        "the hung batch's 3 spans (1 server + 2 client) must be counted as dropped -- a \
-         failure counter without the loss total cannot answer the only question an operator \
-         asks it. scrape:\n{scrape}"
-    );
-    // And the hung batch was never delivered, so the collector recorded no
-    // spans: the drop counter is telling the truth about real losses, not
-    // double-counting a delivery that eventually succeeded.
     assert_eq!(
-        collector.spans.lock().expect("mutex poisoned").len(),
+        drops, 3,
+        "all 3 spans of the request (1 server + 2 client) went only to a hung collector, so \
+         exactly 3 must be counted as dropped. scrape:\n{scrape}"
+    );
+    // Nothing was delivered, so the drop counter reports real losses, not a
+    // delivery that eventually succeeded.
+    assert_eq!(
+        collector.span_count(),
         0,
-        "the hung batch must not have been recorded -- if it were, the drop counter would be \
-         lying"
+        "no export was answered, so the collector must hold no spans"
     );
 
-    // Forwarding continues throughout, and keeps producing exportable spans --
-    // which the NEXT flush (after the collector is answering) will deliver,
-    // proving the exporter itself recovered.
+    // The collector answers from now on. Forwarding continues, and the next
+    // request's spans must reach the collector, which proves the exporter
+    // recovered.
+    collector.release();
     let second = get_with_traceparent(
         listener_addr,
         "/v1/chat/completions",
@@ -1871,35 +1851,23 @@ async fn a_hung_trace_export_is_bounded_and_its_batch_counted_as_dropped() {
         "forwarding must survive a hung trace export, got:\n{second}"
     );
 
-    // Wait for a later batch to actually land on the now-answering collector,
-    // then confirm the drop count did NOT grow for it.
     let flush_deadline = std::time::Instant::now() + Duration::from_secs(40);
-    loop {
-        if collector.completed_exports() >= 1
-            && !collector.spans.lock().expect("mutex poisoned").is_empty()
-        {
-            break;
-        }
-        if std::time::Instant::now() >= flush_deadline {
-            break;
-        }
+    while collector.span_count() < 3 && std::time::Instant::now() < flush_deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(
-        !collector.spans.lock().expect("mutex poisoned").is_empty(),
-        "the exporter must recover and deliver a later batch once the collector answers"
+    assert_eq!(
+        collector.span_count(),
+        3,
+        "the exporter must recover and deliver all 3 spans of the second request once the \
+         collector answers"
     );
-    let drops_after = get(admin_addr, "/stats/prometheus", "admin.local")
-        .lines()
-        .find_map(|l| {
-            l.strip_prefix("envoy_llmproxy_otel_spans_dropped ")?
-                .parse::<i64>()
-                .ok()
-        })
-        .unwrap_or(0);
+    let drops_after = scrape_value(
+        &get(admin_addr, "/stats/prometheus", "admin.local"),
+        SPANS_DROPPED,
+    );
     assert_eq!(
         drops_after, drops,
-        "a successfully delivered batch must not be double-counted as dropped"
+        "a successfully delivered batch must not be counted as dropped"
     );
 
     terminate(&mut child);
