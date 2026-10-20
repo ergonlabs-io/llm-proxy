@@ -927,6 +927,10 @@ impl KeptAliveConnection {
             )))
             .expect("build request");
         let exchange = async {
+            // hyper's http1 client goes back to ready only after its connection
+            // task has finished the previous exchange; sending before that
+            // fails with `Canceled, "connection was not ready"`.
+            self.sender.ready().await.expect("connection ready");
             let response = self
                 .sender
                 .send_request(request)
