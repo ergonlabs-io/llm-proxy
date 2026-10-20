@@ -21,7 +21,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-12 | Three-process Redis partition, checkpointed SIGKILL, and recovery | passing — requires `QA_REDIS_ADDR` |
 | QA-13 | Billing ledger: SIGKILL durability, redelivery, disk cap in both modes | passing — since 2026-10-17 (`qa13_billing_ledger_test.go`); approved through the billing-ledger backlog acceptance (owner, 2026-10-17) |
 | QA-14 | Trace export captures an opted-in tenant only, reassembled | passing — since 2026-10-17 (`qa14_trace_export_test.go`); approved through the trace-export backlog acceptance (owner, 2026-10-17) |
-| QA-15 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa15_weighted_providers_test.go`); approved through the WP-118 backlog acceptance (owner, 2026-10-17) |
+| QA-15 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa15_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
