@@ -1159,7 +1159,33 @@ pub struct PriceEntryDef {
     /// change money semantics by guessing a default.
     #[serde(default)]
     pub tier_mode: Option<TierModeDef>,
+    #[serde(default)]
     pub tiers: Vec<TierDef>,
+    /// What the entry meters. Absent means `tokens`, today's behaviour.
+    #[serde(default)]
+    pub basis: Option<PriceBasisDef>,
+    /// Per-image rows; present only for a `basis: images` entry.
+    #[serde(default)]
+    pub image_prices: Option<Vec<ImagePriceDef>>,
+}
+
+/// What a rate-card entry prices. `characters` and `audio_seconds` are not
+/// accepted yet, so they fail at parse time as unknown variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceBasisDef {
+    Tokens,
+    Images,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImagePriceDef {
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub quality: Option<String>,
+    pub nanodollars_per_image: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1171,6 +1197,14 @@ pub struct TierDef {
     pub cached_input_nanodollars_per_token: u64,
     pub cache_write_nanodollars_per_token: u64,
     pub output_nanodollars_per_token: u64,
+    #[serde(default)]
+    pub image_input_nanodollars_per_token: Option<u64>,
+    #[serde(default)]
+    pub image_output_nanodollars_per_token: Option<u64>,
+    #[serde(default)]
+    pub audio_input_nanodollars_per_token: Option<u64>,
+    #[serde(default)]
+    pub audio_output_nanodollars_per_token: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

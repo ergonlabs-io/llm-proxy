@@ -77,7 +77,7 @@
       "$ref": "#/$defs/Observability"
     },
     "pricing": {
-      "description": "Versioned LLM model rate card. Each completed request is priced in integer nanodollars using all four token buckets. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused.",
+      "description": "Versioned LLM model rate card. Each completed request is priced in integer nanodollars using the meters of each entry's `basis`: all four text token buckets (plus optional image and audio token rates) for `tokens`, or a price per generated image for `images`. A `SIGHUP` reload installs a changed card, including one from a `price_list_file`, unless an `auth` section gives the chain a store: then the store holds the card and wins. The configured card seeds an empty store once, and neither a restart nor a reload replaces a stored card. `PUT /pricing` replaces the card at runtime. With `auth.store: shared` it reaches every replica within one policy poll; this is the only way replicas share a card. With `persistent` it survives a restart but stays on the replica that received it, because each replica owns its own file. With `in_memory`, or with no `auth` section, it is lost on restart. A card whose `effective_from` is in the future is refused.",
       "$ref": "#/$defs/Pricing"
     },
     "auto": {
@@ -1085,14 +1085,42 @@
     "PriceEntry": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider_type", "model", "tier_mode", "tiers"],
+      "required": ["provider_type", "model"],
+      "allOf": [
+        {
+          "if": { "properties": { "basis": { "const": "images" } }, "required": ["basis"] },
+          "then": {
+            "required": ["image_prices"],
+            "not": { "anyOf": [{ "required": ["tier_mode"] }, { "required": ["tiers"] }] }
+          }
+        },
+        {
+          "if": { "not": { "properties": { "basis": { "const": "images" } }, "required": ["basis"] } },
+          "then": {
+            "required": ["tier_mode", "tiers"],
+            "not": { "required": ["image_prices"] }
+          }
+        }
+      ],
       "properties": {
+        "basis": { "enum": ["tokens", "images"], "default": "tokens", "description": "What the entry prices. `tokens`: text, and optionally image and audio, tokens, priced by `tier_mode` and `tiers`. `images`: each generated image, priced by `image_prices`. An `images` entry sets neither `tier_mode` nor `tiers`, and cannot set `cached_input_unpriced` or `cache_write_unpriced` to true, because it prices no tokens." },
+        "image_prices": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/ImagePrice" }, "description": "Required for `basis: images`, and not allowed otherwise. The most specific matching row prices each image: a row naming both `size` and `quality` first, then one naming one, then one naming neither. A request matches a row when each attribute the row names equals the value in the response, or in the request body when the response does not echo it. Values are plain strings matched exactly. A request that matches no row is unpriced: it costs zero and is logged, like an unpriced model. Two rows of the same specificity that one request could match are a load error: identical `size` and `quality` pairs, or a row naming only `size` beside a row naming only `quality`." },
         "cached_input_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cached input remain unpriced." },
         "cache_write_unpriced": { "type": "boolean", "default": false, "description": "Requests reporting cache creation remain unpriced." },
         "provider_type": { "type": "string", "minLength": 1, "description": "The provider type the price applies to, for example `openai` or `anthropic`. Matches the `type` of the provider that served the request, set or inferred from its name." },
         "model": { "type": "string", "minLength": 1, "description": "The model name, matched exactly and case-sensitively against the selected model: the upstream model name for the provider that served the request, or the requested model when no mapping applies." },
-        "tier_mode": { "enum": ["whole_request", "graduated"], "description": "How `tiers` price a request. `whole_request`: the band selected by the input context size prices every token of the request. `graduated`: each context token costs the rate of the band that holds its position, and output tokens cost the rate of the band the whole context selects. No default, because the two modes give different prices." },
-        "tiers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PricingTier" }, "description": "The price bands, in increasing `up_to` order; exactly one band, the last, leaves `up_to` out." }
+        "tier_mode": { "enum": ["whole_request", "graduated"], "description": "Required for `basis: tokens`, and not allowed for `images`. How `tiers` price a request. `whole_request`: the band selected by the input context size prices every token of the request. `graduated`: each context token costs the rate of the band that holds its position, and output tokens cost the rate of the band the whole context selects. No default, because the two modes give different prices." },
+        "tiers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/PricingTier" }, "description": "Required for `basis: tokens`, and not allowed for `images`. The price bands, in increasing `up_to` order; exactly one band, the last, leaves `up_to` out." }
+      }
+    },
+    "ImagePrice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nanodollars_per_image"],
+      "properties": {
+        "size": { "type": "string", "minLength": 1, "description": "The image size this row applies to, for example `1024x1024`. Matched exactly as written. Leave it out to match any size." },
+        "quality": { "type": "string", "minLength": 1, "description": "The image quality this row applies to, for example `high`. Matched exactly as written. Leave it out to match any quality." },
+        "nanodollars_per_image": { "type": "integer", "minimum": 0, "description": "The price of one image, in nanodollars (0.04 USD is `40000000`)." }
       }
     },
     "PricingTier": {
@@ -1104,7 +1132,11 @@
         "input_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one input token, in nanodollars (2.50 USD per million tokens is `2500`)." },
         "cached_input_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one cache-read token, in nanodollars." },
         "cache_write_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one cache-write token, in nanodollars." },
-        "output_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one output token, in nanodollars." }
+        "output_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one output token, in nanodollars." },
+        "image_input_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one image input token, in nanodollars. Set it on every band of the entry or on none." },
+        "image_output_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one image output token, in nanodollars. Set it on every band of the entry or on none." },
+        "audio_input_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one audio input token, in nanodollars. Set it on every band of the entry or on none." },
+        "audio_output_nanodollars_per_token": { "type": "integer", "minimum": 0, "description": "The price of one audio output token, in nanodollars. Set it on every band of the entry or on none." }
       }
     },
     "Ledger": {

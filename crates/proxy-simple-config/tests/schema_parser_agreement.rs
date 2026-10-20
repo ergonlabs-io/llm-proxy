@@ -181,6 +181,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_fields::<PriceEntryDef>,
         ),
         ("#/$defs/PricingTier", "TierDef", parser_fields::<TierDef>),
+        (
+            "#/$defs/ImagePrice",
+            "ImagePriceDef",
+            parser_fields::<ImagePriceDef>,
+        ),
         ("#/$defs/Ledger", "Ledger", parser_fields::<Ledger>),
         (
             "#/$defs/LedgerKey",
@@ -237,6 +242,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/PriceEntry/properties/tier_mode",
             "TierModeDef",
             parser_variants::<TierModeDef>,
+        ),
+        (
+            "#/$defs/PriceEntry/properties/basis",
+            "PriceBasisDef",
+            parser_variants::<PriceBasisDef>,
         ),
         (
             "#/$defs/Ledger/properties/on_unavailable",
