@@ -976,6 +976,10 @@ fn parse_tenant_values(
 /// secret bytes + bootstrap key set + store selection + poll interval the
 /// filter needs at request time. Strict mode: every field either maps in or
 /// errors with its dotted path (AGENTS.md invariant 1).
+/// One bootstrap key as [`BootInputs::virtual_keys`] digests it:
+/// `(key_id, tenant, digest, revoked, tags as "key=value")`.
+type BootKeyEntry = (String, String, Vec<u8>, bool, Vec<String>);
+
 fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let secret_bytes = parse_hmac_secret(config)?;
     let store_spec = parse_store(config)?;
@@ -991,7 +995,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let mut seen_digests: HashMap<Vec<u8>, usize> = HashMap::new();
     // Every entry, for `BootInputs::virtual_keys`. Tags are flattened to
     // `key=value` strings, sorted (the map is ordered).
-    let mut key_entries: Vec<(String, String, Vec<u8>, bool, Vec<String>)> = Vec::new();
+    let mut key_entries: Vec<BootKeyEntry> = Vec::new();
 
     // Absent `virtual_keys` and an empty `virtual_keys` are indistinguishable
     // here (both yield `&[]`), and that's correct: the proto doc says empty
