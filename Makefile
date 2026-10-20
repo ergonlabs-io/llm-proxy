@@ -417,6 +417,14 @@ sweep-compare: ## Run the sweep twice, h1 vs h2 upstream, to price connection re
 	./scripts/capacity-sweep.sh --upstream-protocol http1
 	./scripts/capacity-sweep.sh --upstream-protocol http2
 
+.PHONY: bench-added-latency
+bench-added-latency: capture-qualification-build ## Added p50/p99 latency: direct vs proxy controls off vs on: make bench-added-latency [ARGS="--rounds 5"]
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/added-latency.py $(ARGS)
+
+.PHONY: bench-added-latency-check
+bench-added-latency-check: ## Check the added-latency reporter without starting servers
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_added_latency.py
+
 .PHONY: sweep-docker
 sweep-docker: ## Docker Desktop capacity baseline: proxy pinned to 2 CPUs and 1 GiB
 	./scripts/docker-capacity-sweep.sh $(ARGS)
