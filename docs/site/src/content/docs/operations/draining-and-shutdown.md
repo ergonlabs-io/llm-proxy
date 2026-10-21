@@ -28,7 +28,7 @@ falls back to the OS default.
    connection closes: the response carries `Connection: close` on HTTP/1, and
    the proxy sends `GOAWAY` on HTTP/2.
 5. When no connection is left, the process flushes the access-log queues,
-   then capture, traces, and metrics. Then it exits `0`. It does not wait for
+   then request records, traces, and metrics. Then it exits `0`. It does not wait for
    the full window.
 6. If connections are still open after `--drain-time-s` (default 600), they
    are cut and the process exits `0`. The request record of a cut stream has
