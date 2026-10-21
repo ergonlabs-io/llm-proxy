@@ -1445,9 +1445,10 @@ impl HttpFilterFactory for AuthFilterFactory {
             control_plane.export_snapshot_age(Arc::clone(registry), &ctx.stat_prefix);
         }
         // JWT principals do not verify against the control-plane snapshot,
-        // so their trace-export opt-in is read through this, from the same
-        // snapshot and under the same staleness bound as virtual keys.
-        let trace_consent = Arc::new(crate::auth::TraceConsent::new(
+        // so their trace-export opt-in and provider credentials are read
+        // through this, from the same snapshot and under the same staleness
+        // bound as virtual keys.
+        let tenant_facts = Arc::new(crate::auth::TenantFacts::new(
             control_plane.handle(),
             control_plane.freshness(),
             stats_registry,
@@ -1468,7 +1469,7 @@ impl HttpFilterFactory for AuthFilterFactory {
         for ((snapshot, max_stale), validation) in jwt_snapshots.into_iter().zip(jwt_validations) {
             authenticators.push(Box::new(
                 JwtAuthenticator::new_shared(snapshot, validation, max_stale)
-                    .with_trace_consent(Arc::clone(&trace_consent)),
+                    .with_tenant_facts(Arc::clone(&tenant_facts)),
             ));
         }
         let chain = Arc::new(AuthenticatorChain::new(authenticators));

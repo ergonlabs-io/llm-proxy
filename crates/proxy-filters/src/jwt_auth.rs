@@ -212,9 +212,10 @@ pub struct JwtAuthenticator {
     /// static seeds, which never go stale). See
     /// [`JwksSnapshot::is_stale`].
     max_stale: Option<Duration>,
-    /// Where a JWT tenant's trace-export opt-in is read. `None` (no control
-    /// plane, as in tests and static seeds) captures nothing.
-    trace_consent: Option<Arc<crate::auth::TraceConsent>>,
+    /// Where a JWT tenant's trace-export opt-in and provider credentials are
+    /// read. `None` (no control plane, as in tests and static seeds) captures
+    /// neither.
+    tenant_facts: Option<Arc<crate::auth::TenantFacts>>,
 }
 
 impl JwtAuthenticator {
@@ -227,16 +228,17 @@ impl JwtAuthenticator {
             subject_claim: config.subject_claim,
             expected_issuer: config.issuer,
             max_stale: None,
-            trace_consent: None,
+            tenant_facts: None,
         }
     }
 
     /// Shares a refreshable snapshot (see [`JwksSnapshot`]). `max_stale`
     /// must be `Some` for discovery snapshots so a snapshot whose refreshes
     /// stopped landing is refused rather than served forever.
-    /// Read trace-export consent through `consent` (ADR-0008 decision 2).
-    pub fn with_trace_consent(mut self, consent: Arc<crate::auth::TraceConsent>) -> Self {
-        self.trace_consent = Some(consent);
+    /// Read trace-export consent (ADR-0008 decision 2) and tenant provider
+    /// credentials (ADR-0007) through `facts`.
+    pub fn with_tenant_facts(mut self, facts: Arc<crate::auth::TenantFacts>) -> Self {
+        self.tenant_facts = Some(facts);
         self
     }
 
@@ -253,7 +255,7 @@ impl JwtAuthenticator {
             subject_claim: config.subject_claim,
             expected_issuer: config.issuer,
             max_stale,
-            trace_consent: None,
+            tenant_facts: None,
         }
     }
 }
@@ -422,9 +424,10 @@ impl Authenticator for JwtAuthenticator {
             .then(|| key_id.as_str().to_owned());
         let tenant = TenantId::new(tenant);
         let trace_export = self
-            .trace_consent
+            .tenant_facts
             .as_ref()
-            .is_some_and(|consent| consent.opted_in(&tenant));
+            .and_then(|facts| facts.admit(&tenant).ok())
+            .is_some_and(|admitted| admitted.trace_export);
         AuthOutcome::Authenticated(Principal {
             tenant,
             // See the module doc's "`Principal::key_id` for a JWT" section.
@@ -1275,7 +1278,7 @@ GdGIML90cFtpXr13uutgIg==
     /// on another replica. The token stays valid either way.
     #[test]
     fn a_jwt_tenants_trace_export_opt_in_is_honoured_only_on_a_fresh_snapshot() {
-        use crate::auth::{HmacSecret, KeySet, TraceConsent};
+        use crate::auth::{HmacSecret, KeySet, TenantFacts};
         use crate::control::{ControlPlane, InMemoryControlPlaneStore};
 
         let cp = ControlPlane::new(
@@ -1288,14 +1291,14 @@ GdGIML90cFtpXr13uutgIg==
         cp.set_trace_export(&TenantId::new("acme"), true).unwrap();
         cp.freshness().set_max_staleness(Duration::from_secs(3600));
         let control = proxy_observability::stats::StatsControl::new(1);
-        let consent = Arc::new(TraceConsent::new(
+        let consent = Arc::new(TenantFacts::new(
             cp.handle(),
             cp.freshness(),
             Some(control.registry()),
         ));
         let key = shared_test_key();
         let auth =
-            authenticator_with_key(key, "key-1", default_config()).with_trace_consent(consent);
+            authenticator_with_key(key, "key-1", default_config()).with_tenant_facts(consent);
         let opted_in = |tenant: &str| {
             let token = build_jwt(
                 key,
