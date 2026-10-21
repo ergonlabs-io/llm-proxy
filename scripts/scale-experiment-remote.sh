@@ -215,7 +215,10 @@ start_replicas() {
     for ((i = 0; i < count; i++)); do
         LISTEN[i]="$(free_port)"; ADMIN[i]="$(free_port)"
         write_config "$dir/config-r$((i + 1)).yaml" "${LISTEN[i]}" "${ADMIN[i]}" "$store"
-        "$PROXY_BIN" --config "$dir/config-r$((i + 1)).yaml" --mode validate >/dev/null
+        # Validate with the same --service-node the replica runs with: a
+        # shared store refuses a config without a node id.
+        "$PROXY_BIN" --config "$dir/config-r$((i + 1)).yaml" --mode validate \
+            --service-node "scale-r$((i + 1))" >/dev/null
         taskset -c "${CORES_PROXY[i]}" "$PROXY_BIN" --config "$dir/config-r$((i + 1)).yaml" \
             --concurrency "$PROXY_WORKERS" --service-node "scale-r$((i + 1))" \
             >"$dir/proxy-r$((i + 1)).log" 2>&1 &
