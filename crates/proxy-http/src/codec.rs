@@ -1140,6 +1140,8 @@ async fn serve_one(
         upstream,
         cb_guard,
         active_request,
+        upstream_payload: _,
+        websocket: _,
     }) = upgrade
     {
         tunnels.spawn(bridge_upgrade(

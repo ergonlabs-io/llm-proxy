@@ -1048,13 +1048,10 @@ impl RouterHandler {
         // outside the request/response entity-body telemetry boundary.
         attempt_guard.finish(proxy_observability::records::Termination::Complete);
 
-        // Empty body: the tunnel carries every byte from here on over the
-        // raw `OnUpgrade` streams, not through this response's `StreamBody`
-        // (see `codec::serve_one`'s bridging).
-        let body: StreamBody = local_boxed(
-            Full::new(Bytes::new())
-                .map_err(|infallible: std::convert::Infallible| match infallible {}),
-        );
+        // S10.2: the response body is the upstream's post-`101` byte stream,
+        // fed by the tunnel (`codec::serve_one`), so it passes through the
+        // encode filter chain like any other response body.
+        let (upstream_payload, body) = crate::handler::upgrade_payload_channel();
         HttpResponseParts {
             head: resp.head,
             body,
@@ -1063,6 +1060,8 @@ impl RouterHandler {
                 upstream: upstream_on_upgrade,
                 cb_guard,
                 active_request: Some(active_request),
+                upstream_payload,
+                websocket: requested_upgrade_type(&head.headers).as_deref() == Some("websocket"),
             }),
         }
     }
