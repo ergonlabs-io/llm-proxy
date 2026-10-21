@@ -440,6 +440,7 @@ impl Authenticator for JwtAuthenticator {
             // A JWT carries no key metadata: its requests get header tags
             // only (a claims-to-tags mapping is not built).
             key_tags: Default::default(),
+            withheld_tags: Vec::new(),
         })
     }
 }
@@ -1207,6 +1208,7 @@ GdGIML90cFtpXr13uutgIg==
                     policy_generation: None,
                     trace_export: false,
                     key_tags: Default::default(),
+                    withheld_tags: Vec::new(),
                 })
             }
         }

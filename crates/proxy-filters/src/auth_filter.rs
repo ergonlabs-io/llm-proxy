@@ -1540,7 +1540,11 @@ impl HttpFilter for AuthFilterInstance {
                 // from this principal's own key metadata, so a request can
                 // carry only tags its own tenant's key or its own header set.
                 let tags = match &self.tagging {
-                    Some(tagging) => tagging.resolve(&principal.key_tags, &mut headers.headers),
+                    Some(tagging) => tagging.resolve(
+                        &principal.key_tags,
+                        &principal.withheld_tags,
+                        &mut headers.headers,
+                    ),
                     None => Default::default(),
                 };
                 // Rust note: `stream_info()` returns a `RefMut` guard over the
@@ -2805,6 +2809,7 @@ mod tests {
                 policy_generation: None,
                 trace_export: false,
                 key_tags: Default::default(),
+                withheld_tags: Vec::new(),
             })
         }
     }

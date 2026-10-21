@@ -13,7 +13,7 @@ use proxy_observability::chargeback::{
 };
 use proxy_observability::stats::{Handle, Instrument, InstrumentKind, Registry, WorkerId};
 
-/// Tags dropped, by reason. `reason` is the only label and has five values;
+/// Tags dropped, by reason. `reason` is the only label and has six values;
 /// tag keys and values are never labels, so no request can add a series.
 pub static DROPPED: Instrument = Instrument {
     name: "llmproxy_chargeback_tags_dropped_total",
@@ -132,7 +132,7 @@ pub(crate) fn parse_key_tags(
 /// The policy plus its drop counters, shared by every stream of one chain.
 pub(crate) struct Tagging {
     policy: TagPolicy,
-    exported: Option<(Arc<Registry>, [Handle; 5])>,
+    exported: Option<(Arc<Registry>, [Handle; 6])>,
 }
 
 impl Tagging {
@@ -151,13 +151,15 @@ impl Tagging {
         Self { policy, exported }
     }
 
-    /// Resolves the request's tags from the key's metadata and, when the
+    /// Resolves the request's tags from the credential's tags (`key_tags`
+    /// and `withheld`, see [`TagPolicy::resolve_withheld`]) and, when the
     /// policy enables it, the [`HEADER`], counting every drop. The header is
     /// removed when the policy reads it, so it never reaches the provider;
     /// otherwise it is not touched.
     pub(crate) fn resolve(
         &self,
         key_tags: &ChargebackTags,
+        withheld: &[(String, DropReason)],
         headers: &mut HeaderMap,
     ) -> ChargebackTags {
         let resolved = if self.policy.from_header() {
@@ -166,11 +168,11 @@ impl Tagging {
                 .iter()
                 .map(|v| v.as_bytes())
                 .collect();
-            let resolved = self.policy.resolve(key_tags, &values);
+            let resolved = self.policy.resolve_withheld(key_tags, withheld, &values);
             headers.remove(HEADER);
             resolved
         } else {
-            self.policy.resolve(key_tags, &[])
+            self.policy.resolve_withheld(key_tags, withheld, &[])
         };
         if let Some((registry, handles)) = &self.exported {
             for (reason, count) in resolved.dropped.iter() {
