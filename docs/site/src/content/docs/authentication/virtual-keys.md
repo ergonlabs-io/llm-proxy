@@ -54,8 +54,11 @@ Set exactly one of `hmac_secret` or `hmac_secret_file`. To generate the
 `digest` value, see
 [Manage configured virtual keys](../../authentication/managing-secrets/).
 
-An empty `keys: []` list is valid, but it refuses every request because nothing
-authenticates. The config format emits a load-time warning for it.
+An empty `keys: []` list is valid. If no other source supplies keys, it
+refuses every request because nothing authenticates, and the config format
+emits a load-time warning for it. Keys minted through the admin API are
+another source, so there is no warning when `auth.store` is `shared` or
+`persistent`, or when `admin` is set.
 
 A client sends the key as a bearer token:
 

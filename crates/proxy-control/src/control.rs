@@ -3637,15 +3637,40 @@ impl LoadedRows {
         }
     }
 
-    fn is_empty(self) -> bool {
-        self.tenants == 0 && self.keys == 0
+    /// Whether `self` lost every key, or every tenant, that `before` held.
+    /// Per set rather than both at once: zero keys refuses every stored key
+    /// even while tenants remain.
+    fn emptied_since(self, before: LoadedRows) -> bool {
+        (before.keys > 0 && self.keys == 0) || (before.tenants > 0 && self.tenants == 0)
     }
 }
 
-/// The `llmproxy_policy_store_emptied_total` series for one control plane.
-struct EmptiedCounter {
+/// The `llmproxy_policy_store_emptied_total` and `llmproxy_policy_store_rows`
+/// series for one control plane. The rows gauges only take deltas, so the
+/// last published counts are kept.
+struct StoreRowMetrics {
     registry: Arc<proxy_observability::stats::Registry>,
-    handle: proxy_observability::stats::Handle,
+    emptied: proxy_observability::stats::Handle,
+    keys: proxy_observability::stats::Handle,
+    tenants: proxy_observability::stats::Handle,
+    published: LoadedRows,
+}
+
+impl StoreRowMetrics {
+    fn publish(&mut self, rows: LoadedRows) {
+        let worker = proxy_observability::stats::WorkerId(0);
+        self.registry.add(
+            worker,
+            self.keys,
+            rows.keys as i64 - self.published.keys as i64,
+        );
+        self.registry.add(
+            worker,
+            self.tenants,
+            rows.tenants as i64 - self.published.tenants as i64,
+        );
+        self.published = rows;
+    }
 }
 
 /// Owns the store, the operator's HMAC secret, the config bootstrap keys, and
@@ -3673,11 +3698,11 @@ pub struct ControlPlane {
     age_gauge: Mutex<Option<AgeGauge>>,
     /// Tenant and key rows in the last load this replica published, so a
     /// load that finds the store suddenly empty can say what it lost. See
-    /// [`Self::note_emptied_store`].
+    /// [`Self::note_loaded_rows`].
     loaded_rows: Mutex<LoadedRows>,
-    /// `llmproxy_policy_store_emptied_total`, resolved alongside the age
-    /// gauge by [`Self::export_snapshot_age`].
-    emptied_counter: Mutex<Option<EmptiedCounter>>,
+    /// `llmproxy_policy_store_emptied_total` and `llmproxy_policy_store_rows`,
+    /// resolved alongside the age gauge by [`Self::export_snapshot_age`].
+    row_metrics: Mutex<Option<StoreRowMetrics>>,
     poller: Mutex<Option<PolicyPoller>>,
     /// Key-encryption keys for tenant provider credentials (ADR-0007
     /// decision 2). `None` means `typed_config.tenant_credentials` is not
@@ -3798,7 +3823,7 @@ impl ControlPlane {
             },
             age_gauge: Mutex::new(None),
             loaded_rows: Mutex::new(loaded_rows),
-            emptied_counter: Mutex::new(None),
+            row_metrics: Mutex::new(None),
             poller: Mutex::new(None),
             credential_keys,
             credential_warnings,
@@ -3938,18 +3963,42 @@ impl ControlPlane {
             256,
             &[("scope", "overflow")],
         );
-        *self
-            .emptied_counter
-            .lock()
-            .expect("control plane mutex poisoned") = Some(EmptiedCounter {
-            handle: registry.resolve_capped(
+        let rows_gauge = |kind: &str| {
+            registry.resolve_capped(
+                &proxy_observability::stats::instruments::POLICY_STORE_ROWS,
+                &[("scope", scope), ("kind", kind)],
+                256,
+                &[("scope", "overflow"), ("kind", kind)],
+            )
+        };
+        let mut row_metrics = StoreRowMetrics {
+            emptied: registry.resolve_capped(
                 &proxy_observability::stats::instruments::POLICY_STORE_EMPTIED,
                 &[("scope", scope)],
                 256,
                 &[("scope", "overflow")],
             ),
+            keys: rows_gauge("keys"),
+            tenants: rows_gauge("tenants"),
             registry: Arc::clone(&registry),
-        });
+            published: LoadedRows::default(),
+        };
+        // The boot load ran before the registry existed; publish its counts
+        // now. `loaded_rows` is read under the `row_metrics` lock (the same
+        // order `note_loaded_rows` takes them), so a load racing this is
+        // either seen here or published by that load after this returns.
+        let mut slot = self
+            .row_metrics
+            .lock()
+            .expect("control plane mutex poisoned");
+        row_metrics.publish(
+            *self
+                .loaded_rows
+                .lock()
+                .expect("control plane mutex poisoned"),
+        );
+        *slot = Some(row_metrics);
+        drop(slot);
         *gauge = Some(AgeGauge {
             registry,
             handle,
@@ -3978,20 +4027,23 @@ impl ControlPlane {
         gauge.last = age;
     }
 
-    /// Makes a load that finds no tenants and no keys, after the last load
+    /// Records the row counts of a load in `llmproxy_policy_store_rows`, and
+    /// makes a load that finds no keys, or no tenants, after the last load
     /// found some, loud: an ERROR with both counts and generation stamps,
     /// and one increment of `llmproxy_policy_store_emptied_total`.
     ///
     /// AGENTS.md "Fail-open controls": the replica adopts the empty state,
     /// which fails closed (every virtual key the store held now gets 401),
-    /// but at INFO it was indistinguishable from a quiet store. Adopting
-    /// rather than keeping the last-good snapshot is deliberate; see ADR-0006
-    /// addendum 2026-10-16. A shared
-    /// Redis restarted without persistence, or flushed, looks exactly like
-    /// this: its generation stamp also reads back as 0. One line per
-    /// transition, not per poll: once this load is recorded as empty, the
-    /// next empty load compares equal and stays silent.
-    fn note_emptied_store(&self, loaded: &StoredControlPlane, generation: Option<u64>) {
+    /// but at INFO it was indistinguishable from a quiet store. The store
+    /// stays the source of truth: keeping the last-good snapshot would keep
+    /// serving keys the store no longer has, which fails open on revocation
+    /// (ADR-0006 addendum 2026-10-16). A shared Redis restarted without
+    /// persistence, or flushed, looks exactly like this: its generation
+    /// stamp also reads back as 0. One line per transition, not per poll:
+    /// once this load is recorded as empty, the next empty load compares
+    /// equal and stays silent until a load finds rows again. The state is
+    /// two counts on the poll path, never on a request worker.
+    fn note_loaded_rows(&self, loaded: &StoredControlPlane, generation: Option<u64>) {
         let now = LoadedRows::of(loaded);
         let before = std::mem::replace(
             &mut *self
@@ -4000,7 +4052,27 @@ impl ControlPlane {
                 .expect("control plane mutex poisoned"),
             now,
         );
-        if !now.is_empty() || before.is_empty() {
+        let emptied = now.emptied_since(before);
+        let mut metrics = self
+            .row_metrics
+            .lock()
+            .expect("control plane mutex poisoned");
+        if let Some(metrics) = metrics.as_mut() {
+            // Re-read rather than publish `now`: a later load may already
+            // have replaced it, and the gauge must end at the latest counts.
+            let latest = *self
+                .loaded_rows
+                .lock()
+                .expect("control plane mutex poisoned");
+            metrics.publish(latest);
+            if emptied {
+                metrics
+                    .registry
+                    .incr(proxy_observability::stats::WorkerId(0), metrics.emptied, 1);
+            }
+        }
+        drop(metrics);
+        if !emptied {
             return;
         }
         let generation_before = *self
@@ -4014,21 +4086,11 @@ impl ControlPlane {
             keys_after = now.keys,
             generation_before = ?generation_before,
             generation_after = ?generation,
-            "control-plane store is now EMPTY after holding tenants or keys; every \
+            "control-plane store is now EMPTY of keys or tenants it held; every \
              virtual key it held now gets 401. Unless an operator removed them, the \
              store lost its data: a Redis restarted without persistence (AOF or RDB) \
              or flushed revokes every key fleet-wide"
         );
-        if let Some(counter) = self
-            .emptied_counter
-            .lock()
-            .expect("control plane mutex poisoned")
-            .as_ref()
-        {
-            counter
-                .registry
-                .incr(proxy_observability::stats::WorkerId(0), counter.handle, 1);
-        }
     }
 
     /// Starts the background policy-poller thread, ticking roughly every
@@ -4822,14 +4884,14 @@ impl ControlPlane {
     }
 
     /// `generation` is the stamp read before `loaded`, for the log line of
-    /// [`Self::note_emptied_store`]; `last_generation` still holds the
+    /// [`Self::note_loaded_rows`]; `last_generation` still holds the
     /// previous one when this runs.
     fn snapshot_from(
         &self,
         mut loaded: StoredControlPlane,
         generation: Option<u64>,
     ) -> ControlPlaneSnapshot {
-        self.note_emptied_store(&loaded, generation);
+        self.note_loaded_rows(&loaded, generation);
         let cards = Self::take_rate_cards(&mut loaded);
         *self
             .rate_cards
@@ -5225,6 +5287,27 @@ pub fn rendered_emptied_count(registry: &proxy_observability::stats::Registry, s
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse::<u64>().ok())
         .expect("the emptied counter is exported")
+}
+
+/// The value of `llmproxy_policy_store_rows{scope, kind}` in `registry`'s
+/// Prometheus rendering. `kind` is `keys` or `tenants`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn rendered_store_rows(
+    registry: &proxy_observability::stats::Registry,
+    scope: &str,
+    kind: &str,
+) -> i64 {
+    let series = "envoy_llmproxy_policy_store_rows{";
+    proxy_observability::stats::prometheus_render::render(registry)
+        .lines()
+        .find(|line| {
+            line.starts_with(series)
+                && line.contains(&format!("scope=\"{scope}\""))
+                && line.contains(&format!("kind=\"{kind}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<i64>().ok())
+        .expect("the store rows gauge is exported")
 }
 
 /// A store several [`ControlPlane`]s can share in a test, standing in for a
@@ -8364,6 +8447,80 @@ mod tests {
             emptied[0]
         );
         assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
+    }
+
+    #[test]
+    fn a_load_that_loses_every_key_while_tenants_remain_is_loud_once_per_transition() {
+        // Keys cannot be deleted through the API (a revoke keeps the row), so
+        // the rows are cleared under the store as a lost Redis would, with
+        // the tenant left in place: the transition is per set, not both.
+        let (store, inner) = SharedMemoryStore::new();
+        inner.create_tenant(&TenantId::new("tenant-a")).unwrap();
+        let put = |id: &str| {
+            inner
+                .put_key(&StoredKey {
+                    key_id: KeyId::new(id),
+                    digest: digest_bytes(b"s", &format!("llmp_{id}")),
+                    tenant: TenantId::new("tenant-a"),
+                    revoked: false,
+                    tags: Default::default(),
+                })
+                .unwrap();
+        };
+        let lose_keys = || {
+            let mut state = inner.state.lock().unwrap();
+            state.keys.clear();
+            state.generation += 1;
+        };
+        put("k1");
+        put("k2");
+        let cp = ControlPlane::new(Box::new(store), HmacSecret::new(b"s"), KeySet::new()).unwrap();
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        cp.export_snapshot_age(Arc::clone(&registry), "ingress");
+        assert_eq!(rendered_store_rows(&registry, "ingress", "keys"), 2);
+        assert_eq!(rendered_store_rows(&registry, "ingress", "tenants"), 1);
+
+        let capture = ErrorCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let emptied_lines = || {
+            capture
+                .lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("store is now EMPTY"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        lose_keys();
+        assert!(cp.poll_once().unwrap());
+        let lines = emptied_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("keys_before=2")
+                && lines[0].contains("keys_after=0")
+                && lines[0].contains("tenants_after=1"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
+        assert_eq!(rendered_store_rows(&registry, "ingress", "keys"), 0);
+        assert_eq!(rendered_store_rows(&registry, "ingress", "tenants"), 1);
+
+        // Still keyless after another change: suppressed.
+        inner.create_tenant(&TenantId::new("tenant-b")).unwrap();
+        assert!(cp.poll_once().unwrap());
+        assert_eq!(emptied_lines().len(), 1);
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
+
+        // Keys come back, then go again: the next loss is loud again.
+        put("k3");
+        assert!(cp.poll_once().unwrap());
+        assert_eq!(rendered_store_rows(&registry, "ingress", "keys"), 1);
+        lose_keys();
+        assert!(cp.poll_once().unwrap());
+        assert_eq!(emptied_lines().len(), 2);
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 2);
     }
 
     // --- the hard staleness bound (review H4; ADR-0005: auth fails closed) --

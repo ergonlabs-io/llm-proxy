@@ -301,7 +301,7 @@
         "keys": {
           "type": "array",
           "default": [],
-          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning. The list is fixed when the proxy starts: a `SIGHUP` reload that adds, removes, or revokes a configured key is refused whole, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal. When nothing else supplies keys this is almost certainly a mistake, so it produces a load-time warning. Minted keys are another source: no warning when `auth.store` is `shared` or `persistent`, or when `admin` is set so the admin API can mint keys. The list is fixed when the proxy starts: a `SIGHUP` reload that adds, removes, or revokes a configured key is refused whole, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
           "items": { "$ref": "#/$defs/AuthKey" }
         },
         "store": {

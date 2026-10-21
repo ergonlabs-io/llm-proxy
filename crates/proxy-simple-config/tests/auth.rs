@@ -369,6 +369,36 @@ fn empty_keys_lowers_and_warns() {
     );
 }
 
+/// The empty-keys warning is only true where `auth.keys` is the only source
+/// of keys. A store that holds minted keys (`shared`, `persistent`), or an
+/// `in_memory` store with an admin server to mint into it, must not warn;
+/// without either, `keys: []` still refuses everything and still warns.
+#[test]
+fn empty_keys_warns_only_where_static_keys_are_the_only_source() {
+    let with = |admin: &str, store: &str| {
+        let text = format!(
+            "version: 0\n{admin}\
+             providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+             routes:\n  - {{ model: \"*\", provider: openai }}\n\
+             auth:\n  hmac_secret: \"test-operator-secret\"\n  keys: []\n{store}"
+        );
+        let config = parse(&text).expect("must parse");
+        let lowered = lower(&config).expect("empty `keys` is legal");
+        lowered.warnings.iter().any(|w| w.field_path == "auth.keys")
+    };
+    let admin = "admin: 127.0.0.1:9901\n";
+    let shared = "  store:\n    shared: { url: \"redis://127.0.0.1:6379\" }\n";
+    let persistent = "  store:\n    persistent: { path: /var/lib/llmproxy/keys.redb }\n";
+    let in_memory = "  store:\n    in_memory: {}\n";
+
+    assert!(!with("", shared), "shared: other replicas mint keys");
+    assert!(!with("", persistent), "persistent: keys minted earlier");
+    assert!(!with(admin, in_memory), "in_memory with an admin server");
+    assert!(!with(admin, ""), "default store with an admin server");
+    assert!(with("", in_memory), "in_memory, nothing can mint");
+    assert!(with("", ""), "default store, nothing can mint");
+}
+
 // --- 8: no error or warning message anywhere contains the secret or a digest --
 
 #[test]

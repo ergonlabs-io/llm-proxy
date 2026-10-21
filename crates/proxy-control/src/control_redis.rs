@@ -2739,18 +2739,23 @@ mod tests {
 
     /// A shared Redis restarted without persistence comes back empty. The
     /// replica's next poll adopts that, so every key it held gets 401, and it
-    /// must say so: an ERROR naming the before and after counts, and the
-    /// emptied counter. Only this test's namespace is deleted, not the whole
-    /// database, because other tests share the server; to the replica that
-    /// is the same as a flush, generation stamp included.
+    /// must say so: an ERROR naming the before and after counts, the emptied
+    /// counter, and the rows gauge at zero. A second empty poll stays silent;
+    /// once keys are back, the next emptying is loud again. Only this test's
+    /// namespace is deleted, not the whole database, because other tests
+    /// share the server; to the replica that is the same as a flush,
+    /// generation stamp included.
     #[test]
     #[ignore = "needs a real Redis -- see this module's doc comment"]
     fn redis_a_flushed_store_between_polls_is_loud() {
         use crate::auth::{
             AuthOutcome, Authenticator, HmacSecret, KeySet, VirtualKeyAuthenticator,
         };
-        use crate::control::{rendered_emptied_count, ControlPlane, ErrorCapture};
+        use crate::control::{
+            rendered_emptied_count, rendered_store_rows, ControlPlane, ErrorCapture,
+        };
 
+        const KEYS: usize = 3;
         let store = test_store("flushed");
         let namespace = store.namespace.clone();
         let cp = ControlPlane::new(
@@ -2759,62 +2764,114 @@ mod tests {
             KeySet::new(),
         )
         .expect("replica must load");
-        cp.create_tenant(&TenantId::new("tenant-a")).unwrap();
-        let minted = cp
-            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
-            .unwrap();
         let registry = proxy_observability::stats::StatsControl::new(1).registry();
         cp.export_snapshot_age(Arc::clone(&registry), "ingress");
         let authenticator =
             VirtualKeyAuthenticator::new(HmacSecret::new(b"operator-secret"), cp.handle());
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::AUTHORIZATION,
-            http::HeaderValue::from_str(&format!("Bearer {}", minted.plaintext)).unwrap(),
-        );
-        assert!(matches!(
-            authenticator.authenticate(&headers),
-            AuthOutcome::Authenticated(_)
-        ));
-
+        let bearer = |plaintext: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_str(&format!("Bearer {plaintext}")).unwrap(),
+            );
+            headers
+        };
+        let mint_all = |round: &str| -> Vec<http::HeaderMap> {
+            cp.create_tenant(&TenantId::new("tenant-a")).unwrap();
+            (0..KEYS)
+                .map(|i| {
+                    let minted = cp
+                        .mint_key(
+                            &TenantId::new("tenant-a"),
+                            &KeyId::new(format!("{round}-k{i}")),
+                        )
+                        .unwrap();
+                    bearer(&minted.plaintext)
+                })
+                .collect()
+        };
+        let authenticated = |headers: &http::HeaderMap| {
+            matches!(
+                authenticator.authenticate(headers),
+                AuthOutcome::Authenticated(_)
+            )
+        };
         let url = std::env::var("LLM_PROXY_TEST_REDIS").unwrap();
         let mut conn = redis::Client::open(url).unwrap().get_connection().unwrap();
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(format!("{namespace}:*"))
-            .query(&mut conn)
-            .unwrap();
-        assert!(!keys.is_empty());
-        let _: () = redis::cmd("DEL").arg(&keys).query(&mut conn).unwrap();
+        let mut flush = || {
+            let keys: Vec<String> = redis::cmd("KEYS")
+                .arg(format!("{namespace}:*"))
+                .query(&mut conn)
+                .unwrap();
+            assert!(!keys.is_empty());
+            let _: () = redis::cmd("DEL").arg(&keys).query(&mut conn).unwrap();
+        };
+
+        let held = mint_all("first");
+        assert!(held.iter().all(authenticated));
+        assert_eq!(
+            rendered_store_rows(&registry, "ingress", "keys"),
+            KEYS as i64
+        );
+        assert_eq!(rendered_store_rows(&registry, "ingress", "tenants"), 1);
 
         let capture = ErrorCapture::default();
         let _guard = tracing::subscriber::set_default(capture.clone());
+        let emptied_lines = || {
+            capture
+                .lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("store is now EMPTY"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        flush();
         assert!(
             cp.poll_once().unwrap(),
             "the generation stamp moved back to 0"
         );
-
-        let lines = capture.lines.lock().unwrap().clone();
-        let emptied = lines
-            .iter()
-            .find(|line| line.contains("store is now EMPTY"))
-            .unwrap_or_else(|| panic!("no emptied-store ERROR in {lines:?}"));
+        let lines = emptied_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
         for field in [
             "tenants_before=1",
-            "keys_before=1",
+            &format!("keys_before={KEYS}"),
             "tenants_after=0",
             "keys_after=0",
             "generation_after=Some(0)",
         ] {
-            assert!(emptied.contains(field), "{field} missing from {emptied}");
+            assert!(
+                lines[0].contains(field),
+                "{field} missing from {}",
+                lines[0]
+            );
         }
         assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
+        assert_eq!(rendered_store_rows(&registry, "ingress", "keys"), 0);
+        assert_eq!(rendered_store_rows(&registry, "ingress", "tenants"), 0);
         assert!(
-            !matches!(
-                authenticator.authenticate(&headers),
-                AuthOutcome::Authenticated(_)
-            ),
+            !held.iter().any(authenticated),
             "the replica adopted the empty store"
         );
+
+        // Still empty at the next poll: no second line, no second count.
+        cp.poll_once().unwrap();
+        assert_eq!(emptied_lines().len(), 1);
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 1);
+
+        // Restored, then lost again: loud again.
+        let restored = mint_all("second");
+        assert!(restored.iter().all(authenticated));
+        assert_eq!(
+            rendered_store_rows(&registry, "ingress", "keys"),
+            KEYS as i64
+        );
+        flush();
+        assert!(cp.poll_once().unwrap());
+        assert_eq!(emptied_lines().len(), 2);
+        assert_eq!(rendered_emptied_count(&registry, "ingress"), 2);
+        assert!(!restored.iter().any(authenticated));
     }
 
     fn dt(y: i32, mo: u32, d: u32) -> chrono::DateTime<chrono::Utc> {
