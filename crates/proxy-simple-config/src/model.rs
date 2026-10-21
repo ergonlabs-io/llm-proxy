@@ -491,6 +491,28 @@ pub struct Provider {
     /// `outlier_detection`. Absent means no ejection.
     #[serde(default)]
     pub outlier_detection: Option<OutlierDetectionDef>,
+    /// Concurrency ceilings of this provider's cluster (S5). Lowers to the
+    /// cluster's `DEFAULT`-priority `circuit_breakers` thresholds; a field
+    /// left unset keeps the Envoy default of 1024.
+    #[serde(default)]
+    pub circuit_breakers: Option<CircuitBreakersDef>,
+}
+
+/// `providers.<name>.circuit_breakers`: the S5 budgets of one provider
+/// cluster. They sit on the provider, never the route (AGENTS.md invariant 6),
+/// so each provider of a fallback chain keeps its own ceiling.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreakersDef {
+    /// Concurrent requests in flight to this provider, streams included.
+    #[serde(default)]
+    pub max_requests: Option<u32>,
+    /// Requests waiting for a connection once `max_connections` is reached.
+    #[serde(default)]
+    pub max_pending_requests: Option<u32>,
+    /// Open upstream connections to this provider.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
 }
 
 /// `providers.<name>.outlier_detection`: the consecutive-failure detector of

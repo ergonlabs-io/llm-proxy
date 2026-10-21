@@ -121,6 +121,7 @@ One upstream LLM API. Exactly one of `api_key` / `api_key_file` may be set (omit
 | `tenant_credential_verify_path` | string; pattern `^/` | no | none | Upstream path of the zero-cost GET that checks a tenant key when it is saved, e.g. `/api/v1/key`. Requires `tenant_credentials: true`. Defaults when unset and `base_url` is unset: `/api/v1/key` for `openrouter`, `/v1/models` for `openai` and `anthropic`; no default for other types, and none when `base_url` is set. Sent as is, without the cluster path rewrite. |
 | `request_fields` | [object](#providersnamerequest_fields) | no | none | Generic top-level request-body field policy for this provider, enforced per attempt against whichever provider is actually dialled (so it holds on failover). A name must not appear in both lists. |
 | `outlier_detection` | [object](#providersnameoutlier_detection) | no | none | Passive health checking. After `consecutive_5xx` consecutive failed attempts, the provider is ejected: a `models` entry passes it over, as primary or fallback, while another of its providers is not ejected, and serves from it again when the ejection ends. With every provider of the entry ejected, requests go to them in list order as without ejection. Ejection is per proxy process; replicas do not share it. Absent means the provider is never ejected. |
+| `circuit_breakers` | [object](#providersnamecircuit_breakers) | no | none | Concurrency ceilings for this provider. A request over `max_requests`, or over `max_pending_requests` while it waits for a connection, gets an immediate `503` with the `x-envoy-overloaded: true` header. It is not sent to a fallback provider. Each provider has its own ceilings, and they apply on every model that reaches the provider, as primary or fallback. Each replica enforces its own ceilings. A field left unset keeps its default. |
 
 Any other field is a load error.
 
@@ -403,6 +404,18 @@ Passive health checking. After `consecutive_5xx` consecutive failed attempts, th
 | `consecutive_5xx` | integer; minimum 1, maximum 4294967295 | no | `5` | Consecutive failed attempts that eject the provider. A failure is a 5xx response or a local failure (connection refused, reset, or timeout). A 429 or any other response ends the run. |
 | `base_ejection_time` | [Duration](#duration) | no | `30s` | Length of the first ejection. Each later ejection of the provider lasts this value times the number of ejections so far, up to `max_ejection_time`. Must be greater than 0. |
 | `max_ejection_time` | [Duration](#duration) | no | none | Upper bound on one ejection. Default: the larger of `300s` and `base_ejection_time`. Must not be less than `base_ejection_time`. |
+
+Any other field is a load error.
+
+## `providers.<name>.circuit_breakers`
+
+Concurrency ceilings for this provider. A request over `max_requests`, or over `max_pending_requests` while it waits for a connection, gets an immediate `503` with the `x-envoy-overloaded: true` header. It is not sent to a fallback provider. Each provider has its own ceilings, and they apply on every model that reaches the provider, as primary or fallback. Each replica enforces its own ceilings. A field left unset keeps its default.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `max_requests` | integer; minimum 1, maximum 4294967295 | no | `1024` | Requests in flight to this provider at the same time. A streaming response counts until its last byte. Raise this for many concurrent long streams. |
+| `max_pending_requests` | integer; minimum 1, maximum 4294967295 | no | `1024` | Requests that wait for a connection when `max_connections` connections are open. |
+| `max_connections` | integer; minimum 1, maximum 4294967295 | no | `1024` | Open upstream connections to this provider. |
 
 Any other field is a load error.
 

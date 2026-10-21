@@ -1258,6 +1258,9 @@ fn lower_provider(
     if let Some(outlier_detection) = &provider.outlier_detection {
         cluster["outlier_detection"] = lower_outlier_detection(name, outlier_detection)?;
     }
+    if let Some(circuit_breakers) = &provider.circuit_breakers {
+        cluster["circuit_breakers"] = lower_circuit_breakers(name, circuit_breakers)?;
+    }
     if !up.tls && provider.ca_file.is_some() {
         warnings.push(warning(
             format!("providers.{name}.ca_file"),
@@ -1511,6 +1514,66 @@ fn lower_outlier_detection(
         value["max_ejection_time"] = json!(max.to_string());
     }
     Ok(value)
+}
+
+/// `providers.<name>.circuit_breakers` -> the provider cluster's S5
+/// `circuit_breakers`, one `DEFAULT`-priority thresholds entry (dialect
+/// requests are never `HIGH`). Only the fields the operator set are emitted,
+/// so the rest keep the Envoy defaults. Zero is refused: Envoy accepts it,
+/// but a provider that sheds every request is a typo, not a policy.
+fn lower_circuit_breakers(
+    name: &str,
+    cb: &crate::model::CircuitBreakersDef,
+) -> Result<Value, ConfigError> {
+    let mut thresholds = serde_json::Map::new();
+    for (field, value) in [
+        ("max_requests", cb.max_requests),
+        ("max_pending_requests", cb.max_pending_requests),
+        ("max_connections", cb.max_connections),
+    ] {
+        let Some(value) = value else { continue };
+        if value == 0 {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("providers.{name}.circuit_breakers.{field}"),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        thresholds.insert(field.to_string(), json!(value));
+    }
+    Ok(json!({ "thresholds": [thresholds] }))
+}
+
+/// Envoy's default `max_requests` (S5), which an aggregate of providers
+/// without `circuit_breakers` keeps.
+const DEFAULT_MAX_REQUESTS: u32 = 1024;
+
+/// Sizes an aggregate's own `max_requests` so it never binds before its
+/// members do. The router checks the routed aggregate's budget and then the
+/// dialled member's, so a member's ceiling is the one that applies; left at
+/// the default, the aggregate would cap a model at 1024 however high its
+/// providers were raised. Its members together can never hold more than the
+/// sum of their budgets. With no member configured, nothing is emitted and the
+/// aggregate keeps the default.
+fn size_aggregate_max_requests(config: &SimpleConfig, aggregate: &mut Value, members: &[String]) {
+    let budgets: Vec<Option<u32>> = members
+        .iter()
+        .map(|member| {
+            let name = member
+                .strip_prefix("provider:")
+                .expect("aggregate members are provider clusters");
+            config.providers[name]
+                .circuit_breakers
+                .as_ref()
+                .and_then(|cb| cb.max_requests)
+        })
+        .collect();
+    if budgets.iter().all(Option::is_none) {
+        return;
+    }
+    let sum = budgets.iter().fold(0u32, |sum, budget| {
+        sum.saturating_add(budget.unwrap_or(DEFAULT_MAX_REQUESTS))
+    });
+    aggregate["circuit_breakers"] = json!({ "thresholds": [{ "max_requests": sum }] });
 }
 
 fn token_cluster_name(provider_name: &str) -> String {
@@ -2248,7 +2311,7 @@ fn lower_route(
         (format!("provider:{provider_name}"), None)
     } else {
         let aggregate_name = format!("fallback:route-{index}");
-        let aggregate = json!({
+        let mut aggregate = json!({
             "name": aggregate_name,
             // Envoy REQUIRES this on an aggregate cluster -- see
             // `proxy-config::lower::convert_cluster`. It must NOT carry
@@ -2266,6 +2329,7 @@ fn lower_route(
                 }
             }
         });
+        size_aggregate_max_requests(config, &mut aggregate, &member_clusters);
         (aggregate_name, Some(aggregate))
     };
 
@@ -2552,7 +2616,7 @@ fn lower_model(
     }
     let member_count = members.len();
     let aggregate = |aggregate_name: &str, members: &[String]| {
-        json!({
+        let mut aggregate = json!({
             "name": aggregate_name,
             "lb_policy": "CLUSTER_PROVIDED",
             "cluster_type": {
@@ -2562,7 +2626,9 @@ fn lower_model(
                     "clusters": members,
                 }
             }
-        })
+        });
+        size_aggregate_max_requests(config, &mut aggregate, members);
+        aggregate
     };
     // `validate_semantics` guarantees weights are on every entry or none.
     let weighted = model.providers.iter().any(|entry| entry.weight().is_some());

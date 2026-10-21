@@ -815,6 +815,34 @@
               "description": "Upper bound on one ejection. Default: the larger of `300s` and `base_ejection_time`. Must not be less than `base_ejection_time`."
             }
           }
+        },
+        "circuit_breakers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Concurrency ceilings for this provider. A request over `max_requests`, or over `max_pending_requests` while it waits for a connection, gets an immediate `503` with the `x-envoy-overloaded: true` header. It is not sent to a fallback provider. Each provider has its own ceilings, and they apply on every model that reaches the provider, as primary or fallback. Each replica enforces its own ceilings. A field left unset keeps its default.",
+          "properties": {
+            "max_requests": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 1024,
+              "description": "Requests in flight to this provider at the same time. A streaming response counts until its last byte. Raise this for many concurrent long streams."
+            },
+            "max_pending_requests": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 1024,
+              "description": "Requests that wait for a connection when `max_connections` connections are open."
+            },
+            "max_connections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 1024,
+              "description": "Open upstream connections to this provider."
+            }
+          }
         }
       },
       "not": {

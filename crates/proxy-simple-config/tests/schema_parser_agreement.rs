@@ -150,6 +150,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_fields::<OutlierDetectionDef>,
         ),
         (
+            "#/$defs/Provider/properties/circuit_breakers",
+            "CircuitBreakersDef",
+            parser_fields::<CircuitBreakersDef>,
+        ),
+        (
             "#/$defs/Provider/properties/oauth2_jwt_bearer",
             "OAuth2JwtBearerDef",
             parser_fields::<OAuth2JwtBearerDef>,
