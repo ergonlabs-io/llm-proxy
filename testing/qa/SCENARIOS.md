@@ -25,7 +25,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-16 | Chargeback tags reach ledger entries, bounded metrics, survive a restart | passing — since 2026-10-20 (`qa16_chargeback_tags_test.go`); approved through the chargeback-tags backlog acceptance (owner, 2026-10-20) |
 | QA-17 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa17_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
 | QA-18 | Speech under a tenant budget is charged per character and ledgered; non-2xx charges nothing; transcription charged per second; uncountable shapes refused | passing — since 2026-10-20 (`qa18_speech_metering_test.go`); approved through the v0.6.0 ship gate clause 1 (owner, 2026-10-18) |
-| QA-19 | A JWT caller of a BYOK tenant reaches the provider with the tenant's key and is not platform spend; a JWT caller without a stored key is unchanged | passing — since 2026-10-20 (`qa19_jwt_byok_test.go`); approved through the WP-126 backlog acceptance (owner, 2026-10-19) |
+| QA-19 | A JWT caller of a BYOK tenant reaches the provider with the tenant's key and is not platform spend; a JWT caller without a stored key is unchanged | passing — since 2026-10-20 (`qa19_jwt_byok_test.go`); approved through the JWT tenant-credentials backlog acceptance (owner, 2026-10-19) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -601,7 +601,7 @@ platform` with the tenant among `charged_scopes`, and `beta`'s spend is
 non-zero.
 
 **Why black box.** `jwt_tenant_credentials_e2e.rs` pins the headers across a
-fallback chain from Rust; this checks the WP-126 acceptance from the outside:
+fallback chain from Rust; this checks the JWT tenant-credentials acceptance from the outside:
 the dialect, the admin credential and budget APIs, the provider's view, and
 the ledger read API.
 

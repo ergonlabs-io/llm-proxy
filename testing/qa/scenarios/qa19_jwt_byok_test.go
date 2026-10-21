@@ -248,7 +248,7 @@ func qa19ChargedTenantScope(e qa19Entry) bool {
 	return false
 }
 
-// TestQA19_JwtByokTenantUsesItsOwnKeyAndIsNotPlatformSpend is the WP-126
+// TestQA19_JwtByokTenantUsesItsOwnKeyAndIsNotPlatformSpend is the JWT tenant-credentials
 // acceptance case.
 func TestQA19_JwtByokTenantUsesItsOwnKeyAndIsNotPlatformSpend(t *testing.T) {
 	upstream := mocks.NewOpenAI()
