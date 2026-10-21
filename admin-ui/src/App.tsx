@@ -6,14 +6,16 @@ import { GetStarted } from './components/GetStarted'
 import { Keys } from './components/Keys'
 import { ModelsPricing } from './components/ModelsPricing'
 import { Advanced } from './components/Advanced'
+import { Billing } from './components/Billing'
+import { Traces } from './components/Traces'
 import { loadConn, saveConn, scopedWritePath, type AdminConn } from './lib/api'
 import { useAdminState } from './lib/useAdminState'
+import { showFeature } from './lib/observability'
 
-const TABS = [
+const BASE_TABS = [
   { id: 'start', label: 'Get started' },
   { id: 'keys', label: 'Keys' },
   { id: 'models', label: 'Models & pricing' },
-  { id: 'advanced', label: 'Advanced' },
 ]
 
 export default function App() {
@@ -25,12 +27,30 @@ export default function App() {
     () => import.meta.env.DEV || !!conn.adminUrl.trim() || !!conn.chainPrefix.trim(),
   )
   const state = useAdminState(conn)
+  // The field updates at once; the connection only after typing pauses. Every page reads the token on change,
+  // and the admin server locks a peer out after 10 bad tokens a minute, so a token typed key by key must not
+  // reach the server as dozens of partial tokens.
+  const [tokenInput, setTokenInput] = useState(conn.token)
+  useEffect(() => {
+    if (tokenInput === conn.token) return
+    const id = window.setTimeout(() => setConn((c) => ({ ...c, token: tokenInput })), 600)
+    return () => window.clearTimeout(id)
+  }, [tokenInput, conn.token])
 
   useEffect(() => {
     saveConn(conn)
   }, [conn])
 
   const scopedExample = scopedWritePath('/keys', conn.chainPrefix)
+  // Billing and Traces appear only when the config has a ledger or trace export: an empty page for a feature that
+  // is off would read as broken.
+  const tabs = [
+    ...BASE_TABS,
+    ...(showFeature(state.ledger) ? [{ id: 'billing', label: 'Billing' }] : []),
+    ...(showFeature(state.traces) ? [{ id: 'traces', label: 'Traces' }] : []),
+    { id: 'advanced', label: 'Advanced' },
+  ]
+  const activeTab = tabs.some((t) => t.id === tab) ? tab : 'start'
 
   return (
     <div className="mx-auto min-h-screen max-w-6xl px-4 pb-16">
@@ -41,8 +61,8 @@ export default function App() {
             <KeyRound size={14} className="shrink-0 text-zinc-400" />
             <Input
               type="password"
-              value={conn.token}
-              onChange={(e) => setConn({ ...conn, token: e.target.value })}
+              value={tokenInput}
+              onChange={(e) => setTokenInput(e.target.value)}
               placeholder="Admin token (from the admin-token file or the installer)"
               aria-label="Admin token"
             />
@@ -85,21 +105,31 @@ export default function App() {
       </header>
 
       <div className="mt-4">
-        <Tabs tabs={TABS} active={tab} onChange={setTab} />
+        <Tabs tabs={tabs} active={activeTab} onChange={setTab} />
       </div>
 
       {/* Every page stays mounted, so switching tabs keeps what the user typed. */}
       <main className="mt-4">
-        <div hidden={tab !== 'start'}>
+        <div hidden={activeTab !== 'start'}>
           <GetStarted conn={conn} state={state} onNavigate={setTab} />
         </div>
-        <div hidden={tab !== 'keys'}>
+        <div hidden={activeTab !== 'keys'}>
           <Keys conn={conn} state={state} />
         </div>
-        <div hidden={tab !== 'models'}>
+        <div hidden={activeTab !== 'models'}>
           <ModelsPricing conn={conn} state={state} />
         </div>
-        <div hidden={tab !== 'advanced'}>
+        {showFeature(state.ledger) && (
+          <div hidden={activeTab !== 'billing'}>
+            <Billing conn={conn} state={state} />
+          </div>
+        )}
+        {showFeature(state.traces) && (
+          <div hidden={activeTab !== 'traces'}>
+            <Traces conn={conn} state={state} />
+          </div>
+        )}
+        <div hidden={activeTab !== 'advanced'}>
           <Advanced conn={conn} />
         </div>
       </main>
