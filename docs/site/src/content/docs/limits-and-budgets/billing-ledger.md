@@ -4,16 +4,14 @@ description: "Write a durable, per-request billing record stream and read its de
 summary: A durable, encrypted record of every request the proxy sends to a
   provider. What an entry holds, the ledger config, what happens when the
   ledger is full or fails, and how a consumer pulls and acknowledges entries.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - limits-and-budgets/spend-policies
-  - observability/admin-endpoints
+  - administration/admin-api
   - observability/metrics-and-stats
   - observability/request-capture
   - configuration/reference
 ---
-
-# Billing ledger
 
 Use the billing ledger to give a billing system a durable, per-request record
 of what the proxy charged. The ledger writes one encrypted entry for each
@@ -26,6 +24,15 @@ The ledger is off by default. To enable it, add a `ledger` block to the
 consumer that acknowledges entries. See
 [Configure the ledger](#configure-the-ledger). This page is for the operator
 who runs the proxy and for the engineer who writes the billing consumer.
+
+## At a glance
+
+- **Default when unset:** no ledger. The proxy writes no entries.
+- **Failure mode:** configurable. `on_unavailable: reject` (the default) fails
+  closed: a request that finds no ledger capacity gets a local `503`.
+  `on_unavailable: admit` fails open and counts each request that it serves
+  without an entry.
+- **Needs:** a `ledger` block, an encryption key file, and `--service-node`.
 
 ## The guarantee
 
@@ -102,13 +109,13 @@ The deduplication key is `record.event_id`. It is inside `record`, not at the
 top of the entry. The `record` also holds its own `instance_id` and
 `request_id`, the tenant, the user, the models, the provider, the status, the
 usage, the cost, and the chargeback tags (`tags`). See
-[Chargeback tags](../chargeback-tags/).
+[Chargeback tags](/docs/llm-proxy/limits-and-budgets/chargeback-tags/).
 
 ## Configure the ledger
 
 The `ledger` block is a top-level key of the `llmproxy` config file. The
 schema is normative. See the
-[field reference](../../configuration/reference/#ledger).
+[field reference](/docs/llm-proxy/configuration/reference/#ledger).
 
 | Field | Type | Default | Required | What it does |
 |---|---|---|---|---|
@@ -145,8 +152,8 @@ config with comments.
 ```yaml
 version: 0
 
-listen: 0.0.0.0:8080
-admin: 127.0.0.1:9901
+listen: 127.0.0.1:53421
+admin: 127.0.0.1:53422
 
 providers:
   openai:
@@ -176,24 +183,18 @@ chmod 600 /etc/llm-proxy/ledger.key
 llm-proxy --config llmproxy.yaml --service-node proxy-a
 ```
 
-### The same config in Envoy mode
-
-In Envoy mode, put the same fields in `node.metadata["io.llmproxy.ledger"]` of
-the bootstrap. The field names and ranges are the same. One value differs:
-`group_commit_interval` is a number of seconds, from `0.001` to `1`, not a
-duration string. The `llmproxy` file lowers `50ms` to `0.05`. An unknown key in
-the Envoy block fails the load with its full path.
-
 ### The node id
 
-The ledger needs a node id. Pass `--service-node <name>`, or set `node.id` in
-an Envoy bootstrap. The `llmproxy` file has no field for the node id. The node
-id becomes the `instance_id` of every entry. It must be at most 128 bytes,
+The ledger needs a node id. Pass `--service-node <name>`. The `llmproxy` file
+has no field for the node id. The node id becomes the `instance_id` of every entry. It must be at most 128 bytes,
 unique for each replica, and the same after each restart. It must not be `-`.
 The spool also records it, so a spool written under another node id does not
 open.
 
-If the node id is missing, the proxy does not start and prints:
+If the node id is missing, the proxy does not start and prints the message
+below. The path in the message, `node.metadata["io.llmproxy.ledger"]`, is the
+internal name of the `ledger` block. The message is the same when you start the
+proxy with `--config`.
 
 ```text
 node.metadata["io.llmproxy.ledger"]: the ledger requires a configured node id
@@ -283,13 +284,13 @@ the proxy. If one acknowledgement frees too little space, the answer says
 ## Pull and acknowledge entries
 
 A consumer uses two endpoints on the admin listener. Both need the admin
-bearer token. See [Admin endpoints](../../observability/admin-endpoints/#auth-model).
+bearer token. See [Admin API](/docs/llm-proxy/administration/admin-api/).
 
 ### GET /ledger/entries
 
 ```text
 curl -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
-  'http://127.0.0.1:9901/ledger/entries?after=0&limit=100'
+  'http://127.0.0.1:53422/ledger/entries?after=0&limit=100'
 ```
 
 | Parameter | Type | Default | What it does |
@@ -339,7 +340,7 @@ The answer has this shape. The values are an example.
 
 ```text
 curl -X POST -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
-  'http://127.0.0.1:9901/ledger/ack?through=1'
+  'http://127.0.0.1:53422/ledger/ack?through=1'
 ```
 
 The request has no body. The `through` parameter is required. The proxy removes
@@ -464,8 +465,8 @@ The totals match if no entry was lost and nothing was served under `admit`.
 The spend report covers the current period only. Sum the ledgers of every
 replica before you compare. The spend report covers all replicas only if they
 share an `auth.store`. See
-[Spend policies](../spend-policies/#tenant-budgets) and
-[Metrics and /stats](../../observability/metrics-and-stats/).
+[Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/#tenant-budgets) and
+[Metrics and stats](/docs/llm-proxy/observability/metrics-and-stats/).
 
 ## Failure modes
 
@@ -482,10 +483,24 @@ share an `auth.store`. See
 
 The ledger is not request capture. Capture is best-effort and drops records
 under load. The ledger reserves a slot for each request and counts every loss.
-See [Request capture](../../observability/request-capture/).
+See [Request capture](/docs/llm-proxy/observability/request-capture/).
 
 The ledger is not a spend limit. It records what the proxy charged. It does not
-refuse a request for cost. See [Spend policies](../spend-policies/).
+refuse a request for cost. See
+[Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/).
+
+## Limitations
+
+- Each replica has its own ledger. There is no shared ledger store.
+- A crash loses the entries that the writer has not yet committed. The next
+  start detects the loss. It does not count the entries.
+- The ledger does not change on a `SIGHUP` reload. Restart the proxy to apply a
+  change.
+- The proxy does not write an entry for a request that it refuses before it
+  dials a provider.
+- The ledger has no field for the node id. Pass `--service-node` at start.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Implementation notes
 

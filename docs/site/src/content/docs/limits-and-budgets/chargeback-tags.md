@@ -4,16 +4,14 @@ description: "Attribute spend to a project, team or cost centre with operator al
 summary: Tags from key metadata, JWT claims and an optional request header, filtered by an
   operator allow-list, carried into the request record and the billing-ledger
   entry. How to configure them, set them on a key, and read them back.
-lastUpdated: 2026-10-20
+lastUpdated: 2026-10-21
 related:
   - limits-and-budgets/billing-ledger
   - authentication/virtual-keys
-  - observability/admin-endpoints
+  - administration/admin-api
   - observability/metrics-and-stats
   - configuration/reference
 ---
-
-# Chargeback tags
 
 Use chargeback tags to attribute spend to a project, a team or a cost centre.
 A tag is a `key=value` pair. The proxy writes the accepted tags of a request
@@ -21,7 +19,14 @@ into its request record (`tags`) and into its billing-ledger entry
 (`record.tags`). A finance system can then group the charges by tag.
 
 Tags are attribution only. There is no tag budget. Budgets stay on the tenant
-and the key. See [Spend policies](../spend-policies/).
+and the key. See [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/).
+
+## At a glance
+
+- **Default when unset:** no tags. Without `auth.chargeback_tags`, the proxy
+  attributes no tags, does not copy key metadata, and does not read the header.
+- **Failure mode:** a tag that fails a rule is dropped and counted. The proxy
+  serves the request. A bad tag never refuses a request.
 
 ## Where tags come from
 
@@ -71,9 +76,6 @@ A tag key has 1 to 64 bytes of lowercase letters, digits, `_`, `.` and `-`,
 and starts with a letter. A tag value has ASCII letters, digits, and
 `_ . : / @ + -` only. These rules prevent injection into a CSV export or a log
 line.
-
-In Envoy mode, the same fields are `Authentication.chargeback_tags`,
-`VirtualKey.tags` and `JwtProvider.claim_tags` of the `llmproxy.auth` filter.
 
 ## Tags from JWT claims
 
@@ -168,12 +170,24 @@ series.
 
 - **Billing ledger.** Each entry has the tags in `record.tags`. Entries that
   this release writes have `schema_version` `2`. See
-  [Billing ledger](../billing-ledger/#fields-of-an-entry).
+  [Billing ledger](/docs/llm-proxy/limits-and-budgets/billing-ledger/#fields-of-an-entry).
 - **Request records.** A request record has a `tags` object. It is empty when
   the request has no tags.
 - **Keys.** `GET /keys` and `GET /keys/{id}/spend` show the key-metadata tags.
   Claim tags are not stored. They show only on the request record and the
   ledger entry.
+
+## Limitations
+
+- Tags are attribution only. A tag has no budget and no limit.
+- Only the allow-list decides which tags a request gets. A client cannot add a
+  tag that is not in `allowed`.
+- Claim tags are not stored on the key. They show only on the request record
+  and the ledger entry.
+- The proxy reads only top-level JWT claims, and only string values.
+- Tag keys and values are never metric labels.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Upgrades and downgrades
 
