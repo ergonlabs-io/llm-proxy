@@ -65,3 +65,7 @@ __pycache__/
 
 # macOS Finder metadata
 .DS_Store
+
+# Local research output (competitor reports and notes); not tracked.
+/internal-docs/reports/
+/internal-docs/research_notes/
