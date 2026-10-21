@@ -36,7 +36,9 @@ pub mod route;
 pub mod router;
 pub mod stat_handles;
 pub mod stream_info;
+mod tunnel;
 pub mod upstream_pool;
+pub mod websocket;
 
 pub use codec::{serve_http1, CodecError, Http1Options};
 pub use filter::{

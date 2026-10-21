@@ -2889,6 +2889,49 @@ fn strict_streaming_rejects_a_filter_without_flush_through_capability() {
     }
 }
 
+fn upgrade(enabled: bool) -> proxy_config::ir::UpgradeConfig {
+    proxy_config::ir::UpgradeConfig {
+        upgrade_type: "websocket".to_string(),
+        enabled,
+    }
+}
+
+/// S10.2: a buffering filter on an HCM that upgrades fails the build and
+/// names the upgrade entry and the filter.
+#[test]
+fn an_enabled_upgrade_rejects_a_filter_that_can_buffer_responses() {
+    let names = vec!["flush-through".to_string(), "new-filter".to_string()];
+    let factories: Vec<Arc<dyn HttpFilterFactory>> = vec![
+        Arc::new(TagFactory),
+        Arc::new(UnspecifiedResponseCapabilityFactory),
+    ];
+    let err = check_upgrade_filters(&[upgrade(false), upgrade(true)], &names, &factories)
+        .expect_err("a buffering filter cannot share a chain with upgrades");
+    match err {
+        ConfigError::Validation { field_path, rule } => {
+            assert_eq!(field_path, "upgrade_configs[1]");
+            assert!(rule.contains("new-filter"), "{rule}");
+            assert!(rule.contains("can buffer response bytes"), "{rule}");
+        }
+        other => panic!("expected an upgrade validation error, got {other:?}"),
+    }
+}
+
+/// The same chain is fine without an enabled upgrade, and flush-through
+/// filters are fine with one.
+#[test]
+fn upgrade_filter_check_passes_flush_through_chains_and_disabled_upgrades() {
+    let names = vec!["new-filter".to_string()];
+    let buffering: Vec<Arc<dyn HttpFilterFactory>> =
+        vec![Arc::new(UnspecifiedResponseCapabilityFactory)];
+    check_upgrade_filters(&[upgrade(false)], &names, &buffering)
+        .expect("a disabled upgrade type does not constrain the chain");
+    check_upgrade_filters(&[], &names, &buffering).expect("no upgrade types, no constraint");
+    let flush: Vec<Arc<dyn HttpFilterFactory>> = vec![Arc::new(TagFactory)];
+    check_upgrade_filters(&[upgrade(true)], &names, &flush)
+        .expect("a flush-through filter may run on upgrades");
+}
+
 #[test]
 fn strict_streaming_accepts_an_explicit_flush_through_filter() {
     let names = vec!["flush-through".to_string()];

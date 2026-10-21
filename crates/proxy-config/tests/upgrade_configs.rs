@@ -124,8 +124,8 @@ fn empty_upgrade_type_is_rejected() {
     assert!(err_path(&err).ends_with("upgrade_configs[0].upgrade_type"));
 }
 
-/// Per-upgrade filter chains (`UpgradeConfig.filters`) are unimplemented (the
-/// tunnel is transparent, S10.2 deferred), so setting them is rejected by the
+/// Per-upgrade filter chains (`UpgradeConfig.filters`) are unimplemented (an
+/// upgrade runs the HCM's `http_filters`), so setting them is rejected by the
 /// surface walk with its dotted path -- never silently ignored.
 #[test]
 fn per_upgrade_filters_are_rejected() {

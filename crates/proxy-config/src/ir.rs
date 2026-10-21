@@ -598,7 +598,8 @@ pub struct HttpConnectionManagerConfig {
     /// entry names a type and whether it is enabled by default; a route may
     /// override `enabled` per type (S10.1, wired later). Per-upgrade filter
     /// chains (`UpgradeConfig.filters`) are rejected at lowering as
-    /// unimplemented — the current tunnel is transparent (S10.2 deferred).
+    /// unimplemented; an upgrade runs the HCM's `http_filters`
+    /// (`internal-docs/envoy-divergences.md` row 44).
     pub upgrade_configs: Vec<UpgradeConfig>,
     /// HCM `request_headers_timeout`: max time from the first byte of a
     /// request until its headers are complete. `None` (unset or `0s`) disables

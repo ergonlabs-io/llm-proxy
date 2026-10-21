@@ -22,7 +22,10 @@ use proxy_config::ir::{
     RouteTable, UpgradeConfig, VirtualHostIR,
 };
 use proxy_http::codec::{serve_http1, Http1Options};
-use proxy_http::filter::{RequestHeaders, TerminalFilterInstanceFactory};
+use proxy_http::filter::{
+    DecoderCallbacks, EncoderCallbacks, FilterDataStatus, FilterHeadersStatus,
+    FilterInstanceFactory, HttpFilter, RequestHeaders, TerminalFilterInstanceFactory,
+};
 use proxy_http::filter_manager::FilterChainHandler;
 use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamHandler};
 use proxy_http::router::RouterFilterFactory;
@@ -64,6 +67,14 @@ fn forward_to_up() -> ForwardAction {
 /// Each integration-test file is a separate compilation unit, so this helper
 /// is local to the file.
 async fn build_router(addr: SocketAddr, upgrade_configs: Vec<UpgradeConfig>) -> FilterChainHandler {
+    build_router_with_filters(addr, upgrade_configs, Vec::new()).await
+}
+
+async fn build_router_with_filters(
+    addr: SocketAddr,
+    upgrade_configs: Vec<UpgradeConfig>,
+    filters: Vec<Arc<dyn FilterInstanceFactory>>,
+) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -124,7 +135,7 @@ async fn build_router(addr: SocketAddr, upgrade_configs: Vec<UpgradeConfig>) -> 
             .with_upgrade_configs(upgrade_configs),
     );
     FilterChainHandler::new(
-        Vec::new(),
+        filters,
         terminal_factory,
         Arc::new(route_table),
         false,
@@ -440,6 +451,218 @@ async fn upstream_declining_upgrade_passes_the_response_through() {
                 record.attempts[0].termination,
                 proxy_observability::records::Termination::Complete
             );
+        })
+        .await;
+}
+
+fn websocket_enabled() -> Vec<UpgradeConfig> {
+    vec![UpgradeConfig {
+        upgrade_type: "websocket".to_string(),
+        enabled: true,
+    }]
+}
+
+/// Serve `handler` over the real h1 codec on an in-memory connection and
+/// return a client sender for it.
+async fn connect(
+    handler: Rc<dyn StreamHandler>,
+) -> hyper::client::conn::http1::SendRequest<Empty<Bytes>> {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::task::spawn_local(async move {
+        let _ = serve_http1(
+            server_io,
+            handler,
+            Http1Options {
+                keep_alive: true,
+                header_read_timeout: None,
+                request_head_limits: Default::default(),
+            },
+            std::future::pending::<()>(),
+            DownstreamInfo::loopback(),
+        )
+        .await;
+    });
+    let (sender, conn) =
+        hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(client_io))
+            .await
+            .expect("client handshake");
+    tokio::task::spawn_local(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    sender
+}
+
+fn client_upgrade(path: &str) -> http::Request<Empty<Bytes>> {
+    http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(http::header::HOST, "test.local")
+        .header(http::header::UPGRADE, "websocket")
+        .header(http::header::CONNECTION, "Upgrade")
+        .body(Empty::<Bytes>::new())
+        .unwrap()
+}
+
+/// A decode filter that refuses every request without `x-key` with a `401`,
+/// like an auth filter.
+struct RequireKey;
+
+impl HttpFilter for RequireKey {
+    fn decode_headers(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        headers: &mut RequestHeaders,
+        _end_stream: bool,
+    ) -> FilterHeadersStatus {
+        if headers.headers.contains_key("x-key") {
+            return FilterHeadersStatus::Continue;
+        }
+        cb.send_local_reply(StatusCode::UNAUTHORIZED, "no key", None, "no_key");
+        FilterHeadersStatus::StopIteration
+    }
+}
+
+struct RequireKeyFactory;
+
+impl FilterInstanceFactory for RequireKeyFactory {
+    fn create_filter(&self) -> Box<dyn HttpFilter> {
+        Box::new(RequireKey)
+    }
+}
+
+/// envoy-semantics.md S10.2: the HCM's filter chain runs for an upgrade
+/// request. A decode filter's refusal answers the upgrade before the router,
+/// so the upstream is never dialled and no tunnel opens.
+#[tokio::test(flavor = "current_thread")]
+async fn a_decode_filter_refuses_an_upgrade_before_the_upstream_is_dialled() {
+    LocalSet::new()
+        .run_until(async {
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let upstream_addr = spawn_upgrade_echo_upstream(accepted.clone()).await;
+            let handler: Rc<dyn StreamHandler> = Rc::new(
+                build_router_with_filters(
+                    upstream_addr,
+                    websocket_enabled(),
+                    vec![Arc::new(RequireKeyFactory)],
+                )
+                .await,
+            );
+            let mut sender = connect(handler).await;
+            let response = sender
+                .send_request(client_upgrade("/realtime"))
+                .await
+                .expect("send_request");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            tokio::task::yield_now().await;
+            assert_eq!(
+                accepted.load(Ordering::SeqCst),
+                0,
+                "a refused upgrade must never reach the upstream"
+            );
+        })
+        .await;
+}
+
+/// What the recording encode filter saw, shared with the test.
+#[derive(Default)]
+struct Seen {
+    bytes: Vec<u8>,
+    end_stream: bool,
+    completed: bool,
+}
+
+struct RecordEncode(Rc<std::cell::RefCell<Seen>>);
+
+impl HttpFilter for RecordEncode {
+    fn encode_data(
+        &mut self,
+        _cb: &mut dyn EncoderCallbacks,
+        data: &mut Bytes,
+        end_stream: bool,
+    ) -> FilterDataStatus {
+        let mut seen = self.0.borrow_mut();
+        seen.bytes.extend_from_slice(data);
+        seen.end_stream |= end_stream;
+        FilterDataStatus::Continue
+    }
+
+    fn on_stream_complete(&mut self, _cb: &mut dyn EncoderCallbacks) {
+        self.0.borrow_mut().completed = true;
+    }
+}
+
+/// Rust note: `FilterInstanceFactory` is `Send + Sync`, but the recorder is
+/// `Rc` state on this one test thread, so the factory hands out a recorder
+/// from a thread-local slot instead of holding the `Rc` itself.
+struct RecordEncodeFactory;
+
+thread_local! {
+    static SEEN: Rc<std::cell::RefCell<Seen>> = Rc::new(std::cell::RefCell::new(Seen::default()));
+}
+
+impl FilterInstanceFactory for RecordEncodeFactory {
+    fn create_filter(&self) -> Box<dyn HttpFilter> {
+        Box::new(RecordEncode(SEEN.with(Rc::clone)))
+    }
+}
+
+/// S10.2: the upstream's post-`101` bytes pass through the encode chain as
+/// data, and the stream ends (end of stream, `on_stream_complete`) when the
+/// tunnel closes, not at the `101`.
+#[tokio::test(flavor = "current_thread")]
+async fn the_encode_chain_sees_tunnel_bytes_and_the_stream_ends_at_the_tunnels_close() {
+    LocalSet::new()
+        .run_until(async {
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let upstream_addr = spawn_upgrade_echo_upstream(accepted.clone()).await;
+            let handler: Rc<dyn StreamHandler> = Rc::new(
+                build_router_with_filters(
+                    upstream_addr,
+                    websocket_enabled(),
+                    vec![Arc::new(RecordEncodeFactory)],
+                )
+                .await,
+            );
+            let mut sender = connect(handler).await;
+            let mut response = sender
+                .send_request(client_upgrade("/realtime"))
+                .await
+                .expect("send_request");
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            let mut tunnel = TokioIo::new(hyper::upgrade::on(&mut response).await.unwrap());
+
+            const PING: &[u8] = b"through-the-encode-chain";
+            tunnel.write_all(PING).await.unwrap();
+            let mut reply = [0u8; PING.len()];
+            tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut reply))
+                .await
+                .expect("echo arrives")
+                .unwrap();
+            assert_eq!(&reply, PING);
+            SEEN.with(|seen| {
+                let seen = seen.borrow();
+                assert_eq!(seen.bytes, PING, "the encode chain saw the upstream bytes");
+                assert!(
+                    !seen.end_stream && !seen.completed,
+                    "the stream is still open while the tunnel is"
+                );
+            });
+
+            // The client closes; the echo upstream closes in turn.
+            tunnel.shutdown().await.unwrap();
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut rest))
+                .await
+                .expect("the tunnel closes")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !SEEN.with(|seen| seen.borrow().completed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the stream completes once the tunnel closes");
+            SEEN.with(|seen| assert!(seen.borrow().end_stream, "a clean close ends the stream"));
         })
         .await;
 }

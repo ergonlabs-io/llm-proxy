@@ -235,6 +235,32 @@ fn resolve_per_filter_row(
     Ok(row)
 }
 
+/// envoy-semantics.md S10.2: an HCM with an enabled upgrade type must not
+/// carry a filter that can buffer response bytes. An upgrade's response body
+/// is its tunnel, which the client reads only after the `101`, so a filter
+/// holding response bytes would hold the `101` with them. `names[i]` is
+/// `factories[i]`'s filter name.
+pub fn check_upgrade_filters(
+    upgrade_configs: &[proxy_config::ir::UpgradeConfig],
+    names: &[String],
+    factories: &[Arc<dyn HttpFilterFactory>],
+) -> Result<(), ConfigError> {
+    let Some(upgrade) = upgrade_configs.iter().position(|u| u.enabled) else {
+        return Ok(());
+    };
+    match factories.iter().position(|f| f.may_buffer_response()) {
+        None => Ok(()),
+        Some(filter) => Err(ConfigError::Validation {
+            field_path: format!("upgrade_configs[{upgrade}]"),
+            rule: format!(
+                "upgrade type `{}` is enabled, but HTTP filter '{}' can buffer response bytes, \
+                 which an upgraded stream cannot carry",
+                upgrade_configs[upgrade].upgrade_type, names[filter]
+            ),
+        }),
+    }
+}
+
 /// Build the [`PerRouteTable`] for one HCM's filter chain (ADR-0004): resolve `RouteConfiguration`/`VirtualHost`/`Route`-level
 /// `typed_per_filter_config` once, at build time, against the real chain —
 /// see [`resolve_per_filter_row`] for the per-entry rules. `names[i]` is
