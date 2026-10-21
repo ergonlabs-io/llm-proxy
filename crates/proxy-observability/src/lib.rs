@@ -3,13 +3,6 @@
 //! retry engine and pools.
 
 pub mod access_log;
-#[cfg(unix)]
-pub mod capture;
-pub mod capture_policy;
-#[cfg(all(test, unix))]
-mod capture_tests;
-#[cfg(unix)]
-pub mod capture_transport;
 pub mod chargeback;
 pub mod flags;
 pub mod ledger;

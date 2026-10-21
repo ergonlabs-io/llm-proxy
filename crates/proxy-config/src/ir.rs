@@ -22,8 +22,6 @@ use std::time::Duration;
 // build or render it (AGENTS.md invariant 2's spirit: keep the parsing/rendering
 // logic in the crate that owns it).
 use proxy_observability::access_log::FormatString;
-#[cfg(unix)]
-pub use proxy_observability::capture_policy::EndUserCaptureConfig;
 use proxy_observability::ResponseFlag;
 
 pub type ListenerName = String;
@@ -70,12 +68,6 @@ pub struct ConfigSnapshot {
     /// OTLP or tracing" and is why this field is independent of
     /// [`Self::tracing`] rather than a mode of it.
     pub metrics: Option<MetricsExportConfig>,
-    /// Independently bounded, metadata-only local-agent capture.
-    #[cfg(unix)]
-    pub end_user_capture: Option<EndUserCaptureConfig>,
-    /// Presence is retained so an explicitly disabled namespace still conflicts
-    /// with legacy capture CLI controls rather than silently choosing a mode.
-    pub end_user_capture_configured: bool,
     /// The billing ledger (ADR-0009), from
     /// `node.metadata["io.llmproxy.ledger"]`. `None` means no ledger: no
     /// admission reservation and no entries. Bootstrap-scoped: one writer
@@ -183,9 +175,6 @@ impl ConfigSnapshot {
             // is bootstrap-scoped (a collector endpoint), not an xDS resource,
             // so a listener/cluster/route delivery has nothing to say about it.
             metrics: self.metrics.clone(),
-            #[cfg(unix)]
-            end_user_capture: self.end_user_capture.clone(),
-            end_user_capture_configured: self.end_user_capture_configured,
             ledger: self.ledger.clone(),
             traces: self.traces.clone(),
             ads: self.ads.clone(),

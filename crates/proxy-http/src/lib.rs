@@ -21,7 +21,6 @@ pub mod access_logging;
 pub mod active_requests;
 mod attempt_logging;
 #[cfg(unix)]
-mod capture_cleanup;
 pub mod codec;
 pub mod credential_probe;
 mod credential_provider;

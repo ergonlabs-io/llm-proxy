@@ -3969,7 +3969,7 @@ impl ControlPlane {
         let age = self.snapshot_age().as_secs();
         // Rust note: the wrapping difference, applied back as an i64, is how
         // the registry's delta-only `add` sets a gauge to an absolute value
-        // (the same trick `CaptureSpoolStats::publish` uses).
+        // (the same trick the other delta-only gauges use).
         gauge.registry.add(
             proxy_observability::stats::WorkerId(0),
             gauge.handle,

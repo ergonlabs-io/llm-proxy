@@ -1081,41 +1081,6 @@ pub mod instruments {
     /// unreasonable number of providers, not an expected limit.
     pub const TENANT_CREDENTIAL_SERIES_CEILING: usize = 256;
     pub const TENANT_CREDENTIAL_SERIES_OVERFLOW: &str = "-cardinality-overflow-";
-    pub const CAPTURE_STATE_ADMISSION: Instrument = Instrument {
-        name: "llmproxy_capture_state_admission",
-        kind: InstrumentKind::Counter,
-        unit: "{request}",
-        attribute_keys: &["outcome"],
-        buckets: None,
-    };
-    pub const CAPTURE_ACTIVE: Instrument = Instrument {
-        name: "llmproxy_capture_active_requests",
-        kind: InstrumentKind::UpDownCounter,
-        unit: "{request}",
-        attribute_keys: &[],
-        buckets: None,
-    };
-    pub const CAPTURE_STATE_BYTES: Instrument = Instrument {
-        name: "llmproxy_capture_state_reserved_bytes",
-        kind: InstrumentKind::UpDownCounter,
-        unit: "By",
-        attribute_keys: &[],
-        buckets: None,
-    };
-    pub const CAPTURE_EVENT_BYTES: Instrument = Instrument {
-        name: "llmproxy_capture_event_reserved_bytes",
-        kind: InstrumentKind::UpDownCounter,
-        unit: "By",
-        attribute_keys: &[],
-        buckets: None,
-    };
-    pub const CAPTURE_DROPS: Instrument = Instrument {
-        name: "llmproxy_capture_drops",
-        kind: InstrumentKind::Counter,
-        unit: "{record}",
-        attribute_keys: &["reason"],
-        buckets: None,
-    };
 
     // ------------------------------------------------------- billing ledger --
     //
@@ -1239,8 +1204,7 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
-    /// 1 while the trace emergency switch (or the capture supervisor's gate)
-    /// is closed, 0 while capture is allowed. Published on the exporter's
+    /// 1 while the trace emergency switch is closed, 0 while capture is allowed. Published on the exporter's
     /// tick.
     pub const TRACE_CAPTURE_DISABLED: Instrument = Instrument {
         name: "llmproxy_trace_capture_disabled",
@@ -1343,91 +1307,9 @@ pub mod instruments {
         buckets: None,
     };
 
-    // Rust note: a declarative macro stamps out the nine near-identical
-    // attribute-less gauge definitions below; each expands to a `pub const`.
-    macro_rules! spool_gauge {
-        ($const_name:ident, $name:literal, $unit:literal, $doc:literal) => {
-            #[doc = $doc]
-            pub const $const_name: Instrument = Instrument {
-                name: $name,
-                kind: InstrumentKind::UpDownCounter,
-                unit: $unit,
-                attribute_keys: &[],
-                buckets: None,
-            };
-        };
-    }
-    spool_gauge!(
-        CAPTURE_SPOOL_RETAINED,
-        "llmproxy_capture_spool_retained_records",
-        "{record}",
-        "Records the capture agent's spool currently retains, as last polled."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_PENDING,
-        "llmproxy_capture_spool_pending_records",
-        "{record}",
-        "Durable spool records not yet acknowledged downstream, as last polled."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_DISK_BYTES,
-        "llmproxy_capture_spool_disk_bytes",
-        "By",
-        "Disk bytes the capture agent's spool uses, as last polled."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_MAX_DISK_BYTES,
-        "llmproxy_capture_spool_max_disk_bytes",
-        "By",
-        "Configured disk ceiling of the capture agent's spool."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_QUARANTINE_BYTES,
-        "llmproxy_capture_spool_quarantine_bytes",
-        "By",
-        "Bytes the capture agent's spool has quarantined, as last polled."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_DURABLE_THROUGH,
-        "llmproxy_capture_spool_durable_through_sequence",
-        "1",
-        "Highest sequence the capture agent's spool has made durable."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_POISONED,
-        "llmproxy_capture_spool_poisoned",
-        "1",
-        "1 when the capture agent's spool reports itself poisoned, else 0."
-    );
-    spool_gauge!(
-        CAPTURE_AGENT_REACHABLE,
-        "llmproxy_capture_agent_reachable",
-        "1",
-        "1 when the capture agent answered the last poll (even with a refusal), 0 when \
-         it could not be reached."
-    );
-    spool_gauge!(
-        CAPTURE_SPOOL_STATS_AVAILABLE,
-        "llmproxy_capture_spool_stats_available",
-        "1",
-        "1 when the last poll returned spool stats, 0 when the agent refused or could \
-         not answer (the spool gauges are then stale)."
-    );
-
-    /// Records successfully delivered by the collector thread: append-write in
-    /// legacy mode, authenticated durable-local receipt in agent mode.
+    /// Records successfully appended by the file sink's writer thread.
     pub const METADATA_WRITTEN: Instrument = Instrument {
         name: "llmproxy_metadata_written",
-        kind: InstrumentKind::Counter,
-        unit: "{record}",
-        attribute_keys: &[],
-        buckets: None,
-    };
-
-    /// Agent durability-confirmed records. No attributes; local durability is
-    /// distinct from legacy writes and remote indexing.
-    pub const METADATA_DURABLE: Instrument = Instrument {
-        name: "llmproxy_metadata_durable",
         kind: InstrumentKind::Counter,
         unit: "{record}",
         attribute_keys: &[],
@@ -1446,8 +1328,7 @@ pub mod instruments {
         buckets: None,
     };
 
-    /// Collector serialization/write or unconfirmed-delivery failures. Legacy
-    /// write failures close admission; agent mode can reconnect on later events.
+    /// File sink serialization or write failures. A write failure closes admission.
     pub const METADATA_WRITE_FAILURES: Instrument = Instrument {
         name: "llmproxy_metadata_write_failures",
         kind: InstrumentKind::Counter,
@@ -1510,88 +1391,6 @@ pub fn record_provider_credential_request(
     registry.incr(worker, handle, 1);
 }
 
-/// Gauges mirroring the capture agent's spool, set by one periodic poller
-/// (never the request path). The registry only offers deltas, so `publish`
-/// remembers the last values it set and applies the difference; the mutex is
-/// uncontended because only the poller calls it.
-///
-/// Two separate questions, two gauges. `llmproxy_capture_agent_reachable` is 0
-/// only when the agent could not be reached (transport failure); any answer,
-/// including a refusal for a grant without `"inspect": true` or a close from an
-/// agent too old to know the query, is 1, because record delivery works.
-/// `llmproxy_capture_spool_stats_available` is 1 only when stats came back.
-///
-/// When stats are not available the spool gauges keep their last values:
-/// zeroing them would read as "spool empty and healthy"; stale values plus
-/// `stats_available 0` say "unknown since the last good poll". Before the
-/// first successful poll every gauge is 0.
-pub struct CaptureSpoolStats {
-    registry: Arc<Registry>,
-    gauges: [Handle; 9],
-    last: Mutex<[u64; 9]>,
-}
-
-impl CaptureSpoolStats {
-    pub fn resolve(control: &StatsControl) -> Self {
-        Self {
-            registry: control.registry(),
-            gauges: [
-                &instruments::CAPTURE_SPOOL_RETAINED,
-                &instruments::CAPTURE_SPOOL_PENDING,
-                &instruments::CAPTURE_SPOOL_DISK_BYTES,
-                &instruments::CAPTURE_SPOOL_MAX_DISK_BYTES,
-                &instruments::CAPTURE_SPOOL_QUARANTINE_BYTES,
-                &instruments::CAPTURE_SPOOL_DURABLE_THROUGH,
-                &instruments::CAPTURE_SPOOL_POISONED,
-                &instruments::CAPTURE_AGENT_REACHABLE,
-                &instruments::CAPTURE_SPOOL_STATS_AVAILABLE,
-            ]
-            .map(|instrument| control.resolve(instrument, &[])),
-            last: Mutex::new([0; 9]),
-        }
-    }
-
-    /// Publishes one poll result. `Ok` sets every gauge; `Err(Unreachable)`
-    /// clears `reachable` and `stats_available`; any other error means the
-    /// agent answered, so `reachable` is 1 and `stats_available` is 0.
-    pub fn publish(
-        &self,
-        result: Result<
-            &proxy_capture_protocol::SpoolSnapshot,
-            crate::capture_transport::InspectError,
-        >,
-    ) {
-        use crate::capture_transport::InspectError;
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let mut next = *last;
-        match result {
-            Ok(s) => {
-                next = [
-                    s.retained_records,
-                    s.pending_records,
-                    s.disk_bytes,
-                    s.max_disk_bytes,
-                    s.quarantine_bytes,
-                    s.durable_through_sequence,
-                    u64::from(s.poisoned),
-                    1,
-                    1,
-                ];
-            }
-            Err(error) => {
-                next[7] = u64::from(error != InspectError::Unreachable);
-                next[8] = 0;
-            }
-        }
-        for ((handle, old), new) in self.gauges.iter().zip(last.iter()).zip(next.iter()) {
-            // Wrapping difference as i64: `add` applies it back as u64 wrapping.
-            self.registry
-                .add(WorkerId(0), *handle, new.wrapping_sub(*old) as i64);
-        }
-        *last = next;
-    }
-}
-
 /// Pre-resolved operational signals for the best-effort request-record
 /// collector. Constructed once by the control side and used by both request
 /// workers (admission) and the dedicated collector thread (dequeue/write).
@@ -1609,13 +1408,7 @@ pub struct MetadataDeliveryStats {
     queue_depth: Handle,
     queue_capacity: Handle,
     written: Handle,
-    durable: Handle,
     write_failures: Handle,
-    state_admission: [Handle; 6],
-    active: Handle,
-    state_bytes: Handle,
-    event_bytes: Handle,
-    drops: [Handle; 8],
 }
 
 impl MetadataDeliveryStats {
@@ -1652,31 +1445,7 @@ impl MetadataDeliveryStats {
             queue_depth: control.resolve(&instruments::METADATA_QUEUE_DEPTH, &[]),
             queue_capacity: control.resolve(&instruments::METADATA_QUEUE_CAPACITY, &[]),
             written: control.resolve(&instruments::METADATA_WRITTEN, &[]),
-            durable: control.resolve(&instruments::METADATA_DURABLE, &[]),
             write_failures: control.resolve(&instruments::METADATA_WRITE_FAILURES, &[]),
-            state_admission: [
-                "accepted",
-                "disabled",
-                "capacity_exceeded",
-                "closed",
-                "oversize",
-                "invalid",
-            ]
-            .map(|v| control.resolve(&instruments::CAPTURE_STATE_ADMISSION, &[("outcome", v)])),
-            active: control.resolve(&instruments::CAPTURE_ACTIVE, &[]),
-            state_bytes: control.resolve(&instruments::CAPTURE_STATE_BYTES, &[]),
-            event_bytes: control.resolve(&instruments::CAPTURE_EVENT_BYTES, &[]),
-            drops: [
-                "disabled",
-                "expired",
-                "encoded_limit",
-                "delivery_unknown",
-                "identity_limit",
-                "transport_capacity",
-                "agent_rejected",
-                "unavailable",
-            ]
-            .map(|v| control.resolve(&instruments::CAPTURE_DROPS, &[("reason", v)])),
         }
     }
 
@@ -1691,41 +1460,6 @@ impl MetadataDeliveryStats {
     }
     pub fn change_queue_capacity(&self, delta: i64) {
         self.registry.add(WorkerId(0), self.queue_capacity, delta);
-    }
-    pub fn state_admission(&self, outcome: crate::records::SubmitResult) {
-        use crate::records::SubmitResult::*;
-        let index = match outcome {
-            Accepted => 0,
-            Disabled => 1,
-            CapacityExceeded => 2,
-            Closed => 3,
-            Oversize => 4,
-            Invalid => 5,
-        };
-        self.registry
-            .incr(WorkerId(0), self.state_admission[index], 1);
-    }
-    pub fn reserve_state(&self, bytes: usize) {
-        self.registry.add(WorkerId(0), self.active, 1);
-        self.registry
-            .add(WorkerId(0), self.state_bytes, bytes as i64);
-    }
-    pub fn release_state(&self, bytes: usize) {
-        self.registry.add(WorkerId(0), self.active, -1);
-        self.registry
-            .add(WorkerId(0), self.state_bytes, -(bytes as i64));
-    }
-    pub fn reserve_event(&self, bytes: usize) {
-        self.registry
-            .add(WorkerId(0), self.event_bytes, bytes as i64);
-    }
-    pub fn release_event(&self, bytes: usize) {
-        self.registry
-            .add(WorkerId(0), self.event_bytes, -(bytes as i64));
-    }
-    pub fn capture_drop(&self, reason: CaptureDrop) {
-        self.registry
-            .incr(WorkerId(0), self.drops[reason as usize], 1);
     }
 
     /// Lifecycle point: every nonblocking producer submission.
@@ -1773,27 +1507,10 @@ impl MetadataDeliveryStats {
         self.registry.incr(WorkerId(0), self.written, 1);
     }
 
-    /// Lifecycle point: one authenticated agent Durable receipt matching the event.
-    pub fn record_durable(&self) {
-        self.registry.incr(WorkerId(0), self.durable, 1);
-    }
-
     /// Lifecycle point: JSON serialization or append write error.
     pub fn record_write_failure(&self) {
         self.registry.incr(WorkerId(0), self.write_failures, 1);
     }
-}
-
-#[derive(Clone, Copy)]
-pub enum CaptureDrop {
-    Disabled,
-    Expired,
-    EncodedLimit,
-    DeliveryUnknown,
-    IdentityLimit,
-    TransportCapacity,
-    AgentRejected,
-    Unavailable,
 }
 
 /// Identifies a worker thread/runtime for [`Registry::incr`]/
@@ -3445,90 +3162,6 @@ impl StatsControl {
 mod tests {
     use super::*;
     use std::thread;
-
-    // ---- capture spool gauges ------------------------------------------
-
-    fn spool_snapshot(retained: u64, poisoned: bool) -> proxy_capture_protocol::SpoolSnapshot {
-        proxy_capture_protocol::SpoolSnapshot {
-            node_id: "node".into(),
-            next_sequence: 10,
-            durable_through_sequence: 9,
-            acknowledged_through_sequence: 4,
-            pending_records: 5,
-            retained_records: retained,
-            database_bytes: 1,
-            disk_bytes: 4096,
-            max_disk_bytes: 8192,
-            quarantine_bytes: 7,
-            poisoned,
-            durable_total: 9,
-            rejected_total: 0,
-            failures_total: 0,
-        }
-    }
-
-    #[test]
-    fn capture_spool_publish_separates_reachable_from_stats_available() {
-        use crate::capture_transport::InspectError;
-        let control = StatsControl::new(1);
-        let stats = CaptureSpoolStats::resolve(&control);
-        let registry = control.registry();
-        let value =
-            |instrument: &'static Instrument| registry.value(control.resolve(instrument, &[]));
-
-        stats.publish(Ok(&spool_snapshot(8, false)));
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 8);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_PENDING), 5);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_DISK_BYTES), 4096);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_MAX_DISK_BYTES), 8192);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_QUARANTINE_BYTES), 7);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_DURABLE_THROUGH), 9);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 0);
-        assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE), 1);
-
-        // A decrease, a flag flip, and a repeat must all land as absolutes.
-        stats.publish(Ok(&spool_snapshot(3, true)));
-        stats.publish(Ok(&spool_snapshot(3, true)));
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 1);
-
-        // Only a transport failure reads as unreachable; spool values stay.
-        stats.publish(Err(InspectError::Unreachable));
-        assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 0);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE), 0);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_POISONED), 1);
-
-        // An answering agent that cannot give stats is reachable.
-        for error in [
-            InspectError::Unauthorized,
-            InspectError::Invalid,
-            InspectError::Unavailable,
-            InspectError::Unsupported,
-        ] {
-            stats.publish(Err(InspectError::Unreachable));
-            stats.publish(Err(error));
-            assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1, "{error:?}");
-            assert_eq!(
-                value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE),
-                0,
-                "{error:?}"
-            );
-            assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 3, "{error:?}");
-        }
-
-        stats.publish(Ok(&spool_snapshot(2, false)));
-        assert_eq!(value(&instruments::CAPTURE_AGENT_REACHABLE), 1);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_STATS_AVAILABLE), 1);
-        assert_eq!(value(&instruments::CAPTURE_SPOOL_RETAINED), 2);
-
-        // `/stats` omits names Envoy never had; the scrape is the operator surface.
-        let scrape = prometheus_render::render(&registry);
-        assert!(scrape.contains("envoy_llmproxy_capture_spool_retained_records 2"));
-        assert!(scrape.contains("envoy_llmproxy_capture_agent_reachable 1"));
-        assert!(scrape.contains("envoy_llmproxy_capture_spool_stats_available 1"));
-    }
 
     // ---- 1: resolve identity -------------------------------------------
 

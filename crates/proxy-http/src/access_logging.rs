@@ -24,7 +24,7 @@ use proxy_config::ir::{AccessLogFilterIR, AccessLogFormat, AccessLogIR, Comparis
 use proxy_observability::access_log::{render_into, FormatOp, FormatString, LlmTokens, LogContext};
 use proxy_observability::ledger::LedgerTicket;
 use proxy_observability::records::{
-    LedgerCharge, RequestRecord, RequestRecordSink, MAX_PRINCIPAL_ID_BYTES, SCHEMA_VERSION,
+    LedgerCharge, RequestRecord, RequestRecordSink, SCHEMA_VERSION,
 };
 use proxy_observability::sink::{AccessLogWriter, SinkRegistry};
 use proxy_observability::trace::{FinishedSpan, SpanKind, SpanSink, SpanStatus};
@@ -555,21 +555,8 @@ impl LoggingBody {
         // and hands back the old one, which then drops at the end of the
         // statement. A struct field cannot simply be moved out of `&mut self`.
         drop(std::mem::replace(&mut self.inner, empty_body()));
-        #[cfg(unix)]
-        ctx.stream_info.borrow_mut().check_capture_gate();
-        #[cfg(unix)]
-        let lease = ctx.stream_info.borrow().metadata_lease.clone();
-        #[cfg(unix)]
-        let terminal = lease.as_ref().map(|l| l.reserve_terminal());
-        #[cfg(unix)]
-        let capture_allowed = (ctx.stream_info.borrow().metadata_enabled
-            || ctx
-                .request_record_sink
-                .as_ref()
-                .is_some_and(|s| !s.requires_admission()))
-            && terminal.as_ref().is_none_or(|r| r.is_ok());
-        #[cfg(not(unix))]
-        let capture_allowed = ctx.stream_info.borrow().metadata_enabled;
+        let capture_allowed =
+            ctx.stream_info.borrow().metadata_enabled || ctx.request_record_sink.is_some();
         let endpoint = ctx.stream_info.borrow().llm.endpoint;
         // The whole usage (tokens and meters), not just `llm_tokens` below: a
         // request that reported only a count meter has no tokens but is still
@@ -755,16 +742,9 @@ impl LoggingBody {
                 // Pinned by the auth filter at admission from the snapshot
                 // that verified the key; `None` without that filter.
                 policy_generation: ctx.stream_info.borrow().auth.policy_generation,
-                capture_policy_version: {
-                    #[cfg(unix)]
-                    {
-                        lease.as_ref().map(|l| l.version().to_owned())
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        None
-                    }
-                },
+                // Kept so no record, ledger or trace schema changes; nothing
+                // sets it now that the capture agent is retired.
+                capture_policy_version: None,
                 method: proxy_observability::records::bounded_field(&ctx.request.method),
                 route: proxy_observability::records::bounded_field(&ctx.request.path),
                 requested_model: requested_model
@@ -965,38 +945,10 @@ impl LoggingBody {
             }
             if let (Some(sink), Some(record)) = (record_sink, record) {
                 // No validity pre-check here: a malformed record must reach the
-                // sink (or capture permit) so it is counted as `invalid` in
-                // `llmproxy_metadata_admission` rather than vanishing. Dropping the
-                // permit on that path releases its reservation.
-                #[cfg(unix)]
-                if let Some(Ok(permit)) = terminal {
-                    // Trusted ownership identifiers are rejected, never truncated into collisions.
-                    if tenant
-                        .as_ref()
-                        .is_none_or(|t| t.len() <= MAX_PRINCIPAL_ID_BYTES)
-                        && usage_attribution
-                            .0
-                            .as_ref()
-                            .is_none_or(|k| k.len() <= MAX_PRINCIPAL_ID_BYTES)
-                        && user_id
-                            .as_ref()
-                            .is_none_or(|u| u.len() <= MAX_PRINCIPAL_ID_BYTES)
-                    {
-                        let _ = permit.submit(record);
-                    } else if let Some(lease) = &lease {
-                        lease.identity_limit();
-                    }
-                } else {
-                    let _ = sink.submit(record);
-                }
-                #[cfg(not(unix))]
+                // sink so it is counted as `invalid` in
+                // `llmproxy_metadata_admission` rather than vanishing.
                 let _ = sink.submit(record);
             }
-        }
-
-        #[cfg(unix)]
-        if lease.is_some() {
-            ctx.stream_info.borrow_mut().clear_capture_state();
         }
 
         // Record LLM_CLIENT_TOKEN_USAGE here, at the

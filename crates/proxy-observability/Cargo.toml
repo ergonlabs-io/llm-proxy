@@ -58,7 +58,6 @@ tokio = { workspace = true, features = ["sync", "time", "rt", "net"] }
 # protocol serving a different rule.
 proxy-api = { workspace = true }
 tonic = { workspace = true }
-proxy-capture-protocol = { path = "../proxy-capture-protocol" }
 
 # The billing ledger's writer appends to the encrypted spool (ADR-0009).
 [target.'cfg(unix)'.dependencies]

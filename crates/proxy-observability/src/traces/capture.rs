@@ -181,23 +181,8 @@ pub struct TraceAdmission {
     slots: AtomicUsize,
     bytes: AtomicUsize,
     gate: Arc<TraceGate>,
-    #[cfg(unix)]
-    capture_gate: Option<crate::capture::CaptureSupervisor>,
     sender: mpsc::Sender<Box<CapturedTrace>>,
     pub(crate) stats: TraceStats,
-}
-
-/// What a capture was admitted under: both gates' packed state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Pinned {
-    trace: u64,
-    capture: u64,
-}
-
-impl Pinned {
-    fn open(self) -> bool {
-        self.trace & 1 == 0 && self.capture & 1 == 0
-    }
 }
 
 impl TraceAdmission {
@@ -216,53 +201,20 @@ impl TraceAdmission {
             slots: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
             gate,
-            #[cfg(unix)]
-            capture_gate: None,
             sender,
             stats,
         });
         (admission, receiver)
     }
 
-    /// Also honour the experimental capture supervisor's emergency gate:
-    /// either closed stops body capture.
-    #[cfg(unix)]
-    pub fn with_capture_gate(
-        config: &TraceExportConfig,
-        gate: Arc<TraceGate>,
-        capture_gate: crate::capture::CaptureSupervisor,
-        stats: TraceStats,
-    ) -> (Arc<Self>, mpsc::Receiver<Box<CapturedTrace>>) {
-        let (sender, receiver) = mpsc::channel();
-        let admission = Arc::new(TraceAdmission {
-            max_request: config.max_request_body_bytes,
-            max_response: config.max_response_body_bytes,
-            max_memory: config.max_memory_bytes,
-            max_slots: config.max_queued_traces,
-            slots: AtomicUsize::new(0),
-            bytes: AtomicUsize::new(0),
-            gate,
-            capture_gate: Some(capture_gate),
-            sender,
-            stats,
-        });
-        (admission, receiver)
-    }
-
-    fn pinned(&self) -> Pinned {
-        #[cfg(unix)]
-        let capture = self.capture_gate.as_ref().map_or(0, |c| c.gate_value());
-        #[cfg(not(unix))]
-        let capture = 0;
-        Pinned {
-            trace: self.gate.load(),
-            capture,
-        }
+    /// The trace gate's packed state; bit 0 set means emergency-disabled.
+    fn pinned(&self) -> u64 {
+        self.gate.load()
     }
 
     /// Whether capture is allowed right now: two atomic loads.
     pub fn gate_open(&self) -> bool {
-        self.pinned().open()
+        self.pinned() & 1 == 0
     }
 
     /// The gate a request was admitted under has not moved.
@@ -347,7 +299,7 @@ impl TraceAdmission {
     /// count per request: the operator chose it.
     pub fn admit(self: &Arc<Self>, request: &[u8]) -> Option<TraceCapture> {
         let pinned = self.pinned();
-        if !pinned.open() {
+        if pinned & 1 != 0 {
             self.count_drop(DropReason::EmergencyDisabled);
             return None;
         }
@@ -417,7 +369,7 @@ pub struct TraceCapture {
     admission: Arc<TraceAdmission>,
     /// `None` once discarded or handed over.
     reservation: Option<Reservation>,
-    pinned: Pinned,
+    pinned: u64,
     request: Vec<u8>,
     blocks: Vec<Box<[u8]>>,
     response_len: usize,
@@ -438,7 +390,7 @@ impl std::fmt::Debug for TraceCapture {
 }
 
 impl TraceCapture {
-    /// Whether the gates are still where they were at admission.
+    /// Whether the gate is still where it was at admission.
     fn live(&self) -> bool {
         self.admission.pinned() == self.pinned
     }
@@ -534,7 +486,7 @@ impl TraceCapture {
             response: std::mem::take(&mut self.blocks),
             response_len: self.response_len,
             partial: std::mem::take(&mut self.partial),
-            gate: self.pinned.trace,
+            gate: self.pinned,
             reservation: Some(reservation),
         });
         // A send error means the exporter is gone; the returned trace drops
@@ -606,60 +558,5 @@ impl CapturedTrace {
             r.admission.count_drop(reason);
             r.state = State::Accounted;
         }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use crate::capture::CaptureSupervisor;
-    use crate::stats::MetadataDeliveryStats;
-    use crate::traces::config::TraceCodec;
-
-    fn config() -> TraceExportConfig {
-        TraceExportConfig {
-            directory: "/unused".into(),
-            max_disk_bytes: 1 << 40,
-            max_age: None,
-            codec: TraceCodec::Gzip,
-            max_request_body_bytes: 1024,
-            max_response_body_bytes: 1024,
-            max_memory_bytes: 1 << 20,
-            max_queued_traces: 4,
-            segment_max_bytes: 1 << 26,
-            segment_max_age: std::time::Duration::from_secs(300),
-            max_open_segments: 1,
-            s3: None,
-        }
-    }
-
-    /// The capture supervisor's existing emergency switch (ADR-0008 decision
-    /// 2) stops body capture too: closing it refuses new admissions and
-    /// discards a capture already running, even though the trace gate itself
-    /// stayed open.
-    #[test]
-    fn the_capture_supervisors_emergency_gate_also_stops_trace_capture() {
-        let stats = StatsControl::new(1);
-        let (supervisor, _delivery) =
-            CaptureSupervisor::start(MetadataDeliveryStats::resolve(&stats)).unwrap();
-        let (admission, traces) = TraceAdmission::with_capture_gate(
-            &config(),
-            Arc::new(TraceGate::unpersisted()),
-            supervisor.clone(),
-            TraceStats::resolve(&stats),
-        );
-        let mut running = admission.admit(b"{}").expect("both gates open");
-
-        supervisor.set_disabled(true, 0).unwrap();
-        assert!(!admission.gate_open());
-        assert!(admission.admit(b"{}").is_none());
-        assert!(
-            !running.push_response(b"data"),
-            "the running capture is discarded"
-        );
-        drop(running);
-        assert!(traces.try_recv().is_err());
-        assert_eq!(admission.held_slots(), 0);
-        assert_eq!(admission.retained_bytes(), 0);
     }
 }

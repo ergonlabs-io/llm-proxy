@@ -1,7 +1,9 @@
 # Encrypted metadata spool
 
-`proxy-capture-spool` is a synchronous Unix library used by the independently
-resourced local capture agent. Never invoke its operations on request workers.
+`proxy-capture-spool` is a synchronous Unix library. The billing ledger
+(ADR-0009) is built on it; the crate keeps its original name because the
+on-disk names (`capture.redb`, `LMREDB03`) are part of existing ledger
+directories. Never invoke its operations on request workers.
 It implements local durability, not backend delivery, queries, or YAML policy.
 
 ## API and receipts

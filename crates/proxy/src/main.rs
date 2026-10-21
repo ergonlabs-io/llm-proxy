@@ -42,7 +42,6 @@ mod keygen;
 // input. The group still rejects "both"; "at least one, unless keygen" is
 // checked by hand in `main()`.
 #[command(group(clap::ArgGroup::new("input").args(["config_path", "config"])))]
-#[command(group(clap::ArgGroup::new("capture_destination").args(["request_records_file", "request_records_agent"])))]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -101,35 +100,12 @@ struct Args {
 
     /// Opt-in end-user metadata JSONL collector. Contains identities and model
     /// history; configure access and retention on the destination file.
-    #[arg(long, value_name = "PATH", conflicts_with = "request_records_agent")]
+    #[arg(long, value_name = "PATH")]
     request_records_file: Option<PathBuf>,
-    /// Opt-in Unix metadata agent. Delivery success requires a durable local ACK.
-    #[arg(long, value_name = "SOCKET", requires_all = ["request_records_agent_uid", "request_records_agent_node", "request_records_producer"])]
-    request_records_agent: Option<PathBuf>,
-    /// Expected OS UID of the local metadata agent.
-    #[arg(long, requires = "request_records_agent")]
-    request_records_agent_uid: Option<u32>,
-    /// Expected agent spool node identity, checked on handshake and receipts.
-    #[arg(long, requires = "request_records_agent")]
-    request_records_agent_node: Option<String>,
-    /// Deployment producer ID bound to this proxy's OS UID in agent grants.
-    #[arg(long, requires = "request_records_agent")]
-    request_records_producer: Option<String>,
     /// Maximum retained attempt records per request. Excess attempts are
     /// explicitly reported as truncated; forwarding retry policy is unchanged.
-    #[arg(long, requires="capture_destination", value_parser = clap::value_parser!(u16).range(1..=64))]
+    #[arg(long, requires = "request_records_file", value_parser = clap::value_parser!(u16).range(1..=64))]
     request_record_max_attempts: Option<u16>,
-    /// Milliseconds between capture-agent spool polls; the first poll waits one
-    /// period. A parameter so integration tests need not sleep the default.
-    #[arg(
-        long = "capture-spool-poll-interval-ms",
-        hide = true,
-        value_name = "MS",
-        default_value_t = CAPTURE_SPOOL_POLL_INTERVAL.as_millis() as u64,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    capture_spool_poll_interval_ms: u64,
-
     /// How long the drain sequence waits for connections to close before
     /// forcing worker shutdown (serve mode only).
     #[arg(
@@ -310,20 +286,6 @@ fn main() -> ExitCode {
         }
     };
 
-    if snapshot.end_user_capture_configured
-        && (args.request_records_file.is_some()
-            || args.request_records_agent.is_some()
-            || args.request_record_max_attempts.is_some())
-    {
-        eprintln!(
-            "node.metadata[\"io.llmproxy.capture\"]: cannot combine declarative and CLI capture"
-        );
-        return ExitCode::FAILURE;
-    }
-    if snapshot.end_user_capture.is_some() && args.concurrency > 8 {
-        eprintln!("node.metadata[\"io.llmproxy.capture\"].budgets.max_capture_memory_bytes: concurrency {} exceeds eight scratch owners",args.concurrency);
-        return ExitCode::FAILURE;
-    }
     match args.mode {
         Mode::Translate => {
             // Printed in load(); reaching here means it already succeeded.
@@ -560,178 +522,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
         config_source,
         args.request_records_file,
         args.request_record_max_attempts.unwrap_or(64),
-        args.request_records_agent.map(|socket_path| {
-            proxy_observability::capture_transport::AgentTransportConfig {
-                socket_path,
-                expected_agent_uid: args.request_records_agent_uid.unwrap(),
-                expected_node_id: args.request_records_agent_node.unwrap(),
-                producer_id: args.request_records_producer.unwrap(),
-            }
-        }),
-        Duration::from_millis(args.capture_spool_poll_interval_ms),
     ))
-}
-
-/// How often the spool poller asks the capture agent for its counters.
-const CAPTURE_SPOOL_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Per-poll budget; a slower agent counts as unreachable for that tick.
-const CAPTURE_SPOOL_POLL_DEADLINE: Duration = Duration::from_secs(2);
-
-/// What the poller last learned about the agent, so a log line is written on a
-/// change and never on every tick (AGENTS.md "Fail-open controls": suppress
-/// repeats, or the log becomes the incident).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentLink {
-    /// No successful or failed poll yet, or no endpoint configured.
-    Unknown,
-    Up,
-    Down,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum LinkEvent {
-    WentDown,
-    Recovered,
-}
-
-/// Unknown then down still warns: an agent that was never reachable is the
-/// loudest case. Unknown then up is silent because nothing changed for the
-/// operator.
-fn advance_link(prev: AgentLink, reachable: bool) -> (AgentLink, Option<LinkEvent>) {
-    match (prev, reachable) {
-        (AgentLink::Up, true) | (AgentLink::Unknown, true) => (AgentLink::Up, None),
-        (AgentLink::Down, true) => (AgentLink::Up, Some(LinkEvent::Recovered)),
-        (AgentLink::Down, false) => (AgentLink::Down, None),
-        (AgentLink::Up, false) | (AgentLink::Unknown, false) => {
-            (AgentLink::Down, Some(LinkEvent::WentDown))
-        }
-    }
-}
-
-/// Poller memory between ticks: reachability, plus which "agent answered but
-/// gave no stats" cause was already logged (cleared when stats return).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PollState {
-    link: AgentLink,
-    stats_notice: Option<proxy_observability::capture_transport::InspectError>,
-}
-
-impl PollState {
-    const START: Self = Self {
-        link: AgentLink::Unknown,
-        stats_notice: None,
-    };
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum NoticeEvent {
-    Announce(proxy_observability::capture_transport::InspectError),
-    Cleared,
-}
-
-/// Decides when to log "agent answered but gave no stats". A cause is announced
-/// once; the same cause on later ticks is silent; a transport outage keeps the
-/// remembered cause so a flap does not repeat it; returning stats clears it.
-fn advance_stats_notice(
-    prev: Option<proxy_observability::capture_transport::InspectError>,
-    result: Result<(), proxy_observability::capture_transport::InspectError>,
-) -> (
-    Option<proxy_observability::capture_transport::InspectError>,
-    Option<NoticeEvent>,
-) {
-    use proxy_observability::capture_transport::InspectError;
-    match result {
-        Ok(()) => (None, prev.map(|_| NoticeEvent::Cleared)),
-        Err(InspectError::Unreachable) => (prev, None),
-        Err(error) if prev == Some(error) => (prev, None),
-        Err(error) => (Some(error), Some(NoticeEvent::Announce(error))),
-    }
-}
-
-/// Pure core of a poll's bookkeeping. Only a transport failure moves the link
-/// down: an agent that answers with a refusal or an unsupported-query close is
-/// reachable (record delivery works) and gets a one-time stats notice instead.
-fn advance_poll(
-    state: PollState,
-    result: Result<(), proxy_observability::capture_transport::InspectError>,
-) -> (PollState, Option<LinkEvent>, Option<NoticeEvent>) {
-    use proxy_observability::capture_transport::InspectError;
-    let reachable = !matches!(result, Err(InspectError::Unreachable));
-    let (link, link_event) = advance_link(state.link, reachable);
-    let (stats_notice, notice_event) = advance_stats_notice(state.stats_notice, result);
-    (PollState { link, stats_notice }, link_event, notice_event)
-}
-
-/// One poll: queries the agent, publishes the gauges, logs on transitions.
-/// Fail-open by design: the proxy keeps serving while the agent is down; the
-/// `llmproxy_capture_agent_reachable` gauge and the transition logs make that
-/// visible. A transport failure is "unreachable"; an agent that answers but
-/// cannot give stats (grant without `"inspect": true`, an older agent) is
-/// reachable, because record delivery works, and is logged once per cause.
-/// Logged errors are fixed phrases, never record contents.
-async fn poll_capture_spool_once(
-    stats: &proxy_observability::stats::CaptureSpoolStats,
-    endpoint: Option<proxy_observability::capture_transport::AgentTransportConfig>,
-    state: PollState,
-) -> PollState {
-    use proxy_observability::capture_transport::InspectError;
-    let Some(config) = endpoint else {
-        stats.publish(Err(InspectError::Unreachable));
-        return PollState::START;
-    };
-    let result = proxy_observability::capture_transport::query_spool_stats(
-        &config,
-        CAPTURE_SPOOL_POLL_DEADLINE,
-    )
-    .await;
-    stats.publish(result.as_ref().map_err(|error| *error));
-    let (next, event, notice_event) =
-        advance_poll(state, result.as_ref().map(|_| ()).map_err(|e| *e));
-    match (event, &result) {
-        (Some(LinkEvent::WentDown), Err(error)) => tracing::warn!(
-            %error,
-            "capture agent unreachable: spool gauges are stale and \
-             llmproxy_capture_agent_reachable is 0; request handling continues"
-        ),
-        (Some(LinkEvent::Recovered), _) => tracing::info!("capture agent reachable again"),
-        _ => {}
-    }
-    match notice_event {
-        Some(NoticeEvent::Announce(InspectError::Unauthorized)) => tracing::info!(
-            "capture agent spool stats are off: the producer grant lacks \"inspect\": true; \
-             set it on the producer grant to enable them (record delivery is unaffected)"
-        ),
-        Some(NoticeEvent::Announce(InspectError::Unsupported)) => tracing::info!(
-            "capture agent spool stats are off: the agent closed on the inspection query, so \
-             it predates spool inspection; upgrade the capture agent (record delivery is \
-             unaffected)"
-        ),
-        Some(NoticeEvent::Announce(other)) => tracing::warn!(
-            error = %other,
-            "capture agent answered the spool stats query with an error; spool gauges are \
-             stale (record delivery is unaffected)"
-        ),
-        Some(NoticeEvent::Cleared) => tracing::info!("capture agent spool stats available again"),
-        None => {}
-    }
-    next
-}
-
-async fn run_capture_spool_poller(
-    stats: proxy_observability::stats::CaptureSpoolStats,
-    endpoint: proxy_admin::CaptureAgentProvider,
-    period: Duration,
-) {
-    // First poll one period after boot, so an agent that starts just after the
-    // proxy does not produce a down/up log pair.
-    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    // A slow poll must not queue a burst of catch-up polls behind it.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut state = PollState::START;
-    loop {
-        ticker.tick().await;
-        state = poll_capture_spool_once(&stats, endpoint(), state).await;
-    }
 }
 
 /// How long `run_serve` waits for every worker to report its initial listener
@@ -778,8 +569,6 @@ async fn run_serve(
     config_source: ConfigSource,
     request_records_file: Option<PathBuf>,
     request_record_max_attempts: u16,
-    request_records_agent: Option<proxy_observability::capture_transport::AgentTransportConfig>,
-    capture_spool_poll_interval: Duration,
 ) -> ExitCode {
     // Collected before `snapshot` moves into `WorkerPool::spawn` purely so
     // the startup log line below can name what got bound; each worker binds
@@ -905,88 +694,28 @@ async fn run_serve(
             snapshot.clusters.keys().map(String::as_str),
         ));
     let registry = stats_control.registry();
-    // Request-record capture is an independent best-effort pipeline. Resolve
+    // Request-record delivery is an independent best-effort pipeline. Resolve
     // its finite operational series even when no file collector is configured
     // so Prometheus and OTLP show explicit zeroes rather than an absent signal.
     let metadata_stats = proxy_observability::stats::MetadataDeliveryStats::resolve(&stats_control);
-    let legacy_capture = request_records_file.is_some() || request_records_agent.is_some();
-    if legacy_capture && snapshot.end_user_capture_configured {
-        eprintln!(
-            "node.metadata[\"io.llmproxy.capture\"]: cannot combine declarative and CLI capture"
-        );
-        return ExitCode::FAILURE;
-    }
-    let (capture_supervisor, capture_delivery) = if legacy_capture {
-        (None, None)
-    } else {
-        match proxy_observability::capture::CaptureSupervisor::start(metadata_stats.clone()) {
-            Ok((supervisor, delivery)) => {
-                if let Err(error) =
-                    supervisor.configure(snapshot.end_user_capture.clone(), concurrency)
-                {
-                    eprintln!("{error}");
-                    let _ = delivery.shutdown(Duration::from_secs(1)).await;
-                    return ExitCode::FAILURE;
-                }
-                (Some(supervisor), Some(delivery))
-            }
-            Err(error) => {
-                eprintln!("cannot start capture supervisor: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-    };
-    // Delivery to the capture agent's spool is experimental: the
-    // agent has no reader, acknowledgement, retention or replay dedup, and
-    // stops when its disk limit is reached. Say so where the operator will
-    // see it; the JSONL file sink is the supported destination.
-    if request_records_agent.is_some() || snapshot.end_user_capture_configured {
-        tracing::warn!(
-            "request capture to the llm-capture-agent spool is EXPERIMENTAL: acknowledged records \
-             are never removed, there is no retention or replay deduplication, and capture stops \
-             when the spool reaches its disk limit; use --request-records-file for supported delivery"
-        );
-    }
-    let legacy_agent = request_records_agent.clone();
-    let collector = match (request_records_file, request_records_agent) {
-        (Some(path), None) => Some(proxy_observability::metadata::MetadataDelivery::start(
-            &path,
-            1024,
-            metadata_stats,
-        )),
-        (None, Some(agent)) => Some(
-            proxy_observability::metadata::MetadataDelivery::start_agent(
-                agent,
-                1024,
-                metadata_stats,
+    // The JSONL file sink is the only request-record destination. With no
+    // `--request-records-file` there is no sink at all.
+    let collector = request_records_file.map(|path| {
+        proxy_observability::metadata::MetadataDelivery::start(&path, 1024, metadata_stats)
+    });
+    let (metadata_sink, metadata_delivery) = match collector {
+        Some(Ok((sink, delivery))) => (
+            Some(
+                Arc::new(sink.with_max_attempts(request_record_max_attempts))
+                    as Arc<dyn proxy_observability::records::RequestRecordSink>,
             ),
+            Some(delivery),
         ),
-        (None, None) => None,
-        (Some(_), Some(_)) => {
-            eprintln!("metadata file and agent modes are mutually exclusive");
+        Some(Err(err)) => {
+            eprintln!("cannot start metadata collector: {err}");
             return ExitCode::FAILURE;
         }
-    };
-    let (metadata_sink, metadata_delivery) = match collector {
-        Some(result) => match result {
-            Ok((sink, delivery)) => (
-                Some(
-                    Arc::new(sink.with_max_attempts(request_record_max_attempts))
-                        as Arc<dyn proxy_observability::records::RequestRecordSink>,
-                ),
-                Some(delivery),
-            ),
-            Err(err) => {
-                eprintln!("cannot start metadata collector: {err}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => (
-            capture_supervisor.as_ref().map(|s| {
-                Arc::new(s.clone()) as Arc<dyn proxy_observability::records::RequestRecordSink>
-            }),
-            None,
-        ),
+        None => (None, None),
     };
 
     // ADR-0009: the billing ledger, opened before any worker starts so the
@@ -1013,15 +742,13 @@ async fn run_serve(
     let running_otlp = (snapshot.tracing.clone(), snapshot.metrics.clone());
     let (trace_admission, trace_gate, trace_exporter) = match &snapshot.traces {
         None => (None, None, None),
-        Some(config) => {
-            match open_traces(config, &node.id, capture_supervisor.clone(), &stats_control) {
-                Ok((admission, gate, exporter)) => (Some(admission), Some(gate), Some(exporter)),
-                Err(message) => {
-                    eprintln!("{message}");
-                    return ExitCode::FAILURE;
-                }
+        Some(config) => match open_traces(config, &node.id, &stats_control) {
+            Ok((admission, gate, exporter)) => (Some(admission), Some(gate), Some(exporter)),
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
             }
-        }
+        },
     };
 
     // Resolve operational health series even when exporters are disabled.
@@ -1126,23 +853,6 @@ async fn run_serve(
     // -- see that type's doc in `proxy-core`'s `runtime.rs`.
     let snapshot_handles = Arc::new(SnapshotHandles::new());
 
-    // The capture agent endpoint, resolved fresh by the admin endpoints and the
-    // spool poller. The CLI endpoint is fixed for the process; the declarative
-    // one is read from a live config handle so a reload that moves the agent
-    // is followed without a restart.
-    let capture_endpoint: proxy_admin::CaptureAgentProvider = match legacy_agent.clone() {
-        Some(config) => Arc::new(move || Some(config.clone())),
-        None => {
-            let live = snapshot_handles.register(snapshot.clone());
-            Arc::new(move || {
-                live.load()
-                    .end_user_capture
-                    .as_ref()
-                    .map(|capture| capture.endpoint.clone())
-            })
-        }
-    };
-
     // `/ready`'s readiness probe, built here (not inside
     // `start_admin`) because it needs `cluster_manager`, which `start_admin`
     // deliberately has no dependency on -- `proxy-admin` only ever sees the
@@ -1220,7 +930,6 @@ async fn run_serve(
                 proxy_http::credential_probe::ClusterCredentialProbe::new(cluster_manager.clone()),
             )),
             lifecycle: lifecycle.clone(),
-            capture_agent: Some(capture_endpoint.clone()),
             ledger: ledger.clone(),
             trace_gate: trace_gate.clone(),
         },
@@ -1236,18 +945,6 @@ async fn run_serve(
     if let Some(server) = &admin_server {
         tracing::info!(addr = %server.local_addr(), "admin server listening");
     }
-
-    // Mirror the capture agent's spool counters into gauges. Started only when
-    // an agent endpoint exists at boot; a reload that first introduces one is
-    // not polled until restart (the admin endpoints do follow it).
-    let capture_spool_poller = (legacy_agent.is_some() || snapshot.end_user_capture.is_some())
-        .then(|| {
-            tokio::spawn(run_capture_spool_poller(
-                proxy_observability::stats::CaptureSpoolStats::resolve(&stats_control),
-                capture_endpoint.clone(),
-                capture_spool_poll_interval,
-            ))
-        });
 
     // Rust note: `WorkerPool::spawn` takes `worker_main` by value and clones
     // it once per worker thread (see its doc comment), so `bind_tx` -- an
@@ -1414,9 +1111,6 @@ async fn run_serve(
                 .await
                 .log("listener startup failure");
         }
-        if let Some(delivery) = capture_delivery {
-            let _ = delivery.shutdown(Duration::from_secs(1)).await;
-        }
         return ExitCode::FAILURE;
     }
 
@@ -1459,7 +1153,6 @@ async fn run_serve(
                         &cluster_manager_for_reload,
                         &stats_control,
                         &stat_handle_tables_for_reload,
-                        capture_supervisor.as_ref().map(|s|(s,concurrency)),
                         running_ledger.as_ref(),
                         running_traces.as_ref(),
                         &running_otlp,
@@ -1620,17 +1313,7 @@ async fn run_serve(
         }
     }
 
-    // Capture admissions close only now, after the drain, so a request that
-    // completed inside the drain window was still admitted and recorded;
-    // stopping them first dropped every record from the window.
-    if let Some(supervisor) = &capture_supervisor {
-        supervisor.stop_admissions();
-    }
-    if let Some(poller) = &capture_spool_poller {
-        poller.abort();
-    }
-
-    tracing::info!("drain finished: flushing capture, metadata, trace and metric exports");
+    tracing::info!("drain finished: flushing metadata, trace and metric exports");
 
     // Rust note: the whole flush sequence is one future so it can be raced
     // against `control_signals.recv()` below. Our handlers replaced the default
@@ -1642,19 +1325,6 @@ async fn run_serve(
         // tens of seconds): the operator asked for "now", but records for requests
         // that already finished are still worth a moment.
         let fast_flush_cap = Duration::from_secs(1);
-        if let Some(delivery) = capture_delivery {
-            let configured = capture_supervisor
-                .as_ref()
-                .map(|s| s.drain_deadline())
-                .unwrap_or(Duration::from_secs(5));
-            let deadline = if fast_exit {
-                configured.min(fast_flush_cap)
-            } else {
-                configured
-            };
-            let timed_out = delivery.shutdown(deadline).await;
-            tracing::info!(timed_out, "local capture delivery stopped");
-        }
         if let Some(delivery) = metadata_delivery {
             let budget = if fast_exit {
                 fast_flush_cap
@@ -2026,7 +1696,7 @@ async fn apply_ads_snapshot(
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
-// The boot-scoped inputs (capture, ledger, traces, OTLP, auth) are each checked against the
+// The boot-scoped inputs (ledger, traces, OTLP, auth) are each checked against the
 // reloaded snapshot here, where it is loaded; bundling them only for the lint
 // would hide which one refused a reload.
 #[allow(clippy::too_many_arguments)]
@@ -2037,7 +1707,6 @@ async fn reload(
     cluster_manager: &Arc<proxy_cluster::manager::ClusterManager>,
     stats_control: &proxy_observability::stats::StatsControl,
     tables: &StatHandleTables,
-    capture: Option<(&proxy_observability::capture::CaptureSupervisor, usize)>,
     running_ledger: Option<&proxy_observability::ledger::LedgerConfig>,
     running_traces: Option<&proxy_observability::traces::config::TraceExportConfig>,
     running_otlp: &(
@@ -2116,17 +1785,6 @@ async fn reload(
         tracing::error!(
             %detail,
             "SIGHUP: config reload refused; continuing to serve the previous snapshot"
-        );
-        return None;
-    }
-    if let Some((capture, concurrency)) = capture {
-        if let Err(error) = capture.configure(snapshot.end_user_capture.clone(), concurrency) {
-            tracing::error!(%error,"SIGHUP: capture reload rejected; retaining previous snapshot");
-            return None;
-        }
-    } else if snapshot.end_user_capture_configured {
-        tracing::error!(
-            "node.metadata[\"io.llmproxy.capture\"]: cannot combine declarative and CLI capture"
         );
         return None;
     }
@@ -2356,22 +2014,13 @@ type OpenedTraces = (
 fn open_traces(
     config: &proxy_observability::traces::config::TraceExportConfig,
     node_id: &str,
-    capture_supervisor: Option<proxy_observability::capture::CaptureSupervisor>,
     stats: &proxy_observability::stats::StatsControl,
 ) -> Result<OpenedTraces, String> {
     use proxy_observability::traces::{capture, exporter, gate};
     const ROOT: &str = "node.metadata[\"io.llmproxy.traces\"]";
     let gate = Arc::new(gate::TraceGate::open(&config.directory));
     let trace_stats = capture::TraceStats::resolve(stats);
-    let (admission, traces) = match capture_supervisor {
-        Some(supervisor) => capture::TraceAdmission::with_capture_gate(
-            config,
-            Arc::clone(&gate),
-            supervisor,
-            trace_stats,
-        ),
-        None => capture::TraceAdmission::new(config, Arc::clone(&gate), trace_stats),
-    };
+    let (admission, traces) = capture::TraceAdmission::new(config, Arc::clone(&gate), trace_stats);
     let exporter =
         exporter::TraceExporter::spawn(config, node_id, Arc::clone(&admission), traces, stats)
             .map_err(|e| match e {
@@ -3081,7 +2730,6 @@ struct AdminStartRuntime<'a> {
     cluster_state: Option<proxy_admin::ClusterStateProvider>,
     credential_probe: Option<Arc<dyn proxy_http::credential_probe::TenantCredentialProbe>>,
     lifecycle: Arc<LifecycleState>,
-    capture_agent: Option<proxy_admin::CaptureAgentProvider>,
     ledger: Option<Arc<proxy_observability::ledger::Ledger>>,
     trace_gate: Option<Arc<proxy_observability::traces::gate::TraceGate>>,
 }
@@ -3127,7 +2775,6 @@ async fn start_admin(
             ui,
             lifecycle: Some(runtime.lifecycle),
             credential_probe: runtime.credential_probe,
-            capture_agent: runtime.capture_agent,
             ledger: runtime.ledger,
             trace_gate: runtime.trace_gate,
         },
@@ -3378,96 +3025,6 @@ impl ControlSignals {
 /// inspecting `proxy-admin` in isolation.
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn agent_link_logs_only_on_transitions() {
-        use super::{advance_link as step, AgentLink::*, LinkEvent::*};
-        assert_eq!(step(Unknown, false), (Down, Some(WentDown)));
-        assert_eq!(step(Unknown, true), (Up, None));
-        assert_eq!(step(Up, false), (Down, Some(WentDown)));
-        assert_eq!(step(Down, false), (Down, None), "repeats are suppressed");
-        assert_eq!(step(Down, true), (Up, Some(Recovered)));
-        assert_eq!(step(Up, true), (Up, None));
-    }
-
-    #[test]
-    fn an_answering_agent_without_stats_is_reachable_and_noticed_once() {
-        use super::{advance_poll as step, AgentLink, NoticeEvent, PollState};
-        use proxy_observability::capture_transport::InspectError::*;
-        let up = PollState {
-            link: AgentLink::Up,
-            stats_notice: None,
-        };
-        for cause in [Unauthorized, Unsupported] {
-            let (state, link_event, notice) = step(up, Err(cause));
-            assert_eq!(state.link, AgentLink::Up, "{cause:?} must not read as down");
-            assert_eq!(link_event, None, "{cause:?} must not warn about an outage");
-            assert_eq!(notice, Some(NoticeEvent::Announce(cause)));
-            let (again, link_event, notice) = step(state, Err(cause));
-            assert_eq!((again, link_event, notice), (state, None, None));
-        }
-        let (down, link_event, _) = step(up, Err(Unreachable));
-        assert_eq!(down.link, AgentLink::Down);
-        assert_eq!(link_event, Some(super::LinkEvent::WentDown));
-    }
-
-    #[test]
-    fn stats_notice_is_logged_once_per_cause() {
-        use super::{advance_stats_notice as step, NoticeEvent::*};
-        use proxy_observability::capture_transport::InspectError::*;
-        assert_eq!(
-            step(None, Err(Unauthorized)),
-            (Some(Unauthorized), Some(Announce(Unauthorized)))
-        );
-        assert_eq!(
-            step(Some(Unauthorized), Err(Unauthorized)),
-            (Some(Unauthorized), None)
-        );
-        assert_eq!(
-            step(Some(Unauthorized), Err(Unreachable)),
-            (Some(Unauthorized), None)
-        );
-        assert_eq!(step(None, Err(Unreachable)), (None, None));
-        assert_eq!(
-            step(Some(Unauthorized), Err(Unsupported)),
-            (Some(Unsupported), Some(Announce(Unsupported)))
-        );
-        assert_eq!(step(Some(Unsupported), Ok(())), (None, Some(Cleared)));
-        assert_eq!(step(None, Ok(())), (None, None));
-    }
-
-    #[tokio::test]
-    async fn spool_poll_of_an_absent_agent_marks_it_unreachable_and_warns_once() {
-        let control = proxy_observability::stats::StatsControl::new(1);
-        let stats = proxy_observability::stats::CaptureSpoolStats::resolve(&control);
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = proxy_observability::capture_transport::AgentTransportConfig {
-            socket_path: dir.path().join("absent.sock"),
-            expected_agent_uid: 0,
-            expected_node_id: "node".into(),
-            producer_id: "proxy".into(),
-        };
-        let link = tokio::time::timeout(
-            Duration::from_secs(10),
-            super::poll_capture_spool_once(
-                &stats,
-                Some(endpoint),
-                super::PollState {
-                    link: super::AgentLink::Up,
-                    stats_notice: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(link.link, super::AgentLink::Down);
-        let scrape = proxy_observability::stats::prometheus_render::render(&control.registry());
-        assert!(
-            scrape.contains("envoy_llmproxy_capture_agent_reachable 0")
-                && scrape.contains("envoy_llmproxy_capture_spool_stats_available 0"),
-            "{scrape}"
-        );
-    }
     use super::*;
 
     fn empty_snapshot() -> Arc<ConfigSnapshot> {
@@ -3542,7 +3099,6 @@ mod tests {
                 cluster_state: None,
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
-                capture_agent: None,
                 ledger: None,
                 trace_gate: None,
             },
@@ -3576,7 +3132,6 @@ mod tests {
                 cluster_state: None,
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
-                capture_agent: None,
                 ledger: None,
                 trace_gate: None,
             },
@@ -3615,7 +3170,6 @@ mod tests {
                 cluster_state: None,
                 credential_probe: None,
                 lifecycle: Arc::new(LifecycleState::new()),
-                capture_agent: None,
                 ledger: None,
                 trace_gate: None,
             },
@@ -3855,12 +3409,7 @@ mod tests {
             permissive,
             concurrency: 1,
             request_records_file: None,
-            request_records_agent: None,
-            request_records_agent_uid: None,
-            request_records_agent_node: None,
-            request_records_producer: None,
             request_record_max_attempts: None,
-            capture_spool_poll_interval_ms: 10_000,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
             drain_strategy: None,
             base_id: None,

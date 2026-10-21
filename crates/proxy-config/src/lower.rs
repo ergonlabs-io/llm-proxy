@@ -68,16 +68,9 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
     snapshot.ledger = crate::ledger::convert(b.node.as_ref(), "node")?;
     snapshot.traces = crate::traces::convert(b.node.as_ref(), "node")?;
-    snapshot.end_user_capture_configured = b
-        .node
-        .as_ref()
-        .and_then(|n| n.metadata.as_ref())
-        .is_some_and(|m| m.fields.contains_key("io.llmproxy.capture"));
-    #[cfg(unix)]
-    {
-        snapshot.end_user_capture = crate::capture::convert(b.node.as_ref())?;
-    }
-    #[cfg(not(unix))]
+    // The capture agent was retired in favour of trace export. A bootstrap
+    // that still sets its namespace fails loudly rather than being ignored
+    // (AGENTS.md invariant 1).
     if b.node
         .as_ref()
         .and_then(|node| node.metadata.as_ref())
@@ -85,7 +78,8 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     {
         return Err(unsupported(
             "node.metadata[\"io.llmproxy.capture\"]",
-            "declarative capture policy is not implemented; use the boot-only metadata-agent CLI",
+            "the capture agent was retired in 0.7.0; use trace export \
+             (node.metadata[\"io.llmproxy.traces\"]) or the request-records file sink",
         ));
     }
 

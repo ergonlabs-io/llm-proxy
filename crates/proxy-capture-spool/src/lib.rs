@@ -595,7 +595,7 @@ impl MetadataSpool {
     }
 
     /// Only the caller's genuine backend confirmation permits deletion.
-    /// The local-only capture agent never invokes this API.
+    /// The ledger acknowledges entries only on the operator's `/ledger/ack`.
     ///
     /// Deletes the covered rows; redb reuses their pages, which is how a spool at
     /// its ceiling accepts appends again. Refused at the ceiling, it spends the

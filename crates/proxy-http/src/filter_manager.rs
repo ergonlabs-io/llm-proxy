@@ -755,38 +755,18 @@ impl StreamHandler for FilterChainHandler {
                     crate::endpoint::Endpoint::classify(&req.head.method, req.head.uri.path());
             }
             if let Some(sink) = &self.request_record_sink {
-                #[cfg(unix)]
-                let admission = sink.try_admit();
-                #[cfg(not(unix))]
-                let admission: Result<
-                    Option<()>,
-                    proxy_observability::records::SubmitResult,
-                > = Ok(None);
-                if let Ok(lease) = admission {
-                    let mut info = stream_info.borrow_mut();
-                    info.metadata_enabled = true;
-                    info.metadata_attempt_limit = sink
-                        .max_attempts()
-                        .min(proxy_observability::records::MAX_ATTEMPTS);
-                    #[cfg(unix)]
-                    {
-                        if let Some(lease) = &lease {
-                            info.metadata_attempt_limit = lease.max_attempts();
-                        }
-                        info.metadata_lease = lease;
-                    }
-                    info.metadata_request_id = Some(
-                        proxy_observability::trace::TraceContext::new_root(false)
-                            .trace_id
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect(),
-                    );
-                }
-            }
-            #[cfg(unix)]
-            if stream_info.borrow().metadata_lease.is_some() {
-                crate::capture_cleanup::register(&stream_info);
+                let mut info = stream_info.borrow_mut();
+                info.metadata_enabled = true;
+                info.metadata_attempt_limit = sink
+                    .max_attempts()
+                    .min(proxy_observability::records::MAX_ATTEMPTS);
+                info.metadata_request_id = Some(
+                    proxy_observability::trace::TraceContext::new_root(false)
+                        .trace_id
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                );
             }
             // S10: move the downstream `OnUpgrade`
             // handle (if this request asked for one) off `req` and onto the

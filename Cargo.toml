@@ -9,8 +9,6 @@ members = [
     "crates/proxy-xds",
     "crates/proxy-observability",
     "crates/proxy-capture-spool",
-    "crates/proxy-capture-protocol",
-    "crates/proxy-capture-agent",
     "crates/proxy-admin",
     "crates/proxy-control",
     "crates/proxy-credentials",

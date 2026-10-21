@@ -478,7 +478,7 @@ pub struct StreamInfo {
     pub tenant_credentials: Option<std::sync::Arc<proxy_credentials::TenantCredentialSet>>,
     /// Whose credential the most recent attempt was sent with. Kept here as
     /// well as on `AttemptInfo` because attempt snapshots exist only while
-    /// metadata capture is on, and access logs need it regardless.
+    /// request records are on, and access logs need it regardless.
     pub credential_source: Option<proxy_credentials::CredentialSource>,
     /// The request body's `model` field, published by
     /// the body_rewrite filter (`proxy_filters::body_rewrite_filter`) on the
@@ -523,8 +523,6 @@ pub struct StreamInfo {
     /// Set at admission, before any filter; the router answers it with a
     /// local 503 only when it would dial, so a filter's own refusal wins.
     pub ledger_refusal: Option<proxy_observability::ledger::LedgerRefusal>,
-    #[cfg(unix)]
-    pub metadata_lease: Option<std::sync::Arc<proxy_observability::capture::CaptureLease>>,
     pub metadata_request_id: Option<String>,
     pub metadata_attempt_limit: u16,
     pub attempts_truncated: bool,
@@ -594,8 +592,6 @@ impl Default for StreamInfo {
             attempts: Vec::new(),
             metadata_enabled: false,
             ledger_refusal: None,
-            #[cfg(unix)]
-            metadata_lease: None,
             metadata_request_id: None,
             metadata_attempt_limit: proxy_observability::records::MAX_ATTEMPTS,
             attempts_truncated: false,
@@ -625,19 +621,10 @@ impl StreamInfo {
         host: &str,
         upstream_model: Option<String>,
     ) -> Option<Rc<RefCell<AttemptInfo>>> {
-        #[cfg(unix)]
-        self.check_capture_gate();
         if !self.metadata_enabled {
             return None;
         }
         self.physical_attempt_count = self.physical_attempt_count.saturating_add(1);
-        #[cfg(unix)]
-        if self.metadata_lease.as_ref().is_some_and(|l| {
-            4096usize.saturating_add((self.attempts.len() + 1) * 4096) > l.max_state_bytes()
-        }) {
-            self.attempts_truncated = true;
-            return None;
-        }
         if self.attempts.len()
             >= self
                 .metadata_attempt_limit
@@ -678,32 +665,6 @@ impl StreamInfo {
         }));
         self.attempts.push(attempt.clone());
         Some(attempt)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn check_capture_gate(&mut self) {
-        if self.metadata_lease.as_ref().is_some_and(|l| !l.live()) {
-            self.clear_capture_state();
-        }
-    }
-    #[cfg(unix)]
-    pub(crate) fn clear_capture_state(&mut self) {
-        self.metadata_enabled = false;
-        self.metadata_request_id = None;
-        for attempt in &self.attempts {
-            let Ok(mut a) = attempt.try_borrow_mut() else {
-                return;
-            };
-            a.cluster = String::new();
-            a.host = String::new();
-            a.upstream_model = None;
-            a.served_model = None;
-            a.attempt_id = String::new();
-            a.retry_reason = None;
-        }
-        self.selected_attempt = None;
-        self.attempts = Vec::new();
-        self.metadata_lease = None;
     }
 
     /// Returns `now - request_started_at` without exposing the raw monotonic
