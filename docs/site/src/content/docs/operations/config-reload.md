@@ -4,14 +4,13 @@ description: "Apply config changes with SIGHUP, and see which settings a reload 
 summary: SIGHUP re-reads the config file a running proxy booted with and
   publishes a new snapshot. A config that fails to parse or validate leaves
   the proxy serving the previous snapshot and logs the full error.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - configuration/configuration-file
+  - authentication/virtual-keys
   - observability/metrics-and-stats
   - operations/draining-and-shutdown
 ---
-
-# Reload configuration
 
 Use a reload to change routes, models, limits, and provider settings without
 a restart. To reload, edit the config file and send `SIGHUP` to the process:
@@ -24,11 +23,19 @@ llm-proxy has no file-system watcher. A reload happens only when something
 sends the signal. Some settings need a restart. The table in
 [What a reload applies](#what-a-reload-applies) lists them.
 
+## At a glance
+
+- **Default when unset:** nothing reloads. The proxy has no file watcher. A
+  reload happens only on `SIGHUP`.
+- **Failure mode:** a reload that fails to load, or that changes a setting
+  fixed at start, is refused whole. The proxy keeps serving the previous
+  config.
+
 ## Reload restrictions
 
-A bootstrap with `dynamic_resources` ignores `SIGHUP` and logs a warning.
-Apply dynamic changes through its configured xDS source. The proxy also
-ignores reload signals while draining or shutting down.
+The proxy ignores `SIGHUP` while it drains or shuts down. It logs
+`SIGHUP ignored: the proxy is draining and will not bind new listeners` or
+`SIGHUP ignored: the proxy is shutting down and will not reload`.
 
 Some changes make the proxy refuse the whole reload. See
 [What a reload applies](#what-a-reload-applies) for the full list.
@@ -40,7 +47,6 @@ llm-proxy --config llmproxy.yaml --mode validate
 ```
 
 For a shared store, include the replica's `--service-node` flag when validating.
-For an Envoy bootstrap, use `-c bootstrap.yaml` instead of `--config`.
 
 ## A failed reload keeps the previous config
 
@@ -58,15 +64,14 @@ SIGHUP: config reload failed; continuing to serve the previous snapshot
 A reload re-reads the same config file that the process started with. Then it
 applies the result in this order:
 
-1. Resolve stats handles for any cluster the new snapshot names that the
-   running process has never seen before, so traffic to a brand-new cluster
-   is counted in `/stats` from its first request — see
-   [Metrics and /stats](../../observability/metrics-and-stats/).
-2. Update the shared cluster manager with the new cluster set. A cluster
-   that fails to build (an unimplemented load-balancing policy, a bad TLS
-   config) is logged at `error` and left out of the live cluster set —
-   unlike at boot, where the same failure is fatal, a reload cannot take
-   the process down for it.
+1. Resolve stats handles for any provider that the new config names and the
+   running process has never seen. Traffic to a new provider is counted in
+   `/stats` from its first request. See
+   [Metrics and /stats](/docs/llm-proxy/observability/metrics-and-stats/).
+2. Update the provider set. A provider that fails to build (for example, a
+   bad TLS config) is logged at `error` and left out of the live set. At
+   boot the same failure is fatal. A reload cannot take the process down for
+   it.
 3. Publish the new snapshot. Every worker's listener manager reconciles
    against it, so listeners are added, removed, or reconfigured to match.
 
@@ -101,6 +106,7 @@ that start after a successful reload.
 | `auth.store`, `auth.tenant_credentials` | A change makes the proxy refuse the whole reload. A rotated key file at the same path is a change. | Yes |
 | `observability.tracing`, `observability.metrics` | A change makes the proxy refuse the whole reload. | Yes |
 | `ledger`, `observability.traces` | A change makes the proxy refuse the whole reload. | Yes |
+| Command-line flags (such as `--service-node`) | Not part of the file. They are fixed when the process starts. | Yes |
 | Keys, tenants and policy from the admin API | Not part of the file. They stay in the auth store and are not changed by a reload. | No |
 
 A refused reload keeps the previous snapshot and logs this line at `error`:
@@ -109,20 +115,21 @@ A refused reload keeps the previous snapshot and logs this line at `error`:
 SIGHUP: config reload refused; continuing to serve the previous snapshot
 ```
 
-Its `detail` field names the chain, the filter and the field that changed,
-for example `typed_config.hmac_secret` with the dialect's
-`auth.hmac_secret` / `auth.hmac_secret_file`, and says to restart. For
-`ledger` and the `observability` blocks, the message itself names the field.
-The log never contains the secret.
+Its `detail` field names the field that changed and says to restart. The
+auth fields appear under their internal names, for example
+`typed_config.hmac_secret (the dialect's `auth.hmac_secret` /
+`auth.hmac_secret_file`)`. For `ledger`, `observability.traces`,
+`observability.tracing`, and `observability.metrics`, the log line names the
+field in parentheses. The log never contains the secret.
 
-To rotate the HMAC secret, change it and restart. Configured keys must be digested again under the new secret, and
-keys minted through the admin API stop working, because their digests were
+To rotate the HMAC secret, change it and restart. Configured keys must be
+digested again under the new secret, and keys minted through the admin API stop working, because their digests were
 made with the old secret.
 
 To revoke a key without a restart, use the admin API: `DELETE /keys/{id}` for
 a key minted through the API, or `DELETE /tenants/{id}` to revoke every key
 of a tenant, configured keys included. See
-[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+[Virtual keys](/docs/llm-proxy/authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
 
 ### Requests in flight
 
@@ -130,16 +137,15 @@ A request that started before the reload finishes on the configuration it
 started with, including its retries and fallbacks. A downstream HTTP
 connection from before the reload closes gracefully after its current
 request: an idle keep-alive closes, and the next request opens a new
-connection that uses the new configuration. A TCP proxy connection is not
-closed.
+connection that uses the new configuration.
 
 ### Errors that a reload does not catch
 
 A reload checks that the file parses and validates. Some errors appear only
 when a worker builds the new listener, after the reload has logged success:
 
-- A provider cluster that fails to build is left out of the cluster set and
-  logged at `error`.
+- A provider that fails to build is left out of the live set and logged at
+  `error` as `SIGHUP: cluster rejected during reload`.
 - A TLS file that cannot be read, or a filter that fails to build, makes the
   listener reset new connections until a later reload succeeds. The
   `llmproxy.auth` filter is the exception: its config is parsed before the
@@ -153,27 +159,32 @@ after a reload.
 
 These items also change on a reload:
 
-- **Stats series.** A reload hides the series of a cluster or listener that the
+- **Stats series.** A reload hides the series of a provider or listener that the
   new config no longer names. After two consecutive configs omit the name, the
   proxy frees the series slot. A name that returns later starts at zero. See
-  [Metrics and /stats](../../observability/metrics-and-stats/#series-lifetime-and-reload).
+  [Metrics and /stats](/docs/llm-proxy/observability/metrics-and-stats/#series-lifetime-and-reload).
 - **Rate card (`pricing`).** Without a control-plane store, a reload installs a
   changed `pricing`. A reload with an unchanged `pricing` keeps a card that
   `PUT /pricing` installed. With a store, a reload never replaces the stored
   card.
-- **Global connection limit.** The accept loop reads the limit and the
-  listener's `ignore_global_conn_limit` from the current snapshot on each
-  accepted connection. A reload applies to the next connection.
-- **Tenant-budget cutover.** `PUT /tenants/{id}/budget` returns `409` while the
-  serving spend filter lacks `legacy_tenant_budget_cutover`. Each build of the
-  filter records the value, so a reload that adds the field lifts the `409`. See
-  [Spend policies](../../limits-and-budgets/spend-policies/#migrating-tenant-budgets).
+- **Global connection limit.** The accept loop reads `listen.max_connections`
+  from the current snapshot on each accepted connection. A reload applies to
+  the next connection.
+
+## Limitations
+
+- A reload cannot change the settings that the table marks as needing a
+  restart. The proxy refuses the whole reload instead.
+- A reload does not catch every error. See "Errors that a reload does not
+  catch".
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## SIGTERM after a reload
 
 A `SIGHUP` reload does not change the shutdown sequence. A `SIGTERM` sent
 after one or more reloads still drains and exits cleanly. See
-[Draining and shutdown](../../operations/draining-and-shutdown/) for what that
+[Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/) for what that
 sequence does.
 
 ## Implementation notes
@@ -194,5 +205,4 @@ For maintainers. The `reload` function is in `crates/proxy/src/main.rs`.
   `without_a_store_a_reload_that_did_not_change_the_card_keeps_a_put_card`, and
   `with_a_store_a_reload_never_replaces_the_stored_card`.
 - The accept loop in `crates/proxy-core/src/listener.rs` reads the global
-  connection limit. The tenant-budget cutover is in
-  `crates/proxy-filters/src/spend_limit_filter.rs`.
+  connection limit.

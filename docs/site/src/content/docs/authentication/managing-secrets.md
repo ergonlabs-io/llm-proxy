@@ -6,7 +6,7 @@ summary: The lifecycle of a virtual key listed in `auth.keys`. Generate the
   model policy, verify the request, revoke the key, and rotate the HMAC
   secret. Keys minted through the admin API are covered on the Virtual keys
   page.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - authentication/virtual-keys
   - configuration/configuration-file
@@ -14,19 +14,23 @@ related:
   - reference/cli
 ---
 
-# Manage configured virtual keys
-
 This page is the lifecycle of a virtual key that you list in the config file:
 generate it, install its digest, grant its tenant access to models, verify
 it, revoke it, and rotate the HMAC secret that keys every digest.
 
+## At a glance
+
+- **Default when unset:** no `auth.keys` means no configured keys.
+- **Failure mode:** a bad digest is a load error. A reload that changes keys
+  or the secret is refused, and the old keys keep working.
+
 **Every change to `auth.keys` or the HMAC secret takes a restart.** A
 `SIGHUP` reload that changes them is refused, and the proxy keeps the running
 keys and secret (see
-[Reload configuration](../../operations/config-reload/#what-a-reload-applies)). Keys
+[Reload configuration](/docs/llm-proxy/operations/config-reload/#what-a-reload-applies)). Keys
 can also be minted and revoked at runtime through the admin API, without a
 restart; see
-[Managing keys and tenants at runtime](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+[Managing keys and tenants at runtime](/docs/llm-proxy/authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
 
 ## Before you start
 
@@ -146,7 +150,7 @@ curl -s -i -X PUT http://127.0.0.1:53422/tenants/acme/policy \
 A `204 No Content` response means the policy is stored. The next request
 uses it, with no reload. `{"access":"all"}` grants every model. Both lists
 accept exact names or one trailing `*`; see
-[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime)
+[Virtual keys](/docs/llm-proxy/authentication/virtual-keys/#managing-keys-and-tenants-at-runtime)
 for `deny` and per-key policies.
 
 The policy lives in the auth store. With the default store, `in_memory`, a

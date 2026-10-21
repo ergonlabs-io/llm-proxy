@@ -2,21 +2,19 @@
 title: Tenant provider credentials
 description: "Let a tenant store its own provider API key, so its requests use that key instead of the platform credential."
 summary: Let a tenant send its traffic on its own provider key. Covers strict
-  tenant mode, Envoy-mode setup with the key-encryption key file and the
-  cluster slot, the admin API and its save-time key check, access-log and
-  counter attribution, budget scope, and limitations.
-lastUpdated: 2026-10-18
+  tenant mode, setup with the key-encryption key file, the admin API and its
+  save-time key check, access-log and counter attribution, budget scope, and
+  limitations.
+lastUpdated: 2026-10-21
 related:
   - authentication/virtual-keys
   - authentication/managing-secrets
-  - providers-and-routing/providers-and-clusters
+  - providers/overview
   - providers-and-routing/failover-and-aggregates
   - limits-and-budgets/spend-policies
   - observability/access-logs
   - observability/metrics-and-stats
 ---
-
-# Tenant provider credentials
 
 A tenant can store its own provider key. When that tenant calls llm-proxy with
 its virtual key, the proxy sends the tenant's key to the provider. The operator
@@ -29,14 +27,25 @@ provider account. To enable it, create a key-encryption key file, add
 provider that tenants may bring a key for, and store each key with the admin
 API. The sections under "Setup" give the steps.
 
+## At a glance
+
+- **Default when unset:** no tenant holds a stored key. Every request uses the
+  platform credential.
+- **Failure mode:** fails closed. A tenant that holds a stored key never sends
+  the platform credential. A missing or unreadable key gives `403` or `503`.
+- **Requires:** `auth.tenant_credentials`, a durable `auth.store`
+  (`persistent` or `shared`), and `tenant_credentials: true` on each provider.
+
 This page uses these terms:
 
 - **Platform credential**: the provider key the operator configures on a
-  cluster.
+  provider.
 - **Tenant credential**: one provider key that one tenant stores.
-- **Provider label**: the `provider` name in a cluster's `tenant_credential`
-  slot. A tenant stores its key under this name. A tenant never picks a
-  provider. Routes still pick aggregates.
+- **Provider label**: the name of the provider in `providers`. A tenant
+  stores its key under this name. A tenant never picks a provider. Routes
+  still pick the provider or the model.
+- **Slot**: the place in a provider that takes the tenant key. The config file
+  adds a slot to each provider with `tenant_credentials: true`.
 - **Platform mode**: the tenant holds no stored credential. Requests use the
   platform credential. This is the default.
 - **Tenant mode**: the tenant holds at least one stored credential. No attempt
@@ -54,8 +63,8 @@ credential to any provider. Each attempt uses one of the outcomes below.
 | Situation for one attempt | What the client gets | What the provider receives |
 |---|---|---|
 | Platform mode (no stored credential) | The provider's response | The platform credential, as before |
-| Tenant mode, the cluster has a slot, and the tenant holds a usable key for the slot's provider | The provider's response | The tenant key, in the slot header |
-| Tenant mode, the cluster has no slot, or the tenant holds no key for the slot's provider | `403`, error type `tenant_credential_missing` | Nothing. The provider is not dialled |
+| Tenant mode, the provider has a slot, and the tenant holds a usable key for it | The provider's response | The tenant key, in the slot header |
+| Tenant mode, the provider has no slot, or the tenant holds no key for it | `403`, error type `tenant_credential_missing` | Nothing. The provider is not dialled |
 | Tenant mode, the stored key cannot be decrypted | `503`, body `provider credential failure` | Nothing. The provider is not dialled |
 | Tenant mode, the provider answers `401` to the tenant key | The provider's `401`, passed through | The tenant key, on one attempt. No retry and no fallback |
 
@@ -65,31 +74,32 @@ The `403` reply has this body:
 {"error":{"message":"no tenant credential for provider openrouter","type":"tenant_credential_missing"}}
 ```
 
-If the refused cluster has no slot, the message is `no tenant credential for
+If the refused provider has no slot, the message is `no tenant credential for
 any provider this route can use`.
 
 The `403` and the `503` from this step are final for the request. The proxy
 does not retry them.
 
-Aggregates follow the same rule. An aggregate skips each member that has no
-slot, and each member whose provider the tenant does not hold. The proxy never
-dials a skipped member. If no member is eligible, the reply is the `403` above.
+A model with several providers follows the same rule. The proxy skips each
+provider that has no slot, and each provider for which the tenant holds no
+key. The proxy never dials a skipped provider. If no provider is eligible, the
+reply is the `403` above. See
+[Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/).
 
-When a tenant credential applies, the proxy first applies the cluster's static
-headers. Then it removes the `authorization`, `x-api-key`, and `api-key`
+When a tenant credential applies, the proxy first applies the static headers
+of the provider. Then it removes the `authorization`, `x-api-key`, and `api-key`
 headers from the request. Then it sets the slot header to the tenant value. A
 client header with one of those three names is removed too. The removal covers
-only those three names. A cluster that places its platform key on another
+only those three names. A provider that places its platform key on another
 header keeps that header.
 
 Deleting the last stored key for a tenant returns that tenant to platform mode.
 
 ## Setup
 
-You can set up tenant credentials in the `llmproxy` config file (`--config`) or
-in an Envoy-mode bootstrap (`-c`). Both front ends load the same key ring and
-the same slot. Step 1 is the same for both. Step 2 and step 3 show each front
-end. The config file derives the slot for you, so it skips step 3.
+Set up tenant credentials in the `llmproxy` config file (`--config`). The
+config file derives the slot for each provider that sets
+`tenant_credentials: true`.
 
 ### 1. Create the key-encryption key file
 
@@ -115,8 +125,6 @@ Check the size with `wc -c` and the mode with `ls -l`. The output of `ls -l`
 starts with `-rw-------`.
 
 ### 2. Enable the key ring
-
-#### In the `llmproxy` config file
 
 Set `auth.tenant_credentials` and turn the feature on for each provider with
 `tenant_credentials: true`. A provider that opts in without the key ring is a
@@ -154,114 +162,36 @@ routes:
     provider: openrouter
 ```
 
-The field reference is in
-[Configuration file](../../configuration/configuration-file/), section
-`auth.tenant_credentials`.
+The generated [field reference](/docs/llm-proxy/configuration/reference/)
+lists every field of `auth.tenant_credentials`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `encryption_key_file` | string (path) | none, required | The key file from step 1. New keys are sealed under this key. |
+| `encryption_key_id` | string | none, required | Names this key. The id is stored in plaintext beside each sealed key, so the proxy can pick the right key to open it. |
+| `previous_keys` | list of `{id, file}` | `[]` | Retired keys. Each one opens rows sealed before a rotation. It never seals new rows. Each `id` and `file` is required. |
+
+Every id must be unique across `encryption_key_id` and `previous_keys[].id`.
+A duplicate fails the load. The proxy reads the key files once, at start.
+Restart the proxy to load a changed key file or a changed list.
+
 The header is derived from the provider type. `anthropic` uses `x-api-key`,
 `azure-openai` uses `api-key`, and the other header types use `Authorization:
 Bearer`. `vertex` and `bedrock` are rejected at `tenant_credentials`.
 
-#### In Envoy mode
-
-Add the block to the `llmproxy.auth` filter's `typed_config`. The filter also
-needs a durable store, `persistent` or `shared`. With `tenant_credentials` set,
-an absent or `in_memory` store is a load error at `typed_config.tenant_credentials`.
-
-```yaml
-http_filters:
-  - name: llmproxy.auth
-    typed_config:
-      "@type": type.llmproxy.dev/llmproxy.filters.v0.Authentication
-      hmac_secret: { inline_string: "replace-with-your-hmac-secret" }
-      persistent:
-        path: /var/lib/llmproxy/control.redb
-      tenant_credentials:
-        encryption_key_file: /etc/llmproxy/credential-kek
-        encryption_key_id: kek-2026-10
-        previous_keys: []
-  - name: envoy.filters.http.router
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-```
-
-| Field | Type | Required | What it does |
-|---|---|---|---|
-| `encryption_key_file` | string (path) | yes | The key file from step 1. New keys are sealed under this key. |
-| `encryption_key_id` | string | yes | Names this key. The id is stored in plaintext beside each sealed key, so the proxy can pick the right key to open it. |
-| `previous_keys` | list of `{id, file}` | no | Retired keys. Each one opens rows sealed before a rotation. It never seals new rows. Each `id` and `file` is required. |
-
-Every id must be unique across `encryption_key_id` and `previous_keys[].id`.
-A duplicate fails the load. The proxy reads the key files once per serve,
-when it first builds the filter chain. Restart the proxy to load a changed
-key file or a changed list.
-
-The `tenant_credentials` block does not change the `auth` store. Keys minted
-through the admin API still live in the store the filter selects.
-
-### 3. Add the slot to each cluster that a tenant may use (Envoy mode only)
-
-The slot tells the router which provider a cluster belongs to and where the
-tenant key goes. Add it under the cluster's `io.llmproxy.provider_auth`
-metadata, beside any platform `headers`. The config file does this for each
-provider with `tenant_credentials: true`:
-
-```yaml
-clusters:
-  - name: openrouter
-    type: STATIC
-    connect_timeout: 2s
-    metadata:
-      filter_metadata:
-        io.llmproxy.provider_auth:
-          headers:
-            - { key: authorization, value: "Bearer replace-with-platform-key" }
-          tenant_credential: { provider: openrouter, header: authorization, prefix: "Bearer ", verify_path: /api/v1/key }
-    load_assignment:
-      cluster_name: openrouter
-      endpoints:
-        - lb_endpoints:
-            - endpoint:
-                address:
-                  socket_address: { address: openrouter.example, port_value: 443 }
-```
-
-The endpoint and the transport settings above are placeholders. Use the
-transport settings your provider needs.
-
-| Slot field | Required | What it does |
-|---|---|---|
-| `provider` | yes, non-empty | The provider label. Tenants store keys under this name. |
-| `header` | yes | The request header that carries the key. Stored in lowercase. Must be a valid HTTP header name. |
-| `prefix` | no, default empty | Text put before the key in the header value. `Bearer ` for `Authorization`. Must not contain CR, LF, or control characters. |
-| `verify_path` | no, no default | The path of the `GET` that checks a key when it is saved. Must start with `/`. Without it, `PUT` with `verify` set to `true` returns `422 credential_verification_not_configured`. See [Save-time check](#save-time-check). |
-
-Rules for the slot:
-
-- Only header API-key shapes are supported. A cluster with Vertex OAuth2 or
-  Bedrock SigV4 credentials cannot carry a slot. The load fails.
-- An unknown key inside the slot is a load error that names its full path.
-  A typo such as `provder` fails.
-- A cluster with a slot and no platform headers loads.
-
-### 4. Start the proxy
+### 3. Start the proxy
 
 ```sh
 llm-proxy --config /etc/llmproxy/llmproxy.yaml
 ```
 
-or, in Envoy mode:
-
-```sh
-llm-proxy -c /etc/llmproxy/bootstrap.yaml
-```
-
 The proxy runs in `serve` mode by default. Restart it after any change to the
 key files, `previous_keys`, or the store.
 
-### 5. Create the tenant, its virtual key, and its stored key
+### 4. Create the tenant, its virtual key, and its stored key
 
 Create the tenant and a virtual key as described in
-[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+[Virtual keys](/docs/llm-proxy/authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
 Then store the tenant key. The proxy checks the key with the provider before it
 stores it. The next request from that tenant uses the key.
 
@@ -270,11 +200,11 @@ curl --max-time 10 -X PUT \
   -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"schema_version":1,"api_key":"<the tenant key>","verify":true}' \
-  http://127.0.0.1:9901/tenants/acme/provider_credentials/openrouter
+  http://127.0.0.1:53422/tenants/acme/provider_credentials/openrouter
 ```
 
-Replace `127.0.0.1:9901` with the `admin.address` in your bootstrap. `verify`
-is optional. Leave it out to check the key. A successful call returns `200`
+Replace `127.0.0.1:53422` with the `admin` address in your config file.
+`verify` is optional. Leave it out to check the key. A successful call returns `200`
 and metadata. The response never includes the key:
 
 ```json
@@ -293,26 +223,21 @@ save-time check. It runs when `verify` is `true`, which is the default. Send
 
 The check sends one request to the provider:
 
-- **Method and path.** `GET` to the slot's `verify_path`, as is. The cluster's
+- **Method and path.** `GET` to the `verify_path` of the provider, as is. The path rewrite of the provider
   path rewrite does not apply.
-- **Headers.** The cluster's static headers. Then the proxy removes
+- **Headers.** The static headers of the provider. Then the proxy removes
   `authorization`, `x-api-key`, and `api-key`. Then it sets the slot header to
   the candidate key. The check does not forward any header from the admin
   request.
-- **Connection.** The cluster's own endpoints, transport, TLS settings, and
-  upstream protocol.
+- **Connection.** The endpoints, TLS settings, and upstream protocol of the
+  provider.
 - **Time limit.** 5 seconds, from connect to the response head.
 - **Body.** The proxy never reads the response body. It keeps only the status.
 
-If more than one cluster has a slot for the provider with a `verify_path`, the
-proxy uses the cluster whose name sorts first.
-
-The path is set in each front end:
-
-| Front end | Where the path is set | Default |
-|---|---|---|
-| `llmproxy` config file | `providers.<name>.tenant_credential_verify_path`. Requires `tenant_credentials: true`. | `/api/v1/key` for `openrouter`. `/v1/models` for `openai` and `anthropic`. None for the other types. None when `base_url` is set. |
-| Envoy mode | `verify_path` in the `tenant_credential` slot under `io.llmproxy.provider_auth`. | None. Set it in the slot. |
+Set the path with `providers.<name>.tenant_credential_verify_path`. It
+requires `tenant_credentials: true`. The default is `/api/v1/key` for
+`openrouter`, and `/v1/models` for `openai` and `anthropic`. The other types
+have no default. No default applies when `base_url` is set.
 
 A path must start with `/`. It must be at most 2048 bytes. It must contain only
 printable ASCII, no `#`, and it must be a valid URI path with an optional
@@ -327,7 +252,7 @@ Each result of the check, and the response that `PUT` returns:
 | Any other status, such as `3xx`, `429`, or `5xx` | `502` | `credential_verification_unavailable` | The status | No |
 | No response within 5 seconds | `502` | `credential_verification_unavailable` | none | No |
 | Connect failure, TLS failure, protocol error, or no healthy host | `502` | `credential_verification_unavailable` | none | No |
-| No cluster slot has a `verify_path` for this provider, or the admin server has no probe | `422` | `credential_verification_not_configured` | none | No |
+| The provider has no `verify_path`, or the admin server has no probe | `422` | `credential_verification_not_configured` | none | No |
 
 The proxy checks the key-encryption keys before it sends the key. With no
 key-encryption keys, `PUT` returns `503` and the key does not reach the
@@ -337,7 +262,7 @@ The checks run in this order. The first failure ends the request:
 
 1. The request body. Returns `400`.
 2. The tenant. Returns `404`.
-3. The provider label on a cluster. Returns `422 provider_not_enabled`.
+3. The provider label. Returns `422 provider_not_enabled`.
 4. The key-encryption keys. Returns `503 tenant_credentials_not_configured`.
 5. The save-time check, when `verify` is `true`. Returns the `422` or `502` above.
 6. The store.
@@ -374,7 +299,7 @@ Three routes manage a tenant's stored keys. They sit under the same bearer
 token as the other admin write routes. Set `LLMPROXY_ADMIN_TOKEN` and send it
 as `Authorization: Bearer`. The routes also accept the scoped
 `/chains/{stat_prefix}/...` form. See
-[Virtual keys](../../authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
+[Virtual keys](/docs/llm-proxy/authentication/virtual-keys/#managing-keys-and-tenants-at-runtime).
 
 | Method and path | Request body | Success |
 |---|---|---|
@@ -382,7 +307,7 @@ as `Authorization: Bearer`. The routes also accept the scoped
 | `GET /tenants/{id}/provider_credentials` | none | `200` with `{"schema_version":1,"tenant":"...","credentials":[...]}`, sorted by provider |
 | `DELETE /tenants/{id}/provider_credentials/{provider}` | none | `204`, empty body |
 
-`{provider}` is the provider label from a cluster's slot. A `PUT` for a
+`{provider}` is the provider label, which is the name of a provider in `providers`. A `PUT` for a
 tenant and provider replaces the stored key. The `created_at` value stays the
 same, and `updated_at` changes.
 
@@ -401,13 +326,13 @@ Status codes for `PUT`. The order of the checks is in
 | `401` | Empty, with `www-authenticate` | The bearer token is missing or wrong. |
 | `403` | Text | `LLMPROXY_ADMIN_TOKEN` is unset, empty, or whitespace-only. |
 | `404` | `{"error":{"type":"tenant_not_found","message":"unknown tenant"}}` | The tenant does not exist. |
-| `422` | `{"error":{"type":"provider_not_enabled",...}}` | No cluster has a slot with this provider label. |
+| `422` | `{"error":{"type":"provider_not_enabled",...}}` | No provider with `tenant_credentials: true` has this name. |
 | `422` | `{"error":{"type":"credential_rejected","upstream_status":401,...}}` | The save-time check got `401` or `403`. `upstream_status` is that status. Nothing is stored. |
-| `422` | `{"error":{"type":"credential_verification_not_configured",...}}` | No cluster slot has a `verify_path` for this provider, or the admin server has no probe. Nothing is stored. Send `"verify": false` to store the key unchecked. |
+| `422` | `{"error":{"type":"credential_verification_not_configured",...}}` | The provider has no `verify_path`, or the admin server has no probe. Nothing is stored. Send `"verify": false` to store the key unchecked. |
 | `500` | `{"error":{"type":"credential_seal_failed",...}}` | The key could not be sealed. |
 | `500` | Text | The store refused the write, for example Redis was not reachable. |
 | `502` | `{"error":{"type":"credential_verification_unavailable",...}}` | The save-time check got another status, timed out, or could not connect. `upstream_status` is present only when the provider answered. Nothing is stored. |
-| `503` | `{"error":{"type":"tenant_credentials_not_configured",...}}` | The auth filter has no `tenant_credentials` block, so no key-encryption keys are loaded. Checked before the save-time check, so the key is not sent to the provider. |
+| `503` | `{"error":{"type":"tenant_credentials_not_configured",...}}` | The config has no `auth.tenant_credentials` block, so no key-encryption keys are loaded. Checked before the save-time check, so the key is not sent to the provider. |
 
 Status codes for `GET` and `DELETE`:
 
@@ -434,11 +359,10 @@ Two access-log operators show the attribution:
 | `%LLM_TENANT%` | The authenticated tenant id. `-` when the request is not authenticated. |
 | `%LLM_CREDENTIAL_SOURCE%` | `platform` or `tenant`. The source of the last provider credential applied to this request. `-` when no credential was applied, for example after a `403 tenant_credential_missing`. |
 
-Both operators are in the [access log reference](../../observability/access-logs/#the-operator-set).
+Both operators are in the [access log reference](/docs/llm-proxy/observability/access-logs/#the-operator-set).
 
-The fixed access-log formats of the `llmproxy` config file include
-`%LLM_TENANT%` but not `%LLM_CREDENTIAL_SOURCE%`. To log the credential
-source, use Envoy mode and set `log_format` on the access logger.
+Both the text format and the JSON format of the access log carry these two
+values. The JSON field names are `llm_tenant` and `llm_credential_source`.
 
 ### Counter
 
@@ -449,10 +373,10 @@ The router counts each tenant-mode decision in
 | `outcome` | Meaning | Status |
 |---|---|---|
 | `applied` | The tenant's key was applied to the attempt. | Continues to the provider |
-| `missing` | No slot on the cluster, or the tenant holds no key for the slot's provider. | `403` |
+| `missing` | The provider has no slot, or the tenant holds no key for it. | `403` |
 | `unusable` | The stored key cannot be decrypted. | `503` |
 
-`provider` is the slot's provider label. It is `-` when the refused cluster
+`provider` is the provider label. It is `-` when the refused provider
 has no slot. The counter has no tenant label, because tenant ids are not
 bounded. Each `provider` value must come from configuration. The counter
 stops adding new series at 256, and later provider values fold into
@@ -492,7 +416,7 @@ curl --max-time 10 -X PUT \
   -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"budget":{"max_usd":"10.00","period":"monthly","credential_source":"tenant"}}' \
-  http://127.0.0.1:9901/tenants/acme/budget
+  http://127.0.0.1:53422/tenants/acme/budget
 ```
 
 `credential_source` takes `"platform"` or `"tenant"`. Leave it out for
@@ -526,11 +450,10 @@ written before the scope existed read as platform-scoped.
 - **Durable store only.** With tenant credentials configured, the default
   `in_memory` store is a load error, because it loses the keys on restart and
   tenants would then use the platform credential. Use `persistent` or
-  `shared`. A config that sets `auth.tenant_credentials` or Envoy's
-  `tenant_credentials` with another store fails at load and names the field
-  path.
+  `shared`. A config that sets `auth.tenant_credentials` with another store
+  fails at load and names the field path.
 - **Header shapes.** Only the `Authorization`, `x-api-key`, and `api-key` shapes
-  work. A cluster with Vertex OAuth2 or Bedrock SigV4 cannot carry a slot.
+  work. A `vertex` or `bedrock` provider cannot carry a slot.
 - **Three header names are cleared.** In tenant mode the proxy clears only
   `authorization`, `x-api-key`, and `api-key`. A platform key on another header
   is still sent with the tenant key.
@@ -541,7 +464,7 @@ written before the scope existed read as platform-scoped.
   restart.
 - **Plaintext in memory.** Each replica holds the tenant keys it uses as
   plaintext in memory while the rows are current.
-- **Key-file errors name the Envoy path.** In the `llmproxy` config file, a bad
+- **Key-file errors name the wrong path.** In the `llmproxy` config file, a bad
   key file, a bad permission, or a duplicate id fails the load with the path
   `typed_config.tenant_credentials.…`, not `auth.tenant_credentials.…`. The
   rejection is the same. Only the path differs. Presence and empty-value checks
@@ -551,16 +474,18 @@ written before the scope existed read as platform-scoped.
   all traffic, and charges all spend to it. Remove tenant-scoped budgets before
   a rollback.
 
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
+
 ## Troubleshooting
 
 ### `403` with `"type":"tenant_credential_missing"`
 
-- **Cause.** The cluster that the request reached has no slot, or the tenant
-  holds no key for the slot's provider. Every refusal increments
+- **Cause.** The provider that the request reached has no slot, or the tenant
+  holds no key for it. Every refusal increments
   `llmproxy_tenant_credential_requests_total` with `outcome="missing"`. Some
   refusal paths also log `tenant has no credential slot match for the selected
   cluster` at `warn`. Do not rely on that line alone.
-- **Fix.** Compare the slot's `provider` with the `{provider}` in the `PUT`
+- **Fix.** Compare the provider name with the `{provider}` in the `PUT`
   path. Check the stored keys with `GET /tenants/{id}/provider_credentials`.
   Store the missing key under the provider label.
 
@@ -587,14 +512,14 @@ written before the scope existed read as platform-scoped.
 
 ### `PUT` returns `503` with `tenant_credentials_not_configured`
 
-- **Cause.** The auth filter has no `tenant_credentials` block.
+- **Cause.** The config has no `auth.tenant_credentials` block.
 - **Fix.** Add the block from step 2 and restart.
 
 ### `PUT` returns `422` with `provider_not_enabled`
 
-- **Cause.** No cluster has a slot whose `provider` equals the `{provider}` in
-  the path. The check is exact.
-- **Fix.** Use the slot's `provider` value in the path.
+- **Cause.** No provider with `tenant_credentials: true` has a name equal to the
+  `{provider}` in the path. The check is exact.
+- **Fix.** Use the provider name in the path.
 
 ### `PUT` returns `422` with `credential_rejected`
 
@@ -612,17 +537,15 @@ written before the scope existed read as platform-scoped.
   `upstream_status` is present only in the first case. A connect failure logs
   `admin: could not reach the provider to verify a tenant credential` at `warn`,
   with a `reason`. A timeout and a status error log no line. Nothing is stored.
-- **Fix.** Check that the cluster's endpoint and transport settings match the
-  provider. Check the provider's status. Then send the `PUT` again. If the
+- **Fix.** Check that the endpoint and TLS settings of the provider are right. Check the provider's status. Then send the `PUT` again. If the
   provider is down and you must store the key now, send `"verify": false`.
 
 ### `PUT` returns `422` with `credential_verification_not_configured`
 
-- **Cause.** No cluster slot for this provider has a `verify_path`. Envoy mode
-  has no default path. Or the admin server has no probe.
-- **Fix.** Set `verify_path` in the slot (Envoy mode). Or set
-  `tenant_credential_verify_path` on the provider (`llmproxy` config file). Or
-  send `"verify": false` to store the key unchecked.
+- **Cause.** The provider has no `verify_path`. The type has no default, or
+  `base_url` is set. Or the admin server has no probe.
+- **Fix.** Set `tenant_credential_verify_path` on the provider. Or send
+  `"verify": false` to store the key unchecked.
 
 ### The tenant's key stops applying after a restart
 
