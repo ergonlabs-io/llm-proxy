@@ -22,6 +22,25 @@ or the concurrent streams of a group of callers. The proxy enforces every
 reference in [Field reference](../../configuration/reference/#limit)
 for the field table, the keys, and how entries combine.
 
+`key: client-ip` counts each client address apart. By default the address is
+the TCP peer. Behind a load balancer, all clients then share the balancer's
+address and one bucket. Set `listen.trusted_hops` to the number of proxies in
+front of llm-proxy. The limit then counts the address in `x-forwarded-for`
+that the outermost trusted proxy saw. A client cannot choose its bucket by
+sending its own `x-forwarded-for`, because llm-proxy ignores the entries to the
+left of that address:
+
+```yaml
+listen:
+  address: 0.0.0.0:8080
+  trusted_hops: 1   # one load balancer appends the client address
+```
+
+Set `trusted_hops` only when all connections come through those proxies. A
+client that connects to llm-proxy directly can write any address in
+`x-forwarded-for`. See the `listen` reference in
+[Field reference](../../configuration/reference/#listener).
+
 `key: header:authorization` counts each credential apart. With `auth:`
 configured, the proxy removes the verified `authorization` header, so the
 entry counts each virtual key apart (two keys of one tenant get two

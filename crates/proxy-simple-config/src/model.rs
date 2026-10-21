@@ -333,6 +333,16 @@ pub struct ListenerSpec {
     /// greater than 0. More gets `431`.
     #[serde(default)]
     pub max_request_headers_count: Option<u32>,
+    /// Proxies in front of this one that append to `x-forwarded-for`, such
+    /// as a load balancer. Client-ip limits, request records and access logs
+    /// then attribute a request to the address the outermost trusted proxy
+    /// saw. Unset or 0 means the TCP peer, and `x-forwarded-for` is never
+    /// read. Lowers to the HCM's `use_remote_address: true` and
+    /// `xff_num_trusted_hops` (envoy-semantics S9). Signed so a negative
+    /// value fails validation with this path, not as a mismatch of the whole
+    /// untagged `listen`.
+    #[serde(default)]
+    pub trusted_hops: Option<i64>,
 }
 
 /// Safe edge-proxy defaults for the admission limits, from Envoy's edge

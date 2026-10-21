@@ -62,6 +62,21 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   the client's `Sec-WebSocket-Extensions` offer from a realtime session so its frames
   stay readable. On drain each WebSocket session gets a Close frame with code 1001.
 
+- **Trusted hops for `client-ip` behind a load balancer.** `listen.trusted_hops: N`
+  in the `--config` dialect (Envoy mode: `use_remote_address: true` with
+  `xff_num_trusted_hops: N`) makes `client-ip` limits, request records and access
+  logs use the Nth address from the right of the inbound `x-forwarded-for`: the
+  address the outermost trusted proxy saw. Entries to the left of it are the
+  client's own and never choose a bucket; a shorter list, or an entry that is not
+  an IP address, falls back to the TCP peer. With hops set, the proxy appends the
+  peer to the `x-forwarded-for` it forwards and sets `x-forwarded-proto`. The
+  default, 0, is unchanged: the TCP peer, and `x-forwarded-for` is never read
+  (`internal-docs/envoy-divergences.md` row 45).
+- Request records have `client_address`, the address `client-ip` limits use,
+  without a port. The dialect's JSON access log has the same value as
+  `client_address`, and the access-log format engine has
+  `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%`.
+
 - `make smoke-live` runs live smoke tests against real providers: OpenRouter
   on a free model (non-streaming, streaming, and a bad key that must return
   the provider's 401), Vertex AI, Amazon Bedrock, OpenAI and Anthropic. Each
@@ -73,6 +88,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- Envoy mode: with `use_remote_address: true` and `xff_num_trusted_hops` of 1 or
+  more, `client-ip` limits and `%DOWNSTREAM_REMOTE_ADDRESS%` now use the trusted
+  `x-forwarded-for` entry, as Envoy does. Before, they used the TCP peer. An
+  address taken from `x-forwarded-for` renders as `ip:0` in
+  `%DOWNSTREAM_REMOTE_ADDRESS%`, as in Envoy. With `use_remote_address: false`, an
+  `x-forwarded-for` shorter than the hop count now falls back to the TCP peer, as
+  Envoy does, not to its leftmost entry, which the client writes.
 - A JWT caller (`auth.jwt`, or `jwt_providers` in Envoy mode) whose tenant
   stored its own provider credentials is now sent upstream with that tenant's
   credential, and its spend is tenant-scoped, exactly as for a virtual key of

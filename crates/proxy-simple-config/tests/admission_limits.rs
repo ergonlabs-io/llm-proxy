@@ -214,3 +214,61 @@ fn request_head_limits_out_of_range_are_rejected_with_path() {
         );
     }
 }
+
+/// (use_remote_address, xff_num_trusted_hops) from the IR.
+fn trusted_hops(s: &ConfigSnapshot) -> (bool, u32) {
+    let listener = &s.listeners["llmproxy_listener"];
+    let NetworkFilterSpec::HttpConnectionManager(hcm) = &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected HCM");
+    };
+    (hcm.use_remote_address, hcm.xff_num_trusted_hops)
+}
+
+/// Unset and `0` lower exactly as before trusted hops existed: Envoy's
+/// defaults, so the TCP peer is the client and `x-forwarded-for` is never
+/// appended to.
+#[test]
+fn trusted_hops_unset_or_zero_keep_envoys_defaults() {
+    for listen in [
+        r#""127.0.0.1:8080""#,
+        r#"{ address: "127.0.0.1:8080" }"#,
+        r#"{ address: "127.0.0.1:8080", trusted_hops: 0 }"#,
+    ] {
+        let text = config_with_listen(listen);
+        assert_eq!(
+            trusted_hops(&snapshot(&text).unwrap()),
+            (false, 0),
+            "{listen}"
+        );
+        assert_eq!(
+            trusted_hops(&snapshot_via_translate(&text)),
+            (false, 0),
+            "{listen}"
+        );
+    }
+}
+
+/// Behind trusted hops the proxy is the edge: Envoy's `use_remote_address`
+/// with the same hop count, the configuration Envoy documents for a proxy
+/// behind a load balancer.
+#[test]
+fn trusted_hops_lower_to_use_remote_address_and_xff_num_trusted_hops() {
+    let text = config_with_listen(r#"{ address: "127.0.0.1:8080", trusted_hops: 2 }"#);
+    assert_eq!(trusted_hops(&snapshot(&text).unwrap()), (true, 2));
+    assert_eq!(trusted_hops(&snapshot_via_translate(&text)), (true, 2));
+}
+
+#[test]
+fn out_of_range_trusted_hops_are_rejected_with_path() {
+    for value in ["-1", "4294967296"] {
+        let text = config_with_listen(&format!(
+            r#"{{ address: "127.0.0.1:8080", trusted_hops: {value} }}"#
+        ));
+        let err = parse_simple_config_with_env(&text, &test_env).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field_path, .. } if field_path == "listen.trusted_hops"),
+            "{value}: got {err}"
+        );
+    }
+}
