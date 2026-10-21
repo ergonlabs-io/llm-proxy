@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-20
+
 ### Fixed
 
 - A billing ledger at its `max_disk_bytes` cap could stay closed after the
