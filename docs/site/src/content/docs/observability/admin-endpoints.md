@@ -3,7 +3,7 @@ title: Admin endpoints
 description: "Use the admin server: readiness, config dump, stats, the web UI, and the bearer-gated write API for keys and tenants."
 summary: Reference for every route the admin server answers, which routes
   need the admin token, the request body limits, and the admin UI.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - authentication/virtual-keys
   - authentication/tenant-provider-credentials
@@ -118,7 +118,7 @@ unscoped route.
 | `/ready` | GET | `200 LIVE`, `503 INITIALIZING`, or `503 DRAINING` |
 | `/config_dump` | GET | JSON of the loaded config snapshot |
 | `/clusters` | GET | JSON list of clusters, sorted by name |
-| `/models` | GET | JSON list of the models that the routes match on the `x-llmproxy-model` header |
+| `/models` | GET | JSON list of the models that the routes match on the `x-llmproxy-model` header, each with its `target` cluster, and `path_routes`: the routes that match on the path only, so they serve any model |
 | `/server_info` | GET | JSON with `version` and `uptime_seconds` |
 | `/stats` | GET | Plain-text counters and histograms |
 | `/stats/prometheus` | GET | Prometheus text format |
@@ -398,16 +398,27 @@ API, so any gated action needs the admin token.
 - **Address.** `http://<admin address>/ui/`. `GET /ui`, `GET /ui/`, and
   `GET /ui/<asset>` serve files. An unknown sub-path returns `index.html`.
   Other methods answer `405`.
-- **Tabs.** Overview, Clusters, Tenants, Keys, Pricing, and Capture, in this
-  order.
+- **Pages.** Get started, Keys, Models & pricing, and Advanced (Tenants,
+  Clusters and config, Status and stats), in this order. The Keys page
+  creates keys in the `team` tenant unless you set another tenant in its
+  advanced options. The admin API reserves the `default` tenant, so it cannot
+  create keys there.
+- **Bare address.** With the UI loaded, `GET /` redirects to `/ui/`. Without
+  it, `GET /` answers `404` with the list of endpoints.
+- **Startup log.** The proxy logs `admin UI: http://<admin address>/ui/` when
+  the UI is loaded, or how to load it when it is not. It logs a warning when
+  `LLMPROXY_ADMIN_TOKEN` is not set, because every write is then refused.
 - **Source.** `admin-ui/src`. Build it with `make ui-build`. The output is
   `admin-ui/dist/`.
-- **Load.** Set `LLMPROXY_ADMIN_UI_DIR` to the build output directory and
-  restart the proxy. If it is not set, `/ui` answers `404` with `the admin UI
-  is not loaded for this server instance`.
+- **Load.** Set `LLMPROXY_ADMIN_UI_DIR` to the UI files and restart the
+  proxy: the `admin-ui-dist` directory of the release archive, or
+  `admin-ui/dist/` after `make ui-build`. If it is not set, `/ui` answers `404`
+  with `the admin UI is not loaded for this server instance`.
+- **Token.** `llm-proxy init` writes a token to the `admin-token` file. Start
+  the proxy with `LLMPROXY_ADMIN_TOKEN="$(cat admin-token)"`.
 
 The installer (`scripts/install.sh`) sets `LLMPROXY_ADMIN_UI_DIR` in the
-service runner. It writes a generated admin token to the env file, and it
+service runner. It writes the admin token from `llm-proxy init` to the env file, and it
 prints the line `Admin UI:   http://<host>:<port>/ui/` and the token. The
 token is printed only for a new install.
 Paste the token into the UI to make changes.

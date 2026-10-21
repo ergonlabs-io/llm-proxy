@@ -126,6 +126,10 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("<html", body.lower())
         self.assertEqual(oct((self.data / "service.env").stat().st_mode & 0o777), "0o600")
         self.assertEqual(oct((self.data / "auth-secret").stat().st_mode & 0o777), "0o600")
+        # `llm-proxy init` writes an admin token too; the service must use that
+        # one, or the file next to the config would hold a token that fails.
+        self.assertEqual(oct((self.data / "admin-token").stat().st_mode & 0o777), "0o600")
+        self.assertEqual((self.data / "admin-token").read_text(), self.token())
 
         # The generated token is what makes the UI able to manage anything:
         # without it the admin server refuses every write.

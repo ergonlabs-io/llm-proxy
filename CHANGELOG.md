@@ -35,6 +35,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- The admin UI is organised for a small team getting started: a **Get started**
+  checklist (proxy ready, token accepted, provider and route, key, prices,
+  first request) with token usage per tenant; a **Keys** page that lists every
+  key with its model list, spend limit and spend, and creates keys with
+  optional limits; **Models & pricing** with routing, the models the team's
+  keys may use, and a rate-card editor with a template and prices per 1M
+  tokens. Tenants, clusters and raw stats move under **Advanced**. A new key is
+  shown with a ready-to-run curl, Python or Node request.
+- `llm-proxy init` writes an `admin-token` file and prints the admin UI
+  address. The installer uses that token for the service.
+- `GET /models` reports each pattern's `target` cluster and lists path-only
+  routes in `path_routes`, so a catch-all route no longer reads as no routing.
+- The admin server redirects `GET /` to `/ui/` when the UI is loaded. Startup
+  logs the UI address, and warns when `LLMPROXY_ADMIN_TOKEN` is not set.
 - `--drain-strategy gradual` works as in Envoy. During a drain, HTTP connections
   are told to close one at a time over the first quarter of `--drain-time-s`
   instead of all at once, and a request handled during the drain closes its

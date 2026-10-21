@@ -9,15 +9,22 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 
 const CONFIG_FILE: &str = "llmproxy.yaml";
 const SECRET_FILE: &str = "auth-secret";
+/// Read by the operator into `LLMPROXY_ADMIN_TOKEN`. The token stays out of the config, so a config dump or a
+/// checked-in config never carries it.
+const ADMIN_TOKEN_FILE: &str = "admin-token";
+/// The starter config's `admin` address, printed as the admin UI's address.
+const ADMIN_ADDRESS: &str = "127.0.0.1:53422";
 const DEFAULT_TENANT: &str = "default";
 const DEFAULT_KEY_ID: &str = "default-admin";
 
 pub fn run(directory: &Path) -> Result<(), String> {
     let config_path = directory.join(CONFIG_FILE);
     let secret_path = directory.join(SECRET_FILE);
+    let admin_token_path = directory.join(ADMIN_TOKEN_FILE);
 
     refuse_existing(&config_path)?;
     refuse_existing(&secret_path)?;
+    refuse_existing(&admin_token_path)?;
     fs::create_dir_all(directory)
         .map_err(|e| format!("cannot create {}: {e}", directory.display()))?;
 
@@ -30,26 +37,52 @@ pub fn run(directory: &Path) -> Result<(), String> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let plaintext_key = generate_plaintext_key(&rng);
+    let mut admin_token_bytes = [0_u8; 32];
+    rng.fill(&mut admin_token_bytes)
+        .map_err(|_| "failed to generate the admin token".to_string())?;
+    let admin_token = admin_token_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let digest = digest_hex(&HmacSecret::new(secret_text.as_bytes()), &plaintext_key);
 
     write_new_secret(&secret_path, secret_text.as_bytes())?;
+    if let Err(err) = write_new_secret(&admin_token_path, admin_token.as_bytes()) {
+        let _ = fs::remove_file(&secret_path);
+        return Err(err);
+    }
     if let Err(err) = write_new(&config_path, starter_config(&digest).as_bytes()) {
         let _ = fs::remove_file(&secret_path);
+        let _ = fs::remove_file(&admin_token_path);
         return Err(err);
     }
 
     println!(
-        "Initialized {}\n\n  config: {}\n  authentication secret: {}\n  tenant: {}\n  key id: {}\n\nKey (shown once -- store it now; it cannot be recovered):\n\n  {}\n\nRun:\n\n  cd {}\n  llm-proxy --config {}",
+        "Initialized {}\n\n  config: {}\n  authentication secret: {}\n  admin token: {}\n  tenant: {}\n  key id: {}\n\nKey (shown once -- store it now; it cannot be recovered):\n\n  {}\n\nRun:\n\n  cd {}\n  {}\n\n{}",
         directory.display(),
         config_path.display(),
         secret_path.display(),
+        admin_token_path.display(),
         DEFAULT_TENANT,
         DEFAULT_KEY_ID,
         plaintext_key,
         directory.display(),
-        CONFIG_FILE,
+        run_command(),
+        admin_ui_hint(),
     );
     Ok(())
+}
+
+/// The command `init` prints. The admin token comes from its file, so the admin UI can make changes from the first
+/// start, and never appears on the command line as a literal.
+fn run_command() -> String {
+    format!("LLMPROXY_ADMIN_TOKEN=\"$(cat {ADMIN_TOKEN_FILE})\" llm-proxy --config {CONFIG_FILE}")
+}
+
+fn admin_ui_hint() -> String {
+    format!(
+        "Admin UI: http://{ADMIN_ADDRESS}/ui/\n  Paste the token from {ADMIN_TOKEN_FILE} to manage keys, tenants, budgets and pricing.\n  The UI needs LLMPROXY_ADMIN_UI_DIR set to the admin-ui-dist directory of the release archive."
+    )
 }
 
 fn refuse_existing(path: &Path) -> Result<(), String> {
@@ -96,7 +129,7 @@ fn starter_config(digest: &str) -> String {
 version: 0
 
 listen: 0.0.0.0:53421
-admin: 127.0.0.1:53422
+admin: {ADMIN_ADDRESS}
 
 # Every generated account starts in the reserved `default` tenant. Add more
 # keys with: llm-proxy --mode keygen --tenant default --hmac-secret-file ./auth-secret
@@ -155,6 +188,47 @@ observability:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_writes_an_admin_token_file_and_refuses_to_overwrite_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run(dir.path()).expect("init succeeds in an empty directory");
+        let token =
+            fs::read_to_string(dir.path().join(ADMIN_TOKEN_FILE)).expect("admin token file");
+        assert_eq!(token.len(), 64, "32 random bytes, hex-encoded");
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(dir.path().join(ADMIN_TOKEN_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the admin token is a credential");
+        }
+        let config = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(
+            !config.contains(&token),
+            "the token must stay out of the config"
+        );
+
+        fs::remove_file(dir.path().join(CONFIG_FILE)).unwrap();
+        fs::remove_file(dir.path().join(SECRET_FILE)).unwrap();
+        let err = run(dir.path()).expect_err("an existing admin token file is never overwritten");
+        assert!(err.contains(ADMIN_TOKEN_FILE), "{err}");
+    }
+
+    #[test]
+    fn printed_admin_ui_address_is_the_starter_admin_address() {
+        let text = starter_config(&"a".repeat(64));
+        assert!(text.contains(&format!("admin: {ADMIN_ADDRESS}")));
+        assert!(admin_ui_hint().contains(&format!("http://{ADMIN_ADDRESS}/ui/")));
+        assert!(
+            run_command().contains(&format!("\"$(cat {ADMIN_TOKEN_FILE})\"")),
+            "the token is read from its file, never inlined: {}",
+            run_command()
+        );
+    }
 
     #[test]
     fn starter_config_parses_as_dialect_config() {

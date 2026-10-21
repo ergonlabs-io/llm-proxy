@@ -443,6 +443,10 @@ ui-install: ## Install admin UI dependencies (admin-ui/node_modules)
 ui-build: ## Build the admin UI into admin-ui/dist/ for /ui serving
 	cd admin-ui && npm run build
 
+.PHONY: ui-test
+ui-test: ## Run the admin UI unit tests (vitest)
+	cd admin-ui && npm test
+
 .PHONY: ui-dev
 ui-dev: ## Run the admin UI dev server on http://localhost:5173 (VITE_ADMIN_URL overrides the API origin)
 	cd admin-ui && npm run dev

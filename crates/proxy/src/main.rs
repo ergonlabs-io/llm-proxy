@@ -2741,6 +2741,9 @@ async fn start_admin(
     };
     let config = runtime.snapshot_handles.register(runtime.snapshot);
     let admin_token = std::env::var(ADMIN_TOKEN_ENV_VAR).ok();
+    let token_set = admin_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
     let ui = std::env::var(ADMIN_UI_DIR_ENV_VAR)
         .ok()
         .filter(|dir| !dir.trim().is_empty())
@@ -2760,6 +2763,7 @@ async fn start_admin(
                 }
             },
         );
+    let ui_loaded = ui.is_some();
     let server = proxy_admin::serve(
         addr,
         proxy_admin::AdminRuntime {
@@ -2779,7 +2783,40 @@ async fn start_admin(
     )
     .await
     .map_err(|err| err.to_string())?;
+    let notes = admin_startup_notes(server.local_addr(), ui_loaded, token_set);
+    if let Some(info) = notes.ui {
+        tracing::info!("{info}");
+    }
+    if let Some(warning) = notes.token {
+        tracing::warn!("{warning}");
+    }
     Ok(Some(server))
+}
+
+/// What the operator needs to hear about the admin server at startup: where the UI is, and whether its writes can
+/// work. The admin gate already refuses every write with 403 when the token is unset; without this line a new user
+/// first learns that from a failed click.
+struct AdminStartupNotes {
+    ui: Option<String>,
+    token: Option<String>,
+}
+
+fn admin_startup_notes(addr: SocketAddr, ui_loaded: bool, token_set: bool) -> AdminStartupNotes {
+    let ui = if ui_loaded {
+        Some(format!("admin UI: http://{addr}/ui/"))
+    } else {
+        Some(format!(
+            "admin UI not loaded: set {ADMIN_UI_DIR_ENV_VAR} to the UI bundle (the release archive's admin-ui-dist) \
+             to serve it at http://{addr}/ui/"
+        ))
+    };
+    let token = (!token_set).then(|| {
+        format!(
+            "{ADMIN_TOKEN_ENV_VAR} is not set: admin writes (keys, tenants, budgets, pricing) and key and spend \
+             reads are refused with 403, in the admin UI too"
+        )
+    });
+    AdminStartupNotes { ui, token }
 }
 
 /// Each worker composes three concurrent seams over one shared
@@ -3024,6 +3061,30 @@ impl ControlSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_startup_notes_name_the_ui_and_warn_only_without_a_token() {
+        let addr: SocketAddr = "127.0.0.1:53422".parse().unwrap();
+
+        let ready = admin_startup_notes(addr, true, true);
+        assert_eq!(
+            ready.ui.as_deref(),
+            Some("admin UI: http://127.0.0.1:53422/ui/")
+        );
+        assert!(ready.token.is_none(), "a set token must not warn");
+
+        let bare = admin_startup_notes(addr, false, false);
+        let ui = bare.ui.expect("an unloaded UI says how to load it");
+        assert!(
+            ui.contains(ADMIN_UI_DIR_ENV_VAR) && ui.contains("admin-ui-dist"),
+            "{ui}"
+        );
+        let warning = bare.token.expect("an unset token warns");
+        assert!(
+            warning.contains(ADMIN_TOKEN_ENV_VAR) && warning.contains("403"),
+            "{warning}"
+        );
+    }
 
     fn empty_snapshot() -> Arc<ConfigSnapshot> {
         Arc::new(ConfigSnapshot::default())

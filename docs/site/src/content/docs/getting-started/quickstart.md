@@ -1,7 +1,7 @@
 ---
 title: Quickstart
 description: "Install llm-proxy, create a starter config, send one request to OpenAI through the proxy, and read the token counts in the access log."
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - getting-started/introduction
   - getting-started/installation
@@ -60,8 +60,9 @@ llm-proxy init ./llmproxy-home
 cd ./llmproxy-home
 ```
 
-The command writes `llmproxy.yaml` and `auth-secret`. It refuses to
-overwrite existing files. It prints a key that starts with `llmp_`.
+The command writes `llmproxy.yaml`, `auth-secret`, and `admin-token`. It
+refuses to overwrite existing files. It prints a key that starts with `llmp_`.
+The `admin-token` file holds the token for the admin UI in step 8.
 
 **Copy the key now. The proxy shows it once and cannot recover it.**
 
@@ -133,11 +134,19 @@ Run this from the `llmproxy-home` directory, in a terminal that has
 port `53421`. The admin address is `127.0.0.1:53422`.
 
 ```sh
+LLMPROXY_ADMIN_TOKEN="$(cat admin-token)" \
+LLMPROXY_ADMIN_UI_DIR="$HOME/.config/llm-proxy/admin-ui-dist" \
 llm-proxy --config llmproxy.yaml
 ```
 
-Expected outcome: log lines that end with a `listener bound` line. Leave the
-proxy running. To stop it, press Ctrl+C.
+The two variables turn on the admin UI. `LLMPROXY_ADMIN_TOKEN` lets the UI
+make changes. `LLMPROXY_ADMIN_UI_DIR` names the UI files, which the installer
+copies to `~/.config/llm-proxy/admin-ui-dist` (`/var/lib/llm-proxy/admin-ui-dist`
+when it runs as root). Without them, the proxy still serves requests.
+
+Expected outcome: log lines that end with a `listener bound` line, and an
+`admin UI: http://127.0.0.1:53422/ui/` line. Leave the proxy running. To stop
+it, press Ctrl+C.
 
 If the port is in use, the proxy fails to bind. Stop the other process, or
 change `listen` in `llmproxy.yaml`.
@@ -181,6 +190,20 @@ are an illustration. Yours differ.
 provider response. They must match the `usage` object in the curl output. Every
 field is a JSON string, and a field with no value is `"-"`. For all fields, see
 [Access logs](../../observability/access-logs/).
+
+## Step 8: Open the admin UI
+
+Open `http://127.0.0.1:53422/ui/` in a browser. Paste the token from the
+`admin-token` file into the field at the top.
+
+The **Get started** page shows what is set up and what to do next. On the
+**Keys** page, create one key for each application or person. Each new key is
+shown once, with a request that you can copy and run. **Models & pricing**
+shows which models go to which provider, and holds the prices that give each
+request a cost.
+
+If the proxy logs `LLMPROXY_ADMIN_TOKEN is not set`, the UI cannot make
+changes. Stop the proxy and start it again as step 5 shows.
 
 ## Next steps
 

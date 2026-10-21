@@ -406,6 +406,15 @@ async fn handle(
     // ---- Single-page admin UI (optional, in-memory, same-origin, so no CORS is needed): `GET /ui`, `GET /ui/`,
     // `GET /ui/<asset>`. Unknown sub-paths fall back to index.html. Matching is exact-prefix: `/uix` must not match.
     let path_str = req.uri().path();
+    // The bare admin address is what a new user types first. With the UI loaded, send them to it; without it,
+    // the 404 below lists the endpoints instead.
+    if path_str == "/" && req.method() == Method::GET && runtime.ui.is_some() {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(hyper::header::LOCATION, "/ui/")
+            .body(Full::new(Bytes::new()))
+            .expect("static response is always valid");
+    }
     let ui_remainder = if path_str == "/ui" {
         Some("")
     } else {
@@ -425,8 +434,10 @@ async fn handle(
             None => text(
                 StatusCode::NOT_FOUND,
                 "the admin UI is not loaded for this server instance; set \
-                 LLMPROXY_ADMIN_UI_DIR to the `make ui-build` output directory \
-                 (admin-ui/dist/) and restart",
+                 LLMPROXY_ADMIN_UI_DIR to the UI bundle and restart: the \
+                 `admin-ui-dist` directory of the release archive (the installer \
+                 copies it next to the config), or `admin-ui/dist/` after \
+                 `make ui-build` in a source checkout",
             ),
         };
     }
