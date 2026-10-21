@@ -1047,6 +1047,18 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Realtime session responses whose usage was not metered (ADR-0015),
+    /// by `reason`: `no_usage` (a `response.done` without usage),
+    /// `unreadable` (not JSON, or over the event size cap), `compressed`
+    /// (`permessage-deflate`), `cut` (in flight when the session ended).
+    /// `scope` as above.
+    pub const REALTIME_USAGE_MISSING: Instrument = Instrument {
+        name: "llmproxy_realtime_usage_missing_total",
+        kind: InstrumentKind::Counter,
+        unit: "{response}",
+        attribute_keys: &["scope", "reason"],
+        buckets: None,
+    };
     /// Partial records in which any token count (and so the cost) is the
     /// proxy's estimate rather than a provider figure. `scope` as above.
     pub const USAGE_ESTIMATED: Instrument = Instrument {

@@ -25,6 +25,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-16 | Chargeback tags reach ledger entries, bounded metrics, survive a restart | passing — since 2026-10-20 (`qa16_chargeback_tags_test.go`); approved through the chargeback-tags backlog acceptance (owner, 2026-10-20) |
 | QA-17 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa17_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
 | QA-18 | Speech under a tenant budget is charged per character and ledgered; non-2xx charges nothing; transcription charged per second; uncountable shapes refused | passing — since 2026-10-20 (`qa18_speech_metering_test.go`); approved through the v0.6.0 ship gate clause 1 (owner, 2026-10-18) |
+| QA-21 | Realtime session under a tenant budget is charged from its events and ledgered; refused upgrades never dialled; session limit; cut is partial; drain sends 1001 | passing — since 2026-10-21 (`qa21_realtime_session_test.go`); approved through the realtime-sessions backlog acceptance (owner, 2026-10-21) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -584,6 +585,26 @@ refused with `403` and never reaches the provider.
 binary from Rust; this checks the v0.6.0 ship gate from the outside: the
 dialect rate card, the admin budget, the ledger read API, and the log line
 an operator reads.
+
+## QA-21 — Realtime session under a tenant budget is charged and ledgered
+
+**Property.** With `realtime: { enabled: true }`, a rate card that prices the
+realtime model's text and audio tokens, a ledger, a tenant spend budget and
+`limits: [{ key: global, concurrent_sessions: 1 }]`: a WebSocket upgrade on
+`/v1/realtime?model=...` without credentials gets `401` and the provider is
+never dialled. A session with a key is admitted (`101`); its two responses
+each report 10 input tokens (6 audio) and 5 output tokens (3 audio). While
+it is open a second session gets `429` and is never dialled. After the
+client's Close the ledger holds one entry for the session: `charged_micro_usd`
+= 2 x 56 (the audio tokens at their audio rates), the tenant among
+`charged_scopes`, `endpoint: realtime`, 20/10 tokens with 12/6 audio, and
+`completeness: complete`. A session reset by the client while a response is
+in flight is recorded `partial` and charged once, 56, for the response it
+reported. A session open at SIGTERM receives a Close frame with code 1001.
+
+**Why black box.** `realtime_e2e.rs` drives the binary from Rust; this checks
+the realtime-sessions acceptance from the outside: the dialect, the admin budget, the
+upgrade handshake, the ledger read API and the drain signal.
 
 ## QA-18 — Speech under a tenant budget is charged and ledgered
 

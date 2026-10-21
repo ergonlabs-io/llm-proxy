@@ -11,6 +11,35 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- **Realtime (WebSocket) sessions (WP-37, ADR-0015).** `realtime: { enabled: true }`
+  in the `--config` dialect (Envoy mode: `upgrade_configs` with `upgrade_type:
+  websocket`) proxies a WebSocket on a path ending `/realtime` as one metered
+  session. Auth, model access, `limits` and spend budgets decide at upgrade time,
+  before the provider is dialled; a refusal is an HTTP status. The model is the
+  `model` query parameter, rewritten to the provider's upstream model.
+  `limits[].concurrent_sessions` counts a session for its whole life. Usage is
+  summed from each `response.done` event (text, cached and audio tokens), priced at
+  the rate card's token and audio rates for the provider dialled, and charged once
+  when the session closes; a session cut early is recorded partial and charged what
+  it reported. Each session is one access-log line, request record and ledger entry,
+  with endpoint `realtime`. A response with no readable usage is counted in
+  `llmproxy_realtime_usage_missing_total{reason}` and warned about. The proxy removes
+  the client's `Sec-WebSocket-Extensions` offer from a realtime session so its frames
+  stay readable. On drain each WebSocket session gets a Close frame with code 1001.
+
+### Changed
+
+- **The HTTP filter chain runs on upgraded streams (WP-131, envoy-semantics.md
+  S10.2).** An upgrade's post-`101` upstream bytes pass through the encode filter
+  chain, and the stream ends when the tunnel closes: the access log, request record
+  and ledger entry of an upgraded stream are written at its close, not at the `101`,
+  and `downstream_rq_active` counts it until then, as Envoy does. Client-to-upstream
+  bytes still go straight through (`internal-docs/envoy-divergences.md` row 44). A
+  listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
+  buffer response bytes.
+
 ## [0.6.0] - 2026-10-20
 
 ### Breaking

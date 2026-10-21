@@ -41,6 +41,10 @@ pub enum Endpoint {
     Transcription,
     /// `POST .../audio/translations`.
     Translation,
+    /// A WebSocket upgrade on `.../realtime`: one long-lived session whose
+    /// usage arrives in event frames (`response.done`), not in a response
+    /// body. Classified by [`Endpoint::classify_upgrade`].
+    Realtime,
     /// Paths no provider bills: `GET .../models`, `GET .../usage` and
     /// `POST .../messages/count_tokens`.
     Free,
@@ -86,6 +90,17 @@ impl Endpoint {
         }
     }
 
+    /// Classify a WebSocket upgrade request by its client-facing path (an
+    /// h1 `GET` with `Upgrade: websocket`, or an h2 extended `CONNECT` with
+    /// `:protocol websocket`). A session on `.../realtime` is
+    /// [`Endpoint::Realtime`]; any other upgrade is `Unmetered`.
+    pub fn classify_upgrade(path: &str) -> Endpoint {
+        match path.rsplit('/').next() {
+            Some("realtime") => Endpoint::Realtime,
+            _ => Endpoint::Unmetered,
+        }
+    }
+
     /// A stable snake_case name, for metric labels and logs. The set is
     /// closed, so it is safe as a label value.
     pub fn label(self) -> &'static str {
@@ -100,6 +115,7 @@ impl Endpoint {
             Endpoint::Speech => "speech",
             Endpoint::Transcription => "transcription",
             Endpoint::Translation => "translation",
+            Endpoint::Realtime => "realtime",
             Endpoint::Free => "free",
             Endpoint::Unmetered => "unmetered",
         }
@@ -117,6 +133,77 @@ impl Endpoint {
                 | Endpoint::Embeddings
         )
     }
+}
+
+/// A realtime session's model: its `model` query parameter, percent-decoded
+/// (`+` is a space, as in a form). The first occurrence wins. `None` when
+/// absent, empty, or not UTF-8 after decoding.
+pub fn realtime_model(uri: &http::Uri) -> Option<String> {
+    let query = uri.query()?;
+    let raw = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("model="))?;
+    let decoded = percent_decode(raw)?;
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+/// `uri` with its first `model` query parameter set to `model`, every other
+/// parameter kept as sent: the session asks the provider for the model it
+/// was routed to (AGENTS.md invariant 6). `None` when `uri` has no `model`
+/// parameter or the result is not a valid URI.
+pub fn with_realtime_model(uri: &http::Uri, model: &str) -> Option<http::Uri> {
+    let query = uri.query()?;
+    let mut replaced = false;
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            if !replaced && pair.starts_with("model=") {
+                replaced = true;
+                format!("model={}", percent_encode(model))
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        return None;
+    }
+    let path_and_query = format!("{}?{}", uri.path(), pairs.join("&"));
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    http::Uri::from_parts(parts).ok()
+}
+
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let hex = raw.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -161,5 +248,54 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    /// Only a WebSocket on `.../realtime` is a realtime session; a plain
+    /// request on that path, or an upgrade elsewhere, is not.
+    #[test]
+    fn only_an_upgrade_on_realtime_is_a_realtime_session() {
+        assert_eq!(
+            Endpoint::classify_upgrade("/v1/realtime"),
+            Endpoint::Realtime
+        );
+        assert_eq!(
+            Endpoint::classify_upgrade("/openai/realtime"),
+            Endpoint::Realtime
+        );
+        assert_eq!(
+            Endpoint::classify_upgrade("/v1/realtime/x"),
+            Endpoint::Unmetered
+        );
+        assert_eq!(Endpoint::classify_upgrade("/v1/chat"), Endpoint::Unmetered);
+        assert_eq!(
+            Endpoint::classify(&Method::GET, "/v1/realtime"),
+            Endpoint::Unmetered
+        );
+        assert_eq!(Endpoint::Realtime.label(), "realtime");
+    }
+
+    #[test]
+    fn the_realtime_model_is_read_from_and_written_to_the_query() {
+        let uri: http::Uri = "/v1/realtime?x=1&model=gpt%2Drealtime+v2&model=other"
+            .parse()
+            .unwrap();
+        assert_eq!(realtime_model(&uri).as_deref(), Some("gpt-realtime v2"));
+        let rewritten = with_realtime_model(&uri, "provider/model 1").unwrap();
+        assert_eq!(
+            rewritten.to_string(),
+            "/v1/realtime?x=1&model=provider%2Fmodel%201&model=other"
+        );
+        assert_eq!(
+            realtime_model(&rewritten).as_deref(),
+            Some("provider/model 1")
+        );
+        for none in [
+            "/v1/realtime",
+            "/v1/realtime?model=",
+            "/v1/realtime?model=%zz",
+        ] {
+            assert_eq!(realtime_model(&none.parse().unwrap()), None, "{none}");
+        }
+        assert!(with_realtime_model(&"/v1/realtime?x=1".parse().unwrap(), "m").is_none());
     }
 }

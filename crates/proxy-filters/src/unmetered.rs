@@ -50,8 +50,9 @@ impl Control {
 
 /// Whether a spend budget can count `endpoint`: the five text endpoints,
 /// image generation and edits (tokens or images), speech (characters or
-/// tokens), and transcription and translation (audio duration or tokens)
-/// (ADR-0010 phase 3). Batch and every unknown path stay out.
+/// tokens), transcription and translation (audio duration or tokens)
+/// (ADR-0010 phase 3), and realtime sessions (tokens from their event
+/// frames, ADR-0015). Batch and every unknown path stay out.
 pub(crate) fn metered_under_spend(endpoint: Endpoint) -> bool {
     endpoint.reports_text_tokens()
         || matches!(
@@ -61,6 +62,7 @@ pub(crate) fn metered_under_spend(endpoint: Endpoint) -> bool {
                 | Endpoint::Speech
                 | Endpoint::Transcription
                 | Endpoint::Translation
+                | Endpoint::Realtime
         )
 }
 
@@ -110,10 +112,12 @@ pub(crate) fn countable_under_spend(
 }
 
 /// Whether a token limit can count `endpoint`. Token limits count tokens
-/// only, and only the text endpoints report them for every model, so this
-/// set stays at the five text endpoints (ADR-0010 decision 1).
+/// only, and only the text endpoints and realtime sessions report them for
+/// every model (ADR-0010 decision 1, ADR-0015).
 pub(crate) fn metered_under_token_limit(endpoint: Endpoint) -> bool {
-    endpoint.reports_text_tokens()
+    // A realtime session reports tokens for every model too, in its
+    // `response.done` events (ADR-0015).
+    endpoint.reports_text_tokens() || endpoint == Endpoint::Realtime
 }
 
 /// `llmproxy_unmetered_endpoint_refused_total`. Series are resolved on the

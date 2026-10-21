@@ -62,6 +62,17 @@ pub struct SimpleConfig {
     /// Body-aware request checks. Absent means no request is checked.
     #[serde(default)]
     pub guardrails: Option<Guardrails>,
+    /// Realtime (WebSocket) sessions. Absent means every upgrade is refused.
+    #[serde(default)]
+    pub realtime: Option<Realtime>,
+}
+
+/// `realtime`: lowers to the listener HCM's
+/// `upgrade_configs: [{upgrade_type: websocket}]` (envoy-semantics.md S10).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Realtime {
+    pub enabled: bool,
 }
 
 /// `guardrails`: which check each request's body is sent to. Lowers to the

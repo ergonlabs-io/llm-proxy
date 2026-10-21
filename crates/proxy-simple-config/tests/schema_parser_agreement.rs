@@ -202,6 +202,7 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_fields::<ImagePriceDef>,
         ),
         ("#/$defs/Ledger", "Ledger", parser_fields::<Ledger>),
+        ("#/$defs/Realtime", "Realtime", parser_fields::<Realtime>),
         (
             "#/$defs/LedgerKey",
             "PreviousCredentialKey",

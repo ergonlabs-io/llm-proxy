@@ -3748,6 +3748,11 @@ fn lower_listener(
         hcm["typed_config"]["common_http_protocol_options"]["max_stream_duration"] =
             json!(max.to_string());
     }
+    // `realtime`: WebSocket upgrades run the listener's filter chain, and the
+    // tunnel's frames reach the usage filter (envoy-divergences.md row 44).
+    if config.realtime.as_ref().is_some_and(|r| r.enabled) {
+        hcm["typed_config"]["upgrade_configs"] = json!([{ "upgrade_type": "websocket" }]);
+    }
     // Unset is left out, so Envoy's own defaults (60 KiB, 100) apply.
     let spec = listener_spec(config);
     if let Some(kb) = spec.and_then(|s| s.max_request_headers_kb) {

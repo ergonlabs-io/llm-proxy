@@ -852,6 +852,20 @@ impl RouterHandler {
             routing_model.as_deref(),
             &mut attempt_head,
         );
+        // A realtime session names its model in the query, so the dialled
+        // member's own upstream model goes there, as a body's `model` would
+        // be rewritten (AGENTS.md invariant 6).
+        let realtime_model = {
+            let info = dcb.stream_info();
+            (info.llm.endpoint == crate::endpoint::Endpoint::Realtime)
+                .then(|| info.selected_model.clone())
+                .flatten()
+        };
+        if let Some(model) = realtime_model {
+            if let Some(uri) = crate::endpoint::with_realtime_model(&attempt_head.uri, &model) {
+                attempt_head.uri = uri;
+            }
+        }
         let mut provider_credentials = ProviderCredentials::new(
             attempt_entry.provider_runtime(),
             attempt_entry.request_headers_to_add(),

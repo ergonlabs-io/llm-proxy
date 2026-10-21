@@ -35,6 +35,7 @@ use crate::media_scan::{seconds_to_millis, MediaJsonScanner, MediaSseScanner};
 use crate::pricing::{
     image_prices_conflict, ImagePrice, PriceEntry, PriceList, Priced, Tier, TierBasis, TierMode,
 };
+use crate::realtime_usage::{Missing, RealtimeScanner};
 use crate::usage::{
     extract_json_served_model, extract_json_upstream, extract_json_upstream_from_tail,
     extract_json_usage_parts, extract_json_usage_parts_from_tail, usage_object_parts, Dialect,
@@ -763,6 +764,11 @@ pub struct UsageStats {
     /// tail window. These requests were not metered.
     oversized_unrecoverable: AtomicU64,
     last_oversized_warning: Mutex<Option<Instant>>,
+    /// Realtime responses with no readable usage (ADR-0015).
+    realtime_missing: AtomicU64,
+    last_realtime_warning: Mutex<Option<Instant>>,
+    /// This chain's stat scope, for series resolved on a miss.
+    scope: String,
     /// Requests priced at the provider-reported model instead of the sent one.
     served_model_repriced: AtomicU64,
     /// This chain's `llmproxy_usage_served_model_repriced_total` series.
@@ -879,8 +885,13 @@ impl UsageStats {
             ),
             exported,
             repriced_handle,
+            scope: scope.to_string(),
             ..Default::default()
         }
+    }
+
+    pub fn realtime_missing(&self) -> u64 {
+        self.realtime_missing.load(Ordering::Relaxed)
     }
 
     pub fn oversized_unrecoverable(&self) -> u64 {
@@ -920,6 +931,43 @@ impl UsageStats {
         if let (Some((registry, _)), Some(handle)) = (&self.exported, self.repriced_handle) {
             registry.incr(WorkerId(0), handle, 1);
         }
+    }
+
+    fn note_realtime_missing(&self, missing: &[Missing], cluster: Option<&str>) {
+        for reason in missing {
+            self.realtime_missing.fetch_add(1, Ordering::Relaxed);
+            if let Some((registry, _)) = &self.exported {
+                let handle = registry.resolve_capped(
+                    &instruments::REALTIME_USAGE_MISSING,
+                    &[("scope", self.scope.as_str()), ("reason", reason.label())],
+                    256,
+                    &[("scope", "overflow"), ("reason", reason.label())],
+                );
+                registry.incr(WorkerId(0), handle, 1);
+            }
+        }
+        let now = Instant::now();
+        let mut last = self
+            .last_realtime_warning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|at| now.duration_since(at) < OVERSIZED_WARN_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        // Fails open: the session ran, but these responses are not metered,
+        // so spend and token limits did not count them. Only the cluster name
+        // and the reason labels are logged, never frame content.
+        let reasons: Vec<&str> = missing.iter().map(|m| m.label()).collect();
+        tracing::warn!(
+            cluster = ?cluster,
+            ?reasons,
+            "usage: a realtime session had responses with no readable usage, so they were NOT \
+             metered (no cost, spend and token limits did not count them). Exported as \
+             envoy_llmproxy_realtime_usage_missing_total{{reason}}; this warning repeats at most \
+             once per minute."
+        );
     }
 
     fn note_oversized_unrecoverable(&self, cluster: Option<&str>) {
@@ -1749,6 +1797,7 @@ impl FilterInstanceFactory for UsageFilterInstanceFactory {
             max_inter_chunk: None,
             response_chunks: 0,
             response_ok: false,
+            request_is_connect: false,
             finalized: false,
         })
     }
@@ -1770,6 +1819,9 @@ enum BodyMode {
     MediaJson(MediaJsonScanner),
     /// A media endpoint's event stream, each `data:` line scanned the same way.
     MediaSse(MediaSseScanner),
+    /// An accepted realtime session: the tunnel's server frames, read for
+    /// `response.done` usage (ADR-0015).
+    Realtime(RealtimeScanner),
     /// Anything else (including "haven't seen headers yet"): do nothing.
     Inert,
 }
@@ -1846,9 +1898,12 @@ struct UsageFilterInstance {
     time_to_first_body_byte: Option<Duration>,
     max_inter_chunk: Option<Duration>,
     response_chunks: u64,
-    /// The response status was 2xx. Only such a response that is cut off is
-    /// recorded as a partial, metered stream; an error body is not usage.
+    /// The response status was 2xx, or accepted a realtime session. Only
+    /// such a response that is cut off is recorded as a partial, metered
+    /// stream; an error body is not usage.
     response_ok: bool,
+    /// The request is an h2 extended CONNECT, whose accept status is `200`.
+    request_is_connect: bool,
     /// Guards against writing `StreamInfo` twice — `encode_data` with
     /// `end_stream=true` and a later `encode_trailers` (or vice versa) must
     /// not both finalize.
@@ -2026,6 +2081,7 @@ impl UsageFilterInstance {
                     self.image_meters(Some(facts.completed), &facts.size, &facts.quality),
                 )
             }
+            BodyMode::Realtime(scanner) => (scanner.usage(), LlmMeters::default()),
             BodyMode::Inert => (None, LlmMeters::default()),
         };
         meters.audio_milliseconds = match &self.mode {
@@ -2034,7 +2090,7 @@ impl UsageFilterInstance {
                 self.audio_meter(facts.usage.as_deref(), facts.duration_ms)
             }
             BodyMode::MediaSse(scanner) => self.audio_meter(scanner.facts().usage.as_deref(), None),
-            BodyMode::Sse(_) | BodyMode::Json(_) | BodyMode::Inert => None,
+            BodyMode::Sse(_) | BodyMode::Json(_) | BodyMode::Realtime(_) | BodyMode::Inert => None,
         };
         // A request-side meter: charged only when the response the client got
         // was 2xx, once, at the entry of the cluster dialled last. Speech's
@@ -2100,7 +2156,7 @@ impl UsageFilterInstance {
             BodyMode::Json(body) => extract_json_served_model(&body.buf),
             BodyMode::MediaJson(scanner) => scanner.facts().model.clone(),
             BodyMode::MediaSse(scanner) => scanner.facts().model.clone(),
-            BodyMode::Inert => None,
+            BodyMode::Realtime(_) | BodyMode::Inert => None,
         }
     }
 
@@ -2119,6 +2175,7 @@ impl UsageFilterInstance {
                 let facts = scanner.facts();
                 media_upstream(facts.usage.as_deref(), facts.usage_oversized)
             }
+            BodyMode::Realtime(scanner) => media_upstream(scanner.last_usage_json(), false),
             BodyMode::Inert => UpstreamEvidence::default(),
         }
     }
@@ -2137,6 +2194,7 @@ impl UsageFilterInstance {
             let cluster = cb.stream_info().upstream_cluster.clone();
             self.stats.note_oversized_unrecoverable(cluster.as_deref());
         }
+        self.report_realtime_missing(cb);
         self.write_stats(cb, usage, UsageCompleteness::Complete, Estimated::default());
     }
 
@@ -2148,6 +2206,13 @@ impl UsageFilterInstance {
     /// already reported and the images completed so far, or nothing.
     fn estimate_partial_usage(&self, request_bytes: u64) -> (Option<LlmUsage>, Estimated) {
         let seen = self.compute_usage();
+        if matches!(self.mode, BodyMode::Realtime(_)) {
+            // A session's bytes are mostly base64 audio, so their size says
+            // nothing about tokens. It is charged what its `response.done`
+            // events reported; a response still in flight is reported by
+            // `report_realtime_missing` instead (ADR-0015).
+            return (seen, Estimated::default());
+        }
         if is_media(self.endpoint) {
             // A cut before any image closed observed nothing. Zero images is
             // not a finding then, so the request stays without usage and the
@@ -2165,7 +2230,10 @@ impl UsageFilterInstance {
             // A cut-off JSON body cannot be parsed, so its size stands in for
             // the generated text.
             BodyMode::Json(body) => body.seen,
-            BodyMode::MediaJson(_) | BodyMode::MediaSse(_) | BodyMode::Inert => 0,
+            BodyMode::MediaJson(_)
+            | BodyMode::MediaSse(_)
+            | BodyMode::Realtime(_)
+            | BodyMode::Inert => 0,
         };
         let mut usage = seen.and_then(|seen| seen.tokens).unwrap_or_default();
         let mut estimated = Estimated::default();
@@ -2184,6 +2252,21 @@ impl UsageFilterInstance {
         }
         let nothing = usage == LlmTokenUsage::default();
         ((!nothing).then(|| LlmUsage::from_tokens(usage)), estimated)
+    }
+
+    /// Count and warn about each realtime response the session did not pay
+    /// for (ADR-0015). Runs once, where the stream ends.
+    fn report_realtime_missing(&mut self, cb: &mut dyn EncoderCallbacks) {
+        let BodyMode::Realtime(scanner) = &mut self.mode else {
+            return;
+        };
+        let missing = scanner.take_missing(true);
+        if missing.is_empty() {
+            return;
+        }
+        let cluster = cb.stream_info().upstream_cluster.clone();
+        self.stats
+            .note_realtime_missing(&missing, cluster.as_deref());
     }
 
     /// Write usage, cost, timing and the provider's own evidence into
@@ -2282,11 +2365,18 @@ impl HttpFilter for UsageFilterInstance {
     fn decode_headers(
         &mut self,
         cb: &mut dyn DecoderCallbacks,
-        _headers: &mut RequestHeaders,
+        headers: &mut RequestHeaders,
         _end_stream: bool,
     ) -> FilterHeadersStatus {
         self.endpoint = cb.stream_info().llm.endpoint;
         self.request_dialect = dialect_for_request(self.endpoint);
+        if self.endpoint == Endpoint::Realtime {
+            // `permessage-deflate` would compress the event frames this filter
+            // reads for usage. Without the client's offer the server cannot
+            // negotiate it (RFC 7692 section 5), so the frames stay readable.
+            headers.headers.remove("sec-websocket-extensions");
+            self.request_is_connect = headers.method == http::Method::CONNECT;
+        }
         FilterHeadersStatus::Continue
     }
 
@@ -2298,6 +2388,11 @@ impl HttpFilter for UsageFilterInstance {
     ) -> FilterHeadersStatus {
         self.headers_at = Some(Instant::now());
         self.response_ok = headers.status.is_success();
+        // The accept status of a realtime session: h1 `101`, or `200` to an
+        // h2 extended CONNECT (RFC 8441). Its body is the session's frames.
+        let realtime_accepted = self.endpoint == Endpoint::Realtime
+            && (headers.status == http::StatusCode::SWITCHING_PROTOCOLS
+                || (self.request_is_connect && headers.status == http::StatusCode::OK));
         let route_dialect = cb.per_route_config().and_then(|cfg| {
             cfg.as_any()
                 .downcast_ref::<UsagePerRouteConfig>()
@@ -2309,7 +2404,12 @@ impl HttpFilter for UsageFilterInstance {
             .map(Self::resolve_cluster_dialect);
         let dialect = cluster_dialect.or(route_dialect).unwrap_or(self.dialect);
         self.dialect = dialect;
-        self.mode = classify_body(&headers.headers, self.parse_dialect(), self.endpoint);
+        self.mode = if realtime_accepted {
+            self.response_ok = true;
+            BodyMode::Realtime(RealtimeScanner::default())
+        } else {
+            classify_body(&headers.headers, self.parse_dialect(), self.endpoint)
+        };
         if matches!(
             self.endpoint,
             Endpoint::ImageGeneration | Endpoint::ImageEdit | Endpoint::Speech
@@ -2357,6 +2457,7 @@ impl HttpFilter for UsageFilterInstance {
             BodyMode::Json(body) => body.push(data),
             BodyMode::MediaJson(scanner) => scanner.push(data),
             BodyMode::MediaSse(scanner) => scanner.push(data),
+            BodyMode::Realtime(scanner) => scanner.push(data),
             BodyMode::Inert => {}
         }
 
@@ -2415,6 +2516,7 @@ impl HttpFilter for UsageFilterInstance {
             return;
         }
         self.finalized = true;
+        self.report_realtime_missing(cb);
         let (usage, estimated) = self.estimate_partial_usage(request_bytes);
         self.stats.partial.incr();
         if estimated.input || estimated.output {
@@ -2587,6 +2689,7 @@ mod tests {
             max_inter_chunk: None,
             response_chunks: 0,
             response_ok: false,
+            request_is_connect: false,
             finalized: false,
         }
     }
@@ -4685,5 +4788,125 @@ mod tests {
         );
         assert_eq!(llm.usage.as_ref().and_then(|u| u.meters.images), Some(1));
         assert_eq!(llm.list_cost.map(|c| c.nanodollars), Some(70_000_000));
+    }
+
+    // --- realtime sessions (ADR-0015) ---------------------------------------
+
+    /// One unmasked server text frame.
+    fn ws_text(event: &str) -> Vec<u8> {
+        let payload = event.as_bytes();
+        let mut frame = vec![0x81];
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8);
+        } else {
+            frame.push(126);
+            frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    const RT_DONE_A: &str = r#"{"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":7,"input_token_details":{"audio_tokens":9},"output_token_details":{"audio_tokens":5}}}}"#;
+    const RT_DONE_B: &str =
+        r#"{"type":"response.done","response":{"usage":{"input_tokens":3,"output_tokens":1}}}"#;
+
+    /// Open a priced realtime session: the request headers, then the `101`.
+    fn realtime_session(cb: &mut TestCallbacks) -> UsageFilterInstance {
+        let mut filter = priced_filter_with(&[("gpt-realtime", 10, 100)]);
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.llm.endpoint = Endpoint::Realtime;
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-realtime".into());
+        }
+        let mut request = RequestHeaders {
+            method: Method::GET,
+            uri: "/v1/realtime?model=gpt-realtime".parse().unwrap(),
+            headers: HeaderMap::new(),
+        };
+        request.headers.insert(
+            "sec-websocket-extensions",
+            HeaderValue::from_static("permessage-deflate; client_max_window_bits"),
+        );
+        filter.decode_headers(cb, &mut request, true);
+        assert!(
+            !request.headers.contains_key("sec-websocket-extensions"),
+            "the compression offer is removed so frames stay readable"
+        );
+        let mut accept = ResponseHeaders {
+            status: StatusCode::SWITCHING_PROTOCOLS,
+            headers: HeaderMap::new(),
+        };
+        filter.encode_headers(cb, &mut accept, false);
+        filter
+    }
+
+    /// A session's usage is the sum of its `response.done` events, priced
+    /// once at the session's end at the rate card's token rates.
+    #[test]
+    fn a_realtime_session_is_metered_from_its_response_done_events() {
+        let mut cb = TestCallbacks::new();
+        let mut filter = realtime_session(&mut cb);
+        let mut frames = ws_text(r#"{"type":"response.created"}"#);
+        frames.extend(ws_text(RT_DONE_A));
+        frames.extend(ws_text(r#"{"type":"response.created"}"#));
+        frames.extend(ws_text(RT_DONE_B));
+        // Split mid-frame, as TCP may.
+        let (a, b) = frames.split_at(17);
+        filter.encode_data(&mut cb, &mut Bytes::copy_from_slice(a), false);
+        filter.encode_data(&mut cb, &mut Bytes::copy_from_slice(b), false);
+        assert_eq!(cb.llm().usage, None, "nothing is written before the end");
+        filter.encode_data(&mut cb, &mut Bytes::new(), true);
+
+        let llm = cb.llm();
+        let tokens = llm.usage.and_then(|u| u.tokens).expect("metered");
+        assert_eq!((tokens.input_tokens, tokens.output_tokens), (15, 8));
+        assert_eq!(
+            (tokens.input_audio_tokens, tokens.output_audio_tokens),
+            (9, 5)
+        );
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Complete));
+        assert_eq!(
+            llm.list_cost.expect("priced").nanodollars,
+            15 * 10 + 8 * 100,
+            "audio without a modality rate is priced at the text rate"
+        );
+        assert_eq!(filter.stats.realtime_missing(), 0);
+    }
+
+    /// A session cut while a response is in flight is recorded partial and
+    /// charged what its events reported, never an estimate from the audio
+    /// bytes; the in-flight response is counted as missing usage.
+    #[test]
+    fn a_cut_realtime_session_is_partial_and_its_in_flight_response_is_counted() {
+        let mut cb = TestCallbacks::new();
+        let mut filter = realtime_session(&mut cb);
+        let mut frames = ws_text(r#"{"type":"response.created"}"#);
+        frames.extend(ws_text(RT_DONE_B));
+        frames.extend(ws_text(r#"{"type":"response.created"}"#));
+        frames.extend(ws_text(r#"{"type":"response.audio.delta","delta":"AAAA"}"#));
+        filter.encode_data(&mut cb, &mut Bytes::from(frames), false);
+        filter.on_stream_complete(&mut cb);
+
+        let llm = cb.llm();
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Partial));
+        let tokens = llm.usage.and_then(|u| u.tokens).expect("charged once");
+        assert_eq!((tokens.input_tokens, tokens.output_tokens), (3, 1));
+        assert!(!llm.input_estimated && !llm.output_estimated);
+        assert_eq!(llm.list_cost.expect("priced").nanodollars, 3 * 10 + 100);
+        assert_eq!(filter.stats.realtime_missing(), 1, "the in-flight response");
+        filter.on_stream_complete(&mut cb);
+        assert_eq!(filter.stats.realtime_missing(), 1, "reported once");
+    }
+
+    /// A `response.done` with no usage is counted, never silently free.
+    #[test]
+    fn a_response_done_without_usage_is_counted() {
+        let mut cb = TestCallbacks::new();
+        let mut filter = realtime_session(&mut cb);
+        let frames = ws_text(r#"{"type":"response.done","response":{"status":"failed"}}"#);
+        filter.encode_data(&mut cb, &mut Bytes::from(frames), true);
+        assert_eq!(cb.llm().usage, None);
+        assert_eq!(filter.stats.realtime_missing(), 1);
     }
 }
