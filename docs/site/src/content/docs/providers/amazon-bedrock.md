@@ -43,6 +43,7 @@ providers:
     access_key_id: ${AWS_ACCESS_KEY_ID}
     secret_access_key: ${AWS_SECRET_ACCESS_KEY}
 
+routes: []
 models:
   claude-sonnet:
     providers:

@@ -41,6 +41,7 @@ providers:
     type: openai-compatible
     base_url: https://api.together.xyz
     api_key: ${TOGETHER_API_KEY}
+routes: []
 models:
   chat-default:
     providers:

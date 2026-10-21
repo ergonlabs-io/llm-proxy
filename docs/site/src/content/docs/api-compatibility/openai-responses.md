@@ -38,6 +38,7 @@ providers:
   openai:
     api_key: ${OPENAI_API_KEY}
 
+routes: []
 models:
   gpt-4o:
     providers: [openai]

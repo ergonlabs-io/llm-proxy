@@ -46,6 +46,7 @@ providers:
     publisher: anthropic
     access_token: ${VERTEX_ACCESS_TOKEN}
 
+routes: []
 models:
   claude-sonnet:
     providers:

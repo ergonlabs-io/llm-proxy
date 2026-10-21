@@ -47,6 +47,7 @@ providers:
   openai:
     api_key: ${OPENAI_API_KEY}
 
+routes: []
 models:
   voice:
     providers: [openai/gpt-realtime-2026]

@@ -41,6 +41,7 @@ providers:
   anthropic:
     api_key: ${ANTHROPIC_API_KEY}
 
+routes: []
 models:
   claude-sonnet-4-5:
     providers: [anthropic]
