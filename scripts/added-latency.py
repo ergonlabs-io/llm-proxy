@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Added-latency benchmark: what the proxy adds to a request, controls on.
 
-Build with make capture-qualification-build; run with make bench-added-latency.
+Build with make bench-build; run with make bench-added-latency.
 Method and published results: internal-docs/capacity/added-latency.md.
 
 Each round runs every arm once, in an order that rotates and reverses from
@@ -431,7 +431,7 @@ def main():
 
     missing = [str(p) for p in BINARIES.values() if not p.exists()]
     if missing:
-        sys.exit(f"missing {', '.join(missing)}; run make capture-qualification-build")
+        sys.exit(f"missing {', '.join(missing)}; run make bench-build")
     selected = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = sorted(set(selected) - set(ARMS))
     if unknown:

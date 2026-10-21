@@ -238,11 +238,6 @@ install_files() {
   cp "${TMP}/pkg/llm-proxy" "${BIN}.new"
   chmod 0755 "${BIN}.new"
   mv -f "${BIN}.new" "$BIN"
-  if [ -f "${TMP}/pkg/llm-capture-agent" ]; then
-    cp "${TMP}/pkg/llm-capture-agent" "${INSTALL_DIR}/llm-capture-agent.new"
-    chmod 0755 "${INSTALL_DIR}/llm-capture-agent.new"
-    mv -f "${INSTALL_DIR}/llm-capture-agent.new" "${INSTALL_DIR}/llm-capture-agent"
-  fi
   if [ -d "${TMP}/pkg/admin-ui-dist" ]; then
     rm -rf "$UI_DIR"
     cp -R "${TMP}/pkg/admin-ui-dist" "$UI_DIR"
@@ -563,6 +558,7 @@ uninstall() {
   if [ "$OS" = linux ] && has systemctl; then
     $SYSTEMCTL daemon-reload >/dev/null 2>&1 || true
   fi
+  # The capture agent was retired; keep removing it so an old install is cleaned up.
   rm -f "$BIN" "${INSTALL_DIR}/llm-capture-agent"
   say "Removed the llm-proxy service and ${BIN}"
   if [ "$PURGE" = true ]; then

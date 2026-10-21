@@ -30,8 +30,8 @@ jobs:
         run: rustc --version && cargo --version && cargo nextest --version
       - name: Repository CI checks
         run: make ci
-      - name: Capture reporter checks
-        run: make capture-qualification-check redb-retention-check
+      - name: Redb retention reporter checks
+        run: make redb-retention-check
 
   # The differential rig job is not wired into CI yet; it would go here (docker-compose: llm-proxy vs pinned
   # Envoy image digest + shared upstreams). Smoke subset on PR, full on merge queue.
