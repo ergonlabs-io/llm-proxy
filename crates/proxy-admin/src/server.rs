@@ -33,7 +33,9 @@ use hyper_util::rt::TokioIo;
 use proxy_control::auth::{KeyId, TenantId};
 use proxy_control::control::{ControlPlane, CredentialStoreError, LimitPolicy, StoreError};
 use proxy_control::model_authz::{ModelAccess, ModelPattern};
-use proxy_control::spend::{parse_micro_usd, Period, SpendAccumulator, TenantBudget};
+use proxy_control::spend::{
+    parse_micro_usd, KeyBudget, MicroUsd, Period, SpendAccumulator, TenantBudget,
+};
 use proxy_control::tenant_credential_crypto::TenantSecret;
 use proxy_core::lifecycle::LifecycleState;
 use proxy_core::WorkerConfigHandle;
@@ -1987,11 +1989,16 @@ struct BudgetSpec {
     /// a budget cannot be more precise than a price.
     max_usd: String,
     period: PeriodSpec,
-    /// `"platform"` or `"tenant"`; absent means `"platform"`. Kept a plain
-    /// string so an unknown value gets this module's fixed 400 message
-    /// instead of serde's, which would echo the rejected input back.
+    /// Tenant budgets only: `"platform"` or `"tenant"`; absent means
+    /// `"platform"`. Kept a plain string so an unknown value gets this
+    /// module's fixed 400 message instead of serde's, which would echo the
+    /// rejected input back.
     #[serde(default)]
     credential_source: Option<String>,
+    /// Key budgets only: also count the tenant's own-credential (BYOK)
+    /// spend (ADR-0007 amendment 1). Absent means `false`.
+    #[serde(default)]
+    include_byok_in_limit: Option<bool>,
 }
 
 /// Wire form of [`Period`]: `"daily"` or `"monthly"`. The same spelling is used for requests and responses, so
@@ -2051,7 +2058,7 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                     "max_micro_usd": budget.max_micros.as_micros(),
                     "max_usd": render_micro_usd(budget.max_micros.as_micros()),
                     "period": PeriodSpec::from(budget.period),
-                    "credential_source": budget.credential_source.as_str(),
+                    "include_byok_in_limit": budget.include_byok_in_limit,
                 })),
                 "limits": listing.limits.map(render_limits),
                 "tags": &*listing.tags,
@@ -2714,12 +2721,23 @@ fn handle_set_key_policy(
     }
 }
 
-/// Turns a request's [`BudgetSpec`] into the stored [`TenantBudget`]. Both budget writes use it, so their
-/// validation cannot drift apart.
+/// The ceiling both budget writes share, so their validation cannot drift
+/// apart.
+#[allow(clippy::result_large_err)]
+fn max_micros_from_spec(spec: &BudgetSpec) -> Result<MicroUsd, Response<Full<Bytes>>> {
+    parse_micro_usd(&spec.max_usd).map_err(|err| bad_request(&format!("invalid `max_usd`: {err}")))
+}
+
+/// Turns a `PUT /tenants/{id}/budget` [`BudgetSpec`] into the stored [`TenantBudget`].
 #[allow(clippy::result_large_err)]
 fn budget_from_spec(spec: BudgetSpec) -> Result<TenantBudget, Response<Full<Bytes>>> {
-    let max_micros = parse_micro_usd(&spec.max_usd)
-        .map_err(|err| bad_request(&format!("invalid `max_usd`: {err}")))?;
+    let max_micros = max_micros_from_spec(&spec)?;
+    if spec.include_byok_in_limit.is_some() {
+        return Err(bad_request(
+            "`include_byok_in_limit` applies to key budgets (PUT /keys/{id}/budget); \
+             a tenant budget is scoped by `credential_source`",
+        ));
+    }
     let credential_source = match spec.credential_source.as_deref() {
         // Absent means platform, so existing budgets keep their meaning (ADR-0007).
         None | Some("platform") => CredentialSource::Platform,
@@ -2734,6 +2752,23 @@ fn budget_from_spec(spec: BudgetSpec) -> Result<TenantBudget, Response<Full<Byte
         max_micros,
         period: spec.period.into(),
         credential_source,
+    })
+}
+
+/// Turns a `PUT /keys/{id}/budget` [`BudgetSpec`] into the stored [`KeyBudget`].
+#[allow(clippy::result_large_err)]
+fn key_budget_from_spec(spec: BudgetSpec) -> Result<KeyBudget, Response<Full<Bytes>>> {
+    let max_micros = max_micros_from_spec(&spec)?;
+    if spec.credential_source.is_some() {
+        return Err(bad_request(
+            "`credential_source` applies to tenant budgets; a key budget counts operator \
+             spend, and BYOK spend too with `include_byok_in_limit: true`",
+        ));
+    }
+    Ok(KeyBudget {
+        max_micros,
+        period: spec.period.into(),
+        include_byok_in_limit: spec.include_byok_in_limit.unwrap_or(false),
     })
 }
 
@@ -2814,7 +2849,7 @@ fn handle_set_key_budget(
     };
     let budget = match request.budget {
         None => None,
-        Some(spec) => match budget_from_spec(spec) {
+        Some(spec) => match key_budget_from_spec(spec) {
             Ok(budget) => Some(budget),
             Err(response) => return response,
         },
@@ -3186,9 +3221,9 @@ fn handle_get_key_spend(
             "spend_usd": render_micro_usd(report.total_micros),
             "budget_micro_usd": budget_micros,
             "remaining_micro_usd": remaining_micros,
-            // `null` with no budget, like the two fields above: there is no
-            // scope to report for an unlimited subject.
-            "credential_source": budget.map(|b| b.credential_source.as_str()),
+            // `null` with no budget, like the two fields above: an
+            // unlimited key counts every source for reporting.
+            "include_byok_in_limit": budget.map(|b| b.include_byok_in_limit),
             "last_flush_at": report.last_flush_at.map(|dt| dt.to_rfc3339()),
             "journal_checkpoint_at": report.journal_checkpoint_at.map(|dt| dt.to_rfc3339()),
             "journal_pending_micro_usd": report.journal_pending_micro_usd,

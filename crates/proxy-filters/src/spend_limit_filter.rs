@@ -47,7 +47,8 @@ use crate::auth::{KeyId, TenantId};
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::spend::{
-    self, Charge, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy, SpendAccumulator,
+    self, Charge, KeyBudget, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy,
+    SpendAccumulator,
 };
 use crate::unmetered::{self, RefusalCounter};
 use crate::usage_filter::PricingRegistry;
@@ -469,7 +470,7 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             key_id: None,
             tenant: None,
             period: None,
-            key_budget_scope: None,
+            key_budget: None,
             tenant_budget_scope: None,
             budget_applies: false,
             recorded: false,
@@ -670,13 +671,15 @@ struct SpendLimitFilterInstance {
     period: Option<Period>,
     /// Tenant aggregation uses its own budget period independently of the key.
     tenant: Option<(TenantId, Period)>,
-    /// The configured KEY budget's scope, captured at admission even when it
-    /// did not match this request's mode: a non-matching budget is absent for
-    /// admission (ADR-0007 decision 8) but still decides at encode whether
-    /// this subject may be charged at all. `None` means no key budget was
-    /// configured, and such a subject always records (reporting).
-    key_budget_scope: Option<CredentialSource>,
-    /// The tenant-budget twin of [`Self::key_budget_scope`].
+    /// The configured KEY budget, captured at admission even when it does not
+    /// bind this request's mode: it still decides at encode whether the key
+    /// is charged (ADR-0007 amendment 1, [`KeyBudget::counts`]). `None`
+    /// means no key budget was configured, and such a key always records
+    /// (reporting).
+    key_budget: Option<KeyBudget>,
+    /// The configured TENANT budget's scope, captured the same way: a
+    /// non-matching budget is absent for admission (ADR-0007 decision 8) but
+    /// still decides at encode whether the tenant is charged.
     tenant_budget_scope: Option<CredentialSource>,
     /// Whether a budget actually applied to this request -- distinguishes
     /// "no usage at encode time on a budgeted tenant" (warn: see the module
@@ -781,16 +784,15 @@ impl SpendLimitFilterInstance {
 
         let now = Utc::now();
         let mut scopes = Vec::new();
-        // ADR-0007 decision 8: spend is added to a budget only when the
-        // attempt's source matches the budget's scope. A subject with NO
-        // configured budget records unconditionally -- those counters also
-        // serve spend reporting. A budgeted subject records only when the
-        // router actually attempted the request under that budget's source:
-        // `credential_source` is `None` when no attempt reached the
-        // credential step (ADR-0007 decision 7), which matches no scope.
+        // A subject with NO configured budget records unconditionally --
+        // those counters also serve spend reporting. A key budget counts
+        // operator spend, and BYOK spend only with `include_byok_in_limit`
+        // (ADR-0007 amendment 1). A tenant budget counts only its scope's
+        // source (decision 8). `credential_source` is `None` when no attempt
+        // reached the credential step (decision 7), which counts nowhere.
         if self
-            .key_budget_scope
-            .is_none_or(|scope| credential_source == Some(scope))
+            .key_budget
+            .is_none_or(|budget| budget.counts(credential_source))
         {
             self.accumulator.record_key(
                 &key_id,
@@ -919,7 +921,7 @@ impl HttpFilter for SpendLimitFilterInstance {
             self.period = None;
             self.tenant = None;
             self.budget_applies = false;
-            self.key_budget_scope = None;
+            self.key_budget = None;
             self.tenant_budget_scope = None;
             if !snapshot.key_budgets.is_empty() || tenant_budgets_configured {
                 cb.send_local_reply(
@@ -953,12 +955,14 @@ impl HttpFilter for SpendLimitFilterInstance {
             .as_ref()
             .and_then(|id| snapshot.policies.get(id.as_str()))
             .and_then(|p| p.budget);
-        // Admission enforces only the budgets whose scope matches this
-        // request's mode. A non-matching budget is treated as absent for
-        // this request (ADR-0007 decision 8): no ceiling to compare, no
+        // Admission enforces only the budgets that bind this request's mode:
+        // a key budget always in platform mode and in tenant mode only with
+        // `include_byok_in_limit` (ADR-0007 amendment 1), a tenant budget
+        // only in its scope's mode (decision 8). One that does not bind is
+        // treated as absent for this request: no ceiling to compare, no
         // budget period, `budget_applies` stays false -- exactly the
         // behaviour of a subject with no budget at all.
-        let key_budget = key_budget_configured.filter(|b| b.credential_source == mode);
+        let key_budget = key_budget_configured.filter(|b| b.enforced_in(mode));
         let tenant_budget = tenant_budget_configured.filter(|b| b.credential_source == mode);
         let default_period = self.accumulator.default_period();
         self.key_id = Some(key_id.clone());
@@ -970,7 +974,7 @@ impl HttpFilter for SpendLimitFilterInstance {
             )
         });
         self.budget_applies = key_budget.is_some() || tenant_budget.is_some();
-        self.key_budget_scope = key_budget_configured.map(|b| b.credential_source);
+        self.key_budget = key_budget_configured;
         self.tenant_budget_scope = tenant_budget_configured.map(|b| b.credential_source);
         // A budget that binds this request must be able to count it, or the
         // request would be charged $0 (ADR-0010 decision 1). Refused before
@@ -998,14 +1002,16 @@ impl HttpFilter for SpendLimitFilterInstance {
         let ceilings = [
             key_budget.map(|budget| {
                 (
-                    budget,
+                    budget.max_micros,
+                    budget.period,
                     self.accumulator
                         .current_total_key(&key_id, &budget.period.key_for(now)),
                 )
             }),
             tenant_budget.map(|budget| {
                 (
-                    budget,
+                    budget.max_micros,
+                    budget.period,
                     self.accumulator.current_total(
                         tenant
                             .as_ref()
@@ -1015,9 +1021,8 @@ impl HttpFilter for SpendLimitFilterInstance {
                 )
             }),
         ];
-        for (budget, current_micros) in ceilings.into_iter().flatten() {
-            let period = budget.period;
-            let limit_micros = budget.max_micros.as_micros();
+        for (max_micros, period, current_micros) in ceilings.into_iter().flatten() {
+            let limit_micros = max_micros.as_micros();
 
             // At or over the ceiling denies -- see the module doc's "A
             // configured ceiling of exactly zero denies immediately" section for
@@ -1588,7 +1593,7 @@ mod tests {
     }
 
     /// A `ControlPlane` with a stable key and budget for every test tenant.
-    fn control_plane_with(budgets: &[(&str, TenantBudget)]) -> Arc<ControlPlane> {
+    fn control_plane_with(budgets: &[(&str, KeyBudget)]) -> Arc<ControlPlane> {
         let cp = ControlPlane::new(
             Box::new(InMemoryControlPlaneStore::default()),
             HmacSecret::new(b"test-secret-value-long-enough"),
@@ -1642,7 +1647,7 @@ mod tests {
                 key_id: None,
                 tenant: None,
                 period: None,
-                key_budget_scope: None,
+                key_budget: None,
                 tenant_budget_scope: None,
                 budget_applies: false,
                 recorded: false,
@@ -1857,10 +1862,10 @@ mod tests {
     fn one_micro_per_token_harness(limit_micros: u64) -> FilterHarness {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(limit_micros),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let mut table = Card::default();
@@ -1910,10 +1915,10 @@ mod tests {
     fn a_budgeted_request_admitted_while_stale_is_counted() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(1_000_000),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let harness = stale_filter_with(&cp, Card::default(), Period::Monthly);
@@ -1963,10 +1968,10 @@ mod tests {
     fn a_stale_replica_still_denies_and_a_denial_is_not_counted() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(0),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let harness = stale_filter_with(&cp, Card::default(), Period::Monthly);
@@ -1984,11 +1989,11 @@ mod tests {
 
     // --- unpriced requests under a dollar budget are loud ---------------------
 
-    fn dollar_budget() -> TenantBudget {
-        TenantBudget {
+    fn dollar_budget() -> KeyBudget {
+        KeyBudget {
             max_micros: MicroUsd::from_micros(1_000_000),
             period: Period::Daily,
-            credential_source: CredentialSource::Platform,
+            include_byok_in_limit: false,
         }
     }
 
@@ -2176,12 +2181,12 @@ mod tests {
     /// name stays on one line, and no credential or key identity is in it.
     #[test]
     fn the_unpriced_warning_renders_no_credentials_and_cannot_be_forged() {
-        // A tenant-scoped budget, so the request below (tenant mode, holding a
+        // A key budget that includes BYOK spend, so the request below (tenant mode, holding a
         // tenant credential) is one the budget actually applies to.
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
-                credential_source: CredentialSource::Tenant,
+            KeyBudget {
+                include_byok_in_limit: true,
                 ..dollar_budget()
             },
         )]);
@@ -2319,10 +2324,10 @@ mod tests {
     fn configured_key_policy_rejects_missing_authenticated_key_identity() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(10),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let harness = filter_with(&cp, Card::default(), Period::Monthly);
@@ -2338,10 +2343,10 @@ mod tests {
     fn concurrent_admissions_can_exceed_the_ceiling_until_completion() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(1),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let mut table = Card::default();
@@ -2382,10 +2387,10 @@ mod tests {
     fn one_key_accumulates_across_models_and_selected_providers() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(5),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let mut table = Card::default();
@@ -2421,10 +2426,10 @@ mod tests {
     fn tenant_budget_aggregates_keys_with_independent_periods() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(10),
                 period: Period::Monthly,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let tenant = TenantId::new("tenant-a");
@@ -2484,10 +2489,10 @@ mod tests {
         cp.set_budget(&tenant, None).unwrap();
         cp.set_key_budget(
             &test_key_id("tenant-a"),
-            Some(&TenantBudget {
+            Some(&KeyBudget {
                 max_micros: MicroUsd::from_micros(2),
                 period: Period::Monthly,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             }),
         )
         .unwrap();
@@ -2752,10 +2757,10 @@ mod tests {
     fn under_budget_is_admitted_over_budget_is_denied_with_all_four_headers() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(10_000_000),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
 
@@ -2816,10 +2821,10 @@ mod tests {
     fn a_denied_request_renders_the_rl_response_flag() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(0),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let harness = filter_with(&cp, Card::default(), Period::Monthly);
@@ -2849,10 +2854,10 @@ mod tests {
     fn a_budget_of_exactly_zero_denies_the_very_first_request() {
         let cp = control_plane_with(&[(
             "tenant-zero",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(0),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let harness = filter_with(&cp, Card::default(), Period::Monthly);
@@ -2876,10 +2881,10 @@ mod tests {
     fn an_unpriced_cluster_model_costs_zero_and_never_exhausts_the_budget() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(1),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         // An EMPTY price table -- every (cluster, model) is unpriced.
@@ -2945,10 +2950,10 @@ mod tests {
         // from the unrelated question of period-key carryover.
         cp.set_key_budget(
             &key_id,
-            Some(&TenantBudget {
+            Some(&KeyBudget {
                 max_micros: MicroUsd::from_micros(0),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             }),
         )
         .expect("set_budget must succeed");
@@ -2967,10 +2972,10 @@ mod tests {
     fn period_rollover_restores_budget() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(1_000_000),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let mut table = Card::default();
@@ -3062,10 +3067,10 @@ mod tests {
     fn missing_usage_on_a_budgeted_tenant_warns_and_charges_nothing() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(10_000_000),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let filter = filter_with(&cp, Card::default(), Period::Monthly);
@@ -3108,7 +3113,7 @@ mod tests {
         );
     }
 
-    // --- budgets scoped to one credential source (ADR-0007 decision 8) ----
+    // --- budgets and credential sources (ADR-0007 decision 8, amendment 1) --
 
     /// ADR-0007 decision 8: admission enforces only the budgets whose scope
     /// matches the request's mode. A platform-scoped TENANT budget at its
@@ -3195,11 +3200,13 @@ mod tests {
         );
     }
 
-    /// ADR-0007 decision 8: spend is added to a budget only when the
-    /// attempt's source matches the budget's scope. The two budgets sit on
-    /// DIFFERENT subjects (tenant vs. key), so each assertion reads the
-    /// other budget's counter: a regression that charges either budget from
-    /// the wrong mode moves a counter this test pins at zero.
+    /// Spend is added to a tenant budget only when the attempt's source
+    /// matches its scope (ADR-0007 decision 8), and to a key budget without
+    /// `include_byok_in_limit` only from the operator's credential
+    /// (amendment 1). The two budgets sit on DIFFERENT subjects (tenant vs.
+    /// key), so each assertion reads the other budget's counter: a
+    /// regression that charges either budget from the wrong mode moves a
+    /// counter this test pins at zero.
     ///
     /// Mutation: drop the scope gate in `record_if_present` -- the
     /// zero-assertions must go red.
@@ -3207,10 +3214,10 @@ mod tests {
     fn charges_only_the_budget_whose_scope_matches_the_attempts_source() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(1_000_000),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         cp.set_budget(
@@ -3250,7 +3257,7 @@ mod tests {
         let monthly = Period::Monthly.key_for_now();
 
         // Tenant mode, source Tenant: the tenant-scoped budget is charged,
-        // the platform-scoped key budget is not.
+        // the key budget without include_byok_in_limit is not.
         let harness = filter_with(&cp, table.clone(), Period::Monthly);
         run(&harness, CredentialSource::Tenant);
         assert_eq!(harness.accumulator.current_total(&tenant, &daily), 2);
@@ -3260,12 +3267,12 @@ mod tests {
         ] {
             assert_eq!(
                 key_total, 0,
-                "tenant-mode spend must never be charged to the platform-scoped key budget"
+                "BYOK spend must not be charged to a key budget without include_byok_in_limit"
             );
         }
 
         // Platform mode, source Platform: the converse -- only the
-        // platform-scoped key budget is charged.
+        // key budget is charged.
         let harness = filter_with(&cp, table, Period::Monthly);
         run(&harness, CredentialSource::Platform);
         assert_eq!(harness.accumulator.current_total_key(&key, &daily), 2);
@@ -3292,10 +3299,10 @@ mod tests {
     fn a_budgeted_subject_is_not_charged_when_credential_source_is_none() {
         let cp = control_plane_with(&[(
             "tenant-a",
-            TenantBudget {
+            KeyBudget {
                 max_micros: MicroUsd::from_micros(1_000_000),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: false,
             },
         )]);
         let mut table = Card::default();
@@ -3329,33 +3336,25 @@ mod tests {
         );
     }
 
-    /// ADR-0007 decision 8: when BOTH budgets are tenant-scoped, tenant mode
-    /// enforces both -- each alone at its limit refuses the request. The
-    /// platform-mode half of each case proves the refusals come from scope
-    /// matching, not merely from a budget existing somewhere.
+    /// ADR-0007 amendment 1: a key budget binds a platform-mode request
+    /// always, and a tenant-mode (BYOK) request only with
+    /// `include_byok_in_limit`. The tenant has no budget, so every refusal
+    /// here is the key's.
     ///
-    /// Mutation: enforce every configured budget regardless of scope --
-    /// the platform-mode halves must go red.
+    /// Mutation: make `KeyBudget::enforced_in` ignore the flag (the `false`
+    /// row's tenant-mode half goes red) or ignore the mode (the `false`
+    /// row's platform-mode half goes red).
     #[test]
-    fn tenant_mode_enforces_a_tenant_scoped_key_budget_and_tenant_budget_alike() {
-        for (key_micros, tenant_micros) in [(0, 1_000_000), (1_000_000, 0)] {
+    fn a_key_budget_binds_byok_requests_only_with_include_byok_in_limit() {
+        for include_byok_in_limit in [true, false] {
             let cp = control_plane_with(&[(
                 "tenant-a",
-                TenantBudget {
-                    max_micros: MicroUsd::from_micros(key_micros),
+                KeyBudget {
+                    max_micros: MicroUsd::from_micros(0),
                     period: Period::Daily,
-                    credential_source: CredentialSource::Tenant,
+                    include_byok_in_limit,
                 },
             )]);
-            cp.set_budget(
-                &TenantId::new("tenant-a"),
-                Some(&TenantBudget {
-                    max_micros: MicroUsd::from_micros(tenant_micros),
-                    period: Period::Daily,
-                    credential_source: CredentialSource::Tenant,
-                }),
-            )
-            .unwrap();
             let harness = filter_with(&cp, Card::default(), Period::Monthly);
 
             let mut filter = harness.new_instance();
@@ -3366,19 +3365,18 @@ mod tests {
             decode(&mut filter, &mut cb, &mut request_headers(), true);
             assert_eq!(
                 cb.local_reply.as_ref().map(|(status, _)| *status),
-                Some(StatusCode::TOO_MANY_REQUESTS),
-                "key={key_micros} tenant={tenant_micros}: each tenant-scoped budget at its \
-                 limit must deny on its own in tenant mode"
+                include_byok_in_limit.then_some(StatusCode::TOO_MANY_REQUESTS),
+                "include_byok_in_limit={include_byok_in_limit}: tenant mode"
             );
 
             let mut filter = harness.new_instance();
             let mut cb = TestCallbacks::new();
             cb.set_tenant("tenant-a");
             decode(&mut filter, &mut cb, &mut request_headers(), true);
-            assert!(
-                cb.local_reply.is_none(),
-                "key={key_micros} tenant={tenant_micros}: neither tenant-scoped budget may \
-                 deny a platform-mode request"
+            assert_eq!(
+                cb.local_reply.as_ref().map(|(status, _)| *status),
+                Some(StatusCode::TOO_MANY_REQUESTS),
+                "include_byok_in_limit={include_byok_in_limit}: platform mode"
             );
         }
     }

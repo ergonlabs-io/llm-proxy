@@ -29,7 +29,7 @@ use proxy_observability::chargeback::ChargebackTags;
 use zeroize::Zeroizing;
 // Spend owns period-key and calendar-alignment logic; this module only stores
 // and retrieves the resulting keys.
-use crate::spend::{key_spend_subject, PeriodKey, TenantBudget};
+use crate::spend::{key_spend_subject, KeyBudget, PeriodKey, TenantBudget};
 
 /// Names a key's row in both the budgets and policies tables.
 fn key_budget_subject(key_id: &KeyId) -> TenantId {
@@ -37,7 +37,7 @@ fn key_budget_subject(key_id: &KeyId) -> TenantId {
 }
 
 /// Recovers the key identity from its budgets or policies table subject.
-fn key_id_from_budget_subject(subject: &TenantId) -> Option<KeyId> {
+pub(crate) fn key_id_from_budget_subject(subject: &TenantId) -> Option<KeyId> {
     subject.as_str().strip_prefix("\u{1f}key:").map(KeyId::new)
 }
 
@@ -202,6 +202,9 @@ pub struct StoredControlPlane {
     // them by tenant rather than assuming one row implies the other. See
     // that function's doc for why this is deliberate, not an oversight.
     pub budgets: HashMap<TenantId, TenantBudget>,
+    /// Key budgets, filed in the same budgets table under the key's subject
+    /// (see [`EncodedKeyBudget`]) and split out on load.
+    pub key_budgets: HashMap<KeyId, KeyBudget>,
     pub limits: HashMap<TenantId, LimitPolicy>,
     /// Every tenant credential row. A store that does not support them yet
     /// returns an empty list here and refuses writes.
@@ -484,6 +487,10 @@ pub trait ControlPlaneStore: Send + Sync {
         tenant: &TenantId,
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError>;
+
+    /// Sets or clears a key's spend budget, the key-level twin of
+    /// [`Self::set_budget`]. Each write bumps the policy generation.
+    fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError>;
 
     /// An absent or all-empty policy removes the row. Each write bumps the
     /// policy generation, including removals.
@@ -927,7 +934,7 @@ pub struct ControlPlaneSnapshot {
     /// Spend ceilings by stable key identity. This is deliberately separate
     /// from tenant authorization policy: keys authenticate to tenants, but a
     /// key budget neither grants models nor shares spend with sibling keys.
-    pub key_budgets: HashMap<KeyId, TenantBudget>,
+    pub key_budgets: HashMap<KeyId, KeyBudget>,
     pub tenant_limits: HashMap<TenantId, LimitPolicy>,
     pub key_limits: HashMap<KeyId, LimitPolicy>,
     /// A key's own allow-list. Effective models are the tenant grant
@@ -970,6 +977,7 @@ struct InMemoryState {
     // Independent of `policies` above -- see
     // `StoredControlPlane::budgets`'s doc.
     budgets: HashMap<TenantId, TenantBudget>,
+    key_budgets: HashMap<KeyId, KeyBudget>,
     limits: HashMap<TenantId, LimitPolicy>,
     // Credential rows keyed by `(tenant, provider)` -- the exact
     // create-or-replace identity `put_tenant_credential` names (ADR-0007
@@ -1032,6 +1040,7 @@ impl InMemoryControlPlaneStore {
                 keys: HashMap::new(),
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
+                key_budgets: HashMap::new(),
                 limits: HashMap::new(),
                 tenant_credentials: HashMap::new(),
                 rate_cards: HashMap::new(),
@@ -1113,6 +1122,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             keys: state.keys.values().cloned().collect(),
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
+            key_budgets: state.key_budgets.clone(),
             limits: state.limits.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
             rate_cards: state.rate_cards.values().cloned().collect(),
@@ -1271,6 +1281,23 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             }
             None => {
                 state.budgets.remove(tenant);
+            }
+        }
+        state.generation += 1;
+        Ok(())
+    }
+
+    fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        match budget {
+            Some(budget) => {
+                state.key_budgets.insert(key_id.clone(), *budget);
+            }
+            None => {
+                state.key_budgets.remove(key_id);
             }
         }
         state.generation += 1;
@@ -1849,6 +1876,65 @@ impl From<EncodedTenantBudget> for TenantBudget {
             max_micros: crate::spend::MicroUsd::from_micros(encoded.max_micros),
             period: encoded.period.into(),
             credential_source: encoded.credential_source.into(),
+        }
+    }
+}
+
+/// [`KeyBudget`] as `serde_json` sees it. Key budgets share the budgets
+/// table with tenant budgets, filed under the key's subject, so a row written
+/// before ADR-0007 amendment 1 is an [`EncodedTenantBudget`] with an optional
+/// `credential_source` and no flag. Such a row reads through
+/// [`KeyBudget::from_scoped`]: `tenant` becomes `true`; `platform` or absent
+/// becomes `false`. A row written now carries only the flag, and
+/// `SPEND_SCHEMA_VERSION` does not bump: a build from before the flag ignores
+/// it and reads the row as platform-scoped, so a rollback keeps enforcing
+/// the key budget on operator spend.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct EncodedKeyBudget {
+    #[serde(
+        default = "legacy_schema_version",
+        deserialize_with = "read_schema_version"
+    )]
+    schema_version: u32,
+    max_micros: u64,
+    period: EncodedPeriod,
+    /// Read only, from rows written before the flag; never written.
+    #[serde(default, skip_serializing)]
+    credential_source: Option<EncodedCredentialSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    include_byok_in_limit: Option<bool>,
+}
+
+impl From<&KeyBudget> for EncodedKeyBudget {
+    fn from(budget: &KeyBudget) -> Self {
+        EncodedKeyBudget {
+            schema_version: SPEND_SCHEMA_VERSION,
+            max_micros: budget.max_micros.as_micros(),
+            period: budget.period.into(),
+            credential_source: None,
+            include_byok_in_limit: Some(budget.include_byok_in_limit),
+        }
+    }
+}
+
+impl From<EncodedKeyBudget> for KeyBudget {
+    fn from(encoded: EncodedKeyBudget) -> Self {
+        let max_micros = crate::spend::MicroUsd::from_micros(encoded.max_micros);
+        let period = encoded.period.into();
+        match encoded.include_byok_in_limit {
+            Some(include_byok_in_limit) => KeyBudget {
+                max_micros,
+                period,
+                include_byok_in_limit,
+            },
+            None => KeyBudget::from_scoped(TenantBudget {
+                max_micros,
+                period,
+                credential_source: encoded
+                    .credential_source
+                    .unwrap_or_else(legacy_credential_source)
+                    .into(),
+            }),
         }
     }
 }
@@ -2479,10 +2565,17 @@ impl ControlPlaneStore for RedbControlPlaneStore {
 
         let budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         let mut budgets = HashMap::new();
+        let mut key_budgets = HashMap::new();
         for entry in budgets_table.iter().map_err(store_err)? {
             let (key, value) = entry.map_err(store_err)?;
-            let encoded: EncodedTenantBudget = decode_json(value.value())?;
-            budgets.insert(TenantId::new(key.value()), encoded.into());
+            let subject = TenantId::new(key.value());
+            if let Some(key_id) = key_id_from_budget_subject(&subject) {
+                let encoded: EncodedKeyBudget = decode_json(value.value())?;
+                key_budgets.insert(key_id, encoded.into());
+            } else {
+                let encoded: EncodedTenantBudget = decode_json(value.value())?;
+                budgets.insert(subject, encoded.into());
+            }
         }
 
         let limits_table = txn.open_table(LIMITS_TABLE).map_err(store_err)?;
@@ -2539,6 +2632,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             keys,
             policies,
             budgets,
+            key_budgets,
             limits,
             tenant_credentials,
             rate_cards,
@@ -2784,6 +2878,28 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 }
                 None => {
                     table.remove(tenant.as_str()).map_err(store_err)?;
+                }
+            }
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
+        let subject = key_budget_subject(key_id);
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+            match budget {
+                Some(budget) => {
+                    let encoded: EncodedKeyBudget = budget.into();
+                    table
+                        .insert(subject.as_str(), encode_json(&encoded).as_slice())
+                        .map_err(store_err)?;
+                }
+                None => {
+                    table.remove(subject.as_str()).map_err(store_err)?;
                 }
             }
         }
@@ -3293,7 +3409,7 @@ pub struct KeyListing {
     /// The key's own spend ceiling, or `None` when none is configured
     /// (unlimited) -- see [`crate::spend::TenantBudget`]'s doc for why an
     /// absent budget and an explicit zero ceiling are not the same thing.
-    pub budget: Option<TenantBudget>,
+    pub budget: Option<KeyBudget>,
     pub limits: Option<LimitPolicy>,
     /// The key's own model allow-list, or `None` when it inherits its tenant.
     pub model_access: Option<ModelAccess>,
@@ -4657,12 +4773,12 @@ impl ControlPlane {
     pub fn set_key_budget(
         &self,
         key_id: &KeyId,
-        budget: Option<&TenantBudget>,
+        budget: Option<&KeyBudget>,
     ) -> Result<(), StoreError> {
         if !self.handle().load().key_tenants.contains_key(key_id) {
             return Err(StoreError::NotFound);
         }
-        self.store.set_budget(&key_budget_subject(key_id), budget)?;
+        self.store.set_key_budget(key_id, budget)?;
         self.rebuild();
         Ok(())
     }
@@ -5007,15 +5123,7 @@ impl ControlPlane {
         // looks a tenant's budget up independently of where its policy row
         // came from.
         let mut budgets = loaded.budgets;
-        let mut key_budgets = HashMap::new();
-        budgets.retain(|subject, budget| {
-            if let Some(key_id) = key_id_from_budget_subject(subject) {
-                key_budgets.insert(key_id, *budget);
-                false
-            } else {
-                true
-            }
-        });
+        let key_budgets = loaded.key_budgets;
         let mut tenant_limits = loaded.limits;
         let mut key_limits = HashMap::new();
         tenant_limits.retain(|subject, limits| {
@@ -5401,6 +5509,9 @@ impl ControlPlaneStore for SharedMemoryStore {
     ) -> Result<(), StoreError> {
         self.inner.set_budget(tenant, budget)
     }
+    fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
+        self.inner.set_key_budget(key_id, budget)
+    }
     fn set_limits(
         &self,
         subject: &TenantId,
@@ -5564,6 +5675,39 @@ pub mod log_capture {
     }
 }
 
+/// Key budget rows as builds before `include_byok_in_limit` wrote them, one
+/// per stored scope, with the budget each must load as (ADR-0007 amendment
+/// 1). Shared by the redb and Redis upgrade tests so both stores are held to
+/// one mapping.
+#[cfg(test)]
+pub(crate) fn pre_flag_key_budget_rows() -> Vec<(KeyId, &'static str, KeyBudget)> {
+    use crate::spend::{MicroUsd, Period};
+    let budget = |micros, period, include_byok_in_limit| KeyBudget {
+        max_micros: MicroUsd::from_micros(micros),
+        period,
+        include_byok_in_limit,
+    };
+    vec![
+        // Before ADR-0007 decision 8: no scope, no version. Platform.
+        (
+            KeyId::new("key-unscoped"),
+            r#"{"max_micros":5,"period":"Daily"}"#,
+            budget(5, Period::Daily, false),
+        ),
+        (
+            KeyId::new("key-platform"),
+            r#"{"schema_version":2,"max_micros":6,"period":"Daily","credential_source":"platform"}"#,
+            budget(6, Period::Daily, false),
+        ),
+        // Counted only BYOK spend; now counts BYOK and operator spend.
+        (
+            KeyId::new("key-tenant"),
+            r#"{"schema_version":2,"max_micros":7,"period":"Monthly","credential_source":"tenant"}"#,
+            budget(7, Period::Monthly, true),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5657,6 +5801,13 @@ mod tests {
             budget: Option<&TenantBudget>,
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
+        }
+        fn set_key_budget(
+            &self,
+            key_id: &KeyId,
+            budget: Option<&KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.0.set_key_budget(key_id, budget)
         }
         fn set_limits(
             &self,
@@ -5788,6 +5939,13 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
         }
+        fn set_key_budget(
+            &self,
+            key_id: &KeyId,
+            budget: Option<&KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_key_budget(key_id, budget)
+        }
         fn set_limits(
             &self,
             subject: &TenantId,
@@ -5904,6 +6062,13 @@ mod tests {
             &self,
             _tenant: &TenantId,
             _budget: Option<&TenantBudget>,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn set_key_budget(
+            &self,
+            _key_id: &KeyId,
+            _budget: Option<&KeyBudget>,
         ) -> Result<(), StoreError> {
             Ok(())
         }
@@ -6295,10 +6460,10 @@ mod tests {
             concurrent_streams: Some(2),
             ..Default::default()
         };
-        let budget = TenantBudget {
+        let budget = KeyBudget {
             max_micros: MicroUsd::from_micros(8),
             period: Period::Daily,
-            credential_source: CredentialSource::Platform,
+            include_byok_in_limit: true,
         };
         let access = ModelAccess::Only(vec![ModelPattern::new("gpt-*")]);
         cp.set_key_limits(&key, Some(&limits)).unwrap();
@@ -6373,10 +6538,10 @@ mod tests {
             let key = KeyId::new("key-a");
             cp.mint_key(&TenantId::new("tenant-a"), &key).unwrap();
             let access = ModelAccess::Only(vec![ModelPattern::new("gpt-4*")]);
-            let budget = TenantBudget {
+            let budget = KeyBudget {
                 max_micros: MicroUsd::from_micros(50),
                 period: Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: true,
             };
             if policy_first {
                 cp.set_key_policy(&key, &access).unwrap();
@@ -7260,10 +7425,10 @@ mod tests {
             let tenant = TenantId::new("tenant-a");
             let id = KeyId::new("stable-key");
             let first = cp.mint_key(&tenant, &id).unwrap();
-            let budget = TenantBudget {
+            let budget = KeyBudget {
                 max_micros: crate::spend::MicroUsd::from_micros(10),
                 period: crate::spend::Period::Daily,
-                credential_source: CredentialSource::Platform,
+                include_byok_in_limit: true,
             };
             cp.set_policy(
                 &tenant,
@@ -7723,6 +7888,78 @@ mod tests {
             loaded.budgets.get(&TenantId::new("tenant-a")),
             Some(&budget)
         );
+    }
+
+    /// ADR-0007 amendment 1, redb upgrade: a database written before
+    /// `include_byok_in_limit` holds key budgets with one `credential_source`
+    /// scope, or none. Reopened, each loads with the documented mapping, so
+    /// no key budget stops counting what it counted, and a tenant budget in
+    /// the same table keeps its scope. A key budget written now carries only
+    /// the flag, so a build from before it reads the row as platform-scoped.
+    #[test]
+    fn redb_upgrade_loads_scoped_key_budgets_with_the_include_byok_mapping() {
+        let path = temp_db_path("key-budget-upgrade");
+        let tenant_row =
+            br#"{"schema_version":2,"max_micros":8,"period":"Daily","credential_source":"tenant"}"#;
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(BUDGETS_TABLE).unwrap();
+                for (key_id, row, _) in pre_flag_key_budget_rows() {
+                    table
+                        .insert(key_budget_subject(&key_id).as_str(), row.as_bytes())
+                        .unwrap();
+                }
+                table.insert("tenant-a", tenant_row.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        let loaded = store.load().unwrap();
+        for (key_id, row, expected) in pre_flag_key_budget_rows() {
+            assert_eq!(loaded.key_budgets.get(&key_id), Some(&expected), "{row}");
+        }
+        assert_eq!(loaded.key_budgets.len(), 3);
+        assert_eq!(
+            loaded.budgets.get(&TenantId::new("tenant-a")),
+            Some(&TenantBudget {
+                max_micros: MicroUsd::from_micros(8),
+                period: Period::Daily,
+                credential_source: CredentialSource::Tenant,
+            }),
+        );
+        assert_eq!(
+            loaded.budgets.len(),
+            1,
+            "key rows never load as tenant budgets"
+        );
+
+        let written = KeyBudget {
+            max_micros: MicroUsd::from_micros(9),
+            period: Period::Daily,
+            include_byok_in_limit: true,
+        };
+        let key_id = KeyId::new("key-new");
+        store.set_key_budget(&key_id, Some(&written)).unwrap();
+        let raw: serde_json::Value = {
+            let txn = store.db.begin_read().unwrap();
+            let table = txn.open_table(BUDGETS_TABLE).unwrap();
+            let row = table
+                .get(key_budget_subject(&key_id).as_str())
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice(row.value()).unwrap()
+        };
+        assert_eq!(raw["include_byok_in_limit"], true, "{raw}");
+        assert!(raw.get("credential_source").is_none(), "{raw}");
+        assert_eq!(
+            store.load().unwrap().key_budgets.get(&key_id),
+            Some(&written)
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

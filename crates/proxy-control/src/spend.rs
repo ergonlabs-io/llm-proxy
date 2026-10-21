@@ -2305,6 +2305,13 @@ pub mod test_support {
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
         }
+        fn set_key_budget(
+            &self,
+            key_id: &crate::auth::KeyId,
+            budget: Option<&crate::spend::KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_key_budget(key_id, budget)
+        }
         fn set_limits(
             &self,
             subject: &TenantId,
@@ -2933,6 +2940,13 @@ pub(crate) mod tests {
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
             }
+            fn set_key_budget(
+                &self,
+                key_id: &crate::auth::KeyId,
+                budget: Option<&crate::spend::KeyBudget>,
+            ) -> Result<(), StoreError> {
+                self.0.set_key_budget(key_id, budget)
+            }
             fn set_limits(
                 &self,
                 subject: &TenantId,
@@ -3252,6 +3266,13 @@ pub(crate) mod tests {
             budget: Option<&TenantBudget>,
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
+        }
+        fn set_key_budget(
+            &self,
+            key_id: &crate::auth::KeyId,
+            budget: Option<&crate::spend::KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.0.set_key_budget(key_id, budget)
         }
         fn set_limits(
             &self,
@@ -3705,6 +3726,13 @@ pub(crate) mod tests {
             ) -> Result<(), StoreError> {
                 self.inner.set_budget(tenant, budget)
             }
+            fn set_key_budget(
+                &self,
+                key_id: &crate::auth::KeyId,
+                budget: Option<&crate::spend::KeyBudget>,
+            ) -> Result<(), StoreError> {
+                self.inner.set_key_budget(key_id, budget)
+            }
             fn set_limits(
                 &self,
                 subject: &TenantId,
@@ -3904,6 +3932,13 @@ pub(crate) mod tests {
                 budget: Option<&TenantBudget>,
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
+            }
+            fn set_key_budget(
+                &self,
+                key_id: &crate::auth::KeyId,
+                budget: Option<&crate::spend::KeyBudget>,
+            ) -> Result<(), StoreError> {
+                self.0.set_key_budget(key_id, budget)
             }
             fn set_limits(
                 &self,
