@@ -47,7 +47,13 @@ npm run build
   `/models`, `/pricing` and the token counters in `/stats/prometheus`), **Keys**
   (list, create with optional limits, edit limits, revoke), **Models & pricing**
   (routing from `/models`, the team's model allow-list, the rate card), and
-  **Advanced** (tenants, clusters and config dump, raw status and stats).
+  **Billing** (newest billing-ledger entries; read-only, never acknowledges),
+  **Traces** (body-export switch, per-tenant opt-in, counters), and **Advanced**
+  (tenants, clusters and config dump, raw status and stats). Billing and Traces
+  appear only when `/ledger/entries` and `/traces/capture` answer for the token.
+- Gated reads run only after `GET /keys` accepts the token, stop once a token
+  is rejected, and the token field is debounced: the admin server locks a peer
+  out after 10 bad tokens a minute.
 - The Keys page creates keys in the `team` tenant: the admin API reserves
   `default`. The team model allow-list is written to both `team` and `default`
   (the tenant of the key `llm-proxy init` configures).

@@ -42,7 +42,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   optional limits; **Models & pricing** with routing, the models the team's
   keys may use, and a rate-card editor with a template and prices per 1M
   tokens. Tenants, clusters and raw stats move under **Advanced**. A new key is
-  shown with a ready-to-run curl, Python or Node request.
+  shown with a ready-to-run curl, Python or Node request. With a `ledger`
+  block, a **Billing** page lists the newest requests from the billing ledger
+  (key, model, provider, status, tokens, charge); with `observability.traces`,
+  a **Traces** page shows the body-export switch, per-tenant opt-in and
+  counters. Each page appears only when its feature is configured.
 - `llm-proxy init` writes an `admin-token` file and prints the admin UI
   address. The installer uses that token for the service.
 - `GET /models` reports each pattern's `target` cluster and lists path-only

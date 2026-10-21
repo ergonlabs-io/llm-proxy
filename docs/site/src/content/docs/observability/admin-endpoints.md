@@ -398,8 +398,15 @@ API, so any gated action needs the admin token.
 - **Address.** `http://<admin address>/ui/`. `GET /ui`, `GET /ui/`, and
   `GET /ui/<asset>` serve files. An unknown sub-path returns `index.html`.
   Other methods answer `405`.
-- **Pages.** Get started, Keys, Models & pricing, and Advanced (Tenants,
-  Clusters and config, Status and stats), in this order. The Keys page
+- **Pages.** Get started, Keys, Models & pricing, Billing, Traces, and
+  Advanced (Tenants, Clusters and config, Status and stats), in this order.
+  Billing appears only when the config has a `ledger` block. It lists the
+  newest ledger entries (`GET /ledger/entries`) and never calls
+  `/ledger/ack`. Traces appears only when the config has
+  `observability.traces`. It shows the emergency switch
+  (`/traces/capture`), each key tenant's opt-in
+  (`/tenants/{id}/trace_export`), and the export counters. It does not show
+  the bodies; read them from the trace directory or the bucket. The Keys page
   creates keys in the `team` tenant unless you set another tenant in its
   advanced options. The admin API reserves the `default` tenant, so it cannot
   create keys there.
