@@ -300,7 +300,7 @@
         "max_policy_staleness": {
           "$ref": "#/$defs/Duration",
           "default": "4m",
-          "description": "How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`."
+          "description": "How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request, and every JWT request of a tenant holding stored provider credentials, is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked or a credential deleted elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`."
         },
         "stored_output_owner_ttl": {
           "$ref": "#/$defs/Duration",
@@ -310,7 +310,7 @@
         "jwt": {
           "type": "array",
           "default": [],
-          "description": "JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. JWT callers always use the operator's provider keys, never a tenant's stored provider credentials, so lowering warns when `tenant_credentials` is also set. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning.",
+          "description": "JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. A tenant's stored provider credentials (`tenant_credentials`) apply to its JWT callers exactly as to its virtual keys. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning.",
           "items": { "$ref": "#/$defs/AuthJwtProvider" }
         },
         "chargeback_tags": {

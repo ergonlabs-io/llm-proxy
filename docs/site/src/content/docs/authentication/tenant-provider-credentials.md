@@ -42,9 +42,9 @@ This page uses these terms:
 - **Tenant mode**: the tenant holds at least one stored credential. No attempt
   uses the platform credential.
 
-Tenant credentials apply only to requests that carry a virtual key. A JWT
-principal always uses the platform credential. See
-[Limitations](#limitations).
+The mode applies to every request the tenant sends, with a virtual key or with
+a JWT (`auth.jwt`). A JWT caller and a virtual key of the same tenant send the
+same credential.
 
 ## Strict tenant mode
 
@@ -511,9 +511,12 @@ written before the scope existed read as platform-scoped.
 
 ## Limitations
 
-- **Virtual-key principals only.** A JWT principal reads no control-plane
-  snapshot, so it always uses the platform credential. Its records show
-  `platform`.
+- **A stale policy snapshot refuses tenant mode.** When the auth store has not
+  been read for longer than `auth.max_policy_staleness`, every virtual key
+  gets `503`. A JWT caller of a tenant in tenant mode also gets `503`, so it
+  never uses the platform credential or a deleted key. A JWT caller of a tenant
+  in platform mode is admitted. A tenant that stored its first key during that
+  time stays in platform mode until the snapshot is fresh again.
 - **One check, at save time.** `PUT` checks the key once, before it stores the
   key. The proxy does not check the key again. If the provider revokes the key
   later, `verified_at` does not change. The tenant's next request then gets the
@@ -669,8 +672,11 @@ above.
   `crates/proxy-control/src/control.rs`. `EncodedTenantBudget` has no
   `deny_unknown_fields`, which is why an older build ignores the scope.
 - Store check: `parse_config` in `crates/proxy-filters/src/auth_filter.rs`.
-  JWT principals: `crates/proxy-filters/src/jwt_auth.rs` sets
-  `tenant_credentials: None`.
+  JWT principals: `TenantFacts::admit` in `crates/proxy-control/src/auth.rs`,
+  read by `crates/proxy-filters/src/jwt_auth.rs`. Tests:
+  `a_jwt_tenant_gets_the_credential_set_its_virtual_key_gets` in
+  `auth_filter.rs`, `crates/proxy/tests/jwt_tenant_credentials_e2e.rs`, and
+  QA-19.
 - Counter: `TENANT_CREDENTIAL_REQUESTS` in
   `crates/proxy-observability/src/stats.rs`, rendered in
   `stats/prometheus_render.rs`. Records: `RequestRecord` and `AttemptRecord`

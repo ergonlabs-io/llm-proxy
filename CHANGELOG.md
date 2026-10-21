@@ -11,6 +11,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Changed
+
+- A JWT caller (`auth.jwt`, or `jwt_providers` in Envoy mode) whose tenant
+  stored its own provider credentials is now sent upstream with that tenant's
+  credential, and its spend is tenant-scoped, exactly as for a virtual key of
+  the same tenant. Before, it always used the operator's provider key and was
+  charged as platform spend. A tenant with no stored credential is unchanged.
+  The load warning for `auth.jwt` with `auth.tenant_credentials` is removed
+  (ADR-0014 decision 2, amended).
+- When the policy snapshot is older than `auth.max_policy_staleness`, a JWT
+  request of a tenant that holds stored provider credentials gets `503`
+  (`auth_policy_stale`), as that tenant's virtual keys do. JWT requests of
+  other tenants are admitted as before.
+
 ## [0.6.0] - 2026-10-20
 
 ### Breaking
