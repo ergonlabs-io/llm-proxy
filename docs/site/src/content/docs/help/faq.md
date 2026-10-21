@@ -12,8 +12,7 @@ related:
   - help/troubleshooting
 ---
 
-Each answer describes the code in the repository: release 0.6.1 plus the
-changes that are not yet released. The project is before 1.0. See
+Each answer describes the current code in the repository. The project is before 1.0. See
 [Limitations](/docs/llm-proxy/help/limitations/) for every gap.
 
 ## What it is

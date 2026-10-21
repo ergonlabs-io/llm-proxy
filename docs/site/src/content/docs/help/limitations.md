@@ -14,8 +14,7 @@ related:
 
 This page lists what the proxy does not do when you start it with `--config`.
 The project is before 1.0, and the config surface can still change. The
-entries describe the code in the repository: release 0.6.1 plus the changes
-that are not yet released. The proxy is strict by design. A field that parses
+entries describe the current code in the repository. The proxy is strict by design. A field that parses
 but does nothing produces a load warning, never silence.
 
 Use the status words this way:
