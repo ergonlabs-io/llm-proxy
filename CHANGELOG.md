@@ -62,6 +62,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   the client's `Sec-WebSocket-Extensions` offer from a realtime session so its frames
   stay readable. On drain each WebSocket session gets a Close frame with code 1001.
 
+- `make smoke-live` runs live smoke tests against real providers: OpenRouter
+  on a free model (non-streaming, streaming, and a bad key that must return
+  the provider's 401), Vertex AI, Amazon Bedrock, OpenAI and Anthropic. Each
+  checks the status, the content, and the access-log line's provider and
+  extracted usage. A provider with no credentials is skipped by name
+  (`LIVE-SKIP`); `LIVE_SMOKE_STRICT=1` makes that a failure. The workflow
+  `.github/workflows/live-smoke.yml` runs the target weekly and on demand,
+  never on pull requests. See `testing/diffrig/README.md`.
+
 ### Changed
 
 - A JWT caller (`auth.jwt`, or `jwt_providers` in Envoy mode) whose tenant

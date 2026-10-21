@@ -1,0 +1,87 @@
+# Live provider smoke tests (`make smoke-live`). Every other test runs against
+# mocks, so this is the only job that sees a provider-side wire or auth change.
+#
+# Never runs on pull requests: it calls real providers, some of which bill,
+# and a fork's PR must never see these secrets. Runs weekly and on demand.
+#
+# Credentials come from repository secrets. A provider whose secrets are unset
+# is skipped by name (a `LIVE-SKIP` line, copied to the job summary), not
+# failed, so the job is useful before every provider is configured. Secrets
+# (Settings > Secrets and variables > Actions):
+#   OPENROUTER_API_KEY                                   OpenRouter (free model)
+#   VERTEX_PROJECT, VERTEX_ACCESS_TOKEN, VERTEX_LOCATION Vertex AI (Claude)
+#   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY Amazon Bedrock (Claude)
+#   OPENAI_API_KEY, ANTHROPIC_API_KEY                    OpenAI, Anthropic
+# VERTEX_ACCESS_TOKEN is a short-lived OAuth token; a stored one expires within
+# an hour, so it suits manual dispatch rather than the schedule.
+name: Live smoke
+
+on:
+  schedule:
+    # Tuesdays, 04:41 UTC.
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+    inputs:
+      openrouter_model:
+        description: OpenRouter model (empty for the test's default free model)
+        default: ""
+      strict:
+        description: Fail instead of skipping a provider with no credentials
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-smoke
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Live smoke tests
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_SMOKE_MODEL: ${{ inputs.openrouter_model }}
+          VERTEX_PROJECT: ${{ secrets.VERTEX_PROJECT }}
+          VERTEX_ACCESS_TOKEN: ${{ secrets.VERTEX_ACCESS_TOKEN }}
+          VERTEX_LOCATION: ${{ secrets.VERTEX_LOCATION }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LIVE_SMOKE_STRICT: ${{ inputs.strict && '1' || '' }}
+        run: |
+          # An unset secret arrives as an empty string; unset it so the test
+          # sees "not set" and skips by name instead of sending an empty key.
+          for var in OPENROUTER_API_KEY OPENROUTER_SMOKE_MODEL VERTEX_PROJECT \
+            VERTEX_ACCESS_TOKEN VERTEX_LOCATION AWS_REGION AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY OPENAI_API_KEY ANTHROPIC_API_KEY LIVE_SMOKE_STRICT; do
+            if [ -z "${!var}" ]; then unset "$var"; fi
+          done
+          set -o pipefail
+          make smoke-live 2>&1 | tee live-smoke.log
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Live smoke"
+            echo '```'
+            grep -E '^ +(PASS|FAIL|SIGSEGV|TIMEOUT) |Summary \[|^LIVE-SKIP' live-smoke.log | sort -u || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

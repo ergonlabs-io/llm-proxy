@@ -222,6 +222,16 @@ run: ## Run the proxy with CONFIG (default: examples/tcp-proxy.yaml)
 validate: ## Validate CONFIG and exit, e.g. make validate CONFIG=my-bootstrap.yaml
 	cargo run -p proxy -- -c $(CONFIG) --mode validate
 
+# Opt-in, not part of `make ci`: calls real providers over the internet. Each
+# test whose credentials are unset prints a `LIVE-SKIP` line and passes, so read
+# those lines; LIVE_SMOKE_STRICT=1 turns them into failures. `--no-capture`
+# keeps the lines visible and runs the tests one at a time, which also keeps
+# free-tier rate limits out of the result. .github/workflows/live-smoke.yml runs
+# this weekly. See testing/diffrig/README.md "Live provider smoke tests".
+.PHONY: smoke-live
+smoke-live: ## Live provider smoke tests (OpenRouter, Vertex, Bedrock, OpenAI, Anthropic); needs keys
+	cargo nextest run -p diffrig --test live_smoke --run-ignored ignored-only --no-capture
+
 # Opt-in, not part of `make ci`: downloads the pinned h2spec and starts the binary.
 .PHONY: h2spec
 h2spec: ## HTTP/2 conformance (h2spec) against the downstream h2 listener, plaintext + TLS
