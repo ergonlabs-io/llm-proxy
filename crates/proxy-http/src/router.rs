@@ -26,6 +26,7 @@ use proxy_cluster::{
 };
 use proxy_config::ir::{
     DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher, UpgradeConfig,
+    WeightedSelection,
 };
 use proxy_observability::access_log::TimePoint;
 use proxy_observability::stats::instruments;
@@ -46,7 +47,10 @@ use crate::handler::{
     local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, UpgradeTunnel,
 };
 use crate::retry::{AttemptOutcome, RetryState};
-use crate::route::{apply_prefix_rewrite, select_cluster, weighted_draw, HashIdentity};
+use crate::route::{
+    apply_prefix_rewrite, health_adjusted_draw, latency_draw, select_cluster, weighted_draw,
+    DrawSource, HashIdentity, MemberSignals,
+};
 use crate::stat_handles::RouterStats;
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
@@ -152,6 +156,16 @@ pub struct RouterFilterFactory {
     /// upgrade type is ever allowed -- matching Envoy's "no `upgrade_configs`
     /// means no upgrades" default.
     upgrade_configs: Arc<HashMap<String, bool>>,
+}
+
+impl MemberSignals for ClusterRegistrySnapshot {
+    fn is_drawable(&self, member: &str) -> bool {
+        ClusterRegistrySnapshot::is_drawable(self, member)
+    }
+
+    fn expected_latency_micros(&self, member: &str) -> Option<f64> {
+        ClusterRegistrySnapshot::expected_latency_micros(self, member)
+    }
 }
 
 impl RouterFilterFactory {
@@ -528,6 +542,32 @@ struct AttemptCountCfg {
     /// Set `x-envoy-attempt-count` on the downstream response, to the total
     /// number of attempts made.
     response: bool,
+    /// Set the routing headers (`ROUTING_PROVIDER_HEADER`,
+    /// `ROUTING_TRIED_HEADER`) on the downstream response.
+    routing: bool,
+}
+
+/// The cluster that served the response (`envoy-divergences.md` row 49).
+pub const ROUTING_PROVIDER_HEADER: &str = "x-llmproxy-provider";
+/// Every cluster the request was dispatched to, in order, comma-separated.
+pub const ROUTING_TRIED_HEADER: &str = "x-llmproxy-providers-tried";
+
+/// Sets the routing headers on the response head, so a streaming response
+/// carries them too. Values are operator cluster names only, never a host,
+/// credential or tenant value. `served` is `None` for a local reply, which no
+/// cluster served; `tried` is empty when nothing was dispatched, and then
+/// neither header is set. A name that is not a valid header value is left
+/// out rather than sent mangled.
+fn set_routing_headers(headers: &mut http::HeaderMap, served: Option<&str>, tried: &[String]) {
+    if tried.is_empty() {
+        return;
+    }
+    if let Some(value) = served.and_then(|name| HeaderValue::from_str(name).ok()) {
+        headers.insert(ROUTING_PROVIDER_HEADER, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&tried.join(",")) {
+        headers.insert(ROUTING_TRIED_HEADER, value);
+    }
 }
 
 impl RouterHandler {
@@ -604,6 +644,7 @@ impl RouterHandler {
                         AttemptCountCfg {
                             request: route.include_request_attempt_count,
                             response: route.include_attempt_count_in_response,
+                            routing: route.include_routing_headers_in_response,
                         },
                     )
                     .await
@@ -1131,10 +1172,9 @@ impl RouterHandler {
         let ForwardTarget::Weighted(weighted) = target else {
             return 0;
         };
-        if weighted.hash_policy.is_empty() {
-            return weighted_draw(weighted, headers, &HashIdentity::default(), rand::random).0;
-        }
-        let (draw, source) = {
+        let (draw, source) = if weighted.hash_policy.is_empty() {
+            weighted_draw(weighted, headers, &HashIdentity::default(), rand::random)
+        } else {
             let info = dcb.stream_info();
             let identity = HashIdentity {
                 key_id: info.auth.key_id.as_deref(),
@@ -1143,8 +1183,16 @@ impl RouterHandler {
             };
             weighted_draw(weighted, headers, &identity, rand::random)
         };
-        self.stats.record_session_affinity(source);
-        draw
+        if !weighted.hash_policy.is_empty() {
+            self.stats.record_session_affinity(source);
+        }
+        // A session hash always maps with the configured weights (ADR-0016
+        // decision 6): if latency moved it, every shift in a member's average
+        // would move sessions off their warm prompt cache.
+        if weighted.selection == WeightedSelection::Latency && source != DrawSource::Hashed {
+            return latency_draw(weighted, &self.clusters, rand::random).unwrap_or(draw);
+        }
+        health_adjusted_draw(weighted, draw, source, &self.clusters, rand::random)
     }
 
     async fn apply_forward(
@@ -1264,6 +1312,10 @@ impl RouterHandler {
         };
         let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
 
+        let latency_sampled = matches!(
+            &fwd.target,
+            ForwardTarget::Weighted(weighted) if weighted.selection == WeightedSelection::Latency
+        );
         let mut retry_state = fwd.retry_policy.as_ref().map(RetryState::new);
         if let Some(state) = &mut retry_state {
             // S3.4 (Envoy's `no_retry_body_too_large`): the replay limit is
@@ -1950,6 +2002,11 @@ impl RouterHandler {
                 };
                 let response_info = attempt_info.clone();
                 let send_timing = attempt_timing.clone();
+                // Latency mode samples the cluster actually dialled; other
+                // routes pay nothing for it.
+                let latency_recorder = latency_sampled
+                    .then(|| self.clusters.latency_recorder(attempt_cluster))
+                    .flatten();
                 let mut send = Box::pin(async move {
                     let mut guard = attempt_guard;
                     // The request head goes to the upstream codec on this
@@ -1959,6 +2016,25 @@ impl RouterHandler {
                     match result {
                         Ok(mut response) => {
                             send_timing.mark(TimePoint::UsRxBeg);
+                            // An error answer is often fast; sampling it
+                            // would make a failing member look fast.
+                            if let Some(recorder) =
+                                latency_recorder.filter(|_| response.head.status.is_success())
+                            {
+                                let streaming = response
+                                    .head
+                                    .headers
+                                    .get(http::header::CONTENT_TYPE)
+                                    .is_some_and(|value| {
+                                        value.as_bytes().starts_with(b"text/event-stream")
+                                    });
+                                response.body = timing::latency_sampled(
+                                    response.body,
+                                    recorder,
+                                    attempt_dispatched_at,
+                                    streaming,
+                                );
+                            }
                             response.body = timing::timed(
                                 response.body,
                                 send_timing,
@@ -2480,6 +2556,23 @@ impl RouterHandler {
             resp.head
                 .headers
                 .insert("x-envoy-attempt-count", HeaderValue::from(attempt_number));
+        }
+        if attempt_count.routing {
+            // Only an upstream answer passes through
+            // `finalize_upstream_response`, which stamps the service time; a
+            // local reply (timeout, no host, overflow) was served by no
+            // cluster, though it still lists the attempts made.
+            let served = resp
+                .head
+                .headers
+                .contains_key("x-envoy-upstream-service-time")
+                .then(|| dcb.stream_info().upstream_cluster.clone())
+                .flatten();
+            set_routing_headers(
+                &mut resp.head.headers,
+                served.as_deref(),
+                &ctx.attempted_clusters,
+            );
         }
         resp
     }
@@ -4296,6 +4389,7 @@ mod tests {
                     route_index: 0,
                     include_request_attempt_count: false,
                     include_attempt_count_in_response: false,
+                    include_routing_headers_in_response: false,
                 })],
                 typed_per_filter_config: BTreeMap::new(),
             }],
@@ -4372,6 +4466,7 @@ mod tests {
                     route_index: 0,
                     include_request_attempt_count: false,
                     include_attempt_count_in_response: false,
+                    include_routing_headers_in_response: false,
                 })],
                 typed_per_filter_config: BTreeMap::new(),
             }],
@@ -5559,6 +5654,7 @@ mod tests {
                 route_index: 0,
                 include_request_attempt_count: false,
                 include_attempt_count_in_response: false,
+                include_routing_headers_in_response: false,
             })
         }
         RouteTable::new(
@@ -5639,6 +5735,7 @@ mod tests {
                 route_index: 0,
                 include_request_attempt_count: false,
                 include_attempt_count_in_response: false,
+                include_routing_headers_in_response: false,
             })
         }
         RouteTable::new(

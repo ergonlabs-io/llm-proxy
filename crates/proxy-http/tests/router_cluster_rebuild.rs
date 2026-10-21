@@ -112,6 +112,7 @@ fn handler_for(manager: &Arc<ClusterManager>) -> FilterChainHandler {
                 route_index: 0,
                 include_request_attempt_count: false,
                 include_attempt_count_in_response: false,
+                include_routing_headers_in_response: false,
             })],
             typed_per_filter_config: BTreeMap::new(),
         }],

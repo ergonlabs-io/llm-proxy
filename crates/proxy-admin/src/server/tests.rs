@@ -280,6 +280,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         route_index: 0,
         include_request_attempt_count: false,
         include_attempt_count_in_response: false,
+        include_routing_headers_in_response: false,
         streaming_strict: false,
     });
     let vhost = VirtualHostIR {
@@ -432,6 +433,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
             route_index,
             include_request_attempt_count: false,
             include_attempt_count_in_response: false,
+            include_routing_headers_in_response: false,
             streaming_strict: false,
         })
     }

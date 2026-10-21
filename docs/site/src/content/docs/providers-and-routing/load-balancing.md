@@ -49,7 +49,9 @@ on every worker. Replicas do not coordinate. The split matches the weights
 over many requests, not over a few. Weight `0` makes an entry a fallback
 only. A provider ejected by its `outlier_detection` gets no first picks
 until the ejection ends. The next entry in list order that is not ejected
-takes its share. The proxy does not support cost-aware selection.
+takes its share. To send less traffic to a slow provider, see
+[Preferring the faster provider](#preferring-the-faster-provider). The proxy
+does not support cost-aware selection.
 
 For the rules for `weight`, the load errors, the fallback chain, and
 `outlier_detection`, see
@@ -114,6 +116,57 @@ policy, or a `filter_state` policy with the key `llmproxy.auth.key_id`,
 `llmproxy.auth.user_id` or `llmproxy.auth.tenant` behind the authentication
 filter. A header policy picks the same cluster as Envoy v1.38. Other hash
 policy types are a load error. Design: ADR-0016.
+
+## Preferring the faster provider
+
+With `selection: latency`, a weighted model sends less traffic to a provider
+that answers more slowly than the others.
+
+```yaml
+models:
+  chat-default:
+    providers:
+      - { provider: openai, weight: 1 }
+      - { provider: together, weight: 1 }
+    selection: latency
+```
+
+Each replica keeps a moving average of the latency of each provider. For a
+streaming response, the latency is the time to the first event. For other
+responses, it is the time to the full response. Only successful responses
+of `latency` models count. Each provider's weight is multiplied by the
+average of the fastest provider divided by its own average. The result is
+never less than a tenth of the weight. In the example, if `together` is ten
+times slower than `openai`, `together` gets about 1 request in 11.
+
+- A slow provider always keeps some traffic. Thus the proxy continues to
+  measure it, and the provider gets its share again when it is fast again.
+- A provider that has no measurement yet keeps its full weight.
+- A provider ejected by its `outlier_detection` gets no traffic while another
+  provider is not ejected. This is also true without `selection: latency`.
+- Weight `0` stays a fallback only.
+- A request pinned by `session_affinity` uses the plain weights. Thus a
+  session does not move to a different provider when latencies change.
+- Replicas do not share measurements. Each replica uses its own traffic.
+
+`selection: latency` needs `weight` on every provider of the model. A model
+with one weighted provider has nothing to choose, so the setting has no
+effect there.
+
+In a bootstrap configuration, set route metadata on a `weighted_clusters`
+route. Envoy has no latency mode; this is an llmproxy extension. On another
+route the metadata is a load error.
+
+```yaml
+routes:
+  - match: { prefix: "/" }
+    metadata:
+      filter_metadata:
+        io.llmproxy.selection: { mode: latency }
+    route:
+      weighted_clusters:
+        clusters: [{ name: a, weight: 1 }, { name: b, weight: 1 }]
+```
 
 ## Inside a provider, there is nothing to balance
 

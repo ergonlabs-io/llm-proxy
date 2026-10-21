@@ -1653,6 +1653,11 @@ pub struct RouteEntry {
     /// when true the router sets `x-envoy-attempt-count` on the response to
     /// the TOTAL attempts made. Same denormalization as above.
     pub include_attempt_count_in_response: bool,
+    /// llmproxy extension `VirtualHost.metadata.filter_metadata
+    /// ["io.llmproxy.routing_headers"]` (`envoy-divergences.md` row 49):
+    /// when true the response names the cluster that served it and the
+    /// ordered clusters attempted. Same denormalization as above.
+    pub include_routing_headers_in_response: bool,
 }
 
 #[derive(Debug)]
@@ -1764,6 +1769,21 @@ pub struct WeightedClusters {
     /// random draw. Held here rather than on `ForwardAction` because nothing
     /// else consumes a route hash (ring hash and Maglev are refused).
     pub hash_policy: Vec<RouteHashPolicy>,
+    /// How a draw with no session hash weighs the members (llmproxy
+    /// extension, `envoy-divergences.md` row 48). A hashed draw always uses
+    /// the configured weights, so a session never moves with latency.
+    pub selection: WeightedSelection,
+}
+
+/// The weighting of a [`WeightedClusters`] draw that has no session hash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WeightedSelection {
+    /// The configured weights alone, as Envoy.
+    #[default]
+    Static,
+    /// Each member's weight is scaled down by how much slower its measured
+    /// latency is than the fastest member's, to a floor.
+    Latency,
 }
 
 /// One entry of a route hash policy (Envoy `RouteAction.HashPolicy`,

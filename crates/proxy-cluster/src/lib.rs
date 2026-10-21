@@ -15,6 +15,7 @@ use proxy_config::ir::ClusterName;
 pub mod discovery;
 pub mod health_check;
 pub mod host_set;
+pub mod latency;
 pub mod load_balancer;
 pub mod manager;
 pub mod minted_credential;
