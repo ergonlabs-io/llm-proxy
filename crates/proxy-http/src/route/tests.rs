@@ -1034,3 +1034,129 @@ fn apply_prefix_rewrite_none_for_regex_matcher() {
     };
     assert_eq!(apply_prefix_rewrite(&route.matcher, "/new", "/foo"), None);
 }
+
+/// Members `a:2, b:1, c:1` (cumulative 2, 3, 4) with a fixed health answer.
+fn three_members() -> WeightedClusters {
+    WeightedClusters {
+        cumulative: vec![("a".into(), 2), ("b".into(), 3), ("c".into(), 4)],
+        total_weight: 4,
+        hash_policy: Vec::new(),
+        selection: Default::default(),
+    }
+}
+
+struct Ejected(&'static [&'static str]);
+impl MemberSignals for Ejected {
+    fn is_drawable(&self, member: &str) -> bool {
+        !self.0.contains(&member)
+    }
+    fn expected_latency_micros(&self, _: &str) -> Option<f64> {
+        None
+    }
+}
+
+/// A draw on a healthy member is the configured pick, untouched, and takes
+/// no second random value. A draw on an ejected member is redrawn among the
+/// rest by their configured weights: with `a` ejected, `b` and `c` split
+/// 1:1 over every value.
+#[test]
+fn health_adjusted_draw_moves_only_draws_on_an_ejected_member() {
+    let w = three_members();
+    let b_ejected = Ejected(&["b"]);
+    for draw in [0, 1, 3] {
+        let kept = health_adjusted_draw(&w, draw, DrawSource::Random, &b_ejected, || {
+            panic!("a healthy pick needs no redraw")
+        });
+        assert_eq!(kept, draw);
+    }
+
+    let a_ejected = Ejected(&["a"]);
+    let mut counts = std::collections::BTreeMap::new();
+    for value in 0..100u64 {
+        let draw = health_adjusted_draw(&w, 0, DrawSource::Random, &a_ejected, || value);
+        *counts.entry(w.pick(draw).clone()).or_insert(0) += 1;
+    }
+    assert_eq!(
+        counts,
+        [("b".to_string(), 50), ("c".to_string(), 50)].into()
+    );
+}
+
+/// A hashed draw on an ejected member always lands on the same substitute,
+/// so one session stays put while its member is out; with every member
+/// ejected the configured draw stands and the member's own pick answers.
+#[test]
+fn health_adjusted_draw_keeps_a_session_on_one_substitute() {
+    let w = three_members();
+    let a_ejected = Ejected(&["a"]);
+    for draw in [0, 1] {
+        let first = health_adjusted_draw(&w, draw, DrawSource::Hashed, &a_ejected, || {
+            panic!("a hashed draw never takes a random value")
+        });
+        let again = health_adjusted_draw(&w, draw, DrawSource::Hashed, &a_ejected, || 0);
+        assert_eq!(first, again, "draw {draw} moved between requests");
+        assert_ne!(w.pick(first), "a");
+    }
+
+    let all = Ejected(&["a", "b", "c"]);
+    assert_eq!(
+        health_adjusted_draw(&w, 2, DrawSource::Random, &all, || 0),
+        2
+    );
+}
+
+/// Fixed latencies (microseconds) per member, every member healthy unless
+/// listed as ejected.
+struct Measured(&'static [(&'static str, f64)], &'static [&'static str]);
+impl MemberSignals for Measured {
+    fn is_drawable(&self, member: &str) -> bool {
+        !self.1.contains(&member)
+    }
+    fn expected_latency_micros(&self, member: &str) -> Option<f64> {
+        self.0.iter().find(|(m, _)| *m == member).map(|(_, l)| *l)
+    }
+}
+
+/// Counts which member each value in `0..n` lands on.
+fn latency_split(w: &WeightedClusters, members: &Measured, n: u64) -> Vec<(String, u64)> {
+    let mut counts = std::collections::BTreeMap::new();
+    for value in 0..n {
+        let draw = latency_draw(w, members, || value).expect("a drawable member");
+        *counts.entry(w.pick(draw).clone()).or_insert(0) += 1;
+    }
+    counts.into_iter().collect()
+}
+
+/// Each weight is scaled by `fastest / own latency`: `a` (weight 2, 10 ms)
+/// keeps 1000 permille, `b` (weight 1, 20 ms) 500, and `c` (weight 1,
+/// 1 s) is held at the floor, 100. Scaled weights 2000:500:100 over 2600
+/// values split exactly.
+#[test]
+fn latency_draw_scales_weights_by_relative_latency_to_a_floor() {
+    let w = three_members();
+    let members = Measured(&[("a", 10_000.0), ("b", 20_000.0), ("c", 1_000_000.0)], &[]);
+    assert_eq!(
+        latency_split(&w, &members, 2600),
+        [("a".into(), 2000), ("b".into(), 500), ("c".into(), 100)]
+    );
+}
+
+/// A member with no sample keeps its full weight, so a new member is tried;
+/// an ejected member gets nothing even when it is the fastest, and the
+/// floor is relative to the fastest member still drawable.
+#[test]
+fn latency_draw_tries_unmeasured_members_and_skips_ejected_ones() {
+    let w = three_members();
+    let unmeasured_b = Measured(&[("a", 10_000.0), ("c", 1_000_000.0)], &[]);
+    assert_eq!(
+        latency_split(&w, &unmeasured_b, 3100),
+        [("a".into(), 2000), ("b".into(), 1000), ("c".into(), 100)]
+    );
+    let a_ejected = Measured(&[("a", 1.0), ("b", 20_000.0), ("c", 40_000.0)], &["a"]);
+    assert_eq!(
+        latency_split(&w, &a_ejected, 1500),
+        [("b".into(), 1000), ("c".into(), 500)]
+    );
+    let all = Measured(&[], &["a", "b", "c"]);
+    assert_eq!(latency_draw(&w, &all, || 0), None);
+}

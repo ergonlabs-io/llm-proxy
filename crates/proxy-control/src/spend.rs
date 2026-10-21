@@ -461,6 +461,61 @@ pub struct TenantBudget {
     pub credential_source: CredentialSource,
 }
 
+/// A key's spend ceiling. Same `None`-means-unlimited and integer-money rules
+/// as [`TenantBudget`]; it differs only in what it counts.
+///
+/// # A key budget counts operator spend, and BYOK spend only when asked
+///
+/// ADR-0007 amendment 1 follows OpenRouter's `include_byok_in_limit`: a key
+/// budget always counts spend on the operator's (platform) credential, and
+/// `include_byok_in_limit: true` makes it also count spend on the tenant's
+/// own credential. A tenant budget keeps its single [`CredentialSource`]
+/// scope; only the key level changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyBudget {
+    pub max_micros: MicroUsd,
+    pub period: Period,
+    /// Also count, and enforce on, requests that run on the tenant's own
+    /// credential. Defaults to `false`, as OpenRouter's does.
+    pub include_byok_in_limit: bool,
+}
+
+impl KeyBudget {
+    /// Whether a request admitted in `mode` is held to this ceiling. A
+    /// platform-mode request always is; a tenant-mode (BYOK) request only
+    /// with the flag. Tenant mode never dials the operator's credential
+    /// (ADR-0007 decision 5), so an unenforced budget would count nothing.
+    pub fn enforced_in(&self, mode: CredentialSource) -> bool {
+        mode == CredentialSource::Platform || self.include_byok_in_limit
+    }
+
+    /// Whether spend from an attempt on `source` is added to this budget.
+    /// `None` means no attempt reached the credential step (ADR-0007
+    /// decision 7), so nothing was spent on any credential.
+    pub fn counts(&self, source: Option<CredentialSource>) -> bool {
+        match source {
+            Some(CredentialSource::Platform) => true,
+            Some(CredentialSource::Tenant) => self.include_byok_in_limit,
+            None => false,
+        }
+    }
+
+    /// The upgrade mapping for a key budget stored before the flag existed,
+    /// when it carried one `credential_source` scope (ADR-0007 amendment 1).
+    /// The new budget never stops counting what the old one counted:
+    ///
+    /// - absent or `platform`: `false`, operator spend only, as before.
+    /// - `tenant`: `true`. It keeps counting BYOK spend and now also counts
+    ///   operator spend, which the old scope ignored.
+    pub fn from_scoped(budget: TenantBudget) -> Self {
+        KeyBudget {
+            max_micros: budget.max_micros,
+            period: budget.period,
+            include_byok_in_limit: budget.credential_source == CredentialSource::Tenant,
+        }
+    }
+}
+
 /// What this replica does when its spend state has gone STALE -- when the
 /// accumulator has not reconciled with the store for longer than
 /// [`ReconciliationPolicy::bound`].
@@ -2250,6 +2305,13 @@ pub mod test_support {
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
         }
+        fn set_key_budget(
+            &self,
+            key_id: &crate::auth::KeyId,
+            budget: Option<&crate::spend::KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_key_budget(key_id, budget)
+        }
         fn set_limits(
             &self,
             subject: &TenantId,
@@ -2878,6 +2940,13 @@ pub(crate) mod tests {
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
             }
+            fn set_key_budget(
+                &self,
+                key_id: &crate::auth::KeyId,
+                budget: Option<&crate::spend::KeyBudget>,
+            ) -> Result<(), StoreError> {
+                self.0.set_key_budget(key_id, budget)
+            }
             fn set_limits(
                 &self,
                 subject: &TenantId,
@@ -3197,6 +3266,13 @@ pub(crate) mod tests {
             budget: Option<&TenantBudget>,
         ) -> Result<(), StoreError> {
             self.0.set_budget(tenant, budget)
+        }
+        fn set_key_budget(
+            &self,
+            key_id: &crate::auth::KeyId,
+            budget: Option<&crate::spend::KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.0.set_key_budget(key_id, budget)
         }
         fn set_limits(
             &self,
@@ -3650,6 +3726,13 @@ pub(crate) mod tests {
             ) -> Result<(), StoreError> {
                 self.inner.set_budget(tenant, budget)
             }
+            fn set_key_budget(
+                &self,
+                key_id: &crate::auth::KeyId,
+                budget: Option<&crate::spend::KeyBudget>,
+            ) -> Result<(), StoreError> {
+                self.inner.set_key_budget(key_id, budget)
+            }
             fn set_limits(
                 &self,
                 subject: &TenantId,
@@ -3849,6 +3932,13 @@ pub(crate) mod tests {
                 budget: Option<&TenantBudget>,
             ) -> Result<(), StoreError> {
                 self.0.set_budget(tenant, budget)
+            }
+            fn set_key_budget(
+                &self,
+                key_id: &crate::auth::KeyId,
+                budget: Option<&crate::spend::KeyBudget>,
+            ) -> Result<(), StoreError> {
+                self.0.set_key_budget(key_id, budget)
             }
             fn set_limits(
                 &self,

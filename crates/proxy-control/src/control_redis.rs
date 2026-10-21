@@ -57,15 +57,15 @@ use crate::control::{
     check_object_id, decode_object_owner_row, encode_object_owner_row, ObjectOwner,
 };
 use crate::control::{
-    decode_json, decode_rate_card_row, encode_json, store_err, ControlPlaneStore, EncodedKeyRow,
-    EncodedLimitPolicy, EncodedModelAccess, EncodedRateCardRow, EncodedTenantBudget,
-    EncodedTenantCredentialRow, FlushToken, LimitPolicy, SpendDelta, StoreError,
-    StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential, WindowDelta, WindowRow,
-    TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
+    decode_json, decode_rate_card_row, encode_json, key_id_from_budget_subject, store_err,
+    ControlPlaneStore, EncodedKeyBudget, EncodedKeyRow, EncodedLimitPolicy, EncodedModelAccess,
+    EncodedRateCardRow, EncodedTenantBudget, EncodedTenantCredentialRow, FlushToken, LimitPolicy,
+    SpendDelta, StoreError, StoredControlPlane, StoredKey, StoredRateCard, StoredTenantCredential,
+    WindowDelta, WindowRow, TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
 };
 use crate::control::{decode_trace_export_row, encode_trace_export_row};
 use crate::model_authz::ModelAccess;
-use crate::spend::{PeriodKey, TenantBudget};
+use crate::spend::{key_spend_subject, KeyBudget, PeriodKey, TenantBudget};
 use crate::window_counter::{FleetLeases, LeaseRow, LeaseStore};
 
 /// Namespace prefix used when a caller does not supply one -- see
@@ -916,6 +916,29 @@ type LoadReply = (
     HashMap<String, Vec<u8>>,
 );
 
+impl RedisControlPlaneStore {
+    /// Writes (`Some`) or deletes (`None`) one field of the budgets hash and
+    /// bumps the policy generation in the same transaction. Tenant and key
+    /// budgets share the hash, filed by subject.
+    fn write_budget_row(&self, field: &str, bytes: Option<Vec<u8>>) -> Result<(), StoreError> {
+        let budgets_key = self.budgets_key();
+        let generation_key = self.generation_key();
+        self.with_connection(Lane::Control, |conn| {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            match &bytes {
+                Some(bytes) => pipe.cmd("HSET").arg(&budgets_key).arg(field).arg(bytes),
+                None => pipe.cmd("HDEL").arg(&budgets_key).arg(field),
+            }
+            .ignore()
+            .cmd("INCR")
+            .arg(&generation_key)
+            .ignore()
+            .query::<()>(conn)
+        })
+    }
+}
+
 impl ControlPlaneStore for RedisControlPlaneStore {
     /// One pipeline: `SMEMBERS tenants`, then `HGETALL` of keys, policies,
     /// budgets, limits, tenant credentials, rate cards and trace-export
@@ -1020,10 +1043,19 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             policies.insert(TenantId::new(tenant), encoded.into());
         }
 
+        // Key budgets share this hash under the key's subject; see
+        // `EncodedKeyBudget` for how a row from before the flag reads.
         let mut budgets = HashMap::new();
-        for (tenant, bytes) in budgets_raw {
-            let encoded: EncodedTenantBudget = decode_json(&bytes)?;
-            budgets.insert(TenantId::new(tenant), encoded.into());
+        let mut key_budgets = HashMap::new();
+        for (subject, bytes) in budgets_raw {
+            let subject = TenantId::new(subject);
+            if let Some(key_id) = key_id_from_budget_subject(&subject) {
+                let encoded: EncodedKeyBudget = decode_json(&bytes)?;
+                key_budgets.insert(key_id, encoded.into());
+            } else {
+                let encoded: EncodedTenantBudget = decode_json(&bytes)?;
+                budgets.insert(subject, encoded.into());
+            }
         }
 
         let mut limits = HashMap::new();
@@ -1098,6 +1130,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             keys,
             policies,
             budgets,
+            key_budgets,
             limits,
             tenant_credentials,
             rate_cards,
@@ -1265,39 +1298,13 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         tenant: &TenantId,
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError> {
-        let budgets_key = self.budgets_key();
-        let generation_key = self.generation_key();
-        match budget {
-            Some(budget) => {
-                let encoded: EncodedTenantBudget = budget.into();
-                let bytes = encode_json(&encoded);
-                self.with_connection(Lane::Control, |conn| {
-                    redis::pipe()
-                        .atomic()
-                        .cmd("HSET")
-                        .arg(&budgets_key)
-                        .arg(tenant.as_str())
-                        .arg(&bytes)
-                        .ignore()
-                        .cmd("INCR")
-                        .arg(&generation_key)
-                        .ignore()
-                        .query::<()>(conn)
-                })
-            }
-            None => self.with_connection(Lane::Control, |conn| {
-                redis::pipe()
-                    .atomic()
-                    .cmd("HDEL")
-                    .arg(&budgets_key)
-                    .arg(tenant.as_str())
-                    .ignore()
-                    .cmd("INCR")
-                    .arg(&generation_key)
-                    .ignore()
-                    .query::<()>(conn)
-            }),
-        }
+        let bytes = budget.map(|budget| encode_json(&EncodedTenantBudget::from(budget)));
+        self.write_budget_row(tenant.as_str(), bytes)
+    }
+
+    fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
+        let bytes = budget.map(|budget| encode_json(&EncodedKeyBudget::from(budget)));
+        self.write_budget_row(key_spend_subject(key_id).as_str(), bytes)
     }
 
     fn set_limits(
@@ -2040,6 +2047,36 @@ mod tests {
         }
     }
 
+    /// ADR-0007 amendment 1, Redis upgrade: the redb upgrade test's rows,
+    /// written raw into the budgets hash as a build from before
+    /// `include_byok_in_limit` left them, load with the same mapping.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_upgrade_loads_scoped_key_budgets_with_the_include_byok_mapping() {
+        let store = test_store("key-budget-upgrade");
+        let budgets_key = store.budgets_key();
+        for (key_id, row, _) in crate::control::pre_flag_key_budget_rows() {
+            let field = crate::spend::key_spend_subject(&key_id);
+            store
+                .with_connection(Lane::Control, |conn| {
+                    redis::cmd("HSET")
+                        .arg(&budgets_key)
+                        .arg(field.as_str())
+                        .arg(row.as_bytes())
+                        .query::<()>(conn)
+                })
+                .unwrap();
+        }
+        let loaded = store.load().unwrap();
+        for (key_id, row, expected) in crate::control::pre_flag_key_budget_rows() {
+            assert_eq!(loaded.key_budgets.get(&key_id), Some(&expected), "{row}");
+        }
+        assert!(
+            loaded.budgets.is_empty(),
+            "key rows never load as tenant budgets"
+        );
+    }
+
     #[test]
     #[ignore = "needs a real Redis -- see this module's doc comment"]
     fn redis_rotation_keeps_history_and_rejects_owner_changes_and_tombstone_reuse() {
@@ -2056,12 +2093,12 @@ mod tests {
             tags: Default::default(),
         };
         store.put_key(&row).unwrap();
-        let budget = TenantBudget {
+        let budget = crate::spend::KeyBudget {
             max_micros: crate::spend::MicroUsd::from_micros(10),
             period: crate::spend::Period::Monthly,
-            credential_source: CredentialSource::Platform,
+            include_byok_in_limit: true,
         };
-        store.set_budget(&subject, Some(&budget)).unwrap();
+        store.set_key_budget(&id, Some(&budget)).unwrap();
         store
             .add_spend(
                 "chain",
@@ -2077,7 +2114,7 @@ mod tests {
         row.digest = [2; 32];
         store.put_key(&row).unwrap();
         assert_eq!(store.load().unwrap().keys[0].digest, [2; 32]);
-        assert_eq!(store.load().unwrap().budgets.get(&subject), Some(&budget));
+        assert_eq!(store.load().unwrap().key_budgets.get(&id), Some(&budget));
         assert_eq!(store.load_spend("chain", &subject, &period).unwrap(), 7);
         let generation = store.policy_generation().unwrap();
         row.tenant = TenantId::new("other");

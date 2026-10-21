@@ -6,10 +6,13 @@
 
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
+use proxy_cluster::latency::LatencyEwma;
 use proxy_observability::access_log::TimePoint;
 
 use crate::handler::{local_boxed, BodyError, StreamBody};
@@ -71,6 +74,75 @@ impl Body for TimedBody {
             }
             Poll::Ready(None) => this.timing.mark(this.end),
             Poll::Ready(Some(Err(_))) | Poll::Pending => {}
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Wraps a successful response body so its latency is folded into the
+/// dialled cluster's moving average (`envoy-divergences.md` row 48): time
+/// from dispatch to the first data frame for a stream, whose first byte is
+/// what a caller waits on, and to a clean end otherwise. A body that fails
+/// or is dropped first records nothing.
+pub(super) fn latency_sampled(
+    body: StreamBody,
+    recorder: Arc<LatencyEwma>,
+    dispatched_at: Instant,
+    streaming: bool,
+) -> StreamBody {
+    if body.is_end_stream() {
+        recorder.record(dispatched_at.elapsed());
+        return body;
+    }
+    local_boxed(LatencySampledBody {
+        inner: body,
+        recorder: Some(recorder),
+        dispatched_at,
+        streaming,
+    })
+}
+
+struct LatencySampledBody {
+    inner: StreamBody,
+    /// Taken by the one sample this body records.
+    recorder: Option<Arc<LatencyEwma>>,
+    dispatched_at: Instant,
+    streaming: bool,
+}
+
+impl Body for LatencySampledBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        let sample = match &poll {
+            Poll::Ready(Some(Ok(frame))) => {
+                (this.streaming && frame.is_data()) || this.inner.is_end_stream()
+            }
+            Poll::Ready(None) => true,
+            Poll::Ready(Some(Err(_))) => {
+                this.recorder = None;
+                false
+            }
+            Poll::Pending => false,
+        };
+        if sample {
+            if let Some(recorder) = this.recorder.take() {
+                recorder.record(this.dispatched_at.elapsed());
+            }
         }
         poll
     }
@@ -161,5 +233,59 @@ mod tests {
         let mut body = timed(failing, timing.clone(), None, TimePoint::UsRxEnd);
         assert!(body.frame().await.unwrap().is_err());
         assert_eq!(timing.points().get(TimePoint::UsRxEnd), None);
+    }
+
+    fn chunks(chunks: &[&'static str], fail_after: bool) -> StreamBody {
+        let mut frames: Vec<Result<Frame<Bytes>, BodyError>> = chunks
+            .iter()
+            .map(|c| Ok(Frame::data(Bytes::from_static(c.as_bytes()))))
+            .collect();
+        if fail_after {
+            frames.push(Err(BodyError::Upstream("reset".into())));
+        }
+        local_boxed(http_body_util::StreamBody::new(futures::stream::iter(
+            frames,
+        )))
+    }
+
+    /// A stream is sampled at its first data frame, so a long generation
+    /// does not count against the member; a plain body only at its end.
+    /// Each response records one sample, which a second sample would show
+    /// as an average that is no longer the first value.
+    #[tokio::test]
+    async fn a_stream_is_sampled_at_first_data_and_a_plain_body_at_its_end() {
+        for streaming in [true, false] {
+            let recorder = Arc::new(LatencyEwma::default());
+            let mut body = latency_sampled(
+                chunks(&["a", "b"], false),
+                recorder.clone(),
+                Instant::now(),
+                streaming,
+            );
+            body.frame().await.unwrap().unwrap();
+            assert_eq!(
+                recorder.micros().is_some(),
+                streaming,
+                "streaming: {streaming}"
+            );
+            body.frame().await.unwrap().unwrap();
+            assert!(body.frame().await.is_none());
+            assert!(recorder.micros().is_some(), "streaming: {streaming}");
+        }
+    }
+
+    /// A plain body that fails before its end records nothing.
+    #[tokio::test]
+    async fn a_failed_body_records_no_sample() {
+        let recorder = Arc::new(LatencyEwma::default());
+        let mut body = latency_sampled(
+            chunks(&["a"], true),
+            recorder.clone(),
+            Instant::now(),
+            false,
+        );
+        body.frame().await.unwrap().unwrap();
+        assert!(body.frame().await.unwrap().is_err());
+        assert_eq!(recorder.micros(), None);
     }
 }
