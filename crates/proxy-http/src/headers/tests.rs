@@ -151,7 +151,7 @@ fn resolve_trusted_address_n_hops_reaches_leftmost() {
 }
 
 #[test]
-fn resolve_trusted_address_hops_larger_than_list_falls_back_to_leftmost() {
+fn resolve_trusted_address_hops_larger_than_list_falls_back_to_remote() {
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static(XFF),
@@ -160,7 +160,7 @@ fn resolve_trusted_address_hops_larger_than_list_falls_back_to_leftmost() {
     let remote = v4(9, 9, 9, 9);
     assert_eq!(
         resolve_trusted_address(&headers, remote, &opts(false, 100)),
-        v4(1, 1, 1, 1)
+        remote
     );
 }
 
@@ -175,13 +175,21 @@ fn resolve_trusted_address_empty_xff_falls_back_to_remote() {
 }
 
 #[test]
-fn resolve_trusted_address_use_remote_address_true_ignores_xff() {
+fn resolve_trusted_address_use_remote_address_true_counts_the_peer_as_a_hop() {
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static(XFF),
         HeaderValue::from_static("1.1.1.1"),
     );
     let remote = v4(9, 9, 9, 9);
+    assert_eq!(
+        resolve_trusted_address(&headers, remote, &opts(true, 0)),
+        remote
+    );
+    assert_eq!(
+        resolve_trusted_address(&headers, remote, &opts(true, 1)),
+        v4(1, 1, 1, 1)
+    );
     assert_eq!(
         resolve_trusted_address(&headers, remote, &opts(true, 5)),
         remote
@@ -653,29 +661,53 @@ fn empty_header_map_does_not_panic_anywhere() {
     assert!(!headers.is_empty());
 }
 
-// --- client_address: what rate limits key a request on ---
+// --- trusted_xff_address: what rate limits, records and logs key on ---
 
-#[test]
-fn client_address_ignores_x_forwarded_for_without_trusted_hops() {
+fn xff(value: &'static str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
-    let remote = v4(10, 0, 0, 9);
-    // A client can write this header itself, so it must not choose the
-    // bucket on a mesh HCM with no trusted hops, nor at the edge.
-    assert_eq!(client_address(&headers, remote, &opts(false, 0)), remote);
-    assert_eq!(client_address(&headers, remote, &opts(true, 1)), remote);
+    headers.insert("x-forwarded-for", HeaderValue::from_static(value));
+    headers
 }
 
 #[test]
-fn client_address_uses_the_entry_trusted_hops_vouch_for() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-forwarded-for",
-        HeaderValue::from_static("1.2.3.4, 10.0.0.1"),
-    );
-    let remote = v4(10, 0, 0, 9);
+fn trusted_xff_address_ignores_x_forwarded_for_without_trusted_hops() {
+    // A client can write this header itself, so with zero hops it must not
+    // choose the bucket, on a mesh HCM or at the edge.
+    let headers = xff("1.2.3.4");
+    assert_eq!(trusted_xff_address(&headers, &opts(false, 0)), None);
+    assert_eq!(trusted_xff_address(&headers, &opts(true, 0)), None);
+}
+
+#[test]
+fn trusted_xff_address_at_the_edge_takes_the_entry_the_balancer_appended() {
+    // Edge HCM behind one balancer: the balancer appended the client's
+    // address, and anything left of it is the client's own writing.
+    let headers = xff("198.51.100.66, 1.2.3.4");
     assert_eq!(
-        client_address(&headers, remote, &opts(false, 1)),
-        v4(1, 2, 3, 4)
+        trusted_xff_address(&headers, &opts(true, 1)),
+        Some(v4(1, 2, 3, 4))
     );
+    assert_eq!(
+        trusted_xff_address(&headers, &opts(true, 2)),
+        Some(v4(198, 51, 100, 66))
+    );
+}
+
+#[test]
+fn trusted_xff_address_without_use_remote_address_skips_one_more_entry() {
+    let headers = xff("1.2.3.4, 10.0.0.1");
+    assert_eq!(
+        trusted_xff_address(&headers, &opts(false, 1)),
+        Some(v4(1, 2, 3, 4))
+    );
+}
+
+#[test]
+fn trusted_xff_address_falls_back_to_the_peer_on_a_short_list() {
+    // A client that bypasses the balancer and sends fewer entries than the
+    // hops vouch for gets its TCP peer, as in Envoy, not its leftmost entry.
+    assert_eq!(trusted_xff_address(&HeaderMap::new(), &opts(true, 1)), None);
+    assert_eq!(trusted_xff_address(&xff("1.2.3.4"), &opts(true, 2)), None);
+    assert_eq!(trusted_xff_address(&xff("1.2.3.4"), &opts(false, 1)), None);
+    assert_eq!(trusted_xff_address(&xff("not-an-ip"), &opts(true, 1)), None);
 }

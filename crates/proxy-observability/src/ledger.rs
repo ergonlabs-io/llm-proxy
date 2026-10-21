@@ -1458,6 +1458,7 @@ pub mod testing {
             credential_source: None,
             record_seq: None,
             tags: Default::default(),
+            client_address: None,
         }
     }
 

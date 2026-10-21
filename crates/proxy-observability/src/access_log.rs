@@ -65,6 +65,7 @@ pub enum FormatOp {
     UpstreamHost,
     UpstreamCluster,
     DownstreamRemoteAddress,
+    DownstreamRemoteAddressWithoutPort,
     // No OTel GenAI semconv aliases for these operators. Semconv's
     // `gen_ai.usage.input_tokens` includes the cache buckets, while our
     // `input_tokens` excludes them. A plain alias would under-count billed
@@ -453,6 +454,10 @@ fn build_op(
         "DOWNSTREAM_REMOTE_ADDRESS" => {
             bare(name, args, truncate, input)?;
             FormatOp::DownstreamRemoteAddress
+        }
+        "DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT" => {
+            bare(name, args, truncate, input)?;
+            FormatOp::DownstreamRemoteAddressWithoutPort
         }
         "LLM_INPUT_TOKENS" => {
             bare(name, args, truncate, input)?;
@@ -931,6 +936,15 @@ fn render_op(op: &FormatOp, ctx: &LogContext<'_>, out: &mut String) {
         FormatOp::DownstreamRemoteAddress => {
             out.push_str(ctx.downstream_remote_address.unwrap_or("-"))
         }
+        FormatOp::DownstreamRemoteAddressWithoutPort => match ctx.downstream_remote_address {
+            Some(addr) => match addr.parse::<std::net::SocketAddr>() {
+                Ok(socket) => {
+                    let _ = write!(out, "{}", socket.ip());
+                }
+                Err(_) => out.push_str(addr),
+            },
+            None => out.push('-'),
+        },
         FormatOp::ResponseCodeDetails => out.push_str(ctx.response_code_details.unwrap_or("-")),
         // These six feed billing, so absent usage must render `-`,
         // never a confident-looking `0` -- `None` means "the provider told
@@ -1304,6 +1318,10 @@ mod tests {
                 "%DOWNSTREAM_REMOTE_ADDRESS%",
                 FormatOp::DownstreamRemoteAddress,
             ),
+            (
+                "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%",
+                FormatOp::DownstreamRemoteAddressWithoutPort,
+            ),
             ("%LLM_INPUT_TOKENS%", FormatOp::LlmInputTokens),
             ("%LLM_CACHED_TOKENS%", FormatOp::LlmCachedTokens),
             (
@@ -1555,6 +1573,18 @@ mod tests {
             render(&fs, &c),
             "HTTP/1.1 200 42 10 20 10.0.0.1:8080 my_cluster 127.0.0.1:1234"
         );
+    }
+
+    #[test]
+    fn downstream_remote_address_without_port_drops_the_port() {
+        let empty = http::HeaderMap::new();
+        let mut c = ctx(&empty, &empty, &empty, &[]);
+        let fs = parse("%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%");
+        assert_eq!(render(&fs, &c), "127.0.0.1");
+        c.downstream_remote_address = Some("[2001:db8::7]:0");
+        assert_eq!(render(&fs, &c), "2001:db8::7");
+        c.downstream_remote_address = None;
+        assert_eq!(render(&fs, &c), "-");
     }
 
     #[test]

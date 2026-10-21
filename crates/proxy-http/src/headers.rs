@@ -93,34 +93,45 @@ pub fn apply_xff(headers: &mut HeaderMap, remote: IpAddr, opts: &XffOptions) {
     set_xff_tokens(headers, &tokens);
 }
 
-/// Resolve the client address using `xff_num_trusted_hops`. Skip that many
-/// rightmost XFF entries; if the count exceeds the list, use its leftmost entry.
-/// With `use_remote_address`, or malformed/missing XFF, use `remote`. Without
-/// trusted hops, never attribute limits to client-controlled XFF (Envoy S9).
-pub fn client_address(headers: &HeaderMap, remote: IpAddr, opts: &XffOptions) -> IpAddr {
-    if opts.use_remote_address || opts.xff_num_trusted_hops == 0 {
-        return remote;
+/// The `x-forwarded-for` entry that limits, request records and access logs
+/// attribute a request to, or `None` for the TCP peer: zero hops, fewer
+/// entries than the hops vouch for, or an entry that is not an IP address.
+/// Zero hops always mean the peer, whatever `use_remote_address` says,
+/// because a client can write `x-forwarded-for` itself
+/// (`internal-docs/envoy-divergences.md`). Call it on the headers as they
+/// arrived, before [`apply_xff`] appends the peer.
+pub(crate) fn trusted_xff_address(headers: &HeaderMap, opts: &XffOptions) -> Option<IpAddr> {
+    if opts.xff_num_trusted_hops == 0 {
+        return None;
     }
-    resolve_trusted_address(headers, remote, opts)
+    resolve_xff(headers, opts)
 }
 
+/// Envoy's trusted client address (S9, HCM `xff_num_trusted_hops`), read
+/// from the inbound `x-forwarded-for`. With `use_remote_address` the peer is
+/// itself the first trusted hop, so `N` hops select the Nth entry from the
+/// right; without it, the (N+1)th. A list too short for that falls back to
+/// `remote`, as Envoy does, so a client that bypasses the balancer cannot pick
+/// an address by sending a short header. Unlike [`trusted_xff_address`], zero hops
+/// without `use_remote_address` take the rightmost entry, which is Envoy's
+/// behavior and trusts the header.
 pub fn resolve_trusted_address(headers: &HeaderMap, remote: IpAddr, opts: &XffOptions) -> IpAddr {
-    if opts.use_remote_address {
+    if opts.use_remote_address && opts.xff_num_trusted_hops == 0 {
         return remote;
     }
+    resolve_xff(headers, opts).unwrap_or(remote)
+}
+
+fn resolve_xff(headers: &HeaderMap, opts: &XffOptions) -> Option<IpAddr> {
     let tokens = xff_tokens(headers);
-    if tokens.is_empty() {
-        return remote;
+    // Entries to skip from the right. The peer counts as one trusted hop
+    // when `use_remote_address` is set; the caller rules out 0 hops there.
+    let skip =
+        (opts.xff_num_trusted_hops as usize).saturating_sub(usize::from(opts.use_remote_address));
+    if tokens.len() <= skip {
+        return None;
     }
-    let hops = opts.xff_num_trusted_hops as usize;
-    // Rust note: `saturating_sub` avoids an underflow panic when `hops >=
-    // tokens.len()` — in that case we deliberately land on index 0 (the
-    // leftmost/original entry) rather than wrapping around.
-    let idx = (tokens.len() - 1).saturating_sub(hops);
-    tokens
-        .get(idx)
-        .and_then(|t| t.parse::<IpAddr>().ok())
-        .unwrap_or(remote)
+    tokens[tokens.len() - 1 - skip].parse::<IpAddr>().ok()
 }
 
 /// RFC 1918 private ranges: `10/8`, `172.16/12`, `192.168/16`. Loopback

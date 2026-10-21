@@ -517,6 +517,12 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                     reason: "must be greater than 0".to_string(),
                 });
             }
+            if let Some(hops) = spec.trusted_hops.filter(|&h| u32::try_from(h).is_err()) {
+                return Err(ConfigError::InvalidValue {
+                    field_path: "listen.trusted_hops".to_string(),
+                    reason: format!("must be in 0..={}, got {hops}", u32::MAX),
+                });
+            }
         }
     }
     if let Some(admin) = &config.admin {

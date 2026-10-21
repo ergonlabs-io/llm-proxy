@@ -720,7 +720,21 @@ impl StreamHandler for FilterChainHandler {
             // round trip, not just the part downstream of the router.
             let start_time = SystemTime::now();
             let start_instant = Instant::now();
-            let downstream_remote_address = req.downstream.remote.to_string();
+            // S9: the address limits, records and logs attribute this request
+            // to, read before `apply_xff` below appends the peer. Like Envoy's
+            // `%DOWNSTREAM_REMOTE_ADDRESS%`, an address taken from
+            // `x-forwarded-for` has no port and renders as `ip:0`.
+            let xff_options = crate::headers::XffOptions {
+                use_remote_address: self.use_remote_address,
+                xff_num_trusted_hops: self.xff_num_trusted_hops,
+            };
+            let forwarded_client =
+                crate::headers::trusted_xff_address(&req.head.headers, &xff_options);
+            let client_address = forwarded_client.unwrap_or(req.downstream.remote.ip());
+            let downstream_remote_address = match forwarded_client {
+                Some(ip) => std::net::SocketAddr::new(ip, 0).to_string(),
+                None => req.downstream.remote.to_string(),
+            };
 
             // S9: apply `x-request-id` before the decode filter chain runs, so
             // every decode filter (and the router terminal) observes it. Runs
@@ -742,11 +756,11 @@ impl StreamHandler for FilterChainHandler {
             // (mesh/internal) HCM leaves both headers untouched — it trusts
             // the inbound values.
             if self.use_remote_address {
-                let xff = crate::headers::XffOptions {
-                    use_remote_address: true,
-                    xff_num_trusted_hops: self.xff_num_trusted_hops,
-                };
-                crate::headers::apply_xff(&mut req.head.headers, req.downstream.remote.ip(), &xff);
+                crate::headers::apply_xff(
+                    &mut req.head.headers,
+                    req.downstream.remote.ip(),
+                    &xff_options,
+                );
                 crate::headers::set_forwarded_proto(&mut req.head.headers, req.downstream.is_tls);
             }
             // ADR-0009 decision 5: reserve ledger capacity before any filter
@@ -769,14 +783,6 @@ impl StreamHandler for FilterChainHandler {
             // every filter (including an encode filter's end-of-stream
             // callback) wrote into.
             let stream_info = Rc::new(RefCell::new(StreamInfo::default()));
-            let client_address = crate::headers::client_address(
-                &req.head.headers,
-                req.downstream.remote.ip(),
-                &crate::headers::XffOptions {
-                    use_remote_address: self.use_remote_address,
-                    xff_num_trusted_hops: self.xff_num_trusted_hops,
-                },
-            );
             {
                 let mut info = stream_info.borrow_mut();
                 info.downstream = Some(req.downstream);

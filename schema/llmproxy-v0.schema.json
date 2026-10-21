@@ -272,6 +272,14 @@
           "default": 100,
           "examples": [200]
         },
+        "trusted_hops": {
+          "description": "How many proxies in front of llm-proxy append the client address to `x-forwarded-for`. Set it to 1 behind one load balancer. With N trusted hops, `client-ip` limits, request records and access logs use the Nth address from the right of the `x-forwarded-for` that the request arrived with. This is the address that the outermost trusted proxy saw. The client writes the entries to the left of it, and llm-proxy never uses them. If the header has fewer than N addresses, or that entry is not an IP address, llm-proxy uses the TCP peer address. Set it only when all connections come through those proxies: a client that connects to llm-proxy directly can choose its address. Default: 0. With 0, llm-proxy uses the TCP peer address and does not read `x-forwarded-for`. With 1 or more, llm-proxy also adds the TCP peer address to the `x-forwarded-for` that it sends to the provider, and sets `x-forwarded-proto`. Lowers to the HTTP connection manager's `use_remote_address: true` and `xff_num_trusted_hops`.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "examples": [1]
+        },
         "tls": {
           "description": "Terminate TLS for client connections. Nothing watches the certificate files. After a `SIGHUP` reload, the next accepted connection reads `cert_file` and `key_file` again, so a renewed certificate is served to new connections; existing connections keep the old one. A reload does not check the files: if one cannot be read, the listener resets every new TLS connection until a later reload succeeds, so check the files before you send `SIGHUP`.",
           "type": "object",
@@ -1064,7 +1072,7 @@
       "properties": {
         "key": {
           "type": "string",
-          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per TCP peer address; behind a load balancer that is the balancer's address, because the dialect has no trusted-hops setting), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header, e.g. `header:x-api-key` for per-caller quotas). The header value is hashed, never stored or logged raw, and a request without that header is not counted against this limit. `header:authorization` buckets per credential: on the hashed `authorization` value, or, when `auth:` has verified and removed that header, on the authenticated virtual key (one bucket per key, so two keys of one tenant are counted apart); write `tenant` to bucket on the authenticated tenant.",
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address: the TCP peer address, or behind a load balancer the `x-forwarded-for` address that `listen.trusted_hops` vouches for; without `trusted_hops` every client behind a balancer shares the balancer's bucket), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header, e.g. `header:x-api-key` for per-caller quotas). The header value is hashed, never stored or logged raw, and a request without that header is not counted against this limit. `header:authorization` buckets per credential: on the hashed `authorization` value, or, when `auth:` has verified and removed that header, on the authenticated virtual key (one bucket per key, so two keys of one tenant are counted apart); write `tenant` to bucket on the authenticated tenant.",
           "pattern": "^(global|client-ip|tenant|header:[A-Za-z0-9-]+)$",
           "examples": ["header:authorization", "tenant", "global", "client-ip", "header:x-api-key"]
         },

@@ -3220,6 +3220,9 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "request_id": "%REQ(X-REQUEST-ID)%",
                 "authority": "%REQ(:AUTHORITY)%",
                 "upstream_host": "%UPSTREAM_HOST%",
+                // The resolved client address: behind `listen.trusted_hops`
+                // it is the address the trusted hops vouch for.
+                "client_address": "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%",
                 "llm_input_tokens": "%LLM_INPUT_TOKENS%",
                 "llm_cached_tokens": "%LLM_CACHED_TOKENS%",
                 "llm_cache_creation_tokens": "%LLM_CACHE_CREATION_TOKENS%",
@@ -3760,6 +3763,13 @@ fn lower_listener(
     }
     if let Some(count) = spec.and_then(|s| s.max_request_headers_count) {
         hcm["typed_config"]["common_http_protocol_options"]["max_headers_count"] = json!(count);
+    }
+    // Zero is left out, so a config without trusted hops lowers exactly as
+    // before. With hops, the proxy is the edge behind them: the peer is the
+    // first trusted hop and is appended to `x-forwarded-for` (S9).
+    if let Some(hops) = spec.and_then(|s| s.trusted_hops).filter(|&h| h > 0) {
+        hcm["typed_config"]["use_remote_address"] = json!(true);
+        hcm["typed_config"]["xff_num_trusted_hops"] = json!(hops);
     }
     if let Some(access_log) = access_log {
         hcm["typed_config"]["access_log"] = json!([access_log]);
