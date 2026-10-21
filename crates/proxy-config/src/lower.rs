@@ -6869,6 +6869,7 @@ fn convert_route(
         route_index: 0,
         include_request_attempt_count,
         include_attempt_count_in_response,
+        include_routing_headers_in_response: false,
     })
 }
 

@@ -1653,6 +1653,11 @@ pub struct RouteEntry {
     /// when true the router sets `x-envoy-attempt-count` on the response to
     /// the TOTAL attempts made. Same denormalization as above.
     pub include_attempt_count_in_response: bool,
+    /// llmproxy extension `VirtualHost.metadata.filter_metadata
+    /// ["io.llmproxy.routing_headers"]` (`envoy-divergences.md` row 49):
+    /// when true the response names the cluster that served it and the
+    /// ordered clusters attempted. Same denormalization as above.
+    pub include_routing_headers_in_response: bool,
 }
 
 #[derive(Debug)]
