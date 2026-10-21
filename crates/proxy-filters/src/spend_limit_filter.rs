@@ -966,7 +966,14 @@ impl HttpFilter for SpendLimitFilterInstance {
         let tenant_budget = tenant_budget_configured.filter(|b| b.credential_source == mode);
         let default_period = self.accumulator.default_period();
         self.key_id = Some(key_id.clone());
-        self.period = Some(key_budget.map(|b| b.period).unwrap_or(default_period));
+        // The configured key budget's period even when it does not bind this
+        // request: whatever `KeyBudget::counts` charges must land in the
+        // bucket admission reads.
+        self.period = Some(
+            key_budget_configured
+                .map(|b| b.period)
+                .unwrap_or(default_period),
+        );
         self.tenant = tenant.clone().map(|id| {
             (
                 id,
@@ -3250,10 +3257,10 @@ mod tests {
         let tenant = TenantId::new("tenant-a");
         let key = test_key_id("tenant-a");
         let daily = Period::Daily.key_for_now();
-        // A regression that charges a non-matching budget would record it
-        // under the DEFAULT period (the budget's own period is only applied
-        // to a budget that matched at admission), so both period keys are
-        // read for the subject pinned at zero.
+        // A regression that charges a non-matching tenant budget would
+        // record it under the DEFAULT period (a tenant budget's own period
+        // is only applied when it matched at admission), so both period keys
+        // are read for each subject pinned at zero.
         let monthly = Period::Monthly.key_for_now();
 
         // Tenant mode, source Tenant: the tenant-scoped budget is charged,
