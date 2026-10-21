@@ -2812,7 +2812,7 @@ fn lower_auth(
         virtual_keys.push(virtual_key);
     }
 
-    let jwt_providers = jwt::lower_jwt_providers(auth, warnings)?;
+    let jwt_providers = jwt::lower_jwt_providers(auth)?;
 
     if auth.keys.is_empty() && jwt_providers.is_empty() {
         // Legal (fail closed is the correct reading of "authentication is

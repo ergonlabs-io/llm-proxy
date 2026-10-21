@@ -426,9 +426,9 @@ user, mint a key with `POST /keys` whose `key_id` is that user's id
 (`jwt:<issuer>:<tenant>:<user claim>`) under the same tenant, and set
 `/keys/{id}/policy`, `/budget` or `/limits` on it.
 
-JWT callers always use the operator's provider keys. A tenant's stored
-provider credentials apply to virtual-key requests only, so lowering warns
-when `auth.jwt` and `auth.tenant_credentials` are both set.
+A JWT caller uses its tenant's stored provider credentials exactly as a
+virtual key of that tenant does. See
+[Tenant provider credentials](../../authentication/tenant-provider-credentials/).
 
 ### JWT in an Envoy-mode bootstrap
 

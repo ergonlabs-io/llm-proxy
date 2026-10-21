@@ -343,7 +343,8 @@ pub enum AuthError {
     /// not been confirmed against the store for longer than
     /// `max_policy_staleness_seconds` (review H4). Fail closed: it may still
     /// hold a key another replica revoked. The filter answers 503, not 401,
-    /// because the credential itself may be fine.
+    /// because the credential itself may be fine. A JWT whose tenant holds
+    /// provider credentials gets the same refusal ([`TenantFacts::admit`]).
     PolicyStale,
 }
 
@@ -804,16 +805,26 @@ impl Authenticator for VirtualKeyAuthenticator {
     }
 }
 
-/// Trace-export consent for authenticators that do not verify against the
-/// control-plane snapshot (JWT). The virtual-key path reads the flag from the
-/// snapshot that verified the key; this reads the same snapshot once, at the
-/// same point in the request, so consent is still pinned at admission.
+/// What an authenticator that does not verify against the control-plane
+/// snapshot (JWT) reads from it for an admitted tenant: the trace-export
+/// opt-in (ADR-0008 decision 2) and the tenant's provider credentials
+/// (ADR-0007). The virtual-key path reads both from the snapshot that
+/// verified the key; [`Self::admit`] reads them from one load of the same
+/// snapshot, at the same point in the request, so both are pinned at
+/// admission and cannot come from two different generations.
 ///
-/// Past the staleness bound the snapshot may still list a tenant that opted
-/// out elsewhere, so an opt-in is not honoured (fail closed, the rule the
-/// virtual-key path applies by refusing the key). Each opt-in withheld that
-/// way is counted in `llmproxy_trace_consent_stale_total`.
-pub struct TraceConsent {
+/// Past the staleness bound the snapshot may still hold a row another replica
+/// changed, and the virtual-key path refuses every key (fail closed). Here:
+/// - A tenant the snapshot lists as holding credentials is refused with
+///   [`AuthError::PolicyStale`], as its virtual keys are. Using the stale set
+///   could send a credential the tenant deleted; dropping it would send the
+///   operator's key and charge platform spend, which tenant mode never does
+///   (ADR-0007 decision 5).
+/// - Any other tenant is admitted in platform mode, as before tenant
+///   credentials reached JWT principals, and an opt-in is not honoured. Each
+///   opt-in withheld that way is counted in
+///   `llmproxy_trace_consent_stale_total`.
+pub struct TenantFacts {
     snapshot: Arc<arc_swap::ArcSwap<crate::control::ControlPlaneSnapshot>>,
     freshness: Arc<crate::control::PolicyFreshness>,
     stale: Option<(
@@ -822,7 +833,16 @@ pub struct TraceConsent {
     )>,
 }
 
-impl TraceConsent {
+/// One tenant's facts as [`TenantFacts::admit`] read them.
+pub struct AdmittedTenant {
+    /// Whether the tenant opted in to trace export, on a fresh snapshot.
+    pub trace_export: bool,
+    /// The tenant's provider credentials; `None` in platform mode. Holds
+    /// plaintext keys, so this type has no `Debug`.
+    pub tenant_credentials: Option<Arc<TenantCredentialSet>>,
+}
+
+impl TenantFacts {
     pub fn new(
         snapshot: Arc<arc_swap::ArcSwap<crate::control::ControlPlaneSnapshot>>,
         freshness: Arc<crate::control::PolicyFreshness>,
@@ -838,31 +858,50 @@ impl TraceConsent {
             );
             (registry, handle)
         });
-        TraceConsent {
+        TenantFacts {
             snapshot,
             freshness,
             stale,
         }
     }
 
-    /// Whether `tenant` opted in, on a fresh snapshot.
-    pub fn opted_in(&self, tenant: &TenantId) -> bool {
-        if !self.snapshot.load().trace_export.contains(tenant) {
-            return false;
-        }
+    /// `tenant`'s facts from one snapshot load, or
+    /// [`AuthError::PolicyStale`] for a tenant holding credentials on a
+    /// stale snapshot (see the type doc).
+    pub fn admit(&self, tenant: &TenantId) -> Result<AdmittedTenant, AuthError> {
+        let snapshot = self.snapshot.load();
+        // An empty set is platform mode everywhere downstream (the router
+        // and the spend filter both filter it out), so it is dropped here.
+        let tenant_credentials = snapshot
+            .tenant_credentials
+            .get(tenant)
+            .filter(|set| !set.is_empty())
+            .cloned();
+        let opted_in = snapshot.trace_export.contains(tenant);
         if self.freshness.is_expired() {
-            if let Some((registry, handle)) = &self.stale {
-                registry.incr(proxy_observability::stats::WorkerId(0), *handle, 1);
+            if tenant_credentials.is_some() {
+                return Err(AuthError::PolicyStale);
             }
-            return false;
+            if opted_in {
+                if let Some((registry, handle)) = &self.stale {
+                    registry.incr(proxy_observability::stats::WorkerId(0), *handle, 1);
+                }
+            }
+            return Ok(AdmittedTenant {
+                trace_export: false,
+                tenant_credentials: None,
+            });
         }
-        true
+        Ok(AdmittedTenant {
+            trace_export: opted_in,
+            tenant_credentials,
+        })
     }
 }
 
-impl fmt::Debug for TraceConsent {
+impl fmt::Debug for TenantFacts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TraceConsent").finish_non_exhaustive()
+        f.debug_struct("TenantFacts").finish_non_exhaustive()
     }
 }
 
@@ -1052,6 +1091,54 @@ mod tests {
             }
             _ => panic!("tenant-u's key must authenticate"),
         }
+    }
+
+    // --- `TenantFacts`: what a JWT principal reads from the snapshot ---
+
+    /// A fresh snapshot: the tenant's own set, from the snapshot the virtual
+    /// keys verify against; a tenant without one is in platform mode. Stale:
+    /// the tenant holding credentials is refused, as its virtual keys are,
+    /// and never admitted in platform mode; the other tenant is admitted in
+    /// platform mode, as before.
+    #[test]
+    fn tenant_facts_read_the_credential_set_and_refuse_it_on_a_stale_snapshot() {
+        use crate::control::{ControlPlane, InMemoryControlPlaneStore};
+
+        let secret = HmacSecret::new(b"operator-secret");
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::new()),
+            HmacSecret::new(b"operator-secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        cp.freshness()
+            .set_max_staleness(std::time::Duration::from_secs(3600));
+        let facts = TenantFacts::new(
+            snapshot_with_tenant_credentials(&secret),
+            cp.freshness(),
+            None,
+        );
+
+        let admitted = facts.admit(&TenantId::new("tenant-t")).expect("fresh");
+        let set = admitted.tenant_credentials.expect("tenant-t holds a set");
+        assert!(matches!(
+            set.get("openrouter"),
+            Some(TenantCredential::Usable(_))
+        ));
+        let platform = facts.admit(&TenantId::new("tenant-u")).expect("fresh");
+        assert!(platform.tenant_credentials.is_none());
+
+        cp.freshness()
+            .set_max_staleness(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(matches!(
+            facts.admit(&TenantId::new("tenant-t")),
+            Err(AuthError::PolicyStale)
+        ));
+        let stale = facts
+            .admit(&TenantId::new("tenant-u"))
+            .expect("a tenant without credentials is still admitted");
+        assert!(stale.tenant_credentials.is_none());
     }
 
     // --- 2: an unknown llmp_ key is Rejected, not NoCredential ---

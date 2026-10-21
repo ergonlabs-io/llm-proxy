@@ -1445,9 +1445,10 @@ impl HttpFilterFactory for AuthFilterFactory {
             control_plane.export_snapshot_age(Arc::clone(registry), &ctx.stat_prefix);
         }
         // JWT principals do not verify against the control-plane snapshot,
-        // so their trace-export opt-in is read through this, from the same
-        // snapshot and under the same staleness bound as virtual keys.
-        let trace_consent = Arc::new(crate::auth::TraceConsent::new(
+        // so their trace-export opt-in and provider credentials are read
+        // through this, from the same snapshot and under the same staleness
+        // bound as virtual keys.
+        let tenant_facts = Arc::new(crate::auth::TenantFacts::new(
             control_plane.handle(),
             control_plane.freshness(),
             stats_registry,
@@ -1468,7 +1469,7 @@ impl HttpFilterFactory for AuthFilterFactory {
         for ((snapshot, max_stale), validation) in jwt_snapshots.into_iter().zip(jwt_validations) {
             authenticators.push(Box::new(
                 JwtAuthenticator::new_shared(snapshot, validation, max_stale)
-                    .with_trace_consent(Arc::clone(&trace_consent)),
+                    .with_tenant_facts(Arc::clone(&tenant_facts)),
             ));
         }
         let chain = Arc::new(AuthenticatorChain::new(authenticators));
@@ -2635,6 +2636,138 @@ mod tests {
         let reply = cb.local_reply.as_ref().expect("unknown key must be denied");
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
         assert!(cb.stream_info.borrow().tenant_credentials.is_none());
+    }
+
+    // 11e: a JWT principal follows the virtual-key rule for its tenant
+    // (ADR-0014 decision 2): tenant-t's JWT gets the very set tenant-t's key
+    // gets, tenant-u's JWT stays in platform mode, and on a stale snapshot
+    // tenant-t's JWT is refused with 503 like its key, never admitted with the
+    // operator credential, while tenant-u's JWT is admitted as before.
+    #[test]
+    fn a_jwt_tenant_gets_the_credential_set_its_virtual_key_gets() {
+        use crate::control::{ControlPlane, InMemoryControlPlaneStore};
+        use crate::jwt_auth::{JwkRsaKey, JwtAuthenticator, JwtKeySet, JwtValidationConfig};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let secret = HmacSecret::new(b"secret");
+        let mut keys = KeySet::new();
+        keys.insert(
+            &secret,
+            "llmp_key-t",
+            KeyRecord {
+                key_id: KeyId::new("key-t"),
+                tenant: TenantId::new("tenant-t"),
+                revoked: false,
+                tags: Default::default(),
+            },
+        );
+        let set = Arc::new(TenantCredentialSet::new(std::collections::HashMap::from([
+            (
+                "openrouter".to_string(),
+                TenantCredential::Usable(TenantSecret::new("sk-or-test-secret".to_string())),
+            ),
+        ])));
+        let snapshot = crate::control::ControlPlaneSnapshot {
+            keys,
+            policies: crate::model_authz::TenantPolicyMap::new(),
+            key_budgets: std::collections::HashMap::new(),
+            tenant_limits: std::collections::HashMap::new(),
+            key_limits: std::collections::HashMap::new(),
+            key_policies: std::collections::HashMap::new(),
+            key_tenants: std::collections::HashMap::new(),
+            tenant_credentials: std::collections::HashMap::from([(
+                TenantId::new("tenant-t"),
+                Arc::clone(&set),
+            )]),
+            generation: None,
+            trace_export: std::collections::HashSet::new(),
+        };
+        let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(snapshot)));
+        let virtual_key: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
+            HmacSecret::new(b"secret"),
+            Arc::clone(&snapshot),
+        ));
+        let cp = ControlPlane::new(
+            Box::new(InMemoryControlPlaneStore::new()),
+            HmacSecret::new(b"secret"),
+            KeySet::new(),
+        )
+        .unwrap();
+        cp.freshness()
+            .set_max_staleness(std::time::Duration::from_secs(3600));
+        let key = jwt_test_key();
+        let mut jwks = JwtKeySet::new();
+        jwks.insert(JwkRsaKey {
+            kid: "key-1".to_string(),
+            n: URL_SAFE_NO_PAD.decode(&key.n_b64).expect("n"),
+            e: URL_SAFE_NO_PAD.decode(&key.e_b64).expect("e"),
+        });
+        let jwt: Box<dyn Authenticator> = Box::new(
+            JwtAuthenticator::new(
+                jwks,
+                JwtValidationConfig {
+                    tenant_claim: "tenant".to_string(),
+                    issuer: None,
+                    audience: None,
+                    leeway_seconds: None,
+                    tenant_map: std::collections::HashMap::new(),
+                    subject_claim: None,
+                },
+            )
+            .with_tenant_facts(Arc::new(crate::auth::TenantFacts::new(
+                snapshot,
+                cp.freshness(),
+                None,
+            ))),
+        );
+        let mut filter = AuthFilterInstance {
+            chain: Arc::new(AuthenticatorChain::new(vec![virtual_key, jwt])),
+            tagging: None,
+        };
+        let send_as = |filter: &mut AuthFilterInstance, bearer: &str| {
+            let mut cb = TestCallbacks::new(Some(route_named("r1")));
+            let mut head = request_headers(Some(bearer));
+            filter.decode_headers(&mut cb, &mut head, true);
+            cb
+        };
+        let send = |filter: &mut AuthFilterInstance, tenant: &str| {
+            let token = sign_test_jwt(key, "key-1", &jwt_claims(tenant, ""));
+            send_as(filter, &jwt_bearer(&token))
+        };
+
+        let keyed = send_as(&mut filter, "Bearer llmp_key-t");
+        let keyed_set = keyed.stream_info.borrow().tenant_credentials.clone();
+        assert!(keyed_set.is_some_and(|keyed| Arc::ptr_eq(&keyed, &set)));
+        let cb = send(&mut filter, "tenant-t");
+        assert!(cb.local_reply.is_none());
+        let jwt_set = cb
+            .stream_info
+            .borrow()
+            .tenant_credentials
+            .clone()
+            .expect("tenant-t's JWT gets its set");
+        assert!(Arc::ptr_eq(&jwt_set, &set), "the same set its key gets");
+        let cb = send(&mut filter, "tenant-u");
+        assert!(cb.local_reply.is_none());
+        assert!(cb.stream_info.borrow().tenant_credentials.is_none());
+
+        cp.freshness()
+            .set_max_staleness(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let cb = send(&mut filter, "tenant-t");
+        let reply = cb
+            .local_reply
+            .as_ref()
+            .expect("refused on a stale snapshot");
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.details, "auth_policy_stale");
+        assert!(cb.stream_info.borrow().tenant_credentials.is_none());
+        let cb = send(&mut filter, "tenant-u");
+        assert!(
+            cb.local_reply.is_none(),
+            "platform mode is admitted as before"
+        );
     }
 
     // 12: an unknown llmp_ key -> 401.

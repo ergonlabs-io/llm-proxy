@@ -25,6 +25,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-16 | Chargeback tags reach ledger entries, bounded metrics, survive a restart | passing — since 2026-10-20 (`qa16_chargeback_tags_test.go`); approved through the chargeback-tags backlog acceptance (owner, 2026-10-20) |
 | QA-17 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa17_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
 | QA-18 | Speech under a tenant budget is charged per character and ledgered; non-2xx charges nothing; transcription charged per second; uncountable shapes refused | passing — since 2026-10-20 (`qa18_speech_metering_test.go`); approved through the v0.6.0 ship gate clause 1 (owner, 2026-10-18) |
+| QA-19 | A JWT caller of a BYOK tenant reaches the provider with the tenant's key and is not platform spend; a JWT caller without a stored key is unchanged | passing — since 2026-10-20 (`qa19_jwt_byok_test.go`); approved through the JWT tenant-credentials backlog acceptance (owner, 2026-10-19) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -584,6 +585,25 @@ refused with `403` and never reaches the provider.
 binary from Rust; this checks the v0.6.0 ship gate from the outside: the
 dialect rate card, the admin budget, the ledger read API, and the log line
 an operator reads.
+
+## QA-19 — A JWT caller of a BYOK tenant uses the tenant's key
+
+**Property.** With `auth.jwt` (inline JWKS), `auth.tenant_credentials`, a
+provider with `tenant_credentials: true`, a rate card and a ledger, tenant
+`acme` stores its own provider key through the admin API and tenant `beta`
+stores none; both have a platform-scoped budget (the default scope). A JWT
+for `acme` is served, and the provider receives `Authorization: Bearer
+<acme's key>` only: the operator key is on no header. Its ledger entry has
+`credential_source: tenant`, a non-zero cost, and no `tenant` in
+`charged_scopes`, and `acme`'s spend report stays 0. A JWT for `beta` is
+served with the operator key only, its entry has `credential_source:
+platform` with the tenant among `charged_scopes`, and `beta`'s spend is
+non-zero.
+
+**Why black box.** `jwt_tenant_credentials_e2e.rs` pins the headers across a
+fallback chain from Rust; this checks the JWT tenant-credentials acceptance from the outside:
+the dialect, the admin credential and budget APIs, the provider's view, and
+the ledger read API.
 
 ## QA-18 — Speech under a tenant budget is charged and ledgered
 
