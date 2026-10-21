@@ -3,7 +3,7 @@ title: Draining and shutdown
 description: "Stop the proxy without dropping in-flight requests: drain on SIGTERM and the shutdown sequence."
 summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
   changes, and what the drain deadline cuts.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-20
 related:
   - operations/config-reload
   - reference/cli
@@ -23,7 +23,10 @@ falls back to the OS default.
    balancer or Kubernetes stops sending new traffic.
 2. Every worker closes its listening sockets. New connections are refused.
    A config reload (SIGHUP or xDS) during the drain does not open them again.
-3. Idle keep-alive connections close now.
+3. Each HTTP connection is told to close. With `--drain-strategy immediate`
+   (the default), this happens to every connection now. With `gradual`, it is
+   spread over the window: see [Gradual drain](#gradual-drain). An idle
+   keep-alive connection closes when it is told to.
 4. A request or stream already in flight keeps running. When it finishes, its
    connection closes: the response carries `Connection: close` on HTTP/1, and
    the proxy sends `GOAWAY` on HTTP/2.
@@ -41,6 +44,27 @@ TCP proxy connections are not closed early. They run until the window ends.
 An upgrade tunnel, for example a WebSocket, counts as an active connection. The
 drain start does not close it. The drain stays open until a peer closes the
 tunnel or the drain deadline passes.
+
+## Gradual drain
+
+Behind a load balancer, `immediate` closes every keep-alive connection at the
+same moment, and all clients reconnect at once. Use `--drain-strategy gradual`
+to spread the closes, as Envoy does:
+
+- The proxy tells its HTTP connections to close one at a time, at even
+  intervals over the first quarter of `--drain-time-s`. The first one closes at
+  drain start. With `--drain-time-s 40` and 8 connections on a worker, one
+  closes about every 1.25 seconds, and all are told within 10 seconds.
+- A request that arrives during the drain can also close its connection after
+  its response. The chance starts at 0 at drain start and grows to 1 at the
+  deadline.
+- A config reload (SIGHUP or xDS) during a gradual drain still closes every
+  HTTP connection at once, so a rotated provider key is not sent on a
+  kept-alive connection.
+
+Each worker keeps its own schedule. The drain ends as soon as no connection is
+left, so a gradual drain of idle connections ends after about a quarter of the
+window.
 
 ## Access-log lines at exit
 
@@ -95,7 +119,7 @@ warming, until `initial_fetch_timeout`.
 | Flag | Default | What it does |
 |---|---|---|
 | `--drain-time-s` | `600` | Seconds to wait for connections to finish before cutting them. |
-| `--drain-strategy` | none | Accepted for Envoy command lines. It has no effect: both values drain as described above, and the proxy logs a warning at startup when the flag is given. |
+| `--drain-strategy` | `immediate` | `immediate` tells every connection to close at drain start. `gradual` spreads the closes over the window (see [Gradual drain](#gradual-drain)). |
 
 See [CLI reference](../../reference/cli/) for the full flag list.
 
@@ -104,6 +128,9 @@ See [CLI reference](../../reference/cli/) for the full flag list.
 This section is for maintainers.
 
 - Shutdown sequence and the access-log flush budget: `crates/proxy/src/main.rs`.
+- Drain strategy schedule: `connection_drain_delay` and `drain_close` in
+  `crates/proxy-core/src/drain.rs`; deviations from Envoy are row 1 of
+  `internal-docs/envoy-divergences.md`.
 - Upgrade tunnel during a drain:
   `an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes`
   in `crates/proxy-core/src/listener_drain_tests.rs`.
