@@ -129,7 +129,9 @@ cleanup() {
     echo
     echo "--- teardown ---"
     local leftover
-    leftover="$(pgrep -f 'mock-upstream|llm-proxy' || true)"
+    # By process name: `pgrep -f llm-proxy` also matches any command line
+    # that contains the repository path, such as the shell running this.
+    leftover="$( { pgrep -x mock-upstream; pgrep -x llm-proxy; } || true)"
     if [[ -n "$leftover" ]]; then
         echo "WARNING: processes still running after teardown:"
         ps -o pid,command -p $leftover || true

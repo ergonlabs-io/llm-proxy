@@ -86,7 +86,9 @@ cleanup() {
     echo
     echo "--- teardown ---"
     local leftover
-    leftover="$(pgrep -f 'mock-upstream|llm-proxy|loadgen|redis-server 127.0.0.1' || true)"
+    # Match the binaries, not every command line that contains the repo
+    # path (/root/llm-proxy), which reported this script's own ssh wrapper.
+    leftover="$( { pgrep -x mock-upstream; pgrep -x llm-proxy; pgrep -x loadgen; pgrep -f 'redis-server 127.0.0.1'; } || true)"
     if [[ -n "$leftover" ]]; then
         echo "WARNING: processes still running after teardown:"
         ps -o pid,command -p $leftover || true
@@ -456,8 +458,8 @@ s4a() {
 s4b() {
     local d="$OUT/${1:-s4b}"; mkdir -p "$d"
     local faults="${2:-}" persist="${3:-}" label=""
-    [[ -n "$faults" ]] && label=" + faults, Redis returns ${persist:+WITH ITS DATA (AOF)}"
-    [[ -n "$faults" && -z "$persist" ]] && label="$label EMPTY (no persistence)"
+    [[ -n "$faults" && -n "$persist" ]] && label=" + faults, Redis returns WITH ITS DATA (AOF)"
+    [[ -n "$faults" && -z "$persist" ]] && label=" + faults, Redis returns EMPTY (no persistence)"
     echo "=== ${1:-s4b} fleet stream ceiling: concurrent_streams=$S4_STREAMS, offered 2x$label ===" \
         | tee "$d/label.txt"
     start_mock "$d" --tokens "$TOKENS" --ttft-ms "$TTFT_MS" --inter-token-ms "$INTER_TOKEN_MS"
@@ -470,7 +472,10 @@ s4b() {
     start_stream_sampler "$d"
     scrape_all "$d" before
     # Offered fleet concurrency 2C, by Little's law: rate x stream time.
+    # Faults need room after Redis returns (+130 s): one policy poll (60 s),
+    # then a stretch of steady state before the last stream time.
     local per_replica_rps i duration=180
+    [[ -n "$faults" ]] && duration=300
     per_replica_rps="$(python3 -c "print(round(2 * $S4_STREAMS / 3 / $INTRINSIC_S, 3))")"
     for ((i = 0; i < 3; i++)); do
         loadgen --target "http://127.0.0.1:${LISTEN[i]}" --api-key "$KEY" \
