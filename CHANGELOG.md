@@ -58,6 +58,19 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   only that of its aggregate, as Envoy does; an aggregate in front of a
   configured provider is sized to its members' sum so it does not cap them.
   See [Providers and clusters](docs/site/src/content/docs/providers-and-routing/providers-and-clusters.md#concurrency-ceilings).
+- Session affinity for weighted models. `models.<name>.session_affinity`
+  (`header`, `identity: key | user | tenant`) pins a session to one of the
+  model's weighted providers, so the provider's prompt cache stays warm: the
+  xxHash64 of the session value, not a random draw, picks the first provider
+  in proportion to the weights, on every replica, with no shared state.
+  Failover, ejection and credential isolation are unchanged. Envoy mode:
+  route `hash_policy` (`header`, or `filter_state` with
+  `llmproxy.auth.key_id`, `llmproxy.auth.user_id` or `llmproxy.auth.tenant`)
+  with `weighted_clusters.use_hash_policy: true`; a header policy picks the
+  same cluster as Envoy v1.38. New counter
+  `llmproxy_router_session_affinity_total{outcome}`. Other hash policy shapes
+  are refused with their path (`internal-docs/envoy-divergences.md` row 46).
+  See ADR-0016 and the load-balancing guide.
 - JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
   `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
   `{ claim: department, tag: team }`, so the identity provider sets a JWT

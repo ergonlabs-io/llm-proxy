@@ -46,7 +46,7 @@ use crate::handler::{
     local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, UpgradeTunnel,
 };
 use crate::retry::{AttemptOutcome, RetryState};
-use crate::route::{apply_prefix_rewrite, select_cluster};
+use crate::route::{apply_prefix_rewrite, select_cluster, weighted_draw, HashIdentity};
 use crate::stat_handles::RouterStats;
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
@@ -697,12 +697,7 @@ impl RouterHandler {
         head: &RequestHeaders,
         dcb: &mut dyn DecoderCallbacks,
     ) -> HttpResponseParts {
-        let draw = match &fwd.target {
-            ForwardTarget::Weighted(w) if w.total_weight > 0 => {
-                rand::random::<u64>() % w.total_weight
-            }
-            _ => 0,
-        };
+        let draw = self.target_draw(&fwd.target, &head.headers, dcb);
         let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
             let mut info = dcb.stream_info();
             info.set_response_flag(ResponseFlag::NoClusterFound);
@@ -1122,6 +1117,36 @@ impl RouterHandler {
         });
     }
 
+    /// S1.5: the one draw a request makes for its forward target, reused
+    /// across retries. A weighted target with a hash policy draws from the
+    /// session hash (ADR-0016), so one session keeps its member; otherwise
+    /// the draw is uniform. Shared by `apply_forward` and `handle_upgrade` so
+    /// both selection sites pick the same member for the same request.
+    fn target_draw(
+        &self,
+        target: &ForwardTarget,
+        headers: &http::HeaderMap,
+        dcb: &mut dyn DecoderCallbacks,
+    ) -> u64 {
+        let ForwardTarget::Weighted(weighted) = target else {
+            return 0;
+        };
+        if weighted.hash_policy.is_empty() {
+            return weighted_draw(weighted, headers, &HashIdentity::default(), rand::random).0;
+        }
+        let (draw, source) = {
+            let info = dcb.stream_info();
+            let identity = HashIdentity {
+                key_id: info.auth.key_id.as_deref(),
+                user_id: info.auth.user_id.as_deref(),
+                tenant: info.auth.tenant.as_deref(),
+            };
+            weighted_draw(weighted, headers, &identity, rand::random)
+        };
+        self.stats.record_session_affinity(source);
+        draw
+    }
+
     async fn apply_forward(
         &self,
         fwd: &proxy_config::ir::ForwardAction,
@@ -1131,12 +1156,7 @@ impl RouterHandler {
         dcb: &mut dyn DecoderCallbacks,
         attempt_count: AttemptCountCfg,
     ) -> HttpResponseParts {
-        let draw = match &fwd.target {
-            ForwardTarget::Weighted(w) if w.total_weight > 0 => {
-                rand::random::<u64>() % w.total_weight
-            }
-            _ => 0,
-        };
+        let draw = self.target_draw(&fwd.target, &head.headers, dcb);
 
         let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
             tracing::debug!(

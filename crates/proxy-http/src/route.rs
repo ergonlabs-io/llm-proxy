@@ -7,9 +7,10 @@
 use std::sync::Arc;
 
 use proxy_config::ir::{
-    ForwardTarget, HeaderMatch, HeaderMatchKind, PathMatch, RouteEntry, RouteMatcher, RouteTable,
-    VirtualHostIR,
+    ForwardTarget, HashSource, HeaderMatch, HeaderMatchKind, PathMatch, RouteEntry,
+    RouteHashPolicy, RouteMatcher, RouteTable, VirtualHostIR, WeightedClusters,
 };
+use xxhash_rust::xxh64::{xxh64, Xxh64};
 
 // Regexes are anchored during config compilation, so matching here is already
 // whole-string. Re-anchoring or checking match spans would change alternation
@@ -189,6 +190,93 @@ pub fn select_cluster<'t>(
             }
         }
         ForwardTarget::Weighted(weighted) => Some(weighted.pick(draw).as_str()),
+    }
+}
+
+/// The authenticated identity a route hash policy may read (ADR-0016
+/// decision 5): the values the authentication filter left on `AuthInfo`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HashIdentity<'a> {
+    pub key_id: Option<&'a str>,
+    pub user_id: Option<&'a str>,
+    pub tenant: Option<&'a str>,
+}
+
+/// Envoy `HashPolicyImpl::generateHash` (ADR-0016 decision 1). Each entry
+/// that yields a value is folded in as `rotl(hash, 1) ^ value`, starting from
+/// 0; a terminal entry stops the walk once a hash exists; no value from any
+/// entry means no hash.
+pub fn generate_hash(
+    policy: &[RouteHashPolicy],
+    headers: &http::HeaderMap,
+    identity: &HashIdentity<'_>,
+) -> Option<u64> {
+    let mut hash: Option<u64> = None;
+    for entry in policy {
+        let value = match &entry.source {
+            HashSource::Header(name) => header_hash(headers, name),
+            HashSource::AuthKeyId => identity.key_id.map(|v| xxh64(v.as_bytes(), 0)),
+            HashSource::AuthUserId => identity.user_id.map(|v| xxh64(v.as_bytes(), 0)),
+            HashSource::AuthTenant => identity.tenant.map(|v| xxh64(v.as_bytes(), 0)),
+        };
+        if let Some(value) = value {
+            hash = Some(hash.map_or(0, |h| h.rotate_left(1)) ^ value);
+        }
+        if entry.terminal && hash.is_some() {
+            break;
+        }
+    }
+    hash
+}
+
+/// Envoy `HeaderHashMethod`: no header, no value; otherwise xxHash64 (seed 0)
+/// of every value, sorted and concatenated, so the order a client repeats
+/// the header in does not matter. An empty value is hashed.
+fn header_hash(headers: &http::HeaderMap, name: &http::HeaderName) -> Option<u64> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?;
+    let Some(second) = values.next() else {
+        return Some(xxh64(first.as_bytes(), 0));
+    };
+    let mut all: Vec<&[u8]> = vec![first.as_bytes(), second.as_bytes()];
+    all.extend(values.map(|v| v.as_bytes()));
+    all.sort_unstable();
+    let mut state = Xxh64::new(0);
+    for value in all {
+        state.update(value);
+    }
+    Some(state.digest())
+}
+
+/// How a weighted draw was made, for the router's affinity counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawSource {
+    /// The target has no hash policy: today's random draw.
+    Random,
+    /// The hash policy yielded a hash.
+    Hashed,
+    /// A hash policy is configured but yielded nothing, so the draw is random
+    /// (Envoy falls back the same way).
+    Unhashed,
+}
+
+/// S1.5 with ADR-0016: the draw for a weighted target, in
+/// `[0, total_weight)`. The hash, when there is one, replaces the random
+/// value before the same modulo, as Envoy's `pickWeightedCluster` does.
+/// `random` is called only when no hash is used.
+pub fn weighted_draw(
+    weighted: &WeightedClusters,
+    headers: &http::HeaderMap,
+    identity: &HashIdentity<'_>,
+    random: impl FnOnce() -> u64,
+) -> (u64, DrawSource) {
+    let total = weighted.total_weight.max(1);
+    if weighted.hash_policy.is_empty() {
+        return (random() % total, DrawSource::Random);
+    }
+    match generate_hash(&weighted.hash_policy, headers, identity) {
+        Some(hash) => (hash % total, DrawSource::Hashed),
+        None => (random() % total, DrawSource::Unhashed),
     }
 }
 

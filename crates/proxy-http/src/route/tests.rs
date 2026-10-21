@@ -715,6 +715,141 @@ fn weighted_pick_single_entry() {
     assert_eq!(select_cluster(&fwd.target, &headers(&[]), 6), Some("only"));
 }
 
+// ------------------------------------------- ADR-0016 session hash policy --
+
+/// The weighted target of the single route in `route_config`.
+fn weighted_target(fx: &Fixture) -> &proxy_config::ir::WeightedClusters {
+    let RouteMatch::Found { route, .. } = match_route(fx.table(), &req("h", "/", &headers(&[])))
+    else {
+        panic!("expected match");
+    };
+    let RouteActionIR::Forward(fwd) = &route.action else {
+        panic!("expected forward action");
+    };
+    let ForwardTarget::Weighted(w) = &fwd.target else {
+        panic!("expected weighted target");
+    };
+    w
+}
+
+fn hashed_route(hash_policy: &str) -> Fixture {
+    Fixture::new(&format!(
+        r#"
+                  name: rt
+                  virtual_hosts:
+                    - name: v1
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route:
+                            hash_policy: {hash_policy}
+                            weighted_clusters:
+                              use_hash_policy: true
+                              clusters:
+                                - {{ name: a, weight: 3 }}
+                                - {{ name: b, weight: 1 }}
+"#
+    ))
+}
+
+/// Envoy's own xxHash64 vector (`test/common/common/hash_test.cc`): the
+/// header source hashes a single value exactly as Envoy does, so a session
+/// lands on the member Envoy would pick.
+#[test]
+fn header_hash_matches_envoys_xxhash64() {
+    let fx = hashed_route("[{ header: { header_name: x-session-affinity } }]");
+    let w = weighted_target(&fx);
+    let none = HashIdentity::default();
+    let foo = headers(&[("x-session-affinity", "foo")]);
+    assert_eq!(
+        generate_hash(&w.hash_policy, &foo, &none),
+        Some(3728699739546630719)
+    );
+    // The hash replaces the random value before Envoy's modulo.
+    let (draw, source) = weighted_draw(w, &foo, &none, || panic!("no random draw"));
+    assert_eq!(
+        (draw, source),
+        (3728699739546630719 % 4, DrawSource::Hashed)
+    );
+}
+
+/// Envoy `HeaderHashMethod`: an absent header yields nothing (so the draw is
+/// random), an empty value is hashed, and repeated values are sorted before
+/// hashing, so their order does not matter but their number does.
+#[test]
+fn header_hash_absent_empty_and_repeated_values() {
+    let fx = hashed_route("[{ header: { header_name: x-session-affinity } }]");
+    let w = weighted_target(&fx);
+    let none = HashIdentity::default();
+    assert_eq!(generate_hash(&w.hash_policy, &headers(&[]), &none), None);
+    assert_eq!(
+        weighted_draw(w, &headers(&[]), &none, || 6),
+        (6 % 4, DrawSource::Unhashed)
+    );
+    assert_eq!(
+        generate_hash(
+            &w.hash_policy,
+            &headers(&[("x-session-affinity", "")]),
+            &none
+        ),
+        Some(xxhash_rust::xxh64::xxh64(b"", 0))
+    );
+    let ab = headers(&[("x-session-affinity", "b"), ("x-session-affinity", "a")]);
+    let ba = headers(&[("x-session-affinity", "a"), ("x-session-affinity", "b")]);
+    assert_eq!(
+        generate_hash(&w.hash_policy, &ab, &none),
+        Some(xxhash_rust::xxh64::xxh64(b"ab", 0))
+    );
+    assert_eq!(
+        generate_hash(&w.hash_policy, &ab, &none),
+        generate_hash(&w.hash_policy, &ba, &none)
+    );
+}
+
+/// Envoy `HashPolicyImpl::generateHash`: values fold as `rotl(h, 1) ^ v`;
+/// a terminal entry stops the walk only once a hash exists, so a missing
+/// header falls through to the identity. The policies are built directly:
+/// identity sources only lower behind an authentication filter.
+#[test]
+fn hash_policy_fold_and_terminal() {
+    use proxy_config::ir::{HashSource, RouteHashPolicy};
+    use xxhash_rust::xxh64::xxh64;
+    let entry = |source, terminal| RouteHashPolicy { source, terminal };
+    let header = || HashSource::Header(http::HeaderName::from_static("x-session-affinity"));
+    let identity = HashIdentity {
+        key_id: Some("key-1"),
+        user_id: Some("user-1"),
+        tenant: Some("tenant-1"),
+    };
+    let session = headers(&[("x-session-affinity", "s")]);
+
+    let folded = [entry(header(), false), entry(HashSource::AuthTenant, false)];
+    assert_eq!(
+        generate_hash(&folded, &session, &identity),
+        Some(xxh64(b"s", 0).rotate_left(1) ^ xxh64(b"tenant-1", 0))
+    );
+
+    let terminal = [entry(header(), true), entry(HashSource::AuthKeyId, false)];
+    assert_eq!(
+        generate_hash(&terminal, &session, &identity),
+        Some(xxh64(b"s", 0))
+    );
+    assert_eq!(
+        generate_hash(&terminal, &headers(&[]), &identity),
+        Some(xxh64(b"key-1", 0))
+    );
+
+    let user = [entry(HashSource::AuthUserId, false)];
+    assert_eq!(
+        generate_hash(&user, &headers(&[]), &identity),
+        Some(xxh64(b"user-1", 0))
+    );
+    assert_eq!(
+        generate_hash(&user, &headers(&[]), &HashIdentity::default()),
+        None
+    );
+}
+
 // --------------------------------------------------------- select_cluster --
 
 #[test]

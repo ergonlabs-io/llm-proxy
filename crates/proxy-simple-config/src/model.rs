@@ -898,6 +898,33 @@ pub struct ModelDef {
     /// per-route override on this model's route.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Pins a session to one weighted provider (ADR-0016). Lowers to Envoy
+    /// `weighted_clusters.use_hash_policy` plus a route `hash_policy`; needs
+    /// weights on `providers`.
+    #[serde(default)]
+    pub session_affinity: Option<SessionAffinity>,
+}
+
+/// `models.<name>.session_affinity`: where a request's session key comes
+/// from. At least one of the two is set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAffinity {
+    /// Request header carrying the session key; checked first.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Authenticated identity used when the header is absent.
+    #[serde(default)]
+    pub identity: Option<AffinityIdentity>,
+}
+
+/// `models.<name>.session_affinity.identity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AffinityIdentity {
+    Key,
+    User,
+    Tenant,
 }
 
 /// One entry in a [`ModelDef`]'s `providers` list: either the shorthand
