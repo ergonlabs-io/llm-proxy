@@ -2714,6 +2714,12 @@ fn lower_model(
     }
 
     let mut route = json!({ "match": r#match, "route": action });
+    // A single member (one weighted provider) has no split to bias.
+    if target_key == "weighted_clusters" && model.selection == ModelSelection::Latency {
+        route["metadata"] = json!({
+            "filter_metadata": { "io.llmproxy.selection": { "mode": "latency" } }
+        });
+    }
 
     let mut typed_per_filter_config = json!({
         USAGE_FILTER_NAME: {

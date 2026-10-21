@@ -903,6 +903,21 @@ pub struct ModelDef {
     /// weights on `providers`.
     #[serde(default)]
     pub session_affinity: Option<SessionAffinity>,
+    /// How a weighted alias picks its first provider for a request with no
+    /// session: by weight alone (the default) or by weight scaled by
+    /// measured latency. Lowers to route metadata `io.llmproxy.selection`
+    /// (`envoy-divergences.md` row 48); needs weights on `providers`.
+    #[serde(default)]
+    pub selection: ModelSelection,
+}
+
+/// `models.<name>.selection`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelSelection {
+    #[default]
+    Weighted,
+    Latency,
 }
 
 /// `models.<name>.session_affinity`: where a request's session key comes

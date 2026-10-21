@@ -136,7 +136,13 @@ async fn stream(addr: SocketAddr, headers: &[(&str, &str)]) -> RawResponse {
     send_chat(addr, headers, true).await
 }
 
+/// The body names the model the `x-llmproxy-model` header names, so a
+/// dialect alias routes; Envoy-mode routes ignore it.
 async fn send_chat(addr: SocketAddr, headers: &[(&str, &str)], stream: bool) -> RawResponse {
+    let model = headers
+        .iter()
+        .find(|(name, _)| *name == "x-llmproxy-model")
+        .map_or("gpt-mock", |(_, value)| *value);
     tokio::time::timeout(
         CLIENT_TIMEOUT,
         send_json(
@@ -145,7 +151,7 @@ async fn send_chat(addr: SocketAddr, headers: &[(&str, &str)], stream: bool) -> 
             "/v1/chat/completions",
             headers,
             &json!({
-                "model": "gpt-mock",
+                "model": model,
                 "stream": stream,
                 "messages": [{ "role": "user", "content": "hi" }],
             }),
@@ -320,6 +326,62 @@ async fn a_session_stays_on_its_member_in_latency_mode() {
         b.log.requests().len(),
         before + 20,
         "the pinned session left the slow member"
+    );
+
+    drop(proxy);
+    drop(scratch);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The dialect switch reaches the same behaviour (AGENTS.md invariant 5):
+/// `models.<name>.selection: latency` on a 1:1 weighted alias whose second
+/// provider is slow. Each weighted member is a rotated aggregate, and its
+/// latency is that of the provider it dials first. Same bound as
+/// `latency_mode_sends_most_requests_to_the_fast_member`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dialect_latency_switch_sends_most_requests_to_the_fast_provider() {
+    const N: usize = 100;
+    let a = spawn_upstream("served by a", FAST, None).await;
+    let b = spawn_upstream("served by b", SLOW, None).await;
+    let scratch = ScratchDir::new("latency-dialect");
+    let listen: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let config = format!(
+        r#"
+version: 0
+listen: "{listen}"
+providers:
+  a: {{ type: openai-compatible, base_url: "http://127.0.0.1:{}" }}
+  b: {{ type: openai-compatible, base_url: "http://127.0.0.1:{}" }}
+routes: []
+models:
+  gpt-alias:
+    providers:
+      - {{ provider: a, weight: 1 }}
+      - {{ provider: b, weight: 1 }}
+    selection: latency
+"#,
+        a.port(),
+        b.port()
+    );
+    let path = scratch.write("llmproxy.yaml", &config);
+    let mut proxy = ProxyProcess::spawn(
+        &resolve_llm_proxy_bin(),
+        &path,
+        &scratch.path().join("proxy.log"),
+    );
+    proxy.wait_until_ready(listen, READY_TIMEOUT);
+
+    for i in 0..N {
+        let res = stream(listen, &[("x-llmproxy-model", "gpt-alias")]).await;
+        assert_eq!(res.status, 200, "request {i}: {}", res.body);
+    }
+    let (fast, slow) = (a.log.requests().len(), b.log.requests().len());
+    assert_eq!(fast + slow, N, "each request dialled exactly once");
+    assert!(slow >= 1, "the slow provider keeps a trickle");
+    assert!(
+        slow <= 30,
+        "slow provider served {slow} of {N}; latency mode expects about 10"
     );
 
     drop(proxy);

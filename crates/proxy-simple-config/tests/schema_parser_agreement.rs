@@ -270,6 +270,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_variants::<AffinityIdentity>,
         ),
         (
+            "#/$defs/ModelDef/properties/selection",
+            "ModelSelection",
+            parser_variants::<ModelSelection>,
+        ),
+        (
             "#/$defs/Route/properties/streaming",
             "StreamingMode",
             parser_variants::<StreamingMode>,

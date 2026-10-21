@@ -58,6 +58,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   only that of its aggregate, as Envoy does; an aggregate in front of a
   configured provider is sized to its members' sum so it does not cap them.
   See [Providers and clusters](docs/site/src/content/docs/providers-and-routing/providers-and-clusters.md#concurrency-ceilings).
+- Latency-aware selection for weighted models. `models.<name>.selection:
+  latency` multiplies each provider's weight by the fastest provider's
+  average latency divided by its own, between 0.1 and 1, so a slow provider
+  gets less traffic and keeps enough to be measured. The average is per
+  replica and per provider: time to the first event of a stream, time to the
+  full response otherwise, successful responses only. Requests pinned by
+  `session_affinity` keep the plain weights. Envoy mode: route metadata
+  `io.llmproxy.selection: { mode: latency }` on a `weighted_clusters` route
+  (`internal-docs/envoy-divergences.md` row 48). See the load-balancing guide.
 - Session affinity for weighted models. `models.<name>.session_affinity`
   (`header`, `identity: key | user | tenant`) pins a session to one of the
   model's weighted providers, so the provider's prompt cache stays warm: the
@@ -124,6 +133,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- A weighted route no longer draws a member that has no healthy host. Before,
+  in Envoy mode, a `weighted_clusters` member whose hosts were all ejected by
+  outlier detection kept its share, and its requests went to the ejected
+  hosts. Now the draw goes to the other members by their weights. A session
+  pinned by `session_affinity` moves to one fixed substitute, and sessions on
+  other members do not move. When no member has a healthy host, the behavior
+  is as before. Models in the `llmproxy` dialect already passed over an
+  ejected provider (`internal-docs/envoy-divergences.md` row 47).
 - Envoy mode: with `use_remote_address: true` and `xff_num_trusted_hops` of 1 or
   more, `client-ip` limits and `%DOWNSTREAM_REMOTE_ADDRESS%` now use the trusted
   `x-forwarded-for` entry, as Envoy does. Before, they used the TCP peer. An
