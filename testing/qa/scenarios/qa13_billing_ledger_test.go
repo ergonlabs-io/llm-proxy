@@ -520,7 +520,18 @@ func TestQA13_RejectAtDiskCapRecoversAfterAck(t *testing.T) {
 	if status, body := p.chat(); status != http.StatusOK {
 		t.Fatalf("after acknowledging: %d %q\n--- proxy log ---\n%s", status, body, p.proc.Log())
 	}
-	p.waitMetric("llmproxy_ledger_entries_committed_total", "", served+1)
+	// The entries held at the cap are written when admission resumes and can
+	// fill the spool again, so this request's entry may itself be held until
+	// the next acknowledgement. A consumer keeps acknowledging.
+	committed := "llmproxy_ledger_entries_committed_total"
+	deadline := time.Now().Add(10 * time.Second)
+	for got := p.metric(committed, ""); got != served+1; got = p.metric(committed, "") {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %d, want %d\n--- proxy log ---\n%s", committed, got, served+1, p.proc.Log())
+		}
+		p.drain()
+		time.Sleep(20 * time.Millisecond)
+	}
 	if uint64(len(entries)) > served {
 		t.Fatalf("consumer read %d entries for %d served requests", len(entries), served)
 	}
