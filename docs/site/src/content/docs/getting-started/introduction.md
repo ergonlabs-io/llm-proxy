@@ -1,106 +1,118 @@
 ---
-title: Introduction to llm-proxy
-description: "What llm-proxy is, what it does for LLM traffic, its security defaults, and where to start."
-summary: llm-proxy is a Rust proxy for LLM inference APIs, configured with a
-  single YAML file (schema/llmproxy-v0.schema.json). It meters tokens,
-  enforces token-based rate limits, fails over between same-dialect
-  providers, and authenticates callers.
-lastUpdated: 2026-10-18
+title: Introduction
+description: "What llm-proxy is, what it does today, what it does not do, and how it differs from a hosted router and from the LiteLLM proxy."
+summary: llm-proxy is a self-hosted Rust proxy for LLM inference APIs,
+  configured with one YAML file (schema/llmproxy-v0.schema.json). It forwards
+  requests in the provider's own dialect and adds token metering, virtual keys
+  and JWT authentication, token limits, spend budgets, guardrails, failover,
+  weighted routing, and usage records.
+lastUpdated: 2026-10-21
 related:
+  - getting-started/installation
   - getting-started/quickstart
-  - configuration/configuration-file
+  - getting-started/core-concepts
+  - getting-started/coming-from-litellm-or-openrouter
 ---
 
-# Introduction to llm-proxy
+llm-proxy is a self-hosted gateway for LLM inference APIs, written in Rust. It
+sits between your applications and your providers, such as OpenAI, Anthropic,
+or a self-hosted OpenAI-compatible server (vLLM, Ollama, TGI). It is one binary
+that you configure with one YAML file. Use it to put token accounting, access
+control, limits, and failover in one place instead of in every service.
 
-llm-proxy is a proxy for LLM inference APIs, written in Rust. It sits between
-your callers and providers such as OpenAI, Anthropic, or a self-hosted
-OpenAI-compatible server (vLLM, Ollama, TGI), and it understands the shape of
-an LLM request well enough to meter tokens, route by model, fail over between
-providers, and enforce per-caller budgets.
+The project is pre-1.0. Interfaces change between releases.
 
-## Configuration
+## At a glance
 
-llm-proxy is configured with a single YAML file, normatively defined by
-`schema/llmproxy-v0.schema.json`. You name providers and routes by model
-pattern; llm-proxy handles the rest. Parsing is strict — an unknown or
-misspelled field is a load error naming its exact dotted path, and the
-proxy does not start. [Configuration file reference](../../configuration/configuration-file/)
-is the field-by-field reference.
+- **Config:** one YAML file, passed with `llm-proxy --config <file>`. The
+  schema is `schema/llmproxy-v0.schema.json`.
+- **Strict by default:** an unknown or misspelled field is a load error that
+  names the dotted path. The proxy does not start.
+- **Authentication:** none unless the file has an `auth` block. With the block,
+  a request without a recognized credential gets `401`.
+- **Reload:** the proxy re-reads its file on `SIGHUP`. It does not watch the
+  file. See [Reload configuration](/docs/llm-proxy/operations/config-reload/).
 
-## Features
+## What it does today
 
-These are the LLM-specific features:
+| Capability | Behavior | Learn more |
+|---|---|---|
+| Passthrough | Forwards OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages requests without translation. | [API compatibility](/docs/llm-proxy/api-compatibility/overview/) |
+| Streaming | Forwards server-sent events as they arrive. The proxy does not buffer a response. | [API compatibility](/docs/llm-proxy/api-compatibility/overview/) |
+| Token metering | Reads token counts from each response, streaming or not, without buffering. Counts reach the access log, the usage record, limits, and budgets. | [Access logs](/docs/llm-proxy/observability/access-logs/) |
+| Authentication | Virtual keys (`llmp_...`) and JWT principals (`auth.jwt`). Fails closed. | [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/) |
+| Model access | Per-tenant model allow-lists. A tenant with no policy gets `403` by default. | [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/) |
+| Token and request limits | `limits` entries cap tokens per minute, requests per minute, and concurrent streams. A refusal is `429` with `x-ratelimit-*` headers. | [Token rate limiting](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/) |
+| Spend budgets | Budgets in US dollars for keys and tenants, priced from a rate card. | [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/) |
+| Guardrails | The proxy sends each request body to an HTTP check you run. The check allows or denies. | [Guardrails](/docs/llm-proxy/authentication/guardrails/) |
+| Failover | A route's `fallbacks`, or the providers of a `models` entry, are tried in order on a connection failure, `429`, `500`, `502`, or `503`. | [Failover](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/) |
+| Weighted routing | A `models` entry can split requests across providers by weight, with optional session affinity. | [Load balancing](/docs/llm-proxy/providers-and-routing/load-balancing/) |
+| The `auto` model | A request for `auto` is routed as the model that you pick for its tenant. | [The auto model](/docs/llm-proxy/providers-and-routing/auto-model/) |
+| Tenant provider credentials | A tenant can store its own provider key. | [Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/) |
+| Usage records | Request records file, billing ledger, chargeback tags, and body export. | [Observability](/docs/llm-proxy/observability/overview/) |
+| Realtime | WebSocket sessions, metered, when `realtime.enabled` is `true`. | [Realtime](/docs/llm-proxy/api-compatibility/realtime/) |
+| Admin API and UI | Read endpoints, a bearer-gated write API, and a browser UI at `/ui/`. | [Admin API](/docs/llm-proxy/administration/admin-api/) |
 
-- **Token metering.** Every response is parsed for token counts — OpenAI chat
-  completions, OpenAI Responses, and Anthropic Messages, streaming and
-  non-streaming — without buffering the response body. Counts reach the access log as
-  `%LLM_INPUT_TOKENS%`, `%LLM_OUTPUT_TOKENS%`, `%LLM_CACHED_TOKENS%`,
-  `%LLM_CACHE_CREATION_TOKENS%`, and `%LLM_TOTAL_TOKENS%`, plus TTFT and TPOT
-  timing.
-- **Rate limiting.** A `limits` entry keyed on `global`, `client-ip`,
-  `tenant`, or `header:<name>` caps tokens, requests, or concurrent streams
-  in a one-minute window. A refusal is a 429 with `x-ratelimit-*` headers.
-  A request that is already streaming is not truncated.
-- **Provider failover.** A route's `fallbacks` list is tried in order when the
-  primary provider's connection fails, or it returns a 429 or a 5xx before any
-  response byte — never after streaming to the client has begun. This works
-  between providers that speak the **same** wire dialect (for example, one
-  OpenAI-shaped provider falling back to another). A cross-dialect chain
-  (OpenAI primary, Anthropic fallback) is a load-time error, because the wrong
-  dialect's parser would read the response and report the wrong token counts.
-- **Authentication and model access.** With an `auth:` block, a request must
-  carry a recognized virtual key, or the proxy refuses it with `401` before
-  any provider is reached. An authenticated tenant also needs a model policy
-  that permits the requested model, or it gets `403`. See
-  [Security defaults](#security-defaults).
-- **Spend budgets and pricing.** Tenant and key budgets in US dollars, priced
-  from a rate card. See [Spend policies](../../limits-and-budgets/spend-policies/).
-- **Tenant provider credentials.** A tenant can store its own provider key.
-  See [Tenant provider credentials](../../authentication/tenant-provider-credentials/).
-- **Admin API and UI.** Read endpoints, a bearer-gated write API, and a
-  browser UI at `/ui`. See [Admin endpoints](../../observability/admin-endpoints/).
-- **OTLP metrics export.** `observability.metrics` sends metrics to an
-  OTLP/gRPC collector. See [Metrics and /stats](../../observability/metrics-and-stats/).
-- **Request capture.** See [Request capture](../../observability/request-capture/).
-- **External authorization.** See
-  [External authorization](../../authentication/external-authorization/).
-- **Envoy config and xDS.** The same engine loads an Envoy bootstrap and
-  takes xDS updates. See [xDS conformance](../../operations/xds-conformance/).
+## What it is not
+
+- **Not a translator.** A request for an Anthropic provider must be an
+  Anthropic request. A fallback chain that mixes dialects is a load error.
+- **Not a hosted service.** You run it. It does not hold your provider
+  accounts and does not bill you.
+- **Not a cache.** The proxy has no response cache.
+- **Not a content filter.** The proxy does not inspect prompts itself. A
+  guardrail check that you run does.
+- **Not a file watcher.** A change to the config file has no effect until
+  `SIGHUP` or a restart.
+
+The full list is on [Limitations](/docs/llm-proxy/help/limitations/).
+
+## How it compares
+
+| | llm-proxy | Hosted router (for example OpenRouter) | LiteLLM proxy |
+|---|---|---|---|
+| Where it runs | Your infrastructure | The vendor's infrastructure | Your infrastructure |
+| Dialect handling | Passthrough, no conversion | One API for many providers | Converts between provider formats |
+| Provider credentials | Yours, held on each provider | The vendor's, or yours | Yours |
+| Configuration | One strict YAML file | Dashboard and API | YAML file and a database |
+
+For a term-by-term map, read
+[Coming from LiteLLM or OpenRouter](/docs/llm-proxy/getting-started/coming-from-litellm-or-openrouter/).
 
 ## Security defaults
 
 | Control | Default | Exception |
 |---|---|---|
-| Authentication | Without an `auth:` block, there is none. With one, a request without a recognized virtual key gets `401`. | None. |
+| Authentication | Without an `auth:` block, there is none. With one, a request without a recognized credential gets `401`. | None. |
 | Model authorization | With an `auth:` block, a tenant with no stored model policy gets `403` (`auth.enforce.tenants_without_policy: deny`). | The starter config from `llm-proxy init` sets `allow`. Remove it before you issue keys to other people. |
 | Provider authorization | None. A tenant that may use a model may use every provider that serves it. | A tenant that stores its own provider key can use only providers it holds a key for. |
 | Admin write API | Refused (`403`) unless `LLMPROXY_ADMIN_TOKEN` is set. | None. |
 | Revocation | Through the admin API, at once on the replica that receives it, and within one policy poll on others. A key in `auth.keys` changes only on restart. | None. |
 
-See [Virtual keys](../../authentication/virtual-keys/) and
-[Manage configured virtual keys](../../authentication/managing-secrets/).
+See [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/) and
+[Manage configured virtual keys](/docs/llm-proxy/authentication/managing-secrets/).
 
 ## Where to start
 
-1. [Quickstart](../quickstart/): install, connect one provider, send a request.
-2. [Connect your application](../connect-your-application/): point an SDK at the proxy.
-3. [Manage configured virtual keys](../../authentication/managing-secrets/): keys and model access.
-4. [Configure rate limits](../../limits-and-budgets/token-rate-limiting/) and
-   [spend budgets](../../limits-and-budgets/spend-policies/).
-5. [Share state across replicas](../../operations/running-in-production/) for production.
+1. [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
+2. [Quickstart](/docs/llm-proxy/getting-started/quickstart/): connect one
+   provider and send a request.
+3. [Core concepts](/docs/llm-proxy/getting-started/core-concepts/): the terms
+   and the path of a request.
+4. [Connect your application](/docs/llm-proxy/getting-started/connect-your-application/):
+   point an SDK at the proxy.
+5. [Manage configured virtual keys](/docs/llm-proxy/authentication/managing-secrets/),
+   then [limits](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/) and
+   [spend budgets](/docs/llm-proxy/limits-and-budgets/spend-policies/).
+6. [Running in production](/docs/llm-proxy/operations/running-in-production/):
+   share state across replicas.
 
-## What it is not
+## Limitations
 
-llm-proxy does not watch its config file for changes. A running process
-re-reads its config only on `SIGHUP`. See
-[Reload configuration](../../operations/config-reload/). Changing a config file
-on disk has no effect until you send `SIGHUP` or restart the process.
+- Fallback works only within a chain of providers that use the same dialect.
+- Replicas share counters, keys, and policy only with `auth.store: shared`.
+  See [Running in production](/docs/llm-proxy/operations/running-in-production/).
+- Nothing watches credential or certificate files. A new provider key or
+  certificate needs a `SIGHUP` reload.
 
-Provider fallback works only within a chain of providers that use the same
-dialect. It is not a general "try any provider on failure" mechanism. The
-`models` catalogue in the configuration (a named model mapped to an ordered
-list of providers) turns a list of more than one provider into an ordered
-fallback chain. The same-dialect rule applies to it. See the
-[Configuration file reference](../../configuration/configuration-file/) for the
-field-by-field behavior.
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.

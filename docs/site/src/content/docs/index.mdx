@@ -1,38 +1,108 @@
 ---
 title: llm-proxy
-description: A high-performance proxy for LLM inference APIs.
+description: A self-hosted Rust proxy for LLM APIs with token metering, virtual keys, limits, spend budgets, provider failover, and usage records.
 template: splash
+hero:
+  tagline: One binary and one YAML file between your applications and your model providers.
+  actions:
+    - text: Quickstart
+      link: /docs/llm-proxy/getting-started/quickstart/
+      icon: right-arrow
+    - text: What is llm-proxy?
+      link: /docs/llm-proxy/getting-started/introduction/
+      variant: minimal
 ---
 
-A high-performance proxy for LLM inference APIs. It meters tokens,
-enforces token-based rate limits, fails over between providers, and
-authenticates callers, configured with a single LLM-native YAML file.
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-## Start here
+llm-proxy is a self-hosted proxy for LLM inference APIs. It passes requests
+through to your providers in their own format. It adds token metering,
+virtual keys and JWT authentication, token limits, spend budgets, guardrails,
+failover and weighted routing between providers, and usage records. The
+project is pre-1.0. Interfaces change between releases.
 
-1. **[Quickstart](getting-started/quickstart/)**: install the binary, connect
-   one provider, and send your first request.
-2. **[Connect your application](getting-started/connect-your-application/)**:
-   point the OpenAI or Anthropic SDK at the proxy.
-3. **[Manage configured virtual keys](authentication/managing-secrets/)**:
-   create keys and grant each tenant access to models.
+<CardGrid>
+  <Card title="Passthrough, not translation" icon="right-arrow">
+    Clients send OpenAI or Anthropic requests. The proxy forwards them in the
+    same dialect. It does not convert between dialects.
+  </Card>
+  <Card title="Control who spends what" icon="approve-check">
+    Virtual keys, JWT principals, per-tenant model access, token limits, and
+    spend budgets in US dollars.
+  </Card>
+  <Card title="Strict configuration" icon="setting">
+    An unknown or misspelled field is a load error with its full dotted path.
+  </Card>
+  <Card title="Per-provider credentials" icon="warning">
+    Provider keys live on the provider, not on the route. A failover never
+    sends one provider's key to another provider.
+  </Card>
+</CardGrid>
 
-## Sections
+## Choose a path
 
-- **[Getting started](getting-started/introduction/)**: what llm-proxy is,
-  its security defaults, installation, and the first request.
-- **[Configuration](configuration/configuration-file/)**: how to write the
-  config file, and the generated [field reference](configuration/reference/).
-- **[Providers and routing](providers-and-routing/providers-and-clusters/)**:
-  providers, failover, timeouts, and retries.
-- **[API compatibility](api-compatibility/overview/)**: supported endpoints,
-  streaming, credentials, and model names.
-- **[Authentication](authentication/virtual-keys/)**: virtual keys, model
-  access, tenant provider credentials, and external authorization.
-- **[Limits and budgets](limits-and-budgets/token-rate-limiting/)**: rate
-  limits, current usage, spend budgets, and the billing ledger.
-- **[Observability](observability/overview/)**: access logs, metrics,
-  request records, body export, and the admin API.
-- **[Operations](operations/running-in-production/)**: replicas, reloads,
-  draining, and TLS.
-- **[Reference](reference/cli/)**: the command line.
+<LinkCard
+  title="Getting started"
+  description="Install the binary, run `init`, and send your first request."
+  href="/docs/llm-proxy/getting-started/introduction/"
+/>
+<LinkCard
+  title="Providers"
+  description="OpenAI, Anthropic, OpenRouter, Azure OpenAI, Vertex AI, Bedrock, and OpenAI-compatible servers."
+  href="/docs/llm-proxy/providers/overview/"
+/>
+<LinkCard
+  title="API compatibility"
+  description="Passthrough model, endpoints, streaming, realtime sessions, and proxy-generated errors."
+  href="/docs/llm-proxy/api-compatibility/overview/"
+/>
+<LinkCard
+  title="Configuration"
+  description="Write the `llmproxy` v0 file, and look up each field in the generated reference."
+  href="/docs/llm-proxy/configuration/configuration-file/"
+/>
+<LinkCard
+  title="Routing and reliability"
+  description="Failover, weighted routing, timeouts, retries, and the `auto` model."
+  href="/docs/llm-proxy/providers-and-routing/failover-and-aggregates/"
+/>
+<LinkCard
+  title="Access control"
+  description="Virtual keys, JWT principals, tenant provider credentials, and guardrails."
+  href="/docs/llm-proxy/authentication/virtual-keys/"
+/>
+<LinkCard
+  title="Limits and spend"
+  description="Token rate limits, spend budgets, pricing, current usage, and the billing ledger."
+  href="/docs/llm-proxy/limits-and-budgets/token-rate-limiting/"
+/>
+<LinkCard
+  title="Observability"
+  description="Access logs, metrics, request records, and body export."
+  href="/docs/llm-proxy/observability/overview/"
+/>
+<LinkCard
+  title="Administration"
+  description="The admin API and the admin UI."
+  href="/docs/llm-proxy/administration/admin-api/"
+/>
+<LinkCard
+  title="Operations"
+  description="Config reload, draining, TLS, and the production checklist."
+  href="/docs/llm-proxy/operations/running-in-production/"
+/>
+<LinkCard
+  title="Reference"
+  description="The command line, the config schema, metrics, and the glossary."
+  href="/docs/llm-proxy/reference/cli/"
+/>
+<LinkCard
+  title="Help"
+  description="Troubleshooting, the FAQ, and everything not available."
+  href="/docs/llm-proxy/help/limitations/"
+/>
+<LinkCard
+  title="Coming from LiteLLM or OpenRouter"
+  description="A concept map, including the features that have no equivalent here."
+  href="/docs/llm-proxy/getting-started/coming-from-litellm-or-openrouter/"
+/>
