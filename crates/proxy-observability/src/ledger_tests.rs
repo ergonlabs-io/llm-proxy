@@ -651,3 +651,48 @@ fn a_group_commit_larger_than_the_disk_cap_still_drains() {
         0
     );
 }
+
+/// An entry larger than one commit may hold at a small disk cap can never
+/// commit there, even into an empty spool. Held pending, it closed admission
+/// for good, with every entry behind it held too. It is counted lost
+/// (`oversize`) instead, and the entries after it are written. The entry is
+/// under `MAX_ENTRY_BYTES`, so only the cap makes it unwritable.
+#[test]
+fn an_entry_that_can_never_fit_the_disk_cap_is_lost_not_held() {
+    let dir = TempLedgerDir::new();
+    let mut config = dir.config(8, OnUnavailable::Reject);
+    config.max_disk_bytes = proxy_capture_spool::MIN_DISK_BYTES;
+    let mut ledger = TempLedger::open_with(dir, config);
+    let mut huge = numbered(0);
+    huge.route = "x".repeat(900 * 1024);
+    reserve(&ledger.ledger).append(huge, LedgerCharge::default());
+    reserve(&ledger.ledger).append(numbered(1), LedgerCharge::default());
+    // The writer answers in arrival order, so this read follows both entries.
+    ledger.ledger.read_committed(0, 1, ASK).unwrap();
+    assert!(
+        matches!(admit(&ledger.ledger), Ok(LedgerTicket::Reserved(_))),
+        "admission stays open"
+    );
+
+    let shape: Vec<(u64, String)> = ledger
+        .entries()
+        .into_iter()
+        .map(|e| (e.seq, e.record.event_id))
+        .collect();
+    assert_eq!(shape, [(0, "event-1".to_owned())], "seq stays gapless");
+    let scrape = ledger.scrape();
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"oversize\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"shutdown\"}"
+        ),
+        0
+    );
+}

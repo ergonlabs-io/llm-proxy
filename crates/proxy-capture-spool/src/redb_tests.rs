@@ -1498,3 +1498,50 @@ fn a_repeated_acknowledgement_lets_a_refused_commit_try_again() {
     spool.acknowledge(8).unwrap();
     assert_eq!(spool.commit().unwrap().through_sequence, 9);
 }
+
+/// The bound the billing ledger's writer relies on (`max_batch_bytes` in
+/// `proxy-observability`): a commit of a sixteenth of the ceiling, refused
+/// at the ceiling, publishes after one acknowledgement of everything
+/// retained. The spool is packed as tightly as one-row commits pack it, so
+/// the commit has only what the acknowledgement freed: redb returns a
+/// commit's freed pages in a pass after it publishes, so the next commit can
+/// use them. If either stops holding, the ledger stays at its cap with
+/// everything acknowledged.
+#[test]
+fn a_sixteenth_of_the_ceiling_refused_at_it_commits_after_one_full_acknowledgement() {
+    for size in [4000, 12_000] {
+        let config_in = |temp: &TempDir| {
+            let mut config = test_config(temp);
+            config.max_record_bytes = 16 * 1024;
+            config.max_disk_bytes = MIN_DISK_BYTES;
+            config.max_pending_records = 512;
+            config
+        };
+        let payload = vec![0x5a; size];
+        let reach = {
+            let scratch = TempDir::new().unwrap();
+            fill_with_batches(&mut open(config_in(&scratch)), &payload, 1, u64::MAX)
+        };
+        let temp = TempDir::new().unwrap();
+        let mut spool = open(config_in(&temp));
+        let durable = fill_with_batches(&mut spool, &payload, 1, reach);
+        assert_eq!(durable, reach, "size {size}");
+        let chunk = (MIN_DISK_BYTES as usize / 16) / size;
+        assert!(spool
+            .append_batch(&vec![payload.as_slice(); chunk])
+            .unwrap()
+            .iter()
+            .all(Result::is_ok));
+        assert!(
+            matches!(spool.commit(), Err(Error::Full)),
+            "size {size}: the chunk fitted, so the spool was not at its ceiling"
+        );
+
+        spool.acknowledge(durable).unwrap();
+        assert_eq!(
+            spool.commit().unwrap().through_sequence,
+            durable + chunk as u64,
+            "size {size}"
+        );
+    }
+}

@@ -440,8 +440,10 @@ counters at start, so an idle ledger shows zeros.
 | `llmproxy_spend_charged_micro_usd_total` | none | Micro-dollars the spend filter charged, once for each request that charged a scope. |
 | `llmproxy_ledger_spend_written_micro_usd_total` | none | Micro-dollars of spend charges in committed entries. |
 
-An `oversize` entry is larger than 1 MiB. The proxy logs it and does not write
-it.
+An `oversize` entry is larger than 1 MiB, or larger than 1/16 of
+`max_disk_bytes` when that is less (128 KiB at the 2 MiB minimum). An entry
+that large cannot be written at the disk cap. The proxy does not write it, and
+logs an error at most once every 5 seconds. The counter counts every one.
 
 ### Reconcile
 
