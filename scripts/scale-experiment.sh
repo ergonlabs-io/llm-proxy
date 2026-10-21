@@ -151,10 +151,12 @@ cmd_run() {
     for knob in $RUNNER_KNOBS; do
         [[ -n "${!knob:-}" ]] && env_args+=" $knob=$(printf '%q' "${!knob}")"
     done
-    # Detached, so a dropped ssh session does not kill the run.
+    # Detached, so a dropped ssh session does not kill the run. The whole
+    # backgrounded list is redirected too: otherwise its subshell holds the
+    # ssh channel open and this command waits for the whole run.
     ssh_vm "cd /root/llm-proxy && mkdir -p target/scale/$run_id && . \"\$HOME/.cargo/env\" \
-        && RUN_ID=$run_id$env_args nohup scripts/scale-experiment-remote.sh ${*:-all} \
-           > target/scale/$run_id/runner.log 2>&1 < /dev/null & echo started $run_id"
+        && { RUN_ID=$run_id$env_args setsid nohup scripts/scale-experiment-remote.sh ${*:-all} \
+           > target/scale/$run_id/runner.log 2>&1 < /dev/null & } > /dev/null 2>&1 < /dev/null; echo started $run_id"
     echo "RUN_ID=$run_id" >>"$STATE"
     echo "follow with: $0 tail"
 }
