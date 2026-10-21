@@ -7068,6 +7068,7 @@ fn convert_weighted_clusters(
         cumulative,
         total_weight: total,
         hash_policy,
+        selection: WeightedSelection::Static,
     })
 }
 

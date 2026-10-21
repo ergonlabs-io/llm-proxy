@@ -1041,6 +1041,7 @@ fn three_members() -> WeightedClusters {
         cumulative: vec![("a".into(), 2), ("b".into(), 3), ("c".into(), 4)],
         total_weight: 4,
         hash_policy: Vec::new(),
+        selection: Default::default(),
     }
 }
 

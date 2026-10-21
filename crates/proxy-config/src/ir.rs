@@ -1764,6 +1764,21 @@ pub struct WeightedClusters {
     /// random draw. Held here rather than on `ForwardAction` because nothing
     /// else consumes a route hash (ring hash and Maglev are refused).
     pub hash_policy: Vec<RouteHashPolicy>,
+    /// How a draw with no session hash weighs the members (llmproxy
+    /// extension, `envoy-divergences.md` row 48). A hashed draw always uses
+    /// the configured weights, so a session never moves with latency.
+    pub selection: WeightedSelection,
+}
+
+/// The weighting of a [`WeightedClusters`] draw that has no session hash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WeightedSelection {
+    /// The configured weights alone, as Envoy.
+    #[default]
+    Static,
+    /// Each member's weight is scaled down by how much slower its measured
+    /// latency is than the fastest member's, to a floor.
+    Latency,
 }
 
 /// One entry of a route hash policy (Envoy `RouteAction.HashPolicy`,
