@@ -523,9 +523,10 @@ Stated plainly, because a feature list without this is not much use:
 - **Authorization covers models only.** There is no per-provider
   authorization. An authenticated tenant with no stored model policy is refused
   with 403 unless `auth.enforce.tenants_without_policy` is `allow`.
-- **JWT verification is reachable from Envoy mode only.** `jwt_providers`
-  exists on the `llmproxy.auth` filter of a bootstrap. The `llmproxy` dialect
-  has no field for it. A JWT principal stays on the operator key.
+- **JWT callers always use the operator's provider keys.** `auth.jwt` (and
+  `jwt_providers` in Envoy mode) admits a verified token as a tenant, but never
+  with that tenant's stored provider credentials (ADR-0014), and a JWT
+  caller's chargeback tags come from the `x-cost-tags` header only.
 - **Limits apply to the fleet only with a `shared` store, and loosely.**
   With `auth.store: shared`, token and request windows reconcile through Redis
   about once a second, and each replica publishes its concurrent streams as a

@@ -187,6 +187,7 @@
     <button class="chip" data-ms="v0.4.0">v0.4.0 · gateway<span class="n" id="n-v040"></span></button>
     <button class="chip" data-ms="v0.5.0">v0.5.0 · ledger<span class="n" id="n-v050"></span></button>
     <button class="chip" data-ms="v0.6.0">v0.6.0 · metering<span class="n" id="n-v060"></span></button>
+    <button class="chip" data-ms="v0.7.0">v0.7.0 · deployment<span class="n" id="n-v070"></span></button>
     <button class="chip" data-ms="unscheduled">unscheduled<span class="n" id="n-unsched"></span></button>
     <button class="chip" data-ms="v1.0.0">v1.0.0<span class="n" id="n-v100"></span></button>
     <span class="sep"></span>
@@ -196,15 +197,13 @@
     <button class="chip" data-prio="P3">P3 · later<span class="n" id="n-P3"></span></button>
   </div>
   <p class="now">
-    <b>State 2026-10-20.</b> The latest release is tag <b>v0.6.0</b> (Metering completeness, 2026-10-20): images,
-    speech, transcription and image edits metered in provider units (ADR-0010 phases 2 and 3), chargeback tags and
-    OTel GenAI semconv 1.41.0. No milestone is current; the next one waits for an owner plan. Batch waits on its own ADR.
-    <b>Also in v0.6.0, outside the gate:</b> WP-112 (JWT/OIDC, ADR-0014), WP-114 (guardrail filter), WP-118 (weighted,
-    health-aware alias balancing) and WP-120 (fail over on provider credential failure; owner decision 2026-10-20).
-    <b>In progress:</b> WP-116 (added-latency benchmark): <code>make bench-added-latency</code> and the published page are
-    merged; numbers were taken under load, so a quiet-machine run is still needed before it closes.
-    <b>Next candidates:</b> WP-126 (JWT principals carry BYOK credentials) and WP-127
-    (JWT claims to chargeback tags).
+    <b>State 2026-10-21.</b> Current milestone: <b>v0.7.0 Production deployment</b> (approved 2026-10-21): WP-128
+    (Helm chart and container image), WP-129 (trusted hops for client-ip), WP-130 (--drain-strategy gradual) and WP-116
+    (quiet-machine benchmark run). The latest release is tag v0.6.0 (Metering completeness, 2026-10-20).
+    <b>Identity lane, outside the gate:</b> WP-126 (JWT principals carry BYOK credentials) and WP-127 (JWT claims to
+    chargeback tags).
+    <b>Open defect check:</b> QA-13 failed once in CI after v0.6.0 (ledger at its disk cap did not resume admitting after
+    every entry was acknowledged); under investigation, a v0.6.1 if it is a real defect.
     <b>Test count:</b> 3554 (make ci, 2026-10-20).
   </p>
   <p class="hint">Click a chip to spotlight matching cards; click again to clear. Milestone chips answer <i>when</i>; priority answers <i>what does this buy the product</i>; status answers <i>where is it</i>. Ready = no unmet dependencies today. ▲ marks the critical path; ⚑ marks built-but-unwired code; ⚠ marks a bug found in review.</p>
@@ -227,7 +226,7 @@
     { id: "H", name: "H · LLM layer", color: "var(--lane-h)" },
   ];
 
-  const CURRENT_MS = "v0.6.0"; // the current milestone (MILESTONES.md)
+  const CURRENT_MS = "v0.7.0"; // the current milestone (MILESTONES.md)
 
   // status: done | ready | started | blocked ; ms = the release the WP closes in
   const wps = /*__DATA__*/;
@@ -286,7 +285,7 @@
   }
   for (const [ms, id] of [["v0.0.1", "n-v001"], ["v0.1.0", "n-v010"], ["v0.2.0", "n-v020"],
                           ["v0.3.0", "n-v030"], ["v0.3.2", "n-v032"], ["v0.3.3", "n-v033"], ["v0.3.4", "n-v034"], ["v0.4.0", "n-v040"],
-                          ["v0.5.0", "n-v050"], ["v0.6.0", "n-v060"], ["unscheduled", "n-unsched"], ["v1.0.0", "n-v100"]]) {
+                          ["v0.5.0", "n-v050"], ["v0.6.0", "n-v060"], ["v0.7.0", "n-v070"], ["unscheduled", "n-unsched"], ["v1.0.0", "n-v100"]]) {
     document.getElementById(id).textContent = wps.filter(w => w.ms === ms).length;
   }
 
