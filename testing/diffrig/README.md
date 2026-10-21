@@ -48,11 +48,13 @@ run it.
 OPENROUTER_API_KEY=... make smoke-live
 ```
 
-- **Cost.** OpenRouter uses a free model (`:free`), so it costs nothing. Free
-  models are retired without notice; when the default one returns 404 or 429,
-  pick a current one from `https://openrouter.ai/api/v1/models` and set
-  `OPENROUTER_SMOKE_MODEL`. The other providers bill; every request uses a
-  one-line prompt and `max_tokens` of 24 or less.
+- **Cost.** OpenRouter uses a free model (`:free`), so it costs nothing. Its
+  requests allow 256 tokens, because free models often reason first and
+  reasoning counts against `max_tokens`. Free models are retired or
+  rate-limited without notice; when the default one returns 404 or 429, pick
+  a current one from `https://openrouter.ai/api/v1/models` and set
+  `OPENROUTER_SMOKE_MODEL`. The other providers bill; each of their requests
+  uses a one-line prompt and `max_tokens` of 24 or less.
 - **What is asserted.** A 200, non-empty content, and a JSON access-log line
   that names the provider cluster (`selected_provider`), shows an upstream was
   dialled (`upstream_host`), and carries the usage the proxy extracted

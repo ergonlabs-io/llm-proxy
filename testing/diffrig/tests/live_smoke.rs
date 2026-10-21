@@ -30,10 +30,11 @@
 //!
 //! ## Cost
 //!
-//! OpenRouter uses a free model (`:free` suffix), so its tests cost nothing.
+//! OpenRouter uses a free model (`:free` suffix), so its tests cost nothing;
+//! they allow 256 tokens because free models often reason before answering.
 //! The OpenAI, Anthropic, Vertex and Bedrock tests bill the account behind
-//! their credentials. Every request uses a one-line prompt and a
-//! `max_tokens` of 24 or less.
+//! their credentials, and each uses a one-line prompt and a `max_tokens` of
+//! 24 or less.
 //!
 //! ## Harness
 //!
@@ -67,9 +68,10 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(90);
 const ACCESS_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Free models come and go on OpenRouter; override with
-/// `OPENROUTER_SMOKE_MODEL` when this one is retired. Checked free on
-/// 2026-10-21 against `https://openrouter.ai/api/v1/models`.
-const OPENROUTER_DEFAULT_MODEL: &str = "google/gemma-4-26b-a4b-it:free";
+/// `OPENROUTER_SMOKE_MODEL` when this one is retired or rate-limited. Passed
+/// live on 2026-10-21; the Gemma free models were rate-limited upstream
+/// (429 from a shared pool) that day.
+const OPENROUTER_DEFAULT_MODEL: &str = "liquid/lfm-2.5-2.6b:free";
 
 /// Returns whether every variable in `vars` is set. When one is not, prints a
 /// `LIVE-SKIP` line naming the test and the variable and returns `false`, so
@@ -256,10 +258,14 @@ models:
     )
 }
 
+/// Many free models reason before they answer, and reasoning tokens count
+/// against `max_tokens`, so a small cap ends the reply before any content.
+/// Reasoning cannot always be switched off (some endpoints answer 400), so
+/// the cap leaves room for it instead. Free models cost nothing.
 fn openrouter_body(model: &str, stream: bool) -> Value {
     json!({
         "model": model,
-        "max_tokens": 16,
+        "max_tokens": 256,
         "messages": [{"role": "user", "content": "Reply with exactly one short word."}],
         "stream": stream,
     })
