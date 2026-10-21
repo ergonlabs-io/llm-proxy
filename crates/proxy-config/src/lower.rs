@@ -5459,6 +5459,48 @@ const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
 /// this without inventing a field that the strict Envoy parser would discard.
 const STREAMING_METADATA_KEY: &str = "io.llmproxy.streaming";
 
+/// Namespace for a weighted route's selection mode (`envoy-divergences.md`
+/// row 48). Envoy's `WeightedCluster` has no field for it; route metadata is
+/// the extension carrier, as for `io.llmproxy.streaming`.
+const SELECTION_METADATA_KEY: &str = "io.llmproxy.selection";
+
+/// Read `Route.metadata.filter_metadata["io.llmproxy.selection"]`.
+///
+/// The only accepted form is `{ mode: latency }`; omit the namespace for the
+/// static weighted draw. Any other key or value is refused with its path.
+fn convert_selection_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<Option<WeightedSelection>, ConfigError> {
+    let Some(selection) = metadata.and_then(|m| m.filter_metadata.get(SELECTION_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let selection_path = format!("{path}.metadata.filter_metadata[\"{SELECTION_METADATA_KEY}\"]");
+    let mut unknown: Vec<&String> = selection
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "mode")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{selection_path}.{key}"),
+            format!("`{SELECTION_METADATA_KEY}` only supports `mode: latency`"),
+        ));
+    }
+    match selection.fields.get("mode").and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::StringValue(mode)) if mode == "latency" => {
+            Ok(Some(WeightedSelection::Latency))
+        }
+        Some(_) => Err(invalid(
+            format!("{selection_path}.mode"),
+            "must be `latency`; omit `io.llmproxy.selection` for the static weighted draw",
+        )),
+        None => Err(invalid(format!("{selection_path}.mode"), "is required")),
+    }
+}
+
 /// Read `Route.metadata.filter_metadata["io.llmproxy.streaming"]`.
 ///
 /// The only accepted form is `{ strict: true }`.  `false` is rejected instead
@@ -6759,7 +6801,7 @@ fn convert_route(
     let matcher = convert_route_match(m, &format!("{path}.match"))?;
 
     use route_v3::route::Action;
-    let action = match &r.action {
+    let mut action = match &r.action {
         Some(Action::Route(ra)) => {
             RouteActionIR::Forward(convert_route_action(ra, &format!("{path}.route"))?)
         }
@@ -6799,6 +6841,20 @@ fn convert_route(
         &format!("{path}.typed_per_filter_config"),
     )?;
     let streaming_strict = convert_streaming_strict_metadata(r.metadata.as_ref(), path)?;
+    if let Some(selection) = convert_selection_metadata(r.metadata.as_ref(), path)? {
+        match &mut action {
+            RouteActionIR::Forward(ForwardAction {
+                target: ForwardTarget::Weighted(weighted),
+                ..
+            }) => weighted.selection = selection,
+            _ => {
+                return Err(invalid(
+                    format!("{path}.metadata.filter_metadata[\"{SELECTION_METADATA_KEY}\"]"),
+                    "selection applies only to a route with weighted_clusters",
+                ))
+            }
+        }
+    }
 
     Ok(RouteEntry {
         name: (!r.name.is_empty()).then(|| r.name.clone()),

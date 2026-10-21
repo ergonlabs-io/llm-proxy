@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use crate::discovery::{self, RefreshSchedule};
 use crate::health_check::HealthCheckEngine;
 use crate::host_set::{carry_over_health_flags, diff_host_sets, HostSet, HostSetDiff};
+use crate::latency::LatencyEwma;
 use crate::load_balancer::{self, HostPicker, LbError};
 use crate::minted_credential::MintedCredential;
 use crate::outlier::{OutlierDetector, RequestResult, TracingEventSink};
@@ -136,6 +137,10 @@ struct ManagedCluster {
     /// The task that keeps `minted` fresh ([`run_token_refresh`]). Set by [`ClusterManager::install`] after the
     /// first mint; it holds only a `Weak`. Aborted on `Drop`.
     token_refresh_task: Mutex<Option<JoinHandle<()>>>,
+    /// Moving average of this cluster's response latency, sampled by the router on routes in latency
+    /// selection mode. It lives here so a cluster carried forward across a reload keeps it, and a rebuilt
+    /// one starts afresh.
+    latency: Arc<LatencyEwma>,
 }
 
 impl Drop for ManagedCluster {
@@ -241,6 +246,7 @@ impl ManagedCluster {
                     dns_refresh_task: Mutex::new(None),
                     minted,
                     token_refresh_task: Mutex::new(None),
+                    latency: Arc::new(LatencyEwma::default()),
                 })
             }
             ClusterKind::Aggregate { .. } => {
@@ -276,6 +282,8 @@ impl ManagedCluster {
                     // Credentials live on the member actually dialled (AGENTS.md invariant 6).
                     minted: None,
                     token_refresh_task: Mutex::new(None),
+                    // Never sampled: the router records on the member it dialled.
+                    latency: Arc::new(LatencyEwma::default()),
                 })
             }
         }
@@ -953,6 +961,33 @@ impl ClusterRegistrySnapshot {
                 })
             }),
         }
+    }
+
+    /// Where to record a latency sample for a response from `name`, the cluster actually dialled.
+    pub fn latency_recorder(&self, name: &str) -> Option<Arc<LatencyEwma>> {
+        self.clusters
+            .load()
+            .get(name)
+            .map(|managed| Arc::clone(&managed.latency))
+    }
+
+    /// The latency a weighted draw expects from `name`, in microseconds; `None` before any sample or for
+    /// an unknown cluster. An aggregate answers with the member its walk would dial first: the first member
+    /// with a healthy host, or its first member when none has one.
+    pub fn expected_latency_micros(&self, name: &str) -> Option<f64> {
+        let registry = self.clusters.load();
+        let managed = registry.get(name)?;
+        let Some(members) = managed.aggregate_members() else {
+            return managed.latency.micros();
+        };
+        let walkable =
+            |member: &ClusterName| registry.get(member).filter(|member| !member.is_aggregate());
+        members
+            .iter()
+            .filter_map(walkable)
+            .find(|member| member.host_set.load().has_healthy_host())
+            .or_else(|| members.iter().find_map(walkable))
+            .and_then(|member| member.latency.micros())
     }
 
     /// Whether a cluster in this generation completed its initial discovery.

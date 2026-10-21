@@ -40,13 +40,23 @@ async fn spawn_upstream(text: &str, ttft: Duration, forced_error: Option<u16>) -
 /// An Envoy-mode bootstrap: one route splitting `weighted_clusters` 1:1 over
 /// two plain clusters `a` and `b`, no retry policy. `route_extra` is spliced
 /// into the route (for example its `metadata`), `cluster_extra` into every
-/// cluster.
+/// cluster. `affinity` adds an `x-session-affinity` header hash policy
+/// (ADR-0016).
 fn envoy_bootstrap(
     listen: SocketAddr,
     ports: [u16; 2],
     route_extra: &str,
     cluster_extra: &str,
+    affinity: bool,
 ) -> String {
+    let (hash_policy, use_hash_policy) = if affinity {
+        (
+            "\n                            hash_policy: [{ header: { header_name: x-session-affinity } }]",
+            "\n                              use_hash_policy: true",
+        )
+    } else {
+        ("", "")
+    };
     let cluster = |name: &str, port: u16| {
         format!(
             r#"
@@ -87,8 +97,8 @@ static_resources:
                       routes:
                         - match: {{ prefix: "/" }}{route_extra}
                           route:
-                            timeout: 5s
-                            weighted_clusters:
+                            timeout: 5s{hash_policy}
+                            weighted_clusters:{use_hash_policy}
                               clusters:
                                 - {{ name: a, weight: 1 }}
                                 - {{ name: b, weight: 1 }}
@@ -117,6 +127,16 @@ fn spawn_envoy_mode(
 }
 
 async fn chat(addr: SocketAddr, headers: &[(&str, &str)]) -> RawResponse {
+    send_chat(addr, headers, false).await
+}
+
+/// A streaming request: the mock holds its first event for its `ttft`, which
+/// is what latency mode measures for a stream.
+async fn stream(addr: SocketAddr, headers: &[(&str, &str)]) -> RawResponse {
+    send_chat(addr, headers, true).await
+}
+
+async fn send_chat(addr: SocketAddr, headers: &[(&str, &str)], stream: bool) -> RawResponse {
     tokio::time::timeout(
         CLIENT_TIMEOUT,
         send_json(
@@ -124,7 +144,11 @@ async fn chat(addr: SocketAddr, headers: &[(&str, &str)]) -> RawResponse {
             "POST",
             "/v1/chat/completions",
             headers,
-            &json!({ "model": "gpt-mock", "messages": [{ "role": "user", "content": "hi" }] }),
+            &json!({
+                "model": "gpt-mock",
+                "stream": stream,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
         ),
     )
     .await
@@ -153,7 +177,7 @@ async fn the_weighted_draw_skips_a_member_whose_hosts_are_all_ejected() {
     let a = spawn_upstream("served by a", Duration::from_millis(1), None).await;
     let b = spawn_upstream("served by b", Duration::from_millis(1), Some(500)).await;
     let (addr, scratch, proxy) = spawn_envoy_mode("weighted-skip-ejected", |listen| {
-        envoy_bootstrap(listen, [a.port(), b.port()], "", EJECT_ON_FIRST_5XX)
+        envoy_bootstrap(listen, [a.port(), b.port()], "", EJECT_ON_FIRST_5XX, false)
     });
 
     for _ in 0..200 {
@@ -180,6 +204,123 @@ async fn the_weighted_draw_skips_a_member_whose_hosts_are_all_ejected() {
     }
     assert_eq!(b.log.requests().len(), 1, "ejected b was drawn again");
     assert_eq!(a.log.requests().len(), a_before + 40);
+
+    drop(proxy);
+    drop(scratch);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+const LATENCY_MODE: &str = r#"
+                          metadata:
+                            filter_metadata:
+                              io.llmproxy.selection: { mode: latency }"#;
+
+/// `fast` answers its first event at once; `slow` holds it far longer than
+/// any proxy or scheduler jitter, so the two averages never cross.
+const FAST: Duration = Duration::from_millis(1);
+const SLOW: Duration = Duration::from_millis(300);
+
+/// Weights 1:1, `b` slow. Latency mode scales `b` to the floor (100 per
+/// mille of its weight) once one sample of each exists, so of N sequential
+/// requests `b` expects about 1 + (N - 2) / 11, 10 for N = 100. The bound
+/// (30) is far above that and far below the 50 a static draw expects, so
+/// it holds under a loaded box and fails if the latency weighting is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latency_mode_sends_most_requests_to_the_fast_member() {
+    const N: usize = 100;
+    let a = spawn_upstream("served by a", FAST, None).await;
+    let b = spawn_upstream("served by b", SLOW, None).await;
+    let (addr, scratch, proxy) = spawn_envoy_mode("latency-mode", |listen| {
+        envoy_bootstrap(listen, [a.port(), b.port()], LATENCY_MODE, "", false)
+    });
+
+    for i in 0..N {
+        let res = stream(addr, &[]).await;
+        assert_eq!(res.status, 200, "request {i}: {}", res.body);
+    }
+    let (fast, slow) = (a.log.requests().len(), b.log.requests().len());
+    assert_eq!(fast + slow, N);
+    assert!(slow >= 1, "the slow member keeps a trickle");
+    assert!(
+        slow <= 30,
+        "slow member served {slow} of {N}; latency mode expects about 10"
+    );
+
+    drop(proxy);
+    drop(scratch);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The same members without the extension: the draw is static and the split
+/// follows the 1:1 weights however slow `b` is. `b`'s count is
+/// Binomial(200, 0.5), standard deviation 7.1; +-40 is 5.6 standard
+/// deviations. Requests go out 20 at a time so the slow member costs one
+/// delay per batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_the_extension_the_split_follows_the_weights() {
+    const N: usize = 200;
+    let a = spawn_upstream("served by a", FAST, None).await;
+    let b = spawn_upstream("served by b", SLOW, None).await;
+    let (addr, scratch, proxy) = spawn_envoy_mode("latency-default", |listen| {
+        envoy_bootstrap(listen, [a.port(), b.port()], "", "", false)
+    });
+
+    for _ in 0..N / 20 {
+        let batch = (0..20).map(|_| stream(addr, &[]));
+        for res in futures::future::join_all(batch).await {
+            assert_eq!(res.status, 200, "{}", res.body);
+        }
+    }
+    let slow = b.log.requests().len();
+    assert_eq!(a.log.requests().len() + slow, N);
+    assert!(
+        slow.abs_diff(N / 2) <= 40,
+        "slow member served {slow} of {N}"
+    );
+
+    drop(proxy);
+    drop(scratch);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Session affinity wins over latency (ADR-0016 decision 6): once the slow
+/// member is measured, a session pinned to it stays there; only requests
+/// with no session take the latency-weighted draw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_stays_on_its_member_in_latency_mode() {
+    let a = spawn_upstream("served by a", FAST, None).await;
+    let b = spawn_upstream("served by b", SLOW, None).await;
+    let (addr, scratch, proxy) = spawn_envoy_mode("latency-affinity", |listen| {
+        envoy_bootstrap(listen, [a.port(), b.port()], LATENCY_MODE, "", true)
+    });
+
+    // Sessions until one lands on the slow member; each also measures it.
+    let mut pinned = None;
+    for i in 0..64 {
+        let session = format!("session-{i}");
+        let before = b.log.requests().len();
+        let res = stream(addr, &[("x-session-affinity", &session)]).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        if b.log.requests().len() > before {
+            pinned = Some(session);
+            break;
+        }
+    }
+    let pinned = pinned.expect("a 1:1 hash split puts one of 64 sessions on b");
+
+    let before = b.log.requests().len();
+    for i in 0..20 {
+        let res = stream(addr, &[("x-session-affinity", &pinned)]).await;
+        assert_eq!(res.status, 200, "request {i}: {}", res.body);
+    }
+    assert_eq!(
+        b.log.requests().len(),
+        before + 20,
+        "the pinned session left the slow member"
+    );
 
     drop(proxy);
     drop(scratch);

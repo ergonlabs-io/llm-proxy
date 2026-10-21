@@ -26,6 +26,7 @@ use proxy_cluster::{
 };
 use proxy_config::ir::{
     DataSourceIR, ForwardTarget, RedirectIR, RouteActionIR, RouteMatcher, UpgradeConfig,
+    WeightedSelection,
 };
 use proxy_observability::access_log::TimePoint;
 use proxy_observability::stats::instruments;
@@ -47,8 +48,8 @@ use crate::handler::{
 };
 use crate::retry::{AttemptOutcome, RetryState};
 use crate::route::{
-    apply_prefix_rewrite, health_adjusted_draw, select_cluster, weighted_draw, HashIdentity,
-    MemberHealth,
+    apply_prefix_rewrite, health_adjusted_draw, latency_draw, select_cluster, weighted_draw,
+    DrawSource, HashIdentity, MemberSignals,
 };
 use crate::stat_handles::RouterStats;
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
@@ -157,9 +158,13 @@ pub struct RouterFilterFactory {
     upgrade_configs: Arc<HashMap<String, bool>>,
 }
 
-impl MemberHealth for ClusterRegistrySnapshot {
+impl MemberSignals for ClusterRegistrySnapshot {
     fn is_drawable(&self, member: &str) -> bool {
         ClusterRegistrySnapshot::is_drawable(self, member)
+    }
+
+    fn expected_latency_micros(&self, member: &str) -> Option<f64> {
+        ClusterRegistrySnapshot::expected_latency_micros(self, member)
     }
 }
 
@@ -1140,12 +1145,9 @@ impl RouterHandler {
         let ForwardTarget::Weighted(weighted) = target else {
             return 0;
         };
-        if weighted.hash_policy.is_empty() {
-            let (draw, source) =
-                weighted_draw(weighted, headers, &HashIdentity::default(), rand::random);
-            return health_adjusted_draw(weighted, draw, source, &self.clusters, rand::random);
-        }
-        let (draw, source) = {
+        let (draw, source) = if weighted.hash_policy.is_empty() {
+            weighted_draw(weighted, headers, &HashIdentity::default(), rand::random)
+        } else {
             let info = dcb.stream_info();
             let identity = HashIdentity {
                 key_id: info.auth.key_id.as_deref(),
@@ -1154,7 +1156,15 @@ impl RouterHandler {
             };
             weighted_draw(weighted, headers, &identity, rand::random)
         };
-        self.stats.record_session_affinity(source);
+        if !weighted.hash_policy.is_empty() {
+            self.stats.record_session_affinity(source);
+        }
+        // A session hash always maps with the configured weights (ADR-0016
+        // decision 6): if latency moved it, every shift in a member's average
+        // would move sessions off their warm prompt cache.
+        if weighted.selection == WeightedSelection::Latency && source != DrawSource::Hashed {
+            return latency_draw(weighted, &self.clusters, rand::random).unwrap_or(draw);
+        }
         health_adjusted_draw(weighted, draw, source, &self.clusters, rand::random)
     }
 
@@ -1275,6 +1285,10 @@ impl RouterHandler {
         };
         let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
 
+        let latency_sampled = matches!(
+            &fwd.target,
+            ForwardTarget::Weighted(weighted) if weighted.selection == WeightedSelection::Latency
+        );
         let mut retry_state = fwd.retry_policy.as_ref().map(RetryState::new);
         if let Some(state) = &mut retry_state {
             // S3.4 (Envoy's `no_retry_body_too_large`): the replay limit is
@@ -1961,6 +1975,11 @@ impl RouterHandler {
                 };
                 let response_info = attempt_info.clone();
                 let send_timing = attempt_timing.clone();
+                // Latency mode samples the cluster actually dialled; other
+                // routes pay nothing for it.
+                let latency_recorder = latency_sampled
+                    .then(|| self.clusters.latency_recorder(attempt_cluster))
+                    .flatten();
                 let mut send = Box::pin(async move {
                     let mut guard = attempt_guard;
                     // The request head goes to the upstream codec on this
@@ -1970,6 +1989,25 @@ impl RouterHandler {
                     match result {
                         Ok(mut response) => {
                             send_timing.mark(TimePoint::UsRxBeg);
+                            // An error answer is often fast; sampling it
+                            // would make a failing member look fast.
+                            if let Some(recorder) =
+                                latency_recorder.filter(|_| response.head.status.is_success())
+                            {
+                                let streaming = response
+                                    .head
+                                    .headers
+                                    .get(http::header::CONTENT_TYPE)
+                                    .is_some_and(|value| {
+                                        value.as_bytes().starts_with(b"text/event-stream")
+                                    });
+                                response.body = timing::latency_sampled(
+                                    response.body,
+                                    recorder,
+                                    attempt_dispatched_at,
+                                    streaming,
+                                );
+                            }
                             response.body = timing::timed(
                                 response.body,
                                 send_timing,

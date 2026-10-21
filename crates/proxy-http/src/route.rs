@@ -282,10 +282,55 @@ pub fn weighted_draw(
 
 /// What the draw needs to know about a weighted target's members. The
 /// router reads it from the cluster registry; tests supply fixed answers.
-pub trait MemberHealth {
+pub trait MemberSignals {
     /// False when the member has no healthy host left (see
     /// `ClusterRegistrySnapshot::is_drawable`).
     fn is_drawable(&self, member: &str) -> bool;
+    /// The member's moving-average latency in microseconds, `None` before
+    /// any sample (see `ClusterRegistrySnapshot::expected_latency_micros`).
+    fn expected_latency_micros(&self, member: &str) -> Option<f64>;
+}
+
+/// The least share of its configured weight a drawable member keeps in
+/// latency mode, in permille. A slow member keeps a trickle of traffic, so
+/// its average keeps being sampled and it regains its share once it
+/// recovers.
+pub const LATENCY_FLOOR_PERMILLE: u64 = 100;
+
+/// The draw for a [`WeightedSelection::Latency`] target with no session
+/// hash (`envoy-divergences.md` row 48): the configured pick, with each
+/// member's weight scaled by `fastest / its own` moving-average latency,
+/// clamped to [`LATENCY_FLOOR_PERMILLE`] and 1. A member with no sample yet
+/// keeps its full weight, so a new member is tried. A member with no healthy
+/// host is left out, as [`health_adjusted_draw`] does. A weight 0 member is
+/// not in the target at all. Returns the configured-range draw for the
+/// chosen member, or `None` when no member has a healthy host.
+///
+/// [`WeightedSelection::Latency`]: proxy_config::ir::WeightedSelection::Latency
+pub fn latency_draw(
+    weighted: &WeightedClusters,
+    members: &dyn MemberSignals,
+    random: impl FnOnce() -> u64,
+) -> Option<u64> {
+    let fastest = weighted
+        .cumulative
+        .iter()
+        .filter(|(name, _)| members.is_drawable(name))
+        .filter_map(|(name, _)| members.expected_latency_micros(name))
+        .fold(f64::INFINITY, f64::min);
+    scaled_draw(weighted, random(), |member| {
+        if !members.is_drawable(member) {
+            return 0;
+        }
+        match members.expected_latency_micros(member) {
+            // Rust note: `as u64` saturates, and the clamp bounds it anyway.
+            Some(latency) if fastest.is_finite() => ((fastest / latency) * 1000.0)
+                .round()
+                .clamp(LATENCY_FLOOR_PERMILLE as f64, 1000.0)
+                as u64,
+            _ => 1000,
+        }
+    })
 }
 
 /// Moves a draw off a member with no healthy host (`envoy-divergences.md`
@@ -306,7 +351,7 @@ pub fn health_adjusted_draw(
     weighted: &WeightedClusters,
     draw: u64,
     source: DrawSource,
-    members: &dyn MemberHealth,
+    members: &dyn MemberSignals,
     random: impl FnOnce() -> u64,
 ) -> u64 {
     if members.is_drawable(weighted.pick(draw)) {
