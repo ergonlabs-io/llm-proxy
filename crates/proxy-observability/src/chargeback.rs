@@ -1,11 +1,12 @@
 //! Chargeback tags: operator allow-listed key=value pairs that attribute a
 //! request's spend to a project, team or cost centre.
 //!
-//! Tags come from two sources. The admin sets them on a virtual key (key
-//! metadata), and the client may send them in the [`HEADER`] request header
-//! when the operator enables it. Both pass the same allow-list and caps; a
-//! tag key set by key metadata is never taken from the header, so a client
-//! cannot override what the admin set. Everything not accepted is dropped and
+//! Tags come from two sources. The credential sets them (key metadata the
+//! admin set on a virtual key, or verified JWT claims the operator mapped to
+//! tags), and the client may send them in the [`HEADER`] request header when
+//! the operator enables it. Both pass the same allow-list and caps; a tag key
+//! the credential sets is never taken from the header, so a client cannot
+//! override what the admin or the identity provider set. Everything not accepted is dropped and
 //! counted by [`DropReason`], and a malformed header never fails the request.
 //!
 //! Tags are request-record and ledger data only. They are never a metric
@@ -59,7 +60,7 @@ pub fn validate_key(key: &str) -> Result<(), String> {
 /// Whether every byte of a tag value is in the value alphabet: ASCII letters,
 /// digits and `_ . : / @ + -`. No separators, quotes, spaces or controls, so
 /// a value cannot inject into a CSV export or a log line.
-fn value_alphabet(value: &str) -> bool {
+pub fn value_alphabet(value: &str) -> bool {
     value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"_.:/@+-".contains(&b))
@@ -113,15 +114,18 @@ pub enum DropReason {
     Malformed,
     /// The header set a key that key metadata also sets; the key's value wins.
     Overridden,
+    /// A JWT claim mapped to a tag was absent from the verified token.
+    ClaimMissing,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 5] = [
+    pub const ALL: [DropReason; 6] = [
         DropReason::NotAllowed,
         DropReason::TooLong,
         DropReason::OverCount,
         DropReason::Malformed,
         DropReason::Overridden,
+        DropReason::ClaimMissing,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -131,6 +135,7 @@ impl DropReason {
             DropReason::OverCount => "over_count",
             DropReason::Malformed => "malformed",
             DropReason::Overridden => "overridden",
+            DropReason::ClaimMissing => "claim_missing",
         }
     }
 
@@ -141,7 +146,7 @@ impl DropReason {
 
 /// Drops per reason for one request, indexed like [`DropReason::ALL`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Drops([u64; 5]);
+pub struct Drops([u64; 6]);
 
 impl Drops {
     fn add(&mut self, reason: DropReason) {
@@ -241,6 +246,12 @@ impl TagPolicy {
         self.from_header
     }
 
+    /// Whether `key` is allow-listed. Config uses it to refuse a tag source
+    /// that names a key the policy would always drop.
+    pub fn allows_key(&self, key: &str) -> bool {
+        self.allowed.contains_key(key)
+    }
+
     /// Why `(key, value)` is refused, or `None` when it passes.
     fn check(&self, key: &str, value: &str) -> Option<DropReason> {
         let Some(values) = self.allowed.get(key) else {
@@ -255,8 +266,8 @@ impl TagPolicy {
         }
     }
 
-    /// Resolves a request's tags. `key_tags` is the authenticated key's
-    /// metadata (empty for a JWT principal). `header_values` holds every
+    /// Resolves a request's tags. `key_tags` is the tags the credential set
+    /// (key metadata, or mapped JWT claims). `header_values` holds every
     /// value of the [`HEADER`] the request carried; it is ignored unless the
     /// policy enables the header. More than one value is malformed.
     ///
@@ -264,7 +275,25 @@ impl TagPolicy {
     /// sets is dropped as [`DropReason::Overridden`], and when the total is
     /// over `max_tags` the header's tags are dropped before the key's.
     pub fn resolve(&self, key_tags: &ChargebackTags, header_values: &[&[u8]]) -> Resolved {
+        self.resolve_withheld(key_tags, &[], header_values)
+    }
+
+    /// [`Self::resolve`], plus `withheld`: tag keys the credential owns but
+    /// could not fill (a mapped JWT claim that was missing or not a valid
+    /// value), each with its drop reason. Each is counted, and the header
+    /// cannot set the key, as if the credential had set it.
+    pub fn resolve_withheld(
+        &self,
+        key_tags: &ChargebackTags,
+        withheld: &[(String, DropReason)],
+        header_values: &[&[u8]],
+    ) -> Resolved {
         let mut out = Resolved::default();
+        for (_, reason) in withheld {
+            out.dropped.add(*reason);
+        }
+        let owned =
+            |key: &str| key_tags.contains_key(key) || withheld.iter().any(|(k, _)| k == key);
         let mut from_key = Vec::new();
         for (key, value) in key_tags {
             match self.check(key, value) {
@@ -285,7 +314,7 @@ impl TagPolicy {
             None => out.dropped.add(DropReason::Malformed),
             Some(pairs) => {
                 for (key, value) in pairs {
-                    if key_tags.contains_key(key) {
+                    if owned(key) {
                         out.dropped.add(DropReason::Overridden);
                         continue;
                     }
@@ -451,6 +480,19 @@ mod tests {
         let r = policy(false).resolve(&tags(&[("owner", "x"), ("project", "p")]), &[]);
         assert_eq!(r.tags, tags(&[("project", "p")]));
         assert_eq!(r.dropped.get(DropReason::NotAllowed), 1);
+    }
+
+    #[test]
+    fn withheld_keys_are_counted_and_the_header_cannot_fill_them() {
+        let withheld = [
+            ("team".to_owned(), DropReason::ClaimMissing),
+            ("project".to_owned(), DropReason::Malformed),
+        ];
+        let r = policy(true).resolve_withheld(&tags(&[]), &withheld, &[b"team=infra,project=p"]);
+        assert_eq!(r.tags, tags(&[]));
+        assert_eq!(r.dropped.get(DropReason::ClaimMissing), 1);
+        assert_eq!(r.dropped.get(DropReason::Malformed), 1);
+        assert_eq!(r.dropped.get(DropReason::Overridden), 2);
     }
 
     #[test]

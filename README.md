@@ -523,10 +523,12 @@ Stated plainly, because a feature list without this is not much use:
 - **Authorization covers models only.** There is no per-provider
   authorization. An authenticated tenant with no stored model policy is refused
   with 403 unless `auth.enforce.tenants_without_policy` is `allow`.
-- **A JWT caller's chargeback tags come from the `x-cost-tags` header only.**
+- **A JWT caller's chargeback tags come only from mapped claims and the header.**
   `auth.jwt` (and `jwt_providers` in Envoy mode) admits a verified token as a
   tenant, with that tenant's stored provider credentials as for a virtual key
-  (ADR-0014), but maps no claim to a tag.
+  (ADR-0014). Its tags come from the claims its provider maps
+  (`auth.jwt[].claim_tags`) and from the `x-cost-tags` header; there is no
+  per-JWT key metadata.
 - **Limits apply to the fleet only with a `shared` store, and loosely.**
   With `auth.store: shared`, token and request windows reconcile through Redis
   about once a second, and each replica publishes its concurrent streams as a

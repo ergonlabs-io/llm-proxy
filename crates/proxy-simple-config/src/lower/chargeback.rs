@@ -27,7 +27,7 @@ fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigEr
     }
 }
 
-fn check_key(key: &str, path: &str) -> Result<(), ConfigError> {
+pub(super) fn check_key(key: &str, path: &str) -> Result<(), ConfigError> {
     let mut bytes = key.bytes();
     let well_formed = (1..=MAX_KEY_BYTES).contains(&key.len())
         && bytes.next().is_some_and(|b| b.is_ascii_lowercase())

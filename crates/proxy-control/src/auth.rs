@@ -54,7 +54,7 @@ use http::HeaderMap;
 
 use crate::control::ControlPlaneSnapshot;
 use proxy_credentials::TenantCredentialSet;
-use proxy_observability::chargeback::ChargebackTags;
+use proxy_observability::chargeback::{ChargebackTags, DropReason};
 
 /// Scheme prefix this authenticator recognizes on the `authorization`
 /// header. Anything else (no header, a different scheme, a bare token) is
@@ -252,10 +252,15 @@ pub struct Principal {
     /// request keeps the consent it was admitted with. `false` when the
     /// snapshot has no opt-in row for the tenant.
     pub trace_export: bool,
-    /// Chargeback tags the admin set on the key (key metadata), unfiltered:
-    /// the auth filter's tag policy decides which are attributed. Empty for
-    /// a JWT principal (ADR-0014), which carries no key metadata.
+    /// Chargeback tags the credential sets, unfiltered: the admin's key
+    /// metadata for a virtual key, or the verified claims a JWT provider maps
+    /// to tags. The auth filter's tag policy decides which are attributed.
     pub key_tags: Arc<ChargebackTags>,
+    /// Tag keys the credential owns but did not fill, each with its drop
+    /// reason: a mapped JWT claim that was missing or not a valid value. The
+    /// tag policy counts each, and the header cannot set the key. Empty for
+    /// a virtual key.
+    pub withheld_tags: Vec<(String, DropReason)>,
 }
 
 impl fmt::Debug for Principal {
@@ -799,6 +804,7 @@ impl Authenticator for VirtualKeyAuthenticator {
                 policy_generation: snapshot.generation,
                 trace_export: snapshot.trace_export.contains(&record.tenant),
                 key_tags: record.tags.clone(),
+                withheld_tags: Vec::new(),
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }

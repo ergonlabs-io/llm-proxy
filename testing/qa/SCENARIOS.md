@@ -26,6 +26,7 @@ can be reviewed alongside the tests that cite its case IDs.
 | QA-17 | Weighted alias splits by weight and skips an ejected provider | passing — since 2026-10-20 (`qa17_weighted_providers_test.go`); approved through the weighted-balancing backlog acceptance (owner, 2026-10-17) |
 | QA-18 | Speech under a tenant budget is charged per character and ledgered; non-2xx charges nothing; transcription charged per second; uncountable shapes refused | passing — since 2026-10-20 (`qa18_speech_metering_test.go`); approved through the v0.6.0 ship gate clause 1 (owner, 2026-10-18) |
 | QA-19 | A JWT caller of a BYOK tenant reaches the provider with the tenant's key and is not platform spend; a JWT caller without a stored key is unchanged | passing — since 2026-10-20 (`qa19_jwt_byok_test.go`); approved through the JWT tenant-credentials backlog acceptance (owner, 2026-10-19) |
+| QA-20 | JWT claims set chargeback tags the header cannot override; claim drops counted, never labels | passing — since 2026-10-20 (`qa20_jwt_claim_tags_test.go`); approved through the JWT claim-tags backlog acceptance (owner, 2026-10-20) |
 | QA-9  | ~~Content-type parameter tolerance~~                       | rejected — see below                                    |
 
 States: `proposed` → `approved` → `implemented` → `passing`. Nothing skips
@@ -638,3 +639,27 @@ provider receives no requests.
 **Why black box.** The Rust tests pin the lowering, the draw-to-provider
 mapping and the aggregate's health preference separately; this one checks
 the documented dialect fields together on the real binary with two workers.
+
+## QA-20 — JWT claims set chargeback tags
+
+Approved through the JWT claim-tags acceptance. `qa20_jwt_claim_tags_test.go`
+drives a dialect config with `auth.chargeback_tags` (`from_header: true`,
+`team` limited to two values, `project` open) and one `auth.jwt` provider
+whose static key is the test's own RSA key, with `claim_tags` mapping
+`department` to `team` and `cost_center` to `project`. It uses a ledger and a
+Go mock OpenAI upstream, through the listener and the admin API only.
+
+The Rust tests drive the mapping through the auth filter factory. QA-20 checks
+the documented dialect field on the real binary:
+
+- **Claims beat the header.** A token with `department=infra` and
+  `cost_center=ads`, sent with `x-cost-tags: team=search, project=x`, gives a
+  ledger entry with `team=infra` and `project=ads` and a `jwt:` user.
+- **Drops are counted and served.** A claim value outside `values`, a missing
+  claim, a number claim and a value with a `,` are each served and leave the
+  entry untagged; the header cannot fill those tags. The scrape shows the
+  growth of `not_allowed`, `claim_missing`, `malformed` and `overridden`.
+- **The header never reaches the provider.**
+- **Bounded metrics.** 100 tokens with distinct claim values leave the number
+  of `/stats/prometheus` samples unchanged, and no claim value is in the
+  scrape.

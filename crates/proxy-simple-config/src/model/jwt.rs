@@ -29,6 +29,19 @@ pub struct JwtProviderDef {
     pub tenant: Option<JwtTenantDef>,
     #[serde(default)]
     pub user: Option<JwtUserDef>,
+    /// Verified claims that set chargeback tags. Absent means none.
+    #[serde(default)]
+    pub claim_tags: Vec<JwtClaimTagDef>,
+}
+
+/// One entry in `auth.jwt[i].claim_tags`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JwtClaimTagDef {
+    #[serde(default)]
+    pub claim: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 /// `auth.jwt[i].jwks`: exactly one of `discovery_url` / `keys`.

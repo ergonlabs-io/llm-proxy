@@ -315,7 +315,7 @@
         },
         "chargeback_tags": {
           "$ref": "#/$defs/ChargebackTags",
-          "description": "Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A tag key that key metadata sets is never taken from the header, so a client cannot override the admin. A JWT caller has no key metadata and gets header tags only. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget."
+          "description": "Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A JWT caller's tags come from the verified claims its provider maps (`jwt[].claim_tags`) instead of key metadata. A tag key that key metadata or a claim mapping sets is never taken from the header, so a client cannot override the admin or the identity provider. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget."
         }
       },
       "oneOf": [
@@ -325,7 +325,7 @@
     },
     "AuthJwtProvider": {
       "type": "object",
-      "description": "One JWT issuer. Every field is required.",
+      "description": "One JWT issuer. Every field except `claim_tags` is required.",
       "additionalProperties": false,
       "required": ["issuer", "audience", "jwks", "tenant", "user"],
       "properties": {
@@ -333,7 +333,8 @@
         "audience": { "type": "string", "minLength": 1, "description": "The token's `aud` must contain this value. A token without `aud` is refused.", "examples": ["api://llm-proxy"] },
         "jwks": { "$ref": "#/$defs/AuthJwtJwks" },
         "tenant": { "$ref": "#/$defs/AuthJwtTenant" },
-        "user": { "$ref": "#/$defs/AuthJwtUser" }
+        "user": { "$ref": "#/$defs/AuthJwtUser" },
+        "claim_tags": { "type": "array", "items": { "$ref": "#/$defs/AuthJwtClaimTag" }, "description": "Verified claims that set chargeback tags, so the identity provider, not the client, sets a JWT caller's attribution. Requires `auth.chargeback_tags`. A tag set here is never taken from the `x-cost-tags` header. A claim that is missing, or is not a string of tag value characters, sets no tag: the tag is dropped and counted in `envoy_llmproxy_chargeback_tags_dropped_total` (`claim_missing` or `malformed`), and the request is not refused. The allow-list and caps of `auth.chargeback_tags` apply to claim values as to every tag." }
       }
     },
     "AuthJwtJwks": {
@@ -385,6 +386,16 @@
       "required": ["claim"],
       "properties": {
         "claim": { "type": "string", "minLength": 1, "description": "The claim whose string value names the user, for example Entra's `oid` or `sub`. A token without it is refused. The user id is `jwt:<issuer>:<tenant>:<value>`; per-user key policy, budget and limits apply when a key with that id is minted under the same tenant (`POST /keys`), and only narrow the tenant.", "examples": ["oid"] }
+      }
+    },
+    "AuthJwtClaimTag": {
+      "type": "object",
+      "description": "One claim-to-tag mapping.",
+      "additionalProperties": false,
+      "required": ["claim", "tag"],
+      "properties": {
+        "claim": { "type": "string", "minLength": 1, "description": "The top-level claim whose string value becomes the tag value.", "examples": ["department"] },
+        "tag": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$", "description": "The tag key. Must be in `auth.chargeback_tags.allowed`, and may appear once per provider.", "examples": ["team"] }
       }
     },
     "AuthEnforce": {
@@ -511,7 +522,7 @@
     },
     "ChargebackTags": {
       "type": "object",
-      "description": "The operator's chargeback-tag allow-list and caps. Tags that fail it are dropped and counted by reason: `not_allowed` (key not listed, or value not one of its `values`), `too_long` (over `max_value_bytes`), `over_count` (over `max_tags`; key-metadata tags fill the cap first), `malformed` (the header did not parse; all its tags are dropped and the request is still served) and `overridden` (the header set a key that key metadata sets).",
+      "description": "The operator's chargeback-tag allow-list and caps. Tags that fail it are dropped and counted by reason: `not_allowed` (key not listed, or value not one of its `values`), `too_long` (over `max_value_bytes`), `over_count` (over `max_tags`; key-metadata tags fill the cap first), `malformed` (the header did not parse, and all its tags are dropped; or a mapped JWT claim is not a string of tag value characters), `overridden` (the header set a key that key metadata or a JWT claim mapping sets) and `claim_missing` (a mapped JWT claim is not in the token). A dropped tag never refuses the request.",
       "additionalProperties": false,
       "required": ["allowed"],
       "properties": {

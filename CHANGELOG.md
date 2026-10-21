@@ -47,6 +47,19 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   (`auth_policy_stale`), as that tenant's virtual keys do. JWT requests of
   other tenants are admitted as before.
 
+### Added
+
+- JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
+  `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
+  `{ claim: department, tag: team }`, so the identity provider sets a JWT
+  caller's attribution, not the client. The `auth.chargeback_tags` allow-list
+  and caps apply unchanged, and the `x-cost-tags` header cannot set a mapped
+  tag. Each tag must be allow-listed, or the config does not load.
+- `llmproxy_chargeback_tags_dropped_total` has a sixth `reason`,
+  `claim_missing`, for a mapped claim that is not in the token. A claim that is
+  not a string of tag value characters counts as `malformed`. Neither refuses
+  the request.
+
 ## [0.6.0] - 2026-10-20
 
 ### Breaking

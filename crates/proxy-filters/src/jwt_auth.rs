@@ -17,6 +17,7 @@ use base64::Engine as _;
 use http::header::AUTHORIZATION;
 use http::HeaderMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use proxy_observability::chargeback::{value_alphabet, ChargebackTags, DropReason};
 
 use crate::auth::{
     AuthError, AuthOutcome, Authenticator, KeyId, Principal, TenantId, TenantPolicy, BEARER_PREFIX,
@@ -216,6 +217,9 @@ pub struct JwtAuthenticator {
     /// read. `None` (no control plane, as in tests and static seeds) captures
     /// neither.
     tenant_facts: Option<Arc<crate::auth::TenantFacts>>,
+    /// `(claim, tag)` pairs: verified claims that set chargeback tags. See
+    /// [`claim_tags`].
+    claim_tags: Vec<(String, String)>,
 }
 
 impl JwtAuthenticator {
@@ -229,7 +233,15 @@ impl JwtAuthenticator {
             expected_issuer: config.issuer,
             max_stale: None,
             tenant_facts: None,
+            claim_tags: Vec::new(),
         }
+    }
+
+    /// Sets the claims that become chargeback tags, as `(claim, tag)` pairs.
+    /// The config parser has checked each tag key against the policy.
+    pub fn with_claim_tags(mut self, claim_tags: Vec<(String, String)>) -> Self {
+        self.claim_tags = claim_tags;
+        self
     }
 
     /// Shares a refreshable snapshot (see [`JwksSnapshot`]). `max_stale`
@@ -256,6 +268,7 @@ impl JwtAuthenticator {
             expected_issuer: config.issuer,
             max_stale,
             tenant_facts: None,
+            claim_tags: Vec::new(),
         }
     }
 }
@@ -423,6 +436,7 @@ impl Authenticator for JwtAuthenticator {
             .is_some()
             .then(|| key_id.as_str().to_owned());
         let tenant = TenantId::new(tenant);
+        let (key_tags, withheld_tags) = claim_tags(&data.claims, &self.claim_tags);
         // The same rule a virtual key for this tenant follows: its provider
         // credentials come from the control-plane snapshot (ADR-0007), read
         // once, together with the trace-export opt-in.
@@ -445,11 +459,38 @@ impl Authenticator for JwtAuthenticator {
             tenant_credentials,
             policy_generation: None,
             trace_export,
-            // A JWT carries no key metadata: its requests get header tags
-            // only (a claims-to-tags mapping is not built).
-            key_tags: Default::default(),
+            key_tags,
+            withheld_tags,
         })
     }
+}
+
+/// Reads the mapped claims of a verified token into chargeback tags. The
+/// identity provider asserted them, so they take the place of key metadata:
+/// the auth filter's policy then applies its allow-list and caps, and the
+/// header cannot set these keys. A claim that is absent, not a string, or not
+/// in the tag value alphabet sets no tag; its key is withheld with
+/// [`DropReason::ClaimMissing`] or [`DropReason::Malformed`] so the policy
+/// counts it, and the request is not refused. Length is left to the policy,
+/// which drops an over-long value as `too_long`.
+fn claim_tags(
+    claims: &serde_json::Value,
+    mapping: &[(String, String)],
+) -> (Arc<ChargebackTags>, Vec<(String, DropReason)>) {
+    let mut tags = ChargebackTags::new();
+    let mut withheld = Vec::new();
+    for (claim, tag) in mapping {
+        match claims.get(claim) {
+            None => withheld.push((tag.clone(), DropReason::ClaimMissing)),
+            Some(serde_json::Value::String(value))
+                if !value.is_empty() && value_alphabet(value) =>
+            {
+                tags.insert(tag.clone(), value.clone());
+            }
+            Some(_) => withheld.push((tag.clone(), DropReason::Malformed)),
+        }
+    }
+    (Arc::new(tags), withheld)
 }
 
 #[cfg(test)]
@@ -1215,6 +1256,7 @@ GdGIML90cFtpXr13uutgIg==
                     policy_generation: None,
                     trace_export: false,
                     key_tags: Default::default(),
+                    withheld_tags: Vec::new(),
                 })
             }
         }
