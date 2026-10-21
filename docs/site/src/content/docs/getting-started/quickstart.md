@@ -9,16 +9,15 @@ related:
   - observability/access-logs
 ---
 
-# Quickstart
-
 This page takes you from nothing to one served request. You install the
 binary, create a starter config, send a request, and read the token counts.
 The whole path takes about five minutes.
 
 ## Prerequisites
 
-- macOS on Apple Silicon, or Linux on x86-64 or arm64. For Intel macOS or
-  another platform, see [Install llm-proxy](../installation/).
+- macOS on Apple Silicon, or Linux on x86-64. The release builds only these
+  two platforms. For Intel macOS, Linux on arm64, or another platform, build
+  from source. See [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
 - `curl`, `tar`, and `sed`. The installer needs them.
 - An OpenAI API key in the `OPENAI_API_KEY` environment variable.
 
@@ -47,8 +46,8 @@ llm-proxy --version
 ```
 
 Expected output: one line that starts with `llm-proxy`, for example
-`llm-proxy 0.5.0`. For all installer options, upgrade, and source builds, see
-[Install llm-proxy](../installation/).
+`llm-proxy 0.6.1`. For all installer options, upgrade, and source builds, see
+[Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
 
 ## Step 2: Create a starter config
 
@@ -73,7 +72,7 @@ export LLMP_KEY=llmp_...
 The starter config sets `auth.enforce.tenants_without_policy: allow`. With
 this setting, the printed key can use every model. The proxy warns about the
 setting at startup. Before you give keys to other people, remove it and grant
-models per tenant. See [Virtual keys](../../authentication/virtual-keys/).
+models per tenant. See [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/).
 
 ## Step 3: Choose OpenAI as the provider
 
@@ -189,7 +188,7 @@ are an illustration. Yours differ.
 `llm_input_tokens` and `llm_output_tokens` come from the `usage` object in the
 provider response. They must match the `usage` object in the curl output. Every
 field is a JSON string, and a field with no value is `"-"`. For all fields, see
-[Access logs](../../observability/access-logs/).
+[Access logs](/docs/llm-proxy/observability/access-logs/).
 
 ## Step 8: Open the admin UI
 
@@ -200,18 +199,19 @@ The **Get started** page shows what is set up and what to do next. On the
 **Keys** page, create one key for each application or person. Each new key is
 shown once, with a request that you can copy and run. **Models & pricing**
 shows which models go to which provider, and holds the prices that give each
-request a cost.
+request a cost. See [Admin UI](/docs/llm-proxy/administration/admin-ui/) for
+every page.
 
 If the proxy logs `LLMPROXY_ADMIN_TOKEN is not set`, the UI cannot make
 changes. Stop the proxy and start it again as step 5 shows.
 
 ## Next steps
 
-- [Connect your application](../connect-your-application/): point an SDK at
+- [Connect your application](/docs/llm-proxy/getting-started/connect-your-application/): point an SDK at
   the proxy.
-- [Manage configured virtual keys](../../authentication/managing-secrets/):
+- [Manage configured virtual keys](/docs/llm-proxy/authentication/managing-secrets/):
   create keys and grant model access.
-- [Virtual keys](../../authentication/virtual-keys/): issue keys to other
+- [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/): issue keys to other
   people and grant models per tenant.
-- [Install llm-proxy](../installation/): run the proxy as a service, upgrade,
+- [Install llm-proxy](/docs/llm-proxy/getting-started/installation/): run the proxy as a service, upgrade,
   or build from source.

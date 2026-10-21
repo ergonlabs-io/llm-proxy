@@ -175,7 +175,7 @@ serves a request: `providers` and `models`. The docs do not use the word
 **Node ID**
 : The identity of one replica. Set it with `--service-node`. A shared store,
   the ledger, and trace export need one. See
-  [CLI reference](/docs/llm-proxy/reference/cli/#the---service-node-flag).
+  [CLI reference](/docs/llm-proxy/reference/cli/#the-service-node-flag).
 
 ## O
 

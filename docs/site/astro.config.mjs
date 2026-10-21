@@ -12,13 +12,14 @@ export default defineConfig({
 	site: 'https://ergonlabs.io',
 	base: '/docs/llm-proxy',
 	// Slugs that moved in the docs restructure (DOCS_STRUCTURE.md, "moved"),
-	// so inbound links keep working. Sources and destinations include `base`.
+	// so inbound links keep working. Sources are relative to `base`; destinations
+	// include it.
 	redirects: {
-		'/docs/llm-proxy/providers-and-routing/providers-and-clusters': '/docs/llm-proxy/providers/overview/',
-		'/docs/llm-proxy/providers-and-routing/websocket-and-upgrades': '/docs/llm-proxy/api-compatibility/realtime/',
-		'/docs/llm-proxy/observability/admin-endpoints': '/docs/llm-proxy/administration/admin-api/',
-		'/docs/llm-proxy/authentication/external-authorization': '/docs/llm-proxy/help/limitations/',
-		'/docs/llm-proxy/operations/xds-conformance': '/docs/llm-proxy/help/limitations/',
+		'/providers-and-routing/providers-and-clusters': '/docs/llm-proxy/providers/overview/',
+		'/providers-and-routing/websocket-and-upgrades': '/docs/llm-proxy/api-compatibility/realtime/',
+		'/observability/admin-endpoints': '/docs/llm-proxy/administration/admin-api/',
+		'/authentication/external-authorization': '/docs/llm-proxy/help/limitations/',
+		'/operations/xds-conformance': '/docs/llm-proxy/help/limitations/',
 	},
 	integrations: [
 		starlight({

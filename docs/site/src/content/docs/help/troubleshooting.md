@@ -119,7 +119,7 @@ invalid value at `auth.store.shared`: a shared store requires a configured node 
 
 **Fix.** Start each replica with its own `--service-node <name>`. Use the same
 name after a restart. Pass the flag to `--mode validate` too. See
-[CLI reference](/docs/llm-proxy/reference/cli/#the---service-node-flag).
+[CLI reference](/docs/llm-proxy/reference/cli/#the-service-node-flag).
 
 ### The proxy exits at start and the message names the ledger or trace export
 

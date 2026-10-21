@@ -194,7 +194,7 @@ reads the secret from `auth.hmac_secret` or `auth.hmac_secret_file`.
 | `--drain-time-s` | `SECS` | `600` | Seconds to wait for connections to close during shutdown. See [Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/). |
 | `--drain-strategy` | `gradual` or `immediate` | `immediate` | When the proxy tells each connection to close during a drain. `immediate` closes them all at drain start. `gradual` spreads the closes over the first quarter of `--drain-time-s`. See [Gradual drain](/docs/llm-proxy/operations/draining-and-shutdown/#gradual-drain). |
 | `-l`, `--log-level` | level | `info` | `trace`, `debug`, `info`, `warn`, `error`, `critical`, or `off`. `critical` maps to `error`. |
-| `--service-node` | `NAME` | none | The identity of this replica. See [The --service-node flag](#the---service-node-flag). |
+| `--service-node` | `NAME` | none | The identity of this replica. See [The --service-node flag](#the-service-node-flag). |
 
 The log level sets the filter directly. The proxy does not read `RUST_LOG`.
 
