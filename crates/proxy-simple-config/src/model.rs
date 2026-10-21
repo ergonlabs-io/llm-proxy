@@ -559,8 +559,9 @@ pub struct Auth {
     pub hmac_secret_file: Option<String>,
     /// The configured virtual keys. May be empty -- legal (fail closed: an
     /// `auth:` block with no keys authenticates nothing and therefore
-    /// refuses every request), but almost certainly a mistake, so lowering
-    /// warns rather than silently accepting it.
+    /// refuses every request), but almost certainly a mistake when nothing
+    /// else supplies keys, so lowering warns then. A `shared` or
+    /// `persistent` store, or an `admin` server, supplies minted keys.
     #[serde(default)]
     pub keys: Vec<AuthKey>,
     /// Where minted keys, revocations, and tenant policy live. Absent means

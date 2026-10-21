@@ -2814,7 +2814,16 @@ fn lower_auth(
 
     let jwt_providers = jwt::lower_jwt_providers(auth)?;
 
-    if auth.keys.is_empty() && jwt_providers.is_empty() {
+    // Keys come from somewhere other than `auth.keys` when the store can
+    // hold minted ones: `shared` (minted on any replica) and `persistent`
+    // (minted before this start) always can, and `in_memory` (the default)
+    // can once an admin server is configured to mint into it.
+    let store_supplies_keys = config.admin.is_some()
+        || auth
+            .store
+            .as_ref()
+            .is_some_and(|store| store.shared.is_some() || store.persistent.is_some());
+    if auth.keys.is_empty() && jwt_providers.is_empty() && !store_supplies_keys {
         // Legal (fail closed is the correct reading of "authentication is
         // enabled, and no credential is valid"), but almost certainly not
         // what the operator meant -- AGENTS.md invariant 1's "warn, don't silently

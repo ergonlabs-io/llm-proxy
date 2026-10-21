@@ -44,7 +44,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   closes every connection at once. The startup warning that the flag has no
   effect is removed. Departures from Envoy are in
   `internal-docs/envoy-divergences.md` row 1.
-
+- `llmproxy_policy_store_rows{scope, kind}` (`kind` is `keys` or `tenants`)
+  is the row count of the replica's last load from the store `auth.store`
+  selects, without configured `auth.keys`. Alert when the keys value is 0 on
+  a deployment that mints keys.
 - JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
   `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
   `{ claim: department, tag: team }`, so the identity provider sets a JWT
@@ -105,6 +108,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `%DOWNSTREAM_REMOTE_ADDRESS%`, as in Envoy. With `use_remote_address: false`, an
   `x-forwarded-for` shorter than the hop count now falls back to the TCP peer, as
   Envoy does, not to its leftmost entry, which the client writes.
+- The emptied-store `error` line and `llmproxy_policy_store_emptied_total`
+  now fire when a load loses every key, or every tenant, that the previous
+  load held. Before, both had to be empty, so a store that lost its keys and
+  kept its tenants refused every stored key without a signal. The line now
+  reads `control-plane store is now EMPTY of keys or tenants it held`. The
+  replica still adopts the store's state.
 - A JWT caller (`auth.jwt`, or `jwt_providers` in Envoy mode) whose tenant
   stored its own provider credentials is now sent upstream with that tenant's
   credential, and its spend is tenant-scoped, exactly as for a virtual key of
@@ -130,6 +139,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Fixed
 
+- The `auth.keys: empty` load warning ("refuses every request") is no
+  longer printed when another source supplies keys: an `auth.store` of
+  `shared` or `persistent`, or an `admin` server that can mint keys. It is
+  still printed when `auth.keys` is the only source.
 - A billing ledger at its `max_disk_bytes` cap could stay closed after the
   consumer acknowledged every entry. One group commit can be larger than the
   spool holds at its cap. That commit was refused and retried whole after each

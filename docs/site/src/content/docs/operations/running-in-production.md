@@ -362,21 +362,27 @@ The proxy cannot tell a lost store from an operator who removed every tenant
 and key, so it does not refuse the empty state. Keeping the old copy would
 continue to accept keys that the store no longer has. Thus the replica fails
 closed and makes the transition loud.
-When a load finds no tenants and no keys after the previous load found some,
+When a load finds no keys, or no tenants, after the previous load found some,
 the replica logs one `error` line:
-`control-plane store is now EMPTY after holding tenants or keys`. The line has
+`control-plane store is now EMPTY of keys or tenants it held`. The line has
 these fields:
 
 | Field | Meaning |
 |---|---|
 | `tenants_before`, `keys_before` | Row counts of the previous load. |
-| `tenants_after`, `keys_after` | Row counts of this load (both 0). |
+| `tenants_after`, `keys_after` | Row counts of this load (at least one is 0). |
 | `generation_before`, `generation_after` | The policy generation stamps. A lost Redis reads back as `Some(0)`, lower than before. An operator removal makes the stamp go up. |
 
 The replica also increments `envoy_llmproxy_policy_store_emptied_total` (see
 [Metrics and stats](../../observability/metrics-and-stats/)). Each replica
 logs and counts once per transition, not once per poll. Alert on any increase
 of this counter.
+
+The gauge `envoy_llmproxy_policy_store_rows{kind="keys"}` (and
+`kind="tenants"`) shows the row counts of the last load. Configured
+`auth.keys` entries are not counted. Alert when the keys gauge is 0 on a
+deployment that mints keys: the counter shows the moment the store emptied,
+and the gauge shows that it is still empty.
 
 To recover, restore the Redis data from a backup or AOF file. The replicas
 pick up the restored state at their next poll. If you have no copy, mint the
