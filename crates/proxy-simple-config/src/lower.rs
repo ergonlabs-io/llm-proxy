@@ -3851,6 +3851,17 @@ fn lower_listener(
             "http_filters": http_filters,
         }
     });
+    if config
+        .observability
+        .as_ref()
+        .is_some_and(|o| o.routing_headers)
+    {
+        let vhost = &mut hcm["typed_config"]["route_config"]["virtual_hosts"][0];
+        vhost["include_attempt_count_in_response"] = json!(true);
+        vhost["metadata"] = json!({
+            "filter_metadata": { "io.llmproxy.routing_headers": { "enabled": true } }
+        });
+    }
     // Always emitted: the dialect ships safe defaults, and `0s` is how an
     // operator disables one (Envoy reads `0s` as disabled).
     hcm["typed_config"]["request_headers_timeout"] = json!(headers_timeout.to_string());

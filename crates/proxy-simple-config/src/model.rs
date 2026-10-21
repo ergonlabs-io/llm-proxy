@@ -1122,6 +1122,13 @@ pub struct Observability {
     /// Absent means no trace export.
     #[serde(default)]
     pub traces: Option<Traces>,
+    /// Name the serving provider, the attempt count and the providers tried
+    /// on every response. Lowers to the virtual host's
+    /// `include_attempt_count_in_response` plus metadata
+    /// `io.llmproxy.routing_headers` (`envoy-divergences.md` row 49). Off by
+    /// default: it discloses the operator's routing to callers.
+    #[serde(default)]
+    pub routing_headers: bool,
 }
 
 /// `observability.traces`: lowers to `node.metadata["io.llmproxy.traces"]`,

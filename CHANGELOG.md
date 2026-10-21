@@ -58,6 +58,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   only that of its aggregate, as Envoy does; an aggregate in front of a
   configured provider is sized to its members' sum so it does not cap them.
   See [Providers and clusters](docs/site/src/content/docs/providers-and-routing/providers-and-clusters.md#concurrency-ceilings).
+- Routing response headers. `observability.routing_headers: true` names the
+  provider cluster that served each response (`x-llmproxy-provider`), the
+  attempt count (`x-envoy-attempt-count`) and the provider clusters tried in
+  order (`x-llmproxy-providers-tried`), on the response head, so streams
+  carry them too. Values are cluster names only. Off by default. Envoy mode:
+  virtual-host metadata `io.llmproxy.routing_headers: { enabled: true }` with
+  `include_attempt_count_in_response` (`internal-docs/envoy-divergences.md`
+  row 49). See the failover guide.
 - Latency-aware selection for weighted models. `models.<name>.selection:
   latency` multiplies each provider's weight by the fastest provider's
   average latency divided by its own, between 0.1 and 1, so a slow provider

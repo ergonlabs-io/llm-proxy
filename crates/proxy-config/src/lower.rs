@@ -894,6 +894,7 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "typed_per_filter_config",
             "include_request_attempt_count",
             "include_attempt_count_in_response",
+            "metadata",
         ],
         "envoy.config.route.v3.Route" => &[
             "name",
@@ -5459,6 +5460,52 @@ const USAGE_DIALECT_METADATA_KEY: &str = "io.llmproxy.usage";
 /// this without inventing a field that the strict Envoy parser would discard.
 const STREAMING_METADATA_KEY: &str = "io.llmproxy.streaming";
 
+/// Namespace for the routing response headers (`envoy-divergences.md` row
+/// 49), on `VirtualHost.metadata` beside Envoy's own vhost-level
+/// `include_attempt_count_in_response`.
+const ROUTING_HEADERS_METADATA_KEY: &str = "io.llmproxy.routing_headers";
+
+/// Read `VirtualHost.metadata.filter_metadata["io.llmproxy.routing_headers"]`.
+///
+/// The only accepted form is `{ enabled: true }`; omit the namespace to keep
+/// the headers off. `false`, another key or another type is refused with its
+/// path rather than read as "off".
+fn convert_routing_headers_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<bool, ConfigError> {
+    let Some(headers) = metadata.and_then(|m| m.filter_metadata.get(ROUTING_HEADERS_METADATA_KEY))
+    else {
+        return Ok(false);
+    };
+    let headers_path =
+        format!("{path}.metadata.filter_metadata[\"{ROUTING_HEADERS_METADATA_KEY}\"]");
+    let mut unknown: Vec<&String> = headers
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "enabled")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{headers_path}.{key}"),
+            format!("`{ROUTING_HEADERS_METADATA_KEY}` only supports `enabled: true`"),
+        ));
+    }
+    match headers.fields.get("enabled").and_then(|v| v.kind.as_ref()) {
+        Some(prost_types::value::Kind::BoolValue(true)) => Ok(true),
+        Some(prost_types::value::Kind::BoolValue(false)) => Err(invalid(
+            format!("{headers_path}.enabled"),
+            "must be true; omit `io.llmproxy.routing_headers` to keep the headers off",
+        )),
+        Some(_) => Err(invalid(
+            format!("{headers_path}.enabled"),
+            "must be a boolean",
+        )),
+        None => Err(invalid(format!("{headers_path}.enabled"), "is required")),
+    }
+}
+
 /// Namespace for a weighted route's selection mode (`envoy-divergences.md`
 /// row 48). Envoy's `WeightedCluster` has no field for it; route metadata is
 /// the extension carrier, as for `io.llmproxy.streaming`.
@@ -6712,6 +6759,7 @@ fn convert_route_table(
     let mut vhosts = Vec::new();
     for (i, vh) in rc.virtual_hosts.iter().enumerate() {
         let vh_path = format!("{path}.virtual_hosts[{i}]");
+        let routing_headers = convert_routing_headers_metadata(vh.metadata.as_ref(), &vh_path)?;
         let mut routes = Vec::new();
         for (j, r) in vh.routes.iter().enumerate() {
             // Rust note: `Arc`'d here (not a bare `RouteEntry`) so the S2.8
@@ -6723,6 +6771,7 @@ fn convert_route_table(
                 &format!("{vh_path}.routes[{j}]"),
                 vh.include_request_attempt_count,
                 vh.include_attempt_count_in_response,
+                routing_headers,
             )?));
         }
         let vh_typed_per_filter_config = convert_typed_per_filter_config(
@@ -6793,6 +6842,7 @@ fn convert_route(
     path: &str,
     include_request_attempt_count: bool,
     include_attempt_count_in_response: bool,
+    include_routing_headers_in_response: bool,
 ) -> Result<RouteEntry, ConfigError> {
     let m = r
         .r#match
@@ -6869,7 +6919,7 @@ fn convert_route(
         route_index: 0,
         include_request_attempt_count,
         include_attempt_count_in_response,
-        include_routing_headers_in_response: false,
+        include_routing_headers_in_response,
     })
 }
 

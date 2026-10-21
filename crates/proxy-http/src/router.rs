@@ -542,6 +542,32 @@ struct AttemptCountCfg {
     /// Set `x-envoy-attempt-count` on the downstream response, to the total
     /// number of attempts made.
     response: bool,
+    /// Set the routing headers (`ROUTING_PROVIDER_HEADER`,
+    /// `ROUTING_TRIED_HEADER`) on the downstream response.
+    routing: bool,
+}
+
+/// The cluster that served the response (`envoy-divergences.md` row 49).
+pub const ROUTING_PROVIDER_HEADER: &str = "x-llmproxy-provider";
+/// Every cluster the request was dispatched to, in order, comma-separated.
+pub const ROUTING_TRIED_HEADER: &str = "x-llmproxy-providers-tried";
+
+/// Sets the routing headers on the response head, so a streaming response
+/// carries them too. Values are operator cluster names only, never a host,
+/// credential or tenant value. `served` is `None` for a local reply, which no
+/// cluster served; `tried` is empty when nothing was dispatched, and then
+/// neither header is set. A name that is not a valid header value is left
+/// out rather than sent mangled.
+fn set_routing_headers(headers: &mut http::HeaderMap, served: Option<&str>, tried: &[String]) {
+    if tried.is_empty() {
+        return;
+    }
+    if let Some(value) = served.and_then(|name| HeaderValue::from_str(name).ok()) {
+        headers.insert(ROUTING_PROVIDER_HEADER, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&tried.join(",")) {
+        headers.insert(ROUTING_TRIED_HEADER, value);
+    }
 }
 
 impl RouterHandler {
@@ -618,6 +644,7 @@ impl RouterHandler {
                         AttemptCountCfg {
                             request: route.include_request_attempt_count,
                             response: route.include_attempt_count_in_response,
+                            routing: route.include_routing_headers_in_response,
                         },
                     )
                     .await
@@ -2529,6 +2556,23 @@ impl RouterHandler {
             resp.head
                 .headers
                 .insert("x-envoy-attempt-count", HeaderValue::from(attempt_number));
+        }
+        if attempt_count.routing {
+            // Only an upstream answer passes through
+            // `finalize_upstream_response`, which stamps the service time; a
+            // local reply (timeout, no host, overflow) was served by no
+            // cluster, though it still lists the attempts made.
+            let served = resp
+                .head
+                .headers
+                .contains_key("x-envoy-upstream-service-time")
+                .then(|| dcb.stream_info().upstream_cluster.clone())
+                .flatten();
+            set_routing_headers(
+                &mut resp.head.headers,
+                served.as_deref(),
+                &ctx.attempted_clusters,
+            );
         }
         resp
     }
