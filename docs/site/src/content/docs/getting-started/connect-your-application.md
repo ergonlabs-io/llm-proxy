@@ -3,19 +3,20 @@ title: Connect your application
 description: "Point an existing OpenAI or Anthropic client at llm-proxy: base URL, virtual key, model name, streaming, and the errors you can see."
 summary: Change three settings in an OpenAI-style client, see Python and Node
   examples, and look up the status codes the proxy returns.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - getting-started/quickstart
   - api-compatibility/overview
+  - api-compatibility/openai-chat-completions
+  - api-compatibility/anthropic-messages
+  - api-compatibility/errors
   - authentication/virtual-keys
   - providers-and-routing/auto-model
 ---
 
-# Connect your application
-
 This tutorial shows how to change an existing client so that it sends requests
 through llm-proxy. It assumes the proxy runs. If it does not, follow the
-[quickstart](../quickstart/) first. It also assumes you have a virtual key, which
+[quickstart](/docs/llm-proxy/getting-started/quickstart/) first. It also assumes you have a virtual key, which
 starts with `llmp_`. `llm-proxy init` prints one key, once.
 
 > **Test status.** The repository has no test that runs an OpenAI or Anthropic
@@ -32,6 +33,15 @@ Change three settings. Nothing else in your application changes.
 | Base URL | `http://127.0.0.1:53421/v1` for OpenAI-style clients. This is the address the starter config listens on. |
 | API key | Your virtual key (`llmp_...`). Do not use a provider key. |
 | Model name | A name that a `routes:` entry or a `models:` key matches. |
+
+Each SDK builds the final URL from the base URL. Use the base URL that
+matches the SDK:
+
+| Client | Base URL | Why |
+| --- | --- | --- |
+| OpenAI Python and Node SDK | `http://127.0.0.1:53421/v1` | The SDK appends `/chat/completions`. The proxy needs the `/v1`. |
+| Anthropic Python and Node SDK | `http://127.0.0.1:53421` | The SDK appends `/v1/messages`. Do not add `/v1`. |
+| curl | The full path | You write the path yourself. |
 
 The proxy reads the model from the JSON request body. It does not use the URL
 to choose a provider. Set the key in an environment variable, not in code:
@@ -83,7 +93,7 @@ Code that reads `chunk.choices[0]` without the guard fails on the last chunk.
 To remove the extra chunk, set `observability.force_usage_reporting: false`.
 Then the provider reports usage for a streamed response only if the client asks
 for it, so the proxy can miss the token count. See the
-[API compatibility](../../api-compatibility/overview/#streaming) page.
+[API compatibility](/docs/llm-proxy/api-compatibility/overview/#streaming) page.
 
 ## JavaScript (Node, OpenAI SDK)
 
@@ -147,6 +157,51 @@ In Node, use `new Anthropic({ baseURL: "http://127.0.0.1:53421", authToken:
 process.env.LLMPROXY_KEY })`. The proxy adds the `anthropic-version` header for
 the provider. Your client does not need to match it.
 
+If you set only `api_key`, the request carries no `Authorization` header. With
+authentication on, the proxy returns `401 unauthorized`. The access log shows
+`auth_no_credential` as the response code details. You can also keep
+`api_key` and add the header yourself with
+`default_headers={"Authorization": "Bearer llmp_..."}`.
+
+With authentication off, the proxy does not check the client key. Any
+non-empty `api_key` works, because the proxy replaces it with the provider key.
+
+## curl
+
+Chat Completions:
+
+```sh
+curl --max-time 30 -s http://127.0.0.1:53421/v1/chat/completions \
+  -H "authorization: Bearer $LLMPROXY_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Messages:
+
+```sh
+curl --max-time 30 -s http://127.0.0.1:53421/v1/messages \
+  -H "authorization: Bearer $LLMPROXY_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-haiku-4-5","max_tokens":64,
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+Model list (the proxy answers this request itself):
+
+```sh
+curl --max-time 10 -s http://127.0.0.1:53421/v1/models \
+  -H "authorization: Bearer $LLMPROXY_KEY"
+```
+
+The reply has one entry for each model name in the config:
+
+```json
+{"data":[{"created":0,"id":"claude-haiku-4-5","object":"model","owned_by":"llm-proxy"},{"created":0,"id":"gpt-4o-mini","object":"model","owned_by":"llm-proxy"}],"object":"list"}
+```
+
+The order of the keys and entries can differ in your output.
+
 ## Model names
 
 The `model` value in the request must match a route or a `models:` key. The
@@ -157,7 +212,7 @@ first, then the longest prefix, then `*`.
   the provider. The response is not changed. It shows the provider's model
   name, not the alias your client sent.
 - The name `auto` is reserved. The proxy replaces it with the model the
-  operator chose for the tenant. See [The auto model](../../providers-and-routing/auto-model/).
+  operator chose for the tenant. See [The auto model](/docs/llm-proxy/providers-and-routing/auto-model/).
 - If no rule matches and the config has no `*` rule, the proxy returns `404`.
 
 ## List the models
@@ -172,15 +227,22 @@ The starter config has one route with `model: "*"`. Its catalogue is empty.
 There, `models.list()` returns `403 forbidden`. Add a named model to the config
 to fix this.
 
+## SDK retries
+
+An SDK usually retries a `429`. A token limit or spend budget stays spent
+until its window resets, so a quick retry does not help. Read the `retry-after`
+header and the `x-ratelimit-*` headers instead.
+
 ## Common errors
 
-Errors from the proxy are plain text unless the table says JSON.
+Errors from the proxy are plain text unless the table says JSON. For every
+proxy-made reply, see [Errors](/docs/llm-proxy/api-compatibility/errors/).
 
 | Status | Body | Cause | Fix |
 | --- | --- | --- | --- |
 | 401 | `unauthorized` | The `Authorization: Bearer` header is missing, wrong, or revoked. The response has `www-authenticate: Bearer`. | Send the virtual key as a Bearer token. For the Anthropic SDK, use `auth_token`. |
 | 403 | `forbidden` | The key may not use the model, or the request has no model (a `GET`, or a multipart upload). | Ask the operator to grant the model. Send a JSON body with a `model`. |
-| 403 | `this endpoint cannot be metered, so it is refused under a spend budget or token limit` | The path is not metered and a budget or limit applies to the caller. | Use a metered endpoint. See [API compatibility](../../api-compatibility/overview/#other-paths). |
+| 403 | `this endpoint cannot be metered, so it is refused under a spend budget or token limit` | The path is not metered and a budget or limit applies to the caller. | Use a metered endpoint. See [API compatibility](/docs/llm-proxy/api-compatibility/overview/#other-paths). |
 | 404 | JSON, type `model_not_found` | No route or `models:` key matches, and the config has no `*` rule. | Use a name the config matches, or add a rule. |
 | 404 | JSON, `object not found` | The file or batch ID belongs to another tenant, or is unknown. | Use an ID your tenant created. |
 | 413 | `request body exceeds buffer limit` | The body is larger than `listen.max_request_body_bytes` (1 MiB by default). | Send a smaller body, or raise the limit. |
