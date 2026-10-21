@@ -260,8 +260,12 @@ impl ConfigPublisher {
 
     /// Begins a drain: broadcasts the new [`DrainState`] to every worker. Workers react through
     /// [`crate::drain::drain_worker`].
-    pub fn start_drain(&self, duration: std::time::Duration) -> std::time::Instant {
-        self.drain.start_drain(duration)
+    pub fn start_drain(
+        &self,
+        duration: std::time::Duration,
+        strategy: crate::drain::DrainStrategy,
+    ) -> std::time::Instant {
+        self.drain.start_drain(duration, strategy)
     }
 
     /// Wait until every worker has reported drain completion, or `deadline`

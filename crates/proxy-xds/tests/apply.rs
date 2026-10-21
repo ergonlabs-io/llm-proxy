@@ -1751,3 +1751,129 @@ async fn delta_wrapper_name_mismatch_nacks_without_publishing() {
     );
     assert!(published.lock().unwrap().is_empty());
 }
+
+/// An RDS table whose weighted route hashes the authenticated key
+/// (ADR-0016). Lowered without its listener, it is valid on its own.
+fn identity_hashed_routes(name: &str) -> route_v3::RouteConfiguration {
+    use route_v3::route_action::hash_policy::{FilterState, PolicySpecifier};
+    use route_v3::weighted_cluster::{ClusterWeight, RandomValueSpecifier};
+    let member = |name: &str| ClusterWeight {
+        name: name.to_string(),
+        weight: Some(1),
+        ..Default::default()
+    };
+    route_v3::RouteConfiguration {
+        name: name.to_string(),
+        virtual_hosts: vec![route_v3::VirtualHost {
+            name: "vh".to_string(),
+            domains: vec!["*".to_string()],
+            routes: vec![route_v3::Route {
+                r#match: Some(route_v3::RouteMatch {
+                    path_specifier: Some(route_v3::route_match::PathSpecifier::Prefix(
+                        "/".to_string(),
+                    )),
+                    ..Default::default()
+                }),
+                action: Some(route_v3::route::Action::Route(route_v3::RouteAction {
+                    cluster_specifier: Some(
+                        route_v3::route_action::ClusterSpecifier::WeightedClusters(
+                            route_v3::WeightedCluster {
+                                clusters: vec![member("a"), member("b")],
+                                random_value_specifier: Some(RandomValueSpecifier::UseHashPolicy(
+                                    true,
+                                )),
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    hash_policy: vec![route_v3::route_action::HashPolicy {
+                        policy_specifier: Some(PolicySpecifier::FilterState(FilterState {
+                            key: "llmproxy.auth.key_id".to_string(),
+                        })),
+                        terminal: false,
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// `minimal_rds_listener` with the authentication filter before the router.
+fn authenticated_rds_listener(name: &str, route_name: &str, port: u32) -> listener_v3::Listener {
+    let mut listener = minimal_rds_listener(name, route_name, port);
+    let Some(listener_v3::filter::ConfigType::TypedConfig(any)) =
+        &mut listener.filter_chains[0].filters[0].config_type
+    else {
+        unreachable!("the fixture HCM is a typed config");
+    };
+    let mut hcm = hcm_v3::HttpConnectionManager::decode(any.value.as_slice()).unwrap();
+    let auth = proxy_api::llmproxy::filters::v0::Authentication {
+        hmac_secret: Some(core_v3::DataSource {
+            specifier: Some(core_v3::data_source::Specifier::InlineString(
+                "s".to_string(),
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    hcm.http_filters.insert(
+        0,
+        hcm_v3::HttpFilter {
+            name: "llmproxy.auth".to_string(),
+            config_type: Some(hcm_v3::http_filter::ConfigType::TypedConfig(
+                prost_types::Any {
+                    type_url: "type.llmproxy.dev/llmproxy.filters.v0.Authentication".to_string(),
+                    value: auth.encode_to_vec(),
+                },
+            )),
+            ..Default::default()
+        },
+    );
+    any.value = hcm.encode_to_vec();
+    listener
+}
+
+/// ADR-0016 decision 9: a route hashing an authenticated identity is NACKed
+/// when it meets an HCM with no authentication filter, whichever of LDS or
+/// RDS arrives second, and nothing is published. With the filter, the same
+/// pair is accepted and the listener goes live.
+#[tokio::test]
+async fn an_identity_hashed_rds_route_needs_an_authenticating_listener() {
+    let routes = rds_response("rds-1", &[identity_hashed_routes("ingress-routes")]);
+    let unauthenticated = lds_response(
+        "lds-1",
+        &[minimal_rds_listener("ingress", "ingress-routes", 10000)],
+    );
+
+    for (first, second) in [(&routes, &unauthenticated), (&unauthenticated, &routes)] {
+        let (publish, published) = recording_publisher();
+        let mut applier = ResourceApplier::new(empty_base(), publish);
+        assert_eq!(applier.on_response(first).await, Verdict::Accept);
+        let before = published.lock().unwrap().len();
+        let Verdict::Reject(reason) = applier.on_response(second).await else {
+            panic!("the pairing must be NACKed");
+        };
+        assert!(reason.contains("ingress-routes"), "{reason}");
+        assert!(reason.contains("no authentication filter"), "{reason}");
+        assert!(!applier.current().listeners.contains_key("ingress"));
+        assert_eq!(published.lock().unwrap().len(), before);
+    }
+
+    let (publish, _) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+    let authenticated = lds_response(
+        "lds-1",
+        &[authenticated_rds_listener(
+            "ingress",
+            "ingress-routes",
+            10000,
+        )],
+    );
+    assert_eq!(applier.on_response(&authenticated).await, Verdict::Accept);
+    assert_eq!(applier.on_response(&routes).await, Verdict::Accept);
+    assert!(applier.current().listeners.contains_key("ingress"));
+}

@@ -545,16 +545,12 @@ Stated plainly, because a feature list without this is not much use:
 - **Spend over-admission is bounded, not zero.** With a `shared` store,
   replicas share spend totals. During a store outage each replica enforces
   against the last confirmed total plus its own spend.
-- **`client-ip` buckets see the balancer address behind a load balancer.** The
-  dialect has no trusted-hops setting. It uses the TCP peer address and never
-  reads `x-forwarded-for`.
 - **A key budget counts one credential source.** A budget is scoped to
   `platform` or `tenant` credentials. It ignores spend of the other source
   (ADR-0007). A per-key `include_byok_in_limit` flag that counts both is
   planned for v0.8.0.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
-- **`--drain-strategy` has no effect.** It is accepted and warns at startup when given; both values drain like Envoy's `immediate`.
 - **No Kubernetes controller or CRDs.**
 
 ## Layout

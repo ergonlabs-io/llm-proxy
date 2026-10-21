@@ -318,6 +318,12 @@ pub struct RequestRecord {
     /// records, read as empty.
     #[serde(default)]
     pub tags: crate::chargeback::ChargebackTags,
+    /// The client address the request was attributed to, without a port:
+    /// the TCP peer, or behind trusted hops the `x-forwarded-for` entry they
+    /// vouch for (envoy-semantics S9). The same address `client-ip` limits
+    /// key on. Added under schema version 1: absent in older records.
+    #[serde(default)]
+    pub client_address: Option<String>,
 }
 
 impl RequestRecord {
@@ -353,6 +359,7 @@ impl RequestRecord {
             &self.selected_model,
             &self.upstream_response_id,
             &self.error_category,
+            &self.client_address,
         ]
         .into_iter()
         .flatten()

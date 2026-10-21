@@ -857,6 +857,12 @@ impl LoggingBody {
                 // The auth filter's resolved chargeback tags: allow-listed,
                 // capped and already bounded, so they are copied as they are.
                 tags: ctx.stream_info.borrow().auth.tags.clone(),
+                // The address `client-ip` limits keyed on (S9 trusted hops).
+                client_address: ctx
+                    .stream_info
+                    .borrow()
+                    .client_address
+                    .map(|ip| ip.to_string()),
                 attempts: attempts
                     .into_iter()
                     .map(|attempt| proxy_observability::records::AttemptRecord {

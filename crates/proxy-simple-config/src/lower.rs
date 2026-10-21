@@ -1258,6 +1258,9 @@ fn lower_provider(
     if let Some(outlier_detection) = &provider.outlier_detection {
         cluster["outlier_detection"] = lower_outlier_detection(name, outlier_detection)?;
     }
+    if let Some(circuit_breakers) = &provider.circuit_breakers {
+        cluster["circuit_breakers"] = lower_circuit_breakers(name, circuit_breakers)?;
+    }
     if !up.tls && provider.ca_file.is_some() {
         warnings.push(warning(
             format!("providers.{name}.ca_file"),
@@ -1511,6 +1514,66 @@ fn lower_outlier_detection(
         value["max_ejection_time"] = json!(max.to_string());
     }
     Ok(value)
+}
+
+/// `providers.<name>.circuit_breakers` -> the provider cluster's S5
+/// `circuit_breakers`, one `DEFAULT`-priority thresholds entry (dialect
+/// requests are never `HIGH`). Only the fields the operator set are emitted,
+/// so the rest keep the Envoy defaults. Zero is refused: Envoy accepts it,
+/// but a provider that sheds every request is a typo, not a policy.
+fn lower_circuit_breakers(
+    name: &str,
+    cb: &crate::model::CircuitBreakersDef,
+) -> Result<Value, ConfigError> {
+    let mut thresholds = serde_json::Map::new();
+    for (field, value) in [
+        ("max_requests", cb.max_requests),
+        ("max_pending_requests", cb.max_pending_requests),
+        ("max_connections", cb.max_connections),
+    ] {
+        let Some(value) = value else { continue };
+        if value == 0 {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("providers.{name}.circuit_breakers.{field}"),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        thresholds.insert(field.to_string(), json!(value));
+    }
+    Ok(json!({ "thresholds": [thresholds] }))
+}
+
+/// Envoy's default `max_requests` (S5), which an aggregate of providers
+/// without `circuit_breakers` keeps.
+const DEFAULT_MAX_REQUESTS: u32 = 1024;
+
+/// Sizes an aggregate's own `max_requests` so it never binds before its
+/// members do. The router checks the routed aggregate's budget and then the
+/// dialled member's, so a member's ceiling is the one that applies; left at
+/// the default, the aggregate would cap a model at 1024 however high its
+/// providers were raised. Its members together can never hold more than the
+/// sum of their budgets. With no member configured, nothing is emitted and the
+/// aggregate keeps the default.
+fn size_aggregate_max_requests(config: &SimpleConfig, aggregate: &mut Value, members: &[String]) {
+    let budgets: Vec<Option<u32>> = members
+        .iter()
+        .map(|member| {
+            let name = member
+                .strip_prefix("provider:")
+                .expect("aggregate members are provider clusters");
+            config.providers[name]
+                .circuit_breakers
+                .as_ref()
+                .and_then(|cb| cb.max_requests)
+        })
+        .collect();
+    if budgets.iter().all(Option::is_none) {
+        return;
+    }
+    let sum = budgets.iter().fold(0u32, |sum, budget| {
+        sum.saturating_add(budget.unwrap_or(DEFAULT_MAX_REQUESTS))
+    });
+    aggregate["circuit_breakers"] = json!({ "thresholds": [{ "max_requests": sum }] });
 }
 
 fn token_cluster_name(provider_name: &str) -> String {
@@ -2248,7 +2311,7 @@ fn lower_route(
         (format!("provider:{provider_name}"), None)
     } else {
         let aggregate_name = format!("fallback:route-{index}");
-        let aggregate = json!({
+        let mut aggregate = json!({
             "name": aggregate_name,
             // Envoy REQUIRES this on an aggregate cluster -- see
             // `proxy-config::lower::convert_cluster`. It must NOT carry
@@ -2266,6 +2329,7 @@ fn lower_route(
                 }
             }
         });
+        size_aggregate_max_requests(config, &mut aggregate, &member_clusters);
         (aggregate_name, Some(aggregate))
     };
 
@@ -2493,6 +2557,30 @@ pub(crate) fn model_catalog_order(config: &SimpleConfig) -> Vec<(&String, &Model
     exact
 }
 
+/// `models.<name>.session_affinity` -> Envoy route `hash_policy` (ADR-0016
+/// decision 10): the header first, terminal when an identity follows, so a
+/// request that carries the header is pinned by it alone; then the
+/// authenticated identity the auth filter fills.
+fn session_hash_policy(affinity: &SessionAffinity) -> Value {
+    let mut policy = Vec::new();
+    if let Some(header) = &affinity.header {
+        let mut entry = json!({ "header": { "header_name": header.to_ascii_lowercase() } });
+        if affinity.identity.is_some() {
+            entry["terminal"] = json!(true);
+        }
+        policy.push(entry);
+    }
+    if let Some(identity) = affinity.identity {
+        let key = match identity {
+            AffinityIdentity::Key => proxy_config::lower::HASH_KEY_ID,
+            AffinityIdentity::User => proxy_config::lower::HASH_USER_ID,
+            AffinityIdentity::Tenant => proxy_config::lower::HASH_TENANT,
+        };
+        policy.push(json!({ "filter_state": { "key": key } }));
+    }
+    Value::Array(policy)
+}
+
 /// `models.<name>` -> one route and, for a multi-provider alias, its
 /// aggregate clusters. Each retry against an aggregate advances to the next
 /// provider, so callers select an alias, never a provider.
@@ -2552,7 +2640,7 @@ fn lower_model(
     }
     let member_count = members.len();
     let aggregate = |aggregate_name: &str, members: &[String]| {
-        json!({
+        let mut aggregate = json!({
             "name": aggregate_name,
             "lb_policy": "CLUSTER_PROVIDED",
             "cluster_type": {
@@ -2562,7 +2650,9 @@ fn lower_model(
                     "clusters": members,
                 }
             }
-        })
+        });
+        size_aggregate_max_requests(config, &mut aggregate, members);
+        aggregate
     };
     // `validate_semantics` guarantees weights are on every entry or none.
     let weighted = model.providers.iter().any(|entry| entry.weight().is_some());
@@ -2609,6 +2699,12 @@ fn lower_model(
         "cluster"
     };
     action[target_key] = route_target;
+    if target_key == "weighted_clusters" {
+        if let Some(affinity) = &model.session_affinity {
+            action["weighted_clusters"]["use_hash_policy"] = json!(true);
+            action["hash_policy"] = session_hash_policy(affinity);
+        }
+    }
     if member_count > 1 {
         action["retry_policy"] = json!({
             "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
@@ -2814,7 +2910,16 @@ fn lower_auth(
 
     let jwt_providers = jwt::lower_jwt_providers(auth)?;
 
-    if auth.keys.is_empty() && jwt_providers.is_empty() {
+    // Keys come from somewhere other than `auth.keys` when the store can
+    // hold minted ones: `shared` (minted on any replica) and `persistent`
+    // (minted before this start) always can, and `in_memory` (the default)
+    // can once an admin server is configured to mint into it.
+    let store_supplies_keys = config.admin.is_some()
+        || auth
+            .store
+            .as_ref()
+            .is_some_and(|store| store.shared.is_some() || store.persistent.is_some());
+    if auth.keys.is_empty() && jwt_providers.is_empty() && !store_supplies_keys {
         // Legal (fail closed is the correct reading of "authentication is
         // enabled, and no credential is valid"), but almost certainly not
         // what the operator meant -- AGENTS.md invariant 1's "warn, don't silently
@@ -3220,6 +3325,9 @@ fn lower_access_log(access_logs: &AccessLogs) -> Value {
                 "request_id": "%REQ(X-REQUEST-ID)%",
                 "authority": "%REQ(:AUTHORITY)%",
                 "upstream_host": "%UPSTREAM_HOST%",
+                // The resolved client address: behind `listen.trusted_hops`
+                // it is the address the trusted hops vouch for.
+                "client_address": "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%",
                 "llm_input_tokens": "%LLM_INPUT_TOKENS%",
                 "llm_cached_tokens": "%LLM_CACHED_TOKENS%",
                 "llm_cache_creation_tokens": "%LLM_CACHE_CREATION_TOKENS%",
@@ -3760,6 +3868,13 @@ fn lower_listener(
     }
     if let Some(count) = spec.and_then(|s| s.max_request_headers_count) {
         hcm["typed_config"]["common_http_protocol_options"]["max_headers_count"] = json!(count);
+    }
+    // Zero is left out, so a config without trusted hops lowers exactly as
+    // before. With hops, the proxy is the edge behind them: the peer is the
+    // first trusted hop and is appended to `x-forwarded-for` (S9).
+    if let Some(hops) = spec.and_then(|s| s.trusted_hops).filter(|&h| h > 0) {
+        hcm["typed_config"]["use_remote_address"] = json!(true);
+        hcm["typed_config"]["xff_num_trusted_hops"] = json!(hops);
     }
     if let Some(access_log) = access_log {
         hcm["typed_config"]["access_log"] = json!([access_log]);

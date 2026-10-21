@@ -35,6 +35,42 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- `--drain-strategy gradual` works as in Envoy. During a drain, HTTP connections
+  are told to close one at a time over the first quarter of `--drain-time-s`
+  instead of all at once, and a request handled during the drain closes its
+  connection after its response with a probability that rises to 1 at the
+  deadline. This avoids a reconnect spike at the load balancer in a rolling
+  deploy. `immediate` stays the default and is unchanged. A config reload still
+  closes every connection at once. The startup warning that the flag has no
+  effect is removed. Departures from Envoy are in
+  `internal-docs/envoy-divergences.md` row 1.
+- `llmproxy_policy_store_rows{scope, kind}` (`kind` is `keys` or `tenants`)
+  is the row count of the replica's last load from the store `auth.store`
+  selects, without configured `auth.keys`. Alert when the keys value is 0 on
+  a deployment that mints keys.
+- Per-provider concurrency ceilings in the `--config` dialect (WP-137).
+  `providers.<name>.circuit_breakers` sets `max_requests`,
+  `max_pending_requests` and `max_connections` on the provider's cluster. Each
+  defaults to 1024, as before; a value of 0 or an unknown key is a load error.
+  Before, a `--config` provider could not go above 1024 concurrent requests:
+  the 2026-10-16 scale run's h2 sweep got `503` at 1025 streams. A model with
+  fallbacks now also applies the `max_requests` of the provider it dials, not
+  only that of its aggregate, as Envoy does; an aggregate in front of a
+  configured provider is sized to its members' sum so it does not cap them.
+  See [Providers and clusters](docs/site/src/content/docs/providers-and-routing/providers-and-clusters.md#concurrency-ceilings).
+- Session affinity for weighted models. `models.<name>.session_affinity`
+  (`header`, `identity: key | user | tenant`) pins a session to one of the
+  model's weighted providers, so the provider's prompt cache stays warm: the
+  xxHash64 of the session value, not a random draw, picks the first provider
+  in proportion to the weights, on every replica, with no shared state.
+  Failover, ejection and credential isolation are unchanged. Envoy mode:
+  route `hash_policy` (`header`, or `filter_state` with
+  `llmproxy.auth.key_id`, `llmproxy.auth.user_id` or `llmproxy.auth.tenant`)
+  with `weighted_clusters.use_hash_policy: true`; a header policy picks the
+  same cluster as Envoy v1.38. New counter
+  `llmproxy_router_session_affinity_total{outcome}`. Other hash policy shapes
+  are refused with their path (`internal-docs/envoy-divergences.md` row 46).
+  See ADR-0016 and the load-balancing guide.
 - JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
   `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
   `{ claim: department, tag: team }`, so the identity provider sets a JWT
@@ -62,6 +98,21 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   the client's `Sec-WebSocket-Extensions` offer from a realtime session so its frames
   stay readable. On drain each WebSocket session gets a Close frame with code 1001.
 
+- **Trusted hops for `client-ip` behind a load balancer.** `listen.trusted_hops: N`
+  in the `--config` dialect (Envoy mode: `use_remote_address: true` with
+  `xff_num_trusted_hops: N`) makes `client-ip` limits, request records and access
+  logs use the Nth address from the right of the inbound `x-forwarded-for`: the
+  address the outermost trusted proxy saw. Entries to the left of it are the
+  client's own and never choose a bucket; a shorter list, or an entry that is not
+  an IP address, falls back to the TCP peer. With hops set, the proxy appends the
+  peer to the `x-forwarded-for` it forwards and sets `x-forwarded-proto`. The
+  default, 0, is unchanged: the TCP peer, and `x-forwarded-for` is never read
+  (`internal-docs/envoy-divergences.md` row 45).
+- Request records have `client_address`, the address `client-ip` limits use,
+  without a port. The dialect's JSON access log has the same value as
+  `client_address`, and the access-log format engine has
+  `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%`.
+
 - `make smoke-live` runs live smoke tests against real providers: OpenRouter
   on a free model (non-streaming, streaming, and a bad key that must return
   the provider's 401), Vertex AI, Amazon Bedrock, OpenAI and Anthropic. Each
@@ -73,6 +124,19 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- Envoy mode: with `use_remote_address: true` and `xff_num_trusted_hops` of 1 or
+  more, `client-ip` limits and `%DOWNSTREAM_REMOTE_ADDRESS%` now use the trusted
+  `x-forwarded-for` entry, as Envoy does. Before, they used the TCP peer. An
+  address taken from `x-forwarded-for` renders as `ip:0` in
+  `%DOWNSTREAM_REMOTE_ADDRESS%`, as in Envoy. With `use_remote_address: false`, an
+  `x-forwarded-for` shorter than the hop count now falls back to the TCP peer, as
+  Envoy does, not to its leftmost entry, which the client writes.
+- The emptied-store `error` line and `llmproxy_policy_store_emptied_total`
+  now fire when a load loses every key, or every tenant, that the previous
+  load held. Before, both had to be empty, so a store that lost its keys and
+  kept its tenants refused every stored key without a signal. The line now
+  reads `control-plane store is now EMPTY of keys or tenants it held`. The
+  replica still adopts the store's state.
 - A JWT caller (`auth.jwt`, or `jwt_providers` in Envoy mode) whose tenant
   stored its own provider credentials is now sent upstream with that tenant's
   credential, and its spend is tenant-scoped, exactly as for a virtual key of
@@ -98,6 +162,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Fixed
 
+- The `auth.keys: empty` load warning ("refuses every request") is no
+  longer printed when another source supplies keys: an `auth.store` of
+  `shared` or `persistent`, or an `admin` server that can mint keys. It is
+  still printed when `auth.keys` is the only source.
 - A billing ledger at its `max_disk_bytes` cap could stay closed after the
   consumer acknowledged every entry. One group commit can be larger than the
   spool holds at its cap. That commit was refused and retried whole after each

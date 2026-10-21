@@ -219,6 +219,41 @@ downstream connection itself (for example during drain), it adds its own
 `connection: close`. For an upgrade request the rules differ; see
 [WebSocket and upgrades](../../providers-and-routing/websocket-and-upgrades/#hop-by-hop-headers-on-an-upgrade).
 
+## Concurrency ceilings
+
+Each provider has a ceiling on the requests it has in flight at one time. The
+default is 1024 requests. A streaming response counts until its last byte, so
+1024 long streams fill the ceiling. The next request to that provider gets an
+immediate `503` with the header `x-envoy-overloaded: true`. The proxy does not
+queue it and does not send it to a fallback provider.
+
+To raise or lower the ceiling, set `circuit_breakers` on the provider:
+
+```yaml
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    circuit_breakers:
+      max_requests: 4096
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_requests` | 1024 | Requests in flight to this provider at the same time. |
+| `max_pending_requests` | 1024 | Requests that wait for a connection when `max_connections` connections are open. A request over this value gets the same `503`. |
+| `max_connections` | 1024 | Open upstream connections to this provider. |
+
+- Each value must be 1 or more. A value of 0 is a load error.
+- The ceiling belongs to the provider, not to a route or a model. Every route
+  and model that sends requests to the provider shares it. On a failover chain,
+  each provider applies its own ceiling when the proxy sends a request to it.
+- Each replica of the proxy applies its own ceiling. With N replicas behind a
+  load balancer, the provider can get up to N times the value.
+- An `http1` provider needs one connection for each request in flight. When
+  you raise `max_requests` for it, raise `max_connections` too.
+
+The access log shows a shed request with the response flag `UO`.
+
 ## `routes` vs. the `models` catalogue
 
 Both a `routes` entry and a `models.<name>` entry produce a route in the

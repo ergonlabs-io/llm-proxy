@@ -46,7 +46,7 @@ use crate::handler::{
     local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, UpgradeTunnel,
 };
 use crate::retry::{AttemptOutcome, RetryState};
-use crate::route::{apply_prefix_rewrite, select_cluster};
+use crate::route::{apply_prefix_rewrite, select_cluster, weighted_draw, HashIdentity};
 use crate::stat_handles::RouterStats;
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
@@ -697,12 +697,7 @@ impl RouterHandler {
         head: &RequestHeaders,
         dcb: &mut dyn DecoderCallbacks,
     ) -> HttpResponseParts {
-        let draw = match &fwd.target {
-            ForwardTarget::Weighted(w) if w.total_weight > 0 => {
-                rand::random::<u64>() % w.total_weight
-            }
-            _ => 0,
-        };
+        let draw = self.target_draw(&fwd.target, &head.headers, dcb);
         let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
             let mut info = dcb.stream_info();
             info.set_response_flag(ResponseFlag::NoClusterFound);
@@ -1122,6 +1117,36 @@ impl RouterHandler {
         });
     }
 
+    /// S1.5: the one draw a request makes for its forward target, reused
+    /// across retries. A weighted target with a hash policy draws from the
+    /// session hash (ADR-0016), so one session keeps its member; otherwise
+    /// the draw is uniform. Shared by `apply_forward` and `handle_upgrade` so
+    /// both selection sites pick the same member for the same request.
+    fn target_draw(
+        &self,
+        target: &ForwardTarget,
+        headers: &http::HeaderMap,
+        dcb: &mut dyn DecoderCallbacks,
+    ) -> u64 {
+        let ForwardTarget::Weighted(weighted) = target else {
+            return 0;
+        };
+        if weighted.hash_policy.is_empty() {
+            return weighted_draw(weighted, headers, &HashIdentity::default(), rand::random).0;
+        }
+        let (draw, source) = {
+            let info = dcb.stream_info();
+            let identity = HashIdentity {
+                key_id: info.auth.key_id.as_deref(),
+                user_id: info.auth.user_id.as_deref(),
+                tenant: info.auth.tenant.as_deref(),
+            };
+            weighted_draw(weighted, headers, &identity, rand::random)
+        };
+        self.stats.record_session_affinity(source);
+        draw
+    }
+
     async fn apply_forward(
         &self,
         fwd: &proxy_config::ir::ForwardAction,
@@ -1131,12 +1156,7 @@ impl RouterHandler {
         dcb: &mut dyn DecoderCallbacks,
         attempt_count: AttemptCountCfg,
     ) -> HttpResponseParts {
-        let draw = match &fwd.target {
-            ForwardTarget::Weighted(w) if w.total_weight > 0 => {
-                rand::random::<u64>() % w.total_weight
-            }
-            _ => 0,
-        };
+        let draw = self.target_draw(&fwd.target, &head.headers, dcb);
 
         let Some(cluster_name) = select_cluster(&fwd.target, &head.headers, draw) else {
             tracing::debug!(
@@ -1336,11 +1356,8 @@ impl RouterHandler {
                 // this matches Envoy, whose `Router::Filter` checks the
                 // routed cluster's `max_requests` before any host selection
                 // even runs, not the eventually-dialed host's cluster.
-                // Concretely: today an aggregate's members all share the
-                // aggregate's own `max_requests` budget (there is no
-                // per-member budget to acquire instead -- S5's other three
-                // budgets are connection-pool-level and likewise
-                // untouched by which member ends up dialed).
+                // An aggregate member's own `max_requests` is acquired as
+                // well, once host selection has picked it (below).
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
                     if let Some((failed_cluster, failure)) = credential_failure.take() {
@@ -1412,6 +1429,32 @@ impl RouterHandler {
                         return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                     }
                 };
+                // The dialled member's `max_requests` applies on top of the
+                // aggregate's: in Envoy the connection pool checks the
+                // budget of the cluster that owns the host, so a provider's
+                // ceiling holds whichever route reaches it (AGENTS.md
+                // invariant 6).
+                let member_guard = match &sel.member {
+                    Some(member) => {
+                        let Some(guard) = member
+                            .entry
+                            .circuit_breaker(RoutingPriority::Default)
+                            .try_acquire_request()
+                        else {
+                            tracing::debug!(response_flag = "UO", cluster = %member.name, "circuit breaker: max_requests exceeded");
+                            dcb.stream_info()
+                                .set_response_flag(ResponseFlag::UpstreamOverflow);
+                            let mut resp =
+                                local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
+                            resp.head
+                                .headers
+                                .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
+                            return resp;
+                        };
+                        Some(guard)
+                    }
+                    None => None,
+                };
                 let host = sel.host;
                 if let Some(held) = held_failed_response.take() {
                     // A new attempt is going out, so the earlier failure is
@@ -1422,7 +1465,7 @@ impl RouterHandler {
                 // `LEAST_REQUEST` reads this count. It lives and dies with
                 // `rq_guard` (response body, hedge task, or the end of this
                 // iteration on retry/error), so each attempt counts once.
-                let mut rq_guard = Some((rq_guard, host.begin_request()));
+                let mut rq_guard = Some(((rq_guard, member_guard), host.begin_request()));
                 // `entry` is the *routed* cluster (a plain cluster,
                 // or an aggregate); `sel.member` is set only when `entry` is
                 // an aggregate and names the member that actually owns

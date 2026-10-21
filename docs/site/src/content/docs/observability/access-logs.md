@@ -119,6 +119,7 @@ The fixed JSON format of the `llmproxy` config file has these keys:
 | `request_id` | `%REQ(X-REQUEST-ID)%` |
 | `authority` | `%REQ(:AUTHORITY)%` |
 | `upstream_host` | `%UPSTREAM_HOST%` |
+| `client_address` | `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%`: the client address, without the port. Behind [`listen.trusted_hops`](../../configuration/reference/#listener), it is the address from `x-forwarded-for` that the trusted proxies vouch for. |
 | `selected_provider` | `%UPSTREAM_CLUSTER%` |
 | `llm_input_tokens`, `llm_cached_tokens`, `llm_cache_creation_tokens`, `llm_output_tokens`, `llm_total_tokens` | The matching `%LLM_*_TOKENS%` operators |
 | `llm_input_image_tokens`, `llm_output_image_tokens`, `llm_input_audio_tokens`, `llm_output_audio_tokens` | The matching `%LLM_*_IMAGE_TOKENS%` and `%LLM_*_AUDIO_TOKENS%` operators |
@@ -174,7 +175,8 @@ writes it as literal text.
 | `%COMMON_DURATION(START:END)%` / `%COMMON_DURATION(START:END:PRECISION)%` | The time from time point `START` to time point `END`. `PRECISION` is `ms` (the default), `us`, or `ns`; the value is truncated, not rounded. `-` when the request did not reach one of the two points, or when `END` is before `START`. See [Request phases](#request-phases). |
 | `%BYTES_RECEIVED%` / `%BYTES_SENT%` | Request/response body byte counts. |
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
-| `%DOWNSTREAM_REMOTE_ADDRESS%` | The client's socket address. |
+| `%DOWNSTREAM_REMOTE_ADDRESS%` | The client address. It is the TCP peer address and port, except behind trusted hops (`listen.trusted_hops`, or `xff_num_trusted_hops` in Envoy mode): then it is the address from `x-forwarded-for` that the trusted proxies vouch for, with port `0`, as in Envoy. |
+| `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%` | The same address without the port. |
 | `%LLM_INPUT_TOKENS%` / `%LLM_CACHED_TOKENS%` / `%LLM_CACHE_CREATION_TOKENS%` / `%LLM_OUTPUT_TOKENS%` / `%LLM_TOTAL_TOKENS%` | Token counts from the provider's own usage report. `-` when the provider reported none. It is never `0` in that case. |
 | `%LLM_INPUT_IMAGE_TOKENS%` / `%LLM_OUTPUT_IMAGE_TOKENS%` / `%LLM_INPUT_AUDIO_TOKENS%` / `%LLM_OUTPUT_AUDIO_TOKENS%` | Image or audio tokens that the provider counted inside the input or output tokens. They are part of those counts, not extra tokens. `-` when the provider reported no tokens. `0` when it reported tokens and none were of this kind. |
 | `%LLM_IMAGES%` | The number of images the response returned. `-` when no image count was observed. |

@@ -272,6 +272,14 @@
           "default": 100,
           "examples": [200]
         },
+        "trusted_hops": {
+          "description": "How many proxies in front of llm-proxy append the client address to `x-forwarded-for`. Set it to 1 behind one load balancer. With N trusted hops, `client-ip` limits, request records and access logs use the Nth address from the right of the `x-forwarded-for` that the request arrived with. This is the address that the outermost trusted proxy saw. The client writes the entries to the left of it, and llm-proxy never uses them. If the header has fewer than N addresses, or that entry is not an IP address, llm-proxy uses the TCP peer address. Set it only when all connections come through those proxies: a client that connects to llm-proxy directly can choose its address. Default: 0. With 0, llm-proxy uses the TCP peer address and does not read `x-forwarded-for`. With 1 or more, llm-proxy also adds the TCP peer address to the `x-forwarded-for` that it sends to the provider, and sets `x-forwarded-proto`. Lowers to the HTTP connection manager's `use_remote_address: true` and `xff_num_trusted_hops`.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "examples": [1]
+        },
         "tls": {
           "description": "Terminate TLS for client connections. Nothing watches the certificate files. After a `SIGHUP` reload, the next accepted connection reads `cert_file` and `key_file` again, so a renewed certificate is served to new connections; existing connections keep the old one. A reload does not check the files: if one cannot be read, the listener resets every new TLS connection until a later reload succeeds, so check the files before you send `SIGHUP`.",
           "type": "object",
@@ -301,7 +309,7 @@
         "keys": {
           "type": "array",
           "default": [],
-          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal but almost certainly a mistake, so it produces a load-time warning. The list is fixed when the proxy starts: a `SIGHUP` reload that adds, removes, or revokes a configured key is refused whole, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
+          "description": "Configured virtual keys. May be empty -- an `auth:` block with no keys authenticates nothing and therefore refuses every request (the correct fail-closed reading of \"authentication is enabled, and no credential is valid\"), which is legal. When nothing else supplies keys this is almost certainly a mistake, so it produces a load-time warning. Minted keys are another source: no warning when `auth.store` is `shared` or `persistent`, or when `admin` is set so the admin API can mint keys. The list is fixed when the proxy starts: a `SIGHUP` reload that adds, removes, or revokes a configured key is refused whole, so a change takes effect only after a restart. To revoke without a restart, use the admin API (`DELETE /tenants/{id}` revokes every key of a tenant, configured keys included).",
           "items": { "$ref": "#/$defs/AuthKey" }
         },
         "store": {
@@ -815,6 +823,34 @@
               "description": "Upper bound on one ejection. Default: the larger of `300s` and `base_ejection_time`. Must not be less than `base_ejection_time`."
             }
           }
+        },
+        "circuit_breakers": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Concurrency ceilings for this provider. A request over `max_requests`, or over `max_pending_requests` while it waits for a connection, gets an immediate `503` with the `x-envoy-overloaded: true` header. It is not sent to a fallback provider. Each provider has its own ceilings, and they apply on every model that reaches the provider, as primary or fallback. Each replica enforces its own ceilings. A field left unset keeps its default.",
+          "properties": {
+            "max_requests": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 1024,
+              "description": "Requests in flight to this provider at the same time. A streaming response counts until its last byte. Raise this for many concurrent long streams."
+            },
+            "max_pending_requests": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 1024,
+              "description": "Requests that wait for a connection when `max_connections` connections are open."
+            },
+            "max_connections": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 1024,
+              "description": "Open upstream connections to this provider."
+            }
+          }
         }
       },
       "not": {
@@ -982,6 +1018,28 @@
           "maximum": 4294967295,
           "description": "Upper bound on the output tokens a request for this model may ask for. A request whose limit is larger is refused with a 400 naming the field and the cap; it is never lowered or rewritten. A limit that is not a non-negative integer, or a limit key repeated in the body, is also refused with a 400. A request that names no limit is forwarded unchanged. Each refusal adds 1 to `llmproxy_router_max_output_tokens_rejected_total`. The field checked follows the request path: `/responses` uses `max_output_tokens`, `/messages` uses `max_tokens`, and any other path (chat completions, completions) checks both `max_completion_tokens` and `max_tokens`. A body that is not JSON is forwarded unchanged. The cap follows the model the request names, so it cannot be combined with the `auto` block (a load error). Absent means no cap.",
           "examples": [4096]
+        },
+        "session_affinity": {
+          "$ref": "#/$defs/SessionAffinity"
+        }
+      }
+    },
+    "SessionAffinity": {
+      "type": "object",
+      "description": "Pins a session to one provider of a weighted model, so the provider's prompt cache stays warm. Each request is hashed (xxHash64) and the hash, not a random draw, picks the first provider in proportion to weight: the same session reaches the same provider on every replica while the weights and the provider list are unchanged. A request with no session value gets the usual random pick. Affinity never overrides failover: an ejected provider, or one the request's tenant credentials cannot serve, is passed over as usual, and the session returns when the provider recovers. A weight change that alters the sum of the weights moves most sessions once; keep the sum fixed (for example 100) to move only the sessions whose share changed. Requires `weight` on the model's providers (a load error otherwise). Each pick on such a model adds 1 to `llmproxy_router_session_affinity_total` with `outcome` `hashed` or `unhashed`.",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "header": {
+          "type": "string",
+          "description": "Request header whose value is the session key, hashed raw. Checked first: a request that carries it is pinned by it alone. A header repeated in one request hashes all its values, sorted. The header is forwarded upstream unchanged. A caller can choose its value, and so choose among this model's providers, never outside them.",
+          "pattern": "^[A-Za-z0-9!#$%&'*+.^_`|~-]+$",
+          "examples": ["x-session-affinity"]
+        },
+        "identity": {
+          "type": "string",
+          "enum": ["key", "user", "tenant"],
+          "description": "Authenticated identity used as the session key when `header` is absent or not set. `key`: the credential that authenticated (a virtual key; for a JWT without `subject_claim` this is the signing key, so prefer `user`). `user`: the authenticated user (a virtual key's id, or a JWT subject). `tenant`: the tenant; credentials with no tenant share the reserved `default`. All traffic of one identity reaches one provider. Requires `auth` (a load error otherwise)."
         }
       }
     },
@@ -1064,7 +1122,7 @@
       "properties": {
         "key": {
           "type": "string",
-          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per TCP peer address; behind a load balancer that is the balancer's address, because the dialect has no trusted-hops setting), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header, e.g. `header:x-api-key` for per-caller quotas). The header value is hashed, never stored or logged raw, and a request without that header is not counted against this limit. `header:authorization` buckets per credential: on the hashed `authorization` value, or, when `auth:` has verified and removed that header, on the authenticated virtual key (one bucket per key, so two keys of one tenant are counted apart); write `tenant` to bucket on the authenticated tenant.",
+          "description": "What the limit is counted against: `global` (one bucket for all traffic), `client-ip` (one bucket per client address: the TCP peer address, or behind a load balancer the `x-forwarded-for` address that `listen.trusted_hops` vouches for; without `trusted_hops` every client behind a balancer shares the balancer's bucket), `tenant` (one bucket per authenticated tenant -- requires an `auth:` block; configuring this without one is a load error, since nothing would authenticate a tenant), or `header:<name>` (one bucket per distinct value of the named request header, e.g. `header:x-api-key` for per-caller quotas). The header value is hashed, never stored or logged raw, and a request without that header is not counted against this limit. `header:authorization` buckets per credential: on the hashed `authorization` value, or, when `auth:` has verified and removed that header, on the authenticated virtual key (one bucket per key, so two keys of one tenant are counted apart); write `tenant` to bucket on the authenticated tenant.",
           "pattern": "^(global|client-ip|tenant|header:[A-Za-z0-9-]+)$",
           "examples": ["header:authorization", "tenant", "global", "client-ip", "header:x-api-key"]
         },

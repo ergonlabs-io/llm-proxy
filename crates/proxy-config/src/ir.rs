@@ -645,6 +645,85 @@ impl ListenerConfig {
     }
 }
 
+impl ListenerConfig {
+    /// ADR-0016 decision 9 for RDS-delivered tables: an HCM that names an RDS
+    /// table whose weighted routes hash an authenticated identity must run
+    /// the authentication filter before its router, or those routes could
+    /// never hash. Tables not yet in `routes` are skipped; the check runs
+    /// again when they arrive. `Err` names the table and the route.
+    pub fn check_identity_hash_sources(
+        &self,
+        routes: &HashMap<RouteConfigName, Arc<RouteTable>>,
+    ) -> Result<(), String> {
+        for chain in self
+            .filter_chains
+            .iter()
+            .chain(self.default_filter_chain.iter())
+        {
+            for filter in &chain.filters {
+                let NetworkFilterSpec::HttpConnectionManager(hcm) = filter else {
+                    continue;
+                };
+                let Some(name) = &hcm.rds_route_config_name else {
+                    continue;
+                };
+                let Some(table) = routes.get(name) else {
+                    continue;
+                };
+                if hcm.authenticates_before_router() {
+                    continue;
+                }
+                if let Some((vhost, route)) = table.first_identity_hash_route() {
+                    return Err(format!(
+                        "route configuration `{name}` virtual_hosts[{vhost}].routes[{route}] hashes \
+                         an authenticated identity (ADR-0016), but listener `{}` has no \
+                         authentication filter before its router, so the route could never hash",
+                        self.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HttpConnectionManagerConfig {
+    /// True when the authentication filter (the only filter that fills the
+    /// identity a route hash policy may read) runs before the router.
+    pub fn authenticates_before_router(&self) -> bool {
+        self.http_filters
+            .iter()
+            .take_while(|filter| !filter.is_router)
+            .any(|filter| filter.type_url == crate::lower::AUTH_FILTER_TYPE)
+    }
+}
+
+impl RouteTable {
+    /// The first route, as `(virtual host index, route index)`, whose weighted
+    /// target hashes an authenticated identity (ADR-0016 decision 9).
+    pub fn first_identity_hash_route(&self) -> Option<(usize, usize)> {
+        self.virtual_hosts
+            .iter()
+            .enumerate()
+            .find_map(|(v, vhost)| {
+                vhost
+                    .routes
+                    .iter()
+                    .position(|route| match &route.action {
+                        RouteActionIR::Forward(ForwardAction {
+                            target: ForwardTarget::Weighted(weighted),
+                            ..
+                        }) => weighted
+                            .hash_policy
+                            .iter()
+                            .any(|entry| entry.source.needs_authentication()),
+                        _ => false,
+                    })
+                    .map(|r| (v, r))
+            })
+    }
+}
+
 /// S10: one entry of an HCM's `upgrade_configs`. `upgrade_type` is
 /// stored lowercased because Envoy matches it case-insensitively against the
 /// request's `Upgrade` header.
@@ -1679,6 +1758,42 @@ pub struct WeightedClusters {
     /// (cluster, cumulative weight): e.g. weights 20/30/50 store 20/50/100.
     pub cumulative: Vec<(ClusterName, u64)>,
     pub total_weight: u64,
+    /// Envoy `RouteAction.hash_policy` with `use_hash_policy: true`
+    /// (ADR-0016). When it yields a hash, the draw is `hash % total_weight`
+    /// instead of a random value, so one session keeps its member. Empty: the
+    /// random draw. Held here rather than on `ForwardAction` because nothing
+    /// else consumes a route hash (ring hash and Maglev are refused).
+    pub hash_policy: Vec<RouteHashPolicy>,
+}
+
+/// One entry of a route hash policy (Envoy `RouteAction.HashPolicy`,
+/// ADR-0016 decision 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHashPolicy {
+    pub source: HashSource,
+    /// Envoy `terminal`: once a hash exists after this entry, the rest of the
+    /// list is skipped.
+    pub terminal: bool,
+}
+
+/// What a [`RouteHashPolicy`] hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HashSource {
+    /// A request header, all values sorted and concatenated (Envoy).
+    Header(http::HeaderName),
+    /// Filter state `llmproxy.auth.key_id`: the credential that authenticated.
+    AuthKeyId,
+    /// Filter state `llmproxy.auth.user_id`: the authenticated user.
+    AuthUserId,
+    /// Filter state `llmproxy.auth.tenant`: the authenticated tenant.
+    AuthTenant,
+}
+
+impl HashSource {
+    /// True for the sources only the authentication filter can fill.
+    pub fn needs_authentication(&self) -> bool {
+        !matches!(self, Self::Header(_))
+    }
 }
 
 impl WeightedClusters {

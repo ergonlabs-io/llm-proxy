@@ -956,11 +956,11 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
-    /// Times this replica's control-plane load found no tenants and no keys
+    /// Times this replica's control-plane load found no keys, or no tenants,
     /// after the previous load found some: the store was emptied under it
     /// (a shared Redis restarted without persistence, or flushed), or an
-    /// operator removed every tenant and key. Every virtual key the store
-    /// held gets 401 from then on. Counted once per transition, not per
+    /// operator removed every key or every tenant. Every virtual key the
+    /// store held gets 401 from then on. Counted once per transition, not per
     /// poll. `scope` is the operator-chosen HCM `stat_prefix`. Prometheus
     /// surface only (no Envoy equivalent).
     pub const POLICY_STORE_EMPTIED: Instrument = Instrument {
@@ -968,6 +968,18 @@ pub mod instruments {
         kind: InstrumentKind::Counter,
         unit: "{event}",
         attribute_keys: &["scope"],
+        buckets: None,
+    };
+    /// Rows in this replica's last control-plane load, by `kind` (`keys` or
+    /// `tenants`): what the store `auth.store` selects held, not counting
+    /// configured bootstrap keys. Zero keys means every stored virtual key
+    /// gets 401, so this is the gauge to alert on. `scope` is the
+    /// operator-chosen HCM `stat_prefix`. Prometheus surface only.
+    pub const POLICY_STORE_ROWS: Instrument = Instrument {
+        name: "llmproxy_policy_store_rows",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{row}",
+        attribute_keys: &["scope", "kind"],
         buckets: None,
     };
     /// Seconds since one of a chain's counter seams last reconciled with the

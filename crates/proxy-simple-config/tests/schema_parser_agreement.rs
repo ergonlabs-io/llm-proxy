@@ -150,6 +150,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_fields::<OutlierDetectionDef>,
         ),
         (
+            "#/$defs/Provider/properties/circuit_breakers",
+            "CircuitBreakersDef",
+            parser_fields::<CircuitBreakersDef>,
+        ),
+        (
             "#/$defs/Provider/properties/oauth2_jwt_bearer",
             "OAuth2JwtBearerDef",
             parser_fields::<OAuth2JwtBearerDef>,
@@ -159,6 +164,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/ModelProvider",
             "ModelProvider",
             parser_fields::<ModelProvider>,
+        ),
+        (
+            "#/$defs/SessionAffinity",
+            "SessionAffinity",
+            parser_fields::<SessionAffinity>,
         ),
         ("#/$defs/Route", "RouteRule", parser_fields::<RouteRule>),
         (
@@ -253,6 +263,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/ModelProvider/properties/dialect",
             "Dialect",
             parser_variants::<Dialect>,
+        ),
+        (
+            "#/$defs/SessionAffinity/properties/identity",
+            "AffinityIdentity",
+            parser_variants::<AffinityIdentity>,
         ),
         (
             "#/$defs/Route/properties/streaming",

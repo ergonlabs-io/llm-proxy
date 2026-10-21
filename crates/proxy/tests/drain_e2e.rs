@@ -87,6 +87,17 @@ fn spawn_line_reader(
 
 impl Proxy {
     fn spawn(config: &str, data: u16, admin: u16, drain_time_s: u32, with_token: bool) -> Proxy {
+        Self::spawn_with(config, data, admin, drain_time_s, with_token, &[])
+    }
+
+    fn spawn_with(
+        config: &str,
+        data: u16,
+        admin: u16,
+        drain_time_s: u32,
+        with_token: bool,
+        extra_args: &[&str],
+    ) -> Proxy {
         let config_path = std::env::temp_dir().join(format!(
             "llm-proxy-drain-e2e-{}-{admin}.yaml",
             std::process::id()
@@ -102,6 +113,7 @@ impl Proxy {
                 "--drain-time-s",
                 &drain_time_s.to_string(),
             ])
+            .args(extra_args)
             .stderr(Stdio::piped());
         if with_token {
             command.env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN);
@@ -676,4 +688,78 @@ fn a_second_sigterm_during_the_telemetry_flush_exits_nonzero_promptly() {
         .wait_exit(Duration::from_secs(10))
         .expect("a second signal must abandon the flush, not wait out the 30 s export deadline");
     assert_eq!(status.code(), Some(1), "expected exit 1, got {status:?}");
+}
+
+/// `--drain-strategy gradual` reaches the workers. SIGTERM does not close every
+/// idle keep-alive connection at once: they close one by one across the first
+/// quarter of the 40 s window (about 1.25 s apart here). Once the last is gone,
+/// the process exits, long before the deadline would cut anything.
+#[test]
+fn gradual_drain_closes_idle_keep_alives_on_a_schedule_then_exits_before_the_deadline() {
+    const CONNECTIONS: usize = 8;
+    let upstream = Upstream::spawn();
+    let (data, admin) = (free_port(), free_port());
+    let mut proxy = Proxy::spawn_with(
+        &bootstrap(data, admin, upstream.addr.port()),
+        data,
+        admin,
+        40,
+        false,
+        &["--drain-strategy", "gradual"],
+    );
+    proxy.wait_ready();
+
+    let mut open: Vec<TcpStream> = (0..CONNECTIONS)
+        .map(|_| {
+            let mut client = TcpStream::connect(proxy.data).expect("connect to data listener");
+            client
+                .write_all(b"GET /idle HTTP/1.1\r\nHost: t\r\n\r\n")
+                .unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut response = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !response.ends_with(b"ok") {
+                let n = client.read(&mut buf).expect("read /idle response");
+                assert_ne!(n, 0, "closed before the /idle response");
+                response.extend_from_slice(&buf[..n]);
+            }
+            client.set_nonblocking(true).unwrap();
+            client
+        })
+        .collect();
+
+    // Drops every connection the server has closed; returns how many are gone.
+    let reap = |open: &mut Vec<TcpStream>| {
+        open.retain_mut(|client| {
+            let mut buf = [0u8; 64];
+            matches!(client.read(&mut buf), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock)
+        });
+        CONNECTIONS - open.len()
+    };
+
+    proxy.signal_term();
+    proxy.wait_draining();
+    let mut closed = 0;
+    assert!(
+        poll_until(WAIT, || {
+            closed = reap(&mut open);
+            closed > 0
+        }),
+        "the first scheduled close never came"
+    );
+    assert!(
+        closed < CONNECTIONS,
+        "gradual must not close every connection at drain start ({closed} closed)"
+    );
+    assert!(
+        poll_until(WAIT, || reap(&mut open) == CONNECTIONS),
+        "{} connections still open {WAIT:?} after the first close",
+        open.len()
+    );
+    let status = proxy
+        .wait_exit(WAIT)
+        .expect("the process must exit once every connection has closed");
+    assert!(status.success(), "{status:?}");
 }

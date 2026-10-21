@@ -333,6 +333,16 @@ pub struct ListenerSpec {
     /// greater than 0. More gets `431`.
     #[serde(default)]
     pub max_request_headers_count: Option<u32>,
+    /// Proxies in front of this one that append to `x-forwarded-for`, such
+    /// as a load balancer. Client-ip limits, request records and access logs
+    /// then attribute a request to the address the outermost trusted proxy
+    /// saw. Unset or 0 means the TCP peer, and `x-forwarded-for` is never
+    /// read. Lowers to the HCM's `use_remote_address: true` and
+    /// `xff_num_trusted_hops` (envoy-semantics S9). Signed so a negative
+    /// value fails validation with this path, not as a mismatch of the whole
+    /// untagged `listen`.
+    #[serde(default)]
+    pub trusted_hops: Option<i64>,
 }
 
 /// Safe edge-proxy defaults for the admission limits, from Envoy's edge
@@ -491,6 +501,28 @@ pub struct Provider {
     /// `outlier_detection`. Absent means no ejection.
     #[serde(default)]
     pub outlier_detection: Option<OutlierDetectionDef>,
+    /// Concurrency ceilings of this provider's cluster (S5). Lowers to the
+    /// cluster's `DEFAULT`-priority `circuit_breakers` thresholds; a field
+    /// left unset keeps the Envoy default of 1024.
+    #[serde(default)]
+    pub circuit_breakers: Option<CircuitBreakersDef>,
+}
+
+/// `providers.<name>.circuit_breakers`: the S5 budgets of one provider
+/// cluster. They sit on the provider, never the route (AGENTS.md invariant 6),
+/// so each provider of a fallback chain keeps its own ceiling.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreakersDef {
+    /// Concurrent requests in flight to this provider, streams included.
+    #[serde(default)]
+    pub max_requests: Option<u32>,
+    /// Requests waiting for a connection once `max_connections` is reached.
+    #[serde(default)]
+    pub max_pending_requests: Option<u32>,
+    /// Open upstream connections to this provider.
+    #[serde(default)]
+    pub max_connections: Option<u32>,
 }
 
 /// `providers.<name>.outlier_detection`: the consecutive-failure detector of
@@ -549,8 +581,9 @@ pub struct Auth {
     pub hmac_secret_file: Option<String>,
     /// The configured virtual keys. May be empty -- legal (fail closed: an
     /// `auth:` block with no keys authenticates nothing and therefore
-    /// refuses every request), but almost certainly a mistake, so lowering
-    /// warns rather than silently accepting it.
+    /// refuses every request), but almost certainly a mistake when nothing
+    /// else supplies keys, so lowering warns then. A `shared` or
+    /// `persistent` store, or an `admin` server, supplies minted keys.
     #[serde(default)]
     pub keys: Vec<AuthKey>,
     /// Where minted keys, revocations, and tenant policy live. Absent means
@@ -865,6 +898,33 @@ pub struct ModelDef {
     /// per-route override on this model's route.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Pins a session to one weighted provider (ADR-0016). Lowers to Envoy
+    /// `weighted_clusters.use_hash_policy` plus a route `hash_policy`; needs
+    /// weights on `providers`.
+    #[serde(default)]
+    pub session_affinity: Option<SessionAffinity>,
+}
+
+/// `models.<name>.session_affinity`: where a request's session key comes
+/// from. At least one of the two is set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionAffinity {
+    /// Request header carrying the session key; checked first.
+    #[serde(default)]
+    pub header: Option<String>,
+    /// Authenticated identity used when the header is absent.
+    #[serde(default)]
+    pub identity: Option<AffinityIdentity>,
+}
+
+/// `models.<name>.session_affinity.identity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AffinityIdentity {
+    Key,
+    User,
+    Tenant,
 }
 
 /// One entry in a [`ModelDef`]'s `providers` list: either the shorthand

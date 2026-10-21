@@ -26,6 +26,18 @@ pub const MAX_OUTPUT_TOKENS_REJECTED: Instrument = Instrument {
     buckets: None,
 };
 
+/// Requests on a weighted route with a session hash policy (ADR-0016),
+/// by `outcome`: `hashed` (the session hash chose the member) or `unhashed`
+/// (no configured source had a value, so the draw was random). Two series at
+/// most; never labelled with the session value, key, user or tenant.
+pub const SESSION_AFFINITY: Instrument = Instrument {
+    name: "llmproxy_router_session_affinity_total",
+    kind: InstrumentKind::Counter,
+    unit: "{request}",
+    attribute_keys: &["outcome"],
+    buckets: None,
+};
+
 /// How many distinct unknown names each per-worker dedup set remembers, and
 /// so warns about, before it stops growing. Names are configured, not
 /// client-supplied, so a real deployment that misses this many is already
@@ -239,6 +251,7 @@ pub struct RouterStats {
     worker: WorkerId,
     warned_unknown_clusters: UnknownNames,
     rejected_memo: HandleMemo<Handle>,
+    affinity_memo: HandleMemo<Handle>,
 }
 
 impl RouterStats {
@@ -249,7 +262,27 @@ impl RouterStats {
             worker,
             warned_unknown_clusters: UnknownNames::default(),
             rejected_memo: HandleMemo::new(),
+            affinity_memo: HandleMemo::new(),
         }
+    }
+
+    /// Counts one weighted pick on a route with a session hash policy. A
+    /// route with none records nothing, so the healthy unhashed path stays
+    /// off the registry.
+    pub fn record_session_affinity(&self, source: crate::route::DrawSource) {
+        let outcome = match source {
+            crate::route::DrawSource::Random => return,
+            crate::route::DrawSource::Hashed => "hashed",
+            crate::route::DrawSource::Unhashed => "unhashed",
+        };
+        let handle = self.registry.resolve_capped_memo(
+            &self.affinity_memo,
+            &SESSION_AFFINITY,
+            &[("outcome", outcome)],
+            2,
+            &[("outcome", outcome)],
+        );
+        self.registry.incr(self.worker, handle, 1);
     }
 
     /// Counts one request refused by the output-token cap. The series carries

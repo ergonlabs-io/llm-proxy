@@ -44,6 +44,10 @@ ring = { workspace = true }
 # why the streaming half is not driven through it).
 loadgen = { path = "../loadgen" }
 proxy-simple-config = { path = "../../crates/proxy-simple-config" }
+# session_affinity_e2e.rs: computes the member each session should reach from
+# the documented mapping (xxHash64 % total weight, ADR-0016), independently of
+# the router.
+xxhash-rust = { workspace = true }
 
 [lints]
 workspace = true
