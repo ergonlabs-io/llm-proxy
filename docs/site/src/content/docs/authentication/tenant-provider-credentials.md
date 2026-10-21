@@ -470,8 +470,7 @@ Read a missing value as `platform`. A `null` value on a new record means that
 no attempt reached a credential. It does not mean `platform`. A `403` or a
 `503` from this step can produce `null`.
 
-Records leave the proxy only when you start it with `--request-records-file`
-or `--request-records-agent`.
+Records leave the proxy only when you start it with `--request-records-file`.
 
 ## Budgets
 

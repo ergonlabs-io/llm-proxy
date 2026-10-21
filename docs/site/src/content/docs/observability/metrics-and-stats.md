@@ -121,21 +121,7 @@ each is on [Request capture](../../observability/request-capture/).
 - Record admission and the writer queue: `llmproxy_metadata_admission`
   (label `outcome`), `llmproxy_metadata_queue_depth`,
   `llmproxy_metadata_queue_capacity`, `llmproxy_metadata_written`,
-  `llmproxy_metadata_durable`, `llmproxy_metadata_write_failures`.
-- Capture state: `llmproxy_capture_state_admission` (label `outcome`),
-  `llmproxy_capture_active_requests`,
-  `llmproxy_capture_state_reserved_bytes`,
-  `llmproxy_capture_event_reserved_bytes`, `llmproxy_capture_drops` (label
-  `reason`).
-- Nine capture-spool gauges, from the poll of the capture agent:
-  `llmproxy_capture_spool_retained_records`,
-  `llmproxy_capture_spool_pending_records`,
-  `llmproxy_capture_spool_disk_bytes`,
-  `llmproxy_capture_spool_max_disk_bytes`,
-  `llmproxy_capture_spool_quarantine_bytes`,
-  `llmproxy_capture_spool_durable_through_sequence`,
-  `llmproxy_capture_spool_poisoned`, `llmproxy_capture_agent_reachable`, and
-  `llmproxy_capture_spool_stats_available`.
+  `llmproxy_metadata_write_failures`.
 
 ### Ledger metrics
 

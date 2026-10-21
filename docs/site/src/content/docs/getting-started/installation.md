@@ -28,7 +28,7 @@ The script needs `curl`, `tar`, `od`, and `sed`. It does these steps:
 1. It downloads the release archive and its `.sha256` file.
 2. It stops if the sums do not match.
 3. It runs the new binary with `--version`. It stops if the binary does not run.
-4. It installs `llm-proxy` and, if the archive has it, `llm-capture-agent`.
+4. It installs `llm-proxy`.
 5. It runs `llm-proxy init` on the data directory, if no `llmproxy.yaml` is
    there.
 6. It creates an admin token in `service.env`, if that file does not exist.

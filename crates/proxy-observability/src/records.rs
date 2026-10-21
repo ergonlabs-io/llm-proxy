@@ -2,7 +2,7 @@
 //!
 //! These types are owned by the observability boundary so the data plane can
 //! submit an owned, bounded event without knowing about ClickHouse, object
-//! storage, or a capture agent. The sink is deliberately nonblocking: an
+//! storage, or a remote collector. The sink is deliberately nonblocking: an
 //! unavailable collector must never delay forwarding or alter accounting.
 
 use serde::{Deserialize, Serialize};
@@ -532,87 +532,9 @@ pub enum SubmitResult {
 }
 
 pub trait RequestRecordSink: Send + Sync {
-    fn requires_admission(&self) -> bool {
-        false
-    }
-    /// Legacy sinks have no admission lease. Declarative capture reserves before retention.
-    #[cfg(unix)]
-    fn try_admit(&self) -> Result<Option<Arc<crate::capture::CaptureLease>>, SubmitResult> {
-        Ok(None)
-    }
     fn submit(&self, record: RequestRecord) -> SubmitResult;
     fn max_attempts(&self) -> u16 {
         MAX_ATTEMPTS
-    }
-}
-
-/// Collector boundary owned by the metadata agent. Implementations belong on
-/// the control/sidecar side; request workers only see `RequestRecordSink`.
-pub trait MetadataCollector: Send + 'static {
-    fn commit(&mut self, record: RequestRecord);
-}
-
-pub struct MetadataAgent<C> {
-    receiver: mpsc::Receiver<RequestRecord>,
-    collector: C,
-}
-
-impl<C: MetadataCollector> MetadataAgent<C> {
-    pub fn new(capacity: usize, collector: C) -> (BoundedRecordSink, Self) {
-        let (sink, receiver) = BoundedRecordSink::new(capacity);
-        (
-            sink,
-            Self {
-                receiver,
-                collector,
-            },
-        )
-    }
-
-    /// Drain on a dedicated thread until all producers drop their sink.
-    pub async fn run(self) {
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let mut receiver = self.receiver;
-            let mut collector = self.collector;
-            while let Some(record) = receiver.blocking_recv() {
-                collector.commit(record);
-            }
-            let _ = done_tx.send(());
-        });
-        let _ = done_rx.await;
-    }
-
-    /// Drain queued records after shutdown is requested, then return. The
-    /// caller owns the outer timeout. Collector work cannot block its runtime.
-    /// The relay reserves one additional event (at most MAX_RECORD_BYTES).
-    pub async fn drain_until(mut self, mut shutdown: tokio::sync::oneshot::Receiver<()>) {
-        let (tx, mut rx) = mpsc::channel::<RequestRecord>(1);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            while let Some(record) = rx.blocking_recv() {
-                self.collector.commit(record);
-            }
-            let _ = done_tx.send(());
-        });
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => {
-                    self.receiver.close();
-                    while let Some(record) = self.receiver.recv().await {
-                        if tx.send(record).await.is_err() { break; }
-                    }
-                    break;
-                }
-                record = self.receiver.recv() => match record {
-                    Some(record) => if tx.send(record).await.is_err() { break; },
-                    None => break,
-                }
-            }
-        }
-        drop(tx);
-        let _ = done_rx.await;
     }
 }
 
@@ -976,42 +898,5 @@ pub(crate) mod tests {
                 ..Default::default()
             }
         );
-    }
-
-    #[tokio::test]
-    async fn agent_owns_consumption_and_commits_off_sender_path() {
-        struct Collector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-        impl MetadataCollector for Collector {
-            fn commit(&mut self, record: RequestRecord) {
-                self.0.lock().unwrap().push(record.request_id);
-            }
-        }
-
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (sink, agent) = MetadataAgent::new(1, Collector(seen.clone()));
-        let task = tokio::spawn(agent.run());
-        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
-        drop(sink);
-        task.await.unwrap();
-        assert_eq!(seen.lock().unwrap().as_slice(), &["r"]);
-    }
-
-    #[tokio::test]
-    async fn agent_shutdown_drains_current_queue_without_waiting_for_new_records() {
-        struct Collector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-        impl MetadataCollector for Collector {
-            fn commit(&mut self, record: RequestRecord) {
-                self.0.lock().unwrap().push(record.request_id);
-            }
-        }
-
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (sink, agent) = MetadataAgent::new(2, Collector(seen.clone()));
-        assert_eq!(sink.submit(record()), SubmitResult::Accepted);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(agent.drain_until(shutdown_rx));
-        let _ = shutdown_tx.send(());
-        task.await.unwrap();
-        assert_eq!(seen.lock().unwrap().as_slice(), &["r"]);
     }
 }

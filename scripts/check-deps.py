@@ -85,7 +85,6 @@ def used(ident, paths):
 # anything, but nothing may list one in [dependencies].
 LAYERS = {
     "proxy-api": 0,
-    "proxy-capture-protocol": 0,
     "proxy-capture-spool": 0,
     "proxy-observability": 1,
     "proxy-config": 2,
@@ -93,7 +92,6 @@ LAYERS = {
     "proxy-simple-config": 3,
     "proxy-xds": 3,
     "proxy-cluster": 3,
-    "proxy-capture-agent": 3,
     # The HTTP data plane and the control plane share a layer, so neither
     # may depend on the other; proxy-filters joins them.
     "proxy-http": 4,

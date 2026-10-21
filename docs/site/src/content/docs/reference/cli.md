@@ -114,18 +114,14 @@ has no field for the node, so `--service-node` is the only way to set it with
 
 ### Capture flags
 
-These flags turn on request capture. All are off by default. See
-[Request capture](../../observability/request-capture/) for the agent setup, the
+These flags turn on request capture. Both are off by default. See
+[Request capture](../../observability/request-capture/) for the file format, the
 limits, and the metrics.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--request-records-file <PATH>` | — | Append one JSON line for each request to this file. Conflicts with `--request-records-agent`. |
-| `--request-records-agent <SOCKET>` | — | Send records to the `llm-capture-agent` on this Unix socket. Requires the next three flags. |
-| `--request-records-agent-uid <UID>` | — | The OS UID the agent must run as. |
-| `--request-records-agent-node <ID>` | — | The node ID the agent must report. |
-| `--request-records-producer <ID>` | — | The producer ID in the agent grant for this proxy. |
-| `--request-record-max-attempts <N>` | `64` | Attempt summaries to keep for each record, from 1 to 64. Needs a destination flag. |
+| `--request-records-file <PATH>` | — | Append one JSON line for each request to this file. |
+| `--request-record-max-attempts <N>` | `64` | Attempt summaries to keep for each record, from 1 to 64. Needs `--request-records-file`. |
 
 ## `init`
 

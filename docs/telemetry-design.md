@@ -62,16 +62,16 @@ Proxy request workers
   ├─ bounded request records ── metadata queue ─┐
   └─ bounded content chunks ── content queue ───┤
                                                v
-                                     capture transport workers
+                                     delivery workers
                                                v
-                                     capture-agent collector
+                                     collector (retired: see section 8)
                                       ├─ metadata durable spool → analytics store
                                       └─ content durable spool → object storage
                                                                     ↓
                                               tenant query API ← manifests/index
 ```
 
-The capture agent is initially a separate process/sidecar with independent CPU, memory, disk, network, and concurrency limits. In-process transport runs outside request workers. Operational export must not share a congestible queue or worker pool with content processing.
+The capture agent was a separate process/sidecar with independent CPU, memory, disk, network, and concurrency limits. In-process transport runs outside request workers. Operational export must not share a congestible queue or worker pool with content processing.
 
 The initial backend target is batched request records in ClickHouse and transcript objects in S3-compatible storage. Put backend-specific code behind collector interfaces. A broker is not required for the first implementation; add one only for replay or independent consumers. Backend/client versions and exact insertion/consistency semantics must be verified against official documentation when selected.
 
@@ -117,7 +117,7 @@ Service logs describe lifecycle, configuration, and failures. Rate-limit repeate
 
 ### 5.5 Alert behavior
 
-Alert on forwarding availability/latency and worker health separately from telemetry degradation. Capture backend failure must not fail proxy readiness by default. Publish capture-agent readiness and durability status separately. Aggregate drop counters are the dependable signal when a per-request loss event cannot itself be delivered.
+Alert on forwarding availability/latency and worker health separately from telemetry degradation. Capture backend failure must not fail proxy readiness by default. Aggregate drop counters are the dependable signal when a per-request loss event cannot itself be delivered.
 
 ## 6. End-user telemetry
 
@@ -211,37 +211,14 @@ Legacy synchronous access logs remain a compatibility surface. Add bounded async
 
 ## 8. Capture agent and durable spooling
 
-### 8.1 Separate lanes
-
-The agent owns independent metadata and content memory queues, disk reservations, writer concurrency, retry budgets, and delivery workers. Operational metrics describe each lane using finite labels.
-
-Processing: validate envelope → apply required content/header policy → compress/batch → append spool → durability commit → backend delivery → confirmed commit → reclaim spool.
-
-Prefer redaction before durable storage. If exact raw retention is explicitly permitted, encrypt raw spool content and distinguish it from a redacted view. Streaming redaction cannot be assumed safe across arbitrary chunk boundaries; perform format-aware redaction off path with bounded parsing/staging limits. Unsupported content or redaction failure drops the affected capture and records a reason; it never silently stores unredacted content under a redacted policy.
-
-### 8.2 Spool format and acknowledgements
-
-Use versioned, length-delimited, append-only segments with maximum segment bytes and age. Include segment ID, node identity, schema version, encryption key reference, record lengths, checksums, and a sealed footer. Keep plaintext identifiers out of filenames when sensitive.
-
-A collector acknowledgement means the acknowledged sequence is covered by a completed durability barrier, not merely `write()` or userspace buffer flush. Group commits may amortize fsync; configure and document their crash-loss window. Never report `durable_local` before the barrier.
-
-Use atomic publication of sealed segments with directory durability where needed. Maintain replayable delivery receipts/checkpoints; writing a receipt is subject to the same crash-consistency rules as content. Verify actual filesystem assumptions in recovery tests.
-
-Startup validates segment versions and lengths before allocation, scans unsealed tails to the last valid record, and isolates corrupted segments. Recovery never follows arbitrary paths from untrusted data. Replay pending records without assuming process memory survived. Encrypt with authenticated encryption and provision keys independently of spool files; exact crypto library selection belongs to implementation review.
-
-### 8.3 Saturation and retention
-
-Hard limits: memory bytes/events, metadata/content spool bytes, segment size, spool age, active upload count, per-request bytes, per-tenant sustained capture rate and capacity, high/low watermarks. Reject configurations whose reserved budgets exceed total capacity.
-
-At high watermark stop admitting new body capture or apply an explicit configured sampling policy. Already admitted captures still have finite limits. At the hard limit decline new capture; preserve reserved metadata/control capacity. Previously durability-acknowledged records are not silently evicted to admit new content. Age-based expiry is an explicit recorded terminal disposition with loss counters and the configured retention contract.
-
-Recovery below the low watermark re-enables admission. Do not resume a partially dropped direction and later call it complete. Metadata itself remains best effort before durable commit; reserved capacity is prioritization, not a no-loss guarantee.
-
-### 8.4 Delivery guarantees
-
-Before durable commit, crashes can lose accepted memory events. After durable commit, retry delivery until committed or explicitly expired under policy. Node loss can still lose a local spool unless its volume survives; replicated durability is a separate deployment guarantee.
-
-Retries are bounded in concurrency and attempt duration with exponential backoff/jitter. Backend outage never creates unbounded RAM growth. Disk-full and permission failures disable capture admission and publish health; they do not affect forwarding readiness.
+Retired 2026-10-21 (removal ships in 0.7.0). The capture agent
+(`llm-capture-agent`), its protocol and its declarative
+`io.llmproxy.capture` policy were removed. Body export is trace export
+(`internal-docs/adr/0008-trace-export.md`, `internal-docs/trace-export-design.md`);
+request metadata goes to the JSONL file sink (`--request-records-file`) and the
+billing ledger (ADR-0009). The encrypted spool crate `proxy-capture-spool`
+stays because the ledger is built on it. The text that stood here described a
+design that was never fully built; the repository history has it.
 
 ## 9. Remote storage and querying
 
@@ -298,7 +275,6 @@ Pin request policy snapshots; configuration updates must not reinterpret already
 | Failure | Forwarding | Operational outcome | End-user outcome |
 | --- | --- | --- | --- |
 | Operational collector unavailable | Continues | Bounded export failures/drops; scrape remains | Independent |
-| Capture agent unavailable | Continues | Queue/drop metrics | Metadata/content may be lost before durability |
 | Content queue full | Continues | Bounded reason counters | Stop affected capture; metadata prioritized |
 | Metadata queue full | Continues | Metadata-loss counter | Request record may be absent |
 | Remote storage unavailable | Continues | Spool growth/lag metrics | Retry durable records within spool policy |

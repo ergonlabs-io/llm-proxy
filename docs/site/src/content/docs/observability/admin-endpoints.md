@@ -62,17 +62,14 @@ the presented token.
 |---|---|---|
 | Probes and dumps | `GET /ready`, `/config_dump`, `/clusters`, `/server_info`, `/models` | No |
 | Metrics | `GET /stats`, `/stats/prometheus` | No |
-| Capture counters | `GET /capture/spool/stats` | No |
 | Rate card read | `GET /pricing`, `GET /chains/{stat_prefix}/pricing` | No |
 | Admin UI | `GET /ui`, `GET /ui/...` | No |
-| Capture records | `GET /capture/spool/records` | Yes |
 | Spend reads | `GET .../spend` for keys and tenants | Yes |
 | Billing ledger | `GET /ledger/entries`, `POST /ledger/ack` | Yes |
 | Identity reads | `GET /keys`, `GET /tenants/{id}/provider_credentials` | Yes |
 | All writes | `POST`, `PUT`, `DELETE` routes, and the lifecycle commands | Yes |
 
-The proxy gates `/capture/spool/records` because records are end-user
-metadata. It gates the spend and key-list reads because they expose money and
+The proxy gates the spend and key-list reads because they expose money and
 identity.
 
 `GET /pricing` is open, because its handler runs before the gate. `PUT
@@ -392,29 +389,6 @@ initialized on this chain` if the chain has no usage filter. Without
 says so in `note`. `GET` answers `503` with `llmproxy.usage has no active
 pricing rate card` if no card is active.
 
-## Capture endpoints
-
-These routes inspect the spool of the capture agent. Both answer `404` with
-`no capture agent is configured for this proxy; /capture/spool/* needs a
-capture agent endpoint` if no capture agent is configured. See
-[Request capture](../request-capture/) for the agent and its setup.
-
-| Route | Gated | What it does |
-|---|---|---|
-| `GET /capture/spool/stats` | No | Counters of the spool. No record content. |
-| `GET /capture/spool/records?after=<n>&limit=<n>` | Yes | One page of stored records |
-
-For `records`, `after` is an unsigned integer and defaults to `0`. `limit`
-is from 1 to 100 and defaults to `50`. An unknown or repeated parameter
-gives `400`. The answer holds
-`records`, `next_after_sequence`, and `durable_through_sequence`. The stats
-answer is cached for a short time.
-
-When the agent refuses the query, the answer is `403` and the hint says that
-the proxy grant needs `"inspect": true`. For an agent that does not support
-inspection, the answer is `501`. For an unreachable agent, the answer is
-`503 capture agent unavailable`.
-
 ## Admin UI
 
 The admin server serves a single-page UI at `/ui`. It needs no token to
@@ -451,7 +425,7 @@ For maintainers. Route table, handlers, gate, and limits are in
 - Handlers: `handle_lifecycle`, `handle_mint_key`, `handle_set_key_budget`,
   `handle_set_budget`, `handle_set_key_policy`, `handle_set_tenant_limits`,
   `handle_set_key_limits`, `handle_set_pricing`, `handle_list_keys`,
-  `parse_model_policy`, `parse_records_query`, `capture_error`,
+  `parse_model_policy`,
   `store_error_response`, `render_model_access`, `render_limits`, and
   `LimitSpec::into_policy`.
 - Key policy: `ControlPlane::set_key_policy` in

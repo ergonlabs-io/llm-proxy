@@ -695,7 +695,7 @@ mod writer {
         }
     }
 
-    /// A private regular file of exactly 32 bytes, as the capture agent and
+    /// A private regular file of exactly 32 bytes, as the ledger and
     /// tenant credential keys require.
     fn load_key(key: &LedgerKeyFile, field: &str) -> Result<EncryptionKey, LedgerOpenError> {
         use std::os::unix::fs::PermissionsExt;

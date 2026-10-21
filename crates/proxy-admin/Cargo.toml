@@ -45,9 +45,6 @@ fuzzing = []
 # `ledger::testing`: a real ledger writer over an encrypted spool in a temp
 # dir, so `/ledger/*` tests read and acknowledge real committed entries.
 proxy-observability = { workspace = true, features = ["test-support"] }
-# The capture-spool tests run a fake agent that speaks the real frame protocol
-# over a Unix socket in a private temp dir.
-proxy-capture-protocol = { path = "../proxy-capture-protocol" }
 tempfile = { version = "=3.27.0", default-features = false }
 # The write-API tests build a `ControlPlane` directly and want to name the
 # type of `ControlPlane::handle()` (`Arc<ArcSwap<ControlPlaneSnapshot>>`) in

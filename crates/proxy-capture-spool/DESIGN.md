@@ -1,6 +1,7 @@
 # Capture spool: redb design
 
-The spool stores capture records in redb. Backward compatibility with the
+The spool stores records in redb. The billing ledger (ADR-0009) is its only
+user; the capture agent it was first written for was retired. Backward compatibility with the
 earlier v1 format was deliberately dropped, and increased disk use was accepted.
 
 ## Scope and ownership

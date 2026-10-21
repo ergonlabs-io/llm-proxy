@@ -27,21 +27,9 @@ build: ## Debug build of every crate + the llm-proxy binary
 release: ## Optimized build of the llm-proxy binary (target/release/llm-proxy)
 	cargo build --release -p proxy
 
-.PHONY: capture-qualification-build
-capture-qualification-build: ## Build optimized proxy, local capture agent, mock upstream, and loadgen
-	cargo build --release -p proxy -p proxy-capture-agent -p mockupstream -p loadgen
-
-.PHONY: capture-qualify
-capture-qualify: capture-qualification-build ## Run finite capture latency/RSS qualification; reports under target/
-	python3 scripts/capture-qualification.py $(CAPTURE_QUALIFICATION_ARGS)
-
-.PHONY: capture-agent-qualify
-capture-agent-qualify: capture-qualification-build ## Qualify eight concurrent maximum records against the local agent
-	PYTHONDONTWRITEBYTECODE=1 python3 scripts/capture-agent-qualification.py $(CAPTURE_AGENT_QUALIFICATION_ARGS)
-
-.PHONY: capture-qualification-check
-capture-qualification-check: ## Check qualification reporting without starting test servers
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_capture_qualification.py
+.PHONY: bench-build
+bench-build: ## Build the optimized proxy, mock upstream and loadgen the benchmarks run
+	cargo build --release -p proxy -p mockupstream -p loadgen
 
 .PHONY: lab-ab
 lab-ab: ## Latency lab A/B on a Linux host: make lab-ab BASE=main CAND=HEAD LAB_HOST=root@IP [PATCH=f]
@@ -205,7 +193,6 @@ clean: ## Remove build artifacts
 # toolchain variant leaves another copy of each crate behind. On 2026-10-10
 # that reached 105G in target/debug alone (~165 variants of proxy_filters).
 # `cargo sweep` deletes artifacts by age and for uninstalled toolchains, and
-# leaves target/capture-* qualification reports alone.
 SWEEP_DAYS ?= 14
 .PHONY: clean-stale
 clean-stale: ## Delete build artifacts unused for SWEEP_DAYS days (default 14); needs cargo-sweep
@@ -418,7 +405,7 @@ sweep-compare: ## Run the sweep twice, h1 vs h2 upstream, to price connection re
 	./scripts/capacity-sweep.sh --upstream-protocol http2
 
 .PHONY: bench-added-latency
-bench-added-latency: capture-qualification-build ## Added p50/p99 latency: direct vs proxy controls off vs on: make bench-added-latency [ARGS="--rounds 5"]
+bench-added-latency: bench-build ## Added p50/p99 latency: direct vs proxy controls off vs on: make bench-added-latency [ARGS="--rounds 5"]
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/added-latency.py $(ARGS)
 
 .PHONY: bench-added-latency-check

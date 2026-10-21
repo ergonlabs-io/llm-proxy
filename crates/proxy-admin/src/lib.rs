@@ -36,12 +36,6 @@
 //! accepted with no extra effect, other query parameters are a 400). Without a wired lifecycle they answer 404. See
 //! `internal-docs/envoy-divergences.md`.
 //!
-//! Capture-agent inspection: `GET /capture/spool/stats` (ungated counters) and `GET /capture/spool/records` (gated
-//! like spend, since records are end-user metadata). Each query opens a fresh handshaken connection under a 2 s
-//! deadline. Both answer 404 with no agent configured, 503 when it is unreachable, 403 when the producer grant lacks
-//! `"inspect": true`, and 501 when the agent predates inspection. The stats answer is cached for 5 s, single-flight,
-//! errors included. Records are never cached.
-//!
 //! Billing ledger (ADR-0009 decision 8), both gated like spend: `GET /ledger/entries?after=&limit=` returns
 //! committed entries by cursor, and `POST /ledger/ack?through=` removes them from the spool, which also clears a
 //! disk-cap hold. Both are answered by the ledger's writer thread and waited on from a blocking pool thread, never a
@@ -85,6 +79,6 @@ pub mod server;
 
 pub use dump::{LiveCluster, LiveEndpoint};
 pub use server::{
-    serve, AdminError, AdminRuntime, AdminServer, CaptureAgentProvider, ClusterStateProvider,
-    Readiness, ReadinessProbe, UiAssets,
+    serve, AdminError, AdminRuntime, AdminServer, ClusterStateProvider, Readiness, ReadinessProbe,
+    UiAssets,
 };

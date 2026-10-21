@@ -9,7 +9,6 @@
 //! either mapped or rejected with its full field path — never silently ignored.
 
 pub mod authorization;
-mod capture;
 pub mod error;
 pub mod ir;
 mod ledger;

@@ -155,7 +155,6 @@ async fn start_with_gate(
             ui: None,
             lifecycle: None,
             credential_probe: None,
-            capture_agent: None,
             ledger: None,
             trace_gate: gate,
         },

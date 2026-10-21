@@ -35,8 +35,6 @@ tracing-subscriber = { workspace = true }
 flate2 = { workspace = true }
 # `ledger_e2e.rs` reads the spool the binary wrote.
 proxy-observability = { workspace = true, features = ["test-support"] }
-proxy-capture-agent = { path = "../proxy-capture-agent" }
-proxy-capture-spool = { path = "../proxy-capture-spool" }
 tempfile = { version = "=3.27.0", default-features = false }
 # tests/keygen.rs decodes the printed key's base64url body directly (the
 # generator itself now lives in `proxy_control::auth::generate_plaintext_key`,

@@ -11,6 +11,28 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Breaking
+
+- The capture agent is retired. Use [trace export](docs/site/src/content/docs/observability/trace-export.md)
+  for bodies and `--request-records-file` for request metadata records.
+  - The `llm-capture-agent` binary is no longer in the release tarballs or
+    installed by `install.sh`.
+  - These flags are removed: `--request-records-agent`,
+    `--request-records-agent-uid`, `--request-records-agent-node`,
+    `--request-records-producer`, and the hidden
+    `--capture-spool-poll-interval-ms`. `--request-records-file` and
+    `--request-record-max-attempts` stay.
+  - A bootstrap that sets `node.metadata["io.llmproxy.capture"]` now fails to
+    load with that path in the error. Remove the key.
+  - The `/capture/spool/stats` and `/capture/spool/records` admin endpoints and
+    the Admin UI Capture tab are removed. `/traces/capture` stays.
+  - The `llmproxy_capture_*` metrics and `llmproxy_metadata_durable` are
+    removed.
+  - `capture_policy_version` stays in request records, ledger entries and
+    trace lines, so no schema version changes. It is always `null`.
+  - The `proxy-capture-spool` crate stays, with its on-disk format unchanged:
+    the billing ledger is built on it.
+
 ## [0.6.0] - 2026-10-20
 
 ### Breaking

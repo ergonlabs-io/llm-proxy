@@ -1902,8 +1902,6 @@ dependencies = [
  "prost-types",
  "proxy-admin",
  "proxy-api",
- "proxy-capture-agent",
- "proxy-capture-spool",
  "proxy-cluster",
  "proxy-config",
  "proxy-control",
@@ -1936,7 +1934,6 @@ dependencies = [
  "hyper-util",
  "prost-reflect",
  "proxy-api",
- "proxy-capture-protocol",
  "proxy-config",
  "proxy-control",
  "proxy-core",
@@ -1965,30 +1962,6 @@ dependencies = [
  "serde_yaml",
  "tonic",
  "tonic-build",
-]
-
-[[package]]
-name = "proxy-capture-agent"
-version = "0.6.0"
-dependencies = [
- "clap",
- "proxy-capture-protocol",
- "proxy-capture-spool",
- "proxy-observability",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "proxy-capture-protocol"
-version = "0.6.0"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -2197,7 +2170,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proxy-api",
- "proxy-capture-protocol",
  "proxy-capture-spool",
  "rand",
  "ring",
@@ -2206,7 +2178,6 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
- "socket2 0.5.10",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

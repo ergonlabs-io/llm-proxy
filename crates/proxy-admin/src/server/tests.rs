@@ -379,8 +379,6 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         // named here but never read.
         metrics: None,
         #[cfg(unix)]
-        end_user_capture: None,
-        end_user_capture_configured: false,
         ledger: None,
         traces: None,
         // This fixture is a static-config snapshot, which
@@ -545,8 +543,6 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         // See the other snapshot fixture in this file.
         metrics: None,
         #[cfg(unix)]
-        end_user_capture: None,
-        end_user_capture_configured: false,
         ledger: None,
         traces: None,
         ads: None,
@@ -642,7 +638,6 @@ async fn start_full_with_readiness(
             ui: None,
             lifecycle: None,
             credential_probe: None,
-            capture_agent: None,
             ledger: None,
             trace_gate: None,
         },
@@ -674,7 +669,6 @@ async fn start_with_cluster_state(
             ui: None,
             lifecycle: None,
             credential_probe: None,
-            capture_agent: None,
             ledger: None,
             trace_gate: None,
         },
@@ -1281,7 +1275,6 @@ async fn start_lifecycle(
             ui: None,
             lifecycle: Some(Arc::clone(&state)),
             credential_probe: None,
-            capture_agent: None,
             ledger: None,
             trace_gate: None,
         },
@@ -3313,7 +3306,6 @@ async fn start_with_ui_from_fixture() -> (AdminServer, SocketAddr, std::path::Pa
             ui: Some(Arc::new(ui)),
             lifecycle: None,
             credential_probe: None,
-            capture_agent: None,
             ledger: None,
             trace_gate: None,
         },
@@ -3486,7 +3478,6 @@ async fn key_rotation_conflicts_and_api_version_are_explicit() {
 
 mod admin_rate_limit;
 mod budget_scope;
-mod capture_spool;
 mod credentials;
 mod key_tags;
 mod ledger;

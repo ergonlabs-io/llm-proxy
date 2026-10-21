@@ -42,7 +42,7 @@ def fixture(escaped=False):
             "instance_id": "comparison-instance", "started_at": "2026-10-08T12:00:00Z",
             "finished_at": "2026-10-08T12:00:01Z", "tenant_id": "default", "user_id": None,
             "key_id": None, "trace_id": None, "routing_revision": "example-routing-v1",
-            "policy_generation": 1, "capture_policy_version": "example-capture-v1",
+            "policy_generation": 1, "capture_policy_version": None,
             "method": "POST", "route": "/v1/chat/completions", "requested_model": field,
             "selected_cluster": "provider-a", "selected_provider": "example", "selected_model": field,
             "status": 200, "termination": "complete", "error_category": None, "response_flags": [],

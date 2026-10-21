@@ -1,5 +1,5 @@
 //! Strict decoder for `node.metadata["io.llmproxy.ledger"]`, the billing
-//! ledger (ADR-0009). Process-level, like the capture, tracing and metrics
+//! ledger (ADR-0009). Process-level, like the tracing and metrics
 //! namespaces beside it: there is one ledger writer per process, so it sits
 //! on the bootstrap `node`, not on a listener or HCM.
 //!
