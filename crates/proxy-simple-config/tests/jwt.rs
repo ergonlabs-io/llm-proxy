@@ -378,10 +378,11 @@ fn the_tenant_length_bound_leaves_room_for_a_uuid_subject() {
     lower(&config).expect("an 83-byte tenant fits");
 }
 
-/// JWT principals never carry tenant provider credentials, so a config that
-/// has both warns at `auth.jwt` (ADR-0014 decision 2).
+/// A JWT principal carries its tenant's provider credentials as a virtual key
+/// does (ADR-0014 decision 2), so a config with both lowers without a warning
+/// at `auth.jwt`.
 #[test]
-fn jwt_with_tenant_credentials_warns_that_jwt_callers_use_platform_keys() {
+fn jwt_with_tenant_credentials_lowers_without_a_platform_mode_warning() {
     let dir = std::env::temp_dir().join(format!("llmproxy-jwt-kek-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let kek = dir.join("kek");
@@ -398,7 +399,6 @@ fn jwt_with_tenant_credentials_warns_that_jwt_callers_use_platform_keys() {
         .iter()
         .filter(|w| w.field_path == "auth.jwt")
         .collect();
-    assert_eq!(jwt_warnings.len(), 1, "{:?}", lowered.warnings);
-    assert!(jwt_warnings[0].message.contains("operator's provider keys"));
+    assert!(jwt_warnings.is_empty(), "{:?}", lowered.warnings);
     let _ = std::fs::remove_dir_all(&dir);
 }

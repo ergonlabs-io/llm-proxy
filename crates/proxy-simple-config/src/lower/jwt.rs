@@ -6,10 +6,10 @@
 
 use std::collections::HashMap;
 
-use proxy_config::{ConfigError, ConfigWarning};
+use proxy_config::ConfigError;
 use serde_json::{json, Map, Value};
 
-use super::{warning, MAX_PRINCIPAL_ID_BYTES};
+use super::MAX_PRINCIPAL_ID_BYTES;
 use crate::model::{Auth, JwtJwksDef, JwtProviderDef, SimpleDuration};
 
 /// Bytes a lowered user id must leave for the subject claim: one UUID, the
@@ -21,11 +21,6 @@ const MIN_SUBJECT_BYTES: usize = 36;
 /// The tenant a missing tenant normalizes to (AGENTS.md "Policy Domains").
 /// A JWT must never be admitted as it (ADR-0014 decision 3).
 const RESERVED_DEFAULT_TENANT: &str = "default";
-
-const JWT_PLATFORM_MODE_WARNING: &str =
-    "JWT callers always use the operator's provider keys: a tenant that stored its own \
-     provider credentials (auth.tenant_credentials) has them applied to virtual-key \
-     requests only, and its JWT requests are charged as platform spend (ADR-0014)";
 
 fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigError {
     ConfigError::InvalidValue {
@@ -45,10 +40,7 @@ fn required<'a>(value: Option<&'a String>, path: &str) -> Result<&'a str, Config
 
 /// Lowers every `auth.jwt` entry, in order. An empty list lowers to no
 /// providers, so configs without `jwt` lower byte-identically.
-pub(super) fn lower_jwt_providers(
-    auth: &Auth,
-    warnings: &mut Vec<ConfigWarning>,
-) -> Result<Vec<Value>, ConfigError> {
+pub(super) fn lower_jwt_providers(auth: &Auth) -> Result<Vec<Value>, ConfigError> {
     let mut seen_issuers: HashMap<&str, usize> = HashMap::new();
     let mut out = Vec::with_capacity(auth.jwt.len());
     for (i, provider) in auth.jwt.iter().enumerate() {
@@ -68,9 +60,6 @@ pub(super) fn lower_jwt_providers(
         }
         seen_issuers.insert(issuer, i);
         out.push(lower_provider(provider, issuer, &base)?);
-    }
-    if !auth.jwt.is_empty() && auth.tenant_credentials.is_some() {
-        warnings.push(warning("auth.jwt", JWT_PLATFORM_MODE_WARNING));
     }
     Ok(out)
 }

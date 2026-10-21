@@ -423,21 +423,26 @@ impl Authenticator for JwtAuthenticator {
             .is_some()
             .then(|| key_id.as_str().to_owned());
         let tenant = TenantId::new(tenant);
-        let trace_export = self
-            .tenant_facts
-            .as_ref()
-            .and_then(|facts| facts.admit(&tenant).ok())
-            .is_some_and(|admitted| admitted.trace_export);
+        // The same rule a virtual key for this tenant follows: its provider
+        // credentials come from the control-plane snapshot (ADR-0007), read
+        // once, together with the trace-export opt-in.
+        let admitted = match &self.tenant_facts {
+            Some(facts) => match facts.admit(&tenant) {
+                Ok(admitted) => Some(admitted),
+                Err(err) => return AuthOutcome::Rejected(err),
+            },
+            None => None,
+        };
+        let (trace_export, tenant_credentials) = admitted
+            .map(|admitted| (admitted.trace_export, admitted.tenant_credentials))
+            .unwrap_or_default();
         AuthOutcome::Authenticated(Principal {
             tenant,
             // See the module doc's "`Principal::key_id` for a JWT" section.
             key_id,
             user_id,
             policy: Arc::new(TenantPolicy::default()),
-            // JWT principals stay in platform mode; see ADR-0007. This path
-            // reads the JWKS snapshot, not the control-plane snapshot, and
-            // must not add a second load to reach tenant credentials.
-            tenant_credentials: None,
+            tenant_credentials,
             policy_generation: None,
             trace_export,
             // A JWT carries no key metadata: its requests get header tags
