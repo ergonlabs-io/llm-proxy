@@ -58,8 +58,13 @@ load_state() {
     source "$STATE"
 }
 
+# DO_SSH_IDENTITY: a private key file for a droplet whose key is not in the
+# ssh agent or ~/.ssh/config (one created outside 'up').
+SSH_ID_ARGS=()
+[[ -n "${DO_SSH_IDENTITY:-}" ]] && SSH_ID_ARGS=(-i "$DO_SSH_IDENTITY" -o IdentitiesOnly=yes)
+
 ssh_vm() {
-    ssh -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+    ssh "${SSH_ID_ARGS[@]}" -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
         -o ServerAliveInterval=30 -o ConnectTimeout=10 "root@$DROPLET_IP" "$@"
 }
 
@@ -163,7 +168,7 @@ cmd_tail() {
 cmd_fetch() {
     load_state
     mkdir -p "$STATE_DIR/remote"
-    rsync -az -e "ssh -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new" \
+    rsync -az -e "ssh ${SSH_ID_ARGS[*]} -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new" \
         "root@$DROPLET_IP:/root/llm-proxy/target/scale/" "$STATE_DIR/remote/"
     echo "results in $STATE_DIR/remote/"
 }
