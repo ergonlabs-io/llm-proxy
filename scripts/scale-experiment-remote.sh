@@ -24,7 +24,9 @@ set -euo pipefail
 SCENARIOS="${*:-all}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-BIN="$REPO_ROOT/target/release"
+# SCALE_BIN points at a different build directory (a container's
+# CARGO_TARGET_DIR in a local pre-flight); the droplet uses the default.
+BIN="${SCALE_BIN:-$REPO_ROOT/target/release}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="$REPO_ROOT/target/scale/$RUN_ID"
 mkdir -p "$OUT"
@@ -35,6 +37,14 @@ CORES_UPSTREAM="${CORES_UPSTREAM:-12}"
 CORES_REDIS="${CORES_REDIS:-13}"
 CORES_LOADGEN="${CORES_LOADGEN:-14-15}"
 PROXY_WORKERS="${PROXY_WORKERS:-4}"
+
+# Extra lines for the mock provider block of every generated config, S1's
+# capacity-sweep.sh config included, indented 4 spaces. S1 needs it to raise
+# the provider's concurrency ceiling past the 1024 default once the dialect
+# has a circuit-breaker field; take the field name from the schema, e.g.
+#   PROVIDER_EXTRA_YAML='    <field from schema/llmproxy-v0.schema.json>: ...'
+# Strict mode validates it before any load, so a wrong field fails fast.
+PROVIDER_EXTRA_YAML="${PROVIDER_EXTRA_YAML:-}"
 
 # S2 target rate ladder (rps), S4 limits. See the plan for why these values.
 S2_RATES="${S2_RATES:-1000 2000 5000 10000 20000}"
@@ -54,6 +64,18 @@ export LLMPROXY_ADMIN_TOKEN LLMPROXY_SCALE_HMAC
 umask 022
 
 ulimit -n 65535 || echo "WARNING: could not raise nofile; S1/S2 may be harness-bound" >&2
+
+# The runner targets Linux. Elsewhere (a macOS pre-flight) pinning and the
+# Linux samplers are skipped with a warning, so the functional checks still
+# run; numbers from such a run are not evidence.
+if ! command -v taskset >/dev/null; then
+    echo "WARNING: no taskset; processes run unpinned (not evidence)" >&2
+    taskset() { shift 2; "$@"; }
+fi
+have() { command -v "$1" >/dev/null; }
+now() { # epoch seconds with a fraction; macOS date has no %N
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then echo "$EPOCHREALTIME"; else python3 -c 'import time; print(time.time())'; fi
+}
 
 PIDS=()
 cleanup() {
@@ -92,12 +114,14 @@ manifest() {
         echo "run_id: $RUN_ID"
         echo "commit: $(cat REVISION 2>/dev/null || echo unknown)"
         echo "kernel: $(uname -r)"
-        echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
-        echo "nproc: $(nproc)"
-        echo "mem: $(free -g | awk '/Mem:/{print $2}') GiB"
+        echo "cpu: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')"
+        echo "nproc: $(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+        echo "mem: $(free -g 2>/dev/null | awk '/Mem:/{print $2}') GiB"
         echo "rustc: $(rustc -V 2>/dev/null || echo unknown)"
         echo "ulimit_n: $(ulimit -n)"
-        echo "ip_local_port_range: $(cat /proc/sys/net/ipv4/ip_local_port_range)"
+        echo "ip_local_port_range: $(cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || echo n/a)"
+        echo "loadavg: $(cat /proc/loadavg 2>/dev/null || uptime)"
+        echo "provider_extra_yaml: ${PROVIDER_EXTRA_YAML:-none}"
         echo "droplet: $(curl -fsS --max-time 2 http://169.254.169.254/metadata/v1/size 2>/dev/null || echo unknown)" \
              "$(curl -fsS --max-time 2 http://169.254.169.254/metadata/v1/region 2>/dev/null || true)"
     } >"$OUT/manifest.txt"
@@ -163,6 +187,7 @@ providers:
   mock:
     base_url: http://$MOCK_ADDR
 $UPSTREAM_PROTOCOL_LINE
+$PROVIDER_EXTRA_YAML
 routes:
   - model: "*"
     provider: mock
@@ -259,26 +284,31 @@ scrape_all() { # scrape_all DIR TAG
 # can be recomputed.
 start_samplers() {
     local dir="$1" pids
-    vmstat 1 >"$dir/vmstat.txt" 2>&1 & PIDS+=($!)
+    have vmstat && { vmstat 1 >"$dir/vmstat.txt" 2>&1 & PIDS+=($!); }
     pids="$(IFS=,; echo "${PROXY_PID[*]:-}")"
     if [[ -n "$pids" ]] && command -v pidstat >/dev/null; then
         pidstat -r -u -h -p "$pids" 1 >"$dir/pidstat.txt" 2>&1 & PIDS+=($!)
     fi
 }
-# The proxy exports no in-flight gauge (an earlier version of this sampler
-# read `downstream_cx_active` from /stats, which does not exist, and saw 0
-# for a whole run). So count established TCP connections on each replica's
-# listener instead. S4b/S5 drive `--downstream-mode short`: an admitted
-# stream holds exactly one connection for its life, and a refused one holds
-# it only until the 429 is written, so the count can overstate in-flight
-# streams but never understate them.
+# Fleet in-flight streams every 500 ms, as the upstream sees them:
+# mock-upstream's GET /_mock/stats gives the streams it is serving now and
+# the peak since the previous poll. A stream the proxy refuses never reaches
+# the mock, so this is the ground truth for a fleet ceiling. (The proxy
+# exports no in-flight gauge; an earlier sampler read `downstream_cx_active`
+# from /stats, which does not exist, and saw 0 for a whole run.) Established
+# downstream connections per replica follow as a cross-check, where `ss`
+# exists; they overstate, since a refused stream holds its connection until
+# the 429 is written. Columns: EPOCH IN_FLIGHT PEAK [SS_R1 SS_R2 SS_R3].
 start_stream_sampler() {
     local dir="$1"
     (
         while true; do
-            line="$(date +%s.%N)"
+            line="$(now) $(curl -fsS --max-time 1 "http://$MOCK_ADDR/_mock/stats" 2>/dev/null \
+                | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s["in_flight"], s["peak_in_flight"])' \
+                2>/dev/null || echo NA NA)"
             for p in "${LISTEN[@]}"; do
-                v="$(ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l)"
+                v=NA
+                have ss && v="$(ss -Htn state established "( sport = :$p )" 2>/dev/null | wc -l | tr -d ' ')"
                 line="$line ${v:-NA}"
             done
             echo "$line"
@@ -314,15 +344,26 @@ s0() {
     done
     # The /proc sampler is unverified on Linux (capacity/README.md caveats):
     # a zero RSS here means S1's resource columns cannot be trusted.
-    grep VmRSS "/proc/${PROXY_PID[0]}/status" | tee "$d/rss.txt"
+    if [[ -r "/proc/${PROXY_PID[0]}/status" ]]; then
+        grep VmRSS "/proc/${PROXY_PID[0]}/status" | tee "$d/rss.txt"
+    else
+        echo "no /proc: RSS via ps (kB) $(ps -o rss= -p "${PROXY_PID[0]}")" | tee "$d/rss.txt"
+    fi
+    # The S4b/S5 ground truth: the mock's in-flight gauge must answer.
+    curl -fsS --max-time 2 "http://$MOCK_ADDR/_mock/stats" | tee "$d/mock-stats.json"; echo
     stop_all
 }
 
 s1() {
     echo "=== S1 streaming capacity, one replica (capacity-sweep.sh) ==="
+    # Without PROVIDER_EXTRA_YAML the h2 sweep stops at the default
+    # max_requests (1024) with 503 UpstreamOverflow, which is a config
+    # ceiling, not the proxy's.
+    [[ -n "$PROVIDER_EXTRA_YAML" ]] || echo "NOTE: PROVIDER_EXTRA_YAML unset; the h2 ceiling is the 1024 default" >&2
     for proto in http2 http1; do
         taskset -c "${CORES_PROXY[0]},$CORES_UPSTREAM,$CORES_LOADGEN" \
             ./scripts/capacity-sweep.sh --upstream-protocol "$proto" \
+            ${PROVIDER_EXTRA_YAML:+--provider-yaml "$PROVIDER_EXTRA_YAML"} \
             --hold-secs 40 --out-dir "$OUT/s1-$proto" | tee "$OUT/s1-$proto.log" || true
     done
 }
@@ -392,7 +433,7 @@ s4a() {
     wait_policy_converged
     start_samplers "$d"
     # Start 2 s into a minute so the run covers exactly three epoch windows.
-    local now; now="$(date +%s)"; sleep $(( (60 - now % 60) + 2 ))
+    local secs; secs="$(date +%s)"; sleep $(( (60 - secs % 60) + 2 ))
     scrape_all "$d" before
     local per_replica_rps i
     per_replica_rps="$(python3 -c "print(round(2 * $S4_RPM / 3 / 60, 3))")"
@@ -405,24 +446,17 @@ s4a() {
     done
     wait_loadgens
     scrape_all "$d" after
-    python3 - "$d" "$S4_RPM" "$per_replica_rps" <<'PY' | tee "$d/verdict.txt"
-import json, sys, glob
-d, rpm, per = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
-ok = sum(json.load(open(f))["result"]["success"] for f in sorted(glob.glob(f"{d}/r*.json")))
-windows, n = 3, 3
-# ADR-0006: over-admission is bounded by one reconcile interval (1 s) times
-# the other replicas' admit rate.
-bound = windows * (rpm + (n - 1) * per * 1.0)
-print(f"admitted={ok} limit={windows * rpm} bound={bound:.0f} over={ok - windows * rpm}")
-print("PASS" if ok <= bound else "FAIL")
-PY
+    python3 scripts/scale-verdict.py s4a "$d" "$S4_RPM" "$per_replica_rps" | tee "$d/verdict.txt"
     stop_all
 }
 
 s4b() {
     local d="$OUT/${1:-s4b}"; mkdir -p "$d"
-    local faults="${2:-}" persist="${3:-}"
-    echo "=== ${1:-S4b} fleet stream ceiling: concurrent_streams=$S4_STREAMS, offered 2x ${faults:+(faults, redis restart ${persist:-empty})} ==="
+    local faults="${2:-}" persist="${3:-}" label=""
+    [[ -n "$faults" ]] && label=" + faults, Redis returns ${persist:+WITH ITS DATA (AOF)}"
+    [[ -n "$faults" && -z "$persist" ]] && label="$label EMPTY (no persistence)"
+    echo "=== ${1:-s4b} fleet stream ceiling: concurrent_streams=$S4_STREAMS, offered 2x$label ===" \
+        | tee "$d/label.txt"
     start_mock "$d" --tokens "$TOKENS" --ttft-ms "$TTFT_MS" --inter-token-ms "$INTER_TOKEN_MS"
     start_redis "$d" "$persist"
     start_replicas "$d" 3 shared
@@ -444,73 +478,34 @@ s4b() {
     done
     if [[ -n "$faults" ]]; then
         sleep 60
-        echo "$(date +%s.%N) SIGKILL replica 3" | tee -a "$d/events.txt"
+        echo "$(now) SIGKILL replica 3" | tee -a "$d/events.txt"
         kill -9 "${PROXY_PID[2]}"
         sleep 40
-        echo "$(date +%s.%N) redis down" | tee -a "$d/events.txt"
+        echo "$(now) redis down" | tee -a "$d/events.txt"
         kill "$REDIS_PID"
         sleep 30
-        echo "$(date +%s.%N) redis up" | tee -a "$d/events.txt"
+        echo "$(now) redis up" | tee -a "$d/events.txt"
         redis_server "$d" redis-2.log
+        if [[ -n "$persist" ]]; then
+            # Prove the data came back, or S5b is just S5 again.
+            sleep 2
+            echo "$(now) redis keys after restart: $(redis-cli -p "$REDIS_PORT" dbsize 2>/dev/null)" \
+                | tee -a "$d/events.txt"
+        fi
     fi
     wait_loadgens
     scrape_all "$d" after
-    python3 - "$d" "$S4_STREAMS" "$per_replica_rps" "$INTRINSIC_S" "$duration" "$faults" <<'PY' | tee "$d/verdict.txt"
-import json, os, sys, glob
-d, c, per, t, dur, faults = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
-samples = []   # (epoch seconds, fleet open streams)
-for line in open(f"{d}/streams_active.txt"):
-    parts = line.split()
-    if len(parts) > 1:
-        samples.append((float(parts[0]), sum(int(v) for v in parts[1:] if v != "NA")))
-if not samples or max(v for _, v in samples) == 0:
-    print("INVALID: the stream sampler saw no open streams; it is broken, not the limit")
-    sys.exit(0)
-start = samples[0][0]
-# Steady state: after the 15 s ramp and before the last stream-time.
-steady = [v for ts, v in samples if start + 15 <= ts <= start + dur - t]
-events = {}
-if os.path.exists(f"{d}/events.txt"):
-    for line in open(f"{d}/events.txt"):
-        ts, what = line.split(" ", 1)
-        events[what.strip()] = float(ts)
-reports = [json.load(open(f)) for f in sorted(glob.glob(f"{d}/r*.json"))]
-ok = sum(r["result"]["success"] for r in reports)
-counted_secs = dur - 10
-mean_total_s = sum(r["result"]["success"] * r["result"]["total_from_send_us"]["p50"] for r in reports) / max(ok, 1) / 1e6
-errors = {}
-for r in reports:
-    for k, v in r["result"]["http_errors"].items():
-        errors[k] = errors.get(k, 0) + v
-transport = sum(r["result"]["transport_errors"] for r in reports)
-bound = c + 2 * per * 1.0   # (N-1) replicas x one 1 s lease publish interval
-print(f"fleet open streams: peak={max(v for _, v in samples)} steady_max={max(steady, default=0)} "
-      f"ceiling={c} bound={bound:.0f}")
-print(f"little's law mean in flight ~= {ok * mean_total_s / counted_secs:.0f} "
-      f"(admitted {ok} x p50 {mean_total_s:.2f} s / {counted_secs} s)")
-print(f"http_errors={errors} transport_errors={transport}")
-print("note: a refused stream's connection is counted for an instant, so open streams overstate")
-verdict = max(steady, default=0) <= bound
-unexpected = {k: v for k, v in errors.items() if k != "429"}
-if faults:
-    up = events.get("redis up")
-    if up is not None:
-        # Recovery: one policy poll bound (60 s) after Redis returns, the
-        # ceiling holds again and no key is refused.
-        after = [v for ts, v in samples if up + 60 <= ts <= start + dur - t]
-        print(f"after redis up +60 s: steady_max={max(after, default=0)} samples={len(after)}")
-        verdict = verdict and max(after, default=0) <= bound
-    # Transport errors are expected from the killed replica's own loadgen.
-print("PASS" if verdict and not unexpected else f"FAIL unexpected={unexpected}")
-PY
+    python3 scripts/scale-verdict.py s4b "$d" "$S4_STREAMS" "$per_replica_rps" "$INTRINSIC_S" \
+        "$duration" "$faults" | tee "$d/verdict.txt"
     grep -c -i 'warn' "$d"/proxy-r*.log >"$d/warn-counts.txt" || true
     stop_all; unset REDIS_PORT
 }
 
 # S5: Redis returns EMPTY (no persistence). Reproduces the empty-store finding
-# in internal-docs/capacity/2026-10-16-digitalocean-scale.md; expect 401s
-# until that is fixed. S5b: Redis returns with its AOF, which is the case the
-# plan's "limits enforced again after Redis returns" criterion means.
+# in internal-docs/capacity/2026-10-16-digitalocean-scale.md; expect 401s,
+# so a FAIL, until that is fixed. S5b: Redis returns with its AOF, which is
+# the case the plan's "limits enforced again after Redis returns" criterion
+# means.
 s5() { s4b s5 faults; }
 s5b() { s4b s5b faults persist; }
 
