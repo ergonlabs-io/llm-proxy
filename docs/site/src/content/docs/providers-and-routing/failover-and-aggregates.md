@@ -5,14 +5,14 @@ summary: How to use a route's `fallbacks` list or a `models` entry with several
   providers, which failures move a request to the next provider, how a
   provider that fails often is passed over, and how retry count and the
   same-dialect rule affect a chain.
-lastUpdated: 2026-10-20
+lastUpdated: 2026-10-21
 related:
-  - providers-and-routing/providers-and-clusters
+  - providers/overview
   - providers-and-routing/timeouts-and-retries
+  - providers-and-routing/load-balancing
+  - configuration/models-and-routes
   - configuration/configuration-file
 ---
-
-# Failover and aggregates
 
 Use `fallbacks` to try additional providers in order. Every provider in the
 chain must use the same API dialect. Use this feature when one provider can
@@ -67,7 +67,7 @@ provider only on an outcome that shows the provider did not serve the request:
 
 The route's retry triggers are fixed to this list, and you cannot change them
 in the `llmproxy` dialect. See
-[Timeouts and retries](../../providers-and-routing/timeouts-and-retries/) for
+[Timeouts and retries](/docs/llm-proxy/providers-and-routing/timeouts-and-retries/) for
 the full trigger table. A fallback attempt is a retry that lands on a
 different provider, so the same table applies. A credential failure is the
 exception: it moves to the next provider without using a retry, because the
@@ -88,21 +88,28 @@ return, and the client gets a local `503` (`provider token unavailable` or
 `provider credential failure`).
 
 Selection is strict order. The proxy does not send a share of traffic to the
-fallback while the primary is partly healthy. To spread first picks across
-the providers of a `models` entry, see
-[Weighted selection](#weighted-selection-in-the-models-catalogue). This differs from Envoy's
-aggregate cluster, which can send a share of traffic across a partly healthy
-member boundary. For LLM providers, that share would reach the fallback's
-billing and rate limits while the primary still works. The dialect has no
-setting to change this. Nested chains are not supported: a chain is one level
-of failover.
+fallback while the primary is partly healthy. A share would reach the
+fallback's billing and rate limits while the primary still works. To spread
+first picks across the providers of a `models` entry, see
+[Weighted selection](#weighted-selection-in-the-models-catalogue). The
+dialect has no setting to change the order. Nested chains are not supported: a
+chain is one level of failover.
+
+### A provider over its concurrency ceiling
+
+A provider that has reached its `circuit_breakers.max_requests` ceiling
+answers new requests with an immediate `503` and the header
+`x-envoy-overloaded: true`. The proxy does not retry that `503`. It does not
+send the request to the next provider. The ceiling of the provider that the
+proxy dials decides. See
+[Concurrency ceilings](/docs/llm-proxy/providers/overview/).
 
 ## Credentials stay with each provider
 
 Each provider in the chain keeps its own TLS settings, credentials, and
 `Host` header. When a request fails over, the fallback request carries the
 fallback provider's API key. It does not carry the primary's key. See
-[Providers and clusters](../../providers-and-routing/providers-and-clusters/)
+[Providers overview](/docs/llm-proxy/providers/overview/)
 for the reason.
 
 ## `retries.attempts` and the chain use one retry count
@@ -138,14 +145,19 @@ The reason is accuracy. The primary's request body is not valid for the
 fallback's API. The proxy would also read the fallback's response with the
 wrong dialect's parser, so token counts and billing would be wrong. For
 `models` entries, the load error names the path `models.<name>.providers[<n>]`.
-See [Getting started](../../getting-started/quickstart/) for the error text.
+For `routes`, it names `routes[<i>].fallbacks[<j>]`. This is the text for a
+`models` entry:
+
+```text
+invalid value at `models.chat.providers[1]`: `claude` speaks `anthropic`, but the primary provider `openai` speaks `openai`; cross-dialect model fallback needs request/response translation and is not supported
+```
 
 ## Failover in the `models` catalogue
 
 `models.<name>.providers` is an ordered list. A list with more than one
 provider gets the same retry count as `routes[].fallbacks`: the number of
 providers minus 1. A `models` entry has no `retries` field. See
-[Configuration file](../../configuration/configuration-file/) for the fields
+[Configuration file](/docs/llm-proxy/configuration/configuration-file/) for the fields
 a `models` entry accepts.
 
 ## A provider that is not healthy is passed over
@@ -153,8 +165,8 @@ a `models` entry accepts.
 A chain passes over a member when none of its hosts is healthy. A host is
 not healthy when outlier detection ejected it or when it fails its active
 health checks. The proxy passes over such a member only while a later member
-has a healthy host. This rule applies to `fallbacks`, to `models` entries
-with or without weights, and to aggregates in Envoy mode.
+has a healthy host. This rule applies to `fallbacks` and to `models` entries
+with or without weights.
 
 When every member is unhealthy, the chain runs in list order as if no member
 were ejected. If all of them fail, the client gets the last provider's own
@@ -244,20 +256,6 @@ a provider with its own credentials, `Host` header, upstream model ID, and
 usage dialect. The proxy charges a request at the rate card of the provider
 that it dialled. The proxy does not support cost-aware selection. Entries
 with different API dialects are still a load error.
-
-## Bootstrap configuration
-
-The Envoy-mode equivalent is an `envoy.clusters.aggregate` cluster. Set
-`lb_policy: CLUSTER_PROVIDED` and a `cluster_type.typed_config.clusters`
-member list, then point a route's `cluster` at the aggregate.
-
-For weighted first picks, point the route at `weighted_clusters`. Each entry
-names an aggregate cluster, and each aggregate lists the same providers with
-a different first member. Put `outlier_detection` on the member clusters.
-
-The same-dialect rule applies to the `llmproxy` dialect only, because that
-format checks the dialect of the usage-metering filter. A raw bootstrap
-configuration has no such check.
 
 ## Implementation notes
 
