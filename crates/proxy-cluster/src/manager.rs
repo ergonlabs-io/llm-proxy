@@ -934,6 +934,27 @@ impl ClusterRegistrySnapshot {
         })
     }
 
+    /// Whether a weighted route may draw `name`: false only when the cluster
+    /// exists and has no healthy host (every host ejected by S6 outlier
+    /// detection or failing active health checks). An aggregate counts as
+    /// healthy while any member it would walk has a healthy host. An unknown
+    /// cluster counts as healthy, so the draw leaves it to the router's own
+    /// `NC` answer rather than hiding it.
+    pub fn is_drawable(&self, name: &str) -> bool {
+        let registry = self.clusters.load();
+        let Some(managed) = registry.get(name) else {
+            return true;
+        };
+        match managed.aggregate_members() {
+            None => managed.host_set.load().has_healthy_host(),
+            Some(members) => members.iter().any(|member| {
+                registry.get(member).is_some_and(|member| {
+                    !member.is_aggregate() && member.host_set.load().has_healthy_host()
+                })
+            }),
+        }
+    }
+
     /// Whether a cluster in this generation completed its initial discovery.
     pub fn is_initialized(&self, name: &str) -> bool {
         self.clusters

@@ -1034,3 +1034,69 @@ fn apply_prefix_rewrite_none_for_regex_matcher() {
     };
     assert_eq!(apply_prefix_rewrite(&route.matcher, "/new", "/foo"), None);
 }
+
+/// Members `a:2, b:1, c:1` (cumulative 2, 3, 4) with a fixed health answer.
+fn three_members() -> WeightedClusters {
+    WeightedClusters {
+        cumulative: vec![("a".into(), 2), ("b".into(), 3), ("c".into(), 4)],
+        total_weight: 4,
+        hash_policy: Vec::new(),
+    }
+}
+
+struct Ejected(&'static [&'static str]);
+impl MemberHealth for Ejected {
+    fn is_drawable(&self, member: &str) -> bool {
+        !self.0.contains(&member)
+    }
+}
+
+/// A draw on a healthy member is the configured pick, untouched, and takes
+/// no second random value. A draw on an ejected member is redrawn among the
+/// rest by their configured weights: with `a` ejected, `b` and `c` split
+/// 1:1 over every value.
+#[test]
+fn health_adjusted_draw_moves_only_draws_on_an_ejected_member() {
+    let w = three_members();
+    let b_ejected = Ejected(&["b"]);
+    for draw in [0, 1, 3] {
+        let kept = health_adjusted_draw(&w, draw, DrawSource::Random, &b_ejected, || {
+            panic!("a healthy pick needs no redraw")
+        });
+        assert_eq!(kept, draw);
+    }
+
+    let a_ejected = Ejected(&["a"]);
+    let mut counts = std::collections::BTreeMap::new();
+    for value in 0..100u64 {
+        let draw = health_adjusted_draw(&w, 0, DrawSource::Random, &a_ejected, || value);
+        *counts.entry(w.pick(draw).clone()).or_insert(0) += 1;
+    }
+    assert_eq!(
+        counts,
+        [("b".to_string(), 50), ("c".to_string(), 50)].into()
+    );
+}
+
+/// A hashed draw on an ejected member always lands on the same substitute,
+/// so one session stays put while its member is out; with every member
+/// ejected the configured draw stands and the member's own pick answers.
+#[test]
+fn health_adjusted_draw_keeps_a_session_on_one_substitute() {
+    let w = three_members();
+    let a_ejected = Ejected(&["a"]);
+    for draw in [0, 1] {
+        let first = health_adjusted_draw(&w, draw, DrawSource::Hashed, &a_ejected, || {
+            panic!("a hashed draw never takes a random value")
+        });
+        let again = health_adjusted_draw(&w, draw, DrawSource::Hashed, &a_ejected, || 0);
+        assert_eq!(first, again, "draw {draw} moved between requests");
+        assert_ne!(w.pick(first), "a");
+    }
+
+    let all = Ejected(&["a", "b", "c"]);
+    assert_eq!(
+        health_adjusted_draw(&w, 2, DrawSource::Random, &all, || 0),
+        2
+    );
+}

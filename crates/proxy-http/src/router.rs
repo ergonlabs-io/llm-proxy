@@ -46,7 +46,10 @@ use crate::handler::{
     local_boxed, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, UpgradeTunnel,
 };
 use crate::retry::{AttemptOutcome, RetryState};
-use crate::route::{apply_prefix_rewrite, select_cluster, weighted_draw, HashIdentity};
+use crate::route::{
+    apply_prefix_rewrite, health_adjusted_draw, select_cluster, weighted_draw, HashIdentity,
+    MemberHealth,
+};
 use crate::stat_handles::RouterStats;
 use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
 use guarded::GuardedBody;
@@ -152,6 +155,12 @@ pub struct RouterFilterFactory {
     /// upgrade type is ever allowed -- matching Envoy's "no `upgrade_configs`
     /// means no upgrades" default.
     upgrade_configs: Arc<HashMap<String, bool>>,
+}
+
+impl MemberHealth for ClusterRegistrySnapshot {
+    fn is_drawable(&self, member: &str) -> bool {
+        ClusterRegistrySnapshot::is_drawable(self, member)
+    }
 }
 
 impl RouterFilterFactory {
@@ -1132,7 +1141,9 @@ impl RouterHandler {
             return 0;
         };
         if weighted.hash_policy.is_empty() {
-            return weighted_draw(weighted, headers, &HashIdentity::default(), rand::random).0;
+            let (draw, source) =
+                weighted_draw(weighted, headers, &HashIdentity::default(), rand::random);
+            return health_adjusted_draw(weighted, draw, source, &self.clusters, rand::random);
         }
         let (draw, source) = {
             let info = dcb.stream_info();
@@ -1144,7 +1155,7 @@ impl RouterHandler {
             weighted_draw(weighted, headers, &identity, rand::random)
         };
         self.stats.record_session_affinity(source);
-        draw
+        health_adjusted_draw(weighted, draw, source, &self.clusters, rand::random)
     }
 
     async fn apply_forward(

@@ -280,6 +280,75 @@ pub fn weighted_draw(
     }
 }
 
+/// What the draw needs to know about a weighted target's members. The
+/// router reads it from the cluster registry; tests supply fixed answers.
+pub trait MemberHealth {
+    /// False when the member has no healthy host left (see
+    /// `ClusterRegistrySnapshot::is_drawable`).
+    fn is_drawable(&self, member: &str) -> bool;
+}
+
+/// Moves a draw off a member with no healthy host (`envoy-divergences.md`
+/// row 47). Envoy's `weighted_clusters` ignores health, and a plain member
+/// cluster with every host ejected then panics into its ejected hosts, so
+/// its share of traffic keeps failing.
+///
+/// A draw whose member is drawable is returned unchanged, so a healthy
+/// target takes exactly the configured pick. Otherwise the member is chosen
+/// again among the drawable members by their configured weights, and the
+/// result is returned as a draw in the configured range that
+/// [`WeightedClusters::pick`] maps to that member. A hashed draw redraws from
+/// a hash of itself, so one session keeps landing on the same substitute
+/// and the sessions of other members do not move (ADR-0016 decision 6). With
+/// no drawable member left the original draw stands, and the member's own
+/// panic pick or aggregate chain answers as before.
+pub fn health_adjusted_draw(
+    weighted: &WeightedClusters,
+    draw: u64,
+    source: DrawSource,
+    members: &dyn MemberHealth,
+    random: impl FnOnce() -> u64,
+) -> u64 {
+    if members.is_drawable(weighted.pick(draw)) {
+        return draw;
+    }
+    let value = match source {
+        DrawSource::Hashed => xxh64(&draw.to_le_bytes(), 0),
+        DrawSource::Random | DrawSource::Unhashed => random(),
+    };
+    scaled_draw(weighted, value, |member| {
+        u64::from(members.is_drawable(member))
+    })
+    .unwrap_or(draw)
+}
+
+/// Picks a member for `value` with each member's configured weight
+/// multiplied by `scale(member)`, and returns the configured-range draw that
+/// [`WeightedClusters::pick`] maps to it (the start of its range). `None`
+/// when every scaled weight is 0.
+fn scaled_draw(
+    weighted: &WeightedClusters,
+    value: u64,
+    scale: impl Fn(&str) -> u64,
+) -> Option<u64> {
+    let mut previous = 0;
+    let mut total = 0u64;
+    // (configured start, scaled cumulative weight) per member.
+    let mut scaled = Vec::with_capacity(weighted.cumulative.len());
+    for (name, cumulative) in &weighted.cumulative {
+        let weight = cumulative - previous;
+        total = total.saturating_add(weight.saturating_mul(scale(name)));
+        scaled.push((previous, total));
+        previous = *cumulative;
+    }
+    if total == 0 {
+        return None;
+    }
+    let point = value % total;
+    let i = scaled.partition_point(|&(_, cumulative)| cumulative <= point);
+    scaled.get(i).map(|&(start, _)| start)
+}
+
 /// S1.3: strip the query string (and the `?` itself) from a `:path`. Returns
 /// the whole string unchanged if there's no `?`.
 ///
