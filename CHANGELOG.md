@@ -48,6 +48,16 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   is the row count of the replica's last load from the store `auth.store`
   selects, without configured `auth.keys`. Alert when the keys value is 0 on
   a deployment that mints keys.
+- Per-provider concurrency ceilings in the `--config` dialect (WP-137).
+  `providers.<name>.circuit_breakers` sets `max_requests`,
+  `max_pending_requests` and `max_connections` on the provider's cluster. Each
+  defaults to 1024, as before; a value of 0 or an unknown key is a load error.
+  Before, a `--config` provider could not go above 1024 concurrent requests:
+  the 2026-10-16 scale run's h2 sweep got `503` at 1025 streams. A model with
+  fallbacks now also applies the `max_requests` of the provider it dials, not
+  only that of its aggregate, as Envoy does; an aggregate in front of a
+  configured provider is sized to its members' sum so it does not cap them.
+  See [Providers and clusters](docs/site/src/content/docs/providers-and-routing/providers-and-clusters.md#concurrency-ceilings).
 - JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
   `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
   `{ claim: department, tag: team }`, so the identity provider sets a JWT

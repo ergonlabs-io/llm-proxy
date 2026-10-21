@@ -1336,11 +1336,8 @@ impl RouterHandler {
                 // this matches Envoy, whose `Router::Filter` checks the
                 // routed cluster's `max_requests` before any host selection
                 // even runs, not the eventually-dialed host's cluster.
-                // Concretely: today an aggregate's members all share the
-                // aggregate's own `max_requests` budget (there is no
-                // per-member budget to acquire instead -- S5's other three
-                // budgets are connection-pool-level and likewise
-                // untouched by which member ends up dialed).
+                // An aggregate member's own `max_requests` is acquired as
+                // well, once host selection has picked it (below).
                 let cb = entry.circuit_breaker(RoutingPriority::Default);
                 let Some(rq_guard) = cb.try_acquire_request() else {
                     if let Some((failed_cluster, failure)) = credential_failure.take() {
@@ -1412,6 +1409,32 @@ impl RouterHandler {
                         return local_reply(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream");
                     }
                 };
+                // The dialled member's `max_requests` applies on top of the
+                // aggregate's: in Envoy the connection pool checks the
+                // budget of the cluster that owns the host, so a provider's
+                // ceiling holds whichever route reaches it (AGENTS.md
+                // invariant 6).
+                let member_guard = match &sel.member {
+                    Some(member) => {
+                        let Some(guard) = member
+                            .entry
+                            .circuit_breaker(RoutingPriority::Default)
+                            .try_acquire_request()
+                        else {
+                            tracing::debug!(response_flag = "UO", cluster = %member.name, "circuit breaker: max_requests exceeded");
+                            dcb.stream_info()
+                                .set_response_flag(ResponseFlag::UpstreamOverflow);
+                            let mut resp =
+                                local_reply(StatusCode::SERVICE_UNAVAILABLE, "upstream overloaded");
+                            resp.head
+                                .headers
+                                .insert("x-envoy-overloaded", HeaderValue::from_static("true"));
+                            return resp;
+                        };
+                        Some(guard)
+                    }
+                    None => None,
+                };
                 let host = sel.host;
                 if let Some(held) = held_failed_response.take() {
                     // A new attempt is going out, so the earlier failure is
@@ -1422,7 +1445,7 @@ impl RouterHandler {
                 // `LEAST_REQUEST` reads this count. It lives and dies with
                 // `rq_guard` (response body, hedge task, or the end of this
                 // iteration on retry/error), so each attempt counts once.
-                let mut rq_guard = Some((rq_guard, host.begin_request()));
+                let mut rq_guard = Some(((rq_guard, member_guard), host.begin_request()));
                 // `entry` is the *routed* cluster (a plain cluster,
                 // or an aggregate); `sel.member` is set only when `entry` is
                 // an aggregate and names the member that actually owns
