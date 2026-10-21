@@ -44,8 +44,17 @@ record.
 | OpenAI Embeddings | `POST .../embeddings` | Metered. |
 | Anthropic Messages | `POST .../messages` | Metered. The proxy does not add `stream_options`. |
 
-The proxy recognizes `POST .../messages/count_tokens` and treats it as free. It
-recognizes image and audio endpoints, but it does not meter them.
+The proxy recognizes `POST .../messages/count_tokens` and treats it as free.
+
+Image generation, image edits, speech, transcription and translation
+(`POST .../images/generations`, `.../images/edits`, `.../audio/speech`,
+`.../audio/transcriptions`, `.../audio/translations`) are metered for spend
+budgets, in provider units: images, characters or audio duration, or tokens
+when the provider reports them. A budget refuses a request whose cost the
+proxy cannot count from its shape, such as a translation without
+`response_format: verbose_json`. Token limits count tokens only, so they
+refuse these endpoints. See
+[Spend policies](../../limits-and-budgets/spend-policies/).
 
 ## Endpoints the proxy answers
 
@@ -60,7 +69,7 @@ The model list uses the OpenAI list shape. Each entry has `id`, `object:
 ## Other paths
 
 The proxy forwards every other path to the provider the model selects. This
-includes files, batches, images, and audio. The proxy does not meter these
+includes files, batches and image variations. The proxy does not meter these
 paths. Two controls change what happens:
 
 - **Budget or limit.** If a spend budget or token limit applies to the caller,
@@ -165,7 +174,8 @@ keeps the client query string.
 
 - No translation between OpenAI and Anthropic formats.
 - No CORS support. Browser clients cannot call the proxy.
-- Image and audio endpoints are not metered, so a budget or limit refuses them.
+- Image variations are not metered, so a budget or limit refuses them. Image
+  and audio endpoints count toward spend budgets but not token limits.
 - Files and batches are forwarded only when no budget or limit applies, and
   only for the tenant that owns the object.
 - The listener caps the request body (1 MiB by default).

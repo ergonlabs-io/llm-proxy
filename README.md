@@ -523,9 +523,9 @@ Stated plainly, because a feature list without this is not much use:
 - **Nothing watches files, and some auth settings need a restart.** A `SIGHUP`
   reload reads `api_key_file` and the TLS `cert_file`/`key_file` again. It does
   not apply changes to `auth.keys`, the HMAC secret, the auth store, or the
-  OTLP `tracing`/`metrics` blocks; those take a restart. Changing the HMAC
-  secret and sending `SIGHUP` refuses every key until a restart (a known
-  defect). See the reload table in
+  OTLP `tracing`/`metrics` blocks; a change to any of them refuses the whole
+  reload, and the proxy keeps serving the previous snapshot until a restart.
+  See the reload table in
   [Reload configuration](docs/site/src/content/docs/operations/config-reload.md).
 - **Authorization covers models only.** There is no per-provider
   authorization. An authenticated tenant with no stored model policy is refused
