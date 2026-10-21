@@ -2493,6 +2493,30 @@ pub(crate) fn model_catalog_order(config: &SimpleConfig) -> Vec<(&String, &Model
     exact
 }
 
+/// `models.<name>.session_affinity` -> Envoy route `hash_policy` (ADR-0016
+/// decision 10): the header first, terminal when an identity follows, so a
+/// request that carries the header is pinned by it alone; then the
+/// authenticated identity the auth filter fills.
+fn session_hash_policy(affinity: &SessionAffinity) -> Value {
+    let mut policy = Vec::new();
+    if let Some(header) = &affinity.header {
+        let mut entry = json!({ "header": { "header_name": header.to_ascii_lowercase() } });
+        if affinity.identity.is_some() {
+            entry["terminal"] = json!(true);
+        }
+        policy.push(entry);
+    }
+    if let Some(identity) = affinity.identity {
+        let key = match identity {
+            AffinityIdentity::Key => proxy_config::lower::HASH_KEY_ID,
+            AffinityIdentity::User => proxy_config::lower::HASH_USER_ID,
+            AffinityIdentity::Tenant => proxy_config::lower::HASH_TENANT,
+        };
+        policy.push(json!({ "filter_state": { "key": key } }));
+    }
+    Value::Array(policy)
+}
+
 /// `models.<name>` -> one route and, for a multi-provider alias, its
 /// aggregate clusters. Each retry against an aggregate advances to the next
 /// provider, so callers select an alias, never a provider.
@@ -2609,6 +2633,12 @@ fn lower_model(
         "cluster"
     };
     action[target_key] = route_target;
+    if target_key == "weighted_clusters" {
+        if let Some(affinity) = &model.session_affinity {
+            action["weighted_clusters"]["use_hash_policy"] = json!(true);
+            action["hash_policy"] = session_hash_policy(affinity);
+        }
+    }
     if member_count > 1 {
         action["retry_policy"] = json!({
             "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",

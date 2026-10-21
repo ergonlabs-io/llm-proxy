@@ -160,6 +160,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "ModelProvider",
             parser_fields::<ModelProvider>,
         ),
+        (
+            "#/$defs/SessionAffinity",
+            "SessionAffinity",
+            parser_fields::<SessionAffinity>,
+        ),
         ("#/$defs/Route", "RouteRule", parser_fields::<RouteRule>),
         (
             "#/$defs/Route/properties/retries",
@@ -253,6 +258,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/ModelProvider/properties/dialect",
             "Dialect",
             parser_variants::<Dialect>,
+        ),
+        (
+            "#/$defs/SessionAffinity/properties/identity",
+            "AffinityIdentity",
+            parser_variants::<AffinityIdentity>,
         ),
         (
             "#/$defs/Route/properties/streaming",

@@ -55,6 +55,66 @@ For the rules for `weight`, the load errors, the fallback chain, and
 `outlier_detection`, see
 [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/#weighted-selection-in-the-models-catalogue).
 
+## Keeping a session on one provider
+
+A provider keeps a prompt cache for the conversations it serves. If each
+turn of a conversation goes to a different provider, each provider sees only
+part of the conversation, and its cache does not help. To send all turns of
+a conversation to one provider, add `session_affinity` to a weighted model.
+
+```yaml
+auth:
+  hmac_secret: ${LLMPROXY_HMAC_SECRET}
+  keys: [...]
+models:
+  chat-default:
+    providers:
+      - { provider: openai, weight: 3 }
+      - { provider: together, weight: 1 }
+    session_affinity:
+      header: x-session-affinity
+      identity: key
+```
+
+The proxy hashes the session value with xxHash64. The hash, not a random
+draw, picks the first provider, in proportion to the weights. The same value
+gets the same provider on every worker and every replica, with no shared
+state, while the weights and the provider list do not change.
+
+- `header`: a request header that names the session. The proxy reads it
+  first. A request with the header is pinned by the header only. The proxy
+  hashes the raw value and forwards the header upstream unchanged.
+- `identity`: the authenticated identity to use when the request has no
+  header. `key` is the virtual key. `user` is the authenticated user; use it
+  for JWTs, because without `subject_claim` a JWT's key is its signing key.
+  `tenant` is the tenant. All traffic of one identity goes to one provider.
+  `identity` needs the `auth` block.
+
+A request with no session value gets the usual random draw. Each pick on
+such a model adds 1 to `llmproxy_router_session_affinity_total`, with
+`outcome="hashed"` or `outcome="unhashed"`. The session value is never a
+label and is never logged.
+
+Affinity does not change failover. If the pinned provider is ejected, or the
+tenant's credentials cannot serve it, the session goes to the next provider
+in the list until the pinned provider recovers. The fallback request carries
+only the fallback provider's credentials, and the proxy charges the provider
+that served it.
+
+A weight change that changes the sum of the weights moves most sessions to
+a new provider once. To move only the sessions whose share changed, keep the
+sum fixed, for example at 100. A caller that sets the header can choose
+which of the model's providers it reaches. It cannot reach a provider that
+is not in the model. If you do not want callers to choose, use `identity`
+only.
+
+`session_affinity` lowers to Envoy `weighted_clusters.use_hash_policy` and a
+route `hash_policy`. In a bootstrap configuration, use a `header` hash
+policy, or a `filter_state` policy with the key `llmproxy.auth.key_id`,
+`llmproxy.auth.user_id` or `llmproxy.auth.tenant` behind the authentication
+filter. A header policy picks the same cluster as Envoy v1.38. Other hash
+policy types are a load error. Design: ADR-0016.
+
 ## Inside a provider, there is nothing to balance
 
 Every `providers.<name>` entry lowers to a cluster with exactly one endpoint

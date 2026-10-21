@@ -443,6 +443,7 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
             }
         }
         check_model_weights(name, model, &path)?;
+        check_session_affinity(config, model, &path)?;
     }
 
     // Validate model entries first so dialect lookup cannot mask a more
@@ -1116,6 +1117,54 @@ fn check_provider_ref(
                 "unknown provider `{}` (defined providers: {known})",
                 reference.provider
             ),
+        });
+    }
+    Ok(())
+}
+
+/// `models.<name>.session_affinity` (ADR-0016): only on a weighted alias,
+/// which has a split to pin, and `identity` only with `auth`, which is what
+/// fills the identity; without it no request could hash (AGENTS.md
+/// invariant 1).
+fn check_session_affinity(
+    config: &SimpleConfig,
+    model: &ModelDef,
+    path: &str,
+) -> Result<(), ConfigError> {
+    let Some(affinity) = &model.session_affinity else {
+        return Ok(());
+    };
+    let field_path = format!("{path}.session_affinity");
+    if affinity.header.is_none() && affinity.identity.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field_path,
+            reason: "set `header`, `identity`, or both".to_string(),
+        });
+    }
+    if model.providers.iter().all(|entry| entry.weight().is_none()) {
+        return Err(ConfigError::InvalidValue {
+            field_path,
+            reason: "session affinity pins a session to one provider of a weighted split; \
+                     set `weight` on every entry of `providers`"
+                .to_string(),
+        });
+    }
+    if let Some(header) = &affinity.header {
+        // RFC 9110 token characters, as the schema's pattern.
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+        if header.is_empty() || !header.bytes().all(token) {
+            return Err(ConfigError::InvalidValue {
+                field_path: format!("{field_path}.header"),
+                reason: format!("`{header}` is not a valid HTTP header name"),
+            });
+        }
+    }
+    if affinity.identity.is_some() && config.auth.is_none() {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{field_path}.identity"),
+            reason: "an authenticated identity needs the `auth` block; without it no request \
+                     carries one"
+                .to_string(),
         });
     }
     Ok(())
