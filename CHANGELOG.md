@@ -35,6 +35,16 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- `--drain-strategy gradual` works as in Envoy. During a drain, HTTP connections
+  are told to close one at a time over the first quarter of `--drain-time-s`
+  instead of all at once, and a request handled during the drain closes its
+  connection after its response with a probability that rises to 1 at the
+  deadline. This avoids a reconnect spike at the load balancer in a rolling
+  deploy. `immediate` stays the default and is unchanged. A config reload still
+  closes every connection at once. The startup warning that the flag has no
+  effect is removed. Departures from Envoy are in
+  `internal-docs/envoy-divergences.md` row 1.
+
 - JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
   `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
   `{ claim: department, tag: team }`, so the identity provider sets a JWT

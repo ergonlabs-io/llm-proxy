@@ -2,6 +2,7 @@
 //! accept loops, and HTTP/1 codec over real sockets (`internal-docs/architecture.md` section 8, "Drain"). Every wait is
 //! bounded by `WAIT`.
 use super::*;
+use crate::drain::DrainStrategy;
 use crate::test_ports::free_port;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -273,13 +274,18 @@ async fn start_worker(initial: Arc<ConfigSnapshot>) -> Worker {
 
 impl Worker {
     fn start_drain(&self) {
+        // Far away on purpose: tests must finish because the drain logic
+        // works, not because the deadline passed.
+        self.start_drain_with(DrainStrategy::Immediate, Duration::from_secs(3600));
+    }
+
+    fn start_drain_with(&self, strategy: DrainStrategy, window: Duration) {
         let started = std::time::Instant::now();
         self.drain_tx
             .send(DrainState::Draining {
                 started,
-                // Far away on purpose: tests must finish because the drain
-                // logic works, not because the deadline passed.
-                until: started + Duration::from_secs(3600),
+                until: started + window,
+                strategy,
             })
             .unwrap();
     }
@@ -475,6 +481,135 @@ async fn drain_worker_reports_done_when_only_an_idle_connection_remains() {
                 .expect("an idle keep-alive connection must not hold the drain open");
             assert_eq!(done, Some(crate::runtime::WorkerId(0)));
             drop(client);
+            worker.stop().await;
+        })
+        .await;
+}
+
+/// How many idle keep-alive connections the drain-strategy tests hold open.
+const IDLE_CONNECTIONS: usize = 20;
+
+/// Opens `n` keep-alive connections that have each finished one request, and watches each one: the returned channel
+/// gets one message per connection the server closes.
+async fn idle_keep_alive_connections(
+    port: u16,
+    upstream: &Upstream,
+    worker: &Worker,
+    n: usize,
+) -> mpsc::UnboundedReceiver<()> {
+    upstream.gate.add_permits(n);
+    let (closed_tx, closed) = mpsc::unbounded_channel();
+    for _ in 0..n {
+        let mut client = TcpStream::connect(addr(port)).await.unwrap();
+        client
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_response(&mut client).await;
+        assert!(
+            !response.to_ascii_lowercase().contains("connection: close"),
+            "keep-alive must be on before the drain: {response}"
+        );
+        let closed_tx = closed_tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut rest = Vec::new();
+            let _ = client.read_to_end(&mut rest).await;
+            let _ = closed_tx.send(());
+        });
+    }
+    assert_eq!(worker.registry.live(), n, "every connection is live");
+    closed
+}
+
+/// Waits (bounded by `within`) until `total` connections have closed in all, counting from `closed_so_far`.
+async fn await_closed(
+    closed: &mut mpsc::UnboundedReceiver<()>,
+    mut closed_so_far: usize,
+    total: usize,
+    within: Duration,
+) {
+    tokio::time::timeout(within, async {
+        while closed_so_far < total {
+            closed.recv().await.unwrap();
+            closed_so_far += 1;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("only {closed_so_far} of {total} connections closed"));
+}
+
+/// Connections whose close has already been reported, without waiting.
+fn closed_now(closed: &mut mpsc::UnboundedReceiver<()>) -> usize {
+    std::iter::from_fn(|| closed.try_recv().ok()).count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn immediate_drain_closes_every_idle_keep_alive_connection_at_drain_start() {
+    LocalSet::new()
+        .run_until(async {
+            let upstream = Upstream::spawn().await;
+            let port = free_port();
+            let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
+            let mut closed =
+                idle_keep_alive_connections(port, &upstream, &worker, IDLE_CONNECTIONS).await;
+
+            // A gradual schedule over this hour would space the closes 45s apart, so all of them inside `WAIT`
+            // proves no connection waited for a slot.
+            worker.start_drain_with(DrainStrategy::Immediate, Duration::from_secs(3600));
+            await_closed(&mut closed, 0, IDLE_CONNECTIONS, WAIT).await;
+            worker.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gradual_drain_spreads_idle_keep_alive_closes_over_the_window() {
+    LocalSet::new()
+        .run_until(async {
+            let upstream = Upstream::spawn().await;
+            let port = free_port();
+            let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
+            let mut closed =
+                idle_keep_alive_connections(port, &upstream, &worker, IDLE_CONNECTIONS).await;
+
+            // The first quarter (5s) holds the schedule: one close at once, then one every 250ms.
+            let window = Duration::from_secs(20);
+            worker.start_drain_with(DrainStrategy::Gradual, window);
+            await_closed(&mut closed, 0, 1, WAIT).await;
+            let at_start = 1 + closed_now(&mut closed);
+            assert!(
+                at_start < IDLE_CONNECTIONS,
+                "gradual must not close every connection at drain start ({at_start} closed)"
+            );
+            // This harness has no deadline cut, so every close below came from the schedule.
+            await_closed(&mut closed, at_start, IDLE_CONNECTIONS, window).await;
+            assert_eq!(worker.registry.live(), 0);
+            worker.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_during_a_gradual_drain_closes_kept_alive_connections_at_once() {
+    LocalSet::new()
+        .run_until(async {
+            let upstream = Upstream::spawn().await;
+            let port = free_port();
+            let worker = start_worker(snapshot_for(&[port], upstream.address.port(), 1)).await;
+            let mut closed =
+                idle_keep_alive_connections(port, &upstream, &worker, IDLE_CONNECTIONS).await;
+
+            // Over an hour the slots are 45s apart: only the first closes on schedule within this test.
+            worker.start_drain_with(DrainStrategy::Gradual, Duration::from_secs(3600));
+            await_closed(&mut closed, 0, 1, WAIT).await;
+            let before_reload = 1 + closed_now(&mut closed);
+            assert!(before_reload < IDLE_CONNECTIONS, "{before_reload} closed");
+
+            // A reload (a rotated provider credential) must not wait for the schedule.
+            worker
+                .config
+                .store(snapshot_for(&[port], upstream.address.port(), 2));
+            await_closed(&mut closed, before_reload, IDLE_CONNECTIONS, WAIT).await;
             worker.stop().await;
         })
         .await;

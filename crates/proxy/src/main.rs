@@ -115,11 +115,11 @@ struct Args {
     )]
     drain_time_s: u64,
 
-    /// Accepted for Envoy CLI compatibility. Both values behave as Envoy's
-    /// `immediate`: the startup warning fires only when this flag is given;
-    /// see the docs.
-    #[arg(long = "drain-strategy", value_enum)]
-    drain_strategy: Option<DrainStrategyArg>,
+    /// When, inside the drain window, each HTTP connection is told to close:
+    /// `immediate` (the default) at drain start, `gradual` spread over the
+    /// window, as Envoy does (serve mode only).
+    #[arg(long = "drain-strategy", value_enum, default_value_t = DrainStrategyArg::Immediate)]
+    drain_strategy: DrainStrategyArg,
 
     /// Hot-restart base id. Accepted for CLI compatibility only: we have no
     /// hot-restart implementation, so this is parsed and ignored.
@@ -172,13 +172,20 @@ enum Mode {
     Keygen,
 }
 
-/// CLI-facing drain strategy. Both values are accepted so Envoy command lines
-/// keep working, and both behave as `immediate` (see the startup warning in
-/// `main`); nothing in the data plane reads the choice.
+/// CLI-facing `--drain-strategy`, Envoy's two values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DrainStrategyArg {
     Gradual,
     Immediate,
+}
+
+impl From<DrainStrategyArg> for proxy_core::drain::DrainStrategy {
+    fn from(arg: DrainStrategyArg) -> Self {
+        match arg {
+            DrainStrategyArg::Gradual => Self::Gradual,
+            DrainStrategyArg::Immediate => Self::Immediate,
+        }
+    }
 }
 
 /// Envoy's `--log-level` values.
@@ -461,27 +468,6 @@ impl ConfigSource {
     }
 }
 
-/// The flag is accepted so Envoy command lines keep working, but it has no
-/// effect: every drain is `immediate` (internal-docs/envoy-divergences.md,
-/// "Drain strategy"). Loud on purpose, so an operator who chose `gradual`
-/// learns that idle and finished connections close at drain start. Warns only
-/// when the flag was given, so a default start is silent. Returns whether it
-/// warned, for the unit test.
-fn warn_drain_strategy_ignored(strategy: Option<DrainStrategyArg>) -> bool {
-    let Some(strategy) = strategy else {
-        return false;
-    };
-    tracing::warn!(
-        drain_strategy = ?strategy,
-        "--drain-strategy has no effect: `gradual` and `immediate` both behave as immediate. \
-         At drain start the proxy stops accepting, closes idle keep-alive connections, and lets \
-         in-flight requests finish before closing their connection (Connection: close on \
-         HTTP/1, GOAWAY on HTTP/2); connections still open at --drain-time-s are cut \
-         (see internal-docs/envoy-divergences.md, \"Drain strategy\")"
-    );
-    true
-}
-
 /// Serve mode: build the control runtime, spawn the worker pool, wait for
 /// SIGTERM/SIGINT/SIGHUP, then run the graceful shutdown sequence.
 fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
@@ -500,7 +486,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     }
 
     let drain_time = Duration::from_secs(args.drain_time_s);
-    warn_drain_strategy_ignored(args.drain_strategy);
+    let drain_strategy = args.drain_strategy.into();
 
     // Rust note: the control runtime is a separate, ordinary multi-thread
     // tokio runtime (2 worker threads) -- distinct from the
@@ -516,6 +502,7 @@ fn serve(args: Args, snapshot: ConfigSnapshot) -> ExitCode {
     control_rt.block_on(run_serve(
         args.concurrency,
         drain_time,
+        drain_strategy,
         args.service_node,
         args.service_cluster,
         Arc::new(snapshot),
@@ -563,6 +550,7 @@ const ADMIN_UI_DIR_ENV_VAR: &str = "LLMPROXY_ADMIN_UI_DIR";
 async fn run_serve(
     concurrency: usize,
     drain_time: Duration,
+    drain_strategy: proxy_core::drain::DrainStrategy,
     service_node: Option<String>,
     service_cluster: Option<String>,
     snapshot: Arc<ConfigSnapshot>,
@@ -1044,6 +1032,7 @@ async fn run_serve(
     tracing::info!(
         workers = concurrency,
         drain_time_s = drain_time.as_secs(),
+        drain_strategy = ?drain_strategy,
         service_node = service_node.as_deref().unwrap_or("-"),
         service_cluster = service_cluster.as_deref().unwrap_or("-"),
         listeners = %listener_summary.join(", "),
@@ -1171,6 +1160,7 @@ async fn run_serve(
                     &lifecycle,
                     &publisher,
                     drain_time,
+                    drain_strategy,
                     "POST /drain_listeners",
                 ));
             }
@@ -1215,7 +1205,7 @@ async fn run_serve(
     // `--drain-time-s` from the first drain trigger, not from the signal.
     let deadline = match drain_deadline {
         Some(deadline) => deadline,
-        None => begin_drain(&lifecycle, &publisher, drain_time, "signal"),
+        None => begin_drain(&lifecycle, &publisher, drain_time, drain_strategy, "signal"),
     };
 
     // Wait for every worker to report its connections gone (or the deadline),
@@ -1421,15 +1411,23 @@ fn begin_drain(
     lifecycle: &LifecycleState,
     publisher: &proxy_core::runtime::ConfigPublisher,
     drain_time: Duration,
+    strategy: proxy_core::drain::DrainStrategy,
     trigger: &str,
 ) -> Instant {
     lifecycle.request_drain();
-    let deadline = publisher.start_drain(drain_time);
+    let deadline = publisher.start_drain(drain_time, strategy);
+    let closes = match strategy {
+        proxy_core::drain::DrainStrategy::Immediate => "idle connections close now",
+        proxy_core::drain::DrainStrategy::Gradual => {
+            "connections close spread over the first quarter of the window, or sooner per request"
+        }
+    };
     tracing::info!(
         trigger,
         drain_time_s = drain_time.as_secs(),
-        "drain started: /ready now answers DRAINING, listeners are closing, idle connections \
-         close now, in-flight requests may finish until the deadline"
+        drain_strategy = ?strategy,
+        "drain started: /ready now answers DRAINING, listeners are closing, {closes}, \
+         in-flight requests may finish until the deadline"
     );
     deadline
 }
@@ -3411,7 +3409,7 @@ mod tests {
             request_records_file: None,
             request_record_max_attempts: None,
             drain_time_s: proxy_core::drain::DEFAULT_DRAIN_TIME.as_secs(),
-            drain_strategy: None,
+            drain_strategy: DrainStrategyArg::Immediate,
             base_id: None,
             log_level: LogLevel::Info,
             service_node: None,
@@ -3420,16 +3418,20 @@ mod tests {
     }
 
     #[test]
-    fn drain_strategy_is_none_without_the_flag_and_some_with_it() {
-        let none = Args::try_parse_from(["llm-proxy", "-c", "x.yaml"]).expect("parses");
-        assert_eq!(none.drain_strategy, None);
-        assert!(!warn_drain_strategy_ignored(none.drain_strategy));
+    fn drain_strategy_defaults_to_immediate_and_maps_gradual() {
+        let default = Args::try_parse_from(["llm-proxy", "-c", "x.yaml"]).expect("parses");
+        assert_eq!(
+            proxy_core::drain::DrainStrategy::from(default.drain_strategy),
+            proxy_core::drain::DrainStrategy::Immediate
+        );
 
-        let some =
+        let gradual =
             Args::try_parse_from(["llm-proxy", "-c", "x.yaml", "--drain-strategy", "gradual"])
                 .expect("parses");
-        assert_eq!(some.drain_strategy, Some(DrainStrategyArg::Gradual));
-        assert!(warn_drain_strategy_ignored(some.drain_strategy));
+        assert_eq!(
+            proxy_core::drain::DrainStrategy::from(gradual.drain_strategy),
+            proxy_core::drain::DrainStrategy::Gradual
+        );
     }
 
     #[test]

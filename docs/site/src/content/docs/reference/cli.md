@@ -102,7 +102,7 @@ digest. Store it immediately.
 | `--permissive` | off | Warn on unknown fields in a `-c` bootstrap instead of failing. It has no effect on `--config`, which is always strict. |
 | `--concurrency <N>` | number of available CPU cores | Number of worker runtimes. |
 | `--drain-time-s <SECS>` | `600` | Seconds to wait for connections to close during shutdown — see [Draining and shutdown](../../operations/draining-and-shutdown/). |
-| `--drain-strategy <gradual\|immediate>` | none | Accepted for Envoy compatibility. Both values behave the same and the proxy warns at startup when the flag is given. See [Draining and shutdown](../../operations/draining-and-shutdown/). |
+| `--drain-strategy <gradual\|immediate>` | `immediate` | When each connection is told to close during a drain. `immediate` closes them all at drain start; `gradual` spreads the closes over the first quarter of `--drain-time-s`. See [Draining and shutdown](../../operations/draining-and-shutdown/#gradual-drain). |
 | `--base-id <N>` | — | Accepted for compatibility with tooling that always passes it. llm-proxy has no hot-restart implementation, so this is parsed and ignored. |
 | `-l`, `--log-level <LEVEL>` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `critical`, or `off`. `critical` maps to `error`. |
 | `--service-node <NAME>` | — | Overrides the bootstrap `node.id`. The proxy uses it as the node ID sent to an xDS control plane and as the writer identity for spend limits. Set a stable value for each replica. See [Share state across replicas](../../operations/running-in-production/). |

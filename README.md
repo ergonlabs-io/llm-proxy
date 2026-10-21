@@ -554,7 +554,6 @@ Stated plainly, because a feature list without this is not much use:
   planned for v0.8.0.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
-- **`--drain-strategy` has no effect.** It is accepted and warns at startup when given; both values drain like Envoy's `immediate`.
 - **No Kubernetes controller or CRDs.**
 
 ## Layout

@@ -39,7 +39,9 @@ use tokio::task::JoinHandle;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::drain::{drain_started, ConnectionRegistry, DrainState};
+use crate::drain::{
+    connection_drain_close, drain_started, ConnectionRegistry, DrainCloseHandler, DrainState,
+};
 use crate::filter_chain::{select_filter_chain, ConnectionProperties};
 use crate::header_mutation_filter::HeaderMutationFactory;
 use crate::lifecycle::LifecycleState;
@@ -1594,9 +1596,11 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
             let _guard = registry.register();
 
             // Rust note: `serve_http1` takes an `impl Future`, not a `watch::Receiver`, so it stays
-            // decoupled from drain. Graceful shutdown starts at whichever comes first: drain start
-            // (idle keep-alives close, in-flight requests finish, then `Connection: close` or GOAWAY) or
-            // the final `shutdown`.
+            // decoupled from drain. Graceful shutdown starts at whichever comes first: the drain's close for
+            // this connection (idle keep-alives close, in-flight requests finish, then `Connection: close` or
+            // GOAWAY) or the final `shutdown`. The drain's close comes at drain start under `immediate` and at
+            // a point spread over the window under `gradual`; `DrainCloseHandler` lets a request bring it
+            // forward (internal-docs/envoy-divergences.md, "Drain strategy").
             // The codec hands the same signal to its upgrade tunnels: a WebSocket tunnel sends Close 1001.
             //
             // A reload starts the same graceful shutdown. This connection's handler, routes and cluster view
@@ -1604,6 +1608,12 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
             // keep sending a rotated or revoked provider key until the client closed it. Requests already in
             // flight finish on their own generation, so a retry never mixes generations
             // (internal-docs/envoy-divergences.md).
+            // A reload never waits for the gradual schedule: `superseded` below is its own branch.
+            let close_now = Rc::new(tokio::sync::Notify::new());
+            let handler: Rc<dyn proxy_http::handler::StreamHandler> = Rc::new(
+                DrainCloseHandler::new(handler, drain.clone(), close_now.clone()),
+            );
+            let drain_registry = registry.clone();
             let accepted = snapshot.version;
             let listener = name.clone();
             let superseded = async move {
@@ -1627,7 +1637,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
                     }
                 };
                 tokio::select! {
-                    _ = drain_started(&mut drain) => {}
+                    _ = connection_drain_close(&mut drain, &drain_registry, &close_now) => {}
                     _ = shutdown_signal => {}
                     _ = superseded => {}
                 }
