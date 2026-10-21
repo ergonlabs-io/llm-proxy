@@ -25,6 +25,7 @@ tokio = { workspace = true, features = ["rt", "macros", "io-util", "time", "sync
 thiserror = { workspace = true }
 # S9: per-worker seeding for `x-request-id` generation (headers.rs).
 rand = { workspace = true }
+xxhash-rust = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 ring = { workspace = true }

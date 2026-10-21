@@ -932,8 +932,15 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "hedge_policy",
             "host_rewrite_literal",
             "prefix_rewrite",
+            "hash_policy",
         ],
-        "envoy.config.route.v3.WeightedCluster" => &["clusters"],
+        // ADR-0016: header and the reserved filter-state keys only. Cookie,
+        // connection_properties, query_parameter and regex_rewrite are
+        // refused by omission.
+        "envoy.config.route.v3.RouteAction.HashPolicy" => &["header", "filter_state", "terminal"],
+        "envoy.config.route.v3.RouteAction.HashPolicy.Header" => &["header_name"],
+        "envoy.config.route.v3.RouteAction.HashPolicy.FilterState" => &["key"],
+        "envoy.config.route.v3.WeightedCluster" => &["clusters", "use_hash_policy"],
         "envoy.config.route.v3.WeightedCluster.ClusterWeight" => &["name", "weight"],
         "envoy.config.route.v3.RetryPolicy" => &[
             "retry_on",
@@ -2262,7 +2269,7 @@ fn convert_hcm(
     let upgrade_configs =
         convert_upgrade_configs(&hcm.upgrade_configs, &format!("{path}.upgrade_configs"))?;
 
-    Ok(HttpConnectionManagerConfig {
+    let config = HttpConnectionManagerConfig {
         stat_prefix: hcm.stat_prefix.clone(),
         route_table: Arc::new(route_table),
         rds_route_config_name,
@@ -2303,7 +2310,22 @@ fn convert_hcm(
                 .and_then(|o| o.max_headers_count),
             &format!("{path}.common_http_protocol_options.max_headers_count"),
         )?,
-    })
+    };
+    // ADR-0016 decision 9: an identity hash source needs the authentication
+    // filter before the router, or the route can never hash. An RDS table is
+    // checked where the xDS applier binds it to this HCM.
+    if config.rds_route_config_name.is_none() && !config.authenticates_before_router() {
+        if let Some((vhost, route)) = config.route_table.first_identity_hash_route() {
+            return Err(invalid(
+                format!(
+                    "{path}.route_config.virtual_hosts[{vhost}].routes[{route}].route.hash_policy"
+                ),
+                "hashes an authenticated identity, but no authentication filter precedes the \
+                 router in http_filters, so this route could never hash",
+            ));
+        }
+    }
+    Ok(config)
 }
 
 /// HCM `max_request_headers_kb`. Unset is Envoy's documented default of
@@ -6888,9 +6910,9 @@ fn convert_route_action(
     let target = match &ra.cluster_specifier {
         Some(ClusterSpecifier::Cluster(name)) => ForwardTarget::Cluster(name.clone()),
         Some(ClusterSpecifier::ClusterHeader(h)) => ForwardTarget::ClusterHeader(h.clone()),
-        Some(ClusterSpecifier::WeightedClusters(wc)) => ForwardTarget::Weighted(
-            convert_weighted_clusters(wc, &format!("{path}.weighted_clusters"))?,
-        ),
+        Some(ClusterSpecifier::WeightedClusters(wc)) => {
+            ForwardTarget::Weighted(convert_weighted_clusters(wc, &ra.hash_policy, path)?)
+        }
         Some(_) => {
             return Err(unsupported(
                 path,
@@ -6899,6 +6921,17 @@ fn convert_route_action(
         }
         None => return Err(invalid(path, "a cluster specifier is required")),
     };
+    // ADR-0016 decision 9: a route hash policy only drives a weighted pick.
+    // Envoy also feeds it to ring hash and Maglev, which are refused, so
+    // anywhere else it would be accepted and ignored.
+    let hashed = matches!(&target, ForwardTarget::Weighted(w) if !w.hash_policy.is_empty());
+    if !ra.hash_policy.is_empty() && !hashed {
+        return Err(unsupported(
+            format!("{path}.hash_policy"),
+            "a route hash_policy is used only by weighted_clusters with use_hash_policy: true; \
+             ring hash and Maglev load balancing are not implemented",
+        ));
+    }
 
     // S4: default 15s; explicit 0 disables the total timeout entirely.
     let timeout = match &ra.timeout {
@@ -6985,8 +7018,11 @@ fn convert_route_action(
 
 fn convert_weighted_clusters(
     wc: &route_v3::WeightedCluster,
-    path: &str,
+    hash_policy: &[route_v3::route_action::HashPolicy],
+    route_path: &str,
 ) -> Result<WeightedClusters, ConfigError> {
+    use route_v3::weighted_cluster::RandomValueSpecifier;
+    let path = &format!("{route_path}.weighted_clusters");
     let mut cumulative = Vec::with_capacity(wc.clusters.len());
     let mut total: u64 = 0;
     for (i, cw) in wc.clusters.iter().enumerate() {
@@ -7002,10 +7038,86 @@ fn convert_weighted_clusters(
     if total == 0 {
         return Err(invalid(path, "total weight must be greater than 0"));
     }
+    let use_hash_policy = match &wc.random_value_specifier {
+        Some(RandomValueSpecifier::UseHashPolicy(enabled)) => *enabled,
+        Some(RandomValueSpecifier::HeaderName(_)) => {
+            return Err(unsupported(
+                format!("{path}.header_name"),
+                "a caller-supplied random value is not implemented; use use_hash_policy",
+            ))
+        }
+        None => false,
+    };
+    let hash_policy = if use_hash_policy {
+        if hash_policy.is_empty() {
+            // Envoy accepts this and always falls back to the random value.
+            return Err(invalid(
+                format!("{path}.use_hash_policy"),
+                "use_hash_policy needs a route hash_policy; without one every pick is random",
+            ));
+        }
+        hash_policy
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| convert_hash_policy(entry, &format!("{route_path}.hash_policy[{i}]")))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     Ok(WeightedClusters {
         cumulative,
         total_weight: total,
-        hash_policy: Vec::new(),
+        hash_policy,
+    })
+}
+
+/// Filter-state keys a route hash policy may name (ADR-0016 decision 5).
+/// The authentication filter fills them; there is no other filter state.
+pub const HASH_KEY_ID: &str = "llmproxy.auth.key_id";
+pub const HASH_USER_ID: &str = "llmproxy.auth.user_id";
+pub const HASH_TENANT: &str = "llmproxy.auth.tenant";
+
+fn convert_hash_policy(
+    entry: &route_v3::route_action::HashPolicy,
+    path: &str,
+) -> Result<RouteHashPolicy, ConfigError> {
+    use route_v3::route_action::hash_policy::PolicySpecifier;
+    let source = match &entry.policy_specifier {
+        Some(PolicySpecifier::Header(header)) => {
+            let name =
+                http::HeaderName::from_bytes(header.header_name.as_bytes()).map_err(|_| {
+                    invalid(
+                        format!("{path}.header.header_name"),
+                        "not a valid HTTP header name",
+                    )
+                })?;
+            HashSource::Header(name)
+        }
+        Some(PolicySpecifier::FilterState(state)) => match state.key.as_str() {
+            HASH_KEY_ID => HashSource::AuthKeyId,
+            HASH_USER_ID => HashSource::AuthUserId,
+            HASH_TENANT => HashSource::AuthTenant,
+            _ => {
+                return Err(unsupported(
+                    format!("{path}.filter_state.key"),
+                    format!(
+                        "only the authenticated identity keys `{HASH_KEY_ID}`, `{HASH_USER_ID}` \
+                         and `{HASH_TENANT}` are implemented"
+                    ),
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(unsupported(
+                path,
+                "only header and filter_state hash policies are implemented",
+            ))
+        }
+        None => return Err(invalid(path, "a hash policy specifier is required")),
+    };
+    Ok(RouteHashPolicy {
+        source,
+        terminal: entry.terminal,
     })
 }
 

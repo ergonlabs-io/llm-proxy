@@ -1443,6 +1443,24 @@ impl ResourceApplier {
             );
         }
 
+        // ADR-0016 decision 9: an RDS table is lowered without its listener,
+        // so a route hashing an authenticated identity is checked here, where
+        // tables meet the HCMs that name them. The caller restores its
+        // checkpoint on this rejection, whichever of LDS or RDS came second.
+        let routes = self.staged_routes();
+        let dynamic = self.listeners.names().into_iter().map(|name| {
+            &self
+                .listeners
+                .get(name)
+                .expect("a listener SotwSet name must resolve to an entry")
+                .ir
+        });
+        for listener in self.base.listeners.values().chain(dynamic) {
+            if let Err(reason) = listener.check_identity_hash_sources(&routes) {
+                return Verdict::Reject(reason);
+            }
+        }
+
         self.refresh_active_dynamic_listeners();
         let snapshot = self.assemble_snapshot();
         if !same_published_resources(&self.current, &snapshot) {
