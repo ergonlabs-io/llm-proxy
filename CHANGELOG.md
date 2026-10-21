@@ -11,6 +11,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Fixed
+
+- A billing ledger at its `max_disk_bytes` cap could stay closed after the
+  consumer acknowledged every entry. One group commit can be larger than the
+  spool holds at its cap. That commit was refused and retried whole after each
+  acknowledgement, so admissions never resumed and the held entries were lost
+  at shutdown. The writer now commits in chunks of at most 1/16 of
+  `max_disk_bytes`. The risk was highest at small caps with large entries.
+
 ## [0.6.0] - 2026-10-20
 
 ### Breaking
