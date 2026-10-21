@@ -28,6 +28,47 @@ docker and `make ci` (no docker daemon there) is unaffected. Run them
 explicitly with `cargo test -p diffrig -- --ignored` (with `DIFFRIG_DOCKER=1`
 and docker up).
 
+## Live provider smoke tests
+
+`make smoke-live` runs `tests/live_smoke.rs`: the real binary, loaded with a
+`--config` dialect file, sends a minimal request to each real provider. Every
+other test runs against mocks, so this is where a provider-side wire or auth
+change shows up. Each test is `#[ignore]`d, so `make tq` and `make ci` never
+run it.
+
+| Provider | Variables | Tests |
+|---|---|---|
+| OpenRouter | `OPENROUTER_API_KEY`; optional `OPENROUTER_SMOKE_MODEL` | non-streaming, streaming, bad key (needs no key) |
+| Vertex AI (Claude) | `VERTEX_PROJECT`, `VERTEX_ACCESS_TOKEN`; optional `VERTEX_LOCATION` (default `us-east5`), `VERTEX_SMOKE_MODEL` | non-streaming |
+| Amazon Bedrock (Claude) | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; optional `AWS_SESSION_TOKEN`, `BEDROCK_SMOKE_MODEL` | non-streaming |
+| OpenAI | `OPENAI_API_KEY` | non-streaming, streaming |
+| Anthropic | `ANTHROPIC_API_KEY` | non-streaming, streaming |
+
+```sh
+OPENROUTER_API_KEY=... make smoke-live
+```
+
+- **Cost.** OpenRouter uses a free model (`:free`), so it costs nothing. Free
+  models are retired without notice; when the default one returns 404 or 429,
+  pick a current one from `https://openrouter.ai/api/v1/models` and set
+  `OPENROUTER_SMOKE_MODEL`. The other providers bill; every request uses a
+  one-line prompt and `max_tokens` of 24 or less.
+- **What is asserted.** A 200, non-empty content, and a JSON access-log line
+  that names the provider cluster (`selected_provider`), shows an upstream was
+  dialled (`upstream_host`), and carries the usage the proxy extracted
+  (`llm_input_tokens`, `llm_output_tokens`). The bad-key test asserts the
+  provider's own 401 reaches the client, not a local 5xx.
+- **Skips.** A test whose variables are unset prints
+  `LIVE-SKIP live_smoke::<test>: <VAR> is not set` and passes. Read those
+  lines before you treat a run as coverage. `LIVE_SMOKE_STRICT=1` turns every
+  skip into a failure.
+- **CI.** `.github/workflows/live-smoke.yml` runs the target weekly and on
+  manual dispatch, never on pull requests. It reads the variables above from
+  repository secrets of the same names and copies the `LIVE-SKIP` lines to
+  the job summary.
+- **Never run live yet:** the Vertex and Bedrock tests. Treat their first
+  failure as a finding, not as flakiness.
+
 ## Landed: hermetic reload-under-LLM-traffic topology
 
 `cargo test -p diffrig --test swap_under_load` drives the real proxy against
