@@ -131,8 +131,9 @@ message Authentication {
 // The operator's chargeback-tag policy. Tags come from key metadata (set on a
 // virtual key by the admin API, or `VirtualKey.tags`) and, when
 // `from_header` is true, from the `x-cost-tags` request header
-// (`project=search,team=infra`). A tag key set by key metadata is never taken
-// from the header. Tags that fail the allow-list or a cap are dropped and
+// (`project=search,team=infra`). A JWT caller's tags come from
+// `JwtProvider.claim_tags` instead of key metadata. A tag key set by key
+// metadata or a claim mapping is never taken from the header. Tags that fail the allow-list or a cap are dropped and
 // counted in `llmproxy_chargeback_tags_dropped{reason}`; a malformed header is
 // dropped whole and never fails the request. Tags are never a metric label.
 message ChargebackTags {
@@ -341,6 +342,25 @@ message JwtProvider {
   // accounting identity; use Entra's `oid` for workforce tokens. Without it,
   // legacy `kid` identity remains for compatibility.
   string subject_claim = 9;
+
+  // Optional. Verified claims that set chargeback tags, so the identity
+  // provider, not the client, sets a JWT caller's attribution. Each `tag`
+  // must be allow-listed in `Authentication.chargeback_tags`, which must be
+  // set, and may appear once. A tag set here is never taken from the
+  // `x-cost-tags` header, the same as a key-metadata tag. A claim that is
+  // missing, or is not a string in the tag value alphabet, sets no tag: the
+  // tag is dropped and counted (`claim_missing` or `malformed`), and the
+  // request is not refused.
+  repeated ClaimTag claim_tags = 10;
+}
+
+// One claim-to-tag mapping in `JwtProvider.claim_tags`.
+message ClaimTag {
+  // Required. The top-level claim whose string value becomes the tag value.
+  string claim = 1;
+
+  // Required. The chargeback tag key. Same rules as `AllowedTag.key`.
+  string tag = 2;
 }
 
 // One RSA public key in a `JwtProvider`'s static set, as base64url-encoded

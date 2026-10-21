@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use proxy_config::{ConfigError, ConfigWarning};
 use serde_json::{json, Map, Value};
 
+use super::chargeback::check_key;
 use super::{warning, MAX_PRINCIPAL_ID_BYTES};
-use crate::model::{Auth, JwtJwksDef, JwtProviderDef, SimpleDuration};
+use crate::model::{Auth, ChargebackTagsDef, JwtJwksDef, JwtProviderDef, SimpleDuration};
 
 /// Bytes a lowered user id must leave for the subject claim: one UUID, the
 /// length of Entra's `oid`. A longer subject is refused in request records
@@ -67,7 +68,12 @@ pub(super) fn lower_jwt_providers(
             ));
         }
         seen_issuers.insert(issuer, i);
-        out.push(lower_provider(provider, issuer, &base)?);
+        out.push(lower_provider(
+            provider,
+            issuer,
+            auth.chargeback_tags.as_ref(),
+            &base,
+        )?);
     }
     if !auth.jwt.is_empty() && auth.tenant_credentials.is_some() {
         warnings.push(warning("auth.jwt", JWT_PLATFORM_MODE_WARNING));
@@ -78,6 +84,7 @@ pub(super) fn lower_jwt_providers(
 fn lower_provider(
     provider: &JwtProviderDef,
     issuer: &str,
+    chargeback_tags: Option<&ChargebackTagsDef>,
     base: &str,
 ) -> Result<Value, ConfigError> {
     let audience = required(provider.audience.as_ref(), &format!("{base}.audience"))?;
@@ -160,7 +167,51 @@ fn lower_provider(
         "subject_claim": subject_claim,
     });
     lower_jwks(jwks, &format!("{base}.jwks"), &mut lowered)?;
+    if !provider.claim_tags.is_empty() {
+        lowered["claim_tags"] = lower_claim_tags(provider, chargeback_tags, base)?;
+    }
     Ok(lowered)
+}
+
+/// Lowers `auth.jwt[i].claim_tags`. Each tag must be allow-listed in
+/// `auth.chargeback_tags`; a tag the policy would always drop is a config
+/// error, not a silent no-op (AGENTS.md invariant 1).
+fn lower_claim_tags(
+    provider: &JwtProviderDef,
+    chargeback_tags: Option<&ChargebackTagsDef>,
+    base: &str,
+) -> Result<Value, ConfigError> {
+    let base = format!("{base}.claim_tags");
+    let Some(policy) = chargeback_tags else {
+        return Err(invalid(
+            &base,
+            "requires `auth.chargeback_tags`; without it no tag is attributed",
+        ));
+    };
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(provider.claim_tags.len());
+    for (j, entry) in provider.claim_tags.iter().enumerate() {
+        let path = format!("{base}[{j}]");
+        let claim = required(entry.claim.as_ref(), &format!("{path}.claim"))?;
+        let tag_path = format!("{path}.tag");
+        let tag = required(entry.tag.as_ref(), &tag_path)?;
+        check_key(tag, &tag_path)?;
+        if let Some(&first) = seen.get(tag) {
+            return Err(invalid(
+                &tag_path,
+                format!("duplicate tag `{tag}`; already set at index {first}"),
+            ));
+        }
+        seen.insert(tag, j);
+        if !policy.allowed.iter().any(|allowed| allowed.key == tag) {
+            return Err(invalid(
+                &tag_path,
+                format!("tag `{tag}` is not in `auth.chargeback_tags.allowed`, so it would always be dropped"),
+            ));
+        }
+        out.push(json!({ "claim": claim, "tag": tag }));
+    }
+    Ok(json!(out))
 }
 
 fn lower_jwks(jwks: &JwtJwksDef, base: &str, lowered: &mut Value) -> Result<(), ConfigError> {

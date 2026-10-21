@@ -133,6 +133,11 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "JwtUserDef",
             parser_fields::<JwtUserDef>,
         ),
+        (
+            "#/$defs/AuthJwtClaimTag",
+            "JwtClaimTagDef",
+            parser_fields::<JwtClaimTagDef>,
+        ),
         ("#/$defs/Provider", "Provider", parser_fields::<Provider>),
         (
             "#/$defs/Provider/properties/request_fields",

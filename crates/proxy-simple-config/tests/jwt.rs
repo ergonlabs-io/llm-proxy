@@ -402,3 +402,97 @@ fn jwt_with_tenant_credentials_warns_that_jwt_callers_use_platform_keys() {
     assert!(jwt_warnings[0].message.contains("operator's provider keys"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `auth.jwt[i].claim_tags` lowers to the provider's `claim_tags`, and the
+/// strict loader and the real filter accept it.
+#[test]
+fn claim_tags_lower_and_the_real_filter_accepts_them() {
+    let jwt = format!(
+        "{STATIC_PROVIDER}      claim_tags:\n        - {{ claim: department, tag: team }}\n        - {{ claim: cost_center, tag: project }}\n"
+    );
+    let extra = "  chargeback_tags: { allowed: [ { key: team }, { key: project } ] }\n";
+    let config = parse(&dialect(&jwt, extra)).expect("must parse");
+    let lowered = lower(&config).expect("must lower");
+    let typed = &http_filters(&lowered.bootstrap)[0]["typed_config"];
+    assert_eq!(
+        typed["jwt_providers"][0]["claim_tags"],
+        serde_json::json!([
+            { "claim": "department", "tag": "team" },
+            { "claim": "cost_center", "tag": "project" },
+        ])
+    );
+    let loaded = proxy_simple_config::lower_to_loaded(&config).expect("strict-valid");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    let listener = snapshot.listeners.values().next().expect("one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    let typed = hcm
+        .http_filters
+        .iter()
+        .find(|f| f.type_url == proxy_filters::auth_filter::TYPE_URL)
+        .and_then(|f| f.config.as_ref())
+        .expect("llmproxy.auth carries its typed_config");
+    AuthFilterFactory
+        .create(typed, &FactoryContext::default())
+        .expect("the real auth filter must accept the lowered claim tags");
+}
+
+/// Every `claim_tags` rule fails at its dotted path, including a tag the
+/// policy would always drop and a mapping without any policy.
+#[test]
+fn each_claim_tags_rule_is_refused_at_its_dotted_path() {
+    let policy = "  chargeback_tags: { allowed: [ { key: team }, { key: project } ] }\n";
+    let with = |entries: &str| format!("{STATIC_PROVIDER}      claim_tags: {entries}\n");
+    let cases: Vec<(String, &str, &str)> = vec![
+        (
+            with("[ { claim: department, tag: team, from: header } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[0].from",
+        ),
+        (
+            with("[ { tag: team } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[0].claim",
+        ),
+        (
+            with("[ { claim: \"\", tag: team } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[0].claim",
+        ),
+        (
+            with("[ { claim: department } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[0].tag",
+        ),
+        (
+            with("[ { claim: department, tag: Team } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[0].tag",
+        ),
+        (
+            with("[ { claim: department, tag: team }, { claim: group, tag: team } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[1].tag",
+        ),
+        (
+            with("[ { claim: department, tag: owner } ]"),
+            policy,
+            "auth.jwt[0].claim_tags[0].tag",
+        ),
+        (
+            with("[ { claim: department, tag: team } ]"),
+            "",
+            "auth.jwt[0].claim_tags",
+        ),
+    ];
+    for (jwt, extra, expected) in cases {
+        assert_eq!(
+            invalid_path(&dialect(&jwt, extra)),
+            expected,
+            "config:\n{jwt}"
+        );
+    }
+}

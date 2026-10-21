@@ -1,7 +1,7 @@
 ---
 title: Chargeback tags
 description: "Attribute spend to a project, team or cost centre with operator allow-listed tags on usage records and ledger entries."
-summary: Tags from key metadata and an optional request header, filtered by an
+summary: Tags from key metadata, JWT claims and an optional request header, filtered by an
   operator allow-list, carried into the request record and the billing-ledger
   entry. How to configure them, set them on a key, and read them back.
 lastUpdated: 2026-10-20
@@ -28,14 +28,16 @@ and the key. See [Spend policies](../spend-policies/).
 - **Key metadata.** The admin sets tags on a virtual key with the admin API,
   or with `auth.keys[].tags` in the config file. Each request that the key
   authenticates gets these tags.
+- **JWT claims.** For a JWT caller, the operator maps verified claims to tags
+  with `auth.jwt[].claim_tags`. The identity provider sets these tags. See
+  [Tags from JWT claims](#tags-from-jwt-claims).
 - **The `x-cost-tags` request header.** The client sends comma-separated
   pairs, for example `x-cost-tags: project=search,team=infra`. The proxy reads
   this header only if `from_header` is `true`.
 
 If key metadata and the header set the same tag key, the key metadata wins. A
-client cannot change a tag that the admin set.
-
-A JWT caller has no key metadata. Its requests get header tags only.
+client cannot change a tag that the admin set. Claim tags work the same way: a
+client cannot change a tag that a claim mapping sets.
 
 A request gets tags only from its own key and its own header. A tenant cannot
 put tags on the requests of a different tenant.
@@ -70,8 +72,42 @@ and starts with a letter. A tag value has ASCII letters, digits, and
 `_ . : / @ + -` only. These rules prevent injection into a CSV export or a log
 line.
 
-In Envoy mode, the same fields are `Authentication.chargeback_tags` and
-`VirtualKey.tags` of the `llmproxy.auth` filter.
+In Envoy mode, the same fields are `Authentication.chargeback_tags`,
+`VirtualKey.tags` and `JwtProvider.claim_tags` of the `llmproxy.auth` filter.
+
+## Tags from JWT claims
+
+A JWT caller has no key metadata. To attribute its spend, map verified claims
+to tags on the JWT provider:
+
+```yaml
+auth:
+  chargeback_tags:
+    allowed:
+      - key: team
+        values: [infra, search]
+      - key: project
+  jwt:
+    - issuer: https://login.example.com/
+      # audience, jwks, tenant and user as usual
+      claim_tags:
+        - { claim: department, tag: team }
+        - { claim: cost_center, tag: project }
+```
+
+The proxy reads each `claim` from the token after it verifies the signature.
+The claim value becomes the value of `tag`. The value then goes through the
+same allow-list and limits as every other tag.
+
+- `auth.chargeback_tags` must be set, and each `tag` must be in its
+  `allowed` list. Otherwise the config does not load.
+- A `tag` can occur only one time in one provider.
+- The header cannot set a mapped tag, also when the claim is missing or the
+  proxy drops its value.
+- A claim that is not in the token is dropped as `claim_missing`. A claim that
+  is not a string, or has a character that is not valid in a tag value, is
+  dropped as `malformed`. The request is served.
+- Only top-level claims are read.
 
 ## Set tags on a key
 
@@ -116,14 +152,15 @@ each drop in `llmproxy_chargeback_tags_dropped_total` with a `reason` label:
 | `not_allowed` | The key is not in `allowed`, or the value is not in its `values`. |
 | `too_long` | The value is longer than `max_value_bytes`. |
 | `over_count` | The request has more than `max_tags` accepted tags. |
-| `malformed` | The header did not parse. The proxy drops all of its tags. |
-| `overridden` | The header set a tag key that key metadata also sets. |
+| `malformed` | The header did not parse, and the proxy drops all of its tags. Or a mapped JWT claim is not a string of valid tag value characters. |
+| `overridden` | The header set a tag key that key metadata or a JWT claim mapping also sets. |
+| `claim_missing` | A mapped JWT claim is not in the token. |
 
 A header is malformed if it has an item without `=`, an empty item, a key that
 is not valid, a value with a character that is not valid, the same key two
 times, more than 4096 bytes, or if the request has the header two times.
 
-Tag keys and values are never metric labels. Only the five `reason` values
+Tag keys and values are never metric labels. Only the six `reason` values
 make series, so many different tag values cannot increase the number of
 series.
 
@@ -135,6 +172,8 @@ series.
 - **Request records.** A request record has a `tags` object. It is empty when
   the request has no tags.
 - **Keys.** `GET /keys` and `GET /keys/{id}/spend` show the key-metadata tags.
+  Claim tags are not stored. They show only on the request record and the
+  ledger entry.
 
 ## Upgrades and downgrades
 

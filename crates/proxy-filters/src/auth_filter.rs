@@ -706,6 +706,9 @@ struct JwtProviderConfig {
     /// `max_stale` for the authenticator is `interval * STALE_AFTER_MISSED`;
     /// static providers (`None`) never go stale.
     discovery: Option<DiscoveryConfig>,
+    /// `claim_tags` as `(claim, tag)` pairs; see
+    /// [`JwtAuthenticator::with_claim_tags`].
+    claim_tags: Vec<(String, String)>,
 }
 
 /// The parsed shape of one provider's `discovery_url` /
@@ -859,9 +862,81 @@ fn parse_jwt_providers(config: &DynamicMessage) -> Result<Vec<JwtProviderConfig>
                 subject_claim,
             },
             discovery,
+            claim_tags: parse_claim_tags(msg, &base)?,
         });
     }
     Ok(out)
+}
+
+/// Reads one provider's `claim_tags`. Each claim must be named and each tag
+/// key valid and unique; [`check_claim_tags`] checks the keys against the
+/// tag policy once both are parsed.
+fn parse_claim_tags(
+    msg: &DynamicMessage,
+    base: &str,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let entries: Vec<prost_reflect::Value> = msg
+        .get_field_by_name("claim_tags")
+        .and_then(|v| v.as_list().map(<[_]>::to_vec))
+        .unwrap_or_default();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(entries.len());
+    for (j, entry) in entries.iter().enumerate() {
+        let path = format!("{base}.claim_tags[{j}]");
+        let entry = entry
+            .as_message()
+            .ok_or_else(|| invalid(&path, "must be a message"))?;
+        let field = |name: &str| {
+            entry
+                .get_field_by_name(name)
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        };
+        let (claim, tag) = (field("claim"), field("tag"));
+        if claim.is_empty() {
+            return Err(invalid(format!("{path}.claim"), "must not be empty"));
+        }
+        proxy_observability::chargeback::validate_key(&tag)
+            .map_err(|reason| invalid(format!("{path}.tag"), reason))?;
+        if let Some(first) = out.iter().position(|(_, t)| *t == tag) {
+            return Err(invalid(
+                format!("{path}.tag"),
+                format!("duplicate tag `{tag}`; already set at index {first}"),
+            ));
+        }
+        out.push((claim, tag));
+    }
+    Ok(out)
+}
+
+/// Refuses a claim tag the policy would always drop, and claim tags without
+/// a policy, which would attribute nothing (AGENTS.md invariant 1).
+fn check_claim_tags(
+    providers: &[JwtProviderConfig],
+    policy: Option<&proxy_observability::chargeback::TagPolicy>,
+) -> Result<(), ConfigError> {
+    for (i, provider) in providers.iter().enumerate() {
+        let base = format!("typed_config.jwt_providers[{i}].claim_tags");
+        if provider.claim_tags.is_empty() {
+            continue;
+        }
+        let Some(policy) = policy else {
+            return Err(invalid(
+                base,
+                "requires `chargeback_tags`; without it no tag is attributed",
+            ));
+        };
+        for (j, (_, tag)) in provider.claim_tags.iter().enumerate() {
+            if !policy.allows_key(tag) {
+                return Err(invalid(
+                    format!("{base}[{j}].tag"),
+                    format!(
+                        "tag `{tag}` is not in `chargeback_tags.allowed`, so it would always be dropped"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reads one provider's `discovery_url` / `refresh_interval_seconds` /
@@ -1143,16 +1218,19 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         tenant_credentials: credential_ring.as_ref().map(KeyRing::fingerprint),
     };
 
+    let jwt_providers = parse_jwt_providers(config)?;
+    let tag_policy = crate::chargeback_tags::parse_policy(config)?;
+    check_claim_tags(&jwt_providers, tag_policy.as_ref())?;
     Ok(AuthConfig {
         secret_bytes,
         bootstrap_keys: key_set,
         store_spec,
         poll_interval,
         max_policy_staleness,
-        jwt_providers: parse_jwt_providers(config)?,
+        jwt_providers,
         credential_ring,
         boot_inputs,
-        tag_policy: crate::chargeback_tags::parse_policy(config)?,
+        tag_policy,
     })
 }
 
@@ -1216,6 +1294,7 @@ impl HttpFilterFactory for AuthFilterFactory {
                 keys,
                 validation,
                 discovery,
+                claim_tags,
             } = provider;
             match discovery {
                 Some(d) => {
@@ -1240,7 +1319,7 @@ impl HttpFilterFactory for AuthFilterFactory {
                     jwt_snapshots.push((snapshot, None));
                 }
             }
-            jwt_validations.push(validation);
+            jwt_validations.push((validation, claim_tags));
         }
 
         if matches!(store_spec, StoreSpec::Shared { .. }) && !node_id_is_configured(ctx.node_id()) {
@@ -1465,10 +1544,13 @@ impl HttpFilterFactory for AuthFilterFactory {
         // JWT, so the first JWT provider in order decides every JWT outcome.
         let mut authenticators: Vec<Box<dyn Authenticator>> = Vec::new();
         authenticators.push(authenticator);
-        for ((snapshot, max_stale), validation) in jwt_snapshots.into_iter().zip(jwt_validations) {
+        for ((snapshot, max_stale), (validation, claim_tags)) in
+            jwt_snapshots.into_iter().zip(jwt_validations)
+        {
             authenticators.push(Box::new(
                 JwtAuthenticator::new_shared(snapshot, validation, max_stale)
-                    .with_trace_consent(Arc::clone(&trace_consent)),
+                    .with_trace_consent(Arc::clone(&trace_consent))
+                    .with_claim_tags(claim_tags),
             ));
         }
         let chain = Arc::new(AuthenticatorChain::new(authenticators));

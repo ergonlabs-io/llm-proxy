@@ -391,3 +391,165 @@ fn static_key_tags_are_a_boot_input_and_the_policy_is_not() {
     .refusal(&running)
     .is_none());
 }
+
+/// A JWT provider at `https://issuer.example` mapping `(claim, tag)` pairs.
+fn claim_tag_provider(claim_tags: &[(&str, &str)]) -> DynamicMessage {
+    let key = jwt_test_key();
+    let mut provider = jwt_provider(
+        "tenant",
+        Some("https://issuer.example"),
+        Some("llm-proxy"),
+        vec![jwt_key("key-1", &key.n_b64, &key.e_b64)],
+    );
+    let entries = claim_tags
+        .iter()
+        .map(|(claim, tag)| {
+            let mut entry = message("llmproxy.filters.v0.ClaimTag");
+            entry.set_field_by_name("claim", Value::String(claim.to_string()));
+            entry.set_field_by_name("tag", Value::String(tag.to_string()));
+            Value::Message(entry)
+        })
+        .collect();
+    provider.set_field_by_name("claim_tags", Value::List(entries));
+    provider
+}
+
+fn claim_tag_config(claim_tags: &[(&str, &str)], tags: Option<DynamicMessage>) -> DynamicMessage {
+    let mut config =
+        authentication_with_jwt(inline_secret(SECRET), vec![claim_tag_provider(claim_tags)]);
+    if let Some(tags) = tags {
+        config.set_field_by_name("chargeback_tags", Value::Message(tags));
+    }
+    config
+}
+
+/// A signed token for `tenant-j` with `extra` claims (`,"k":v` JSON text).
+fn claim_token(extra: &str) -> String {
+    jwt_bearer(&sign_test_jwt(
+        jwt_test_key(),
+        "key-1",
+        &jwt_claims(
+            "tenant-j",
+            &format!(r#","iss":"https://issuer.example","aud":"llm-proxy"{extra}"#),
+        ),
+    ))
+}
+
+/// Mapped claims set tags the header cannot override. A value outside the
+/// allow-list, a missing claim and a non-string claim are each dropped and
+/// counted, the header still cannot fill those keys, and the request is
+/// served.
+#[test]
+fn jwt_claims_set_tags_the_header_cannot_override() {
+    let (ctx, registry) = ctx_with_registry();
+    let config = claim_tag_config(
+        &[("department", "team"), ("cost_center", "project")],
+        Some(policy(
+            &[
+                ("team", &["infra", "search"]),
+                ("project", &[]),
+                ("env", &[]),
+            ],
+            true,
+            0,
+            0,
+        )),
+    );
+    let factory = AuthFilterFactory.create(&config, &ctx).unwrap();
+
+    let (got, header_kept) = send(
+        factory.as_ref(),
+        &claim_token(r#","department":"infra","cost_center":"ads""#),
+        &["team=search,project=x,env=prod"],
+    );
+    assert_eq!(
+        got,
+        tags(&[("team", "infra"), ("project", "ads"), ("env", "prod")])
+    );
+    assert!(!header_kept);
+
+    // Not allowed, and missing: the header fills neither.
+    let (got, _) = send(
+        factory.as_ref(),
+        &claim_token(r#","department":"marketing""#),
+        &["team=search,project=y"],
+    );
+    assert_eq!(got, tags(&[]));
+    // Not a string, and outside the value alphabet.
+    let (got, _) = send(
+        factory.as_ref(),
+        &claim_token(r#","department":7,"cost_center":"a b""#),
+        &[],
+    );
+    assert_eq!(got, tags(&[]));
+
+    let lines = dropped(&registry);
+    for (reason, count) in [
+        ("claim_missing", 1),
+        ("malformed", 2),
+        ("not_allowed", 1),
+        ("overridden", 4),
+    ] {
+        let want = format!("reason=\"{reason}\"");
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&want))
+            .unwrap_or_else(|| panic!("no {reason} series in {lines:?}"));
+        assert!(line.ends_with(&format!(" {count}")), "{line}");
+    }
+    let rendered = proxy_observability::stats::prometheus_render::render(&registry);
+    assert!(!rendered.contains("marketing"), "{rendered}");
+}
+
+/// A claim value over `max_value_bytes` is dropped by the policy's own cap.
+#[test]
+fn an_over_long_claim_value_is_dropped_as_too_long() {
+    let (ctx, registry) = ctx_with_registry();
+    let config = claim_tag_config(
+        &[("cost_center", "project")],
+        Some(policy(&[("project", &[])], false, 0, 4)),
+    );
+    let factory = AuthFilterFactory.create(&config, &ctx).unwrap();
+    let (got, _) = send(
+        factory.as_ref(),
+        &claim_token(r#","cost_center":"abcde""#),
+        &[],
+    );
+    assert_eq!(got, tags(&[]));
+    assert!(dropped(&registry)
+        .iter()
+        .any(|l| l.contains("reason=\"too_long\"") && l.ends_with(" 1")));
+}
+
+#[test]
+fn malformed_claim_tags_are_rejected_with_their_field_path() {
+    let allowed = || Some(policy(&[("team", &[])], false, 0, 0));
+    let cases: Vec<(DynamicMessage, &str)> = vec![
+        (
+            claim_tag_config(&[("department", "team")], None),
+            "typed_config.jwt_providers[0].claim_tags",
+        ),
+        (
+            claim_tag_config(&[("department", "owner")], allowed()),
+            "typed_config.jwt_providers[0].claim_tags[0].tag",
+        ),
+        (
+            claim_tag_config(&[("department", "Team")], allowed()),
+            "typed_config.jwt_providers[0].claim_tags[0].tag",
+        ),
+        (
+            claim_tag_config(&[("", "team")], allowed()),
+            "typed_config.jwt_providers[0].claim_tags[0].claim",
+        ),
+        (
+            claim_tag_config(&[("department", "team"), ("group", "team")], allowed()),
+            "typed_config.jwt_providers[0].claim_tags[1].tag",
+        ),
+    ];
+    for (config, want) in cases {
+        match parse_config(&config) {
+            Err(ConfigError::InvalidValue { field_path, .. }) => assert_eq!(field_path, want),
+            other => panic!("{want}: expected InvalidValue, got {other:?}"),
+        }
+    }
+}

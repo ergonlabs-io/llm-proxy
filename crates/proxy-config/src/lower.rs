@@ -615,7 +615,9 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "refresh_interval_seconds",
             "trusted_ca",
             "subject_claim",
+            "claim_tags",
         ],
+        "llmproxy.filters.v0.ClaimTag" => &["claim", "tag"],
         "llmproxy.filters.v0.JwtKey" => &["kid", "n", "e"],
         // The owned token-budget shape.  Keep both fields
         // here even though the factory performs the required/value checks:

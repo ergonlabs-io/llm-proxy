@@ -77,7 +77,7 @@ Downstream authentication. Exactly one of `hmac_secret` / `hmac_secret_file` is 
 | `max_policy_staleness` | [Duration](#duration) | no | `4m` | How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`. |
 | `stored_output_owner_ttl` | [Duration](#duration) | no | `720h` | How long the proxy keeps the owner of a stored response (`/v1/responses`) or a stored chat completion (`/v1/chat/completions` with `store: true`). These are created by inference requests, so their owners expire rather than accumulate. After the TTL the object is refused to every tenant, its creator included, until `PUT /tenants/{id}/objects/{object_id}` assigns it again; set it to at least the provider's retention. Whole seconds, at least `1s`. A load error with `enforce.object_ownership: false`, which omits the filter that reads it. |
 | `jwt` | array of [AuthJwtProvider](#authjwtprovider) | no | `[]` | JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. JWT callers always use the operator's provider keys, never a tenant's stored provider credentials, so lowering warns when `tenant_credentials` is also set. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning. |
-| `chargeback_tags` | [ChargebackTags](#chargebacktags) | no | none | Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A tag key that key metadata sets is never taken from the header, so a client cannot override the admin. A JWT caller has no key metadata and gets header tags only. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget. |
+| `chargeback_tags` | [ChargebackTags](#chargebacktags) | no | none | Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A JWT caller's tags come from the verified claims its provider maps (`jwt[].claim_tags`) instead of key metadata. A tag key that key metadata or a claim mapping sets is never taken from the header, so a client cannot override the admin or the identity provider. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget. |
 
 Any other field is a load error.
 
@@ -324,7 +324,7 @@ Any other field is a load error.
 
 Used at: `auth.jwt[]`.
 
-One JWT issuer. Every field is required.
+One JWT issuer. Every field except `claim_tags` is required.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -333,6 +333,7 @@ One JWT issuer. Every field is required.
 | `jwks` | [AuthJwtJwks](#authjwtjwks) | yes | none | Where the issuer's signing keys come from: exactly one of `discovery_url` or `keys`. |
 | `tenant` | [AuthJwtTenant](#authjwttenant) | yes | none | Which claim names the tenant, and which claim values are admitted as which tenant. |
 | `user` | [AuthJwtUser](#authjwtuser) | yes | none | Which claim names the user. |
+| `claim_tags` | array of [AuthJwtClaimTag](#authjwtclaimtag) | no | none | Verified claims that set chargeback tags, so the identity provider, not the client, sets a JWT caller's attribution. Requires `auth.chargeback_tags`. A tag set here is never taken from the `x-cost-tags` header. A claim that is missing, or is not a string of tag value characters, sets no tag: the tag is dropped and counted in `envoy_llmproxy_chargeback_tags_dropped_total` (`claim_missing` or `malformed`), and the request is not refused. The allow-list and caps of `auth.chargeback_tags` apply to claim values as to every tag. |
 
 Any other field is a load error.
 
@@ -340,7 +341,7 @@ Any other field is a load error.
 
 Used at: `auth.chargeback_tags`.
 
-The operator's chargeback-tag allow-list and caps. Tags that fail it are dropped and counted by reason: `not_allowed` (key not listed, or value not one of its `values`), `too_long` (over `max_value_bytes`), `over_count` (over `max_tags`; key-metadata tags fill the cap first), `malformed` (the header did not parse; all its tags are dropped and the request is still served) and `overridden` (the header set a key that key metadata sets).
+The operator's chargeback-tag allow-list and caps. Tags that fail it are dropped and counted by reason: `not_allowed` (key not listed, or value not one of its `values`), `too_long` (over `max_value_bytes`), `over_count` (over `max_tags`; key-metadata tags fill the cap first), `malformed` (the header did not parse, and all its tags are dropped; or a mapped JWT claim is not a string of tag value characters), `overridden` (the header set a key that key metadata or a JWT claim mapping sets) and `claim_missing` (a mapped JWT claim is not in the token). A dropped tag never refuses the request.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -598,6 +599,19 @@ Which claim names the user.
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `claim` | string; minimum length 1 | yes | none | The claim whose string value names the user, for example Entra's `oid` or `sub`. A token without it is refused. The user id is `jwt:<issuer>:<tenant>:<value>`; per-user key policy, budget and limits apply when a key with that id is minted under the same tenant (`POST /keys`), and only narrow the tenant. Examples: `oid`. |
+
+Any other field is a load error.
+
+## `AuthJwtClaimTag`
+
+Used at: `auth.jwt[].claim_tags[]`.
+
+One claim-to-tag mapping.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `claim` | string; minimum length 1 | yes | none | The top-level claim whose string value becomes the tag value. Examples: `department`. |
+| `tag` | string; pattern `^[a-z][a-z0-9_.-]{0,63}$` | yes | none | The tag key. Must be in `auth.chargeback_tags.allowed`, and may appear once per provider. Examples: `team`. |
 
 Any other field is a load error.
 
