@@ -88,8 +88,10 @@ differently.
   the model from the body after it chooses a first route, so a request can
   match no route at first and reach a provider later.
 - A request that no budget applies to is not refused and logs nothing.
-- A budget applies only when its credential scope matches the request
-  (`credential_source`). A refused request adds nothing to any budget.
+- A tenant budget applies only when its credential scope matches the request
+  (`credential_source`). A key budget applies to requests on the platform
+  credential, and to requests on the tenant's own key only with
+  `include_byok_in_limit: true`. A refused request adds nothing to any budget.
 
 Each refusal increments
 `llmproxy_unmetered_endpoint_refused_total{endpoint, control}`. `control` is
@@ -226,6 +228,10 @@ curl -X PUT http://127.0.0.1:9901/keys/alice-laptop/budget \
   -d '{"schema_version":2,"budget":{"max_usd":"100.00","period":"monthly"}}'
 ```
 
+Add `"include_byok_in_limit":true` to the budget to also count spend on the
+tenant's own provider key. The default is `false`. See
+[Tenant provider credentials](../../authentication/tenant-provider-credentials/#budgets).
+
 `{"budget":null}` clears the ceiling. `GET /keys/{id}/spend` returns that
 key's ledger and `GET /keys` lists policies without exposing secrets. Both
 reads require admin authorization. Use `/chains/{stat_prefix}/...` when
@@ -284,12 +290,14 @@ does not infer it.
 A tenant budget stays enforced after the cutover. The filter reads the cutover
 value only when it starts, and the value does not disable a tenant budget.
 `PUT /tenants/{id}/budget` sets or clears a tenant budget with the same body as
-a key budget. `GET /tenants/{id}/spend` returns the tenant ledger. The ledger
+a key budget, except that it takes `credential_source` instead of
+`include_byok_in_limit`. `GET /tenants/{id}/spend` returns the tenant ledger. The ledger
 adds the spend of every key of the tenant, in the tenant budget's own period.
 
 A request gets `429` when its key ceiling or its tenant ceiling is reached.
 Clearing one ceiling does not change the spend or the ceiling of the other. A
-budget counts only the requests in its credential scope; see
+tenant budget counts only the requests in its credential scope, and a key
+budget counts BYOK requests only with `include_byok_in_limit`; see
 [Budgets](../../authentication/tenant-provider-credentials/#budgets).
 `%RESPONSE_CODE_DETAILS%` shows `spend_budget_exceeded` for the `429`.
 

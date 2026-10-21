@@ -113,7 +113,13 @@ pub fn parse_budget(body: &[u8]) -> Result<Option<(u64, String)>, u16> {
     let Some(spec) = request.budget else {
         return Ok(None);
     };
-    let budget = super::budget_from_spec(spec).map_err(|response| response.status().as_u16())?;
-    let micros = budget.max_micros.as_micros();
+    // The key form is the one that names `include_byok_in_limit`.
+    let micros = if spec.include_byok_in_limit.is_some() {
+        super::key_budget_from_spec(spec).map(|budget| budget.max_micros)
+    } else {
+        super::budget_from_spec(spec).map(|budget| budget.max_micros)
+    }
+    .map_err(|response| response.status().as_u16())?
+    .as_micros();
     Ok(Some((micros, super::render_micro_usd(micros))))
 }

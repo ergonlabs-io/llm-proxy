@@ -32,6 +32,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
     trace lines, so no schema version changes. It is always `null`.
   - The `proxy-capture-spool` crate stays, with its on-disk format unchanged:
     the billing ledger is built on it.
+- A key budget counts operator spend, and BYOK spend too with
+  `include_byok_in_limit: true`, as on OpenRouter (WP-136, ADR-0007
+  amendment 1). Tenant budgets keep their `credential_source` scope.
+  - `PUT /keys/{id}/budget` takes `include_byok_in_limit` (default `false`)
+    and returns `400` for `credential_source`. `PUT /tenants/{id}/budget`
+    returns `400` for `include_byok_in_limit`.
+  - `GET /keys` (in each `budget`) and `GET /keys/{id}/spend` report
+    `include_byok_in_limit` instead of `credential_source`.
+  - Stored key budgets load with a mapping, so none stops counting what it
+    counted: absent or `platform` becomes `false`; `tenant` becomes `true`,
+    so it now also counts platform spend and applies to platform-mode
+    requests.
+  - A rollback to an earlier build reads a key budget written by this build
+    as platform-scoped.
 
 ### Added
 
