@@ -84,8 +84,34 @@ pub const DEFAULT_GROUP_COMMIT_MAX_ENTRIES: usize = 512;
 pub const MAX_GROUP_COMMIT_ENTRIES: usize = 4096;
 pub const DEFAULT_GROUP_COMMIT_INTERVAL: Duration = Duration::from_millis(50);
 /// An entry larger than this is not written; it is counted as lost. Entries
-/// carry bounded record fields, so reaching it means a producer bug.
+/// carry bounded record fields, so reaching it means a producer bug. A small
+/// `max_disk_bytes` lowers the limit further (`max_entry_bytes`); the spool
+/// still reads entries up to this size.
 pub const MAX_ENTRY_BYTES: usize = 1024 * 1024;
+
+/// The most entry bytes the writer appends and commits in one spool
+/// transaction: a sixteenth of `max_disk_bytes`. A commit refused at the cap
+/// stays pending until an acknowledgement makes room, and the spool's file
+/// grows only by doubling, so at its cap an empty spool holds as little as
+/// half of `max_disk_bytes`. A pending commit larger than that is refused after
+/// every acknowledgement, and admissions never resume.
+///
+/// Within the bound, one acknowledgement of everything committed is enough:
+/// redb frees the deleted rows' pages in a pass right after the
+/// acknowledgement publishes, so the pending commit can use them.
+/// `proxy-capture-spool`'s
+/// `a_sixteenth_of_the_ceiling_refused_at_it_commits_after_one_full_acknowledgement`
+/// pins this against a spool packed by one-row commits.
+fn max_batch_bytes(max_disk_bytes: u64) -> usize {
+    usize::try_from(max_disk_bytes / 16).unwrap_or(usize::MAX)
+}
+
+/// The largest entry this ledger writes. An entry above the commit bound
+/// could never commit at the cap and would hold every entry behind it, so it
+/// is counted lost (`oversize`) instead.
+fn max_entry_bytes(max_disk_bytes: u64) -> usize {
+    MAX_ENTRY_BYTES.min(max_batch_bytes(max_disk_bytes))
+}
 
 /// `node.metadata["io.llmproxy.ledger"]`, or the dialect's `ledger` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +139,8 @@ const UNLEDGERED_WARN_INTERVAL_SECS: u64 = 5;
 
 /// How often an idle writer looks at the stop flag.
 const IDLE_POLL: Duration = Duration::from_millis(100);
+/// How often the writer repeats the error for entries it cannot write.
+const OVERSIZE_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The terminal record and its charge, before the writer numbers it.
 struct Pending {
@@ -648,6 +676,10 @@ mod writer {
             epoch,
             next_seq: 0,
             max_batch: config.group_commit_max_entries,
+            max_batch_bytes: max_batch_bytes(config.max_disk_bytes),
+            max_entry_bytes: max_entry_bytes(config.max_disk_bytes),
+            oversize_warned_at: None,
+            oversize_suppressed: 0,
             interval: config.group_commit_interval,
             uncommitted: 0,
             uncommitted_spend: 0,
@@ -778,6 +810,13 @@ mod writer {
         epoch: u64,
         next_seq: u64,
         max_batch: usize,
+        /// The most entry bytes one spool transaction appends and commits.
+        max_batch_bytes: usize,
+        /// Larger entries are counted lost, with a throttled error.
+        max_entry_bytes: usize,
+        oversize_warned_at: Option<Instant>,
+        /// Oversize entries since the last error line.
+        oversize_suppressed: usize,
         interval: Duration,
         /// Appended to the spool, not yet committed. Their slots are held.
         uncommitted: usize,
@@ -1034,12 +1073,12 @@ mod writer {
             // not numbered, so `seq` stays gapless.
             let first_seq = self.next_seq;
             let mut payloads = Vec::with_capacity(batch.len());
+            let mut spends = Vec::with_capacity(batch.len());
             let mut oversize = 0;
-            let mut spend = 0u64;
             batch.retain_mut(|entry| {
                 entry.seq = self.next_seq;
                 let bytes = serde_json::to_vec(&*entry).expect("ledger entries serialize");
-                if bytes.len() > MAX_ENTRY_BYTES {
+                if bytes.len() > self.max_entry_bytes {
                     oversize += 1;
                     return false;
                 }
@@ -1047,49 +1086,91 @@ mod writer {
                 // Only a charge the spend filter made is a spend charge
                 // (ADR-0009 decision 7); a list price on an unbudgeted route
                 // is not.
-                if !entry.charged_scopes.is_empty() {
-                    spend = spend.saturating_add(entry.charged_micro_usd);
-                }
+                spends.push(if entry.charged_scopes.is_empty() {
+                    0
+                } else {
+                    entry.charged_micro_usd
+                });
                 payloads.push(bytes);
                 true
             });
             if oversize > 0 {
-                self.ledger.stats.lost(LostReason::Oversize, oversize);
-                self.ledger.release(oversize);
-                tracing::error!(
-                    entries = oversize,
-                    max_bytes = MAX_ENTRY_BYTES,
-                    "billing ledger entries exceed the entry size limit and were not written"
-                );
+                self.lost_oversize(oversize);
             }
-            let views: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-            #[cfg(test)]
-            let appended = if self.hooks.take_refused_append() {
-                Err(SpoolError::Full)
-            } else {
-                self.spool.append_batch(&views)
-            };
-            #[cfg(not(test))]
-            let appended = self.spool.append_batch(&views);
-            match appended {
-                Ok(results) => {
-                    if let Some(Err(error)) = results.into_iter().find(Result::is_err) {
-                        return Err(error);
-                    }
-                    self.uncommitted += payloads.len();
-                    self.uncommitted_spend = self.uncommitted_spend.saturating_add(spend);
-                    batch.clear();
+            // In chunks of at most `max_batch_bytes`, each appended and
+            // committed whole. `batch` keeps only what is not yet appended.
+            let mut written = 0;
+            while written < payloads.len() {
+                let mut end = written + 1;
+                let mut bytes = payloads[written].len();
+                while end < payloads.len() && bytes + payloads[end].len() <= self.max_batch_bytes {
+                    bytes += payloads[end].len();
+                    end += 1;
                 }
-                Err(SpoolError::Full) => {
-                    // Nothing was appended: give the numbers back.
-                    self.next_seq = first_seq;
-                    self.at_cap();
+                let views: Vec<&[u8]> = payloads[written..end].iter().map(Vec::as_slice).collect();
+                #[cfg(test)]
+                let appended = if self.hooks.take_refused_append() {
+                    Err(SpoolError::Full)
+                } else {
+                    self.spool.append_batch(&views)
+                };
+                #[cfg(not(test))]
+                let appended = self.spool.append_batch(&views);
+                match appended {
+                    Ok(results) => {
+                        if let Some(Err(error)) = results.into_iter().find(Result::is_err) {
+                            return Err(error);
+                        }
+                        self.uncommitted += end - written;
+                        self.uncommitted_spend = spends[written..end]
+                            .iter()
+                            .fold(self.uncommitted_spend, |sum, s| sum.saturating_add(*s));
+                        batch.drain(..end - written);
+                    }
+                    Err(SpoolError::Full) => {
+                        // Nothing of this chunk was appended: give its numbers
+                        // and the rest's back.
+                        self.next_seq = first_seq + written as u64;
+                        self.at_cap();
+                        self.backlog.extend(batch.drain(..));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+                written = end;
+                if !self.commit()? {
+                    // This chunk stays pending in the spool; the rest is held
+                    // unnumbered.
+                    self.next_seq = first_seq + written as u64;
                     self.backlog.extend(batch.drain(..));
                     return Ok(());
                 }
-                Err(error) => return Err(error),
             }
-            self.commit().map(|_| ())
+            Ok(())
+        }
+
+        /// Count entries over `max_entry_bytes` lost. The error repeats at
+        /// most every `OVERSIZE_WARN_INTERVAL`, naming how many were lost
+        /// since the last line; the counter counts every one.
+        fn lost_oversize(&mut self, entries: usize) {
+            self.ledger.stats.lost(LostReason::Oversize, entries);
+            self.ledger.release(entries);
+            self.oversize_suppressed += entries;
+            let now = Instant::now();
+            if self
+                .oversize_warned_at
+                .is_some_and(|at| now.duration_since(at) < OVERSIZE_WARN_INTERVAL)
+            {
+                return;
+            }
+            tracing::error!(
+                entries = self.oversize_suppressed,
+                max_bytes = self.max_entry_bytes,
+                "billing ledger entries exceed the entry size limit and were not written; \
+                 llmproxy_ledger_entries_lost_total{{reason=\"oversize\"}} counts every one"
+            );
+            self.oversize_warned_at = Some(now);
+            self.oversize_suppressed = 0;
         }
 
         /// Commit what is appended. `Ok(false)`: refused at the disk cap; the

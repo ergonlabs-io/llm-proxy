@@ -94,6 +94,22 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
   buffer response bytes.
 
+## [0.6.1] - 2026-10-20
+
+### Fixed
+
+- A billing ledger at its `max_disk_bytes` cap could stay closed after the
+  consumer acknowledged every entry. One group commit can be larger than the
+  spool holds at its cap. That commit was refused and retried whole after each
+  acknowledgement, so admissions never resumed and the held entries were lost
+  at shutdown. The writer now commits in chunks of at most 1/16 of
+  `max_disk_bytes`. The risk was highest at small caps with large entries.
+- One billing-ledger entry too large for the spool at its cap had the same
+  effect, even when every other entry was acknowledged. An entry larger than
+  1/16 of `max_disk_bytes` (128 KiB at the 2 MiB minimum) is now not written.
+  It is counted in `llmproxy_ledger_entries_lost_total{reason="oversize"}`, as
+  entries over 1 MiB already were. The error log for these entries now repeats
+  at most once every 5 seconds.
 
 ## [0.6.0] - 2026-10-20
 

@@ -583,3 +583,116 @@ fn a_batch_refused_at_the_cap_gives_its_seq_numbers_back() {
         .collect();
     assert_eq!(shape, expected);
 }
+
+/// One group commit can hold more entries than the spool at its cap has room
+/// for even with every committed entry acknowledged: a minimum-size spool
+/// holds about 1 MiB. Committed whole, a refused batch stayed pending and was
+/// refused again after every acknowledgement, so admissions never resumed.
+/// The writer commits in chunks bounded by the disk cap instead, so what a
+/// refusal leaves pending fits once the consumer has acknowledged; its
+/// "acknowledge until admitting" loop drains everything, and nothing is lost.
+#[test]
+fn a_group_commit_larger_than_the_disk_cap_still_drains() {
+    const BATCH: usize = 128;
+    let dir = TempLedgerDir::new();
+    let mut config = dir.config(BATCH, OnUnavailable::Reject);
+    config.max_disk_bytes = proxy_capture_spool::MIN_DISK_BYTES;
+    // The batch closes on its size, never on the timer, so all of it is one
+    // group commit.
+    config.group_commit_max_entries = BATCH;
+    config.group_commit_interval = Duration::from_secs(600);
+    let mut ledger = TempLedger::open_with(dir, config);
+    let padding = "x".repeat(12 * 1024);
+    let slots: Vec<_> = (0..BATCH).map(|_| reserve(&ledger.ledger)).collect();
+    for (i, slot) in slots.into_iter().enumerate() {
+        let mut rec = numbered(i);
+        rec.route = padding.clone();
+        slot.append(rec, LedgerCharge::default());
+    }
+    // The writer answers in arrival order, so this read follows the batch.
+    ledger.ledger.read_committed(0, 1, ASK).unwrap();
+    assert_eq!(
+        admit(&ledger.ledger).err(),
+        Some(Unavailable::DiskFull),
+        "the batch did not reach the cap; make it larger"
+    );
+
+    let mut acked = 0;
+    let mut pulled = Vec::new();
+    let mut rounds = 0;
+    loop {
+        let page = ledger.ledger.read_committed(acked, 1000, ASK).unwrap();
+        let through = page.entries.last().map_or(acked, |e| e.cursor);
+        pulled.extend(page.entries.into_iter().map(|e| e.entry.seq));
+        let ack = ledger.ledger.acknowledge(through, ASK).expect("ack");
+        acked = through;
+        if ack.admitting {
+            break;
+        }
+        rounds += 1;
+        assert!(
+            rounds < 32,
+            "never resumed admitting with everything acknowledged ({} of {BATCH} read)",
+            pulled.len()
+        );
+    }
+    pulled.extend(ledger.entries().into_iter().map(|e| e.seq));
+    assert_eq!(pulled, (0..BATCH as u64).collect::<Vec<_>>());
+    let scrape = ledger.scrape();
+    assert_eq!(
+        counter(&scrape, "envoy_llmproxy_ledger_entries_committed_total"),
+        BATCH as u64
+    );
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"shutdown\"}"
+        ),
+        0
+    );
+}
+
+/// An entry larger than one commit may hold at a small disk cap can never
+/// commit there, even into an empty spool. Held pending, it closed admission
+/// for good, with every entry behind it held too. It is counted lost
+/// (`oversize`) instead, and the entries after it are written. The entry is
+/// under `MAX_ENTRY_BYTES`, so only the cap makes it unwritable.
+#[test]
+fn an_entry_that_can_never_fit_the_disk_cap_is_lost_not_held() {
+    let dir = TempLedgerDir::new();
+    let mut config = dir.config(8, OnUnavailable::Reject);
+    config.max_disk_bytes = proxy_capture_spool::MIN_DISK_BYTES;
+    let mut ledger = TempLedger::open_with(dir, config);
+    let mut huge = numbered(0);
+    huge.route = "x".repeat(900 * 1024);
+    reserve(&ledger.ledger).append(huge, LedgerCharge::default());
+    reserve(&ledger.ledger).append(numbered(1), LedgerCharge::default());
+    // The writer answers in arrival order, so this read follows both entries.
+    ledger.ledger.read_committed(0, 1, ASK).unwrap();
+    assert!(
+        matches!(admit(&ledger.ledger), Ok(LedgerTicket::Reserved(_))),
+        "admission stays open"
+    );
+
+    let shape: Vec<(u64, String)> = ledger
+        .entries()
+        .into_iter()
+        .map(|e| (e.seq, e.record.event_id))
+        .collect();
+    assert_eq!(shape, [(0, "event-1".to_owned())], "seq stays gapless");
+    let scrape = ledger.scrape();
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"oversize\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        counter(
+            &scrape,
+            "envoy_llmproxy_ledger_entries_lost_total{reason=\"shutdown\"}"
+        ),
+        0
+    );
+}
