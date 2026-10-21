@@ -1317,26 +1317,27 @@ async fn overall_timeout_wins_over_a_retry_budget_the_per_try_timeout_would_othe
 
 #[tokio::test(flavor = "current_thread")]
 async fn per_try_timeout_is_armed_fresh_for_every_attempt() {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         LocalSet::new()
             .run_until(async {
-                // Both attempts individually take ~35ms to answer -- just
-                // under the 50ms per-try limit. If the per-try timer were
+                // Each attempt takes ~300ms to answer, under the 500ms
+                // per-try limit with 200ms to spare, so a loaded box does not
+                // push one attempt past it. If the per-try timer were
                 // (incorrectly) armed once at the start of the whole attempt
                 // loop instead of fresh per attempt, attempt 2 would inherit
-                // attempt 1's already-elapsed time and the combined ~70ms
-                // would blow the 50ms budget, timing out. Both attempts
+                // attempt 1's elapsed time, and the combined ~600ms (only ever
+                // more under load) would blow the 500ms budget. Both attempts
                 // proceeding to a final 200 proves the timer resets per
                 // attempt.
                 let (addr, count) =
-                    spawn_upstream_answers_after_delay_then_fails_first(Duration::from_millis(35))
+                    spawn_upstream_answers_after_delay_then_fails_first(Duration::from_millis(300))
                         .await;
                 let router = build_router(
                     addr,
                     forward_to_up(Some(retry_policy_with_per_try_timeout(
                         "5xx",
                         1,
-                        Duration::from_millis(50),
+                        Duration::from_millis(500),
                     ))),
                 )
                 .await;
