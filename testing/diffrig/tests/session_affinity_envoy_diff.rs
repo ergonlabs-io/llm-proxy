@@ -101,17 +101,28 @@ static_resources:
     )
 }
 
-async fn wait_listening(address: std::net::SocketAddr) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+/// Docker's port forward accepts TCP before Envoy listens, so readiness is
+/// Envoy's own log line, as in `ext_authz_e2e.rs`.
+async fn wait_for_envoy(container: &str) {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if tokio::net::TcpStream::connect(address).await.is_ok() {
+            let logs = std::process::Command::new("docker")
+                .args(["logs", container])
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&logs.stdout),
+                String::from_utf8_lossy(&logs.stderr)
+            );
+            if text.contains("starting main dispatch loop") {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("Envoy listener did not come up");
+    .expect("Envoy did not start");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -180,7 +191,7 @@ async fn envoy_v138_and_llm_proxy_pick_the_same_member_per_session() {
     );
     let _envoy = Container(String::from_utf8(output.stdout).unwrap().trim().to_owned());
     let envoy_addr = format!("127.0.0.1:{envoy_port}").parse().unwrap();
-    wait_listening(envoy_addr).await;
+    wait_for_envoy(&_envoy.0).await;
 
     // Which upstream served one request through `addr`, read from the
     // upstreams' own logs rather than from either proxy.
@@ -194,8 +205,8 @@ async fn envoy_v138_and_llm_proxy_pick_the_same_member_per_session() {
                     addr,
                     "POST",
                     "/v1/chat/completions",
-                    &[("x-session-affinity", session.as_str())],
-                    &json!({ "model": "gpt-mock", "messages": [] }),
+                    &[("host", "affinity"), ("x-session-affinity", session.as_str())],
+                    &json!({ "model": "gpt-mock", "messages": [{ "role": "user", "content": "hi" }] }),
                 ),
             )
             .await
@@ -211,17 +222,29 @@ async fn envoy_v138_and_llm_proxy_pick_the_same_member_per_session() {
     };
 
     // Envoy may answer 503 for a moment while STRICT_DNS resolves.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let mut last = (0, String::new());
+    let probe = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let res = send_json(envoy_addr, "POST", "/v1/chat/completions", &[], &json!({})).await;
+            let res = send_json(
+                envoy_addr,
+                "POST",
+                "/v1/chat/completions",
+                &[("host", "affinity")],
+                &json!({ "model": "gpt-mock", "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            last = (res.status, format!("{:?} {}", res.headers, res.body));
             if res.status == 200 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("Envoy never reached the upstreams");
+    .await;
+    assert!(
+        probe.is_ok(),
+        "Envoy never reached the upstreams; last answer {last:?}"
+    );
 
     let mut members = std::collections::BTreeSet::new();
     for i in 0..40 {
