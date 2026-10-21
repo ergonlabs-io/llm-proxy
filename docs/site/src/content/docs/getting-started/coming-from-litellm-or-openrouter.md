@@ -37,7 +37,8 @@ Anthropic Messages request to an Anthropic provider.
 | `timeout` | `routes[].idle_timeout` | Default 90s. It measures time with no bytes flowing. There is no total-duration timeout by default. |
 | `simple-shuffle` with weights | `weight` on the providers of a `models` entry | The first provider is picked in proportion to weight. |
 | Sticky routing for prompt caching | `models.<name>.session_affinity` | Pins a session to one provider of a weighted model. |
-| `least-busy`, `latency-based-routing`, cost-based routing | None | Cost-aware selection is not supported. |
+| `latency-based-routing` | `selection: latency` on a weighted `models` entry | A slower provider gets less traffic. Each replica measures latency on its own. |
+| `least-busy`, cost-based routing | None | Cost-aware selection is not supported. |
 | Cooldown of a failing deployment | `providers.<name>.outlier_detection` | Ejection is per proxy process. |
 | `max_parallel_requests` | `limits[].concurrent_sessions`, and `providers.<name>.circuit_breakers` | The first counts streams for each bucket. The second caps requests to one provider. |
 | Virtual keys | `auth.keys`, or keys minted through the admin API | A key belongs to a tenant. Create a key with `--mode keygen` or the admin API. |

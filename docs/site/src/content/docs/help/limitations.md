@@ -45,7 +45,7 @@ Use the status words this way:
 
 | Gap | Status | What happens today | Workaround |
 |---|---|---|---|
-| Cost-based or latency-based routing | Not built | Failover is ordered. A `models` entry with `weight` splits first picks by fixed weights, not by cost or speed. | Order providers or set weights yourself. See [Load balancing](/docs/llm-proxy/providers-and-routing/load-balancing/). |
+| Cost-based routing | Not built | Failover is ordered. A `models` entry with `weight` splits first picks by weight. With `selection: latency`, the proxy also scales the weights by measured latency. It never uses cost. | Order providers or set weights yourself. See [Load balancing](/docs/llm-proxy/providers-and-routing/load-balancing/). |
 | Nested fallback chains | Not built | A chain has one level. | Put all fallbacks in one list. |
 | Replay after a stream starts | By design | The proxy never replays a request after bytes reach the client. | Retry in the client. |
 | Retry rules | Partly built | `routes[].retries.attempts` sets the count, from 0 to 5. The trigger set is fixed: connection failure, refused stream, reset before any response byte, and the statuses `429`, `500`, `502`, `503`. | None in the `--config` file. See [Timeouts and retries](/docs/llm-proxy/providers-and-routing/timeouts-and-retries/). |

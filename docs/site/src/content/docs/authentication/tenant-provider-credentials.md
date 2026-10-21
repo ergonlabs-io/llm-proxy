@@ -398,18 +398,59 @@ Records leave the proxy only when you start it with `--request-records-file`.
 
 ## Budgets
 
-Each spend budget has one credential scope, `platform` or `tenant`. A budget
-is enforced and charged only for requests in its scope.
+Key budgets and tenant budgets count credential sources differently. Both
+levels are enforced when both are set.
+
+- A subject with no budget records all of its spend, in both modes.
+- A subject with a budget records only the spend that the budget counts. Its
+  spend report shows that spend only.
+
+### Key budgets: `include_byok_in_limit`
+
+A key budget follows OpenRouter's `include_byok_in_limit` model (ADR-0007
+amendment 1):
+
+- A key budget always counts spend on the platform credential, and always
+  applies to platform-mode requests.
+- With `include_byok_in_limit: true`, it also counts spend on the tenant's own
+  key, and also applies to tenant-mode requests.
+- With `include_byok_in_limit: false` (the default), tenant-mode requests are
+  not limited by the key budget, and their spend is not recorded against it.
+
+```sh
+curl --max-time 10 -X PUT \
+  -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"budget":{"max_usd":"10.00","period":"monthly","include_byok_in_limit":true}}' \
+  http://127.0.0.1:9901/keys/acme-laptop/budget
+```
+
+A key budget body that sets `credential_source` returns `400` and stores
+nothing. The key listing (`GET /keys`) returns `include_byok_in_limit` inside
+each `budget` object, and `budget` is `null` when the key has no budget.
+`GET /keys/{id}/spend` returns it at the top level. It is `null` when there is
+no budget.
+
+Key budgets stored before `include_byok_in_limit` existed had one
+`credential_source` scope. They load with this mapping, so a budget never
+stops counting what it counted before:
+
+| Stored scope | Loads as | Change |
+|---|---|---|
+| absent (before scopes) | `include_byok_in_limit: false` | None. |
+| `platform` | `include_byok_in_limit: false` | None. |
+| `tenant` | `include_byok_in_limit: true` | It now also counts platform spend and applies to platform-mode requests. |
+
+### Tenant budgets: `credential_source`
+
+Each tenant budget has one credential scope, `platform` or `tenant`. A tenant
+budget is enforced and charged only for requests in its scope.
 
 - A **platform-scoped** budget applies to platform-mode requests. In tenant
   mode the budget is ignored. It sets no ceiling and records no spend.
 - A **tenant-scoped** budget applies to tenant-mode requests only.
-- A subject with no budget records all of its spend, in both modes.
-- A subject with a budget records only the spend in the budget's scope. Its
-  spend report shows that scope only.
 
-The admin API sets the scope. Send `credential_source` with the budget. The
-tenant and key budget routes take the same body:
+Send `credential_source` with the budget:
 
 ```sh
 curl --max-time 10 -X PUT \
@@ -421,16 +462,15 @@ curl --max-time 10 -X PUT \
 
 `credential_source` takes `"platform"` or `"tenant"`. Leave it out for
 `platform`, which keeps the meaning that existing budgets had. Any other value
-returns `400` and stores nothing. The `400` message does not echo the value.
+returns `400` and stores nothing. The `400` message does not echo the value. A
+tenant budget body that sets `include_byok_in_limit` also returns `400`.
 
-The scope shows in three places. The key listing (`GET /keys`) returns it inside
-each `budget` object, and `budget` is `null` when the key has no budget. Both
-spend reads, `GET /tenants/{id}/spend` and `GET /keys/{id}/spend`, return it at
-the top level. It is `null` when there is no budget.
+`GET /tenants/{id}/spend` returns the scope at the top level. It is `null` when
+there is no budget.
 
-A tenant with a platform-scoped budget and its own stored key is not limited
-by that budget. Its tenant-mode spend is not recorded against it. Budget rows
-written before the scope existed read as platform-scoped.
+A tenant with a platform-scoped tenant budget and its own stored key is not
+limited by that budget. Its tenant-mode spend is not recorded against it.
+Budget rows written before the scope existed read as platform-scoped.
 
 ## Limitations
 
@@ -472,7 +512,9 @@ written before the scope existed read as platform-scoped.
 - **Rollback.** A build from before budget scopes has no scope field. It
   ignores `credential_source` on a budget row. It then applies that budget to
   all traffic, and charges all spend to it. Remove tenant-scoped budgets before
-  a rollback.
+  a rollback. A build from before `include_byok_in_limit` ignores the flag on a
+  key budget row and reads the budget as platform-scoped. It then stops
+  counting BYOK spend for a key that set the flag.
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
@@ -586,13 +628,18 @@ above.
   `tenant_credential_with_vertex_or_bedrock_is_a_hard_error`,
   `tenant_credential_unknown_key_names_the_full_dotted_path`, and
   `tenant_credential_slot_alone_lowers_to_provider_runtime`.
-- Admin routes: `put_tenant_credential_inner` and `budget_from_spec` in
+- Admin routes: `put_tenant_credential_inner`, `budget_from_spec` and
+  `key_budget_from_spec` in
   `crates/proxy-admin/src/server.rs`. Tests: `server/tests/credentials.rs` and
   `server/tests/budget_scope.rs` in `crates/proxy-admin/src/`.
 - Budget scope: `crates/proxy-filters/src/spend_limit_filter.rs`, and
-  `legacy_credential_source` and `EncodedTenantBudget` in
-  `crates/proxy-control/src/control.rs`. `EncodedTenantBudget` has no
-  `deny_unknown_fields`, which is why an older build ignores the scope.
+  `legacy_credential_source`, `EncodedTenantBudget` and `EncodedKeyBudget` in
+  `crates/proxy-control/src/control.rs`. Neither row has
+  `deny_unknown_fields`, which is why an older build ignores the scope and the
+  flag. The key budget mapping is `KeyBudget::from_scoped` in
+  `crates/proxy-control/src/spend.rs`. Tests:
+  `crates/proxy/tests/byok_key_budget_e2e.rs` and
+  `redb_upgrade_loads_scoped_key_budgets_with_the_include_byok_mapping`.
 - Store check: `parse_config` in `crates/proxy-filters/src/auth_filter.rs`.
   JWT principals: `TenantFacts::admit` in `crates/proxy-control/src/auth.rs`,
   read by `crates/proxy-filters/src/jwt_auth.rs`. Tests:

@@ -79,8 +79,9 @@ names the path `models.<name>.providers[<n>]`. The all-zero error names
 
 A provider that its `outlier_detection` ejected gets no first picks. The next
 entry in list order that is not ejected takes its share. The provider serves
-first picks again when the ejection ends. The proxy does not support
-cost-aware selection.
+first picks again when the ejection ends. To send less traffic to a slow
+provider, see [Prefer the faster provider](#prefer-the-faster-provider). The
+proxy does not support cost-aware selection.
 
 For the fallback chain, the retry count, and `outlier_detection`, see
 [Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/#weighted-selection-in-the-models-catalogue).
@@ -162,6 +163,42 @@ These are the load errors for `session_affinity`:
 A model with a single provider accepts `session_affinity`. It has no effect,
 because every request already reaches that provider.
 
+## Prefer the faster provider
+
+With `selection: latency`, a weighted model sends less traffic to a provider
+that answers more slowly than the others.
+
+```yaml
+models:
+  chat-default:
+    providers:
+      - { provider: openai, weight: 1 }
+      - { provider: together, weight: 1 }
+    selection: latency
+```
+
+Each replica keeps a moving average of the latency of each provider. For a
+streaming response, the latency is the time to the first event. For other
+responses, it is the time to the full response. Only successful responses
+of `latency` models count. Each provider's weight is multiplied by the
+average of the fastest provider divided by its own average. The result is
+never less than a tenth of the weight. In the example, if `together` is ten
+times slower than `openai`, `together` gets about 1 request in 11.
+
+- A slow provider always keeps some traffic. Thus the proxy continues to
+  measure it, and the provider gets its share again when it is fast again.
+- A provider that has no measurement yet keeps its full weight.
+- A provider ejected by its `outlier_detection` gets no traffic while another
+  provider is not ejected. This is also true without `selection: latency`.
+- Weight `0` stays a fallback only.
+- A request pinned by `session_affinity` uses the plain weights. Thus a
+  session does not move to a different provider when latencies change.
+- Replicas do not share measurements. Each replica uses its own traffic.
+
+`selection: latency` needs `weight` on every provider of the model. A model
+with one weighted provider has nothing to choose, so the setting has no
+effect there.
+
 ## Concurrency ceilings
 
 Each provider has its own ceilings. They shed load before a provider is
@@ -187,8 +224,8 @@ full example.
   setting to balance across endpoints.
 - Weights apply to `models` entries only. A `routes` entry sends the request
   to its one provider and then to its fallbacks, in order.
-- The weighted pick does not use load, latency, or cost. The proxy does not
-  support cost-aware selection.
+- The weighted pick does not use load or cost. It uses latency only with
+  `selection: latency`. The proxy does not support cost-aware selection.
 - The random split is not coordinated across replicas. Session affinity is
   the same on every replica as long as the weights and providers match.
 

@@ -159,8 +159,10 @@ differently.
   the model from the body after it chooses a first route, so a request can
   match no route at first and reach a provider later.
 - A request that no budget applies to is not refused and logs nothing.
-- A budget applies only when its credential scope matches the request
-  (`credential_source`). A refused request adds nothing to any budget.
+- A tenant budget applies only when its credential scope matches the request
+  (`credential_source`). A key budget applies to requests on the platform
+  credential, and to requests on the tenant's own key only with
+  `include_byok_in_limit: true`. A refused request adds nothing to any budget.
 
 Each refusal increments
 `llmproxy_unmetered_endpoint_refused_total{endpoint, control}`. `control` is
@@ -307,8 +309,10 @@ curl --max-time 10 -X PUT http://127.0.0.1:53422/keys/alice-laptop/budget \
   -d '{"schema_version":2,"budget":{"max_usd":"100.00","period":"monthly"}}'
 ```
 
-The call returns `204`. `PUT /tenants/{id}/budget` takes the same body for a
-tenant. The body can also carry `credential_source`. See
+The call returns `204`. Add `"include_byok_in_limit":true` to a key budget
+to also count spend on the tenant's own provider key. The default is `false`.
+`PUT /tenants/{id}/budget` takes the same body for a tenant, except that it
+takes `credential_source` instead of `include_byok_in_limit`. See
 [Budgets](/docs/llm-proxy/authentication/tenant-provider-credentials/#budgets).
 
 - `period` is `daily` or `monthly`. Both use UTC.
@@ -338,12 +342,14 @@ reset or reassignment.
 ## Tenant budgets
 
 `PUT /tenants/{id}/budget` sets or clears a tenant budget with the same body as
-a key budget. `GET /tenants/{id}/spend` returns the tenant ledger. The ledger
+a key budget, except that it takes `credential_source` instead of
+`include_byok_in_limit`. `GET /tenants/{id}/spend` returns the tenant ledger. The ledger
 adds the spend of every key of the tenant, in the tenant budget's own period.
 
 A request gets `429` when its key ceiling or its tenant ceiling is reached.
 Clearing one ceiling does not change the spend or the ceiling of the other. A
-budget counts only the requests in its credential scope; see
+tenant budget counts only the requests in its credential scope, and a key
+budget counts BYOK requests only with `include_byok_in_limit`; see
 [Budgets](/docs/llm-proxy/authentication/tenant-provider-credentials/#budgets).
 `%RESPONSE_CODE_DETAILS%` shows `spend_budget_exceeded` for the `429`.
 
@@ -431,11 +437,12 @@ metric labels.
 - There are no spend reservations. Overspend is possible. See
   [Admission and overspend](#admission-and-overspend).
 - A budget cannot count batches, files, and unknown endpoints. It refuses them.
-- A budget counts only the requests in its credential scope.
+- A tenant budget counts only the requests in its credential scope. A key
+  budget counts requests on the tenant's own provider key only with
+  `include_byok_in_limit: true`.
 - A request with no price adds $0. Give every model a price.
 - The dialect has no recovery journal. A `SIGKILL` loses unflushed charges.
 - A budget has a period of `daily` or `monthly`. There is no other period.
-- The `include_byok_in_limit` key-budget flag does not exist.
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 

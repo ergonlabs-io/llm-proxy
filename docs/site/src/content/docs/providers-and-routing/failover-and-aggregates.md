@@ -257,6 +257,34 @@ usage dialect. The proxy charges a request at the rate card of the provider
 that it dialled. The proxy does not support cost-aware selection. Entries
 with different API dialects are still a load error.
 
+## See which provider served a response
+
+To see which provider served a response and whether a failover happened,
+turn on `observability.routing_headers`.
+
+```yaml
+observability:
+  routing_headers: true
+```
+
+Then each response that the proxy forwards has these headers:
+
+| Header | Value |
+|---|---|
+| `x-llmproxy-provider` | The provider cluster that served the response, for example `provider:standby`. |
+| `x-envoy-attempt-count` | The number of upstream attempts, for example `2` after one failover. |
+| `x-llmproxy-providers-tried` | The provider clusters attempted, in order, separated by commas, for example `provider:primary,provider:standby`. |
+
+The headers are on the response head, so a streaming response has them
+before its first event. A response that the proxy made itself, for example a
+`503` when no provider can be reached, has `x-llmproxy-providers-tried` and
+`x-envoy-attempt-count` but no `x-llmproxy-provider`. A request that was not
+sent to a provider has none of the headers.
+
+The values are cluster names only. They never contain an upstream host, a
+credential or tenant data. The setting is off by default because the headers
+show your routing to callers.
+
 ## Implementation notes
 
 This section is for maintainers.

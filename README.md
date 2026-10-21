@@ -545,10 +545,6 @@ Stated plainly, because a feature list without this is not much use:
 - **Spend over-admission is bounded, not zero.** With a `shared` store,
   replicas share spend totals. During a store outage each replica enforces
   against the last confirmed total plus its own spend.
-- **A key budget counts one credential source.** A budget is scoped to
-  `platform` or `tenant` credentials. It ignores spend of the other source
-  (ADR-0007). A per-key `include_byok_in_limit` flag that counts both is
-  planned for v0.8.0.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
 - **No Kubernetes controller or CRDs.**

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use proxy_control::auth::{KeyId, TenantId};
 use proxy_control::control::ControlPlane;
-use proxy_control::spend::{MicroUsd, Period, SpendAccumulator, TenantBudget};
+use proxy_control::spend::{KeyBudget, MicroUsd, Period, SpendAccumulator};
 use proxy_filters::spend_limit_filter::SharedSpendLimitState;
 use proxy_http::{
     filter::RequestHeaders,
@@ -19,7 +19,6 @@ use proxy_http::{
 use proxy_observability::ledger::testing::TempLedger;
 use proxy_observability::ledger::OnUnavailable;
 use proxy_observability::records::ChargeScope;
-use proxy_observability::records::CredentialSource;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -473,10 +472,10 @@ fn refused_requests_get_no_entry_and_seq_has_no_gaps() {
             .control_plane
             .set_key_budget(
                 &KeyId::new("key-broke"),
-                Some(&TenantBudget {
+                Some(&KeyBudget {
                     max_micros: MicroUsd::from_micros(0),
                     period: Period::Daily,
-                    credential_source: CredentialSource::Platform,
+                    include_byok_in_limit: false,
                 }),
             )
             .unwrap();

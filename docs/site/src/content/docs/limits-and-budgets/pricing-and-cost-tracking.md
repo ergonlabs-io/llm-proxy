@@ -256,11 +256,9 @@ price. Three parts make this work:
 A request that uses a stored tenant credential has a price like any other
 request. The access log field `llm_credential_source` shows `tenant` for it.
 Whether the price counts toward a spend budget depends on the budget scope
-(`credential_source`). See
+(`credential_source` on a tenant budget, `include_byok_in_limit` on a key
+budget). See
 [Budgets](/docs/llm-proxy/authentication/tenant-provider-credentials/#budgets).
-
-The `include_byok_in_limit` key-budget flag is not implemented. A budget today
-has one credential scope, `platform` or `tenant`.
 
 ## Where the cost appears
 
@@ -447,8 +445,6 @@ in the price list has no price.
   tier.
 - The proxy cannot price batches, files, and other endpoints that report no
   usage. A spend budget or token limit refuses them.
-- `include_byok_in_limit` does not exist. See
-  [Requests that use a tenant credential](#requests-that-use-a-tenant-credential).
 - Cost has no per-tenant, per-key, or per-model metric series. Read cost from
   the access log, the request records, the ledger, and the spend reports.
 
