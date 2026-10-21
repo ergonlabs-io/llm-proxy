@@ -115,6 +115,24 @@ const ALLOWLIST: &[AllowlistEntry] = &[
                   rather than reading `.cumulative` directly.",
     },
     AllowlistEntry {
+        struct_name: "WeightedClusters",
+        field_name: "hash_policy",
+        kind: EntryKind::KnownInert,
+        reason: "ADR-0016 IR change, landed before its router reader.",
+    },
+    AllowlistEntry {
+        struct_name: "RouteHashPolicy",
+        field_name: "source",
+        kind: EntryKind::KnownInert,
+        reason: "ADR-0016 IR change, landed before its router reader.",
+    },
+    AllowlistEntry {
+        struct_name: "RouteHashPolicy",
+        field_name: "terminal",
+        kind: EntryKind::KnownInert,
+        reason: "ADR-0016 IR change, landed before its router reader.",
+    },
+    AllowlistEntry {
         struct_name: "TcpProxyConfig",
         field_name: "stat_prefix",
         kind: EntryKind::KnownInertNameCollision,

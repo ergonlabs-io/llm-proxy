@@ -7005,6 +7005,7 @@ fn convert_weighted_clusters(
     Ok(WeightedClusters {
         cumulative,
         total_weight: total,
+        hash_policy: Vec::new(),
     })
 }
 
