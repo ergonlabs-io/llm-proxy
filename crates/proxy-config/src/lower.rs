@@ -830,8 +830,8 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             &["config_source", "route_config_name"]
         }
         // S10: `filters` is deliberately NOT listed -- per-upgrade
-        // filter chains are unimplemented (the tunnel is transparent, S10.2
-        // deferred), so a config setting them is rejected right here by the
+        // filter chains are unimplemented (an upgrade runs the HCM's
+        // `http_filters`, envoy-divergences.md row 44), so a config setting them is rejected right here by the
         // surface walk with the generic "not implemented yet" message rather
         // than needing a convert-time check. `upgrade_type`/`enabled` are the
         // supported surface.

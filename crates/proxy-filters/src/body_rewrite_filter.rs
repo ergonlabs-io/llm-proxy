@@ -423,6 +423,17 @@ impl HttpFilter for BodyRewriteFilterInstance {
         // directly rather than through `modify_decoded_headers` -- that
         // callback is a no-op called from inside `decode_headers` itself
         // (see its doc); this parameter IS the live request head.
+        // A realtime session has no body; its model is the `model` query
+        // parameter, proven by the URL the provider is sent (the router
+        // rewrites it to the routed model), so it is published like a body's.
+        if cb.stream_info().llm.endpoint == proxy_http::endpoint::Endpoint::Realtime {
+            let model = proxy_http::endpoint::realtime_model(&headers.uri);
+            cb.stream_info().requested_model = model.clone();
+            apply_model_header(&mut headers.headers, model.as_deref());
+            cb.clear_route_cache();
+            self.state = State::PassThrough;
+            return FilterHeadersStatus::Continue;
+        }
         let path = headers.uri.path();
         self.takes_usage_option = !(path.ends_with("/responses") || path.ends_with("/messages"));
         let form_boundary = headers

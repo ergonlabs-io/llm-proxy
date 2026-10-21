@@ -33,6 +33,35 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   - The `proxy-capture-spool` crate stays, with its on-disk format unchanged:
     the billing ledger is built on it.
 
+### Added
+
+- JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
+  `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
+  `{ claim: department, tag: team }`, so the identity provider sets a JWT
+  caller's attribution, not the client. The `auth.chargeback_tags` allow-list
+  and caps apply unchanged, and the `x-cost-tags` header cannot set a mapped
+  tag. Each tag must be allow-listed, or the config does not load.
+- `llmproxy_chargeback_tags_dropped_total` has a sixth `reason`,
+  `claim_missing`, for a mapped claim that is not in the token. A claim that is
+  not a string of tag value characters counts as `malformed`. Neither refuses
+  the request.
+
+- **Realtime (WebSocket) sessions (WP-37, ADR-0015).** `realtime: { enabled: true }`
+  in the `--config` dialect (Envoy mode: `upgrade_configs` with `upgrade_type:
+  websocket`) proxies a WebSocket on a path ending `/realtime` as one metered
+  session. Auth, model access, `limits` and spend budgets decide at upgrade time,
+  before the provider is dialled; a refusal is an HTTP status. The model is the
+  `model` query parameter, rewritten to the provider's upstream model.
+  `limits[].concurrent_sessions` counts a session for its whole life. Usage is
+  summed from each `response.done` event (text, cached and audio tokens), priced at
+  the rate card's token and audio rates for the provider dialled, and charged once
+  when the session closes; a session cut early is recorded partial and charged what
+  it reported. Each session is one access-log line, request record and ledger entry,
+  with endpoint `realtime`. A response with no readable usage is counted in
+  `llmproxy_realtime_usage_missing_total{reason}` and warned about. The proxy removes
+  the client's `Sec-WebSocket-Extensions` offer from a realtime session so its frames
+  stay readable. On drain each WebSocket session gets a Close frame with code 1001.
+
 ### Changed
 
 - A JWT caller (`auth.jwt`, or `jwt_providers` in Envoy mode) whose tenant
@@ -47,18 +76,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   (`auth_policy_stale`), as that tenant's virtual keys do. JWT requests of
   other tenants are admitted as before.
 
-### Added
+- **The HTTP filter chain runs on upgraded streams (WP-131, envoy-semantics.md
+  S10.2).** An upgrade's post-`101` upstream bytes pass through the encode filter
+  chain, and the stream ends when the tunnel closes: the access log, request record
+  and ledger entry of an upgraded stream are written at its close, not at the `101`,
+  and `downstream_rq_active` counts it until then, as Envoy does. Client-to-upstream
+  bytes still go straight through (`internal-docs/envoy-divergences.md` row 44). A
+  listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
+  buffer response bytes.
 
-- JWT claims can set chargeback tags. `auth.jwt[].claim_tags` (Envoy mode:
-  `JwtProvider.claim_tags`) maps a verified claim to a tag key, for example
-  `{ claim: department, tag: team }`, so the identity provider sets a JWT
-  caller's attribution, not the client. The `auth.chargeback_tags` allow-list
-  and caps apply unchanged, and the `x-cost-tags` header cannot set a mapped
-  tag. Each tag must be allow-listed, or the config does not load.
-- `llmproxy_chargeback_tags_dropped_total` has a sixth `reason`,
-  `claim_missing`, for a mapped claim that is not in the token. A claim that is
-  not a string of tag value characters counts as `malformed`. Neither refuses
-  the request.
 
 ## [0.6.0] - 2026-10-20
 

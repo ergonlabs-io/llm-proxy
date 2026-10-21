@@ -14,7 +14,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
@@ -173,9 +173,12 @@ where
     tokio::pin!(conn);
     tokio::pin!(shutdown);
 
+    let mut shutting_down = false;
     let result = tokio::select! {
         result = &mut conn => result,
         _ = &mut shutdown => {
+            shutting_down = true;
+            tunnels.drain.start();
             conn.as_mut().graceful_shutdown();
             // `graceful_shutdown` only *requests* the shutdown; the
             // connection must keep being polled to actually drain the
@@ -190,8 +193,9 @@ where
     // the tunnel task, while that tunnel is still live. The caller's
     // connection accounting (proxy-core's drain registry) ends when this
     // function returns, and envoy-semantics.md S10.5 counts upgraded streams
-    // as active for drain, so return only once every tunnel has closed.
-    tunnels.wait_idle().await;
+    // as active for drain, so return only once every tunnel has closed. A
+    // drain that starts while a tunnel is open still reaches it.
+    tunnels.wait_idle_or_drain(shutdown, shutting_down).await;
     result.map_err(CodecError::Connection)
 }
 
@@ -250,9 +254,12 @@ where
     tokio::pin!(conn);
     tokio::pin!(shutdown);
 
+    let mut shutting_down = false;
     let result = tokio::select! {
         result = &mut conn => result,
         _ = &mut shutdown => {
+            shutting_down = true;
+            tunnels.drain.start();
             conn.as_mut().graceful_shutdown();
             conn.as_mut().await
         }
@@ -261,7 +268,7 @@ where
     // Same drain contract as `serve_http1`'s tail. An h2 tunnel's bytes ride
     // this connection, so it normally ends no later than `conn`; waiting
     // keeps "returned" meaning "no tunnel left" on both codecs.
-    tunnels.wait_idle().await;
+    tunnels.wait_idle_or_drain(shutdown, shutting_down).await;
     result.map_err(CodecError::Connection)
 }
 
@@ -1140,13 +1147,27 @@ async fn serve_one(
         upstream,
         cb_guard,
         active_request,
+        upstream_payload,
+        websocket,
     }) = upgrade
     {
+        // S10.2: the response body is what the tunnel writes to the client
+        // after the `101`; hyper gets an empty one for the handshake.
+        let (head, body) = built.into_parts();
+        let built = Response::from_parts(head, empty_body());
         tunnels.spawn(bridge_upgrade(
             downstream,
             upstream,
+            crate::tunnel::TunnelParts {
+                payload: upstream_payload,
+                body,
+                websocket,
+                drain: tunnels.drain.clone(),
+                idle_timeout: WEBSOCKET_TUNNEL_IDLE_TIMEOUT,
+            },
             (cb_guard, active_request),
         ));
+        return built;
     }
 
     built
@@ -1163,6 +1184,9 @@ async fn serve_one(
 #[derive(Clone, Default)]
 struct UpgradeTunnels {
     inner: Rc<UpgradeTunnelsInner>,
+    /// Started when the connection's shutdown future resolves; every tunnel
+    /// on the connection watches it (a WebSocket sends Close 1001).
+    drain: crate::tunnel::DrainSignal,
 }
 
 #[derive(Default)]
@@ -1195,6 +1219,23 @@ impl UpgradeTunnels {
         });
     }
 
+    /// [`Self::wait_idle`], starting the tunnels' drain if `shutdown`
+    /// resolves first. `already` says the caller saw it resolve, so it is
+    /// not polled again.
+    async fn wait_idle_or_drain(
+        &self,
+        shutdown: std::pin::Pin<&mut impl Future<Output = ()>>,
+        already: bool,
+    ) {
+        if !already {
+            tokio::select! {
+                () = self.wait_idle() => return,
+                () = shutdown => self.drain.start(),
+            }
+        }
+        self.wait_idle().await;
+    }
+
     async fn wait_idle(&self) {
         // Rust note: same check-then-`notified()` shape as proxy-core's
         // `ConnectionRegistry::wait_empty`, and race-free for the same
@@ -1207,8 +1248,8 @@ impl UpgradeTunnels {
 }
 
 /// Envoy's HCM `stream_idle_timeout` default (S10) -- this is a FIXED
-/// default for now, not yet wired to that IR field; see `pump_with_idle_timeout`'s
-/// doc for the tear-down semantics it drives.
+/// default for now, not yet wired to that IR field; see `crate::tunnel::run`
+/// for the tear-down semantics it drives.
 const WEBSOCKET_TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// S10: await both halves of an established upgrade
@@ -1224,6 +1265,7 @@ const WEBSOCKET_TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 async fn bridge_upgrade(
     downstream: hyper::upgrade::OnUpgrade,
     upstream: hyper::upgrade::OnUpgrade,
+    parts: crate::tunnel::TunnelParts,
     _cb_guard: (
         Option<proxy_cluster::CbGuard>,
         Option<proxy_cluster::ActiveRequestGuard>,
@@ -1242,122 +1284,9 @@ async fn bridge_upgrade(
             return;
         }
     };
-    let downstream = TokioIo::new(downstream);
-    let upstream = TokioIo::new(upstream);
-    pump_with_idle_timeout(downstream, upstream, WEBSOCKET_TUNNEL_IDLE_TIMEOUT).await;
+    crate::tunnel::run(TokioIo::new(downstream), TokioIo::new(upstream), parts).await;
     // `_cb_guard` drops here, releasing the `max_connections` slot exactly
     // when the physical connection this tunnel owned is actually done with.
-}
-
-/// Bidirectional byte pump between `a` and `b` (the two WebSocket/upgrade
-/// tunnel ends), with an IDLE timeout: it tears down once no byte has moved
-/// in EITHER direction for `idle_timeout`, rather than living forever until
-/// a peer closes (`copy_bidirectional`, which this replaces, has no idle
-/// awareness at all). A healthy connection with periodic ping/pong keepalive
-/// traffic resets the timer just like any other byte, so this only trips a
-/// genuinely stalled tunnel.
-///
-/// Split out from `bridge_upgrade` so it's testable directly against
-/// `tokio::io::duplex` pairs, without needing a real hyper upgrade.
-async fn pump_with_idle_timeout<A, B>(mut a: A, mut b: B, idle_timeout: Duration)
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut a_to_b_buf = [0u8; 8192];
-    let mut b_to_a_buf = [0u8; 8192];
-    // Rust note: once a direction hits EOF (a clean close), its read half is
-    // done for good -- `_done` latches that so the loop stops polling that
-    // side's `read` (a `select!` branch guard below) while the other
-    // direction keeps draining normally.
-    let mut a_to_b_done = false;
-    let mut b_to_a_done = false;
-    let (mut a_to_b_bytes, mut b_to_a_bytes) = (0u64, 0u64);
-
-    // Rust note: `tokio::pin!` + `Sleep::reset` is the idiomatic way to run
-    // ONE timer across many loop iterations without allocating a fresh
-    // `sleep()` future each time -- `select!` re-polls the same pinned
-    // `Sleep` every iteration, and any branch that observes real activity
-    // pushes its deadline forward with `.reset(..)` instead of replacing it.
-    // That's what makes this an IDLE timeout (resets on activity) rather
-    // than a fixed total-duration one.
-    let deadline = tokio::time::sleep(idle_timeout);
-    tokio::pin!(deadline);
-
-    loop {
-        if a_to_b_done && b_to_a_done {
-            break;
-        }
-
-        tokio::select! {
-            result = a.read(&mut a_to_b_buf), if !a_to_b_done => {
-                match result {
-                    Ok(0) => {
-                        a_to_b_done = true;
-                        // Clean EOF from `a`: half-close `b`'s write side so
-                        // its peer sees the same close, then keep draining
-                        // whatever `b` still has in flight -- the same
-                        // clean-close behavior `copy_bidirectional` gives.
-                        if let Err(err) = b.shutdown().await {
-                            tracing::debug!(error = %err, "upgrade tunnel: half-close after downstream EOF failed");
-                        }
-                    }
-                    Ok(n) => {
-                        if let Err(err) = b.write_all(&a_to_b_buf[..n]).await {
-                            tracing::debug!(error = %err, "upgrade tunnel: downstream->upstream write failed");
-                            break;
-                        }
-                        if let Err(err) = b.flush().await {
-                            tracing::debug!(error = %err, "upgrade tunnel: downstream->upstream flush failed");
-                            break;
-                        }
-                        a_to_b_bytes += n as u64;
-                        deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "upgrade tunnel: downstream read failed");
-                        break;
-                    }
-                }
-            }
-            result = b.read(&mut b_to_a_buf), if !b_to_a_done => {
-                match result {
-                    Ok(0) => {
-                        b_to_a_done = true;
-                        if let Err(err) = a.shutdown().await {
-                            tracing::debug!(error = %err, "upgrade tunnel: half-close after upstream EOF failed");
-                        }
-                    }
-                    Ok(n) => {
-                        if let Err(err) = a.write_all(&b_to_a_buf[..n]).await {
-                            tracing::debug!(error = %err, "upgrade tunnel: upstream->downstream write failed");
-                            break;
-                        }
-                        if let Err(err) = a.flush().await {
-                            tracing::debug!(error = %err, "upgrade tunnel: upstream->downstream flush failed");
-                            break;
-                        }
-                        b_to_a_bytes += n as u64;
-                        deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "upgrade tunnel: upstream read failed");
-                        break;
-                    }
-                }
-            }
-            () = &mut deadline => {
-                tracing::debug!(idle_timeout = ?idle_timeout, "upgrade tunnel: idle timeout, tearing down");
-                break;
-            }
-        }
-    }
-
-    tracing::debug!(
-        down_to_up = a_to_b_bytes,
-        up_to_down = b_to_a_bytes,
-        "upgrade tunnel closed"
-    );
 }
 
 /// The codec-level `400` for a request whose framing is ambiguous.
@@ -1373,6 +1302,11 @@ fn closing_response(status: http::StatusCode) -> Response<StreamBody> {
         .header(http::header::CONTENT_LENGTH, "0")
         .body(body)
         .expect("static status and headers are valid")
+}
+
+/// An empty response body: the `101`'s, whose real body the tunnel writes.
+fn empty_body() -> StreamBody {
+    local_boxed(http_body_util::Empty::<bytes::Bytes>::new().map_err(|e| match e {}))
 }
 
 /// The size of `req`'s head written canonically: request line, one
@@ -1420,12 +1354,9 @@ fn build_response(parts: HttpResponseParts) -> Response<StreamBody> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use http::HeaderMap;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{pump_with_idle_timeout, request_wants_upgrade};
+    use super::request_wants_upgrade;
 
     #[test]
     fn upgrade_plus_connection_upgrade_is_true() {
@@ -1480,126 +1411,5 @@ mod tests {
     #[test]
     fn no_headers_at_all_is_false() {
         assert!(!request_wants_upgrade(&HeaderMap::new()));
-    }
-
-    /// A stalled tunnel -- nothing written on either side -- must be torn
-    /// down once `idle_timeout` elapses with no activity at all, rather than
-    /// living forever (the `copy_bidirectional` behavior this pump
-    /// replaces).
-    #[tokio::test]
-    async fn idle_tunnel_is_torn_down_after_idle_window() {
-        let (down, _down_test) = tokio::io::duplex(1024);
-        let (up, _up_test) = tokio::io::duplex(1024);
-        let idle = Duration::from_millis(100);
-
-        // Rust note: bound the assertion with `tokio::time::timeout` so a
-        // regression that makes the pump hang fails THIS test instead of
-        // hanging the suite. A few multiples of `idle` covers scheduling
-        // jitter without masking a real "never tears down" bug.
-        tokio::time::timeout(idle * 5, pump_with_idle_timeout(down, up, idle))
-            .await
-            .expect("idle tunnel must be torn down by the idle timeout, not hang forever");
-    }
-
-    /// ANY byte in EITHER direction resets the idle timer -- a tunnel
-    /// carrying periodic traffic (e.g. WebSocket ping/pong) must not be torn
-    /// down mid-conversation just because more time than `idle_timeout` has
-    /// passed since the tunnel opened.
-    #[tokio::test]
-    async fn activity_resets_idle_timer() {
-        let (down, mut down_test) = tokio::io::duplex(1024);
-        let (up, mut up_test) = tokio::io::duplex(1024);
-        let idle = Duration::from_millis(100);
-
-        let pump = tokio::spawn(pump_with_idle_timeout(down, up, idle));
-
-        // One byte every ~40ms for ~280ms: strictly more than `idle` (100ms)
-        // has elapsed since the tunnel opened by the time this loop ends, so
-        // a timer that reset on a fixed schedule (rather than on real
-        // activity) would already have torn the pump down.
-        let sent: Vec<u8> = (0u8..7).collect();
-        for &byte in &sent {
-            down_test
-                .write_all(&[byte])
-                .await
-                .expect("write to downstream test end");
-            down_test.flush().await.expect("flush downstream test end");
-            tokio::time::sleep(Duration::from_millis(40)).await;
-        }
-
-        assert!(
-            !pump.is_finished(),
-            "pump must not tear down while the tunnel is still active"
-        );
-
-        // Everything sent downstream->upstream must have been forwarded
-        // byte-for-byte before any teardown.
-        let mut received = vec![0u8; sent.len()];
-        tokio::time::timeout(Duration::from_secs(1), up_test.read_exact(&mut received))
-            .await
-            .expect("timed out reading forwarded bytes")
-            .expect("read forwarded bytes");
-        assert_eq!(received, sent);
-
-        // No more activity now: the pump must go idle and tear itself down
-        // within roughly `idle` of the last byte.
-        tokio::time::timeout(idle * 5, pump)
-            .await
-            .expect("pump must tear down once activity stops")
-            .expect("pump task must not panic");
-    }
-
-    /// The normal EOF-driven close path must still work, and finish
-    /// promptly on its own -- not merely because the idle timer eventually
-    /// caught up. `idle` here is deliberately much larger than a clean close
-    /// should ever take, so a short bound on the final await proves this.
-    #[tokio::test]
-    async fn clean_close_finishes_promptly_not_via_idle_timer() {
-        let (down, mut down_test) = tokio::io::duplex(1024);
-        let (up, mut up_test) = tokio::io::duplex(1024);
-        let idle = Duration::from_secs(10);
-
-        let pump = tokio::spawn(pump_with_idle_timeout(down, up, idle));
-
-        down_test
-            .write_all(b"hello")
-            .await
-            .expect("write before close");
-        down_test.flush().await.expect("flush before close");
-        down_test
-            .shutdown()
-            .await
-            .expect("shutdown downstream test end");
-
-        // The in-flight bytes must still be delivered before the close is
-        // processed.
-        let mut received = [0u8; 5];
-        tokio::time::timeout(Duration::from_secs(1), up_test.read_exact(&mut received))
-            .await
-            .expect("timed out reading in-flight bytes")
-            .expect("read in-flight bytes");
-        assert_eq!(&received, b"hello");
-
-        // The pump half-closes `up`'s write side once `down` hits EOF
-        // (mirroring TCP half-close propagation), so `up_test`'s own read
-        // sees EOF too.
-        let mut eof_probe = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(1), up_test.read(&mut eof_probe))
-            .await
-            .expect("timed out waiting for propagated half-close")
-            .expect("read after propagated half-close");
-        assert_eq!(n, 0, "downstream EOF must propagate to the upstream side");
-
-        // Close the other direction too -- what a real WebSocket close
-        // handshake looks like end to end (both peers close).
-        up_test
-            .shutdown()
-            .await
-            .expect("shutdown upstream test end");
-
-        tokio::time::timeout(Duration::from_millis(500), pump)
-            .await
-            .expect("clean close must finish promptly, not wait for the idle timer")
-            .expect("pump task must not panic");
     }
 }

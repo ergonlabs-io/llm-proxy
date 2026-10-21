@@ -235,6 +235,42 @@ fn resolve_per_filter_row(
     Ok(row)
 }
 
+/// The request asks for a WebSocket. The codec turns an h2 `:protocol` into
+/// an `Upgrade` header, so this reads both wire forms.
+fn is_websocket(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("websocket"))
+}
+
+/// envoy-semantics.md S10.2: an HCM with an enabled upgrade type must not
+/// carry a filter that can buffer response bytes. An upgrade's response body
+/// is its tunnel, which the client reads only after the `101`, so a filter
+/// holding response bytes would hold the `101` with them. `names[i]` is
+/// `factories[i]`'s filter name.
+pub fn check_upgrade_filters(
+    upgrade_configs: &[proxy_config::ir::UpgradeConfig],
+    names: &[String],
+    factories: &[Arc<dyn HttpFilterFactory>],
+) -> Result<(), ConfigError> {
+    let Some(upgrade) = upgrade_configs.iter().position(|u| u.enabled) else {
+        return Ok(());
+    };
+    match factories.iter().position(|f| f.may_buffer_response()) {
+        None => Ok(()),
+        Some(filter) => Err(ConfigError::Validation {
+            field_path: format!("upgrade_configs[{upgrade}]"),
+            rule: format!(
+                "upgrade type `{}` is enabled, but HTTP filter '{}' can buffer response bytes, \
+                 which an upgraded stream cannot carry",
+                upgrade_configs[upgrade].upgrade_type, names[filter]
+            ),
+        }),
+    }
+}
+
 /// Build the [`PerRouteTable`] for one HCM's filter chain (ADR-0004): resolve `RouteConfiguration`/`VirtualHost`/`Route`-level
 /// `typed_per_filter_config` once, at build time, against the real chain —
 /// see [`resolve_per_filter_row`] for the per-entry rules. `names[i]` is
@@ -751,8 +787,11 @@ impl StreamHandler for FilterChainHandler {
                 // Classified once, from the client-facing method and path
                 // before any filter or route rewrites them (ADR-0010
                 // decision 1). Every filter reads this, never its own copy.
-                info.llm.endpoint =
-                    crate::endpoint::Endpoint::classify(&req.head.method, req.head.uri.path());
+                info.llm.endpoint = if req.on_upgrade.is_some() && is_websocket(&req.head.headers) {
+                    crate::endpoint::Endpoint::classify_upgrade(req.head.uri.path())
+                } else {
+                    crate::endpoint::Endpoint::classify(&req.head.method, req.head.uri.path())
+                };
             }
             if let Some(sink) = &self.request_record_sink {
                 let mut info = stream_info.borrow_mut();

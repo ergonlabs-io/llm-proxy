@@ -140,6 +140,64 @@ pub struct UpgradeTunnel {
     /// tunnel's whole life like `cb_guard`. `None` only where no host was
     /// selected.
     pub active_request: Option<proxy_cluster::ActiveRequestGuard>,
+    /// S10.2: the sending half of the `101` response's body. The tunnel
+    /// feeds the upstream's post-`101` bytes in here, so they pass through
+    /// the encode filter chain as ordinary data callbacks, and writes what
+    /// the chain emits to the client. Dropping it ends the response body,
+    /// which is when the stream's encode end-of-stream, access log and
+    /// request record run.
+    pub upstream_payload: UpgradePayloadSender,
+    /// The upgrade type is `websocket`, so the tunnel may speak RFC 6455
+    /// framing toward the client (a Close frame on drain, envoy-semantics.md
+    /// S10.5). Any other upgrade type stays an opaque byte stream.
+    pub websocket: bool,
+}
+
+/// How many upstream reads may wait in an [`UpgradePayloadSender`] before
+/// the tunnel stops reading the upstream: backpressure, not buffering.
+const UPGRADE_PAYLOAD_DEPTH: usize = 4;
+
+/// The tunnel's end of an [`upgrade_payload_channel`].
+pub struct UpgradePayloadSender(tokio::sync::mpsc::Sender<Bytes>);
+
+impl UpgradePayloadSender {
+    /// Queue one upstream read for the encode chain. Waits while the chain
+    /// is [`UPGRADE_PAYLOAD_DEPTH`] reads behind. `Err` means the response
+    /// body is gone (the stream was torn down), so the tunnel should stop.
+    pub async fn send(&self, chunk: Bytes) -> Result<(), UpgradePayloadClosed> {
+        self.0.send(chunk).await.map_err(|_| UpgradePayloadClosed)
+    }
+}
+
+/// The response body behind an [`UpgradePayloadSender`] was dropped.
+#[derive(Debug)]
+pub struct UpgradePayloadClosed;
+
+/// A bounded channel whose receiving half is a [`StreamBody`]: the body of an
+/// accepted upgrade's response. It yields each chunk sent as one data frame
+/// and ends cleanly once the sender is dropped.
+pub fn upgrade_payload_channel() -> (UpgradePayloadSender, StreamBody) {
+    let (tx, rx) = tokio::sync::mpsc::channel(UPGRADE_PAYLOAD_DEPTH);
+    (
+        UpgradePayloadSender(tx),
+        local_boxed(UpgradePayloadBody(rx)),
+    )
+}
+
+struct UpgradePayloadBody(tokio::sync::mpsc::Receiver<Bytes>);
+
+impl hyper::body::Body for UpgradePayloadBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BodyError>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(|bytes| Ok(hyper::body::Frame::data(bytes))))
+    }
 }
 
 /// One per HTTP connection manager instance. The codec calls `handle` once
@@ -277,5 +335,44 @@ mod tests {
             },
         ));
         assert!(!body.is_end_stream());
+    }
+
+    /// The payload body yields each chunk the tunnel sends, in order, and
+    /// ends only once the sender is dropped: that end is what runs the
+    /// stream's encode end-of-stream, so it must not come early or never.
+    #[tokio::test]
+    async fn upgrade_payload_body_yields_sent_chunks_then_ends_when_the_sender_drops() {
+        let (tx, mut body) = super::upgrade_payload_channel();
+        let feed = async move {
+            tx.send(Bytes::from_static(b"one"))
+                .await
+                .expect("body alive");
+            tx.send(Bytes::from_static(b"two"))
+                .await
+                .expect("body alive");
+        };
+        let read = async {
+            let mut seen = Vec::new();
+            while let Some(frame) = body.frame().await {
+                seen.push(frame.expect("payload frames never error").into_data().ok());
+            }
+            seen
+        };
+        let ((), seen) = tokio::join!(feed, read);
+        assert_eq!(
+            seen,
+            vec![
+                Some(Bytes::from_static(b"one")),
+                Some(Bytes::from_static(b"two"))
+            ]
+        );
+    }
+
+    /// A dropped body tells the tunnel to stop feeding it.
+    #[tokio::test]
+    async fn sending_to_a_dropped_payload_body_fails() {
+        let (tx, body) = super::upgrade_payload_channel();
+        drop(body);
+        assert!(tx.send(Bytes::from_static(b"x")).await.is_err());
     }
 }

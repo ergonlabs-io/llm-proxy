@@ -179,10 +179,12 @@ provider on failover. That has been a real key-disclosure bug here twice.
 - **Terminates TLS.** Listener TLS from the dialect; mTLS, SAN matchers, and dual
   certificates from the bootstrap surface.
 
-- **Tunnels HTTP upgrades.** A WebSocket `Upgrade` — the shape several providers'
-  realtime APIs use — passes through byte for byte once the upstream accepts it.
-  Bootstrap configuration only; `upgrade_configs` is not reachable from the
-  dialect.
+- **Meters realtime sessions.** With `realtime: { enabled: true }`, a WebSocket
+  session on a `/realtime` path — the shape several providers' realtime APIs use —
+  is authenticated, model-checked, limited and budgeted when it opens, metered
+  from its `response.done` events (text and audio tokens) and charged and ledgered
+  once when it closes. Drain closes open sessions with code 1001. Other upgrades
+  pass through byte for byte once the upstream accepts them.
 
 - **Tells you what it is doing.** Access logs with token counts,
   time-to-first-token, time-per-output-token, and standard response flags. OTLP
@@ -508,6 +510,11 @@ Stated plainly, because a feature list without this is not much use:
   HTTP/2 provider is offered `h2` and nothing else, so a backend that cannot
   speak it fails the TLS handshake rather than downgrading, which rules out most
   local plaintext servers. Upgrade requests bypass the cache by design.
+- **Realtime sessions are metered from `response.done` events only.** Usage is
+  read in the OpenAI Realtime event shape; a provider that reports it otherwise
+  is counted as missing usage and warned about, not charged. A response cut
+  before its `response.done` is not charged, and client frames are never
+  inspected. There are no per-session gauges or mid-session log checkpoints.
 - **The Envoy-baselined rename-churn comparison was waived.** The v0.3.2 gate
   is met without it. A zero-5xx run on a capacity host passed, but no run
   compares the proxy with Envoy at 5k requests per second

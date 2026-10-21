@@ -1458,6 +1458,17 @@ fn build_hcm_handler(
         });
     }
 
+    // envoy-semantics.md S10.2: no filter that can hold response bytes on an HCM that upgrades.
+    {
+        let names: Vec<String> = filters.iter().map(|f| f.name.clone()).collect();
+        let factories: Vec<_> = filters.iter().map(|f| f.factory.clone()).collect();
+        proxy_http::filter_manager::check_upgrade_filters(&hcm.upgrade_configs, &names, &factories)
+            .map_err(|e| HttpFilterChainBuildError {
+                context: context.to_string(),
+                reason: e.to_string(),
+            })?;
+    }
+
     // With tracing on, the router gets a CLIENT span sink so every dispatched attempt can emit a
     // span (see `RouterFilterFactory::with_tracing`). `None` costs nothing.
     let mut router_factory = RouterFilterFactory::new(
@@ -1586,7 +1597,7 @@ async fn run_terminal_filter<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static
             // decoupled from drain. Graceful shutdown starts at whichever comes first: drain start
             // (idle keep-alives close, in-flight requests finish, then `Connection: close` or GOAWAY) or
             // the final `shutdown`.
-            // Hook: a realtime/WebSocket session would send Close 1001 when `drain_started` resolves.
+            // The codec hands the same signal to its upgrade tunnels: a WebSocket tunnel sends Close 1001.
             //
             // A reload starts the same graceful shutdown. This connection's handler, routes and cluster view
             // (and so its provider credentials) belong to `snapshot`. Without this a kept-alive connection would

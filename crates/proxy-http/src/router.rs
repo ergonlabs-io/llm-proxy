@@ -852,6 +852,20 @@ impl RouterHandler {
             routing_model.as_deref(),
             &mut attempt_head,
         );
+        // A realtime session names its model in the query, so the dialled
+        // member's own upstream model goes there, as a body's `model` would
+        // be rewritten (AGENTS.md invariant 6).
+        let realtime_model = {
+            let info = dcb.stream_info();
+            (info.llm.endpoint == crate::endpoint::Endpoint::Realtime)
+                .then(|| info.selected_model.clone())
+                .flatten()
+        };
+        if let Some(model) = realtime_model {
+            if let Some(uri) = crate::endpoint::with_realtime_model(&attempt_head.uri, &model) {
+                attempt_head.uri = uri;
+            }
+        }
         let mut provider_credentials = ProviderCredentials::new(
             attempt_entry.provider_runtime(),
             attempt_entry.request_headers_to_add(),
@@ -1048,13 +1062,10 @@ impl RouterHandler {
         // outside the request/response entity-body telemetry boundary.
         attempt_guard.finish(proxy_observability::records::Termination::Complete);
 
-        // Empty body: the tunnel carries every byte from here on over the
-        // raw `OnUpgrade` streams, not through this response's `StreamBody`
-        // (see `codec::serve_one`'s bridging).
-        let body: StreamBody = local_boxed(
-            Full::new(Bytes::new())
-                .map_err(|infallible: std::convert::Infallible| match infallible {}),
-        );
+        // S10.2: the response body is the upstream's post-`101` byte stream,
+        // fed by the tunnel (`codec::serve_one`), so it passes through the
+        // encode filter chain like any other response body.
+        let (upstream_payload, body) = crate::handler::upgrade_payload_channel();
         HttpResponseParts {
             head: resp.head,
             body,
@@ -1063,6 +1074,8 @@ impl RouterHandler {
                 upstream: upstream_on_upgrade,
                 cb_guard,
                 active_request: Some(active_request),
+                upstream_payload,
+                websocket: requested_upgrade_type(&head.headers).as_deref() == Some("websocket"),
             }),
         }
     }

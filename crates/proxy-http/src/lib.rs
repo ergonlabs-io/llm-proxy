@@ -35,7 +35,9 @@ pub mod route;
 pub mod router;
 pub mod stat_handles;
 pub mod stream_info;
+mod tunnel;
 pub mod upstream_pool;
+pub mod websocket;
 
 pub use codec::{serve_http1, CodecError, Http1Options};
 pub use filter::{
@@ -44,7 +46,8 @@ pub use filter::{
 };
 pub use filter_manager::{FilterChainHandler, DEFAULT_BUFFER_LIMIT};
 pub use handler::{
-    BodyError, DownstreamInfo, HttpRequestParts, HttpResponseParts, StreamBody, StreamHandler,
+    upgrade_payload_channel, BodyError, DownstreamInfo, HttpRequestParts, HttpResponseParts,
+    StreamBody, StreamHandler, UpgradePayloadClosed, UpgradePayloadSender,
 };
 pub use headers::{
     apply_xff, ensure_request_id, generate_request_id, is_internal_request,

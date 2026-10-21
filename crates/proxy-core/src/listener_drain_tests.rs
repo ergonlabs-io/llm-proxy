@@ -491,13 +491,33 @@ async fn echo(client: &mut TcpStream, payload: &[u8]) {
     assert_eq!(echoed, payload);
 }
 
+/// A client-to-server text frame: masked, as RFC 6455 section 5.3 requires.
+fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+    masked_frame(0x1, payload)
+}
+
+/// A client Close frame with code 1001.
+fn masked_close_frame() -> Vec<u8> {
+    masked_frame(0x8, &1001u16.to_be_bytes())
+}
+
+fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    assert!(payload.len() < 126);
+    let mask = [0x11, 0x22, 0x33, 0x44];
+    let mut frame = vec![0x80 | opcode, 0x80 | payload.len() as u8];
+    frame.extend_from_slice(&mask);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    frame
+}
+
 /// envoy-semantics.md S10.5: an upgraded stream counts as active for drain.
 /// Hyper resolves an upgraded connection as soon as it hands the raw IO to
 /// the tunnel task, so the drain start that gracefully shuts down HTTP
 /// connections must neither cut the tunnel nor let `drain_worker` report
-/// done while it still carries bytes.
+/// done while it still carries bytes. A WebSocket tunnel is told to go away
+/// with a Close frame (code 1001).
 #[tokio::test(flavor = "multi_thread")]
-async fn an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes() {
+async fn an_upgraded_websocket_gets_close_1001_on_drain_and_holds_drain_open_until_it_closes() {
     LocalSet::new()
         .run_until(async {
             let upstream = spawn_upgrade_echo_upstream().await;
@@ -530,14 +550,31 @@ async fn an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_c
             }
             let head = String::from_utf8_lossy(&head);
             assert!(head.starts_with("HTTP/1.1 101"), "{head}");
-            echo(&mut client, b"before").await;
+            // Well-formed client frames (masked, RFC 6455 section 5.3); the
+            // upstream echoes them back as they are.
+            echo(&mut client, &masked_text_frame(b"before")).await;
 
             // The deadline is an hour away, so only the registry emptying can
             // make the worker report.
             worker.start_drain();
             // The refusal proves this worker has observed the drain start.
             assert_connect_refused(addr(port)).await;
-            echo(&mut client, b"during").await;
+            // S10.5 (llm-proxy extension): drain tells the client to go away
+            // with a Close frame, code 1001, instead of a reset at the deadline.
+            let close = proxy_http::websocket::close_frame(
+                proxy_http::websocket::CLOSE_GOING_AWAY,
+                "server draining",
+            );
+            let mut got = vec![0u8; close.len()];
+            tokio::time::timeout(WAIT, client.read_exact(&mut got))
+                .await
+                .expect("the Close frame must arrive once drain starts")
+                .expect("read the Close frame");
+            assert_eq!(got, close);
+            assert_eq!(&got[2..4], &1001u16.to_be_bytes());
+            // The client's Close reply still reaches the upstream: the tunnel
+            // stays open until a peer closes it.
+            client.write_all(&masked_close_frame()).await.unwrap();
             assert!(
                 matches!(done_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
                 "drain_worker reported done while an upgraded tunnel was live"

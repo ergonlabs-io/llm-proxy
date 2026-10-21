@@ -667,6 +667,50 @@ fn merge_modality(target: &mut Modality, dialect: Dialect, usage: &serde_json::V
 /// keys — that is what stops one dialect's parser from "successfully" reading
 /// another dialect's `usage` object and reporting zero tokens (a wrong answer
 /// is worse than no answer when this feeds billing).
+/// Read one realtime `response.done` event's `response.usage` object (the
+/// OpenAI Realtime shape, served by any provider that speaks it):
+/// `input_tokens` and `output_tokens` include their cached and modality
+/// subsets, `input_token_details` carries `cached_tokens`, `audio_tokens`,
+/// `image_tokens` and `cached_tokens_details.{audio,image}_tokens`, and
+/// `output_token_details` carries `audio_tokens`. As in the Responses arm,
+/// `input` is the non-cached remainder, and the audio and image subsets are
+/// the non-cached ones, so they sit inside it. `None` when the object
+/// reports neither input nor output tokens.
+pub fn realtime_usage_parts(usage: &serde_json::Value) -> Option<(TokenUsage, Modality)> {
+    let at = |path: &[&str]| {
+        path.iter()
+            .try_fold(usage, |value, key| value.get(key))
+            .and_then(|value| token_count(Some(value)))
+    };
+    let input = at(&["input_tokens"]);
+    let output = at(&["output_tokens"]);
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    let cached = at(&["input_token_details", "cached_tokens"]).unwrap_or(0);
+    let cached_of =
+        |kind: &str| at(&["input_token_details", "cached_tokens_details", kind]).unwrap_or(0);
+    let uncached_of = |kind: &str| {
+        at(&["input_token_details", kind])
+            .unwrap_or(0)
+            .saturating_sub(cached_of(kind))
+    };
+    Some((
+        TokenUsage {
+            input_tokens: input.unwrap_or(0).saturating_sub(cached),
+            cached_tokens: cached,
+            cache_creation_tokens: 0,
+            output_tokens: output.unwrap_or(0),
+        },
+        Modality {
+            input_audio_tokens: uncached_of("audio_tokens"),
+            input_image_tokens: uncached_of("image_tokens"),
+            output_audio_tokens: at(&["output_token_details", "audio_tokens"]).unwrap_or(0),
+            output_image_tokens: 0,
+        },
+    ))
+}
+
 fn usage_from_object(dialect: Dialect, usage: &serde_json::Value) -> Option<TokenUsage> {
     let raw = read_tokens(dialect, usage);
     if raw.is_empty() {
