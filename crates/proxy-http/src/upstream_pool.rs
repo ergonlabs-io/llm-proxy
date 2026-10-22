@@ -1,10 +1,11 @@
 //! Per-worker upstream connection caches. h2 connections are multiplexed and
-//! bounded per key; h1 connections are reused only after a clean response end.
+//! grow with demand per key; h1 connections are reused only after a clean response end.
 //! The caches stay in `proxy-http` because their hyper senders are `!Send`.
 //!
 //! h2 clients expose no way to observe the peer's available stream capacity.
-//! The cache uses a conservative in-flight count to spread work across a
-//! bounded connection set; hyper's per-connection queue handles excess sends.
+//! The cache uses a conservative in-flight count to decide when to dial
+//! another connection, bounded by the cluster's `max_connections`; hyper's
+//! per-connection queue handles excess sends.
 //!
 //! Connection slots live inside the byte stream, so eviction does not release
 //! a slot while an h2 stream still owns the socket. Periodic sweeps remove
@@ -231,53 +232,30 @@ impl AsyncWrite for SlotIo {
 }
 
 /// How many streams this cache will let itself *prefer* piling onto one
-/// connection before it goes looking for another. Not a real limit --
-/// nothing here can observe the peer's actual `max_concurrent_streams`
-/// (this module's doc explains why hyper's public h2 client API doesn't
-/// expose it) -- just our own conservative guess for "probably has room",
-/// used only to decide which of our own connections to route a request to.
-/// 100 is not invented for this: it's `DEFAULT_INITIAL_MAX_SEND_STREAMS`,
-/// the exact value hyper's own h2 client assumes for a connection before it
-/// has heard a real SETTINGS frame from the peer
-/// (`hyper-1.11.0/src/proto/h2/client.rs:61`) -- i.e. the same conservative
-/// "this is safe until proven otherwise" number hyper itself already
-/// trusts. Once every connection in the set looks this busy,
-/// [`UpstreamConnCache::get_or_connect`] dials another rather than queuing
-/// everything behind a guess.
+/// connection before it dials another. Not a real limit -- nothing here can
+/// observe the peer's actual `max_concurrent_streams` (this module's doc
+/// explains why hyper's public h2 client API doesn't expose it) -- just our
+/// own conservative guess for "probably has room". 100 is
+/// `DEFAULT_INITIAL_MAX_SEND_STREAMS`, the value hyper's own h2 client
+/// assumes for a connection before it has heard the peer's SETTINGS
+/// (`hyper-1.11.0/src/proto/h2/client.rs:61`), and RFC 9113 6.5.2's
+/// recommended floor for the setting.
 ///
-/// Honest limitation, not a defect: this is a heuristic, and it can be
-/// wrong in either direction because nothing here ever learns the peer's
-/// *real* advertised limit. Against the hyper server this module's doc
-/// measured (which advertises 200), this guess dials a second connection
-/// at 100 in-flight streams even though the first connection could actually
-/// have carried all 200 -- conservative, not optimal. So this fix does not
-/// remove the per-connection ceiling, it multiplies it by
-/// [`MAX_CONNECTIONS_PER_KEY`]: roughly 100 -> ~400 for that measured peer,
-/// not 100 -> unbounded. A peer that advertises fewer than 100 (unusual;
-/// RFC 7540 6.5.2 suggests 100 as a floor, but nothing enforces it) can
-/// still see more concurrent leases than it will actually run concurrently
-/// on a given connection -- safely, since hyper's own per-connection queue
-/// (this module's doc, above) absorbs the excess rather than failing it,
-/// just later than an accurate guess would have spread the load.
+/// The guess is wrong in the safe direction for a peer that allows more
+/// (hyper's server default is 200): the cache dials sooner than it must. A
+/// peer that allows fewer still sees the excess queued by hyper on that
+/// connection rather than refused.
+///
+/// There is no fixed cap on connections per key. One was tried (4), and it
+/// became the replica's stream ceiling: 4 connections x 200 streams = 800
+/// per worker, measured at 808 on one worker and about 3,000 on four
+/// (`internal-docs/capacity/README.md`; `internal-docs/capacity/2026-10-22-digitalocean-dedicated.md`,
+/// "Day 3"), with CPU to spare. Dialing only when every connection is at this
+/// soft limit already bounds the set by demand, at one connection per 100
+/// in-flight streams, and in-flight streams are bounded by the cluster's
+/// `max_requests`. The cluster's `max_connections` is the hard bound, as in
+/// Envoy's h2 pool (`internal-docs/envoy-semantics.md` S5).
 const SOFT_STREAMS_PER_CONNECTION: usize = 100;
-
-/// The hard cap on how many physical connections one [`ConnKey`] may hold at
-/// once. Must be bounded: with no cap, a sustained burst above
-/// [`SOFT_STREAMS_PER_CONNECTION`] would dial a fresh connection (and TLS
-/// handshake, where configured) per request once every existing connection
-/// looked busy -- recreating exactly the connect-per-request cost pooling
-/// exists to avoid. 4 is a deliberately small, fixed starting point: the
-/// capacity sweep that motivated this module plateaued with ONE connection
-/// capped at 200 real concurrent streams (hyper's own server default,
-/// `hyper-1.11.0/src/proto/h2/server.rs:69`); four connections, each free to
-/// carry however many streams the peer really allows (not just our
-/// [`SOFT_STREAMS_PER_CONNECTION`] guess -- see this module's doc), gives
-/// several times that ceiling per key while still amortizing the TCP+TLS
-/// handshake cost over many requests per connection, and without opening
-/// enough parallel connections to itself look like abuse to a peer that
-/// caps concurrent connections per client. Not (yet) configurable per
-/// cluster; a fixed conservative default is used.
-const MAX_CONNECTIONS_PER_KEY: usize = 4;
 
 /// Cached connection and its in-flight count. Its connection slot stays in
 /// the socket (see [`SlotIo`]) until the connection ends.
@@ -507,12 +485,16 @@ impl UpstreamConnCache {
     /// key's slot is removed again if it is still empty and no other checkout
     /// holds it (hazard 4), so a failure leaves neither a poisoned entry nor
     /// an empty one for the sweep to find -- the caller's own retry, if any,
-    /// or the next request simply tries again. Never returns an
-    /// error purely because every existing connection is busy: once the set
-    /// is at `MAX_CONNECTIONS_PER_KEY`, this hands out the least-loaded
-    /// member anyway and lets hyper's own per-connection queue (see this
-    /// module's doc) absorb the rest, exactly as the original single connection
-    /// already did for everything past its one connection's real capacity.
+    /// or the next request simply tries again.
+    ///
+    /// Never fails while a live connection exists. When every connection is
+    /// busy and the cluster's `max_connections` budget is full, or the extra
+    /// dial fails, this hands out the least-loaded connection and lets
+    /// hyper's per-connection queue (see this module's doc) absorb streams
+    /// past the peer's real limit. A full budget is checked before dialing,
+    /// not discovered by the dial: the dial would park in the pending queue
+    /// for up to `connect_timeout` while holding this key's lock, stalling
+    /// every request for the key on this worker.
     ///
     /// Rust note: the per-key `tokio::sync::Mutex` (not this cache's own
     /// `RefCell`) is what's held across the `.await`s below (dial,
@@ -568,9 +550,9 @@ impl UpstreamConnCache {
         }
 
         // 2. Every existing connection (if any) looks busy -- dial one more,
-        // as long as the set is still under the hard cap on how many
-        // physical connections this key is allowed to hold.
-        if conns.len() < MAX_CONNECTIONS_PER_KEY {
+        // unless one exists and the cluster has no connection slot to spare
+        // (see this function's doc).
+        if conns.is_empty() || key.build.has_connection_headroom() {
             // The connection's `max_connections` slot moves into the stream
             // (`SlotIo`), so it is released when the socket is, not when this
             // cache happens to evict the entry. A failed handshake drops the
@@ -598,11 +580,13 @@ impl UpstreamConnCache {
             let (sender, timing) = match dialed {
                 Ok(dialed) => dialed,
                 Err(err) => {
-                    let unused = conns.is_empty();
-                    drop(conns);
-                    if unused {
-                        self.remove_unused_slot(&key, &slot);
+                    // The connections we already hold are still usable; a
+                    // failed extra dial must not fail a request they can carry.
+                    if let Some(conn) = least_loaded(&conns) {
+                        return Ok(lease(conn));
                     }
+                    drop(conns);
+                    self.remove_unused_slot(&key, &slot);
                     return Err(err);
                 }
             };
@@ -615,16 +599,10 @@ impl UpstreamConnCache {
             return Ok(lease(conn));
         }
 
-        // 3. At the cap and everything looks busy: never fail purely
-        // because of that -- hand out the least-loaded connection anyway.
-        // hyper's own per-connection queue still won't drop or reject the
-        // request; it queues internally until a real stream slot frees,
-        // exactly like the original single connection did for everything past
-        // its own real capacity.
-        let conn = conns
-            .iter()
-            .min_by_key(|c| c.activity.in_flight.get())
-            .expect("MAX_CONNECTIONS_PER_KEY > 0, so the set is non-empty by branch 2");
+        // 3. Everything looks busy and the cluster's connection budget is
+        // full: share the least-loaded connection. hyper queues a stream past
+        // the peer's real limit until a stream slot frees; it does not reject it.
+        let conn = least_loaded(&conns).expect("branch 2 dials whenever the set is empty");
         Ok(lease(conn))
     }
 
@@ -664,6 +642,11 @@ impl UpstreamConnCache {
     pub fn clear(&self) {
         self.slots.borrow_mut().clear();
     }
+}
+
+/// The cached connection carrying the fewest leased streams, if any.
+fn least_loaded(conns: &[PooledConn]) -> Option<&PooledConn> {
+    conns.iter().min_by_key(|c| c.activity.in_flight.get())
 }
 
 /// Lease one stream on `conn`: increments its in-flight counter and returns
@@ -765,8 +748,8 @@ pub fn set_worker_membership(oracle: MembershipOracle) {
 
 /// How many IDLE h1 connections [`H1ConnCache`] will hold open, at most, for
 /// one [`ConnKey`], waiting for a future request to lease them. Deliberately
-/// small: unlike the h2 cache's [`MAX_CONNECTIONS_PER_KEY`] (which bounds
-/// *concurrently in-use* connections), every one of these is doing nothing
+/// small: unlike the h2 cache's connections (which grow with *concurrently
+/// in-use* streams, see [`SOFT_STREAMS_PER_CONNECTION`]), every one of these is doing nothing
 /// but holding a socket open on the CHANCE the next request happens to be
 /// for the same upstream soon -- 8 is enough to smooth out a bursty
 /// sequential workload against one provider without accumulating a large
@@ -2114,15 +2097,159 @@ mod tests {
                 );
 
                 let opened = accepted.load(Ordering::SeqCst);
-                assert!(
-                    opened > 1,
-                    "expected more than one physical connection to have been dialed, got {opened}"
+                assert_eq!(
+                    opened, 2,
+                    "the 101st lease dials exactly one more connection, got {opened}"
                 );
-                assert!(
-                    opened <= MAX_CONNECTIONS_PER_KEY,
-                    "opened {opened} connections, more than the cache's own cap of \
-                     {MAX_CONNECTIONS_PER_KEY}"
+            })
+            .await;
+    }
+
+    /// Lease `n` streams on `key` without sending on them. A lease counts as
+    /// in flight from the moment it is taken (see `StreamGuard`), so this
+    /// fills connections to the soft limit deterministically.
+    async fn lease_n(
+        cache: &UpstreamConnCache,
+        key: &ConnKey,
+        pool: &dyn HttpConnPool,
+        n: usize,
+    ) -> Vec<PooledSendRequest> {
+        let mut leases = Vec::with_capacity(n);
+        for i in 0..n {
+            let lease = cache.get_or_connect(key.clone(), pool).await;
+            leases.push(lease.unwrap_or_else(|err| panic!("lease {i} of {n} failed: {err}")));
+        }
+        leases
+    }
+
+    /// How many connections the cache holds for `key`.
+    fn cached_connections(cache: &UpstreamConnCache, key: &ConnKey) -> usize {
+        cache.slots.borrow().get(key).map_or(0, |slot| {
+            slot.try_lock()
+                .expect("no checkout is in progress between leases")
+                .len()
+        })
+    }
+
+    /// The connection set grows with demand, one connection per
+    /// `SOFT_STREAMS_PER_CONNECTION` in-flight streams. A fixed cap of 4
+    /// connections per key held one worker to 4 x the peer's
+    /// `max_concurrent_streams` (800 against hyper's server default) with CPU
+    /// to spare (`internal-docs/capacity/2026-10-22-digitalocean-dedicated.md`,
+    /// "Day 3").
+    #[tokio::test(flavor = "current_thread")]
+    async fn connections_grow_past_four_while_every_one_is_at_the_soft_limit() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, _accepted) = spawn_counting_h2_upstream().await;
+                let pool = plaintext_pool(addr);
+                let cache = UpstreamConnCache::new();
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
+
+                let leases =
+                    lease_n(&cache, &key, &pool, 5 * SOFT_STREAMS_PER_CONNECTION + 1).await;
+
+                assert_eq!(
+                    cached_connections(&cache, &key),
+                    6,
+                    "{} leases need six connections at {SOFT_STREAMS_PER_CONNECTION} each",
+                    leases.len()
                 );
+            })
+            .await;
+    }
+
+    /// With the cluster's `max_connections` spent, a checkout that finds every
+    /// connection busy shares the least-loaded one at once. Dialing would park
+    /// in the pending queue (this budget allows one pending dial) for the
+    /// pool's 30 s `connect_timeout` while holding the key's lock. The 10 s
+    /// bound only catches that park; the real path does not wait at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_spent_connection_budget_shares_a_busy_connection_without_parking() {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, accepted) = spawn_counting_h2_upstream().await;
+                let budget = CircuitBreakerState::from_thresholds(CircuitBreakerThresholds {
+                    max_connections: 1,
+                    max_pending_requests: 1,
+                    ..CircuitBreakerThresholds::ENVOY_DEFAULT
+                });
+                let pool = pool_on(addr, &budget);
+                let cache = UpstreamConnCache::new();
+                let key = key_on("up", addr, UpstreamProtocol::Http2, &budget);
+                let mut leases = lease_n(&cache, &key, &pool, SOFT_STREAMS_PER_CONNECTION).await;
+
+                let extra = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    cache.get_or_connect(key.clone(), &pool),
+                )
+                .await
+                .expect("the checkout parked on the spent connection budget")
+                .expect("a busy connection still carries the stream");
+                leases.push(extra);
+
+                assert_eq!(cached_connections(&cache, &key), 1);
+                leases
+                    .pop()
+                    .expect("pushed one line above")
+                    .send(get_request())
+                    .await
+                    .expect("the shared connection answers");
+                assert_eq!(accepted.load(Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    /// A failed extra dial does not fail a request the connections already
+    /// held can carry. The upstream stops listening after its first
+    /// connection, so the second dial is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_extra_dial_falls_back_to_a_busy_connection() {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tokio::task::spawn_local(async move {
+                    let (io, _peer) = listener.accept().await.unwrap();
+                    drop(listener);
+                    let service = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::new(),
+                        )))
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(LocalExec)
+                        .serve_connection(TokioIo::new(io), service)
+                        .await;
+                });
+                let pool = plaintext_pool(addr);
+                let cache = UpstreamConnCache::new();
+                let key = test_key("up", addr, UpstreamProtocol::Http2);
+                let mut leases = lease_n(&cache, &key, &pool, SOFT_STREAMS_PER_CONNECTION).await;
+                // The first connection is accepted, and the listener closed,
+                // once a request has gone over it.
+                leases
+                    .pop()
+                    .expect("leased above")
+                    .send(get_request())
+                    .await
+                    .expect("first connection answers");
+                leases.push(
+                    cache
+                        .get_or_connect(key.clone(), &pool)
+                        .await
+                        .expect("refill to the soft limit"),
+                );
+
+                let extra = cache
+                    .get_or_connect(key.clone(), &pool)
+                    .await
+                    .expect("a refused extra dial falls back to the busy connection");
+
+                assert_eq!(cached_connections(&cache, &key), 1);
+                extra
+                    .send(get_request())
+                    .await
+                    .expect("the busy connection answers");
             })
             .await;
     }
