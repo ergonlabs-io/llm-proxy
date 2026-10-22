@@ -474,6 +474,22 @@ pub trait ControlPlaneStore: Send + Sync {
     /// audit trail survives a revoke) -- see `StoredKey::revoked`'s use in
     /// [`ControlPlane::rebuild`] for why the row is not deleted.
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError>;
+    /// Revokes every row in `key_ids` as [`Self::revoke_key`] does, skips an
+    /// id the store has never seen, and returns how many rows it revoked.
+    /// Offboarding a tenant revokes all its keys at once; a store overrides
+    /// this to do that in one write instead of one per key. The default is
+    /// one [`Self::revoke_key`] per id.
+    fn revoke_keys(&self, key_ids: &[KeyId]) -> Result<usize, StoreError> {
+        let mut revoked = 0;
+        for key_id in key_ids {
+            match self.revoke_key(key_id) {
+                Ok(()) => revoked += 1,
+                Err(StoreError::NotFound) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(revoked)
+    }
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError>;
 
     /// Sets or clears `tenant`'s spend budget.
@@ -1254,6 +1270,24 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             // `ControlPlaneStore::policy_generation`'s doc.
             None => Err(StoreError::NotFound),
         }
+    }
+
+    fn revoke_keys(&self, key_ids: &[KeyId]) -> Result<usize, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        let mut revoked = 0;
+        for key_id in key_ids {
+            if let Some(rec) = state.keys.get_mut(key_id) {
+                rec.revoked = true;
+                revoked += 1;
+            }
+        }
+        if revoked > 0 {
+            state.generation += 1;
+        }
+        Ok(revoked)
     }
 
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
@@ -2845,6 +2879,35 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    /// One transaction and one fsync for the whole batch.
+    fn revoke_keys(&self, key_ids: &[KeyId]) -> Result<usize, StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let mut revoked = 0;
+        {
+            let mut table = txn.open_table(KEYS_TABLE).map_err(store_err)?;
+            for key_id in key_ids {
+                let row: Option<EncodedKeyRow> =
+                    match table.get(key_id.as_str()).map_err(store_err)? {
+                        Some(guard) => Some(decode_json(guard.value())?),
+                        None => None,
+                    };
+                let Some(mut row) = row else { continue };
+                row.revoked = true;
+                table
+                    .insert(key_id.as_str(), encode_json(&row).as_slice())
+                    .map_err(store_err)?;
+                revoked += 1;
+            }
+        }
+        if revoked == 0 {
+            // Nothing written: dropping `txn` rolls back, and the stamp stays.
+            return Ok(0);
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(revoked)
     }
 
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
@@ -4560,19 +4623,19 @@ impl ControlPlane {
     /// poll is included.
     fn revoke_tenant_keys(&self, tenant: &TenantId) -> Result<usize, StoreError> {
         let loaded = self.store.load()?;
-        let mut revoked = 0;
-        for key in loaded
+        let active: Vec<KeyId> = loaded
             .keys
             .iter()
             .filter(|key| &key.tenant == tenant && !key.revoked)
-        {
-            match self.store.revoke_key(&key.key_id) {
-                Ok(()) => revoked += 1,
-                // Gone between the load and the revoke: nothing to revoke.
-                Err(StoreError::NotFound) => {}
-                Err(err) => return Err(err),
-            }
-        }
+            .map(|key| key.key_id.clone())
+            .collect();
+        // One batched write; a key gone between the load and the revoke is
+        // skipped, since there is nothing left to revoke.
+        let mut revoked = if active.is_empty() {
+            0
+        } else {
+            self.store.revoke_keys(&active)?
+        };
         let stored: HashSet<&KeyId> = loaded.keys.iter().map(|key| &key.key_id).collect();
         for (digest, record) in self.bootstrap_keys.iter() {
             if &record.tenant != tenant || record.revoked || stored.contains(&record.key_id) {
@@ -5498,6 +5561,9 @@ impl ControlPlaneStore for SharedMemoryStore {
     }
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError> {
         self.inner.revoke_key(key_id)
+    }
+    fn revoke_keys(&self, key_ids: &[KeyId]) -> Result<usize, StoreError> {
+        self.inner.revoke_keys(key_ids)
     }
     fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
         self.inner.set_policy(tenant, access)
@@ -7767,6 +7833,66 @@ mod tests {
             redb_store.revoke_key(&KeyId::new("nonexistent")),
             inmemory_store.revoke_key(&KeyId::new("nonexistent")),
         );
+    }
+
+    // --- revoke_keys: one batched write per store; unknown ids are skipped,
+    //     and a batch that writes nothing leaves the stamp alone
+
+    #[test]
+    fn revoke_keys_revokes_known_rows_and_bumps_the_stamp_only_on_a_write() {
+        let stores: [(&str, Box<dyn ControlPlaneStore>); 2] = [
+            ("redb", Box::new(RedbControlPlaneStore::in_memory())),
+            ("in-memory", Box::new(InMemoryControlPlaneStore::default())),
+        ];
+        for (name, store) in stores {
+            for id in ["k1", "k2", "k3"] {
+                store
+                    .put_key(&StoredKey {
+                        key_id: KeyId::new(id),
+                        digest: digest_bytes(b"secret", id),
+                        tenant: TenantId::new("tenant-a"),
+                        revoked: false,
+                        tags: Default::default(),
+                    })
+                    .unwrap();
+            }
+            let before = store.policy_generation().unwrap();
+
+            let revoked = store
+                .revoke_keys(&[KeyId::new("k1"), KeyId::new("gone"), KeyId::new("k3")])
+                .unwrap();
+
+            assert_eq!(revoked, 2, "{name}: counts only the rows it revoked");
+            let mut states: Vec<(String, bool)> = store
+                .load()
+                .unwrap()
+                .keys
+                .iter()
+                .map(|k| (k.key_id.as_str().to_string(), k.revoked))
+                .collect();
+            states.sort();
+            assert_eq!(
+                states,
+                [
+                    ("k1".into(), true),
+                    ("k2".into(), false),
+                    ("k3".into(), true)
+                ],
+                "{name}: revokes exactly the listed rows"
+            );
+            let after = store.policy_generation().unwrap();
+            assert!(
+                after > before,
+                "{name}: a batch that wrote must bump the stamp"
+            );
+
+            assert_eq!(store.revoke_keys(&[KeyId::new("gone")]).unwrap(), 0);
+            assert_eq!(
+                store.policy_generation().unwrap(),
+                after,
+                "{name}: a batch that wrote nothing must not bump the stamp"
+            );
+        }
     }
 
     // --- redb: set_policy then load() returns it; create_tenant/delete_tenant reflected
