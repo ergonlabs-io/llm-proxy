@@ -422,7 +422,9 @@ s2() {
 s3() {
     local d store rate="${S3_RATE:-3000}"
     echo "=== S3 shared-store cost: 3 replicas, in_memory vs shared, ${rate} rps total ==="
-    for store in in_memory shared; do
+    # S3_STORES reverses the order to test for drift in host load between
+    # the two halves (the second half has run with more steal so far).
+    for store in ${S3_STORES:-in_memory shared}; do
         d="$OUT/s3-$store"; mkdir -p "$d"
         start_mock "$d" --tokens 16 --ttft-ms 5 --inter-token-ms 0
         [[ "$store" == shared ]] && start_redis "$d"
