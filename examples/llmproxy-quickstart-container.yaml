@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# The quick-start configuration for the container image: one OpenAI-compatible
+# provider, and every model routed to it. The file holds no secrets and no
+# URLs. Set two environment variables, then start the proxy:
+#
+#   export UPSTREAM_BASE_URL=https://api.openai.com   # scheme, host and port only, no /v1
+#   export UPSTREAM_API_KEY=...                        # the provider's API key
+#   docker run --rm -p 127.0.0.1:8080:8080 -e UPSTREAM_BASE_URL -e UPSTREAM_API_KEY \
+#     -v "$PWD/llmproxy-quickstart-container.yaml:/etc/llm-proxy/llmproxy.yaml:ro" \
+#     ghcr.io/ergonlabs-io/llm-proxy:latest
+#
+# For Ollama on the Docker host, set
+# UPSTREAM_BASE_URL=http://host.docker.internal:11434 and set
+# UPSTREAM_API_KEY to any value; Ollama ignores it.
+#
+# Inside the container the proxy listens on all interfaces, because Docker
+# forwards the published port to the container address. Publish the port on
+# 127.0.0.1 only, as above. There is no `auth` section, so the proxy does not
+# check callers. Anyone who can reach the port uses your provider key. Add
+# virtual keys before you expose it (docs: Authentication > Virtual keys).
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  # Any name other than openai, anthropic or openrouter is an
+  # OpenAI-compatible provider. The proxy sends the key as
+  # `Authorization: Bearer`, in place of the caller's Authorization header.
+  upstream:
+    base_url: ${UPSTREAM_BASE_URL}
+    api_key: ${UPSTREAM_API_KEY}
+
+routes:
+  - model: "*"
+    provider: upstream
+
+# One JSON line per request on stdout, with the token counts.
+observability:
+  access_logs:
+    output: stdout
+    format: json

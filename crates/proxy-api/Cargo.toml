@@ -3,6 +3,8 @@ name = "proxy-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [lib]
 # Generated proto doc-comments contain YAML/text snippets rustdoc would try to

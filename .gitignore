@@ -28,6 +28,11 @@ testing/diffrig/captures/
 # repository is worse than none: it looks present locally and is invisible to
 # the people it exists for.
 !SECURITY.md
+# Community files GitHub shows on the repository page, and the pull request
+# template. Same reason as SECURITY.md: untracked here means missing there.
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+!.github/**/*.md
 !testing/corpus/fixtures/**/SOURCES.md
 # The spec the Go QA suite is written from — reviewable alongside the tests
 # that cite its case IDs.

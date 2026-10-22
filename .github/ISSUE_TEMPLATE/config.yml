@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ergonlabs-io/llm-proxy/blob/main/SECURITY.md
+    about: Do not open a public issue for a vulnerability. Follow the security policy.
+  - name: Documentation
+    url: https://ergonlabs.io/docs/llm-proxy/
+    about: Configuration reference, guides, and known limitations.
