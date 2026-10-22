@@ -195,6 +195,10 @@ enum Lane {
     /// `last_flush_seq` and `load_spend` batches, the `load_spend` batch that
     /// fills buckets at bind time, and the operator's `overwrite_spend`.
     Spend,
+    /// Tier 3: rate-window reconciliation, every second, and the usage
+    /// endpoint's window reads. Its own connection, so a spend flush that
+    /// carries many rows cannot hold the one-second window flush behind it.
+    Windows,
     /// Tier 4: the stream-lease publisher, once per publish interval. Its
     /// own connection, so a long spend flush cannot hold a publish past the
     /// lease TTL and expire this replica's live leases.
@@ -203,6 +207,21 @@ enum Lane {
     /// naming an object this replica has not cached. Its own connection, so
     /// object traffic cannot delay a revocation pickup on [`Lane::Control`].
     Objects,
+}
+
+/// One lane's open connection, and the scripts loaded on it so far (by
+/// hash), so a pipelined batch sends `SCRIPT LOAD` once per connection
+/// rather than once per pipeline (see [`RedisControlPlaneStore::pipelined`]).
+/// Dropped with the connection, so a reconnect loads again.
+struct LaneConnection {
+    conn: Connection,
+    loaded: Vec<String>,
+}
+
+impl LaneConnection {
+    fn has_loaded(&self, script: &Script) -> bool {
+        self.loaded.iter().any(|hash| hash == script.get_hash())
+    }
 }
 
 /// [`ControlPlaneStore::add_spend`]'s Lua script. ADR-0006 §2 decides that
@@ -585,13 +604,15 @@ fn unescape_component(escaped: &str) -> Option<String> {
 pub struct RedisControlPlaneStore {
     client: Client,
     /// The [`Lane::Control`] connection, opened on first use.
-    control_conn: Mutex<Option<Connection>>,
+    control_conn: Mutex<Option<LaneConnection>>,
     /// The [`Lane::Spend`] connection, opened on first use.
-    spend_conn: Mutex<Option<Connection>>,
+    spend_conn: Mutex<Option<LaneConnection>>,
+    /// The [`Lane::Windows`] connection, opened on first use.
+    windows_conn: Mutex<Option<LaneConnection>>,
     /// The [`Lane::Lease`] connection, opened on first use.
-    lease_conn: Mutex<Option<Connection>>,
+    lease_conn: Mutex<Option<LaneConnection>>,
     /// The [`Lane::Objects`] connection, opened on first use.
-    objects_conn: Mutex<Option<Connection>>,
+    objects_conn: Mutex<Option<LaneConnection>>,
     /// Connect, read, and write timeout of both lanes: [`IO_TIMEOUT`] in
     /// production. A field rather than the constant read in place so the
     /// lane tests can hold a call in flight far longer than that without
@@ -645,6 +666,7 @@ impl RedisControlPlaneStore {
             client,
             control_conn: Mutex::new(None),
             spend_conn: Mutex::new(None),
+            windows_conn: Mutex::new(None),
             lease_conn: Mutex::new(None),
             objects_conn: Mutex::new(None),
             io_timeout: IO_TIMEOUT,
@@ -684,9 +706,21 @@ impl RedisControlPlaneStore {
         lane: Lane,
         f: impl FnOnce(&mut Connection) -> redis::RedisResult<T>,
     ) -> Result<T, StoreError> {
+        self.with_lane_connection(lane, |lane_conn| f(&mut lane_conn.conn))
+    }
+
+    /// [`Self::with_connection`], handing `f` the lane's whole
+    /// [`LaneConnection`] so it can see which scripts that connection has
+    /// already loaded.
+    fn with_lane_connection<T>(
+        &self,
+        lane: Lane,
+        f: impl FnOnce(&mut LaneConnection) -> redis::RedisResult<T>,
+    ) -> Result<T, StoreError> {
         let slot = match lane {
             Lane::Control => &self.control_conn,
             Lane::Spend => &self.spend_conn,
+            Lane::Windows => &self.windows_conn,
             Lane::Lease => &self.lease_conn,
             Lane::Objects => &self.objects_conn,
         };
@@ -701,7 +735,10 @@ impl RedisControlPlaneStore {
                 .map_err(store_err)?;
             conn.set_read_timeout(Some(timeout)).map_err(store_err)?;
             conn.set_write_timeout(Some(timeout)).map_err(store_err)?;
-            *guard = Some(conn);
+            *guard = Some(LaneConnection {
+                conn,
+                loaded: Vec::new(),
+            });
         }
         // Rust note: `.as_mut()` on the `Option`, not `.take()` -- a
         // successful call must leave the connection in the `Mutex` for the
@@ -850,44 +887,73 @@ impl RedisControlPlaneStore {
         )
     }
 
-    /// Runs one spend command per row on [`Lane::Spend`], as one pipeline per
+    /// Runs one command per row on `lane`, as one pipeline per
     /// [`SPEND_PIPELINE_ROWS`] rows, and answers one result per row in order.
-    /// Every command must reply with an integer or nil (read as `0`). A
-    /// pipeline that fails gives each of its rows the error and drops the
-    /// connection like any other failed call, so the next pipeline reconnects.
+    /// Every command must reply with an integer or nil (read as `0`).
     ///
     /// Not `MULTI`/`EXEC`: the rows are independent, and each `add_spend`
     /// script is already atomic on its own. A plain pipeline only saves the
     /// round trips.
+    ///
+    /// # `script` is loaded once per connection
+    ///
+    /// A pipeline cannot fall back to loading a script mid-way the way a
+    /// single [`redis::Script::invoke`] does, so a batch of `EVALSHA` names
+    /// its script here and the first pipeline on a connection leads with
+    /// `SCRIPT LOAD`. Later pipelines on that connection skip it. Redis keeps
+    /// loaded scripts until it restarts or is flushed; a restart drops the
+    /// connection, and a `NOSCRIPT` reply fails the pipeline, which drops it
+    /// too, so the next pipeline loads the script again on a fresh one.
+    /// Read-only batches pass `None` and never load anything.
+    ///
+    /// # The first failed pipeline ends the batch
+    ///
+    /// A failed pipeline drops the connection like any other failed call, so
+    /// the next one would dial again and could wait out another
+    /// [`IO_TIMEOUT`]. A batch of many pipelines against a dead Redis would
+    /// then hold its caller (the flusher, under its flush lock, or shutdown)
+    /// for one timeout per pipeline. So every row from the failed pipeline on
+    /// gets its error, and nothing more is sent. The callers already treat
+    /// each row's error on its own and retry next tick.
     fn pipelined<R>(
         &self,
-        preload: &str,
+        lane: Lane,
+        script: Option<(&Script, &str)>,
         rows: &[R],
         mut queue: impl FnMut(&mut redis::Pipeline, &R),
     ) -> Vec<Result<u64, StoreError>> {
         let mut results = Vec::with_capacity(rows.len());
-        for chunk in rows.chunks(SPEND_PIPELINE_ROWS) {
-            let mut pipe = redis::pipe();
-            pipe.cmd("SCRIPT").arg("LOAD").arg(preload).ignore();
-            for row in chunk {
-                queue(&mut pipe, row);
-            }
-            let replies =
-                self.with_connection(Lane::Spend, |conn| pipe.query::<Vec<Option<u64>>>(conn));
-            match replies {
+        for (index, chunk) in rows.chunks(SPEND_PIPELINE_ROWS).enumerate() {
+            let replies = self.with_lane_connection(lane, |lane_conn| {
+                let mut pipe = redis::pipe();
+                let preload = script.filter(|(script, _)| !lane_conn.has_loaded(script));
+                if let Some((_, source)) = preload {
+                    pipe.cmd("SCRIPT").arg("LOAD").arg(source).ignore();
+                }
+                for row in chunk {
+                    queue(&mut pipe, row);
+                }
+                let replies = pipe.query::<Vec<Option<u64>>>(&mut lane_conn.conn)?;
+                if let Some((script, _)) = preload {
+                    lane_conn.loaded.push(script.get_hash().to_owned());
+                }
+                Ok(replies)
+            });
+            let err = match replies {
                 Ok(replies) if replies.len() == chunk.len() => {
                     results.extend(replies.into_iter().map(|v| Ok(v.unwrap_or(0))));
+                    continue;
                 }
-                Ok(replies) => {
-                    let err = StoreError::Unavailable(format!(
-                        "spend pipeline answered {} replies for {} commands",
-                        replies.len(),
-                        chunk.len()
-                    ));
-                    results.extend(chunk.iter().map(|_| Err(err.clone())));
-                }
-                Err(err) => results.extend(chunk.iter().map(|_| Err(err.clone()))),
-            }
+                Ok(replies) => StoreError::Unavailable(format!(
+                    "redis pipeline answered {} replies for {} commands",
+                    replies.len(),
+                    chunk.len()
+                )),
+                Err(err) => err,
+            };
+            let unsent = rows.len() - index * SPEND_PIPELINE_ROWS;
+            results.extend(std::iter::repeat_n(Err(err), unsent));
+            break;
         }
         results
     }
@@ -1487,28 +1553,30 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         })
     }
 
-    /// One pipeline of `EVALSHA` per [`SPEND_PIPELINE_ROWS`] rows, led by a
-    /// `SCRIPT LOAD` so the hash is known to Redis before the first call (a
-    /// pipeline cannot fall back to loading the script mid-way the way a
-    /// single [`redis::Script::invoke`] does). The load is idempotent and
-    /// costs one short command per pipeline.
+    /// One pipeline of `EVALSHA` per [`SPEND_PIPELINE_ROWS`] rows; the first
+    /// on a connection loads the script (see [`Self::pipelined`]).
     fn add_spend_batch(
         &self,
         stat_prefix: &str,
         node_id: &str,
         rows: &[SpendDelta<'_>],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(ADD_SPEND_LUA, rows, |pipe, row| {
-            pipe.cmd("EVALSHA")
-                .arg(self.add_spend_script.get_hash())
-                .arg(2)
-                .arg(self.spend_key(stat_prefix, row.tenant.as_str(), row.period.as_str()))
-                .arg(self.seq_key(stat_prefix, row.tenant.as_str(), row.period.as_str()))
-                .arg(node_id)
-                .arg(row.seq)
-                .arg(row.delta_micros)
-                .arg(spend_expires_at(row.period));
-        })
+        self.pipelined(
+            Lane::Spend,
+            Some((&self.add_spend_script, ADD_SPEND_LUA)),
+            rows,
+            |pipe, row| {
+                pipe.cmd("EVALSHA")
+                    .arg(self.add_spend_script.get_hash())
+                    .arg(2)
+                    .arg(self.spend_key(stat_prefix, row.tenant.as_str(), row.period.as_str()))
+                    .arg(self.seq_key(stat_prefix, row.tenant.as_str(), row.period.as_str()))
+                    .arg(node_id)
+                    .arg(row.seq)
+                    .arg(row.delta_micros)
+                    .arg(spend_expires_at(row.period));
+            },
+        )
     }
 
     fn last_flush_seq_batch(
@@ -1517,7 +1585,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         node_id: &str,
         rows: &[(TenantId, PeriodKey)],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(ADD_SPEND_LUA, rows, |pipe, (tenant, period)| {
+        self.pipelined(Lane::Spend, None, rows, |pipe, (tenant, period)| {
             pipe.cmd("HGET")
                 .arg(self.seq_key(stat_prefix, tenant.as_str(), period.as_str()))
                 .arg(node_id);
@@ -1529,13 +1597,13 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         stat_prefix: &str,
         rows: &[(TenantId, PeriodKey)],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(ADD_SPEND_LUA, rows, |pipe, (tenant, period)| {
+        self.pipelined(Lane::Spend, None, rows, |pipe, (tenant, period)| {
             pipe.cmd("GET")
                 .arg(self.spend_key(stat_prefix, tenant.as_str(), period.as_str()));
         })
     }
 
-    /// Window rows ride the spend lane and its pipelining; see
+    /// Window rows ride [`Lane::Windows`] and the spend pipelining; see
     /// [`ADD_WINDOW_LUA`]. Every delivery carries `EXPIREAT` window end plus
     /// grace, so rows expire without a sweeper.
     fn add_window_batch(
@@ -1544,23 +1612,28 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         node_id: &str,
         rows: &[WindowDelta<'_>],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(ADD_WINDOW_LUA, rows, |pipe, delta| {
-            pipe.cmd("EVALSHA")
-                .arg(self.add_window_script.get_hash())
-                .arg(2)
-                .arg(self.window_key(scope, delta.row))
-                .arg(self.window_seq_key(scope, delta.row))
-                .arg(node_id)
-                .arg(delta.seq)
-                .arg(delta.delta)
-                .arg(
-                    delta
-                        .row
-                        .window
-                        .end_secs()
-                        .saturating_add(WINDOW_ROW_GRACE_SECS),
-                );
-        })
+        self.pipelined(
+            Lane::Windows,
+            Some((&self.add_window_script, ADD_WINDOW_LUA)),
+            rows,
+            |pipe, delta| {
+                pipe.cmd("EVALSHA")
+                    .arg(self.add_window_script.get_hash())
+                    .arg(2)
+                    .arg(self.window_key(scope, delta.row))
+                    .arg(self.window_seq_key(scope, delta.row))
+                    .arg(node_id)
+                    .arg(delta.seq)
+                    .arg(delta.delta)
+                    .arg(
+                        delta
+                            .row
+                            .window
+                            .end_secs()
+                            .saturating_add(WINDOW_ROW_GRACE_SECS),
+                    );
+            },
+        )
     }
 
     fn last_window_seq_batch(
@@ -1569,7 +1642,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         node_id: &str,
         rows: &[WindowRow],
     ) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(ADD_WINDOW_LUA, rows, |pipe, row| {
+        self.pipelined(Lane::Windows, None, rows, |pipe, row| {
             pipe.cmd("HGET")
                 .arg(self.window_seq_key(scope, row))
                 .arg(node_id);
@@ -1577,7 +1650,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     }
 
     fn load_window_batch(&self, scope: &str, rows: &[WindowRow]) -> Vec<Result<u64, StoreError>> {
-        self.pipelined(ADD_WINDOW_LUA, rows, |pipe, row| {
+        self.pipelined(Lane::Windows, None, rows, |pipe, row| {
             pipe.cmd("GET").arg(self.window_key(scope, row));
         })
     }

@@ -3172,6 +3172,47 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Ok(total)
     }
 
+    /// ONE write transaction, so one commit and one fsync, however many rows
+    /// the flusher delivers in a tick; each row is the same dedup read and
+    /// read-modify-write [`Self::add_spend`] does. A failure fails every row
+    /// of the batch, and nothing of it is committed: the flusher retries each
+    /// row under the same token next tick. A batch of nothing but replays
+    /// writes nothing and is aborted, like a single replay.
+    fn add_spend_batch(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[SpendDelta<'_>],
+    ) -> Vec<Result<u64, StoreError>> {
+        match self.add_spend_batch_inner(stat_prefix, node_id, rows) {
+            Ok(totals) => totals.into_iter().map(Ok).collect(),
+            Err(err) => rows.iter().map(|_| Err(err.clone())).collect(),
+        }
+    }
+
+    /// One read transaction for the whole batch.
+    fn last_flush_seq_batch(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[(TenantId, PeriodKey)],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.read_spend_rows(rows, SPEND_SEQ_TABLE, |(tenant, period)| {
+            (stat_prefix, tenant.as_str(), period.as_str(), node_id)
+        })
+    }
+
+    /// One read transaction for the whole batch.
+    fn load_spend_batch(
+        &self,
+        stat_prefix: &str,
+        rows: &[(TenantId, PeriodKey)],
+    ) -> Vec<Result<u64, StoreError>> {
+        self.read_spend_rows(rows, SPEND_TABLE, |(tenant, period)| {
+            (stat_prefix, tenant.as_str(), period.as_str())
+        })
+    }
+
     fn add_window_batch(
         &self,
         scope: &str,
@@ -3224,6 +3265,82 @@ impl ControlPlaneStore for RedbControlPlaneStore {
 }
 
 impl RedbControlPlaneStore {
+    /// [`ControlPlaneStore::add_spend_batch`]'s transaction.
+    fn add_spend_batch_inner(
+        &self,
+        stat_prefix: &str,
+        node_id: &str,
+        rows: &[SpendDelta<'_>],
+    ) -> Result<Vec<u64>, StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let mut totals = Vec::with_capacity(rows.len());
+        let mut wrote = false;
+        {
+            let mut seq_table = txn.open_table(SPEND_SEQ_TABLE).map_err(store_err)?;
+            let mut spend_table = txn.open_table(SPEND_TABLE).map_err(store_err)?;
+            for delta in rows {
+                let row = (stat_prefix, delta.tenant.as_str(), delta.period.as_str());
+                let seq_key = (
+                    stat_prefix,
+                    delta.tenant.as_str(),
+                    delta.period.as_str(),
+                    node_id,
+                );
+                let current = spend_table
+                    .get(row)
+                    .map_err(store_err)?
+                    .map(|guard| guard.value())
+                    .unwrap_or(0);
+                let last_seq = seq_table
+                    .get(seq_key)
+                    .map_err(store_err)?
+                    .map(|guard| guard.value());
+                if last_seq.is_some_and(|last| delta.seq <= last) {
+                    totals.push(current);
+                    continue;
+                }
+                let total = current.saturating_add(delta.delta_micros);
+                spend_table.insert(row, total).map_err(store_err)?;
+                seq_table.insert(seq_key, delta.seq).map_err(store_err)?;
+                totals.push(total);
+                wrote = true;
+            }
+        }
+        if wrote {
+            txn.commit().map_err(store_err)?;
+        } else {
+            txn.abort().map_err(store_err)?;
+        }
+        Ok(totals)
+    }
+
+    /// Reads one `u64` per spend row inside a single read transaction; a
+    /// missing row reads as `0`, as [`ControlPlaneStore::load_spend`] does.
+    fn read_spend_rows<'r, K: redb::Key + 'static>(
+        &self,
+        rows: &'r [(TenantId, PeriodKey)],
+        table: redb::TableDefinition<'_, K, u64>,
+        key: impl Fn(&'r (TenantId, PeriodKey)) -> K::SelfType<'r>,
+    ) -> Vec<Result<u64, StoreError>> {
+        let read = || -> Result<Vec<u64>, StoreError> {
+            let txn = self.db.begin_read().map_err(store_err)?;
+            let table = txn.open_table(table).map_err(store_err)?;
+            rows.iter()
+                .map(|row| {
+                    Ok(table
+                        .get(key(row))
+                        .map_err(store_err)?
+                        .map(|guard| guard.value())
+                        .unwrap_or(0))
+                })
+                .collect()
+        };
+        match read() {
+            Ok(values) => values.into_iter().map(Ok).collect(),
+            Err(err) => rows.iter().map(|_| Err(err.clone())).collect(),
+        }
+    }
+
     /// Reads one value per row inside a single read transaction.
     fn read_windows(
         &self,
@@ -5707,6 +5824,9 @@ pub(crate) fn pre_flag_key_budget_rows() -> Vec<(KeyId, &'static str, KeyBudget)
         ),
     ]
 }
+
+#[cfg(test)]
+mod redb_spend_batch_tests;
 
 #[cfg(test)]
 mod tests {

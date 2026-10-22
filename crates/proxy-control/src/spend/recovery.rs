@@ -346,11 +346,18 @@ mod tests {
             .unwrap();
         let accumulator =
             SpendAccumulator::new("chain".into(), store.clone(), Period::Daily, "node".into());
+        let budget = crate::spend::KeyBudget {
+            max_micros: crate::spend::MicroUsd::from_micros(1_000),
+            period: Period::Daily,
+            include_byok_in_limit: false,
+        };
         accumulator
-            .prepare_request_workers(std::slice::from_ref(&known))
+            .prepare_request_workers(&[(known.clone(), budget)])
             .unwrap();
-        assert_eq!(accumulator.current_total_key(&known, &period), 2);
-        assert_eq!(accumulator.current_total_key(&unknown, &period), 0);
+        assert_eq!(accumulator.admission_total_key(&known, &period, 1_000), 2);
+        // A key the prefetch did not know (minted after boot) starts at zero;
+        // the admission marks it budgeted, so the next flush reads it back.
+        assert_eq!(accumulator.admission_total_key(&unknown, &period, 1_000), 0);
         accumulator.flush_now().unwrap();
         assert_eq!(accumulator.current_total_key(&unknown, &period), 9);
     }

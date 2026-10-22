@@ -193,6 +193,28 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- Shared spend and rate-window counters now cost the store calls in proportion
+  to traffic, not to the number of keys. Before, every idle row was read back
+  on every flush: each key's spend rows every 5 seconds, and each rate window
+  every second.
+  - The spend flusher reads back an idle row only when a budget consults it:
+    every flush once the row holds half its ceiling, otherwise once a minute.
+    It never reads back a row with no budget, a revoked key's row, or
+    tomorrow's row before midnight. Spend still reaches the store on every
+    flush that has spend to deliver.
+  - The startup spend prefetch reads only the budget period rows of keys and
+    tenants that have a budget. Revoked keys are left out.
+  - The rate-window flusher reads back an idle window every flush once it
+    holds half its limit, otherwise every 10 seconds.
+  - `GET` of a key's or tenant's spend reads the store's total for a row with
+    nothing waiting to be flushed, so it includes other replicas' spend.
+  - Rate-window counters have their own Redis connection, so a large spend
+    flush does not delay them.
+  - A Redis batch loads its script once per connection, not once per
+    pipeline, and stops at the first failed pipeline instead of reconnecting
+    for each of the rest.
+  - With `auth.store: persistent`, a spend flush writes all its rows in one
+    transaction, so one disk sync, not one per row.
 - A weighted route no longer draws a member that has no healthy host. Before,
   in Envoy mode, a `weighted_clusters` member whose hosts were all ejected by
   outlier detection kept its share, and its requests went to the ejected
