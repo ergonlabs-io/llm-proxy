@@ -736,6 +736,13 @@ pub async fn handshake_upstream_http2<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
 {
+    // A request's HEADERS and DATA leave in two writes, even when the body is
+    // buffered: `h2` keeps a new stream "pending open" until the connection
+    // task writes its HEADERS, and hyper's body pump waits for send capacity,
+    // which only an open stream gets. Holding the flush for one scheduler
+    // turn so the pump can queue DATA saves that write, but was measured to
+    // add about 2 ms to median latency at 1k rps on these `LocalSet` workers.
+    // Sending the body in the same turn needs `h2` driven directly, not hyper.
     let io = TokioIo::new(io);
 
     let builder = hyper::client::conn::http2::Builder::new(LocalExec);

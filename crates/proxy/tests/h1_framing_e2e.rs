@@ -255,6 +255,63 @@ fn accepted_framing_reaches_the_upstream_normalized() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The proxy keeps the upstream's `Content-Length` framing when no filter
+/// changes the body, as Envoy does (envoy-semantics.md S9): no re-encoding
+/// as chunked, and the body arrives byte for byte. The body is a full chat
+/// completion with `usage`, so the usage filter reads it on the way through.
+/// Two requests on one connection prove the length frames the response
+/// exactly.
+#[test]
+fn an_unmodified_response_keeps_the_upstream_content_length() {
+    const COMPLETION: &[u8] = br#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+    let dir = scratch_dir("content-length");
+    let (upstream, received) = spawn_strict_upstream_answering(COMPLETION);
+    let proxy = Proxy::start(&dir, upstream);
+
+    let mut stream = connect(proxy.listen);
+    for attempt in 1..=2 {
+        stream
+            .write_all(&request(
+                &format!("Content-Length: {}\r\n", BODY.len()),
+                BODY.as_bytes(),
+            ))
+            .expect("write request");
+        let head = read_head(&mut stream)
+            .unwrap_or_else(|| panic!("request {attempt}: no response head"))
+            .to_ascii_lowercase();
+        assert!(
+            head.starts_with("http/1.1 200"),
+            "request {attempt}:\n{head}"
+        );
+        let lengths: Vec<&str> = head
+            .lines()
+            .filter_map(|l| l.strip_prefix("content-length:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            lengths,
+            [COMPLETION.len().to_string()],
+            "request {attempt}: the upstream Content-Length must reach the client unchanged:\n{head}"
+        );
+        assert!(
+            !head.contains("transfer-encoding"),
+            "request {attempt}: an unmodified body must not be re-encoded as chunked:\n{head}"
+        );
+        let mut body = vec![0; COMPLETION.len()];
+        stream.read_exact(&mut body).expect("response body");
+        assert_eq!(
+            body, COMPLETION,
+            "request {attempt}: body changed in transit"
+        );
+        received
+            .recv_timeout(IO_TIMEOUT)
+            .unwrap_or_else(|_| panic!("request {attempt}: nothing reached the upstream"));
+    }
+
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Three requests in one write: a Content-Length body whose content looks
 /// like a request line, a chunked body, and a bodiless GET. Each reaches the
 /// upstream separately and in order, and the responses come back in order.
@@ -616,6 +673,20 @@ fn read_crlf_line(reader: &mut impl std::io::BufRead) -> Result<String, String> 
 /// reads the body by its framing, sends what it saw on the channel, and
 /// answers `200` with an empty JSON object.
 fn spawn_strict_upstream() -> (SocketAddr, mpsc::Receiver<UpstreamRequest>) {
+    spawn_strict_upstream_answering(b"{}")
+}
+
+/// [`spawn_strict_upstream`], answering every request with `body` framed by
+/// `Content-Length`.
+fn spawn_strict_upstream_answering(
+    body: &'static [u8],
+) -> (SocketAddr, mpsc::Receiver<UpstreamRequest>) {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
     let addr = listener.local_addr().expect("no local addr");
     let (tx, rx) = mpsc::channel();
@@ -623,6 +694,7 @@ fn spawn_strict_upstream() -> (SocketAddr, mpsc::Receiver<UpstreamRequest>) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let tx = tx.clone();
+            let response = response.clone();
             std::thread::spawn(move || {
                 // macOS: an accepted socket can inherit the listener's
                 // non-blocking flag; reads below must block.
@@ -673,13 +745,7 @@ fn spawn_strict_upstream() -> (SocketAddr, mpsc::Receiver<UpstreamRequest>) {
                     if !ok {
                         return;
                     }
-                    if writer
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                              Content-Length: 2\r\n\r\n{}",
-                        )
-                        .is_err()
-                    {
+                    if writer.write_all(&response).is_err() {
                         return;
                     }
                 }
