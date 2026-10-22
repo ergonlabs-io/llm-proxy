@@ -333,6 +333,29 @@ loadgen() { # loadgen ARGS... (pinned)
     taskset -c "$CORES_LOADGEN" "$BIN/loadgen" "$@"
 }
 
+# PERF_SECS > 0: profile replica 1 on-CPU with call graphs for that long,
+# starting 20 s into the load, while S2/S3 run. Point PROXY_BIN at a build
+# with frame pointers (RUSTFLAGS="-C force-frame-pointers=yes") or the stacks
+# are one frame deep. Writes perf-report.txt and perf-script.txt.gz in DIR.
+PERF_SECS="${PERF_SECS:-0}"
+start_profile() { # start_profile DIR PID
+    [[ "$PERF_SECS" -gt 0 ]] || return 0
+    have perf || { echo "WARNING: PERF_SECS set but no perf" >&2; return 0; }
+    (
+        sleep 20
+        perf record -F 499 -g -p "$2" -o "$1/perf.data" -- sleep "$PERF_SECS" >/dev/null 2>&1 \
+            || { echo "perf record failed" >&2; exit 0; }
+        perf report -i "$1/perf.data" --stdio --no-children --percent-limit 0.5 \
+            >"$1/perf-report.txt" 2>/dev/null || true
+        perf script -i "$1/perf.data" 2>/dev/null | gzip >"$1/perf-script.txt.gz" || true
+    ) &
+    PROFILE_PID=$!
+}
+wait_profile() {
+    [[ -n "${PROFILE_PID:-}" ]] && { wait "$PROFILE_PID" || true; }
+    PROFILE_PID=""
+}
+
 # ----------------------------------------------------------------- scenarios
 
 s0() {
@@ -412,6 +435,7 @@ s3() {
         done
         start_samplers "$d"
         scrape_all "$d" before
+        start_profile "$d" "${PROXY_PID[0]}"
         for ((i = 0; i < 3; i++)); do
             loadgen --target "http://127.0.0.1:${LISTEN[i]}" --api-key "${keys[i]}" \
                 --endpoint chat --model mock-model --no-stream --rate "$((rate / 3))" \
@@ -420,6 +444,7 @@ s3() {
         LOADGEN_PIDS+=($!); PIDS+=($!)
         done
         wait_loadgens
+        wait_profile
         scrape_all "$d" after
         stop_all; unset REDIS_PORT
     done
