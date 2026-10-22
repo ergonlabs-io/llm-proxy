@@ -49,6 +49,14 @@ class S4bTests(unittest.TestCase):
         _, ok = V.s4b(series(C, overrides={(40, 41): C + 200}), [report()], {}, C, PER, T, DUR, False)
         self.assertFalse(ok)
 
+    def test_bound_is_one_lease_publish_interval_of_the_other_replicas(self):
+        # 300 + 2 x 57.97 x 0.25 = 328.99: S4a's 1 s reconcile interval would
+        # allow 415.
+        _, ok = V.s4b(series(C, overrides={(40, 41): 328}), [report()], {}, C, PER, T, DUR, False)
+        self.assertTrue(ok)
+        _, ok = V.s4b(series(C, overrides={(40, 41): 330}), [report()], {}, C, PER, T, DUR, False)
+        self.assertFalse(ok)
+
     def test_a_spike_inside_the_ramp_is_not_steady_state(self):
         _, ok = V.s4b(series(C, overrides={(2, 3): C + 200}), [report()], {}, C, PER, T, DUR, False)
         self.assertTrue(ok)

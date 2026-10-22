@@ -25,9 +25,13 @@ import json
 import os
 import sys
 
-# ADR-0006: one reconcile (S4a) or lease publish (S4b) interval, in seconds.
-SYNC_INTERVAL_S = 1.0
-# A killed replica's leases expire after their 5 s TTL, plus two publishes.
+# ADR-0006 defaults addendum, in seconds. S4a's bound is one rate-window
+# reconcile interval of the other replicas' admits (DEFAULT_WINDOW_FLUSH_INTERVAL);
+# S4b's is one lease publish interval (DEFAULT_LEASE_PUBLISH_INTERVAL).
+RECONCILE_INTERVAL_S = 1.0
+LEASE_PUBLISH_INTERVAL_S = 0.25
+# A killed replica's leases expire after their 5 s TTL plus up to two
+# publishes (5.5 s); the rest is for the survivors to refill the fleet.
 RELEASE_BOUND_S = 7.0
 # After Redis returns, allow one policy poll bound (60 s) before the ceiling
 # must hold again.
@@ -72,7 +76,7 @@ def load_events(path):
 
 def s4a(reports, rpm, per_replica_rps, windows=3, replicas=REPLICAS):
     ok = sum(r["result"]["success"] for r in reports)
-    bound = windows * (rpm + (replicas - 1) * per_replica_rps * SYNC_INTERVAL_S)
+    bound = windows * (rpm + (replicas - 1) * per_replica_rps * RECONCILE_INTERVAL_S)
     lines = [f"admitted={ok} limit={windows * rpm} bound={bound:.0f} over={ok - windows * rpm}"]
     return lines, ok <= bound
 
@@ -91,7 +95,7 @@ def s4b(samples, reports, events, streams, per_replica_rps, intrinsic_s, duratio
                 "not the limit"], None
     start = samples[0][0]
     steady_lo, steady_hi = start + 15, start + duration - intrinsic_s
-    bound = streams + (replicas - 1) * per_replica_rps * SYNC_INTERVAL_S
+    bound = streams + (replicas - 1) * per_replica_rps * LEASE_PUBLISH_INTERVAL_S
 
     kill, down, up = events.get("SIGKILL replica 3"), events.get("redis down"), events.get("redis up")
     # The fault window is excluded from the steady-state check: fail-open

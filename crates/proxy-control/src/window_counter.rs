@@ -37,18 +37,22 @@ pub const DEFAULT_WINDOW_RECONCILIATION_BOUND: Duration = Duration::from_secs(10
 /// one gauge, so a long outage does not flood the log.
 pub const STALE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How often the lease publisher runs by default: the same one-second
-/// cadence as the window reconcile, so concurrency over-admission is bounded
-/// by about one second of stream arrivals on the other replicas (amendment G).
-pub const DEFAULT_LEASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the lease publisher runs by default. Concurrency over-admission
+/// is bounded by about one interval of stream arrivals on the other replicas
+/// (amendment G), so this runs four times as often as the window reconcile:
+/// on a dedicated c-16 with 3 replicas at 2x offered load it cut the fleet
+/// peak over a 300-stream limit from 417 to 330 with no new refusals, for
+/// four times the lease-publish rate on the store (ADR-0006 defaults addendum).
+pub const DEFAULT_LEASE_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long a published lease row lives without a refresh by default: five
+/// How long a published lease row lives without a refresh by default: twenty
 /// publish intervals, above the minimum of three (addendum §3). A publish to
-/// Redis can block for its one-second I/O timeout before the next interval
-/// starts, so three intervals would leave room for only one slow publish
-/// before a live replica's leases expired and the others over-admitted. Five
-/// survive two failed publishes in a row. It is also how long a crashed
-/// replica's slots stay held, and five seconds is short beside a stream.
+/// Redis can block for its one-second I/O timeout, and the next one starts an
+/// interval after it returns, so three intervals would not survive even one
+/// slow publish before a live replica's leases expired and the others
+/// over-admitted. Five seconds survives three timed-out publishes in a row.
+/// It is also how long a crashed replica's slots stay held, and five seconds
+/// is short beside a stream.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(5);
 
 /// The retry hint a concurrency refusal carries: a stream slot frees when a
@@ -1366,6 +1370,17 @@ mod tests {
             node.to_string(),
             ttl,
         )
+    }
+
+    /// Addendum §3: a lease row must outlive at least three publishes, or one
+    /// late publish lets a live replica's leases expire.
+    #[test]
+    fn the_default_lease_ttl_spans_at_least_three_publish_intervals() {
+        assert!(
+            DEFAULT_LEASE_TTL >= 3 * DEFAULT_LEASE_PUBLISH_INTERVAL,
+            "TTL {DEFAULT_LEASE_TTL:?} is under three publish intervals of \
+             {DEFAULT_LEASE_PUBLISH_INTERVAL:?}"
+        );
     }
 
     #[test]
