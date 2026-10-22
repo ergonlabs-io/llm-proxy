@@ -3,6 +3,8 @@
 //! dialect and Envoy mode reach the same IR and pick the same member for the
 //! same session (AGENTS.md invariant 5).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use proxy_config::ir::{ForwardTarget, NetworkFilterSpec, RouteActionIR, WeightedClusters};
 use proxy_config::{build_snapshot, parse_bootstrap, ConfigError, ConfigFormat, StrictMode};
 use proxy_http::route::{weighted_draw, DrawSource, HashIdentity};

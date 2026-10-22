@@ -6,6 +6,8 @@
 //! (TLS worked) or counts a refused handshake, so a proxy that never dialled
 //! cannot pass the negative case.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

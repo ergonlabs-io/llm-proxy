@@ -10,6 +10,8 @@
 //! ephemeral ports, a guard that kills the proxy on drop); each `tests/*.rs`
 //! file is its own crate, so the helpers are duplicated.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

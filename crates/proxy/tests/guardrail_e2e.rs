@@ -6,6 +6,8 @@
 //! "Fail-open controls"). The filter's own decisions are unit-tested in
 //! `proxy-filters`; the dialect block in `proxy-simple-config`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

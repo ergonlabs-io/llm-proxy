@@ -5,6 +5,8 @@
 //! provider and keeping the rest of the list as its fallback chain. An alias
 //! with no weights lowers exactly as before.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::BTreeMap;
 
 use proxy_config::ir::{ClusterKind, ForwardTarget, NetworkFilterSpec, RouteActionIR};

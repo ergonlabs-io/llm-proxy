@@ -10,6 +10,8 @@
 //! Rust note: `current_thread` with `start_paused` keeps the throttle's
 //! per-worker state, the tracing default and the clock on one thread.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

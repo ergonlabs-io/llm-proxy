@@ -8,6 +8,8 @@
 //! Docker is explicit, as in `ext_authz_e2e.rs`: `#[ignore]`d, run with
 //! `cargo test -p diffrig --test session_affinity_envoy_diff -- --ignored`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::time::Duration;
 
 use diffrig::harness::{

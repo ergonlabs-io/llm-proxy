@@ -18,6 +18,8 @@
 //! Rust note: same harness shape as `tests/partial_usage_e2e.rs` (std threads,
 //! ephemeral ports, a `Drop` that kills the proxy, every wait bounded).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

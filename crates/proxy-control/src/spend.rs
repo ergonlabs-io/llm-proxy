@@ -2337,6 +2337,7 @@ impl Drop for SpendAccumulator {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used)] // Test support may panic; see AGENTS.md "Rust style".
 pub mod test_support {
     use super::*;
     use crate::control::{FlushToken, InMemoryControlPlaneStore};

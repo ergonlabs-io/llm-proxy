@@ -1,6 +1,8 @@
 //! Exercises profile selection, terminal frames, and usage counts through a
 //! real HTTP round trip over an in-memory pipe (AGENTS.md "Running The Product").
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::sync::Arc;
 
 use bytes::Bytes;

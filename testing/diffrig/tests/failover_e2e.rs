@@ -1,6 +1,8 @@
 //! Exercises provider failover, attempt accounting, and credential isolation
 //! through the real binary and dialect config.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

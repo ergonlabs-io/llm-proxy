@@ -6,7 +6,8 @@ pub mod access_log;
 pub mod chargeback;
 pub mod flags;
 pub mod ledger;
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod ledger_tests;
 pub mod metadata;
 /// Maps [`trace::FinishedSpan`] to the OTLP wire types

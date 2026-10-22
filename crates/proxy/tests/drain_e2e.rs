@@ -13,6 +13,7 @@
 //! `tests/*.rs` file, so helpers are duplicated rather than shared, and
 //! `env!("CARGO_BIN_EXE_llm-proxy")` drives the real binary.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
 #![cfg(unix)]
 
 mod common;

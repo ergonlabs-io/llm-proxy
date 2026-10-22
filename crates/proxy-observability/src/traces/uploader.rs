@@ -78,18 +78,25 @@ pub struct UploadQueue {
 
 impl UploadQueue {
     pub fn push(&self, segment: Sealed) {
-        self.state.lock().unwrap().pending.push_back(segment);
+        self.state
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .pending
+            .push_back(segment);
         self.ready.notify_one();
     }
 
     /// Hold the queue while evicting, so the uploader cannot take the
     /// segment being evicted, nor the evictor delete the one in flight.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
-        self.state.lock().unwrap()
+        self.state.lock().expect("lock poisoned: a holder panicked")
     }
 
     fn stop(&self) {
-        self.state.lock().unwrap().stopping = true;
+        self.state
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .stopping = true;
         self.ready.notify_all();
     }
 }
@@ -118,7 +125,7 @@ impl UploaderStats {
         let i = UploadFailure::ALL
             .iter()
             .position(|f| *f == failure)
-            .unwrap();
+            .expect("ALL lists every variant");
         self.registry.incr(WorkerId(0), self.failures[i], 1);
     }
 }
@@ -293,7 +300,10 @@ async fn run(
         // Wait for work without holding a runtime thread's attention: the
         // condvar wait is short and this runtime runs nothing else.
         let segment = {
-            let mut state = queue.state.lock().unwrap();
+            let mut state = queue
+                .state
+                .lock()
+                .expect("lock poisoned: a holder panicked");
             loop {
                 if state.stopping || stop.load(Ordering::Acquire) {
                     return;
@@ -305,7 +315,7 @@ async fn run(
                 state = queue
                     .ready
                     .wait_timeout(state, Duration::from_millis(200))
-                    .unwrap()
+                    .expect("lock poisoned: a holder panicked")
                     .0;
             }
         };
@@ -318,14 +328,21 @@ async fn run(
         match outcome {
             Ok(()) => {
                 let _ = std::fs::remove_file(&segment.path);
-                queue.state.lock().unwrap().in_flight = None;
+                queue
+                    .state
+                    .lock()
+                    .expect("lock poisoned: a holder panicked")
+                    .in_flight = None;
                 let _ = uploaded.send(segment.path);
                 stats.registry.incr(WorkerId(0), stats.uploaded, 1);
                 attempt = 0;
             }
             Err(failure) => {
                 {
-                    let mut state = queue.state.lock().unwrap();
+                    let mut state = queue
+                        .state
+                        .lock()
+                        .expect("lock poisoned: a holder panicked");
                     state.in_flight = None;
                     // The exporter may have evicted it meanwhile only if it
                     // was not in flight, which it was; retry it first.

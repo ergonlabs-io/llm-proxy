@@ -9,6 +9,8 @@
 //! `a_tenant_policy_write_changes_model_authorization_live` also records a known
 //! defect: model authorization currently denies requests in a real filter chain.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 

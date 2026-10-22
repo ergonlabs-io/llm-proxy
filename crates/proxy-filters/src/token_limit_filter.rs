@@ -1374,22 +1374,10 @@ impl TokenLimitFilterInstance {
                 // Rust note: `HeaderValue::from` on formatted decimal
                 // strings never fails (ASCII digits are always a valid
                 // header value), so these unwraps are total.
-                headers.insert(
-                    "x-ratelimit-limit",
-                    http::HeaderValue::from_str(&limit.to_string()).unwrap(),
-                );
-                headers.insert(
-                    "x-ratelimit-remaining",
-                    http::HeaderValue::from_str(&remaining.to_string()).unwrap(),
-                );
-                headers.insert(
-                    "x-ratelimit-reset",
-                    http::HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
-                );
-                headers.insert(
-                    "retry-after",
-                    http::HeaderValue::from_str(&retry_secs.to_string()).unwrap(),
-                );
+                headers.insert("x-ratelimit-limit", http::HeaderValue::from(limit));
+                headers.insert("x-ratelimit-remaining", http::HeaderValue::from(remaining));
+                headers.insert("x-ratelimit-reset", http::HeaderValue::from(reset_secs));
+                headers.insert("retry-after", http::HeaderValue::from(retry_secs));
             })),
             refusal.details(),
         );

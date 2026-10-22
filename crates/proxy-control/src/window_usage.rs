@@ -296,6 +296,7 @@ impl Shared {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used)] // Test support may panic; see AGENTS.md "Rust style".
 pub mod test_store {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};

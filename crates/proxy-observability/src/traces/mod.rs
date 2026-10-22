@@ -5,14 +5,16 @@
 pub mod capture;
 pub mod config;
 pub mod exporter;
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod exporter_tests;
 pub mod gate;
 pub mod reassemble;
 pub mod segment;
 pub mod sigv4;
 pub mod uploader;
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod uploader_tests;
 
 /// Longest `tenant=<encoded id>` directory name a tenant may have to opt in.

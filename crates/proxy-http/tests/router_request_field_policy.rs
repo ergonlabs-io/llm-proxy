@@ -10,6 +10,8 @@
 //! Rust note: the router spawns non-`Send` connection drivers, so these tests
 //! run on a `current_thread` runtime inside a `LocalSet`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;

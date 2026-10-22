@@ -27,7 +27,11 @@ impl State {
             durable: 0,
             acknowledged: 0,
             count: 0,
-            digest: inventory_hash().finish().as_ref().try_into().unwrap(),
+            digest: inventory_hash()
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digest is 32 bytes"),
         }
     }
     pub fn encode(&self, node: &str) -> Vec<u8> {
@@ -46,11 +50,11 @@ impl State {
         if bytes.len() < 14 || &bytes[..8] != MAGIC {
             return Err(Error::Corrupt);
         }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4-byte range"));
         if version != VERSION {
             return Err(Error::UnknownVersion(version));
         }
-        let length = u16::from_le_bytes(bytes[12..14].try_into().unwrap()) as usize;
+        let length = u16::from_le_bytes(bytes[12..14].try_into().expect("2-byte range")) as usize;
         if length == 0 || length > 128 || bytes.len() != 14 + length + 64 {
             return Err(Error::Corrupt);
         }
@@ -58,13 +62,16 @@ impl State {
             return Err(Error::Corrupt);
         }
         let rest = &bytes[14 + length..];
-        let number = |start| u64::from_le_bytes(rest[start..start + 8].try_into().unwrap());
+        let number =
+            |start| u64::from_le_bytes(rest[start..start + 8].try_into().expect("8-byte range"));
         let state = Self {
             next: number(0),
             durable: number(8),
             acknowledged: number(16),
             count: number(24),
-            digest: rest[32..].try_into().unwrap(),
+            digest: rest[32..]
+                .try_into()
+                .expect("length check leaves 64 - 32 = 32 digest bytes"),
         };
         if state.next == 0
             || state.durable >= state.next
@@ -137,11 +144,11 @@ pub(crate) fn key_id(envelope: &[u8], bound: usize) -> Result<&str> {
     {
         return Err(Error::Corrupt);
     }
-    let version = u32::from_le_bytes(envelope[8..12].try_into().unwrap());
+    let version = u32::from_le_bytes(envelope[8..12].try_into().expect("4-byte range"));
     if version != VERSION {
         return Err(Error::UnknownVersion(version));
     }
-    let length = u16::from_le_bytes(envelope[12..14].try_into().unwrap()) as usize;
+    let length = u16::from_le_bytes(envelope[12..14].try_into().expect("2-byte range")) as usize;
     let overhead = PREFIX_BYTES + length + 12 + 16;
     if length == 0 || length > 128 || envelope.len() < overhead || envelope.len() - overhead > bound
     {
@@ -162,7 +169,9 @@ pub(crate) fn decrypt(
     let key = keys.get(id).ok_or(Error::MissingKey)?;
     let nonce_start = PREFIX_BYTES + id.len();
     let prefix_end = nonce_start + 12;
-    let nonce = envelope[nonce_start..prefix_end].try_into().unwrap();
+    let nonce = envelope[nonce_start..prefix_end]
+        .try_into()
+        .expect("12-byte range");
     let mut bytes = envelope[prefix_end..].to_vec();
     let length = key
         .key

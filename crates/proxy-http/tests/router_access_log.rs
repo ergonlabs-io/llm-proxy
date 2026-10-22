@@ -6,6 +6,8 @@
 //! Rust note: `send_upstream_http1` uses `spawn_local`, so tests need a
 //! `LocalSet` on a current-thread runtime.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read as _;

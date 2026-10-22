@@ -5,6 +5,8 @@
 //! latency through fixed mock delays far apart, so no assertion depends on a
 //! wall-clock window.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

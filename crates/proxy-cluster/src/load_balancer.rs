@@ -100,7 +100,7 @@ impl RoundRobinLb {
     /// chosen host's `current` drops below zero, so it cannot win again until other picks accumulate enough weight.
     /// Weights 5 and 1 (total 6) give `A A A B A A`, repeating: `B` never waits through five `A`s.
     fn smooth_weighted_pick(&self, hosts: &[Arc<Host>]) -> Option<Arc<Host>> {
-        let mut state = self.swrr.lock().unwrap();
+        let mut state = self.swrr.lock().expect("lock poisoned: a holder panicked");
         // Reconcile with the current candidate set. Tracked hosts keep their `current` (the memory across picks), new
         // hosts start at 0, and departed hosts are dropped.
         let mut next: Vec<SwrrEntry> = Vec::with_capacity(hosts.len());
@@ -191,7 +191,7 @@ impl LoadBalancer for RandomLb {
         if hosts.is_empty() {
             return None;
         }
-        let mut rng = self.rng.lock().unwrap();
+        let mut rng = self.rng.lock().expect("lock poisoned: a holder panicked");
         let idx = rng.gen_range(0..hosts.len());
         Some(Arc::clone(&hosts[idx]))
     }
@@ -238,7 +238,7 @@ impl LoadBalancer for LeastRequestLb {
         if hosts.len() == 1 {
             return Some(Arc::clone(&hosts[0]));
         }
-        let mut rng = self.rng.lock().unwrap();
+        let mut rng = self.rng.lock().expect("lock poisoned: a holder panicked");
         let k = self.choice_count.min(hosts.len());
         // Rust note: partial Fisher-Yates shuffles only the first `k` slots, since P2C needs `k` distinct candidates.
         // Sampling without replacement matters: sampling with replacement could draw the same host twice and never
@@ -352,7 +352,7 @@ impl HostPicker {
         if priorities.is_empty() {
             return None;
         }
-        let last = *priorities.last().unwrap();
+        let last = *priorities.last().expect("checked non-empty above");
 
         let mut loads: Vec<(u32, u64)> = Vec::with_capacity(priorities.len());
         let mut remaining: u64 = 100;
@@ -372,7 +372,10 @@ impl HostPicker {
             remaining = remaining.saturating_sub(load);
         }
 
-        let mut rng = self.priority_rng.lock().unwrap();
+        let mut rng = self
+            .priority_rng
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         let draw = rng.gen_range(0..100u64);
         let mut acc = 0u64;
         for (priority, load) in &loads {

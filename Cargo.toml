@@ -225,3 +225,7 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
+# Panics in request code say why they cannot happen; see AGENTS.md "Rust style".
+# clippy.toml exempts test code.
+unwrap_used = "warn"
+fn_params_excessive_bools = "warn"

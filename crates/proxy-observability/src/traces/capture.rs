@@ -159,7 +159,10 @@ impl TraceStats {
     }
 
     pub fn dropped(&self, reason: DropReason, n: u64) {
-        let i = DropReason::ALL.iter().position(|r| *r == reason).unwrap();
+        let i = DropReason::ALL
+            .iter()
+            .position(|r| *r == reason)
+            .expect("ALL lists every variant");
         self.registry.incr(WorkerId(0), self.dropped[i], n);
     }
 

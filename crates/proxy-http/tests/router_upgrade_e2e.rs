@@ -3,6 +3,8 @@
 //! and upstream-decline tests inspect router responses directly because no
 //! tunnel is established.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::rc::Rc;

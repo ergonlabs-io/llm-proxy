@@ -6,6 +6,8 @@
 //! The negative cases matter more than the happy path. Every upstream TLS defect in this project's history has been on
 //! the verification path, not the handshake-succeeds path.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 #[path = "../src/test_ports.rs"]
 mod test_ports;
 

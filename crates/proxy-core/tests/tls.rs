@@ -3,6 +3,8 @@
 //! `tokio::io::duplex` pipes (no real sockets needed since both factories'
 //! `wrap` are generic over `AsyncRead + AsyncWrite`).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

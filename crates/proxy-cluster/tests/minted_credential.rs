@@ -3,6 +3,8 @@
 //! local mock token endpoint. No real provider and no real key: the RSA key is
 //! generated for the test run.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

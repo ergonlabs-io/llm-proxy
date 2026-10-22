@@ -7,6 +7,8 @@
 //!
 //! Every await is bounded by `tokio::time::timeout`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

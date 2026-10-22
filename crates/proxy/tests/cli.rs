@@ -6,6 +6,8 @@
 //! absolute path of the `llm-proxy` binary this crate produces, so we don't
 //! have to guess `target/debug/...` ourselves.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

@@ -9,6 +9,8 @@
 //! on the cluster (`io.llmproxy.provider_auth` `models`), so the same alias
 //! must reach each provider under that provider's own name.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

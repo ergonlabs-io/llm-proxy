@@ -505,7 +505,10 @@ impl LedgerStats {
     }
 
     fn index(reason: Unavailable) -> usize {
-        Unavailable::ALL.iter().position(|r| *r == reason).unwrap()
+        Unavailable::ALL
+            .iter()
+            .position(|r| *r == reason)
+            .expect("ALL lists every variant")
     }
 
     fn rejected(&self, reason: Unavailable) {
@@ -1296,6 +1299,7 @@ mod writer {
 /// for what its writer committed. Used by this crate's tests and, through
 /// the `test-support` feature, by the HTTP and listener tests.
 #[cfg(all(unix, any(test, feature = "test-support")))]
+#[allow(clippy::unwrap_used)] // Test support may panic; see AGENTS.md "Rust style".
 pub mod testing {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

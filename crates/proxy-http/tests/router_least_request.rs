@@ -10,6 +10,8 @@
 //! `current_thread` runtime; the mock upstreams are plain `tokio::spawn`
 //! tasks on the same runtime and make progress whenever the test awaits.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::rc::Rc;

@@ -67,8 +67,18 @@ impl SampleSeries {
         if self.samples.is_empty() {
             anyhow::bail!("no process samples were collected -- cannot summarize");
         }
-        let peak_rss_bytes = self.samples.iter().map(|s| s.rss_bytes).max().unwrap();
-        let peak_fds = self.samples.iter().map(|s| s.fd_count).max().unwrap();
+        let peak_rss_bytes = self
+            .samples
+            .iter()
+            .map(|s| s.rss_bytes)
+            .max()
+            .expect("checked non-empty above");
+        let peak_fds = self
+            .samples
+            .iter()
+            .map(|s| s.fd_count)
+            .max()
+            .expect("checked non-empty above");
 
         // Rust note: `windows(2)` hands back overlapping pairs
         // `[s0,s1],[s1,s2],...` -- exactly the consecutive-sample deltas we

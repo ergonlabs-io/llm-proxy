@@ -2,6 +2,8 @@
 //! `io.llmproxy.selection` on the model's weighted route, which Envoy mode
 //! reads into the IR (AGENTS.md invariant 5, `envoy-divergences.md` row 48).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use proxy_config::build_snapshot;
 use proxy_config::ir::{ForwardTarget, NetworkFilterSpec, RouteActionIR, WeightedSelection};
 use proxy_config::ConfigError;

@@ -9,6 +9,8 @@
 //! suite runs in `make ci`. See `diffrig::harness` for the shared
 //! spawn/poll/HTTP-client machinery this file builds on.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

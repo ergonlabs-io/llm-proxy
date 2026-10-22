@@ -522,12 +522,21 @@ impl MetadataSpool {
                 format::hash_record(&mut hash, *sequence, bytes);
             }
             let mut state = self.state;
-            state.durable = self.pending.last().unwrap().0;
+            state.durable = self
+                .pending
+                .last()
+                .expect("commit returns early when nothing is pending")
+                .0;
             state.count = state
                 .count
                 .checked_add(self.pending.len() as u64)
                 .ok_or(Error::Corrupt)?;
-            state.digest = hash.clone().finish().as_ref().try_into().unwrap();
+            state.digest = hash
+                .clone()
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digest is 32 bytes");
             #[cfg(test)]
             self.hooks.trip(Fault::CommitBeforeCommit)?;
             self.publish(&state, &self.pending, None)?;
@@ -671,7 +680,12 @@ impl MetadataSpool {
             let mut state = self.state;
             state.acknowledged = through_sequence;
             state.count = count;
-            state.digest = hash.clone().finish().as_ref().try_into().unwrap();
+            state.digest = hash
+                .clone()
+                .finish()
+                .as_ref()
+                .try_into()
+                .expect("SHA-256 digest is 32 bytes");
             #[cfg(test)]
             self.hooks.trip(Fault::AcknowledgeBeforeCommit)?;
             self.publish(&state, &[], Some(through_sequence))?;
@@ -783,7 +797,9 @@ impl MetadataSpool {
         })
     }
     fn active_key(&self) -> &EncryptionKey {
-        self.keys.get(&self.active_id).unwrap()
+        self.keys
+            .get(&self.active_id)
+            .expect("open inserts the active key into keys")
     }
     fn healthy(&self) -> Result<()> {
         if self.poisoned.get() {

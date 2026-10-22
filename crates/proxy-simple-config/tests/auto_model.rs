@@ -8,6 +8,8 @@
 //! `model_resolver_routing.rs` on purpose: the crate keeps no shared test
 //! scaffolding.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

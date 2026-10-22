@@ -17,6 +17,8 @@
 //! `SIGHUP`. Traffic keeps running after the reload, then drains, and every
 //! outcome is checked.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;

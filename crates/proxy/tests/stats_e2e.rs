@@ -3,6 +3,8 @@
 //! text equivalent. `downstream_cx_total` is checked in both formats; its label
 //! uses the listener name (internal-docs/envoy-divergences.md).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

@@ -13,6 +13,8 @@
 //! threads, ephemeral ports, a `Proxy` guard that kills the child on drop).
 //! Every wait is bounded by `STARTUP_TIMEOUT` or a socket read timeout.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

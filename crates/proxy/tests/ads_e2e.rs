@@ -14,6 +14,8 @@
 //! `the_ack_does_not_reach_the_wire_until_the_handler_future_resolves`, which
 //! proves the seam works but not that `main.rs` uses it.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

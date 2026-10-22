@@ -9,6 +9,8 @@
 //! per-provider counts are asserted exactly. That also proves the binary uses
 //! that mapping, which a tolerance would not.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;

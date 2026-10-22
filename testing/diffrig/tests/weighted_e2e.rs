@@ -8,6 +8,8 @@
 //! runs the lowered bootstrap in Envoy mode (`-c`), so both front-ends reach
 //! the same behaviour (AGENTS.md invariant 5).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;

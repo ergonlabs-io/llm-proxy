@@ -36,6 +36,8 @@
 //! derives the routing header from it and strips any client-supplied one, so
 //! a client cannot route itself around a fallback chain.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

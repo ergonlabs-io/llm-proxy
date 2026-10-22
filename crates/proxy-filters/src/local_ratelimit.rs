@@ -513,17 +513,14 @@ impl LocalRateLimitFilter {
 
     fn add_standard_headers(headers: &mut HeaderMap, decision: RateLimitDecision) {
         // `HeaderValue::from_str` is total for decimal ASCII rendered here.
-        headers.insert(
-            "x-ratelimit-limit",
-            HeaderValue::from_str(&decision.limit.to_string()).unwrap(),
-        );
+        headers.insert("x-ratelimit-limit", HeaderValue::from(decision.limit));
         headers.insert(
             "x-ratelimit-remaining",
-            HeaderValue::from_str(&decision.remaining.to_string()).unwrap(),
+            HeaderValue::from(decision.remaining),
         );
         headers.insert(
             "x-ratelimit-reset",
-            HeaderValue::from_str(&decision.reset_after.as_secs().to_string()).unwrap(),
+            HeaderValue::from(decision.reset_after.as_secs()),
         );
     }
 }

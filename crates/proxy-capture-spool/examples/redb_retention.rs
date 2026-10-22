@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)] // Example code may panic; see AGENTS.md "Rust style".
+
 use proxy_capture_spool::{EncryptionKey, MetadataSpool, SpoolConfig};
 use serde_json::Value;
 use std::{

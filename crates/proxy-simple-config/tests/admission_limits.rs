@@ -7,6 +7,8 @@
 //! IR by the real Envoy-mode loader, both directly and via the translate
 //! (`to_envoy_yaml`) round trip.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::time::Duration;
 
 use proxy_config::ir::NetworkFilterSpec;

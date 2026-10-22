@@ -46,6 +46,8 @@
 //! Assertion messages print response bodies and access-log lines, never the
 //! config or the environment.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 

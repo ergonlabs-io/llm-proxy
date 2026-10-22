@@ -9,6 +9,8 @@
 //! duplicated, and `env!("CARGO_BIN_EXE_llm-proxy")` drives the real binary
 //! because `crates/proxy` has no `[lib]` target to link against.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

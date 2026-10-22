@@ -296,7 +296,10 @@ impl ManagedCluster {
         let Some(engine) = &self.health_engine else {
             return;
         };
-        let mut probes = self.probes.lock().unwrap();
+        let mut probes = self
+            .probes
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         for addr in &diff.removed {
             if let Some(handle) = probes.remove(addr) {
                 handle.abort();
@@ -783,7 +786,12 @@ impl ClusterManager {
             schedule,
             first_wait,
         ));
-        if let Some(previous) = managed.dns_refresh_task.lock().unwrap().replace(task) {
+        if let Some(previous) = managed
+            .dns_refresh_task
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .replace(task)
+        {
             previous.abort();
         }
     }
@@ -796,7 +804,12 @@ impl ClusterManager {
             Arc::downgrade(&self.clusters),
             wait,
         ));
-        if let Some(previous) = managed.token_refresh_task.lock().unwrap().replace(task) {
+        if let Some(previous) = managed
+            .token_refresh_task
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .replace(task)
+        {
             previous.abort();
         }
     }

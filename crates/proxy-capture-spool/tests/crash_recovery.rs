@@ -1,4 +1,6 @@
 //! Process-crash tests independent of the spool implementation's unit tests.
+
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
 #![cfg(unix)]
 
 use proxy_capture_spool::{EncryptionKey, MetadataSpool, SpoolConfig};

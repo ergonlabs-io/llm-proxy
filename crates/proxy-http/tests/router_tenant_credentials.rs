@@ -5,6 +5,8 @@
 //! Rust note: router drivers use `spawn_local`; tests use a local runtime and
 //! bound each router await with `tokio::time::timeout`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;

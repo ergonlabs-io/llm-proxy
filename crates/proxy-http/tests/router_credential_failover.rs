@@ -10,6 +10,8 @@
 //! Rust note: connection drivers use `spawn_local`, so tests need a `LocalSet`
 //! on a current-thread runtime.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

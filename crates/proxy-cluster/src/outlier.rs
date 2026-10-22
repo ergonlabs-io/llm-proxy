@@ -362,7 +362,12 @@ impl OutlierDetector {
     /// a scheduled ejection's deadline.
     #[cfg(test)]
     async fn await_pending_unejects(&self) {
-        let mut set = std::mem::take(&mut *self.unejects.lock().unwrap());
+        let mut set = std::mem::take(
+            &mut *self
+                .unejects
+                .lock()
+                .expect("lock poisoned: a holder panicked"),
+        );
         while let Some(joined) = set.join_next().await {
             joined.expect("un-eject task must not panic");
         }
@@ -400,7 +405,10 @@ impl OutlierDetector {
     /// request, not interval-batched).
     pub fn report_result(&self, addr: SocketAddr, result: RequestResult) {
         let (fired_5xx, fired_gateway) = {
-            let mut states = self.states.lock().unwrap();
+            let mut states = self
+                .states
+                .lock()
+                .expect("lock poisoned: a holder panicked");
             let state = states.entry(addr).or_default();
             match result {
                 RequestResult::Success => {
@@ -472,7 +480,10 @@ impl OutlierDetector {
     /// snapshot.
     fn run_interval_tick(&self) {
         let snapshot: Vec<(SocketAddr, u32, u32)> = {
-            let mut states = self.states.lock().unwrap();
+            let mut states = self
+                .states
+                .lock()
+                .expect("lock poisoned: a holder panicked");
             states
                 .iter_mut()
                 .map(|(addr, state)| {
@@ -557,7 +568,7 @@ impl OutlierDetector {
     /// ejection attempt.
     fn attempt_eject(&self, addr: SocketAddr, cause: EjectionCause, enforcing_percent: u8) {
         let enforce = {
-            let mut rng = self.rng.lock().unwrap();
+            let mut rng = self.rng.lock().expect("lock poisoned: a holder panicked");
             rng.gen_range(0..100u32) < u32::from(enforcing_percent)
         };
         if !enforce {
@@ -604,7 +615,10 @@ impl OutlierDetector {
         }
 
         let ejection_count = {
-            let mut states = self.states.lock().unwrap();
+            let mut states = self
+                .states
+                .lock()
+                .expect("lock poisoned: a holder panicked");
             let state = states.entry(addr).or_default();
             state.ejection_count += 1;
             state.ejection_count
@@ -639,7 +653,10 @@ impl OutlierDetector {
                 );
             }
         };
-        let mut set = self.unejects.lock().unwrap();
+        let mut set = self
+            .unejects
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         // Reap finished timers so a long-lived cluster does not accumulate
         // completed entries.
         while set.try_join_next().is_some() {}

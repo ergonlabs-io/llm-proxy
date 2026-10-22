@@ -2,6 +2,8 @@
 //! of cross-protocol upgrades. The end-to-end case exercises the real codec,
 //! router, and mock upstream; rejection cases assert no upstream dial occurs.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::rc::Rc;

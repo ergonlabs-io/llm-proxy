@@ -1,4 +1,6 @@
 //! Protocol and failure-policy proof at the real downstream socket boundary.
+
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
 use diffrig::harness::{
     free_port, resolve_llm_proxy_bin, send_json_optional, ProxyProcess, ScratchDir, READY_TIMEOUT,
 };

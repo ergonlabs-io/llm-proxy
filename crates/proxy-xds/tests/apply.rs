@@ -4,6 +4,8 @@
 //! Fixtures build the proto types directly and encode them into an `Any`, as
 //! `dynamic_lower.rs` does. There is no bootstrap file on this path.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 

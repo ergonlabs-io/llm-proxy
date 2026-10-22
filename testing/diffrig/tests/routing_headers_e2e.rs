@@ -2,6 +2,8 @@
 //! served it, the attempt count and the providers tried, through the real
 //! binary (`envoy-divergences.md` row 49).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

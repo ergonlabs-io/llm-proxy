@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use proxy_config::ConfigError;
 use proxy_simple_config::{lower, parse_simple_config, SimpleConfig};
 

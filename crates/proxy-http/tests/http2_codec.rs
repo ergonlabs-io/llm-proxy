@@ -2,6 +2,8 @@
 //! `!Send` (ADR-0003), so tests use a local runtime. Multiplexing tests verify
 //! that concurrent streams do not share per-stream state.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::future::Future;

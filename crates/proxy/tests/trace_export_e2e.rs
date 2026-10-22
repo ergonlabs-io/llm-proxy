@@ -6,6 +6,8 @@
 //! ephemeral ports, a child killed on drop, every wait bounded. The proxy is
 //! stopped with SIGTERM so the exporter seals its segments.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

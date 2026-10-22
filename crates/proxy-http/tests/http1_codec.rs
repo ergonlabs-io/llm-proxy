@@ -1,6 +1,8 @@
 //! Tests the HTTP/1.1 codec and `StreamHandler` over an in-memory duplex pipe.
 //! The codec is `!Send` (ADR-0003), so tests run on a current-thread `LocalSet`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::rc::Rc;

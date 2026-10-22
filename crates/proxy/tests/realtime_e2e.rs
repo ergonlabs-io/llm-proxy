@@ -13,6 +13,8 @@
 //! threads, ephemeral ports, a `Drop` that kills the proxy). Every wait is
 //! bounded, so a hung child fails the test instead of stalling it.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

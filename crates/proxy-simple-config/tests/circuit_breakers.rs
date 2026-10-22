@@ -6,6 +6,8 @@
 //! `crates/proxy/tests/provider_circuit_breaker_e2e.rs` proves the shedding
 //! through the real binary.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use proxy_config::ir::{CircuitBreakerThresholds, CircuitBreakers};
 use proxy_config::ConfigError;
 use proxy_simple_config::{lower, lower_to_loaded, parse_simple_config};

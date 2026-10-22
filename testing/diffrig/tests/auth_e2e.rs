@@ -3,6 +3,8 @@
 //! Digests are computed with the same HMAC derivation as the authenticator. Each
 //! successful exchange costs two tokens: one input and one output.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::time::Duration;
 

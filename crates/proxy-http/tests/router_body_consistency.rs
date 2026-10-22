@@ -10,6 +10,8 @@
 //! `spawn_local`, so these tests run on a `current_thread` runtime inside a
 //! `LocalSet`, like `router_aggregate.rs`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

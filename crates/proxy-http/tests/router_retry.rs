@@ -8,6 +8,8 @@
 //! driver tasks via `tokio::task::spawn_local`, so every test needs a
 //! `LocalSet` on a `current_thread` runtime.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read as _;

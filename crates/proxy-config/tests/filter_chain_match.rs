@@ -2,6 +2,8 @@
 //! listener socket options (`tcp_backlog_size`/`bind_to_port`), and the
 //! `CidrRange` matcher that backs `prefix_ranges`/`source_prefix_ranges`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::IpAddr;
 
 use proxy_config::ir::*;

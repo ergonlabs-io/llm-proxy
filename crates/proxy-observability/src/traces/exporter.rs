@@ -313,7 +313,10 @@ impl Exporter {
                 self.stats
                     .incr(self.stats.written[usize::from(!complete)], 1);
                 for reason in &partial {
-                    let i = PartialReason::ALL.iter().position(|r| r == reason).unwrap();
+                    let i = PartialReason::ALL
+                        .iter()
+                        .position(|r| r == reason)
+                        .expect("ALL lists every variant");
                     self.stats.incr(self.stats.partial[i], 1);
                 }
                 trace.mark_accounted();
@@ -354,7 +357,10 @@ impl Exporter {
             if let Some(upload) = &self.upload {
                 upload.queue.push(segment.clone());
             }
-            let i = SealReason::ALL.iter().position(|r| *r == reason).unwrap();
+            let i = SealReason::ALL
+                .iter()
+                .position(|r| *r == reason)
+                .expect("ALL lists every variant");
             self.stats.incr(self.stats.sealed[i], 1);
             if reason == SealReason::Lru
                 && segment.open_for.is_some_and(|age| age < YOUNG_LRU_SEAL)

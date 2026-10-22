@@ -1075,22 +1075,13 @@ impl HttpFilter for SpendLimitFilterInstance {
                         // integrator reading a raw `x-ratelimit-remaining` value
                         // here without reading this filter's docs would
                         // reasonably misinterpret it as a request or token count.
-                        headers.insert(
-                            "x-ratelimit-limit",
-                            http::HeaderValue::from_str(&limit_micros.to_string()).unwrap(),
-                        );
+                        headers.insert("x-ratelimit-limit", http::HeaderValue::from(limit_micros));
                         headers.insert(
                             "x-ratelimit-remaining",
-                            http::HeaderValue::from_str(&remaining_micros.to_string()).unwrap(),
+                            http::HeaderValue::from(remaining_micros),
                         );
-                        headers.insert(
-                            "x-ratelimit-reset",
-                            http::HeaderValue::from_str(&reset_secs.to_string()).unwrap(),
-                        );
-                        headers.insert(
-                            "retry-after",
-                            http::HeaderValue::from_str(&retry_secs.to_string()).unwrap(),
-                        );
+                        headers.insert("x-ratelimit-reset", http::HeaderValue::from(reset_secs));
+                        headers.insert("retry-after", http::HeaderValue::from(retry_secs));
                     })),
                     DENY_DETAILS,
                 );

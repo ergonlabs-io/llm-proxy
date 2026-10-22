@@ -220,18 +220,24 @@ impl FileSink {
 
 impl AccessLogWriter for FileSink {
     fn write_line(&self, line: &str) {
-        // Rust note: `.lock().unwrap()` — a poisoned mutex here would mean a
+        // Rust note: `.lock().expect("lock poisoned: a holder panicked")` — a poisoned mutex here would mean a
         // previous writer panicked mid-write, which never happens (this
         // method never panics); `.unwrap()` documents "this can't fail" the
         // same way it does throughout the codebase's Mutex usage.
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self
+            .writer
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         if let Err(e) = w.write_all(line.as_bytes()) {
             self.limiter.warn("file write", &e);
         }
     }
 
     fn flush(&self) {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self
+            .writer
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         if let Err(e) = w.flush() {
             self.limiter.warn("file flush", &e);
         }
@@ -239,7 +245,10 @@ impl AccessLogWriter for FileSink {
 
     fn reopen(&self) -> io::Result<()> {
         let file = open_append(&self.path)?;
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self
+            .writer
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         // Flush whatever's still buffered against the *old* file handle
         // before we drop it — best effort, matches `write_line`'s "never
         // fail the caller" contract by simply not propagating this error.
@@ -384,7 +393,9 @@ fn record_drop_stat() {
 /// queued; the caller is exiting anyway). Shutdown/control paths only.
 pub fn flush_all_queued(timeout: Duration) -> bool {
     let live: Vec<Arc<QueueShared>> = {
-        let mut guard = LIVE_QUEUES.lock().unwrap();
+        let mut guard = LIVE_QUEUES
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         guard.retain(|w| w.strong_count() > 0);
         guard.iter().filter_map(Weak::upgrade).collect()
     };
@@ -411,7 +422,7 @@ pub fn flush_all_queued(timeout: Duration) -> bool {
 impl QueueShared {
     /// Queue a control item. `false` if the writer thread has already gone.
     fn submit_control(&self, item: Item) -> bool {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().expect("lock poisoned: a holder panicked");
         if st.exited {
             return false;
         }
@@ -472,7 +483,9 @@ impl QueuedSink {
             .name("access-log-writer".to_string())
             .spawn(move || writer_loop(&worker, inner.as_ref()))?;
         {
-            let mut live = LIVE_QUEUES.lock().unwrap();
+            let mut live = LIVE_QUEUES
+                .lock()
+                .expect("lock poisoned: a holder panicked");
             live.retain(|w| w.strong_count() > 0);
             live.push(Arc::downgrade(&shared));
         }
@@ -490,19 +503,29 @@ fn writer_loop(shared: &QueueShared, inner: &dyn AccessLogWriter) {
         // Take the whole backlog in one lock acquisition so producers are
         // never blocked behind inner-sink I/O.
         let batch = {
-            let mut st = shared.state.lock().unwrap();
+            let mut st = shared
+                .state
+                .lock()
+                .expect("lock poisoned: a holder panicked");
             while !st.closed && !st.has_control && st.line_bytes < WAKE_BYTES {
                 if st.items.is_empty() {
                     // Idle: the next line wakes us (see `parked`).
                     st.parked = true;
-                    st = shared.wake.wait(st).unwrap();
+                    st = shared
+                        .wake
+                        .wait(st)
+                        .expect("lock poisoned: a holder panicked");
                     st.parked = false;
                 } else {
                     // Lines are waiting: let more join them for one tick.
                     // Producers do not wake us per line, so this is where
                     // the batching happens. A control item, the byte
                     // threshold or shutdown cuts the tick short.
-                    st = shared.wake.wait_timeout(st, FLUSH_INTERVAL).unwrap().0;
+                    st = shared
+                        .wake
+                        .wait_timeout(st, FLUSH_INTERVAL)
+                        .expect("lock poisoned: a holder panicked")
+                        .0;
                     break;
                 }
             }
@@ -540,7 +563,11 @@ fn writer_loop(shared: &QueueShared, inner: &dyn AccessLogWriter) {
 
 impl AccessLogWriter for QueuedSink {
     fn write_line(&self, line: &str) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self
+            .shared
+            .state
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         if st.line_bytes + line.len() > self.shared.max_bytes {
             drop(st);
             let n = self.shared.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -593,7 +620,11 @@ impl AccessLogWriter for QueuedSink {
 
 impl Drop for QueuedSink {
     fn drop(&mut self) {
-        self.shared.state.lock().unwrap().closed = true;
+        self.shared
+            .state
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .closed = true;
         self.shared.wake.notify_one();
     }
 }
@@ -673,7 +704,7 @@ fn shared_file(path: &str) -> io::Result<Arc<QueuedSink>> {
     let key = canonical_key(Path::new(path));
     if let Some(live) = file_sinks()
         .lock()
-        .unwrap()
+        .expect("lock poisoned: a holder panicked")
         .get(&key)
         .and_then(Weak::upgrade)
     {
@@ -683,7 +714,9 @@ fn shared_file(path: &str) -> io::Result<Arc<QueuedSink>> {
         path.to_string(),
         Arc::new(FileSink::new(path)?),
     )?);
-    let mut map = file_sinks().lock().unwrap();
+    let mut map = file_sinks()
+        .lock()
+        .expect("lock poisoned: a holder panicked");
     if let Some(live) = map.get(&key).and_then(Weak::upgrade) {
         return Ok(live);
     }

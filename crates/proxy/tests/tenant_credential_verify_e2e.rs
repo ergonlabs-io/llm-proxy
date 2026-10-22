@@ -11,6 +11,8 @@
 //! Rust note: same harness shape as `tests/auth_store_e2e.rs` (std threads,
 //! ephemeral ports, a guard that kills the child on drop, every wait bounded).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

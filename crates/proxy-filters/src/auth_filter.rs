@@ -209,8 +209,12 @@ fn parse_digest_hex(raw: &str, index: usize) -> Result<Vec<u8>, ConfigError> {
     // reachable.
     let mut bytes = Vec::with_capacity(32);
     for pair in raw.as_bytes().as_chunks::<2>().0 {
-        let hi = (pair[0] as char).to_digit(16).unwrap();
-        let lo = (pair[1] as char).to_digit(16).unwrap();
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .expect("validated as hex above");
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .expect("validated as hex above");
         bytes.push(((hi << 4) | lo) as u8);
     }
     Ok(bytes)

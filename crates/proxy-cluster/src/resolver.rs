@@ -57,13 +57,19 @@ impl FakeResolver {
 
     /// Seed or replace the address set `resolve(host)` returns.
     pub fn set(&self, host: &str, addrs: Vec<IpAddr>) {
-        self.records.lock().unwrap().insert(host.to_string(), addrs);
+        self.records
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .insert(host.to_string(), addrs);
     }
 
     /// Make `resolve(host)` sleep for `delay` before returning its (already
     /// seeded) result. Test-only knob -- see the `delays` field doc.
     pub fn set_delay(&self, host: &str, delay: Duration) {
-        self.delays.lock().unwrap().insert(host.to_string(), delay);
+        self.delays
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .insert(host.to_string(), delay);
     }
 }
 
@@ -72,7 +78,7 @@ impl HostResolver for FakeResolver {
         let result = self
             .records
             .lock()
-            .unwrap()
+            .expect("lock poisoned: a holder panicked")
             .get(host)
             .cloned()
             .ok_or_else(|| {
@@ -81,7 +87,12 @@ impl HostResolver for FakeResolver {
                     format!("no fake DNS record for `{host}`"),
                 )
             });
-        let delay = self.delays.lock().unwrap().get(host).copied();
+        let delay = self
+            .delays
+            .lock()
+            .expect("lock poisoned: a holder panicked")
+            .get(host)
+            .copied();
         Box::pin(async move {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;

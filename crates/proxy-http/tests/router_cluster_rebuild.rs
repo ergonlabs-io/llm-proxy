@@ -17,6 +17,8 @@
 //! with `tokio::task::spawn_local`, so the test runs on a `current_thread`
 //! runtime inside a `LocalSet`, like the other router tests.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};

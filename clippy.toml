@@ -1,0 +1,2 @@
+# Tests may panic on assertions; see AGENTS.md "Rust style".
+allow-unwrap-in-tests = true

@@ -2,6 +2,8 @@
 //! validation, and lowering through the full Envoy-mode pipeline
 //! (strict parse + PGV validation + IR build).
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use proxy_config::{ConfigError, ConfigFrontEnd, UNKNOWN_FIELD_DIALECT_HINT};
 use proxy_simple_config::{
     lower, lower_to_loaded, parse_simple_config_with_env, to_envoy_yaml, MODEL_HEADER,

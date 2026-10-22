@@ -3,6 +3,8 @@
 //! A multi-thread runtime lets the server and blocking test waits progress together
 //! (AGENTS.md "Build And Test"); `ChildGuard` reaps spawned processes.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 mod common;
 
 use common::free_port;

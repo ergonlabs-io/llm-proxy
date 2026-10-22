@@ -69,6 +69,27 @@ Comments explain why, in place. Cite only durable references: ADR numbers,
 sections of this file, and upstream Envoy docs. Never cite work-package IDs,
 increments, lanes, or planning-document parts; git history records provenance.
 
+## Rust style
+
+Adapted from the Google Rust style guide. Enforced lints are in
+`[workspace.lints.clippy]`; `clippy.toml` exempts test code from `unwrap_used`.
+
+- **Panics.** Outside tests, never `unwrap()`. Prefer `if let`, `let ... else`,
+  or `?` over a check followed by an unwrap. When a panic is correct, use
+  `expect("...")` and state the invariant that makes it unreachable, not the
+  operation: `expect("window index is bounded by len")`, not
+  `expect("get window")`.
+- **`#[must_use]`.** Mark functions whose result is the whole point of the call,
+  and types that do nothing until consumed: reservations, permits, guards,
+  builders. Silently dropping a spend reservation is a billing bug. `Result`
+  is already `#[must_use]`.
+- **Assertion messages.** Give `assert!` and `debug_assert!` a message that says
+  why the condition must hold and prints the values involved. Do not restate
+  the condition.
+- **Bool parameters.** When a call site such as `f(x, true, false)` does not
+  say what the flags mean, use a two-variant enum instead. Where a `bool`
+  stays, name it at the call site with a comment: `f(x, /* strict */ true)`.
+
 ## Policy Domains
 
 - **Routing:** fleet-scoped aliases, provider order/fallback, upstream model

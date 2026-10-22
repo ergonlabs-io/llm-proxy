@@ -277,7 +277,7 @@ impl ScratchDir {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock is after the Unix epoch")
                 .as_nanos()
         ));
         std::fs::create_dir_all(&path).expect("create scratch dir");

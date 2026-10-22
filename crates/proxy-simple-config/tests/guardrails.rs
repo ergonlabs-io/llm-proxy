@@ -5,6 +5,8 @@
 //! router against a mock provider and real HTTP check services, so a denial
 //! is proven by what the provider never received.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

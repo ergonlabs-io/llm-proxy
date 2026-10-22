@@ -5870,6 +5870,7 @@ impl ControlPlaneStore for SharedMemoryStore {
 /// check what the log line renders). Shared by this crate's test modules, like
 /// [`test_snapshot_handle`].
 #[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used)] // Test support may panic; see AGENTS.md "Rust style".
 pub mod log_capture {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};

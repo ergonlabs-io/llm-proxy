@@ -1,6 +1,8 @@
 //! The request-record JSONL file sink (`--request-records-file`) against the
 //! real binary: a request that spans SIGTERM is still recorded, and records
 //! keep flowing, in order, across a SIGHUP reload on a kept-alive client.
+
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
 #![cfg(unix)]
 mod common;
 

@@ -1,6 +1,8 @@
 //! Tests for the upstream HTTP/2 codec, including streaming and wire-level
 //! reset handling. The codec uses `spawn_local`, so tests run inside a `LocalSet`.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::future::Future;
 use std::rc::Rc;
 

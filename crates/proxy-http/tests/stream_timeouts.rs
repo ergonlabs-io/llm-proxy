@@ -1,6 +1,8 @@
 //! Exercises HCM stream timeouts against a handler and scripted socket
 //! upstream, including stalled and continuously producing responses.
 
+#![allow(clippy::unwrap_used)] // Test code may panic; see AGENTS.md "Rust style".
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read as _;
