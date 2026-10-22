@@ -51,6 +51,10 @@ HOLD_SECS=30
 WARMUP_SECS=3
 MAX_CONCURRENCY=""
 PROVIDER_YAML=""
+PROXY_CORES=""
+MOCK_CORES=""
+LOADGEN_CORES=""
+PROXY_WORKERS=""
 ACCESS_LOGS=off
 SLO_P99_MS=""
 SLO_TTFT_P99_MS=""
@@ -74,6 +78,10 @@ Options:
                                     generation time -- see the note below)
   --slo-ttft-p99-ms N               TTFT SLO (default: 2x the mock's own TTFT + 500ms)
   --access-logs on|off              Enable proxy access logging (default: off)
+  --proxy-cores LIST                Pin the proxy to these cores (taskset -c LIST)
+  --mock-cores LIST                 Pin the mock upstream to these cores
+  --loadgen-cores LIST              Pin loadgen to these cores
+  --proxy-workers N                 Proxy --concurrency (default: one per core it may use)
   --provider-yaml LINES             Extra lines for the mock provider block,
                                     indented 4 spaces (e.g. a higher circuit
                                     breaker, so the sweep is not capped at the
@@ -96,6 +104,10 @@ while [[ $# -gt 0 ]]; do
         --slo-ttft-p99-ms)   SLO_TTFT_P99_MS="$2"; shift 2 ;;
         --access-logs)       ACCESS_LOGS="$2"; shift 2 ;;
         --provider-yaml)     PROVIDER_YAML="$2"; shift 2 ;;
+        --proxy-cores)       PROXY_CORES="$2"; shift 2 ;;
+        --mock-cores)        MOCK_CORES="$2"; shift 2 ;;
+        --loadgen-cores)     LOADGEN_CORES="$2"; shift 2 ;;
+        --proxy-workers)     PROXY_WORKERS="$2"; shift 2 ;;
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
         -h|--help)           usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -147,9 +159,19 @@ cargo build --"$PROFILE" -p proxy -p mockupstream -p loadgen
 
 BIN="target/$PROFILE"
 
+# Per-process pinning, so each process has the cores a report says it had.
+# Wrapping this whole script in one taskset mask instead lets the three share
+# every core in it, and the proxy then sizes its worker pool to the mask.
+pin() { if [[ -n "$1" ]]; then echo taskset -c "$1"; fi; }
+read -r -a PIN_PROXY <<<"$(pin "$PROXY_CORES")"
+read -r -a PIN_MOCK <<<"$(pin "$MOCK_CORES")"
+read -r -a PIN_LOADGEN <<<"$(pin "$LOADGEN_CORES")"
+PROXY_ARGS=()
+[[ -n "$PROXY_WORKERS" ]] && PROXY_ARGS=(--concurrency "$PROXY_WORKERS")
+
 echo
 echo "=== starting mock upstream ==="
-"$BIN/mock-upstream" \
+${PIN_MOCK[@]+"${PIN_MOCK[@]}"} "$BIN/mock-upstream" \
     --listen 127.0.0.1:0 \
     --protocol auto \
     --tokens "$TOKENS" \
@@ -219,7 +241,8 @@ echo "=== validating config ==="
 
 echo
 echo "=== starting proxy ==="
-"$BIN/llm-proxy" --config "$CONFIG" >"$PROXY_LOG" 2>&1 &
+${PIN_PROXY[@]+"${PIN_PROXY[@]}"} "$BIN/llm-proxy" --config "$CONFIG" \
+    ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 
 # Readiness fence: the admin endpoint's /ready, not a sleep and not a bare
@@ -308,7 +331,7 @@ SWEEP_ARGS=(
 [[ -n "$MAX_CONCURRENCY" ]] && SWEEP_ARGS+=(--sweep-max-concurrency "$MAX_CONCURRENCY")
 
 set +e
-"$BIN/loadgen" "${SWEEP_ARGS[@]}"
+${PIN_LOADGEN[@]+"${PIN_LOADGEN[@]}"} "$BIN/loadgen" "${SWEEP_ARGS[@]}"
 SWEEP_STATUS=$?
 set -e
 

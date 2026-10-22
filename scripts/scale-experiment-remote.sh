@@ -32,6 +32,8 @@ OUT="$REPO_ROOT/target/scale/$RUN_ID"
 mkdir -p "$OUT"
 
 # Core layout. Override on a smaller host, e.g. CORES_PROXY="0-1 2-3 4-5".
+# S1 runs one replica, so it can give the mock and loadgen the cores replicas
+# 2 and 3 would use: S1_CORES_UPSTREAM, S1_CORES_LOADGEN (default: as above).
 read -r -a CORES_PROXY <<<"${CORES_PROXY:-0-3 4-7 8-11}"
 CORES_UPSTREAM="${CORES_UPSTREAM:-12}"
 CORES_REDIS="${CORES_REDIS:-13}"
@@ -394,8 +396,10 @@ s1() {
     # ceiling, not the proxy's.
     [[ -n "$PROVIDER_EXTRA_YAML" ]] || echo "NOTE: PROVIDER_EXTRA_YAML unset; the h2 ceiling is the 1024 default" >&2
     for proto in http2 http1; do
-        taskset -c "${CORES_PROXY[0]},$CORES_UPSTREAM,$CORES_LOADGEN" \
-            ./scripts/capacity-sweep.sh --upstream-protocol "$proto" \
+        ./scripts/capacity-sweep.sh --upstream-protocol "$proto" \
+            --proxy-cores "${CORES_PROXY[0]}" --proxy-workers "$PROXY_WORKERS" \
+            --mock-cores "${S1_CORES_UPSTREAM:-$CORES_UPSTREAM}" \
+            --loadgen-cores "${S1_CORES_LOADGEN:-$CORES_LOADGEN}" \
             ${PROVIDER_EXTRA_YAML:+--provider-yaml "$PROVIDER_EXTRA_YAML"} \
             --hold-secs 40 --out-dir "$OUT/s1-$proto" | tee "$OUT/s1-$proto.log" || true
     done
