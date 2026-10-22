@@ -35,7 +35,7 @@ use proxy_http::handler::{local_boxed, DownstreamInfo, HttpRequestParts, StreamH
 use proxy_http::router::RouterFilterFactory;
 use proxy_http::stat_handles::{RouterStats, StatHandles};
 use proxy_observability::access_log::parse_format;
-use proxy_observability::records::{BoundedRecordSink, RequestRecord};
+use proxy_observability::records::{BoundedRecordSink, RequestRecord, Termination};
 use proxy_observability::stats::{instruments, Registry, StatsControl, WorkerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -550,7 +550,7 @@ async fn aggregate_with_no_eligible_member_is_403_and_dials_nothing() {
         .run_until(async {
             let (a_addr, a_seen) = spawn_upstream(200).await;
             let (b_addr, b_seen) = spawn_upstream(200).await;
-            let fixture = build(
+            let mut fixture = build(
                 vec![
                     member(
                         "a",
@@ -569,6 +569,11 @@ async fn aggregate_with_no_eligible_member_is_403_and_dials_nothing() {
             let (status, body) = send(&fixture, false).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_credential_counts(&fixture.registry, Some(("openai", "missing")));
+            // The router's refusal is a local reply, not a completed exchange.
+            assert_eq!(
+                only_record(&mut fixture).termination,
+                Termination::LocalReply
+            );
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(json["error"]["type"], "tenant_credential_missing");
             assert!(

@@ -596,16 +596,26 @@ async fn build_failover_handler(
     retry_on: &str,
     num_retries: u32,
 ) -> FilterChainHandler {
+    build_failover_handler_over(
+        member_cluster("a", a, Vec::new()),
+        member_cluster("b", b, Vec::new()),
+        retry_on,
+        num_retries,
+    )
+    .await
+}
+
+/// [`build_failover_handler`] over the given member clusters `a` and `b`.
+async fn build_failover_handler_over(
+    a: ClusterConfig,
+    b: ClusterConfig,
+    retry_on: &str,
+    num_retries: u32,
+) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
-    snapshot.insert(
-        "a".to_string(),
-        Arc::new(member_cluster("a", a, Vec::new())),
-    );
-    snapshot.insert(
-        "b".to_string(),
-        Arc::new(member_cluster("b", b, Vec::new())),
-    );
+    snapshot.insert("a".to_string(), Arc::new(a));
+    snapshot.insert("b".to_string(), Arc::new(b));
     snapshot.insert("providers".to_string(), Arc::new(aggregate_cluster()));
     manager.update_from_snapshot(&snapshot).await;
     let mut fwd = forward_to_providers();
@@ -758,6 +768,60 @@ async fn a_failed_attempt_with_an_endless_body_is_abandoned_not_drained() {
                 .expect("a's writer must be cut off when the attempt is abandoned")
                 .unwrap();
             assert!(written > 0, "the endless body must have started");
+        })
+        .await;
+}
+
+/// When the retry finds no member left to dial, the client gets the held
+/// failed response, and that response keeps its member's `max_requests`
+/// permit while its body is open, as it would had no retry been admitted.
+/// `a` allows one request and `b` has no host: while the first client still
+/// holds `a`'s 503 body, a second request overflows at `a` instead of
+/// dialling it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_returned_held_response_keeps_its_members_permit() {
+    LocalSet::new()
+        .run_until(async {
+            let (a_addr, _a_task) = spawn_scripted_upstream(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\nbu",
+                false,
+            )
+            .await;
+            let mut a = member_cluster("a", a_addr, Vec::new());
+            a.circuit_breakers.default.max_requests = 1;
+            let mut b = member_cluster("b", a_addr, Vec::new());
+            b.endpoints.clear();
+            let handler = build_failover_handler_over(a, b, "5xx", 1).await;
+
+            let first = tokio::time::timeout(
+                Duration::from_secs(10),
+                handler.handle(request("/v1/chat/completions")),
+            )
+            .await
+            .expect("first request bounded");
+            assert_eq!(first.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                !first.head.headers.contains_key("x-envoy-overloaded"),
+                "the first answer must be a's own 503"
+            );
+
+            let second = tokio::time::timeout(
+                Duration::from_secs(10),
+                handler.handle(request("/v1/chat/completions")),
+            )
+            .await
+            .expect("second request bounded");
+            assert_eq!(second.head.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                second
+                    .head
+                    .headers
+                    .get("x-envoy-overloaded")
+                    .map(|v| v.as_bytes()),
+                Some(&b"true"[..]),
+                "a's permit must still be held by the first response"
+            );
+            drop(first);
         })
         .await;
 }

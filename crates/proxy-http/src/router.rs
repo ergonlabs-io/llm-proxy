@@ -10,6 +10,7 @@
 //! encode chain in [`crate::filter_manager::FilterChainHandler`] so it sees
 //! end-of-stream mutations from encoder filters.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -284,6 +285,11 @@ pub struct RouterHandler {
     /// at stream construction -- see that field's doc. Read by
     /// [`Self::upgrade_allowed`].
     upgrade_configs: Arc<HashMap<String, bool>>,
+    /// Set when the response handed back came from an upstream. Every other
+    /// router response is a local reply (no route, a refusal, an overflow, a
+    /// timeout, a direct response or redirect), which `respond` records on
+    /// the stream as Envoy's `sendLocalReply` does.
+    upstream_answered: Cell<bool>,
 }
 
 impl RouterHandler {
@@ -304,6 +310,7 @@ impl RouterHandler {
             captured_trailers: None,
             span_sink,
             upgrade_configs,
+            upstream_answered: Cell::new(false),
         }
     }
 
@@ -370,7 +377,12 @@ impl TerminalHttpFilter for RouterHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HttpResponseParts> + 'a>> {
         Box::pin(async move {
             let response = self.route_and_forward(cb).await;
-            if response.head.status == StatusCode::SERVICE_UNAVAILABLE {
+            let local = !self.upstream_answered.get();
+            if local {
+                cb.stream_info().is_local_reply = true;
+            }
+            // A provider's own 503 passed through is not this proxy refusing.
+            if local && response.head.status == StatusCode::SERVICE_UNAVAILABLE {
                 let route = cb.route();
                 let info = cb.stream_info();
                 let (listener, version) = self
@@ -1062,6 +1074,7 @@ impl RouterHandler {
             }
             attempt_guard.0 = None;
             resp.body = local_boxed(GuardedBody::new(resp.body, (cb_guard, active_request)));
+            self.upstream_answered.set(true);
             return resp;
         }
 
@@ -1102,6 +1115,7 @@ impl RouterHandler {
         // fed by the tunnel (`codec::serve_one`), so it passes through the
         // encode filter chain like any other response body.
         let (upstream_payload, body) = crate::handler::upgrade_payload_channel();
+        self.upstream_answered.set(true);
         HttpResponseParts {
             head: resp.head,
             body,
@@ -1456,20 +1470,20 @@ impl RouterHandler {
                         // A retry was admitted but nothing is left to dial.
                         // Envoy retries against already-tried hosts, so a
                         // client there still sees an upstream answer; return
-                        // the last one rather than inventing a 503.
+                        // the last one rather than inventing a 503. Its
+                        // member's permit and request count ride with its
+                        // body, as they would had it been answered directly.
                         let held = held_failed_response.take().expect("checked above");
                         tracing::debug!(
                             cluster = %cluster_name,
                             "retry found no untried host; returning the last upstream response"
                         );
-                        let service_time_ms =
-                            u64::try_from(held.dispatched_at.elapsed().as_millis())
-                                .unwrap_or(u64::MAX);
+                        self.upstream_answered.set(true);
                         return finalize_upstream_response(
                             held.response,
-                            service_time_ms,
+                            held.service_time_ms,
                             fwd.idle_timeout,
-                            Some(rq_guard),
+                            Some((rq_guard, held.guards)),
                             None,
                         );
                     }
@@ -1510,8 +1524,10 @@ impl RouterHandler {
                 let host = sel.host;
                 if let Some(held) = held_failed_response.take() {
                     // A new attempt is going out, so the earlier failure is
-                    // not needed any more. Free its connection if the body is
-                    // small, otherwise drop it.
+                    // not needed any more. Its member's permit goes back
+                    // first; then its connection is kept only if the rest of
+                    // a small body arrives promptly.
+                    drop(held.guards);
                     drain_failed_attempt_body(held.response.body).await;
                 }
                 // `LEAST_REQUEST` reads this count. It lives and dies with
@@ -2412,11 +2428,22 @@ impl RouterHandler {
                             if response_already_guarded || response_from_hedge {
                                 // Hedge bookkeeping owns this response's
                                 // guards; just release it.
+                                drop(rq_guard.take());
                                 drain_failed_attempt_body(resp.body).await;
                             } else {
+                                // The routed cluster's permit is released
+                                // here so the retry can take its own; the
+                                // member's stays with the held response.
+                                let ((_routed, member_guard), active_request) = rq_guard
+                                    .take()
+                                    .expect("normal response owns this attempt guard");
                                 held_failed_response = Some(HeldFailedResponse {
                                     response: resp,
-                                    dispatched_at: winning_attempt_dispatched_at,
+                                    service_time_ms: u64::try_from(
+                                        winning_attempt_dispatched_at.elapsed().as_millis(),
+                                    )
+                                    .unwrap_or(u64::MAX),
+                                    guards: (member_guard, active_request),
                                 });
                             }
                             continue;
@@ -2436,6 +2463,7 @@ impl RouterHandler {
                         let service_time_ms =
                             u64::try_from(winning_attempt_dispatched_at.elapsed().as_millis())
                                 .unwrap_or(u64::MAX);
+                        self.upstream_answered.set(true);
                         return finalize_upstream_response(
                             resp,
                             service_time_ms,
@@ -2584,28 +2612,43 @@ impl RouterHandler {
 /// resets the stream) instead of being buffered without bound.
 const FAILED_ATTEMPT_DRAIN_LIMIT: usize = 64 * 1024;
 
+/// How long the next attempt waits for a failed attempt's body to finish.
+/// Envoy resets a retried attempt at once (`internal-docs/envoy-divergences.md`
+/// row 50); a body that is already arriving is worth the wait to keep its
+/// connection, but a provider that stalls its error body must not hold up the
+/// failover until the stream's idle timeout.
+const FAILED_ATTEMPT_DRAIN_DEADLINE: Duration = Duration::from_millis(250);
+
 /// A retriable upstream response kept, body unread, until the next attempt is
 /// set up.
 struct HeldFailedResponse {
     response: HttpResponseParts,
-    /// When the attempt that produced `response` was dispatched, for
-    /// `x-envoy-upstream-service-time`.
-    dispatched_at: std::time::Instant,
+    /// This proxy's time to the response's headers, for
+    /// `x-envoy-upstream-service-time` if the response is returned after all.
+    service_time_ms: u64,
+    /// The producing member's `max_requests` permit and least-request count,
+    /// which belong to this response until it is dropped or returned.
+    guards: (Option<CbGuard>, proxy_cluster::ActiveRequestGuard),
 }
 
 /// Read and discard a failed attempt's body, at most
-/// [`FAILED_ATTEMPT_DRAIN_LIMIT`] bytes.
-async fn drain_failed_attempt_body(mut body: StreamBody) {
-    let mut seen = 0usize;
-    while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else { return };
-        if let Some(data) = frame.data_ref() {
-            seen = seen.saturating_add(data.len());
-            if seen > FAILED_ATTEMPT_DRAIN_LIMIT {
-                return;
+/// [`FAILED_ATTEMPT_DRAIN_LIMIT`] bytes and for at most
+/// [`FAILED_ATTEMPT_DRAIN_DEADLINE`]. A body cut short is dropped, which
+/// resets its stream, so its connection is never reused.
+async fn drain_failed_attempt_body(body: StreamBody) {
+    async fn drain(mut body: StreamBody) {
+        let mut seen = 0usize;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else { return };
+            if let Some(data) = frame.data_ref() {
+                seen = seen.saturating_add(data.len());
+                if seen > FAILED_ATTEMPT_DRAIN_LIMIT {
+                    return;
+                }
             }
         }
     }
+    let _ = tokio::time::timeout(FAILED_ATTEMPT_DRAIN_DEADLINE, drain(body)).await;
 }
 
 /// Final touches on the response that goes back to the client: the
@@ -3842,11 +3885,8 @@ fn ledger_unavailable_reply(
     dcb: &mut dyn DecoderCallbacks,
     reason: proxy_observability::ledger::Unavailable,
 ) -> HttpResponseParts {
-    {
-        let mut info = dcb.stream_info();
-        info.is_local_reply = true;
-        info.response_code_details = Some(format!("ledger_unavailable_{}", reason.as_str()));
-    }
+    dcb.stream_info().response_code_details =
+        Some(format!("ledger_unavailable_{}", reason.as_str()));
     let mut resp = local_reply(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("billing ledger unavailable: {}\n", reason.as_str()),

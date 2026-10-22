@@ -75,6 +75,17 @@ fn temp_path(name: &str) -> PathBuf {
 }
 
 async fn circuit_broken_router(access_log: &std::path::Path) -> FilterChainHandler {
+    // Never dialled: the breaker refuses first.
+    router_to(access_log, 9, 0).await
+}
+
+/// Routes `/v1/` to cluster `"up"`: one endpoint at `127.0.0.1:port` with
+/// the given `max_requests`.
+async fn router_to(
+    access_log: &std::path::Path,
+    port: u16,
+    max_requests: u32,
+) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
     snapshot.insert(
@@ -85,11 +96,10 @@ async fn circuit_broken_router(access_log: &std::path::Path) -> FilterChainHandl
             discovery: DiscoveryType::Static,
             lb_policy: LbPolicy::RoundRobin,
             connect_timeout: Duration::from_secs(5),
-            // Never dialled: the breaker refuses first.
             endpoints: vec![EndpointIR {
                 metadata: Default::default(),
                 host: "127.0.0.1".to_string(),
-                port: 9,
+                port,
                 weight: 1,
                 priority: 0,
             }],
@@ -98,7 +108,7 @@ async fn circuit_broken_router(access_log: &std::path::Path) -> FilterChainHandl
             per_connection_buffer_limit_bytes: 1 << 20,
             circuit_breakers: CircuitBreakers {
                 default: CircuitBreakerThresholds {
-                    max_requests: 0,
+                    max_requests,
                     ..CircuitBreakerThresholds::ENVOY_DEFAULT
                 },
                 high: CircuitBreakerThresholds::ENVOY_DEFAULT,
@@ -239,6 +249,49 @@ async fn circuit_breaker_503s_log_once_per_window_with_suppressed_count() {
             let access = std::fs::read_to_string(&path).unwrap();
             assert_eq!(access.lines().count(), 600);
             assert!(access.lines().all(|line| line == "503 UO"), "{access}");
+            std::fs::remove_file(&path).unwrap();
+        })
+        .await;
+}
+
+/// A provider's own 503 passed through is not this proxy refusing: no
+/// "local 503 response" line, and the access log records it with no flag.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_passed_through_upstream_503_is_not_logged_as_local() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy")
+            .await;
+    });
+
+    LocalSet::new()
+        .run_until(async {
+            let path = temp_path("passthrough");
+            let handler = router_to(&path, port, 1024).await;
+            tokio::time::timeout(Duration::from_secs(10), send_503s(&handler, 1))
+                .await
+                .expect("the upstream answered within the bound");
+            assert_eq!(captured.warning_lines(), Vec::<String>::new());
+
+            assert!(proxy_observability::sink::flush_all_queued(
+                Duration::from_secs(5)
+            ));
+            let access = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(access, "503 -\n");
             std::fs::remove_file(&path).unwrap();
         })
         .await;
