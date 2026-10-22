@@ -545,7 +545,7 @@ s4b() {
 }
 
 # S5: Redis returns EMPTY (no persistence). Reproduces the empty-store finding
-# in internal-docs/capacity/2026-10-21-digitalocean-shared-rerun.md; expect 401s,
+# in internal-docs/capacity/2026-10-22-digitalocean-dedicated.md; expect 401s,
 # so a FAIL, until that is fixed. S5b: Redis returns with its AOF, which is
 # the case the plan's "limits enforced again after Redis returns" criterion
 # means.
