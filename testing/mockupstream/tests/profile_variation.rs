@@ -10,8 +10,8 @@ use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use mockupstream::frames::StreamConfig;
 use mockupstream::handler::{self, AppState};
-use mockupstream::profiles::{Dist, Profile, ProfileSet, DEFAULT_PROFILE};
-use serde_json::{json, Value};
+use mockupstream::profiles::{DEFAULT_PROFILE, Dist, Profile, ProfileSet};
+use serde_json::{Value, json};
 use tokio::io::duplex;
 
 /// Runs an HTTP/1.1 server and Hyper client over an in-memory duplex pipe.
@@ -262,4 +262,37 @@ async fn non_streaming_usage_matches_a_valid_draw() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     let k = value["usage"]["output_tokens"].as_u64().unwrap();
     assert!((8..=12).contains(&k), "k={k} out of mock-medium range");
+}
+
+/// A non-streaming reply is framed by `content-length`, not chunked, on both
+/// dialects. The proxy forwards upstream framing as it is, so a mock that
+/// chunks fixed-length JSON makes the proxy look like it drops
+/// `content-length`, and adds a closing-chunk write to every measured request.
+#[tokio::test]
+async fn non_streaming_reply_is_framed_by_content_length() {
+    let mut sender = spawn_server(test_state()).await;
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        sender.ready().await.expect("connection ready");
+        let req = Request::post(path)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(
+                br#"{"model":"mock-medium","stream":false}"#,
+            )))
+            .unwrap();
+        let resp = sender.send_request(req).await.expect("send request");
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let headers = resp.headers().clone();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            headers
+                .get("content-length")
+                .map(|v| v.to_str().unwrap().to_owned()),
+            Some(body.len().to_string()),
+            "{path}: content-length must equal the body length; headers: {headers:?}"
+        );
+        assert!(
+            headers.get("transfer-encoding").is_none(),
+            "{path}: a fixed-length reply must not be chunked; headers: {headers:?}"
+        );
+    }
 }

@@ -180,21 +180,50 @@ async fn handle_dialect(
 /// Move the in-flight guard into the response body, so the request stays
 /// counted until hyper drops the body: when the last frame is written, or
 /// when the client disconnects mid-stream.
-///
-/// Rust note: `map_frame`'s closure owns `guard` (`move`), and the closure
-/// lives inside the boxed body, so dropping the body drops the guard. The
-/// `let _ = &guard;` only makes the closure capture it.
 fn hold_until_body_ends(
     response: Response<ResponseBody>,
     guard: InFlightGuard,
 ) -> Response<ResponseBody> {
-    response.map(|body| {
-        body.map_frame(move |frame| {
-            let _ = &guard;
-            frame
-        })
+    response.map(|inner| {
+        HeldBody {
+            inner,
+            _guard: guard,
+        }
         .boxed()
     })
+}
+
+/// A response body that carries an [`InFlightGuard`] and is otherwise the
+/// body it wraps. It must forward `size_hint`: hyper frames a response by its
+/// exact size hint, so a wrapper that reports an unknown size (as
+/// `map_frame` does) turns every fixed-length JSON reply into HTTP/1.1
+/// chunked encoding and drops `content-length` from h2 replies. The proxy
+/// then forwards that framing, which makes the proxy look like it re-encodes.
+struct HeldBody {
+    inner: ResponseBody,
+    _guard: InFlightGuard,
+}
+
+impl hyper::body::Body for HeldBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    // Rust note: `ResponseBody` is a `BoxBody`, which is `Unpin`, so
+    // `Pin::new` reaches the inner body without a pin projection.
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Read the whole request body, capped at [`MAX_BODY_BYTES`]. Returns the
@@ -251,8 +280,8 @@ fn json_error(status: StatusCode, message: &str) -> Response<ResponseBody> {
 mod tests {
     use super::*;
     use crate::profiles::Dist;
-    use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
 
     fn profile(
         name: &str,
