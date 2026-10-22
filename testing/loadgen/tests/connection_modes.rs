@@ -108,8 +108,9 @@ async fn h1_pool_preserves_timeout_accounting() {
     assert_eq!(summary.timeouts, summary.streams_counted, "{summary:?}");
 }
 
-#[tokio::test]
-async fn h2_tls_alpn_multiplexes_simultaneous_streams() {
+/// A TLS acceptor for `localhost` offering `alpn`, and the PEM of the CA
+/// that signed it.
+fn tls_acceptor(alpn: &[u8]) -> (TlsAcceptor, String) {
     let ca_key = KeyPair::generate().expect("ca key");
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -135,8 +136,13 @@ async fn h2_tls_alpn_multiplexes_simultaneous_streams() {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .expect("server config");
-    server.alpn_protocols = vec![b"h2".to_vec()];
-    let acceptor = TlsAcceptor::from(Arc::new(server));
+    server.alpn_protocols = vec![alpn.to_vec()];
+    (TlsAcceptor::from(Arc::new(server)), ca.pem())
+}
+
+#[tokio::test]
+async fn h2_tls_alpn_multiplexes_simultaneous_streams() {
+    let (acceptor, ca_pem) = tls_acceptor(b"h2");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("address");
     let accepted = Arc::new(AtomicUsize::new(0));
@@ -165,7 +171,7 @@ async fn h2_tls_alpn_multiplexes_simultaneous_streams() {
         }
     });
     let ca_path = std::env::temp_dir().join(format!("loadgen-ca-{}.pem", std::process::id()));
-    std::fs::write(&ca_path, ca.pem()).expect("write CA");
+    std::fs::write(&ca_path, &ca_pem).expect("write CA");
     let mut cfg = config(
         format!("https://localhost:{}", addr.port()),
         DownstreamMode::H2,
@@ -179,4 +185,49 @@ async fn h2_tls_alpn_multiplexes_simultaneous_streams() {
     assert_eq!(summary.transport.connections_opened, 1, "{summary:?}");
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
     assert!(summary.transport.streams_per_connection >= 8.0);
+}
+
+#[tokio::test]
+async fn h1_pool_speaks_http1_over_tls_and_reuses_connections() {
+    let (acceptor, ca_pem) = tls_acceptor(b"http/1.1");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            count.fetch_add(1, Ordering::Relaxed);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tls), service_fn(response))
+                    .await;
+            });
+        }
+    });
+    let ca_path = std::env::temp_dir().join(format!("loadgen-h1-ca-{}.pem", std::process::id()));
+    std::fs::write(&ca_path, &ca_pem).expect("write CA");
+    let mut cfg = config(
+        format!("https://localhost:{}", addr.port()),
+        DownstreamMode::H1Pool,
+        2,
+    );
+    Arc::get_mut(&mut cfg).expect("unique").transport.ca_file = Some(ca_path.clone());
+    let summary = driver::run_closed_loop(cfg, 8, Duration::from_millis(300), Duration::ZERO).await;
+    let _ = std::fs::remove_file(ca_path);
+    assert_eq!(summary.error_rate, 0.0, "{summary:?}");
+    assert!(summary.success > 2, "{summary:?}");
+    assert!(summary.transport.connections_opened <= 2, "{summary:?}");
+    assert!(summary.transport.connections_reused > 0, "{summary:?}");
+    assert_eq!(
+        summary.transport.connections_opened as usize,
+        accepted.load(Ordering::Relaxed),
+        "every opened connection completed a TLS accept"
+    );
 }
