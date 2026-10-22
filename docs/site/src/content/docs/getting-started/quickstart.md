@@ -1,7 +1,7 @@
 ---
 title: Quickstart
 description: "Install llm-proxy, create a starter config, send one request to OpenAI through the proxy, and read the token counts in the access log."
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-22
 related:
   - getting-started/introduction
   - getting-started/installation
@@ -13,11 +13,17 @@ This page takes you from nothing to one served request. You install the
 binary, create a starter config, send a request, and read the token counts.
 The whole path takes about five minutes.
 
+For a faster start with no authentication, see the
+[Quick start](/docs/llm-proxy/getting-started/installation/#quick-start) on
+the installation page.
+
 ## Prerequisites
 
-- macOS on Apple Silicon, or Linux on x86-64. The release builds only these
-  two platforms. For Intel macOS, Linux on arm64, or another platform, build
-  from source. See [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
+- macOS on Apple Silicon, or Linux on x86-64. The release workflow also
+  builds Linux arm64, but releases up to v0.6.1 have no arm64 archive. For
+  Intel macOS, Linux on arm64 with an older release, or another platform,
+  build from source. See
+  [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
 - `curl`, `tar`, and `sed`. The installer needs them.
 - An OpenAI API key in the `OPENAI_API_KEY` environment variable.
 

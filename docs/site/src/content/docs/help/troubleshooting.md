@@ -5,7 +5,7 @@ summary: Symptom-first fixes for llm-proxy. Entries are grouped by area -
   startup and config, authentication and access, routing, limits and budgets,
   provider errors, streaming and usage, admin, TLS, reload, and storage.
   Error strings are the ones the proxy prints.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-22
 related:
   - api-compatibility/errors
   - reference/response-flags
@@ -72,7 +72,7 @@ an error with its full dotted path.
 
 **Cause.** These top-level keys are reserved. Version 0 of the file rejects
 them. The message ends with `(strict mode; see
-internal-docs/envoy-divergences.md)`. That file is not part of the release.
+internal-docs/envoy-divergences.md)`. That file is in the repository.
 
 **Fix.** Remove the key. To export traces, use `observability.tracing`.
 

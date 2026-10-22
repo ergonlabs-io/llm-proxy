@@ -5,7 +5,7 @@ summary: How to install the llm-proxy Helm chart from GHCR, what the chart
   creates, how it wires readiness and the drain into a rolling update, how to
   share limits and spend across replicas with Redis, and the values you can
   set.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-22
 related:
   - operations/deployment
   - operations/draining-and-shutdown
@@ -14,13 +14,17 @@ related:
   - configuration/configuration-file
 ---
 
-Each release publishes a container image and a Helm chart to the GitHub
-container registry (GHCR). The chart runs llm-proxy as a Deployment (or a
+The release workflow publishes a container image and a Helm chart to the
+GitHub container registry (GHCR). The chart runs llm-proxy as a Deployment (or a
 StatefulSet) behind a Service. It reads your `--config` file from a
 ConfigMap and your provider keys from a Secret. It sets the probes, the
 preStop hook and the termination grace period so that a rolling update does
 not fail a request that is in flight. The chart has no operator and no
 custom resources.
+
+:::caution
+The image and the chart are published for releases after v0.6.1.
+:::
 
 ## At a glance
 

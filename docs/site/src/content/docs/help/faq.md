@@ -4,7 +4,7 @@ description: "Short answers to the questions engineers ask when they compare llm
 summary: Questions an evaluator asks, answered in a few sentences each. Every
   answer states what the proxy does today and links to the page that explains
   it.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-22
 related:
   - getting-started/introduction
   - getting-started/coming-from-litellm-or-openrouter
@@ -157,7 +157,7 @@ See [Running in production](/docs/llm-proxy/operations/running-in-production/).
 
 ### Is there a Docker image or Helm chart?
 
-Yes. Each release publishes a container image,
+Yes, for releases after v0.6.1. The release workflow publishes a container image,
 `ghcr.io/ergonlabs-io/llm-proxy`, and a Helm chart,
 `oci://ghcr.io/ergonlabs-io/charts/llm-proxy`. See
 [Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/).

@@ -14,25 +14,29 @@ and cluster policy on top of it, not a parallel system.
 
 [![CI](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ergonlabs-io/llm-proxy/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Version: v0.6.1](https://img.shields.io/badge/version-v0.6.1-blue.svg)
+[![Release](https://img.shields.io/github/v/release/ergonlabs-io/llm-proxy?sort=semver)](https://github.com/ergonlabs-io/llm-proxy/releases)
+[![Docs](https://img.shields.io/badge/docs-ergonlabs.io-blue.svg)](https://ergonlabs.io/docs/llm-proxy/)
 ![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
-![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
 </div>
 
 ```sh
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml            # serve, against a local Ollama
-cargo run -p proxy -- --config examples/llmproxy.yaml --mode validate   # check a configuration; exit
-cargo run -p proxy -- --config examples/llmproxy.yaml --mode translate  # print the data-plane bootstrap it lowers to
+export UPSTREAM_BASE_URL=https://api.openai.com UPSTREAM_API_KEY=sk-...
+llm-proxy --config examples/llmproxy-quickstart.yaml
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+See [Quick start](#quick-start) for the binary, container, and source options,
+and the [documentation](https://ergonlabs.io/docs/llm-proxy/) for everything
+else.
+
 > [!NOTE]
-> **The data plane serves real traffic; workspace qualification passed 2,335 tests.**
-> `v0.6.1` is the current release.
-> Interfaces still change between releases and there are no backports to earlier
-> tags. Read [What is not built yet](#what-is-not-built-yet) before you depend
-> on it — that section is deliberately specific — and
-> [Roadmap](#roadmap) for where each release stands.
+> **Pre-1.0.** The data plane serves real traffic, but interfaces still change
+> between releases and there are no backports to earlier tags. Read
+> [What is not built yet](#what-is-not-built-yet) before you depend on it —
+> that section is deliberately specific — and [Roadmap](#roadmap) for where
+> each release stands.
 
 ---
 
@@ -210,184 +214,110 @@ provider on failover. That has been a real key-disclosure bug here twice.
   ourselves and both being wrong. The v0.3.2 gate shipped in tag v0.3.5; see
   [Roadmap](#roadmap).
 
-## Build
+## Quick start
 
-Requires a Rust toolchain and `protoc` (`brew install protobuf`, or
-`apt install protobuf-compiler`). The result is a single static binary,
-`llm-proxy`, with no runtime dependencies.
+From download to a first proxied request in about five minutes. Pick one way to
+get the proxy; the run steps after it are the same for all three.
 
-```sh
-git clone https://github.com/ergonlabs-io/llm-proxy.git
-cd llm-proxy
-cargo build --workspace          # -> target/debug/llm-proxy
-make ci                          # fmt, clippy, tests, doctests, qa — what CI enforces
-make tq                          # the whole test suite via nextest
-```
-
-### Use OpenRouter locally
-
-The OpenRouter provider forwards OpenAI-compatible chat requests requests, rewriting `/v1` to OpenRouter's `/api/v1` on the selected cluster. The
-example contains 469 model IDs imported on 2026-10-08, including vendor prefixes
-and suffixes. `/v1/models` serves those IDs locally; it does not query OpenRouter. Availability, supported
-parameters, and account permissions are determined by OpenRouter.
+**Release binary** (Linux x86-64 and arm64, macOS on Apple silicon):
 
 ```sh
-export OPENROUTER_API_KEY='your-openrouter-key'
-python3 scripts/import-openrouter-models.py  # optional explicit catalog refresh
-make build
-./target/debug/llm-proxy --config examples/llmproxy-openrouter.yaml
+os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSLO "https://github.com/ergonlabs-io/llm-proxy/releases/latest/download/llm-proxy-$os-$arch.tar.gz"
+tar -xzf "llm-proxy-$os-$arch.tar.gz"
+curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart.yaml
 ```
 
-Point your OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Discover model
-IDs with `curl http://127.0.0.1:8080/v1/models`, then use one as the request's `model`:
+Releases up to v0.6.1 have no Linux arm64 archive; build from source there.
+
+**Container image** (`ghcr.io/ergonlabs-io/llm-proxy`, linux/amd64 and
+linux/arm64; published for releases after v0.6.1):
 
 ```sh
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Hello"}]}'
+curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart-container.yaml
+export UPSTREAM_BASE_URL=https://api.openai.com UPSTREAM_API_KEY=sk-...
+docker run --rm -p 127.0.0.1:8080:8080 -e UPSTREAM_BASE_URL -e UPSTREAM_API_KEY \
+  -v "$PWD/llmproxy-quickstart-container.yaml:/etc/llm-proxy/llmproxy.yaml:ro" \
+  ghcr.io/ergonlabs-io/llm-proxy:latest
 ```
 
-The example denies the `models`, `route`, `plugins`, and `transforms` body fields on the OpenRouter provider: OpenRouter honors them to run other models or paid plugins, and they bypass the proxy's model authorization. Remove entries from `request_fields.deny` to allow them.
+Then skip to step 3.
 
-The example listens only on loopback and has no downstream authentication. The
-OpenRouter key comes from the environment and replaces downstream authorization
-on the provider cluster. Live requests use your OpenRouter account and may incur
-charges. This configuration covers OpenAI-compatible chat and streaming; other
-OpenRouter API families are not qualified by this example. See the
-[OpenRouter model API](https://openrouter.ai/docs/api/api-reference/models/get-models).
+**From source** (needs `protoc`: `brew install protobuf` or
+`apt install protobuf-compiler`; `rustup` installs the pinned Rust toolchain):
 
-The OpenRouter importer installs exact token rates in
-`pricing.price_list`, and preserves all published pricing in `pricing.catalog`.
-The Pricing UI reads `GET /pricing` from the proxy, including the active version
-and explicit reasons for models without a usable token rate card. No cache rates
-are inferred and fractional nanodollars are never rounded. An unknown cache rate
-makes requests reporting that cache bucket unpriced; ordinary requests still use
-the known input/output rates. Whole-request tier overrides are imported with
-inclusive thresholds. Non-token charges remain visible but are excluded from
-token cost calculation.
+```sh
+git clone https://github.com/ergonlabs-io/llm-proxy.git && cd llm-proxy
+cargo build --release -p proxy
+```
 
-Where the rate card lives depends on whether the filter chain has a
-control-plane store: an `auth` section in the dialect, or `llmproxy.auth` in
-bootstrap mode. `examples/llmproxy-openrouter.yaml` has none.
+In the steps below, use `./target/release/llm-proxy` for `./llm-proxy` and
+`examples/llmproxy-quickstart.yaml` for `llmproxy-quickstart.yaml`.
 
-- **With a store**, the store holds the rate card, per chain, and it wins. At
-  start the configured rate card seeds an empty store once. After that, neither a
-  restart nor a `SIGHUP` reload replaces a stored rate card; the proxy logs once
-  when the configuration differs from the stored card. `PUT /pricing` writes the
-  store and installs the card on the replica that received it at once. Every
-  other replica that shares the store installs it on its next policy poll, which
-  is 48 to 60 seconds at the default `poll_interval_seconds`. Only the
-  `persistent` and `shared` stores keep the card across a restart. The default
-  in-memory store loses it, and the response says `"persisted": false`.
-- **Without a store**, the configuration is the only durable source. A `SIGHUP`
-  reload installs the configured rate card when it changed, and a reload that did
-  not change it keeps a rate card installed with `PUT`. `PUT /pricing` changes
-  only the replica that receives it, and a restart loads the configured rate card
-  again. The response says `"persisted": false`.
+**1. Point it at a provider.** `examples/llmproxy-quickstart.yaml` routes every
+model to one OpenAI-compatible provider and reads both its address and its key
+from the environment:
 
-A request that has started keeps the rate card that was active when it started.
-A listener rebuilds its filter chain when a connection arrives after a reload, so
-a changed configured rate card applies from the first new connection.
+```sh
+export UPSTREAM_BASE_URL=https://api.openai.com   # scheme, host and port only, no /v1
+export UPSTREAM_API_KEY=sk-...                     # your provider key
+./llm-proxy --config llmproxy-quickstart.yaml --mode validate
+# configuration 'llmproxy-quickstart.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
+```
 
-**Warning:** A model with no price adds $0 to every `llmproxy.spend_limit`
-dollar budget. The proxy does not refuse the request. It logs one warning for
-each chain and model, with the reason, and stops logging that model. It names at
-most 256 models per chain, then logs one summary line. A model has no price when
-the rate card has no entry for it. `PUT /pricing` replaces the whole rate card, so a model that is
-missing from the new rate card has no price. The access log shows `-` for
-`%LLM_LIST_COST%` when the rate card has no price. `GET /keys/{id}/spend` counts
-these requests in `unpriced_requests`.
+For a local Ollama, use `UPSTREAM_BASE_URL=http://127.0.0.1:11434` and any
+value for the key.
 
-`PUT /pricing` needs the admin token (`LLMPROXY_ADMIN_TOKEN`) as a bearer token.
-It does not need an `auth` section. It accepts a body up to 4 MiB, which holds
-the rate card in `examples/llmproxy-openrouter.yaml` with its catalog (268 KB
-compact, 401 KB pretty-printed); every other admin write is limited to 64 KiB.
-It returns `400` for invalid JSON, an invalid rate card, or an `effective_from`
-in the future. A rate card applies from the moment it is installed, so a future
-date is refused instead of applied early. It returns `503` when the store
-refuses the write, and then no replica has changed.
+**2. Start it.** It listens on `127.0.0.1:8080`, with the admin endpoint on
+`127.0.0.1:9901`.
 
-Each priced request records the rate card version (`%LLM_RATE_CARD_VERSION%` in
-the access log). The version covers the price entries and the map from cluster to
-provider type, so replicas that differ in either record different versions.
-`GET /pricing` also shows `rate_card_version`.
+```sh
+./llm-proxy --config llmproxy-quickstart.yaml
+```
 
-Importing prices does not create dollar budgets.
+**3. Send a request** from a second terminal:
 
-### Install a release
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
 
-On macOS (Apple Silicon) or Linux (x86-64), install the latest release and start
-it as a service:
+The proxy replaces the caller's `Authorization` header with the provider key
+and prints one JSON access-log line per request, with `llm_input_tokens` and
+`llm_output_tokens`. The quick-start config has no `auth` section, so it does
+not check callers; keep it on loopback. Next:
+[virtual keys](https://ergonlabs.io/docs/llm-proxy/authentication/virtual-keys/),
+budgets, and [`llm-proxy init`](https://ergonlabs.io/docs/llm-proxy/getting-started/quickstart/),
+which writes a starter config with authentication turned on.
+
+### Install as a service
+
+On macOS (Apple silicon) or Linux, the install script downloads the release,
+verifies its SHA-256 checksum, writes a starter configuration with
+`llm-proxy init` and an admin token, and starts the proxy as a launchd agent or
+a systemd unit:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh
 ```
 
-The installer:
+It prints the admin UI address (`http://127.0.0.1:53422/ui/`), the admin token,
+and an API key for the proxy on port `53421`. Re-run it to upgrade. For its
+options, and for Kubernetes with the Helm chart in `deploy/helm/llm-proxy`, see
+[Install llm-proxy](https://ergonlabs.io/docs/llm-proxy/getting-started/installation/)
+and [Kubernetes and Helm](https://ergonlabs.io/docs/llm-proxy/operations/kubernetes/).
 
-- downloads the release for your platform and verifies its SHA-256 checksum;
-- creates a starter configuration with `llm-proxy init` and an admin token;
-- starts the proxy as a launchd agent (macOS) or a systemd user unit (Linux),
-  so it restarts after a crash and at login;
-- waits until the proxy is ready, then prints the admin UI address, the admin
-  token, and the proxy API key.
+### Providers
 
-Open `http://127.0.0.1:53422/ui/` and paste the admin token to manage keys,
-tenants, and pricing. The proxy API listens on port `53421`. The admin UI
-listens on loopback only; on a remote host, use `ssh -L 53422:127.0.0.1:53422`,
-or install with `--admin-address 0.0.0.0:53422` on a network you trust. The
-admin API is plain HTTP, so on that address the admin token crosses the network
-unencrypted, and `/config_dump`, `/stats`, and `/clusters` are readable without
-it. The installer warns about this on every run.
+OpenAI, Anthropic, OpenRouter, Azure OpenAI, Vertex AI, Amazon Bedrock, and any
+OpenAI-compatible server (vLLM, Ollama, TGI). `examples/` has a runnable file
+for several of them; `examples/llmproxy-openrouter.yaml` carries OpenRouter's
+model catalog and token rates. See
+[Providers](https://ergonlabs.io/docs/llm-proxy/providers/overview/).
 
-Run as root on Linux, the installer writes a system unit that runs as an
-`llm-proxy` system user, with files in `/usr/local/bin` and `/var/lib/llm-proxy`.
-Without systemd (for example, in a container), it starts a background process.
+### A fuller configuration
 
-Re-run the same command to upgrade. It keeps the existing configuration,
-secrets, and admin token. Pass options after `sh -s --`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.6.1 --port 8080 --admin-port 8081
-```
-
-| Option | Effect |
-| --- | --- |
-| `--version TAG` | Install this release instead of the latest. |
-| `--port N`, `--admin-port N` | Ports for a new configuration. |
-| `--admin-address HOST:PORT` | Admin and UI address for a new configuration, for example `0.0.0.0:53422`. |
-| `--no-start` | Install only. |
-| `--no-service` | Start a background process instead of a service. |
-| `--uninstall [--purge]` | Remove the service and binary; `--purge` also deletes the data directory. |
-
-## Quick start
-
-**1. Check the configuration without starting anything.**
-
-```sh
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode validate
-# configuration 'examples/llmproxy-ollama.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
-```
-
-`examples/llmproxy-ollama.yaml` runs against a local Ollama and needs no API
-keys or environment variables. `--mode validate` warns when you switch a control off
-(for example `auth.enforce.model_policy: false`), so a configuration that says
-more than the proxy does tells you at load time rather than in production.
-
-**2. See what it lowers to.**
-
-```sh
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml --mode translate
-```
-
-**3. Serve, and send it an ordinary OpenAI-shaped request** on the port the file
-lists:
-
-```sh
-cargo run -p proxy -- --config examples/llmproxy-ollama.yaml
-```
-
-A useful configuration is small:
+A configuration with failover and a token limit is still small:
 
 ```yaml
 version: 0
@@ -414,7 +344,8 @@ limits:
 
 `examples/llmproxy.yaml` is the annotated version of the same file, and
 `schema/llmproxy-v0.schema.json` is the authority on every field — editors that
-understand `yaml-language-server` autocomplete against it.
+understand `yaml-language-server` autocomplete against it. `--mode translate`
+prints the data-plane bootstrap a dialect file lowers to.
 
 ## Configuration surfaces
 
@@ -582,11 +513,10 @@ internal-docs/            architecture, Envoy semantics and divergences,
 
 ## Documentation
 
-Full documentation lives in `docs/site/` — an Astro Starlight site covering
-getting started, the configuration reference, providers and routing,
-authentication, limits and budgets, observability, and operations. Build it with
-`make docs-build`, or run it locally with `make docs-dev`. It is not published to
-a public URL yet.
+The documentation is published at
+[ergonlabs.io/docs/llm-proxy](https://ergonlabs.io/docs/llm-proxy/). Its source is
+the Astro Starlight site in `docs/site/`: build it with `make docs-build`, check
+its links with `make docs-check`, or serve it locally with `make docs-dev`.
 
 ## Development
 
@@ -603,15 +533,14 @@ make xds-conformance   # xDS behaviour against a real go-control-plane server
 make sweep             # the capacity sweep behind the numbers above
 ```
 
-Release gates, work packages, and architecture decision records are in
-`internal-docs/`; contribution conventions are summarised in
-[`AGENTS.md`](AGENTS.md).
+Release gates and architecture decision records are in `internal-docs/`; the
+code conventions are in [`AGENTS.md`](AGENTS.md).
 
 ## Contributing and security
 
-Vulnerability reports: see [SECURITY.md](SECURITY.md). Do not report a
-suspected vulnerability in a public issue. The private reporting channel is not
-published yet.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[code of conduct](CODE_OF_CONDUCT.md). Report a suspected vulnerability
+privately, as [SECURITY.md](SECURITY.md) describes, never in a public issue.
 
 ## Licence
 
