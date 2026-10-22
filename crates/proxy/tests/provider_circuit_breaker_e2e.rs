@@ -114,6 +114,46 @@ fn a_fallback_model_sheds_at_the_dialled_providers_ceiling() {
     finish(proxy, &dir);
 }
 
+/// A provider that sends `503` headers and then stalls its body must not hold
+/// up failover: the fallback answers while the stalled body is still open
+/// (without a bound the wait is the 10-minute stream idle timeout, far past
+/// the client's read timeout). The stalled connection is closed rather than
+/// reused, and `capped`'s single `max_requests` permit comes back, so the
+/// next request is served by `capped` itself.
+#[test]
+fn a_stalled_error_body_does_not_hold_up_failover_or_the_providers_permit() {
+    let dir = scratch_dir("stall");
+    let capped = StallingMock::start();
+    let open = Mock::start(false);
+    let proxy = Proxy::start(
+        &dir,
+        &config_text(
+            capped.addr,
+            open.addr,
+            "    circuit_breakers: { max_requests: 1 }\n",
+            "models:\n  chain: { providers: [capped, open] }\n",
+        ),
+    );
+
+    let first = send_chat(proxy.listen, "chain");
+    assert_ok(&first);
+    assert_eq!(open.count(), 1, "the fallback did not answer");
+    wait_until(
+        || capped.stall_ended(),
+        "the proxy to close the stalled connection",
+    );
+
+    let second = send_chat(proxy.listen, "chain");
+    assert_ok(&second);
+    assert_eq!(
+        capped.connections(),
+        2,
+        "the second request must reach capped on a new connection"
+    );
+    assert_eq!(open.count(), 1, "the second request failed over");
+    finish(proxy, &dir);
+}
+
 // ------------------------------------------------------------------ helpers --
 
 fn finish(proxy: Proxy, dir: &Path) {
@@ -365,4 +405,70 @@ fn assert_overflow(response: &str) {
                 .contains("x-envoy-overloaded: true"),
         "expected the UpstreamOverflow 503:\n{response}"
     );
+}
+
+/// A mock OpenAI upstream whose first connection answers `503` headers and
+/// 10 of 100 body bytes, then waits for the proxy to close the connection
+/// (the stall ends only then). Later connections answer 200.
+struct StallingMock {
+    addr: SocketAddr,
+    connections: Arc<AtomicUsize>,
+    stall_ended: Arc<AtomicBool>,
+}
+
+impl StallingMock {
+    fn start() -> StallingMock {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
+        let addr = listener.local_addr().expect("no local addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let stall_ended = Arc::new(AtomicBool::new(false));
+        let (count, ended) = (Arc::clone(&connections), Arc::clone(&stall_ended));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                let ended = Arc::clone(&ended);
+                std::thread::spawn(move || {
+                    if read_request(&mut stream).is_none() {
+                        return;
+                    }
+                    if first {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\
+                              Content-Length: 100\r\n\r\noverloaded",
+                        );
+                        // No read timeout: this returns only when the proxy
+                        // closes the connection.
+                        let _ = stream.set_read_timeout(None);
+                        let mut buf = [0u8; 64];
+                        while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                        ended.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    let body = r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}"#;
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        StallingMock {
+            addr,
+            connections,
+            stall_ended,
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    fn stall_ended(&self) -> bool {
+        self.stall_ended.load(Ordering::SeqCst)
+    }
 }

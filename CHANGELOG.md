@@ -215,6 +215,24 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
   buffer response bytes.
 
+### Fixed
+
+- A provider that sent `503` or `429` headers and then stalled its body held up
+  failover until the stream idle timeout (10 minutes in the dialect), and held
+  its `max_requests` permit for that time (WP-150). The next attempt now
+  releases that permit first, waits at most 250 ms for the failed body, and
+  otherwise closes the connection (`internal-docs/envoy-divergences.md` row 50).
+  When no member is left and the last provider's answer is returned, it keeps
+  that provider's permit until its body ends.
+- Router local replies (no route, `403 tenant_credential_missing`, a `400`
+  request-field refusal, direct responses and redirects) are recorded with
+  termination `local_reply`, not `complete`. The "local 503 response" warning
+  no longer fires for a provider's own `503`.
+- `x-envoy-*` request headers from an external client no longer reach the
+  provider (envoy-semantics.md S9). A request is external when it comes from a
+  public address or carries more than one `x-forwarded-for` entry
+  (`internal-docs/envoy-divergences.md` row 51).
+
 ## [0.6.1] - 2026-10-20
 
 ### Fixed
