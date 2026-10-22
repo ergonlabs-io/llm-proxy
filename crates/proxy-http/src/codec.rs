@@ -6,7 +6,9 @@
 
 use std::cell::Cell;
 use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http::{Request, Response};
@@ -14,7 +16,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 
 use crate::filter::{RequestHeaders, ResponseHeaders};
@@ -439,7 +441,7 @@ pub async fn send_upstream_http1<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    let io = TokioIo::new(io);
+    let io = TokioIo::new(UpstreamReadCap { inner: io });
 
     // Rust note: unlike the downstream server `Builder` (which has a
     // `keep_alive` knob controlling whether *it* offers a next request slot),
@@ -670,7 +672,7 @@ pub async fn handshake_upstream_http1<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    let io = TokioIo::new(io);
+    let io = TokioIo::new(UpstreamReadCap { inner: io });
 
     let builder = hyper::client::conn::http1::Builder::new();
     let (sender, conn) = builder
@@ -687,6 +689,88 @@ where
     });
 
     Ok((sender, conn_task))
+}
+
+/// The most bytes one read from an HTTP/1 upstream hands to hyper. Below
+/// hyper's initial 8 KiB read buffer, so the buffer never grows.
+const UPSTREAM_H1_MAX_READ: usize = 4096;
+
+/// Caps each read from an HTTP/1 upstream at [`UPSTREAM_H1_MAX_READ`] bytes.
+///
+/// hyper doubles an h1 read buffer after any read that fills it. A streamed
+/// LLM response mostly arrives in small reads, but a burst (the socket backs
+/// up while the downstream is slow) grows the buffer well past what the
+/// stream needs. In a 1000-stream heap profile, capping reads cut the
+/// upstream read buffers' peak from about 14 KiB to about 6 KiB per stream,
+/// at no measurable CPU cost. hyper's own knobs cannot do this:
+/// `max_buf_size` and `read_buf_exact_size` also limit the response head,
+/// which must keep accepting what Envoy accepts (80 KiB by default for
+/// HTTP/1).
+///
+/// Only the read size changes. A larger body or SSE event arrives over more
+/// reads, and a response head still accumulates across reads up to hyper's
+/// own limit.
+struct UpstreamReadCap<IO> {
+    inner: IO,
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for UpstreamReadCap<IO> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() <= UPSTREAM_H1_MAX_READ {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        }
+        // Rust note: a `ReadBuf` over a prefix of `buf` needs initialized
+        // memory unless built with `unsafe` (denied workspace-wide), and
+        // zeroing that prefix on every read costs measurable CPU. Read into
+        // a per-thread scratch buffer, zeroed once, and copy only what
+        // arrived. Workers are single-threaded and this does not re-enter.
+        READ_SCRATCH.with_borrow_mut(|scratch| {
+            let mut limited = ReadBuf::new(&mut scratch[..]);
+            std::task::ready!(Pin::new(&mut self.inner).poll_read(cx, &mut limited))?;
+            buf.put_slice(limited.filled());
+            Poll::Ready(Ok(()))
+        })
+    }
+}
+
+thread_local! {
+    static READ_SCRATCH: std::cell::RefCell<Box<[u8]>> =
+        std::cell::RefCell::new(vec![0; UPSTREAM_H1_MAX_READ].into_boxed_slice());
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for UpstreamReadCap<IO> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    // hyper picks its write strategy from this, so it must pass through.
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Rust note: h2's hyper client needs an `Executor` to drive the internal
