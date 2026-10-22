@@ -4,6 +4,7 @@
 //! dialect's strict schema; legacy `DataSource` config remains accepted for
 //! one release.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -37,9 +38,9 @@ use crate::pricing::{
 };
 use crate::realtime_usage::{Missing, RealtimeScanner};
 use crate::usage::{
-    extract_json_served_model, extract_json_upstream, extract_json_upstream_from_tail,
-    extract_json_usage_parts, extract_json_usage_parts_from_tail, usage_object_parts, Dialect,
-    Modality, SseUsageScanner, TokenUsage, UpstreamEvidence,
+    extract_json_facts, extract_json_upstream_from_tail, extract_json_usage_parts_from_tail,
+    usage_object_parts, Dialect, JsonResponseFacts, Modality, SseUsageScanner, TokenUsage,
+    UpstreamEvidence,
 };
 use proxy_http::LlmMeters;
 
@@ -1835,10 +1836,18 @@ struct JsonBody {
     overflowed: bool,
     /// Total body bytes seen, including any dropped from the head.
     seen: u64,
+    /// What one parse of the complete body found. Usage, served model and
+    /// evidence are read at different points of `finalize`; the body is
+    /// parsed once for all of them, and again only if more bytes arrive.
+    ///
+    /// Rust note: `OnceCell` fills itself on first read through a shared
+    /// `&self`, which is what the `compute_*` readers hold.
+    facts: OnceCell<JsonResponseFacts>,
 }
 
 impl JsonBody {
     fn push(&mut self, data: &[u8]) {
+        self.facts.take();
         self.seen = self.seen.saturating_add(data.len() as u64);
         if !self.overflowed && self.buf.len() + data.len() <= MAX_JSON_BODY_BYTES {
             self.buf.extend_from_slice(data);
@@ -1852,6 +1861,11 @@ impl JsonBody {
             let excess = self.buf.len() - JSON_TAIL_WINDOW_BYTES;
             drop(self.buf.split_to(excess));
         }
+    }
+
+    /// The single parse of a body that stayed under the cap.
+    fn facts(&self) -> &JsonResponseFacts {
+        self.facts.get_or_init(|| extract_json_facts(&self.buf))
     }
 }
 
@@ -2063,10 +2077,7 @@ impl UsageFilterInstance {
                 extract_json_usage_parts_from_tail(dialect, &body.buf),
                 LlmMeters::default(),
             ),
-            BodyMode::Json(body) => (
-                extract_json_usage_parts(dialect, &body.buf),
-                LlmMeters::default(),
-            ),
+            BodyMode::Json(body) => (body.facts().usage_parts(dialect), LlmMeters::default()),
             BodyMode::MediaJson(scanner) => {
                 let facts = scanner.facts();
                 (
@@ -2153,7 +2164,7 @@ impl UsageFilterInstance {
         match &self.mode {
             BodyMode::Sse(scanner) => scanner.served_model(),
             BodyMode::Json(body) if body.overflowed => None,
-            BodyMode::Json(body) => extract_json_served_model(&body.buf),
+            BodyMode::Json(body) => body.facts().served_model.clone(),
             BodyMode::MediaJson(scanner) => scanner.facts().model.clone(),
             BodyMode::MediaSse(scanner) => scanner.facts().model.clone(),
             BodyMode::Realtime(_) | BodyMode::Inert => None,
@@ -2166,7 +2177,7 @@ impl UsageFilterInstance {
         match &self.mode {
             BodyMode::Sse(scanner) => scanner.upstream(),
             BodyMode::Json(body) if body.overflowed => extract_json_upstream_from_tail(&body.buf),
-            BodyMode::Json(body) => extract_json_upstream(&body.buf),
+            BodyMode::Json(body) => body.facts().upstream.clone(),
             BodyMode::MediaJson(scanner) => {
                 let facts = scanner.facts();
                 media_upstream(facts.usage.as_deref(), facts.usage_oversized)

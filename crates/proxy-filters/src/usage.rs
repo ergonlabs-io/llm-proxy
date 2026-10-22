@@ -85,9 +85,7 @@ pub fn extract_json_usage(dialect: Dialect, body: &[u8]) -> Option<TokenUsage> {
 /// As [`extract_json_usage`], with the [`Modality`] subsets the same `usage`
 /// object reported.
 pub fn extract_json_usage_parts(dialect: Dialect, body: &[u8]) -> Option<(TokenUsage, Modality)> {
-    let json_body: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let usage = json_body.get("usage")?;
-    usage_parts(dialect, usage)
+    extract_json_facts(body).usage_parts(dialect)
 }
 
 /// Read one raw `usage` object (as JSON text) into its token buckets and
@@ -199,8 +197,7 @@ fn bounded_served_model(model: &str) -> Option<String> {
 /// tail path has no counterpart: providers emit `model` near the start of the
 /// document, which the tail window has already dropped.
 pub fn extract_json_served_model(body: &[u8]) -> Option<String> {
-    let json_body: serde_json::Value = serde_json::from_slice(body).ok()?;
-    bounded_served_model(json_body.get("model")?.as_str()?)
+    extract_json_facts(body).served_model
 }
 
 // --- the provider's own identifiers and usage object ------------------------
@@ -308,10 +305,84 @@ fn raw_members(json: &str) -> Option<RawMembers<'_>> {
 
 /// Id and `usage` of a complete (non-streaming) JSON response body.
 pub fn extract_json_upstream(body: &[u8]) -> UpstreamEvidence {
-    let mut evidence = UpstreamEvidence::default();
+    extract_json_facts(body).upstream
+}
+
+// --- one pass over a complete JSON response body ---------------------------
+
+/// Everything the usage filter reads from a complete (non-streaming) JSON
+/// response body, from a single parse.
+///
+/// The body's bulk is the generated text in `choices`; building a
+/// `serde_json::Value` of it costs a tree of allocations per response, three
+/// times over when usage, model and evidence each parse the body. This pass
+/// borrows the top-level `model`, `id` and `usage` members as raw text and
+/// checks every other value without building it.
+///
+/// Acceptance rules:
+/// - usage and served model need the whole body to parse as a
+///   `serde_json::Value` would; the last of duplicate keys wins, as in a
+///   `Value`;
+/// - the evidence follows the derived `RawMembers` parse that the SSE path
+///   also uses: lenient about values it skips, and empty when `id`, `usage`,
+///   `message` or `response` is repeated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsonResponseFacts {
+    /// The top-level `usage` member as sent, when the body is valid JSON.
+    usage: Option<String>,
+    /// As [`extract_json_served_model`].
+    pub served_model: Option<String>,
+    /// As [`extract_json_upstream`].
+    pub upstream: UpstreamEvidence,
+}
+
+impl JsonResponseFacts {
+    /// As [`extract_json_usage_parts`]: only the small `usage` object is
+    /// parsed here, not the body again.
+    pub fn usage_parts(&self, dialect: Dialect) -> Option<(TokenUsage, Modality)> {
+        usage_object_parts(dialect, self.usage.as_deref()?)
+    }
+}
+
+/// Parse a complete JSON response body once; see [`JsonResponseFacts`].
+pub fn extract_json_facts(body: &[u8]) -> JsonResponseFacts {
+    // A `Value` parse of bytes rejects invalid UTF-8 inside strings, and
+    // anything outside a string is a syntax error, so checking the whole body
+    // up front rejects the same bodies.
     let Ok(text) = std::str::from_utf8(body) else {
-        return evidence;
+        return JsonResponseFacts::default();
     };
+    let Ok(top) = serde_json::from_str::<TopMembers<'_>>(text) else {
+        // Not a JSON object, or a value a `Value` cannot hold. Neither has a
+        // usage or model; the evidence parse is laxer, so it gets its own try.
+        return JsonResponseFacts {
+            upstream: lenient_upstream(text),
+            ..JsonResponseFacts::default()
+        };
+    };
+    let mut facts = JsonResponseFacts::default();
+    if !top.repeated {
+        if let Some(id) = top.id {
+            facts.upstream.set_id(id.get());
+        }
+        if let Some(usage) = top.usage {
+            facts.upstream.set_usage(usage.get());
+        }
+    }
+    if top.raw_values_strict() {
+        facts.usage = top.usage.map(|usage| usage.get().to_owned());
+        facts.served_model = top
+            .model
+            .and_then(|model| serde_json::from_str::<String>(model.get()).ok())
+            .and_then(|model| bounded_served_model(&model));
+    }
+    facts
+}
+
+/// The [`RawMembers`] parse of the evidence. Reached only for a body
+/// [`TopMembers`] rejects, so a valid response is still parsed once.
+fn lenient_upstream(text: &str) -> UpstreamEvidence {
+    let mut evidence = UpstreamEvidence::default();
     let Some(members) = raw_members(text) else {
         return evidence;
     };
@@ -322,6 +393,171 @@ pub fn extract_json_upstream(body: &[u8]) -> UpstreamEvidence {
         evidence.set_usage(usage.get());
     }
     evidence
+}
+
+/// The top-level members of a response body: `model`, `id` and `usage` as
+/// raw text (the last of duplicates, as a `Value` keeps), every other value
+/// checked by [`Strict`].
+#[derive(Default)]
+struct TopMembers<'a> {
+    model: Option<&'a serde_json::value::RawValue>,
+    id: Option<&'a serde_json::value::RawValue>,
+    usage: Option<&'a serde_json::value::RawValue>,
+    /// `id`, `usage`, `message` or `response` appeared twice, which fails the
+    /// derived [`RawMembers`] parse the evidence follows.
+    repeated: bool,
+}
+
+impl TopMembers<'_> {
+    /// A raw member is skipped laxly by the parser, so check it as a `Value`
+    /// would have. Wrapping it in `[..]` puts it at the depth it had in the
+    /// body, so the nesting limit falls where it did.
+    fn raw_values_strict(&self) -> bool {
+        [self.model, self.id, self.usage]
+            .into_iter()
+            .flatten()
+            .all(|raw| {
+                let raw = raw.get();
+                if raw.starts_with('"') {
+                    serde_json::from_str::<Strict>(raw).is_ok()
+                } else {
+                    serde_json::from_str::<Strict>(&format!("[{raw}]")).is_ok()
+                }
+            })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TopMembers<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(TopMembersVisitor)
+    }
+}
+
+struct TopMembersVisitor;
+
+impl<'de> serde::de::Visitor<'de> for TopMembersVisitor {
+    type Value = TopMembers<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut top = TopMembers::default();
+        let mut seen = [false; 4];
+        let mut note = |slot: usize, repeated: &mut bool| {
+            *repeated |= std::mem::replace(&mut seen[slot], true);
+        };
+        while let Some(key) = map.next_key::<TopKey>()? {
+            match key {
+                TopKey::Model => top.model = map.next_value()?,
+                TopKey::Id => {
+                    note(0, &mut top.repeated);
+                    top.id = map.next_value()?;
+                }
+                TopKey::Usage => {
+                    note(1, &mut top.repeated);
+                    top.usage = map.next_value()?;
+                }
+                TopKey::Message => {
+                    note(2, &mut top.repeated);
+                    map.next_value::<Strict>()?;
+                }
+                TopKey::Response => {
+                    note(3, &mut top.repeated);
+                    map.next_value::<Strict>()?;
+                }
+                TopKey::Other => {
+                    map.next_value::<Strict>()?;
+                }
+            }
+        }
+        Ok(top)
+    }
+}
+
+/// A top-level key, decoded (`"\u0069d"` is `id`), as a `Value` and the
+/// derived [`RawMembers`] parse decode it.
+enum TopKey {
+    Model,
+    Id,
+    Usage,
+    Message,
+    Response,
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for TopKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl serde::de::Visitor<'_> for KeyVisitor {
+            type Value = TopKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object key")
+            }
+            fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<TopKey, E> {
+                Ok(match key {
+                    "model" => TopKey::Model,
+                    "id" => TopKey::Id,
+                    "usage" => TopKey::Usage,
+                    "message" => TopKey::Message,
+                    "response" => TopKey::Response,
+                    _ => TopKey::Other,
+                })
+            }
+        }
+        deserializer.deserialize_identifier(KeyVisitor)
+    }
+}
+
+/// A JSON value checked exactly as strictly as parsing it into a
+/// `serde_json::Value` checks it, without building it: numbers in `f64`
+/// range, `\u` escapes that decode (no lone surrogate), and the nesting limit.
+/// `IgnoredAny` and `RawValue` only scan, so they accept bodies a `Value`
+/// rejects. Usage feeds billing, so a body is billable only when a `Value`
+/// parse of it would succeed.
+struct Strict;
+
+impl<'de> serde::Deserialize<'de> for Strict {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(Strict)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Strict {
+    type Value = Strict;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Strict, E> {
+        Ok(Strict)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Strict, E> {
+        Ok(Strict)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Strict, E> {
+        Ok(Strict)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Strict, E> {
+        Ok(Strict)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Strict, E> {
+        Ok(Strict)
+    }
+    fn visit_unit<E>(self) -> Result<Strict, E> {
+        Ok(Strict)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Strict, A::Error> {
+        while seq.next_element::<Strict>()?.is_some() {}
+        Ok(Strict)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
+        while map.next_key::<Strict>()?.is_some() {
+            map.next_value::<Strict>()?;
+        }
+        Ok(Strict)
+    }
 }
 
 /// `usage` of an oversized body, from the tail window. The id sits at the
@@ -1619,6 +1855,120 @@ mod tests {
         let e = extract_json_upstream(body.as_bytes());
         assert_eq!(e.response_id.as_deref(), Some(id.as_str()));
         assert!(!e.id_oversized);
+    }
+
+    // ---- one pass over a complete JSON body ---------------------------------
+
+    /// The three whole-body parses the single pass replaced, kept as the
+    /// oracle: usage and model from a `serde_json::Value`, evidence from the
+    /// derived borrowed-member parse.
+    fn three_parse_oracle(
+        dialect: Dialect,
+        body: &[u8],
+    ) -> (
+        Option<(TokenUsage, Modality)>,
+        Option<String>,
+        UpstreamEvidence,
+    ) {
+        let value = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let usage = value
+            .as_ref()
+            .and_then(|v| v.get("usage"))
+            .and_then(|u| usage_parts(dialect, u));
+        let model = value
+            .as_ref()
+            .and_then(|v| v.get("model")?.as_str())
+            .and_then(bounded_served_model);
+        let mut evidence = UpstreamEvidence::default();
+        if let Some(members) = std::str::from_utf8(body).ok().and_then(raw_members) {
+            if let Some(id) = members.id {
+                evidence.set_id(id.get());
+            }
+            if let Some(usage) = members.usage {
+                evidence.set_usage(usage.get());
+            }
+        }
+        (usage, model, evidence)
+    }
+
+    #[test]
+    fn single_json_pass_matches_the_three_parses_it_replaced() {
+        let usage = r#"{"prompt_tokens":12,"completion_tokens":5,"input_tokens":9,"output_tokens":4,"prompt_tokens_details":{"cached_tokens":2,"audio_tokens":1}}"#;
+        let nest = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        let mut bodies: Vec<Vec<u8>> = vec![
+            // `usage`, `model` and `id` also appear nested and inside strings;
+            // only the top-level members count.
+            format!(
+                r#"{{"model":"gpt-x","id":"chatcmpl-1","choices":[{{"message":{{"content":"\"usage\":{{\"prompt_tokens\":99}}","usage":{{"prompt_tokens":98}},"model":"inner","id":"inner"}}}}],"response":{{"usage":{{"input_tokens":97}}}},"usage":{usage}}}"#
+            )
+            .into_bytes(),
+            // Escaped keys decode to the member names.
+            format!(r#"{{"m\u006fdel":"gpt-x","\u0069d":"c-2","us\u0061ge":{usage}}}"#).into_bytes(),
+            // Duplicate keys: a `Value` keeps the last; the evidence parse
+            // fails on a repeated `id`, `usage`, `message` or `response`.
+            format!(r#"{{"usage":{{"prompt_tokens":1}},"usage":{usage},"id":"c-3"}}"#).into_bytes(),
+            br#"{"model":"first","model":"second","id":"a","id":"b"}"#.to_vec(),
+            br#"{"model":"m","id":"c","message":{},"message":{}}"#.to_vec(),
+            br#"{"model":"m","usage":{"prompt_tokens":1},"usage":null}"#.to_vec(),
+            // Values a `Value` rejects but a scan accepts: a lone surrogate
+            // and an out-of-range number, in a skipped member and in a kept one.
+            format!(r#"{{"model":"m","id":"c","choices":["\ud800"],"usage":{usage}}}"#).into_bytes(),
+            format!(r#"{{"model":"m","id":"c","created":1e400,"usage":{usage}}}"#).into_bytes(),
+            format!(r#"{{"model":"m\ud800","id":"c","usage":{usage}}}"#).into_bytes(),
+            br#"{"model":"m","id":"c","usage":{"prompt_tokens":1,"x":1e400}}"#.to_vec(),
+            // Not an object, not JSON, not UTF-8, trailing bytes, nulls.
+            format!(r#"["c-4",{usage},null,null]"#).into_bytes(),
+            b"<html>bad gateway</html>".to_vec(),
+            b"{\"model\":\"m\xff\",\"usage\":{\"prompt_tokens\":1}}".to_vec(),
+            format!(r#"{{"usage":{usage}}} x"#).into_bytes(),
+            br#"{"model":null,"id":null,"usage":null}"#.to_vec(),
+            br#"{"model":7,"id":5,"usage":"text"}"#.to_vec(),
+        ];
+        // The nesting limit, either side of it, in a skipped member and in
+        // each kept one.
+        for n in 125..=128 {
+            for member in ["choices", "id", "model"] {
+                bodies.push(
+                    format!(
+                        r#"{{"model":"m","id":"c","usage":{usage},"{member}":{}}}"#,
+                        nest(n)
+                    )
+                    .into_bytes(),
+                );
+            }
+            bodies.push(
+                format!(
+                    r#"{{"model":"m","usage":{{"prompt_tokens":1,"x":{}}}}}"#,
+                    nest(n - 1)
+                )
+                .into_bytes(),
+            );
+        }
+        let mut usage_seen = [false; 2];
+        for body in &bodies {
+            let facts = extract_json_facts(body);
+            for dialect in [
+                Dialect::OpenAi,
+                Dialect::Anthropic,
+                Dialect::OpenAiResponses,
+            ] {
+                let (usage, model, evidence) = three_parse_oracle(dialect, body);
+                let label = String::from_utf8_lossy(body);
+                assert_eq!(
+                    facts.usage_parts(dialect),
+                    usage,
+                    "{dialect:?} usage of {label}"
+                );
+                assert_eq!(facts.served_model, model, "model of {label}");
+                assert_eq!(facts.upstream, evidence, "evidence of {label}");
+                usage_seen[usize::from(usage.is_some())] = true;
+            }
+        }
+        assert_eq!(
+            usage_seen,
+            [true, true],
+            "cases on both sides of acceptance"
+        );
     }
 
     #[test]
