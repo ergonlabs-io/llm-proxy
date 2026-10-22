@@ -57,7 +57,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
@@ -720,6 +720,9 @@ struct DiscoveryConfig {
     /// parseable PEM-with-certs at load; the refresher parses them again
     /// into roots on its own thread.
     ca_pem: Option<Vec<u8>>,
+    /// The configured seed keys as `(kid, n, e)`, sorted by `kid`. Public
+    /// key material, kept only so [`JwksSlotKey`] can tell two seeds apart.
+    seed: Vec<(String, Vec<u8>, Vec<u8>)>,
 }
 
 // Rust note: hand-written because `JwtValidationConfig`/`JwtKeySet` do not
@@ -805,7 +808,7 @@ fn parse_jwt_providers(config: &DynamicMessage) -> Result<Vec<JwtProviderConfig>
             .unwrap_or_default();
         // Empty is legal only with discovery (the first refresh populates
         // the set); without it, a provider with no keys verifies nothing.
-        let discovery = parse_discovery(msg, &base)?;
+        let mut discovery = parse_discovery(msg, &base)?;
         if keys.is_empty() && discovery.is_none() {
             return Err(invalid(
                 format!("{base}.keys"),
@@ -848,7 +851,13 @@ fn parse_jwt_providers(config: &DynamicMessage) -> Result<Vec<JwtProviderConfig>
                 .unwrap_or_default();
             let n = parse_jwk_component(&n_raw, &format!("{key_base}.n"))?;
             let e = parse_jwk_component(&e_raw, &format!("{key_base}.e"))?;
+            if let Some(d) = discovery.as_mut() {
+                d.seed.push((kid.clone(), n.clone(), e.clone()));
+            }
             key_set.insert(JwkRsaKey { kid, n, e });
+        }
+        if let Some(d) = discovery.as_mut() {
+            d.seed.sort();
         }
 
         out.push(JwtProviderConfig {
@@ -998,6 +1007,7 @@ fn parse_discovery(
         url,
         interval,
         ca_pem,
+        seed: Vec::new(),
     }))
 }
 
@@ -1234,6 +1244,61 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     })
 }
 
+/// The singleton key under which each chain keeps its [`JwksRegistry`].
+const JWKS_REGISTRY_KEY: &str = "llmproxy.auth/jwks";
+
+/// Everything that decides what a discovery provider's snapshot holds. Two
+/// builds with equal keys share one snapshot; the log label is left out, so
+/// reordering providers on a reload keeps their snapshots.
+#[derive(PartialEq, Eq, Hash)]
+struct JwksSlotKey {
+    discovery_url: String,
+    expected_issuer: Option<String>,
+    interval: Duration,
+    ca_pem: Option<Vec<u8>>,
+    seed: Vec<(String, Vec<u8>, Vec<u8>)>,
+}
+
+/// One chain's discovery snapshots. The filter chain is built once per
+/// worker and again on every reload, and each build must read the snapshot
+/// that the one refresher thread for that provider publishes to; a snapshot
+/// built per `create` reaches only the build that started the refresher.
+///
+/// Entries are `Weak`, like the refresher's own handle: a snapshot lives as
+/// long as some built chain uses it. A reload that keeps the provider finds
+/// the live snapshot (the old chains are still built while the new ones are),
+/// so its keys and its refresher carry over. A reload that changes or drops
+/// the provider lets the old snapshot go with the old chains, and its
+/// refresher stops (see `start_jwks_refresher`), so reloads do not pile up
+/// refresher threads.
+#[derive(Default)]
+struct JwksRegistry {
+    slots: std::sync::Mutex<HashMap<JwksSlotKey, Weak<arc_swap::ArcSwap<JwksSnapshot>>>>,
+}
+
+impl JwksRegistry {
+    /// The live snapshot for `key`, or a new one seeded with `seed` and fed
+    /// by a newly started refresher.
+    fn snapshot(
+        &self,
+        key: JwksSlotKey,
+        seed: JwtKeySet,
+        spec: RefreshSpec,
+    ) -> Arc<arc_swap::ArcSwap<JwksSnapshot>> {
+        let mut slots = self.slots.lock().expect("JWKS registry mutex poisoned");
+        if let Some(live) = slots.get(&key).and_then(Weak::upgrade) {
+            return live;
+        }
+        slots.retain(|_, slot| slot.strong_count() > 0);
+        let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(JwksSnapshot::discovering(
+            seed,
+        ))));
+        crate::jwks_refresh::start_jwks_refresher(Arc::clone(&snapshot), spec);
+        slots.insert(key, Arc::downgrade(&snapshot));
+        snapshot
+    }
+}
+
 /// [`HttpFilterFactory`] for [`TYPE_URL`]. No `parse_per_route` override —
 /// this filter has no per-route config; the trait default
 /// (`ConfigError::Unimplemented`) is correct.
@@ -1277,49 +1342,6 @@ impl HttpFilterFactory for AuthFilterFactory {
             if let Some(refusal) = boot_inputs.refusal(&running) {
                 return Err(refusal);
             }
-        }
-
-        // One shared JWKS snapshot per JWT provider,
-        // built here (outside the singleton closure) so every worker's
-        // authenticator loads the same `Arc`. Static providers seed once and
-        // never change; discovery providers seed (possibly empty) and are
-        // republished by a background thread spawned exactly once inside the
-        // closure below -- per-serve, not per-worker, so N workers don't
-        // launch N refresh loops against the IdP.
-        let mut jwt_snapshots = Vec::with_capacity(jwt_providers.len());
-        let mut jwt_validations = Vec::with_capacity(jwt_providers.len());
-        let mut jwt_refreshes = Vec::new();
-        for (i, provider) in jwt_providers.into_iter().enumerate() {
-            let JwtProviderConfig {
-                keys,
-                validation,
-                discovery,
-                claim_tags,
-            } = provider;
-            match discovery {
-                Some(d) => {
-                    let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                        JwksSnapshot::discovering(keys),
-                    )));
-                    jwt_refreshes.push((
-                        Arc::clone(&snapshot),
-                        RefreshSpec {
-                            discovery_url: d.url,
-                            expected_issuer: validation.issuer.clone(),
-                            interval: d.interval,
-                            ca_pem: d.ca_pem,
-                            label: format!("jwt_providers[{i}]"),
-                        },
-                    ));
-                    jwt_snapshots.push((snapshot, Some(d.interval * STALE_AFTER_MISSED)));
-                }
-                None => {
-                    let snapshot =
-                        Arc::new(arc_swap::ArcSwap::new(Arc::new(JwksSnapshot::seeded(keys))));
-                    jwt_snapshots.push((snapshot, None));
-                }
-            }
-            jwt_validations.push((validation, claim_tags));
         }
 
         if matches!(store_spec, StoreSpec::Shared { .. }) && !node_id_is_configured(ctx.node_id()) {
@@ -1377,15 +1399,6 @@ impl HttpFilterFactory for AuthFilterFactory {
         // afterward to build the authenticator's own `HmacSecret`.
         let control_plane = ctx
             .get_or_try_init(TYPE_URL, || {
-                // 2c-iv: discovery refreshers start here, inside the
-                // once-per-serve closure, for the same reason the store is
-                // built here: one loop per provider per serve, not one per
-                // worker. Each thread holds only a `Weak` to its snapshot
-                // (see `start_jwks_refresher`), so a reload retires the old
-                // threads when their snapshots drop.
-                for (snapshot, spec) in jwt_refreshes {
-                    crate::jwks_refresh::start_jwks_refresher(snapshot, spec);
-                }
                 report_store_kind(
                     store_spec.kind(),
                     ctx.node_id(),
@@ -1536,6 +1549,52 @@ impl HttpFilterFactory for AuthFilterFactory {
             VirtualKeyAuthenticator::new(HmacSecret::new(&secret_bytes), control_plane.handle())
                 .with_freshness(control_plane.freshness()),
         );
+        // Static providers seed once and never change, so each build may
+        // hold its own copy. Discovery providers share one snapshot per
+        // provider through the chain's registry: built after the control
+        // plane so a failed build starts no refresher.
+        let jwks_registry = ctx
+            .get_or_try_init(JWKS_REGISTRY_KEY, || {
+                Ok(Arc::new(JwksRegistry::default()) as Arc<dyn std::any::Any + Send + Sync>)
+            })?
+            .downcast::<JwksRegistry>()
+            .expect("the JWKS registry singleton is always a JwksRegistry");
+        let mut jwt_snapshots = Vec::with_capacity(jwt_providers.len());
+        let mut jwt_validations = Vec::with_capacity(jwt_providers.len());
+        for (i, provider) in jwt_providers.into_iter().enumerate() {
+            let JwtProviderConfig {
+                keys,
+                validation,
+                discovery,
+                claim_tags,
+            } = provider;
+            match discovery {
+                Some(d) => {
+                    let key = JwksSlotKey {
+                        discovery_url: d.url.clone(),
+                        expected_issuer: validation.issuer.clone(),
+                        interval: d.interval,
+                        ca_pem: d.ca_pem.clone(),
+                        seed: d.seed,
+                    };
+                    let spec = RefreshSpec {
+                        discovery_url: d.url,
+                        expected_issuer: validation.issuer.clone(),
+                        interval: d.interval,
+                        ca_pem: d.ca_pem,
+                        label: format!("jwt_providers[{i}]"),
+                    };
+                    let snapshot = jwks_registry.snapshot(key, keys, spec);
+                    jwt_snapshots.push((snapshot, Some(d.interval * STALE_AFTER_MISSED)));
+                }
+                None => {
+                    let snapshot =
+                        Arc::new(arc_swap::ArcSwap::new(Arc::new(JwksSnapshot::seeded(keys))));
+                    jwt_snapshots.push((snapshot, None));
+                }
+            }
+            jwt_validations.push((validation, claim_tags));
+        }
         // One chain per (filter config, listener), shared by every per-stream
         // instance below via `Arc::clone` -- see `token_limit_filter`'s
         // `TokenLimitFilterFactory::create` for the same one-store-per-listener
@@ -3308,6 +3367,68 @@ mod tests {
                 "one series at 1, however many workers build the chain"
             );
         }
+    }
+
+    /// The JWKS registry keeps no snapshot alive on its own: once every
+    /// chain using a discovery snapshot is gone, the next build gets a new
+    /// one and the dead entry is pruned. A registry holding strong handles
+    /// would keep every refresher a reload retired running for the life of
+    /// the process. Builds that share a key share the snapshot; the
+    /// multi-worker and reload e2e tests in `dialect_jwt_e2e.rs` own that.
+    #[test]
+    fn the_jwks_registry_releases_snapshots_no_chain_uses() {
+        let registry = JwksRegistry::default();
+        // Port 1 refuses at once, so the refreshers started here fail their
+        // fetches quietly and stop once their snapshot is dropped.
+        let slot = |interval_secs: u64| {
+            let interval = Duration::from_secs(interval_secs);
+            let url = "https://127.0.0.1:1/.well-known/openid-configuration".to_string();
+            let key = JwksSlotKey {
+                discovery_url: url.clone(),
+                expected_issuer: None,
+                interval,
+                ca_pem: None,
+                seed: Vec::new(),
+            };
+            let spec = RefreshSpec {
+                discovery_url: url,
+                expected_issuer: None,
+                interval,
+                ca_pem: None,
+                label: "registry-test".to_string(),
+            };
+            (key, spec)
+        };
+        let live_slots = |registry: &JwksRegistry| registry.slots.lock().unwrap().len();
+
+        let (key, spec) = slot(600);
+        let retired = registry.snapshot(key, JwtKeySet::new(), spec);
+        let retired_weak = Arc::downgrade(&retired);
+        drop(retired);
+        // The refresher upgrades its own `Weak` while a fetch runs, so wait
+        // out the first (refused) fetch. Generous bound: only a handle held
+        // forever fails this.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while retired_weak.strong_count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the registry must not keep a snapshot alive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A reload that changed the interval: a new slot, and the dead one
+        // is pruned rather than left to accumulate.
+        let (key, spec) = slot(300);
+        let current = registry.snapshot(key, JwtKeySet::new(), spec);
+        assert_eq!(live_slots(&registry), 1, "the dead slot was pruned");
+
+        // The original config again, after its chains are gone: a fresh
+        // snapshot, not the dropped one.
+        let (key, spec) = slot(600);
+        let rebuilt = registry.snapshot(key, JwtKeySet::new(), spec);
+        assert!(!Arc::ptr_eq(&rebuilt, &current));
+        assert_eq!(live_slots(&registry), 2);
     }
 
     // 19: the shared-singleton property.
