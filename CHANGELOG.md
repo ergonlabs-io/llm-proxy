@@ -215,6 +215,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
   buffer response bytes.
 
+### Fixed
+
+- JWT `discovery_url` key refresh reached only one worker. The other workers
+  kept the keys they started with, and after a SIGHUP reload no worker got
+  refreshed keys. When the identity provider rotated its signing key, most
+  requests got 401; with no seed keys, they got 401 from the start (WP-140).
+  All workers now share one refreshed key set per provider, and a reload keeps
+  it and its refresh.
+
 ## [0.6.1] - 2026-10-20
 
 ### Fixed

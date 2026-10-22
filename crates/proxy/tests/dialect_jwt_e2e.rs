@@ -3,7 +3,8 @@
 //! unmapped-tenant token gets 401; a validly signed token whose tenant has no
 //! grant gets 403 and is never admitted as `default`. The discovery case
 //! serves the OIDC document and JWKS from a loopback HTTPS server the test
-//! owns, so nothing leaves the machine.
+//! owns, so nothing leaves the machine. The rotation cases run several
+//! workers and a SIGHUP reload against that server and rotate its key.
 //!
 //! Rust note: same harness shape as `tests/tenant_enforcement_e2e.rs` (std
 //! threads, ephemeral ports, a `Drop` that kills the proxy). Every wait is
@@ -17,7 +18,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -31,6 +33,8 @@ const ADMIN_TOKEN: &str = "dialect-jwt-e2e-admin-token";
 const ISSUER: &str = "https://idp.test";
 const AUDIENCE: &str = "api://llm-proxy";
 const KID: &str = "k1";
+/// The `kid` the IdP rotates to.
+const ROTATED_KID: &str = "k2";
 /// Mapped and granted every model.
 const GRANTED_TENANT: &str = "acme";
 /// Mapped, but no model policy is ever stored for it.
@@ -69,19 +73,61 @@ R7gVFiRwVoeAS4UwnrS8NA==
 -----END PRIVATE KEY-----
 ";
 
+/// A second throwaway key, the one the IdP rotates to.
+const ROTATED_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCub3ny4yTlqWrd
+8tZmKfJumqAjUIFY1UyWtd89AI31MLCB0LJgVcJchKGlGIzXd0hHFtQ/HsjQvi3K
+glDP68tRLa63/RCJCywwz3zu1GlAQI5jzqyh4Epn2qEe86bqXssikOr3UReke2de
+N4NO1Gv/CqPPk/FBzMGYdt2iVC5+tOjo+egof4Q945uH+weIgwa1XOvXoPLCBHRS
+K9nLb2kablHIVfKovdLB5O+xPB1tOOYKgxaiaHd893QI/zvA0PiI9v7/DMpxunUz
+b+r2PMMxWM5l+nbdodXSvsXcyZrKeudZf/A6zEWmli5QcDQ8A7q67ZpQF4/snRmk
+XJMft3lxAgMBAAECggEAANnQWXacK8vwwSu5uf6DDTZkiOeP9J6jD1UhxUq8ZobE
+mvgpS+j/LV5ZlNQ9fkuO/FxzJT+sMRXMZAwmAsL0Ae2xcs+hhgRE7z6ugv0MP7ZQ
+5icQQSs2kbJyThQC1hUnnn/gdYZdZtL8mmwLkECJqlEjTWmQ/VuB/Oa6MVwsbI0e
+nrziN7I8Xdcsn2PpyYHe5XKjgig++7lirZmuqgW2e/goIxTsFlOxJionjxe4R6/b
+8oKFA5J6QXp7OklxlvF48ZyMEkzDFEBZn2VBNjSMIKj4MmpAWvkMoHFk3RxA8gr3
+rVUimCYITL7X0p7ECao6GSD1jE9Ax4vm/A3gywh3MQKBgQDdUhcI+KPtDRgjREzk
+UWGG5PwaOudFqdcym4I0KtRncfksaMALtRTLs6sbg85fsTBHJ1FRxthHvtv2WCjW
+AMxpPb7OTCZQhs0KHDs0RqJ+6ogVd0zgk/rgfleHWAp3Ve2ntFgurs0w2tryWkdv
+TmQM5eTPl3G35wUBTjwQRd6tlQKBgQDJxKoMXr5xfYI5FIkoN6v8wYjlQzp/eIP1
+YPOlVH3FUOuVkOxBx8qMYDOkuvP7m1rdl0ZwKaa/ZOQzqm1R9AW3zVy/owRWZz80
+TcLGmefysT+edrpRPIPGfLIClgEHdJ8XXPayXuoq3Pfo1nSWqzWf7uHPT6GAW4nJ
+47e5YPsNbQKBgH7RWBOy7bOaqjcjHvBBVaIHOhIJqJX5cS81fpFH7XftDfuNdmX+
++BCVPjnA+BNLI7/R3r3+M9ZAnif1ckjWIks3r0rkxZuk8n6VmLMmulwBJcMvHiUd
+hkb2/k62eyDQYyKSq2jsjvUsowL2CjLUd24QmWD+hZH8VZje7Hnin2tVAoGADydA
+BjHPZ8KfVx4dtvGHbzIxz9YevJgWgQVJBy+zSnBrYQ5DUCVrJuPKvSJ1VH40ctP7
+rEzUgydWpDK2hyMmkslPn+zkVIDolEsKx9OjQezh9ErCb3t2AiA3Vk5hwWeW0zBe
+LsNGHvX9gHUqyG4PVvWf6+v1GyjEzm7Vy4xnDnkCgYAgekm4FUfTE10E4L4dMrfS
+uMtzn/4U6/fpnJX/H29UxHRCqOzeuv46q0zSmfn2gyIbGrFOdU0UoEsfb39ToAci
+d+FiIpqbf0+YOqp1oLJZY/L0MYhB08y2y6lwewzSETzFDuGPUgiH1y1sgvZbfg2B
+3UOhFMyqUNgduoS3rGf3JQ==
+-----END PRIVATE KEY-----
+";
+
 struct SigningKey {
+    kid: &'static str,
     pkcs1_der: Vec<u8>,
     n: String,
     e: String,
 }
 
 fn signing_key() -> SigningKey {
+    load_key(KID, TEST_KEY_PEM)
+}
+
+fn rotated_signing_key() -> SigningKey {
+    load_key(ROTATED_KID, ROTATED_KEY_PEM)
+}
+
+fn load_key(kid: &'static str, pem: &str) -> SigningKey {
     use rsa::pkcs1::EncodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::traits::PublicKeyParts;
 
-    let private = rsa::RsaPrivateKey::from_pkcs8_pem(TEST_KEY_PEM).expect("test key parses");
+    let private = rsa::RsaPrivateKey::from_pkcs8_pem(pem).expect("test key parses");
     SigningKey {
+        kid,
         pkcs1_der: private.to_pkcs1_der().expect("PKCS#1").as_bytes().to_vec(),
         n: URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
         e: URL_SAFE_NO_PAD.encode(private.e().to_bytes_be()),
@@ -97,7 +143,10 @@ fn now() -> u64 {
 
 /// An RS256 token over `claims`, signed with the test key.
 fn sign(key: &SigningKey, claims: &serde_json::Value) -> String {
-    let header = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{KID}"}}"#));
+    let header = URL_SAFE_NO_PAD.encode(format!(
+        r#"{{"alg":"RS256","typ":"JWT","kid":"{}"}}"#,
+        key.kid
+    ));
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
     let message = format!("{header}.{payload}");
     let pair = ring::signature::RsaKeyPair::from_der(&key.pkcs1_der).expect("PKCS#1 DER");
@@ -149,8 +198,8 @@ fn a_valid_token_reaches_the_provider_and_every_bad_token_is_refused() {
     let dir = scratch_dir("static");
     let upstream = Upstream::spawn();
     let jwks = format!(
-        "{{ keys: [ {{ kid: {KID}, n: \"{}\", e: \"{}\" }} ] }}",
-        key.n, key.e
+        "{{ keys: [ {{ kid: {}, n: \"{}\", e: \"{}\" }} ] }}",
+        key.kid, key.n, key.e
     );
     let proxy = Proxy::start(&dir, &config_text(&upstream, &jwt_entry(ISSUER, &jwks)));
     grant_all_models(&proxy, GRANTED_TENANT);
@@ -260,6 +309,146 @@ fn discovery_over_https_publishes_the_key_set_and_admits_a_valid_token() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Workers in the rotation tests. Each worker builds its own filter chain.
+const WORKERS: usize = 4;
+/// Requests per check, each on a fresh connection. On Linux `SO_REUSEPORT`
+/// spreads connections across the workers; 32 leaves a worker unvisited
+/// with odds below 1 in 10^3.
+const SPREAD: usize = 32;
+
+/// After the IdP rotates its signing key, every worker admits a token signed
+/// by the new key and refuses one signed by the retired key. Each worker
+/// builds its own filter chain, so a refresh that reached only one worker's
+/// key set leaves the others on the boot key set.
+#[test]
+fn a_rotated_discovery_key_is_accepted_by_every_worker() {
+    let old_key = signing_key();
+    let new_key = rotated_signing_key();
+    let dir = scratch_dir("rotation-workers");
+    let upstream = Upstream::spawn();
+    let idp = Idp::spawn(&old_key, &dir);
+    let issuer = format!("https://localhost:{}", idp.port);
+    let proxy = Proxy::start_with_workers(
+        &dir,
+        &config_text(&upstream, &jwt_entry(&issuer, &refreshing_jwks(&idp))),
+        WORKERS,
+    );
+    grant_all_models(&proxy, GRANTED_TENANT);
+    let old_token = sign(
+        &old_key,
+        &claims(&issuer, "tid-acme", serde_json::json!({})),
+    );
+    let new_token = sign(
+        &new_key,
+        &claims(&issuer, "tid-acme", serde_json::json!({})),
+    );
+
+    await_admitted(&proxy, &old_token, "the boot key");
+    assert_every_request(&proxy, &old_token, "HTTP/1.1 200", "the boot key");
+
+    idp.rotate_to(&new_key);
+    await_admitted(&proxy, &new_token, "the rotated key");
+    assert_every_request(&proxy, &new_token, "HTTP/1.1 200", "the rotated key");
+    assert_every_request(&proxy, &old_token, "HTTP/1.1 401", "the retired key");
+
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A SIGHUP reload rebuilds every worker's filter chain. The rebuilt chains
+/// keep the refreshed key set, and refreshing continues after the reload, so
+/// a later rotation still reaches every worker.
+#[test]
+fn a_reload_keeps_the_refreshed_key_set_and_keeps_refreshing_it() {
+    let old_key = signing_key();
+    let new_key = rotated_signing_key();
+    let dir = scratch_dir("rotation-reload");
+    let upstream = Upstream::spawn();
+    let idp = Idp::spawn(&old_key, &dir);
+    let issuer = format!("https://localhost:{}", idp.port);
+    let proxy = Proxy::start_with_workers(
+        &dir,
+        &config_text(&upstream, &jwt_entry(&issuer, &refreshing_jwks(&idp))),
+        WORKERS,
+    );
+    grant_all_models(&proxy, GRANTED_TENANT);
+    let old_token = sign(
+        &old_key,
+        &claims(&issuer, "tid-acme", serde_json::json!({})),
+    );
+    let new_token = sign(
+        &new_key,
+        &claims(&issuer, "tid-acme", serde_json::json!({})),
+    );
+    await_admitted(&proxy, &old_token, "the boot key");
+
+    proxy.reload();
+    // No wait: the rebuilt chains must serve the refreshed key set from
+    // their first request, not from the next refresh.
+    assert_every_request(
+        &proxy,
+        &old_token,
+        "HTTP/1.1 200",
+        "the boot key after a reload",
+    );
+
+    idp.rotate_to(&new_key);
+    await_admitted(&proxy, &new_token, "the rotated key after a reload");
+    assert_every_request(
+        &proxy,
+        &new_token,
+        "HTTP/1.1 200",
+        "the rotated key after a reload",
+    );
+    assert_every_request(
+        &proxy,
+        &old_token,
+        "HTTP/1.1 401",
+        "the retired key after a reload",
+    );
+
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A discovery `jwks:` value against `idp` that refreshes every second.
+fn refreshing_jwks(idp: &Idp) -> String {
+    format!(
+        "{{ discovery_url: \"https://localhost:{}/.well-known/openid-configuration\", \
+         trusted_ca_file: \"{}\", refresh_interval: 1s }}",
+        idp.port,
+        idp.ca_file.display()
+    )
+}
+
+/// Polls until `token` is admitted once: a refresh lands within one interval.
+fn await_admitted(proxy: &Proxy, token: &str, what: &str) {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let response = chat(proxy, token);
+        if response.starts_with("HTTP/1.1 200") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} was never admitted:\n{response}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Sends [`SPREAD`] requests, each on a fresh connection, and requires
+/// every one to get `expected`.
+fn assert_every_request(proxy: &Proxy, token: &str, expected: &str, what: &str) {
+    for i in 0..SPREAD {
+        let response = chat(proxy, token);
+        assert!(
+            response.starts_with(expected),
+            "{what}: request {i} of {SPREAD} did not get {expected}:\n{response}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------ helpers --
 
 /// The dialect file; `auth_extra` is appended inside the `auth` block.
@@ -300,30 +489,37 @@ struct Proxy {
     child: Child,
     listen: SocketAddr,
     admin: SocketAddr,
+    stderr: Receiver<String>,
 }
 
 impl Proxy {
     fn start(dir: &Path, config: &str) -> Proxy {
+        Proxy::start_with_workers(dir, config, 1)
+    }
+
+    fn start_with_workers(dir: &Path, config: &str, workers: usize) -> Proxy {
         let listen = port_after(config, "listen: 127.0.0.1:");
         let admin = port_after(config, "admin: 127.0.0.1:");
         let path = dir.join("llmproxy.yaml");
         std::fs::write(&path, config).expect("write temp config");
-        let child = Command::new(BIN)
+        let mut child = Command::new(BIN)
             .args([
                 "--config",
                 path.to_str().expect("utf-8 path"),
                 "--concurrency",
-                "1",
+                &workers.to_string(),
             ])
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn llm-proxy");
+        let stderr = spawn_line_reader(child.stderr.take().expect("piped stderr"));
         let proxy = Proxy {
             child,
             listen: SocketAddr::from(([127, 0, 0, 1], listen)),
             admin: SocketAddr::from(([127, 0, 0, 1], admin)),
+            stderr,
         };
         assert!(
             wait_for_connectable(proxy.admin, STARTUP_TIMEOUT),
@@ -337,6 +533,42 @@ impl Proxy {
         );
         proxy
     }
+
+    /// Sends SIGHUP without changing the config file. A reload always
+    /// advances the snapshot version, so every worker rebuilds its filter
+    /// chain on its next accept.
+    fn reload(&self) {
+        let status = Command::new("kill")
+            .args(["-HUP", &self.child.id().to_string()])
+            .status()
+            .expect("failed to send SIGHUP");
+        assert!(status.success(), "kill -HUP failed");
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let mut log = String::new();
+        loop {
+            match self.stderr.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) if line.contains("SIGHUP: config reload succeeded") => return,
+                Ok(line) => log.push_str(&line),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("proxy exited:\n{log}"),
+            }
+            assert!(Instant::now() < deadline, "no reload log line:\n{log}");
+        }
+    }
+}
+
+/// Forwards each stderr line; the reader also keeps the pipe drained so the
+/// child never blocks on a full pipe.
+fn spawn_line_reader(stderr: impl Read + Send + 'static) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stderr)) {
+            let Ok(line) = line else { break };
+            // The receiver may be gone; keep draining regardless.
+            let _ = tx.send(line + "\n");
+        }
+    });
+    rx
 }
 
 impl Drop for Proxy {
@@ -500,11 +732,12 @@ impl Upstream {
 }
 
 /// A loopback HTTPS identity provider: serves the OIDC discovery document
-/// and a JWKS holding the test key, under a `localhost` certificate from a
-/// CA written to `ca_file`.
+/// and a JWKS holding one key, under a `localhost` certificate from a CA
+/// written to `ca_file`. [`Idp::rotate_to`] replaces the served key.
 struct Idp {
     port: u16,
     ca_file: PathBuf,
+    jwks: Arc<Mutex<String>>,
     jwks_fetches: Arc<AtomicUsize>,
 }
 
@@ -546,10 +779,8 @@ impl Idp {
             "jwks_uri": format!("{issuer}/jwks"),
         })
         .to_string();
-        let jwks = serde_json::json!({
-            "keys": [{ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": KID, "n": key.n, "e": key.e }],
-        })
-        .to_string();
+        let jwks = Arc::new(Mutex::new(jwks_document(key)));
+        let served = Arc::clone(&jwks);
         let jwks_fetches = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&jwks_fetches);
         std::thread::spawn(move || {
@@ -558,7 +789,7 @@ impl Idp {
                 let (tls, discovery, jwks, counter) = (
                     Arc::clone(&tls),
                     discovery.clone(),
-                    jwks.clone(),
+                    Arc::clone(&served),
                     Arc::clone(&counter),
                 );
                 std::thread::spawn(move || {
@@ -574,7 +805,7 @@ impl Idp {
                         discovery
                     } else if request_line.contains(" /jwks ") {
                         counter.fetch_add(1, Ordering::SeqCst);
-                        jwks
+                        jwks.lock().expect("JWKS lock").clone()
                     } else {
                         let _ = stream.write_all(
                             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -597,11 +828,25 @@ impl Idp {
         Idp {
             port,
             ca_file,
+            jwks,
             jwks_fetches,
         }
+    }
+
+    /// Serves only `key` from now on, as an IdP does after a rotation that
+    /// retires the old key.
+    fn rotate_to(&self, key: &SigningKey) {
+        *self.jwks.lock().expect("JWKS lock") = jwks_document(key);
     }
 
     fn jwks_fetches(&self) -> usize {
         self.jwks_fetches.load(Ordering::SeqCst)
     }
+}
+
+fn jwks_document(key: &SigningKey) -> String {
+    serde_json::json!({
+        "keys": [{ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": key.kid, "n": key.n, "e": key.e }],
+    })
+    .to_string()
 }
