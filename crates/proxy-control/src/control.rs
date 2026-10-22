@@ -273,8 +273,8 @@ fn validate_key_update(previous: &StoredKey, next: &StoredKey) -> Result<(), Sto
 /// Deliberately small (`InMemoryControlPlaneStore`'s writes
 /// are infallible; the `redb` and Redis stores map their I/O errors onto it),
 /// because the two call sites that interpret it -- [`ControlPlane::new`]
-/// (hard error) and [`ControlPlane::rebuild`] (log and keep serving) -- do
-/// not need to distinguish reasons, only "it failed".
+/// (hard error) and [`ControlPlane::rebuild`] (keep serving the last
+/// snapshot) -- do not need to distinguish reasons, only "it failed".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     /// The backend could not be reached or read at all.
@@ -287,6 +287,12 @@ pub enum StoreError {
     /// The caller supplied a value the store must never hold (for example an
     /// over-long principal id). Maps to a client error, not a store outage.
     InvalidInput(String),
+    /// An admin write reached the store, but this replica's reload after it
+    /// failed, so the replica still serves the previous policy until a later
+    /// poll succeeds. Only [`ControlPlane`]'s write methods return it; a
+    /// store never does. The write is durable, so the caller must not read
+    /// this as "nothing happened", and a retry is safe.
+    NotApplied(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -298,6 +304,11 @@ impl std::fmt::Display for StoreError {
             StoreError::NotFound => write!(f, "control-plane store: not found"),
             StoreError::Conflict(reason) => write!(f, "control-plane store conflict: {reason}"),
             StoreError::InvalidInput(reason) => write!(f, "invalid input: {reason}"),
+            StoreError::NotApplied(reason) => write!(
+                f,
+                "written to the control-plane store, but not yet applied on this replica \
+                 (it still serves the previous policy until its next successful poll): {reason}"
+            ),
         }
     }
 }
@@ -2378,7 +2389,7 @@ pub(crate) fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Resul
 /// own doc already reads "the backend could not be reached or read at
 /// all", which is exactly what a `redb` I/O or corruption failure is, and
 /// neither of [`ControlPlane`]'s two call sites (`new`'s hard boot error,
-/// `rebuild`'s log-and-keep-serving) distinguishes error reasons -- see
+/// `rebuild`'s keep-serving) distinguishes error reasons -- see
 /// [`StoreError`]'s doc.
 ///
 /// Rust note: `impl std::fmt::Display` as the bound (not a concrete error
@@ -3437,6 +3448,11 @@ pub struct MintedKey {
     pub plaintext: String,
     /// The key's chargeback tags after the mint.
     pub tags: ChargebackTags,
+    /// `false` when the key reached the store but this replica's reload
+    /// after it failed: the key 401s here until the next successful poll.
+    /// A mint reports this rather than failing, because an error would drop
+    /// the only copy of the plaintext for a key that does exist.
+    pub applied: bool,
 }
 
 impl std::fmt::Debug for MintedKey {
@@ -3870,6 +3886,13 @@ pub struct ControlPlane {
     /// poll to rebuild rather than risk comparing against a stale or
     /// meaningless number. See [`Self::poll_once`].
     last_generation: Mutex<Option<u64>>,
+    /// Held across the whole stamp, `load()`, publish and `last_generation`
+    /// sequence of [`Self::rebuild`] and [`Self::poll_once`]. Without it an
+    /// admin rebuild and the poller interleave, and the slower one publishes
+    /// an older snapshot last, which brings a revoked key back until the
+    /// next poll. Because each holder reads the stamp only after taking the
+    /// lock, publishes happen in stamp order.
+    publish: Mutex<()>,
     /// When a poll (or a `rebuild()`) last SUCCEEDED, and the staleness
     /// bound. See [`Self::snapshot_age`] and [`PolicyFreshness`].
     freshness: Arc<PolicyFreshness>,
@@ -3995,6 +4018,7 @@ impl ControlPlane {
             bootstrap_keys,
             published,
             last_generation: Mutex::new(generation),
+            publish: Mutex::new(()),
             freshness: {
                 let freshness = PolicyFreshness::new();
                 freshness.mark_reconciled();
@@ -4041,7 +4065,13 @@ impl ControlPlane {
     /// `Err` leaves both untouched, exactly like `published`: a failed
     /// refresh is not a reconciliation and must not reset the staleness
     /// clock [`Self::snapshot_age`] reports.
-    pub fn rebuild(&self) {
+    ///
+    /// The `Err` is returned, not only logged: an admin write whose rebuild
+    /// failed is durable in the store but not live here, and its caller must
+    /// say so (see [`StoreError::NotApplied`]). Runs under the `publish`
+    /// lock, so it never interleaves with [`Self::poll_once`].
+    pub fn rebuild(&self) -> Result<(), StoreError> {
+        let _publish = self.publish.lock().expect("control plane mutex poisoned");
         let generation = self.store.policy_generation().ok();
         match self.store.load() {
             Ok(loaded) => {
@@ -4053,14 +4083,34 @@ impl ControlPlane {
                     .expect("control plane mutex poisoned") = generation;
                 self.freshness.mark_reconciled();
                 self.notify_rate_card_watches();
+                Ok(())
             }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "control-plane store refresh failed; keeping the last published snapshot"
                 );
+                Err(err)
             }
         }
+    }
+
+    /// [`Self::rebuild`] after an admin write, with a failure turned into
+    /// [`StoreError::NotApplied`] so the caller reports the write as durable
+    /// but not live, rather than as success or as "nothing written".
+    fn apply_write(&self) -> Result<(), StoreError> {
+        self.rebuild()
+            .map_err(|err| StoreError::NotApplied(err.to_string()))
+    }
+
+    /// [`Self::rebuild`] for the writes whose effect does not wait on it:
+    /// boot-time seeding and rate cards, which are delivered to this
+    /// replica's watchers directly. A failed reload there only delays
+    /// unrelated policy until the next poll, and failing the caller would
+    /// refuse a filter build over a transient store read. `rebuild` has
+    /// already logged the failure.
+    fn rebuild_after_seed(&self) {
+        let _ = self.rebuild();
     }
 
     /// Replica-to-replica propagation step: reads ONLY the
@@ -4080,6 +4130,7 @@ impl ControlPlane {
     /// caller (the policy-poller thread) is what logs it, so the staleness
     /// warning's suppression state lives with the thread, not here.
     pub fn poll_once(&self) -> Result<bool, StoreError> {
+        let _publish = self.publish.lock().expect("control plane mutex poisoned");
         let generation = self.store.policy_generation()?;
         let previous = *self
             .last_generation
@@ -4514,12 +4565,13 @@ impl ControlPlane {
             revoked: false,
             tags: tags.clone(),
         })?;
-        self.rebuild();
+        let applied = self.rebuild().is_ok();
         Ok(MintedKey {
             key_id: key_id.clone(),
             tenant: tenant.clone(),
             plaintext,
             tags,
+            applied,
         })
     }
 
@@ -4567,7 +4619,7 @@ impl ControlPlane {
         };
         drop(snapshot);
         self.store.put_key(&next)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4575,7 +4627,7 @@ impl ControlPlane {
     /// the next request rather than the next unrelated rebuild.
     pub fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError> {
         self.store.revoke_key(key_id)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4584,7 +4636,7 @@ impl ControlPlane {
         reject_control_characters("tenant", tenant.as_str())?;
         reject_reserved_tenant(tenant)?;
         self.store.create_tenant(tenant)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4613,7 +4665,7 @@ impl ControlPlane {
         let mut revoked = self.revoke_tenant_keys(tenant)?;
         self.store.delete_tenant(tenant)?;
         revoked += self.revoke_tenant_keys(tenant)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(revoked)
     }
 
@@ -4662,7 +4714,7 @@ impl ControlPlane {
     /// Sets `tenant`'s model-access policy, then republishes.
     pub fn set_policy(&self, tenant: &TenantId, access: &ModelAccess) -> Result<(), StoreError> {
         self.store.set_policy(tenant, access)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4679,7 +4731,7 @@ impl ControlPlane {
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError> {
         self.store.set_budget(tenant, budget)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4688,7 +4740,7 @@ impl ControlPlane {
     /// see it on their next poll.
     pub fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
         self.store.set_trace_export(tenant, enabled)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4705,7 +4757,7 @@ impl ControlPlane {
         limits: Option<&LimitPolicy>,
     ) -> Result<(), StoreError> {
         self.store.set_limits(tenant, limits)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4720,7 +4772,7 @@ impl ControlPlane {
     /// [`Self::store_tenant_secret`], which seals it first.
     pub fn put_tenant_credential(&self, rec: &StoredTenantCredential) -> Result<(), StoreError> {
         self.store.put_tenant_credential(rec)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4735,7 +4787,7 @@ impl ControlPlane {
         provider: &str,
     ) -> Result<(), StoreError> {
         self.store.delete_tenant_credential(tenant, provider)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4842,7 +4894,7 @@ impl ControlPlane {
             return Err(StoreError::NotFound);
         }
         self.store.set_key_budget(key_id, budget)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4856,7 +4908,7 @@ impl ControlPlane {
             return Err(StoreError::NotFound);
         }
         self.store.set_limits(&key_budget_subject(key_id), limits)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4868,7 +4920,7 @@ impl ControlPlane {
             return Err(StoreError::NotFound);
         }
         self.store.set_policy(&key_budget_subject(key_id), access)?;
-        self.rebuild();
+        self.apply_write()?;
         Ok(())
     }
 
@@ -4960,7 +5012,7 @@ impl ControlPlane {
     pub fn put_rate_card(&self, card: &StoredRateCard) -> Result<(), StoreError> {
         self.store.put_rate_card(card)?;
         self.record_rate_card(card);
-        self.rebuild();
+        self.rebuild_after_seed();
         Ok(())
     }
 
@@ -4973,7 +5025,7 @@ impl ControlPlane {
         if wrote {
             self.record_rate_card(card);
         }
-        self.rebuild();
+        self.rebuild_after_seed();
         Ok(wrote)
     }
 
@@ -5058,7 +5110,7 @@ impl ControlPlane {
             existing.insert(tenant.clone());
         }
 
-        self.rebuild();
+        self.rebuild_after_seed();
         Ok(())
     }
 
@@ -5492,6 +5544,39 @@ pub struct SharedMemoryStore {
     pub inner: Arc<InMemoryControlPlaneStore>,
     /// Makes rate card writes fail, to test what a refused write leaves behind.
     pub refuse_rate_cards: Arc<std::sync::atomic::AtomicBool>,
+    /// Faults and pauses injected into this handle's own calls.
+    pub hooks: Arc<StoreHooks>,
+}
+
+/// A hook a [`SharedMemoryStore`] runs inside one of its calls.
+#[cfg(any(test, feature = "test-support"))]
+pub type StoreHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Faults and pauses a [`SharedMemoryStore`] injects, so a test can make the
+/// store fail or stall at a chosen point of a real [`ControlPlane`] call.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct StoreHooks {
+    /// Makes `load` fail with `Unavailable` after any write has landed.
+    pub fail_loads: std::sync::atomic::AtomicBool,
+    /// Runs after `load` has read the store and before it returns, so a test
+    /// can hold a load's (by then stale) result back.
+    pub after_load: Mutex<Option<StoreHook>>,
+    /// Runs before `revoke_key` writes, so a test can make the store slow.
+    pub before_revoke: Mutex<Option<StoreHook>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl StoreHooks {
+    /// Rust note: clones the hook out of the lock before running it, so a
+    /// hook that blocks does not also block every other call that checks
+    /// for one.
+    fn run(slot: &Mutex<Option<StoreHook>>) {
+        let hook = slot.lock().expect("store hook mutex poisoned").clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -5502,6 +5587,7 @@ impl SharedMemoryStore {
             SharedMemoryStore {
                 inner: Arc::clone(&inner),
                 refuse_rate_cards: Arc::default(),
+                hooks: Arc::default(),
             },
             inner,
         )
@@ -5512,6 +5598,7 @@ impl SharedMemoryStore {
         SharedMemoryStore {
             inner: Arc::clone(&self.inner),
             refuse_rate_cards: Arc::clone(&self.refuse_rate_cards),
+            hooks: Arc::clone(&self.hooks),
         }
     }
 
@@ -5545,7 +5632,12 @@ impl ControlPlaneStore for SharedMemoryStore {
         self.inner.load_window_batch(scope, rows)
     }
     fn load(&self) -> Result<StoredControlPlane, StoreError> {
-        self.inner.load()
+        if self.hooks.fail_loads.load(Ordering::SeqCst) {
+            return Err(StoreError::Unavailable("load refused by the test".into()));
+        }
+        let loaded = self.inner.load();
+        StoreHooks::run(&self.hooks.after_load);
+        loaded
     }
     fn policy_generation(&self) -> Result<u64, StoreError> {
         self.inner.policy_generation()
@@ -5560,6 +5652,7 @@ impl ControlPlaneStore for SharedMemoryStore {
         self.inner.put_key(rec)
     }
     fn revoke_key(&self, key_id: &KeyId) -> Result<(), StoreError> {
+        StoreHooks::run(&self.hooks.before_revoke);
         self.inner.revoke_key(key_id)
     }
     fn revoke_keys(&self, key_ids: &[KeyId]) -> Result<usize, StoreError> {
@@ -6220,7 +6313,7 @@ mod tests {
                 tags: Default::default(),
             })
             .expect("put_key must succeed against an in-memory store");
-        cp.rebuild();
+        cp.rebuild().unwrap();
 
         match authenticator.authenticate(&headers) {
             AuthOutcome::Authenticated(principal) => {
@@ -6342,7 +6435,7 @@ mod tests {
 
         let cp = ControlPlane::new(Box::new(store), HmacSecret::new(secret_bytes), bootstrap)
             .expect("boot must succeed");
-        cp.rebuild();
+        cp.rebuild().unwrap();
         let authenticator =
             VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
 
@@ -6430,7 +6523,10 @@ mod tests {
 
         // Now the store starts failing, and a refresh is attempted.
         fail_flag.store(true, Ordering::SeqCst);
-        cp.rebuild();
+        assert!(
+            cp.rebuild().is_err(),
+            "a failed refresh must reach the caller"
+        );
 
         // The previously published snapshot must still be in effect -- the
         // same key still authenticates. It must NOT have been replaced by an
@@ -6791,7 +6887,7 @@ mod tests {
             KeySet::new(),
         )
         .unwrap();
-        cp.rebuild();
+        cp.rebuild().unwrap();
         assert_eq!(cp.handle().load().key_policies.get(&key), Some(&access));
         assert!(!cp
             .handle()
@@ -8649,6 +8745,93 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- concurrent refreshers publish in stamp order (review R-3)
+
+    /// The poller loads generation G, then stalls before publishing. An admin
+    /// revoke meanwhile writes G+1 and rebuilds. Whatever the interleaving,
+    /// the snapshot published last must be the newer one: the revoked key
+    /// must not authenticate again once both refreshes are done.
+    #[test]
+    fn concurrent_poll_and_rebuild_never_publish_an_older_generation_last() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        let secret_bytes = b"operator-secret";
+        let (store, inner) = SharedMemoryStore::new();
+        let hooks = Arc::clone(&store.hooks);
+        let cp = Arc::new(
+            ControlPlane::new(
+                Box::new(store),
+                HmacSecret::new(secret_bytes),
+                KeySet::new(),
+            )
+            .expect("empty store must not fail boot"),
+        );
+        let minted = cp
+            .mint_key(&TenantId::new("tenant-a"), &KeyId::new("k1"))
+            .unwrap();
+        assert!(minted.applied);
+        let authenticator =
+            VirtualKeyAuthenticator::new(HmacSecret::new(secret_bytes), cp.handle());
+        let headers = headers_with_authorization(&format!("Bearer {}", minted.plaintext));
+
+        // Another replica's write moves the stamp, so the poll below reloads.
+        inner.create_tenant(&TenantId::new("tenant-b")).unwrap();
+
+        // The next load (the poller's) reads the store, then waits for
+        // `release` before returning that by-then stale result.
+        let armed = Arc::new(AtomicBool::new(true));
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        *hooks.after_load.lock().unwrap() = Some(Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let poller = {
+            let cp = Arc::clone(&cp);
+            std::thread::spawn(move || cp.poll_once())
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the poller must reach its load");
+
+        let (revoked_tx, revoked_rx) = mpsc::channel();
+        let admin = {
+            let cp = Arc::clone(&cp);
+            std::thread::spawn(move || {
+                let result = cp.revoke_key(&KeyId::new("k1"));
+                let _ = revoked_tx.send(());
+                result
+            })
+        };
+        // Give an unserialised rebuild the chance to publish first, which is
+        // the interleaving that used to resurrect the key. With the publish
+        // lock the revoke is still waiting here, so this times out; that is
+        // not a failure, and no assertion depends on how long it took.
+        let _ = revoked_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+
+        assert_eq!(poller.join().unwrap(), Ok(true));
+        admin.join().unwrap().expect("the revoke must apply");
+
+        assert!(
+            matches!(
+                authenticator.authenticate(&headers),
+                AuthOutcome::Rejected(AuthError::RevokedKey)
+            ),
+            "the stalled poll published its older snapshot over the revoke"
+        );
+        assert_eq!(
+            cp.poll_once(),
+            Ok(false),
+            "the recorded generation must be the newest one published"
+        );
     }
 
     // --- policy propagation by version-stamp polling ------------------
@@ -10518,8 +10701,8 @@ mod tests {
             .unwrap();
         assert!(is_unusable(&cp, "tenant-a", "openrouter"));
         assert_eq!(cp.credential_warnings_emitted(), 1);
-        cp.rebuild();
-        cp.rebuild();
+        cp.rebuild().unwrap();
+        cp.rebuild().unwrap();
         assert!(is_unusable(&cp, "tenant-a", "openrouter"));
         assert_eq!(
             cp.credential_warnings_emitted(),
