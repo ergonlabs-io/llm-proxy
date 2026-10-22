@@ -1,22 +1,22 @@
 ---
 title: Configuration file
 description: "Write an llmproxy.yaml file: how the blocks relate, strict parsing, environment variables, validation, and three complete examples."
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - configuration/reference
+  - configuration/models-and-routes
+  - configuration/strict-config-mode
   - getting-started/quickstart
-  - providers-and-routing/providers-and-clusters
+  - providers/overview
   - operations/config-reload
 ---
-
-# Configuration file
 
 The configuration file is a YAML file that you pass with `--config`. This page
 shows how the file is built, how its blocks depend on each other, and how to
 check a file before you start the proxy.
 
 Field definitions are not on this page. Each field, its type, its default and
-its rules are in the [Configuration field reference](../reference/). That page
+its rules are in the [Configuration field reference](/docs/llm-proxy/configuration/reference/). That page
 is generated from `schema/llmproxy-v0.schema.json`, the normative schema. If
 this page and the reference disagree, the reference is right. Report the
 difference.
@@ -28,17 +28,17 @@ Each block builds on the one before it.
 
 | Block | Job | Depends on |
 |---|---|---|
-| [`version`](../reference/#top-level) | Names the schema version. Always `0`. | Nothing |
-| [`providers`](../reference/#provider) | Names each upstream LLM API and holds its credentials. | Nothing |
-| [`routes`](../reference/#route) and [`models`](../reference/#modeldef) | Choose a provider (or an ordered list of providers) for each requested model name. | `providers` |
-| [`auto`](../reference/#automodel) | Resolves the reserved model name `auto` to a real model. | `routes` or `models`; `auth` for per-tenant entries |
-| `guardrails` | Sends each request body to an HTTP check that allows or denies it. See [Request guardrails](../../authentication/guardrails/). | `auth` for per-tenant entries |
-| [`auth`](../reference/#auth) | Checks who the caller is, and which models the caller may use. | Nothing |
-| [`limits`](../reference/#limit) | Limits requests, tokens and concurrent streams. | `auth` for the `tenant` key |
-| [`pricing`](../reference/#pricing) | Gives each completed request a price. | `providers` (the `type` of each provider) |
-| [`observability`](../reference/#observability) | Writes access logs and exports metrics and traces. | `auth` for `traces` |
-| [`ledger`](../reference/#ledger) | Writes one encrypted entry for each request sent to a provider. | `--service-node` |
-| [`listen`](../reference/#listener) and `admin` | Set the addresses the proxy binds. | Nothing |
+| [`version`](/docs/llm-proxy/configuration/reference/#top-level) | Names the schema version. Always `0`. | Nothing |
+| [`providers`](/docs/llm-proxy/configuration/reference/#provider) | Names each upstream LLM API and holds its credentials. | Nothing |
+| [`routes`](/docs/llm-proxy/configuration/reference/#route) and [`models`](/docs/llm-proxy/configuration/reference/#modeldef) | Choose a provider (or an ordered list of providers) for each requested model name. | `providers` |
+| [`auto`](/docs/llm-proxy/configuration/reference/#automodel) | Resolves the reserved model name `auto` to a real model. | `routes` or `models`; `auth` for per-tenant entries |
+| `guardrails` | Sends each request body to an HTTP check that allows or denies it. See [Request guardrails](/docs/llm-proxy/authentication/guardrails/). | `auth` for per-tenant entries |
+| [`auth`](/docs/llm-proxy/configuration/reference/#auth) | Checks who the caller is, and which models the caller may use. | Nothing |
+| [`limits`](/docs/llm-proxy/configuration/reference/#limit) | Limits requests, tokens and concurrent streams. | `auth` for the `tenant` key |
+| [`pricing`](/docs/llm-proxy/configuration/reference/#pricing) | Gives each completed request a price. | `providers` (the `type` of each provider) |
+| [`observability`](/docs/llm-proxy/configuration/reference/#observability) | Writes access logs and exports metrics and traces. | `auth` for `traces` |
+| [`ledger`](/docs/llm-proxy/configuration/reference/#ledger) | Writes one encrypted entry for each request sent to a provider. | `--service-node` |
+| [`listen`](/docs/llm-proxy/configuration/reference/#listener) and `admin` | Set the addresses the proxy binds. | Nothing |
 
 A request moves through the blocks in this way:
 
@@ -57,7 +57,7 @@ A request moves through the blocks in this way:
 Credentials and other values that vary by provider belong to the provider, not
 to the route. After a failover, the request carries the credentials of the
 fallback provider only. The page
-[Providers and clusters](../../providers-and-routing/providers-and-clusters/)
+[Providers overview](/docs/llm-proxy/providers/overview/)
 explains this.
 
 ## Strict parsing and errors
@@ -66,15 +66,17 @@ Parsing is strict. An unknown or misspelled field is a load error. The error
 names the full dotted path of the field. The proxy never ignores a field
 silently, and no option turns this off for a `--config` file.
 
-For example, `fallback` instead of `fallbacks` gives this error:
+For example, `api_keyy` instead of `api_key` gives this error:
 
 ```text
-unknown field at `routes[0].fallback`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)
+unknown field at `providers.openai.api_keyy`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)
 ```
 
 The top-level keys `envoy`, `tracing` and `clusters` are reserved for a future
 schema version. The proxy rejects them in version 0. To export traces, use
-`observability.tracing`.
+`observability.tracing`. The page
+[Strict config mode](/docs/llm-proxy/configuration/strict-config-mode/) lists
+the error texts and every load-time warning.
 
 The editor can check the file while you type. Point a YAML language server at
 `schema/llmproxy-v0.schema.json`.
@@ -112,7 +114,7 @@ and the rule for it.
 | Price list | `pricing.price_list_file` |
 
 Which files a `SIGHUP` reload reads again, and which settings need a restart,
-is in [What a reload applies](../../operations/config-reload/#what-a-reload-applies).
+is in [What a reload applies](/docs/llm-proxy/operations/config-reload/#what-a-reload-applies).
 
 ## Validate a file
 
@@ -137,16 +139,6 @@ expect. For example, an `auth` block with no keys is a warning.
 `validate` reads the same environment variables as `serve`. Set the same
 variables, and pass `--service-node` if the file needs it. See
 [Rules that span fields](#rules-that-span-fields).
-
-`--mode translate` prints the Envoy bootstrap configuration that the proxy
-builds from your file. Use it to see what a setting becomes. Secrets print as
-`[REDACTED]` unless you pass `--reveal-secrets`.
-
-```bash
-llm-proxy --config llmproxy.yaml --mode translate
-```
-
-The flags are in the [command-line reference](../../reference/cli/).
 
 ## Example: the smallest file
 
@@ -244,7 +236,7 @@ Three links connect the blocks in this file:
   request for a model with no entry has no price.
 
 Tenant model grants, budgets and per-tenant limits are not in the file. You
-set them with the admin API. See [Virtual keys](../../authentication/virtual-keys/).
+set them with the admin API. See [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/).
 
 ## Example: failover
 
@@ -295,7 +287,7 @@ The `local-vllm` provider has no key. It has the type `openai-compatible`,
 because its name is not one of the three names that imply a type. Every
 provider in one chain must speak the same wire dialect, so you cannot add
 `anthropic` as a fallback for `openai`. See
-[Failover and aggregates](../../providers-and-routing/failover-and-aggregates/).
+[Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/).
 
 ## Rules that span fields
 
@@ -304,19 +296,19 @@ field reference holds the definition of each field.
 
 ### Which rule routes a request
 
-- The proxy applies [`routes`](../reference/#route) first, from top to bottom.
+- The proxy applies [`routes`](/docs/llm-proxy/configuration/reference/#route) first, from top to bottom.
   The first match wins. It does not reorder routes by how specific they are.
   Put specific patterns above broad ones.
-- A [`models`](../reference/#modeldef) entry works as an implicit route that
+- A [`models`](/docs/llm-proxy/configuration/reference/#modeldef) entry works as an implicit route that
   the proxy applies after `routes`. A route with the pattern `*` therefore
   hides every `models` entry.
-- A request that matches nothing gets a `404` with a JSON body that lists the
-  known models.
+- A request that matches nothing gets a `404`. The JSON body has the error type
+  `model_not_found`.
 - The file needs at least one entry in `routes`, or at least one entry in
   `models`.
-- If you set [`auto`](../reference/#automodel), a `models` key or a
+- If you set [`auto`](/docs/llm-proxy/configuration/reference/#automodel), a `models` key or a
   `routes[].model` of `auto` is a load error. See
-  [The auto model](../../providers-and-routing/auto-model/).
+  [The auto model](/docs/llm-proxy/providers-and-routing/auto-model/).
 
 ### Chains stay in one dialect
 
@@ -332,16 +324,16 @@ cannot say which one. Use a `models` entry in the object form, and set
 
 | Setting | Why |
 |---|---|
-| [`limits[].key: tenant`](../reference/#limit) | Nothing else identifies a tenant. |
-| [`auto.tenants`](../reference/#automodel) | The entries use the tenant names from `auth`. |
-| [`observability.traces`](../reference/#traces) | Only a tenant can opt in. |
-| [`providers.<name>.tenant_credentials`](../reference/#provider) | It needs `auth.tenant_credentials`. That block needs a durable `auth.store`: `persistent` or `shared`. |
+| [`limits[].key: tenant`](/docs/llm-proxy/configuration/reference/#limit) | Nothing else identifies a tenant. |
+| [`auto.tenants`](/docs/llm-proxy/configuration/reference/#automodel) | The entries use the tenant names from `auth`. |
+| [`observability.traces`](/docs/llm-proxy/configuration/reference/#traces) | Only a tenant can opt in. |
+| [`providers.<name>.tenant_credentials`](/docs/llm-proxy/configuration/reference/#provider) | It needs `auth.tenant_credentials`. That block needs a durable `auth.store`: `persistent` or `shared`. |
 
 With `auth` set, a tenant that has no stored model policy is refused with a
 `403`. Set a policy with the admin API, or set
-[`auth.enforce.tenants_without_policy`](../reference/#authenforce) to `allow`.
+[`auth.enforce.tenants_without_policy`](/docs/llm-proxy/configuration/reference/#authenforce) to `allow`.
 Setting a control in `auth.enforce` to `false` removes that control and logs a
-warning at load. See [Virtual keys](../../authentication/virtual-keys/).
+warning at load. See [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/).
 
 ### Settings that need `--service-node`
 
@@ -349,32 +341,32 @@ The dialect has no field for the node identity of a replica. These settings
 need the `--service-node` flag, with a value that is unique to the replica and
 stable across restarts:
 
-- [`auth.store.shared`](../reference/#authstore). Without the flag, the load
+- [`auth.store.shared`](/docs/llm-proxy/configuration/reference/#authstore). Without the flag, the load
   error names `auth.store.shared`.
-- [`ledger`](../reference/#ledger).
-- [`observability.traces`](../reference/#traces).
+- [`ledger`](/docs/llm-proxy/configuration/reference/#ledger).
+- [`observability.traces`](/docs/llm-proxy/configuration/reference/#traces).
 
 The setup of a shared store is in
-[Running in production](../../operations/running-in-production/).
+[Running in production](/docs/llm-proxy/operations/running-in-production/).
 
 ### Prices and budgets
 
-- Spend budgets use the price from [`pricing`](../reference/#pricing). With
+- Spend budgets use the price from [`pricing`](/docs/llm-proxy/configuration/reference/#pricing). With
   `auth.enforce.spend` on and no `pricing`, every request costs `$0`, and the
   proxy warns at load.
 - A request for a model with no price entry is charged `$0` under a dollar
   budget, and is not refused. See
-  [Spend policies](../../limits-and-budgets/spend-policies/).
+  [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/).
 - With `auth` set, `auth.store` holds the rate card. A change to `pricing` in
   the file does not replace a card that the store already holds. See the
-  [`pricing` reference](../reference/#pricing).
+  [`pricing` reference](/docs/llm-proxy/configuration/reference/#pricing).
 
 ### Syntax that is not yet applied
 
 The `provider/model` form is applied in a `models` entry. In `routes[].provider`
 and `routes[].fallbacks`, the proxy accepts the form but does not rewrite the
 model. The client's model name goes upstream unchanged, and the load logs a
-warning that names the field. See [`ProviderModelRef`](../reference/#providermodelref).
+warning that names the field. See [`ProviderModelRef`](/docs/llm-proxy/configuration/reference/#providermodelref).
 
 ## Where each feature is explained
 
@@ -382,21 +374,25 @@ The field reference defines the fields. These pages explain how to use them.
 
 | Topic | Page |
 |---|---|
-| Provider types, base URLs, Azure OpenAI, Vertex, Bedrock, OpenRouter | [Providers and clusters](../../providers-and-routing/providers-and-clusters/) |
-| Fallbacks and ordered `models` lists | [Failover and aggregates](../../providers-and-routing/failover-and-aggregates/) |
-| Retries and timeouts | [Timeouts and retries](../../providers-and-routing/timeouts-and-retries/) |
-| Virtual keys, tenants and the HMAC secret | [Virtual keys](../../authentication/virtual-keys/) |
-| Tenant provider credentials | [Tenant provider credentials](../../authentication/tenant-provider-credentials/) |
-| Request, token and concurrency limits | [Token rate limiting](../../limits-and-budgets/token-rate-limiting/) |
-| Budgets and the rate card | [Spend policies](../../limits-and-budgets/spend-policies/) |
-| The billing ledger | [Billing ledger](../../limits-and-budgets/billing-ledger/) |
-| Access logs, metrics and tracing | [Observability overview](../../observability/overview/) |
-| The `/v1/models` and `/v1/embeddings` endpoints | [API compatibility](../../api-compatibility/overview/) |
-| TLS on the listener and the handshake deadline | [TLS](../../operations/tls/) |
-| Changing a file while the proxy runs | [Reload configuration](../../operations/config-reload/) |
+| Provider types, base URLs, Azure OpenAI, Vertex, Bedrock, OpenRouter | [Providers overview](/docs/llm-proxy/providers/overview/) |
+| Model patterns, the `models` catalog and the upstream model name | [Models and routes](/docs/llm-proxy/configuration/models-and-routes/) |
+| Fallbacks and ordered `models` lists | [Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/) |
+| Retries and timeouts | [Timeouts and retries](/docs/llm-proxy/providers-and-routing/timeouts-and-retries/) |
+| Virtual keys, tenants and the HMAC secret | [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/) |
+| Tenant provider credentials | [Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/) |
+| Request, token and concurrency limits | [Token rate limiting](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/) |
+| Budgets and the rate card | [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/) |
+| The billing ledger | [Billing ledger](/docs/llm-proxy/limits-and-budgets/billing-ledger/) |
+| Access logs, metrics and tracing | [Observability overview](/docs/llm-proxy/observability/overview/) |
+| The `/v1/models` and `/v1/embeddings` endpoints | [API compatibility](/docs/llm-proxy/api-compatibility/overview/) |
+| TLS on the listener and the handshake deadline | [TLS](/docs/llm-proxy/operations/tls/) |
+| Changing a file while the proxy runs | [Reload configuration](/docs/llm-proxy/operations/config-reload/) |
 
-## What the file does not express
+## Limitations
 
-The file has no field for a route that replies with a redirect. That action
-exists only in an Envoy bootstrap configuration loaded with `-c`. Every route
-in a `--config` file forwards to a provider.
+- Every route in a `--config` file forwards to a provider. The file cannot
+  express a route that replies with a redirect.
+- The file has no field for the node identity of a replica. Use the
+  `--service-node` flag. See [Rules that span fields](#rules-that-span-fields).
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.

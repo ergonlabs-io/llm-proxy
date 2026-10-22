@@ -523,9 +523,9 @@ Stated plainly, because a feature list without this is not much use:
 - **Nothing watches files, and some auth settings need a restart.** A `SIGHUP`
   reload reads `api_key_file` and the TLS `cert_file`/`key_file` again. It does
   not apply changes to `auth.keys`, the HMAC secret, the auth store, or the
-  OTLP `tracing`/`metrics` blocks; those take a restart. Changing the HMAC
-  secret and sending `SIGHUP` refuses every key until a restart (a known
-  defect). See the reload table in
+  OTLP `tracing`/`metrics` blocks; a change to any of them refuses the whole
+  reload, and the proxy keeps serving the previous snapshot until a restart.
+  See the reload table in
   [Reload configuration](docs/site/src/content/docs/operations/config-reload.md).
 - **Authorization covers models only.** There is no per-provider
   authorization. An authenticated tenant with no stored model policy is refused
@@ -545,10 +545,6 @@ Stated plainly, because a feature list without this is not much use:
 - **Spend over-admission is bounded, not zero.** With a `shared` store,
   replicas share spend totals. During a store outage each replica enforces
   against the last confirmed total plus its own spend.
-- **A key budget counts one credential source.** A budget is scoped to
-  `platform` or `tenant` credentials. It ignores spend of the other source
-  (ADR-0007). A per-key `include_byok_in_limit` flag that counts both is
-  planned for v0.8.0.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
 - **No Kubernetes controller or CRDs.**

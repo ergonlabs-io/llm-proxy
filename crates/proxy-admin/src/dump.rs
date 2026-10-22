@@ -542,6 +542,21 @@ pub struct ModelInventory {
     /// dimension model routing is expressed on (see [`models_from_snapshot`]).
     pub header: &'static str,
     pub models: Vec<ModelDump>,
+    /// Routes that match on the path alone, so they serve any model that reaches them. Kept apart from `models`
+    /// so that no entry there names a model the config never mentioned. Without this list, a config whose only
+    /// route is a catch-all (the starter config's `model: "*"`) reads as routing nothing.
+    pub path_routes: Vec<PathRouteDump>,
+}
+
+/// One route with no [`MODEL_HEADER_NAME`] matcher, as `GET /models` renders it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PathRouteDump {
+    /// The path matcher, rendered as `prefix:/`, `exact:/v1/models` or `regex:...`.
+    pub path: String,
+    /// See [`ModelDump::target`].
+    pub target: Option<String>,
+    pub route: Option<String>,
+    pub route_table: String,
 }
 
 /// One model pattern, as `GET /models` renders it. Hand-picked fields, like every type in this module.
@@ -560,6 +575,10 @@ pub struct ModelDump {
     /// The route table holding the route: an HCM-inlined table's name, or an
     /// RDS-delivered table's (`ConfigSnapshot::routes` doc).
     pub route_table: String,
+    /// Where the route forwards: its cluster (an aggregate for a fallback chain), `header:<name>` when the router
+    /// reads the cluster from a header, or the weighted clusters joined with `,`. `None` for a route that does not
+    /// forward (a redirect or a direct response).
+    pub target: Option<String>,
 }
 
 impl ModelDump {
@@ -586,7 +605,25 @@ impl ModelDump {
             r#match: kind,
             route: route_name.clone(),
             route_table: route_table.to_string(),
+            target: None,
         }
+    }
+}
+
+/// [`ModelDump::target`]'s rendering of a route action.
+fn route_target(action: &RouteActionIR) -> Option<String> {
+    match action {
+        RouteActionIR::Forward(forward) => Some(match &forward.target {
+            ForwardTarget::Cluster(cluster) => cluster.clone(),
+            ForwardTarget::ClusterHeader(header) => format!("header:{header}"),
+            ForwardTarget::Weighted(weighted) => weighted
+                .cumulative
+                .iter()
+                .map(|(cluster, _)| cluster.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        }),
+        RouteActionIR::Redirect(_) | RouteActionIR::DirectResponse { .. } => None,
     }
 }
 
@@ -594,15 +631,17 @@ impl ModelDump {
 /// dimension: `proxy_filters::body_rewrite_filter` publishes the request's `model` onto it, and `proxy_simple_config`
 /// lowers each `routes[].model` pattern into a matcher on it.
 ///
-/// Routes that do not match on that header are deliberately absent. A plain `/v1/chat/completions` prefix route
-/// serves every model and names none, so inventing an entry would report a model the config never mentioned.
+/// Routes that do not match on that header are deliberately absent from `models`. A plain `/v1/chat/completions`
+/// prefix route serves every model and names none, so inventing an entry would report a model the config never
+/// mentioned. They are listed in `path_routes` instead.
 ///
 /// Both route sources are walked: RDS tables (`ConfigSnapshot::routes`) and tables inlined in an HCM. Identical
 /// entries are de-duplicated, and the result is sorted, so the response is stable for a given config.
 pub fn models_from_snapshot(snapshot: &ConfigSnapshot) -> ModelInventory {
     let mut models: Vec<ModelDump> = Vec::new();
+    let mut path_routes: Vec<PathRouteDump> = Vec::new();
     for table in snapshot.routes.values() {
-        collect_models(table, &mut models);
+        collect_models(table, &mut models, &mut path_routes);
     }
     for listener in snapshot.listeners.values() {
         for chain in listener
@@ -612,31 +651,52 @@ pub fn models_from_snapshot(snapshot: &ConfigSnapshot) -> ModelInventory {
         {
             for filter in &chain.filters {
                 if let NetworkFilterSpec::HttpConnectionManager(hcm) = filter {
-                    collect_models(&hcm.route_table, &mut models);
+                    collect_models(&hcm.route_table, &mut models, &mut path_routes);
                 }
             }
         }
     }
     models.sort();
     models.dedup();
+    path_routes.sort();
+    path_routes.dedup();
     ModelInventory {
         header: MODEL_HEADER_NAME,
         models,
+        path_routes,
     }
 }
 
 /// One route table's contribution to [`models_from_snapshot`].
-fn collect_models(table: &RouteTable, out: &mut Vec<ModelDump>) {
+fn collect_models(
+    table: &RouteTable,
+    out: &mut Vec<ModelDump>,
+    path_routes: &mut Vec<PathRouteDump>,
+) {
     for vhost in &table.virtual_hosts {
         for route in &vhost.routes {
+            let target = route_target(&route.action);
+            let mut matches_model = false;
             for header in &route.matcher.headers {
                 if header.name.eq_ignore_ascii_case(MODEL_HEADER_NAME) {
-                    out.push(ModelDump::from_header_match(
-                        header,
-                        &route.name,
-                        table.name.as_str(),
-                    ));
+                    matches_model = true;
+                    out.push(ModelDump {
+                        target: target.clone(),
+                        ..ModelDump::from_header_match(header, &route.name, table.name.as_str())
+                    });
                 }
+            }
+            if !matches_model {
+                path_routes.push(PathRouteDump {
+                    path: match &route.matcher.path {
+                        PathMatch::Prefix(p) => format!("prefix:{p}"),
+                        PathMatch::Exact(p) => format!("exact:{p}"),
+                        PathMatch::Regex(re) => format!("regex:{}", re.as_str()),
+                    },
+                    target,
+                    route: route.name.clone(),
+                    route_table: table.name.to_string(),
+                });
             }
         }
     }

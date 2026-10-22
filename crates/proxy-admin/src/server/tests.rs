@@ -280,6 +280,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         route_index: 0,
         include_request_attempt_count: false,
         include_attempt_count_in_response: false,
+        include_routing_headers_in_response: false,
         streaming_strict: false,
     });
     let vhost = VirtualHostIR {
@@ -432,6 +433,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
             route_index,
             include_request_attempt_count: false,
             include_attempt_count_in_response: false,
+            include_routing_headers_in_response: false,
             streaming_strict: false,
         })
     }
@@ -3270,9 +3272,20 @@ async fn get_models_lists_model_header_patterns_and_skips_path_only_routes() {
         ]
     );
     assert!(
-        !body.contains("chat-completions"),
+        models.iter().all(|m| m["target"] == "upstream"),
+        "each model entry names the cluster its route forwards to: {body}"
+    );
+    assert!(
+        models.iter().all(|m| m["route"] != "chat-completions"),
         "a path-only route names no model and must not be reported as one: {body}"
     );
+    // The path-only route is listed apart, with its target, so a catch-all
+    // config does not read as routing nothing.
+    let path_routes = value["path_routes"].as_array().expect("path_routes array");
+    assert_eq!(path_routes.len(), 1, "{body}");
+    assert_eq!(path_routes[0]["route"], "chat-completions");
+    assert_eq!(path_routes[0]["path"], "prefix:/");
+    assert_eq!(path_routes[0]["target"], "upstream");
 }
 
 /// Starts the real HTTP admin socket with an in-`temp_dir` UI bundle: an
@@ -3368,11 +3381,34 @@ async fn ui_does_not_shadow_api_or_prefix_siblings() {
 }
 
 #[tokio::test]
+async fn bare_admin_address_redirects_to_the_ui_when_loaded() {
+    let (_server, addr, _dir) = start_with_ui_from_fixture().await;
+    let (status, headers, _body) = request(addr, "GET", "/", None, "").await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(
+        headers.get("location").map(|v| v.as_bytes()),
+        Some(&b"/ui/"[..])
+    );
+}
+
+#[tokio::test]
+async fn bare_admin_address_lists_endpoints_without_the_ui() {
+    let (_server, addr) = start(snapshot_with_secret()).await;
+    let (status, body) = get(addr, "/").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("available endpoints"), "{body}");
+}
+
+#[tokio::test]
 async fn ui_absent_is_a_hinted_404() {
     let (_server, addr) = start(snapshot_with_secret()).await;
     let (status, body) = get(addr, "/ui").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("LLMPROXY_ADMIN_UI_DIR"), "{body}");
+    assert!(
+        body.contains("admin-ui-dist"),
+        "a binary user has no source checkout; the hint must name the release bundle: {body}"
+    );
 }
 
 #[tokio::test]

@@ -398,6 +398,13 @@ pub mod test_store {
         ) -> Result<(), StoreError> {
             self.inner.set_budget(tenant, budget)
         }
+        fn set_key_budget(
+            &self,
+            key_id: &crate::auth::KeyId,
+            budget: Option<&crate::spend::KeyBudget>,
+        ) -> Result<(), StoreError> {
+            self.inner.set_key_budget(key_id, budget)
+        }
         fn set_limits(
             &self,
             subject: &TenantId,

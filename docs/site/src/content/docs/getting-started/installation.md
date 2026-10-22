@@ -1,19 +1,33 @@
 ---
 title: Install llm-proxy
 description: "Install llm-proxy with the install script or from source, run it as a service, and upgrade or remove it."
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - getting-started/quickstart
   - reference/cli
   - operations/running-in-production
 ---
 
-# Install llm-proxy
-
 You can install llm-proxy with the install script or build it from source.
-The script supports macOS on Apple Silicon and Linux on x86-64 or arm64. It
-installs the binary and starts the proxy as a service. Intel macOS has no
-prebuilt release. Build from source on that platform.
+The release workflow builds two archives: Linux on x86-64 and macOS on Apple
+Silicon. The script installs the binary and starts the proxy as a service.
+Intel macOS and Linux on arm64 have no prebuilt release. Build from source on
+those platforms.
+
+## At a glance
+
+- Prebuilt platforms: Linux x86-64 and macOS Apple Silicon.
+- Default binary path: `~/.local/bin/llm-proxy`.
+- Default data directory: `~/.config/llm-proxy`.
+- The script refuses to continue if the SHA-256 sum of the archive does not
+  match.
+
+:::caution
+The script accepts Linux on arm64. It asks for the asset
+`llm-proxy-linux-arm64.tar.gz`, which the release workflow does not build.
+The download fails with `There may be no linux/arm64 build in this release.`
+Build from source on that platform.
+:::
 
 ## Install with the script
 
@@ -162,5 +176,26 @@ The binary is `target/debug/llm-proxy`. For an optimized binary, add
 
 A source build does not start a service. To create a config, run
 `./target/debug/llm-proxy init ./llmproxy-home`. Then continue at step 3 of the
-[Quickstart](../quickstart/), with this binary path in place of `llm-proxy`.
-For the command-line flags, see the [CLI reference](../../reference/cli/).
+[Quickstart](/docs/llm-proxy/getting-started/quickstart/), with this binary
+path in place of `llm-proxy`. For the command-line flags, see the
+[CLI reference](/docs/llm-proxy/reference/cli/).
+
+## Verify the install
+
+Print the version. Then validate a config file.
+
+```sh
+llm-proxy --version
+llm-proxy --config ./llmproxy.yaml --mode validate
+```
+
+For a valid file, the second command prints
+`configuration '...' OK (N listener(s), N cluster(s), N warning(s))`. A load
+error names the dotted path of the field at fault.
+
+## Limitations
+
+- No prebuilt release for Intel macOS, Linux on arm64, or Windows.
+- No Docker image and no Helm chart.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.

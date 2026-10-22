@@ -1,31 +1,62 @@
 ---
-title: Admin endpoints
-description: "Use the admin server: readiness, config dump, stats, the web UI, and the bearer-gated write API for keys and tenants."
+title: Admin API
+description: "Use the admin server: readiness, config dump, stats, the web UI, and the bearer-gated write API for keys, tenants, budgets, limits, credentials, and pricing."
 summary: Reference for every route the admin server answers, which routes
-  need the admin token, the request body limits, and the admin UI.
-lastUpdated: 2026-10-18
+  need the admin token, the request body limits, and the status codes.
+lastUpdated: 2026-10-21
 related:
+  - administration/admin-ui
   - authentication/virtual-keys
   - authentication/tenant-provider-credentials
   - limits-and-budgets/spend-policies
   - limits-and-budgets/billing-ledger
+  - limits-and-budgets/pricing-and-cost-tracking
   - operations/draining-and-shutdown
   - observability/metrics-and-stats
-  - observability/request-capture
+  - help/limitations
 ---
 
-# Admin endpoints
-
 Use the admin server to check readiness, read the loaded config and stats,
-manage keys and tenants, and drain the proxy. It is an HTTP listener. To enable
-it, set the top-level `admin` field of the config. See the
-[configuration file](../../configuration/configuration-file/) reference. It
-serves read endpoints, a write API for keys, tenants, budgets, credentials, and
-pricing, three lifecycle commands, and the admin UI. To enable the write API,
-set `LLMPROXY_ADMIN_TOKEN`.
+manage keys and tenants, and drain the proxy. It is an HTTP listener. It
+serves read endpoints, a write API for keys, tenants, budgets, limits,
+credentials, and pricing, three lifecycle commands, and the
+[admin UI](/docs/llm-proxy/administration/admin-ui/).
 
 This page lists each route and its auth rule. It does not repeat the request
 and response details that other pages already own.
+
+## At a glance
+
+- **Default when unset:** no admin server. Set the top-level `admin` field to
+  turn it on.
+- **Failure mode:** fails closed. If `LLMPROXY_ADMIN_TOKEN` is unset, empty,
+  or only spaces, every gated route answers `403`.
+- **Open routes:** the read routes for probes, config, stats, and the rate
+  card need no token.
+
+```yaml title="llmproxy.yaml"
+version: 0
+listen: 127.0.0.1:53421
+admin: 127.0.0.1:53422
+auth:
+  hmac_secret_file: ./auth-secret
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+routes:
+  - model: "*"
+    provider: openai
+```
+
+```sh
+LLMPROXY_ADMIN_TOKEN="$(cat admin-token)" llm-proxy --config llmproxy.yaml
+curl --max-time 5 http://127.0.0.1:53422/ready
+```
+
+Expected output: `LIVE`.
+
+The key, tenant, budget, limit, and credential routes need the `auth` section.
+Without it they answer `503`.
 
 ## Auth model
 
@@ -47,69 +78,71 @@ A gated route passes two checks in this order:
    token. If it does not, the route answers `401` with a `www-authenticate`
    challenge and the body `missing or invalid bearer token`.
 
-The proxy compares the token with a constant-time check.
+The proxy compares the token with a constant-time check. The router answers
+`404` for an unknown path and `405` for a wrong method before it checks the
+token.
 
 **Caution.** After 10 missing or wrong bearer tokens from one peer IP within 60
 seconds, the proxy refuses that peer's gated requests with `429` and a
 `Retry-After` header (in seconds). This lasts until the 60-second window ends,
 even if the peer then sends the right token. The limit covers all write
-endpoints and the gated reads, such as `GET /keys`, spend reads, and capture
-records. A correct token before the limit clears the count for that peer. The
-proxy logs each refusal at warn with the peer IP and the endpoint. It never logs
-the presented token.
+endpoints and the gated reads, such as `GET /keys`, spend reads, and the
+ledger routes. A correct token before the limit clears the count for that
+peer. The proxy logs each refusal at warn with the peer IP and the endpoint.
+It never logs the presented token.
 
 | Route class | Routes | Gated |
 |---|---|---|
 | Probes and dumps | `GET /ready`, `/config_dump`, `/clusters`, `/server_info`, `/models` | No |
 | Metrics | `GET /stats`, `/stats/prometheus` | No |
-| Rate card read | `GET /pricing`, `GET /chains/{stat_prefix}/pricing` | No |
-| Admin UI | `GET /ui`, `GET /ui/...` | No |
+| Rate card read | `GET /pricing` | No |
+| Admin UI | `GET /`, `GET /ui`, `GET /ui/...` | No |
 | Spend reads | `GET .../spend` for keys and tenants | Yes |
 | Billing ledger | `GET /ledger/entries`, `POST /ledger/ack` | Yes |
-| Identity reads | `GET /keys`, `GET /tenants/{id}/provider_credentials` | Yes |
+| Trace-export switch | `GET /traces/capture`, `POST /traces/capture` | Yes |
+| Identity reads | `GET /keys`, `GET /tenants/{id}/provider_credentials`, `GET /tenants/{id}/trace_export`, `GET /tenants/{id}/objects/{object_id}` | Yes |
 | All writes | `POST`, `PUT`, `DELETE` routes, and the lifecycle commands | Yes |
 
 The proxy gates the spend and key-list reads because they expose money and
-identity.
-
-`GET /pricing` is open, because its handler runs before the gate. `PUT
-/pricing` passes the gate.
+identity. `GET /pricing` is open, because its handler runs before the gate.
+`PUT /pricing` passes the gate.
 
 ### Body size limits
 
 | Route | Maximum request body |
 |---|---|
-| `PUT /pricing`, `PUT /chains/{stat_prefix}/pricing` | 4 MiB (4,194,304 bytes) |
+| `PUT /pricing` | 4 MiB (4,194,304 bytes) |
 | All other routes that read a body | 64 KiB (65,536 bytes) |
 
 A body over the limit gets `413` with the body `request body exceeds the
-<cap>-byte cap for this endpoint`. The gate runs before
-the body is read, so only a caller with the token can send a large body.
+<cap>-byte cap for this endpoint`. The gate runs before the body is read, so
+only a caller with the token can send a large body.
 
 ### Common errors
 
 | Status | When |
 |---|---|
+| `400` | The body is not valid JSON, or it has an unknown field. The body starts with `malformed request body:`. |
 | `404` | The path is unknown. The body lists the available endpoints. |
 | `405` | The path exists but the method is wrong. The body is `<path> only accepts <METHOD>`. |
-| `503` | Unscoped keys, tenants, or spend route, and no `llmproxy.auth` filter is built yet. |
-| `500` | Unscoped route, and more than one chain configures `llmproxy.auth`. Use a `/chains/...` route. |
+| `409` | The write would be stored and never enforced. The body is `{"error":"not_enforced", ...}`. See below. |
+| `503` | A key, tenant, or spend route, and the config has no `auth` section. |
 
-The `503` body is `the auth control plane is not initialized yet: ...`. The
-`500` body starts with `the unscoped admin write API cannot resolve a single
-auth control plane`.
+The `503` body is `the auth control plane is not initialized yet: ...`.
 
-## Scoped routes: `/chains/{stat_prefix}/...`
+A `409` `not_enforced` answer means the matching control is off. These
+writes need the matching `auth.enforce` field to stay `true` (the default):
 
-Each key, tenant, and pricing route has a second form that starts with
-`/chains/{stat_prefix}`. The `stat_prefix` is the name of one HTTP connection
-manager in the config. Use the scoped form when more than one filter chain
-configures `llmproxy.auth`. The unscoped form then answers `500`.
+| Write | Needs |
+|---|---|
+| `PUT /tenants/{id}/policy`, `PUT /keys/{id}/policy` | `auth.enforce.model_policy` |
+| `PUT /tenants/{id}/budget` | `auth.enforce.spend` |
+| `PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits` | `auth.enforce.limits` |
+| `PUT /tenants/{id}/objects/{object_id}` | `auth.enforce.object_ownership` |
 
-A scoped route with an unknown `stat_prefix` answers `404` with the body
-`no chain named '<name>' registers an llmproxy.auth control plane ...`.
-The auth, gate, and body rules are the same as for the
-unscoped route.
+The proxy stores nothing when it answers `409`. The dialect logs a load-time
+warning for each control that you turn off. See
+[Configuration reference](/docs/llm-proxy/configuration/reference/#authenforce).
 
 ## Read endpoints
 
@@ -118,20 +151,27 @@ unscoped route.
 | `/ready` | GET | `200 LIVE`, `503 INITIALIZING`, or `503 DRAINING` |
 | `/config_dump` | GET | JSON of the loaded config snapshot |
 | `/clusters` | GET | JSON list of clusters, sorted by name |
-| `/models` | GET | JSON list of the models that the routes match on the `x-llmproxy-model` header |
+| `/models` | GET | JSON list of the models that the routes match on the `x-llmproxy-model` header, each with its `target` cluster, and `path_routes`: the routes that match on the path only, so they serve any model |
 | `/server_info` | GET | JSON with `version` and `uptime_seconds` |
 | `/stats` | GET | Plain-text counters and histograms |
 | `/stats/prometheus` | GET | Prometheus text format |
+| `/` | GET | `302` to `/ui/` if the UI is loaded. Otherwise `404` with the list of endpoints. |
 
-Without a probe wired in, `/ready` always answers `200 LIVE`. `/stats` and `/stats/prometheus` answer `404` if no
-stats registry exists. The proxy does not return an empty `200`. See
-[Metrics and /stats](../metrics-and-stats/) for the counters.
+`/stats` and `/stats/prometheus` answer `404` if no stats registry exists.
+The proxy does not return an empty `200`. See
+[Metrics and /stats](/docs/llm-proxy/observability/metrics-and-stats/) for
+the counters.
+
+```sh
+curl --max-time 5 http://127.0.0.1:53422/server_info
+```
 
 ## Billing ledger endpoints
 
 Two routes read and acknowledge the billing ledger. Both are gated. Without a
 `ledger` block in the config, both answer `404`. The parameters, the answers,
-and the status codes are on [Billing ledger](../../limits-and-budgets/billing-ledger/#pull-and-acknowledge-entries).
+and the status codes are on
+[Billing ledger](/docs/llm-proxy/limits-and-budgets/billing-ledger/#pull-and-acknowledge-entries).
 
 | Route | Method | Answer |
 |---|---|---|
@@ -153,15 +193,15 @@ admin server instance`.
 `/drain_listeners` accepts the query parameters `graceful` and `inboundonly`.
 They have no extra effect, because the drain is always the full graceful one.
 Any other parameter gives `400` with `unsupported query parameter '<name>' on
-/drain_listeners; accepted: graceful, inboundonly`. On success the answer is `200 OK`. See
-[Draining and shutdown](../../operations/draining-and-shutdown/).
+/drain_listeners; accepted: graceful, inboundonly`. On success the answer is
+`200 OK`. See
+[Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/).
 
 ## Keys and tenants
 
-All routes in this section are gated. Each also exists under
-`/chains/{stat_prefix}`. Request fields are strict: an unknown field gives
-`400`. See [Virtual keys](../../authentication/virtual-keys/) for the key
-model and examples.
+All routes in this section are gated. Request fields are strict: an unknown
+field gives `400`. See [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/)
+for the key model and examples.
 
 | Route | Method | Success | What it does |
 |---|---|---|---|
@@ -171,7 +211,7 @@ model and examples.
 | `/keys/{id}/budget` | PUT | `204` | Sets or clears a key budget. |
 | `/keys/{id}/policy` | PUT | `204` | Sets the model allow-list of one key. The key can only narrow its tenant grant. See "Key model policy". |
 | `/keys/{id}/limits` | PUT | `204` | Sets or clears the rate limits of one key. The key can only narrow its tenant limits. See "Tenant and key limits". |
-| `/keys/{id}/tags` | PUT | `204` | Replaces the chargeback tags of one key. Body: `tags`. See [Chargeback tags](../../limits-and-budgets/chargeback-tags/). |
+| `/keys/{id}/tags` | PUT | `204` | Replaces the chargeback tags of one key. Body: `tags`. See [Chargeback tags](/docs/llm-proxy/limits-and-budgets/chargeback-tags/). |
 | `/keys/{id}/spend` | GET | `200` | Reads the spend of a key, with the key's `tags`. |
 | `/tenants` | POST | `201` | Creates a tenant. Body: `tenant`. |
 | `/tenants/{id}` | DELETE | `204` | Deletes a tenant and revokes every key that authenticates as it. Minted keys are revoked and their rows stay. Config-file `auth.keys` entries for the tenant are revoked by a revoked store row with the same key id. That row wins on every replica that shares the store, and across restarts. Revoked key ids are permanent. The next request with any of those keys gets `401`. |
@@ -179,47 +219,80 @@ model and examples.
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
 | `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
-| `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Request and response body export](../trace-export/). |
-| `/tenants/{id}/objects/{object_id}` | PUT | `204` | Assigns a provider object that no tenant owns to the tenant. No body. An object whose owner expired has no owner, so it can be assigned again. An assignment never expires. `204` also when the tenant already owns it. `409` `object_owned` when another tenant owns it: an owner is never replaced. `404` for an unknown tenant. `409` `not_enforced` when no chain runs `llmproxy.object_ownership`. See "Object ownership". |
-| `/tenants/{id}/objects/{object_id}` | GET | `200` | Reads whether the store records the tenant as the owner. The answer is `{"tenant": "...", "object_id": "...", "owned": true, "expires_at": ...}`. `expires_at` is the expiry of the owner in Unix seconds, or `null` when the owner never expires. Any other case gives `404` `object_not_owned`, and the answer does not say whether another tenant owns the object. |
-| `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. See [Request and response body export](../trace-export/). |
+| `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Request and response body export](/docs/llm-proxy/observability/trace-export/). |
+| `/tenants/{id}/objects/{object_id}` | PUT | `204` | Assigns a provider object that no tenant owns to the tenant. No body. See "Object ownership". |
+| `/tenants/{id}/objects/{object_id}` | GET | `200` | Reads whether the store records the tenant as the owner. See "Object ownership". |
+| `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. Without trace export configured, both answer `404`. See [Request and response body export](/docs/llm-proxy/observability/trace-export/). |
 
 The mint answer is the only time the proxy returns the key text. The store
-keeps a digest only.
+keeps a digest only. A second `POST /keys` with the same `tenant` and
+`key_id` replaces the key text. The old text stops working on the next
+request. If the body leaves out `tags`, the key keeps its tags.
+
+| Status | Cause on `POST /keys` |
+|---|---|
+| `400` | `tenant` or `key_id` is empty or not valid, a field is unknown, `schema_version` is not `2`, or the tenant is reserved. The tenant `default` is reserved. |
+| `409` | `key ownership is immutable` (the `key_id` belongs to another tenant), or `revoked key IDs cannot be reused`. |
+
+`DELETE /keys/{id}` revokes a key that has a row in the store. A key that
+exists only in `auth.keys` has no row, and the call answers `404` with the
+body `not found`. To revoke such a key, delete its tenant, or set
+`revoked: true` in the config file and restart the proxy. A reload that
+removes or revokes a configured key is refused. `PUT /keys/{id}/tags` answers
+`409` for a key defined in the config file or a revoked key.
 
 The budget body is `{"budget": {"max_usd": "500.00", "period": "monthly"}}`
 to set a ceiling, or `{"budget": null}` to clear it. The key budget and the
-tenant budget use the same body shape. See
-[Spend policies](../../limits-and-budgets/spend-policies/) for periods, the
-spend response, and how the proxy counts spend.
+tenant budget use the same body shape, with one extra field for each:
+
+- A tenant budget takes `credential_source`: `platform` (default) or
+  `tenant`. A key budget with this field gives `400`.
+- A key budget takes `include_byok_in_limit` (default `false`). A tenant
+  budget with this field gives `400`.
+
+The spend reads answer `503` with `llmproxy.spend_limit is not configured on
+this chain, so there is no spend accumulator to report from` when
+`auth.enforce.spend` is `false`. `GET /keys/{id}/spend` answers `404` for an
+unknown key. See
+[Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/) for
+periods, the spend response, and how the proxy counts spend.
 
 ## Object ownership
 
 `auth.enforce.object_ownership` keeps provider objects to the tenant that
 created them. The objects are files, batches, responses, stored chat
 completions, uploads, vector stores, fine-tuning jobs, assistants, threads,
-containers, and conversations. See [Configuration reference](../../configuration/reference/#authenforce).
+containers, and conversations. See
+[Configuration reference](/docs/llm-proxy/configuration/reference/#authenforce).
 The proxy records the owner of each object that a tenant creates. It refuses
 a request for an object that the tenant does not own, or that no tenant owns.
 An object created outside the proxy, or before the proxy recorded owners, has
 no owner. Assign it with the admin API:
 
 ```sh
-curl -X PUT http://$ADMIN_ADDR/tenants/acme/objects/file-abc123 \
-  -H "authorization: Bearer $ADMIN_TOKEN"
+curl --max-time 5 -X PUT http://127.0.0.1:53422/tenants/acme/objects/file-abc123 \
+  -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN"
 ```
 
-The scoped forms are `PUT` and `GET /chains/{stat_prefix}/tenants/{id}/objects/{object_id}`.
-Both methods need the admin bearer token, like the other tenant writes.
-The `GET` reads the store, not the cache of one replica.
-It shows whether the owner survives a restart (`persistent` store) and
-whether every replica sees it (`shared` store).
+| Call | Answer |
+|---|---|
+| `PUT` | `204` when the tenant owns the object after the call, also when it owned it before. |
+| `PUT` | `409` `object_owned` when another tenant owns the object. An owner is never replaced. |
+| `PUT` | `404` `tenant_not_found` for an unknown tenant. |
+| `PUT` | `409` `not_enforced` when `auth.enforce.object_ownership` is `false`. |
+| `GET` | `200` with `{"tenant": "...", "object_id": "...", "owned": true, "expires_at": ...}`. `expires_at` is the expiry of the owner in Unix seconds, or `null` when the owner never expires. |
+| `GET` | `404` `object_not_owned` in any other case. The answer does not say whether another tenant owns the object. |
+
+An object whose owner expired has no owner, so it can be assigned again. An
+assignment never expires. Both methods need the admin bearer token. The `GET`
+reads the store, not the cache of one replica. It shows whether the owner
+survives a restart (`persistent` store) and whether every replica sees it
+(`shared` store).
 
 The owner of a stored response or a stored chat completion expires after
 `auth.stored_output_owner_ttl` (default `720h`). After that time the proxy
 refuses the object to every tenant, the creator included. Assign the object
-again with the `PUT` to give it back. The owner that the `PUT` writes never
-expires.
+again with the `PUT` to give it back.
 
 The proxy writes the owner to the store just after it sends the create
 response. If the process stops in that instant, the object has no owner. Assign
@@ -231,13 +304,12 @@ multipart file uploads and bodyless `GET` requests to these endpoints with
 
 ## Key model policy
 
-`PUT /keys/{id}/policy` sets a model allow-list on one key. The scoped form
-is `PUT /chains/{stat_prefix}/keys/{id}/policy`. The call needs the admin
-token, like the other writes. The body is the same as the body of
+`PUT /keys/{id}/policy` sets a model allow-list on one key. The call needs the
+admin token, like the other writes. The body is the same as the body of
 `PUT /tenants/{id}/policy`.
 
 ```bash
-curl -X PUT http://$ADMIN_ADDR/keys/k1/policy \
+curl --max-time 5 -X PUT http://127.0.0.1:53422/keys/k1/policy \
   -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
   -d '{"access":{"only":["gpt-4o"]},"deny":["gpt-4-old"]}'
 ```
@@ -247,7 +319,7 @@ curl -X PUT http://$ADMIN_ADDR/keys/k1/policy \
 | `204` | The proxy stored the policy. |
 | `400` | A pattern in `access.only` or `deny` is not an exact model name or one trailing `*`. The proxy stores nothing. |
 | `404` | The key does not exist. The proxy stores nothing. |
-| `409` | No chain runs `llmproxy.model_authz`. The body is `{"error":"not_enforced", ...}`. The proxy stores nothing. |
+| `409` | `auth.enforce.model_policy` is `false`. The body is `{"error":"not_enforced", ...}`. The proxy stores nothing. |
 
 The effective models of a request are the tenant grant intersected with the
 key list. These rules apply:
@@ -255,7 +327,7 @@ key list. These rules apply:
 - A key only narrows. It never widens the grant of its tenant.
 - A key with no policy keeps the grant of its tenant.
 - `{"access":"all"}` returns the key to the grant of its tenant.
-- A key policy also narrows when `tenants_without_policy` is `ALLOW`.
+- A key policy also narrows when `tenants_without_policy` is `allow`.
 - A refusal by a key policy is the same `403` as a refusal by a tenant
   policy. The `response_code_details` value is `model_not_permitted`.
 - The change applies to the next request. No reload is needed.
@@ -276,15 +348,14 @@ A key set to `{"access":"all"}` lists as `{"access":"all"}`, not `null`.
 
 ## Tenant and key limits
 
-`PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits` set rate limits. The
-scoped forms are `PUT /chains/{stat_prefix}/tenants/{id}/limits` and
-`PUT /chains/{stat_prefix}/keys/{id}/limits`. Both calls need the admin token.
+`PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits` set rate limits. Both
+calls need the admin token.
 
 The body has one required key, `limits`. It can have the optional key
 `schema_version`, which must be `1`.
 
 ```bash
-curl -X PUT http://$ADMIN_ADDR/tenants/acme/limits \
+curl --max-time 5 -X PUT http://127.0.0.1:53422/tenants/acme/limits \
   -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
   -d '{"limits":{"tokens_per_minute":100000,"requests_per_minute":600,"concurrent_streams":20}}'
 ```
@@ -305,17 +376,16 @@ fields clears the stored row.
 | `204` | The proxy stored the limits, or cleared them. |
 | `400` | The body is not valid. The `limits` key is missing, a field is unknown, or `schema_version` is not `1`. The proxy stores nothing. |
 | `404` | The key does not exist (`PUT /keys/{id}/limits` only). The proxy stores nothing. |
-| `409` | No chain runs `llmproxy.token_limit`. The body is `{"error":"not_enforced", ...}`. The proxy stores nothing. |
+| `409` | `auth.enforce.limits` is `false` and no `limits` entry adds the limiter. The body is `{"error":"not_enforced", ...}`. The proxy stores nothing. |
 
 These rules apply:
 
 - A request must pass the limits of its tenant and the limits of its key.
   The tenant sets the ceiling. A key only narrows it.
 - A key with no limits is bound by its tenant alone.
-- A window is one minute. Windows
-  start on whole minutes (they are aligned to the Unix epoch), so the first
-  window can be shorter than a minute. See
-  [Configure rate limits](../../limits-and-budgets/token-rate-limiting/#windows).
+- A window is one minute. Windows start on whole minutes (they are aligned to
+  the Unix epoch), so the first window can be shorter than a minute. See
+  [Configure rate limits](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/#windows).
 - A write applies to the next request. No reload is needed.
 - The limits persist with the configured store. They survive a restart on
   the persistent store.
@@ -334,10 +404,10 @@ limit, and the response has the headers `x-ratelimit-limit`,
 | `concurrent_streams` | `too many concurrent streams` |
 
 The dialect adds `llmproxy.token_limit` for you when `auth` is set. See
-`auth.enforce.limits` in
-[Configuration file](../../configuration/configuration-file/).
+`auth.enforce.limits` in the
+[Configuration reference](/docs/llm-proxy/configuration/reference/#authenforce).
 
-Caution: token and request counts are shared between replicas only when
+**Caution.** Token and request counts are shared between replicas only when
 `auth.store` is `shared`. They reconcile about once a second, so the fleet
 can admit a little over a limit between reconciles. With the `in_memory` or
 `persistent` store each replica counts alone, so N replicas can admit up to
@@ -359,8 +429,7 @@ is `null` when the key has no limits.
 
 ## Tenant provider credentials
 
-All routes are gated and also exist under `/chains/{stat_prefix}`. The list
-route returns metadata only.
+All routes are gated. The list route returns metadata only.
 
 | Route | Method | What it does |
 |---|---|---|
@@ -369,9 +438,10 @@ route returns metadata only.
 | `/tenants/{id}/provider_credentials/{provider}` | DELETE | Removes a credential |
 
 Any method other than `DELETE` on the `{provider}` path routes to the `PUT`
-handler, so a wrong method answers `405` with `... only accepts PUT`. Without `tenant_credentials` on the auth filter, the
-`PUT` answers `503` with the code `tenant_credentials_not_configured`. See
-[Tenant provider credentials](../../authentication/tenant-provider-credentials/)
+handler, so a wrong method answers `405` with `... only accepts PUT`. Without
+`auth.tenant_credentials` in the config, the `PUT` answers `503` with the code
+`tenant_credentials_not_configured`. See
+[Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/)
 for setup, the save-time check, and error codes.
 
 ## Pricing
@@ -381,53 +451,45 @@ for setup, the save-time check, and error codes.
 | `/pricing` | GET | No | Shows the active rate card |
 | `/pricing` | PUT | Yes | Publishes a new rate card (up to 4 MiB) |
 
-Both routes also exist as `/chains/{stat_prefix}/pricing`. A successful `PUT`
-answers `200` with `rate_card_version`, `persisted`, and `note`. The `PUT`
-answers `400` for an invalid card. It answers `503` with `llmproxy.usage is not
-initialized on this chain` if the chain has no usage filter. Without
-`llmproxy.auth`, the `PUT` still works, for this process only, and the answer
-says so in `note`. `GET` answers `503` with `llmproxy.usage has no active
-pricing rate card` if no card is active.
+A successful `PUT` answers `200` with `rate_card_version`, `persisted`, and
+`note`. The `note` says if the card survives a restart and if other replicas
+see it. The `PUT` answers `400` for an invalid card, and for a card with an
+`effective_from` in the future. It answers `503` with `the rate card was not
+changed: the control-plane store refused it: ...` if the store refuses the
+card. Without `auth`, the `PUT` still works, for this process only, and the
+answer says so in `note`. `GET` answers `503` with `llmproxy.usage has no
+active pricing rate card` if no card is active. See
+[Pricing and cost tracking](/docs/llm-proxy/limits-and-budgets/pricing-and-cost-tracking/).
 
-## Admin UI
+## Limitations
 
-The admin server serves a single-page UI at `/ui`. It needs no token to
-load, because the page and its assets are static. The UI calls the same admin
-API, so any gated action needs the admin token.
+- The admin port uses plain HTTP, and the dialect has no TLS setting for it.
+  The admin token crosses the network unencrypted if you bind the port to a
+  non-loopback address.
+- One token has full admin rights. There are no roles.
+- The admin API has no audit log. The proxy writes an info log line for most
+  writes.
+- An id that contains `/` cannot be addressed. The proxy does not decode
+  percent escapes.
 
-- **Address.** `http://<admin address>/ui/`. `GET /ui`, `GET /ui/`, and
-  `GET /ui/<asset>` serve files. An unknown sub-path returns `index.html`.
-  Other methods answer `405`.
-- **Tabs.** Overview, Clusters, Tenants, Keys, Pricing, and Capture, in this
-  order.
-- **Source.** `admin-ui/src`. Build it with `make ui-build`. The output is
-  `admin-ui/dist/`.
-- **Load.** Set `LLMPROXY_ADMIN_UI_DIR` to the build output directory and
-  restart the proxy. If it is not set, `/ui` answers `404` with `the admin UI
-  is not loaded for this server instance`.
-
-The installer (`scripts/install.sh`) sets `LLMPROXY_ADMIN_UI_DIR` in the
-service runner. It writes a generated admin token to the env file, and it
-prints the line `Admin UI:   http://<host>:<port>/ui/` and the token. The
-token is printed only for a new install.
-Paste the token into the UI to make changes.
-
-**Caution.** The admin port uses plain HTTP. The admin token crosses the
-network unencrypted if you bind the port to a non-loopback address.
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Implementation notes
 
 For maintainers. Route table, handlers, gate, and limits are in
 `crates/proxy-admin/src/server.rs`.
 
-- Gate: `admin_gate` and `secrets_match`. Body limits: `MAX_PRICING_BODY_BYTES`,
-  `MAX_ADMIN_BODY_BYTES`, and `read_limited_body`.
+- Gate: `admin_gate` and `secrets_match`. Failure limiter:
+  `crates/proxy-admin/src/server/auth_limit.rs` (`MAX_FAILURES`, `WINDOW`).
+  Body limits: `MAX_PRICING_BODY_BYTES`, `MAX_ADMIN_BODY_BYTES`, and
+  `read_limited_body`.
+- Routing: `match_write_route` and `WriteRoute::expected_method`. Routing runs
+  before the gate, so a wrong method gets `405`.
 - Handlers: `handle_lifecycle`, `handle_mint_key`, `handle_set_key_budget`,
   `handle_set_budget`, `handle_set_key_policy`, `handle_set_tenant_limits`,
   `handle_set_key_limits`, `handle_set_pricing`, `handle_list_keys`,
-  `parse_model_policy`,
-  `store_error_response`, `render_model_access`, `render_limits`, and
-  `LimitSpec::into_policy`.
+  `parse_model_policy`, `store_error_response`, `render_model_access`,
+  `render_limits`, and `LimitSpec::into_policy`.
 - Key policy: `ControlPlane::set_key_policy` in
   `crates/proxy-control/src/control.rs` and `authorize_model` in
   `crates/proxy-filters/src/model_authz_filter.rs`. Tests:
@@ -446,11 +508,13 @@ For maintainers. Route table, handlers, gate, and limits are in
 - Limits: `SetLimitsRequest` and `LimitSpec` use `deny_unknown_fields`.
   `token_limit_enforced` decides the `409`. Tests in
   `crates/proxy-admin/src/server/tests/limits.rs`:
-  `put_limits_unknown_key_and_unknown_fields_do_not_write`,
-  `put_limits_without_token_limit_is_409_and_stores_nothing`, and
-  `scoped_put_limits_uses_named_chain_and_legacy_type_url`. The test
+  `put_limits_unknown_key_and_unknown_fields_do_not_write` and
+  `put_limits_without_token_limit_is_409_and_stores_nothing`. The test
   `limits_survive_a_restart_with_a_persistent_store` is in
   `tenant_enforcement_e2e.rs`. `POLICY_WINDOW`, `Refusal::body`, and `refuse`
   are in `crates/proxy-filters/src/token_limit_filter.rs`.
+- Tests for other groups are in `crates/proxy-admin/src/server/tests/`:
+  `object_owners.rs`, `credentials.rs`, `key_tags.rs`, `budget_scope.rs`,
+  `ledger.rs`, `trace_export.rs`, `pricing.rs`, and `admin_rate_limit.rs`.
 - UI: `admin-ui/src/App.tsx` defines the tab order. `scripts/install.sh` sets
   `LLMPROXY_ADMIN_UI_DIR` and prints the token.

@@ -1021,6 +1021,13 @@
         },
         "session_affinity": {
           "$ref": "#/$defs/SessionAffinity"
+        },
+        "selection": {
+          "type": "string",
+          "enum": ["weighted", "latency"],
+          "default": "weighted",
+          "description": "How a weighted model picks the first provider for a request. `weighted` (the default): in proportion to `weight`. `latency`: in proportion to `weight` scaled by the provider's measured latency, so a slower provider receives less traffic. The scale is the fastest provider's average latency divided by this provider's, between 0.1 and 1: a slow provider keeps at least a tenth of its weight, so it is still measured and regains its share when it is fast again. A provider not yet measured keeps its full weight. Latency is an exponentially weighted average kept by each replica for each provider, from successful responses of `latency` models only: time to the first streamed event for a stream, time to the full response otherwise. A provider ejected by its `outlier_detection` gets no traffic in either mode while another provider is not ejected. A request pinned by `session_affinity` always uses the plain weights, so a session does not move when latencies change. Requires `weight` on the model's providers (a load error otherwise); a model with one weighted provider has no choice to make.",
+          "examples": ["latency"]
         }
       }
     },
@@ -1151,6 +1158,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "routing_headers": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, every proxied response names how it was routed, on the response head (a stream carries them before its first event): `x-llmproxy-provider` is the provider cluster that served it (`provider:<name>`), `x-envoy-attempt-count` is the number of upstream attempts, and `x-llmproxy-providers-tried` lists the provider clusters attempted, in order, comma-separated, so a failover shows both. A response the proxy produced itself (for example a timeout) has no `x-llmproxy-provider`. Values are provider names only, never a host, a credential or tenant data. Off by default, because it shows callers the operator's routing."
+        },
         "access_logs": {
           "type": "object",
           "description": "Where and how per-request/per-session access log entries are written.",

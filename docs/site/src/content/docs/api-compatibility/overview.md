@@ -4,20 +4,41 @@ description: "Which provider APIs llm-proxy forwards, what it changes in a reque
 summary: Reference for the passthrough model, the supported API families,
   endpoints the proxy answers itself, streaming, credentials, model names, and
   limitations.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - getting-started/connect-your-application
-  - providers-and-routing/providers-and-clusters
+  - api-compatibility/openai-chat-completions
+  - api-compatibility/openai-responses
+  - api-compatibility/anthropic-messages
+  - api-compatibility/realtime
+  - api-compatibility/errors
+  - providers/overview
   - authentication/virtual-keys
   - providers-and-routing/auto-model
   - limits-and-budgets/token-rate-limiting
 ---
 
-# API compatibility
-
 llm-proxy forwards requests to a provider. It does not translate them. A client
 that speaks a provider's API keeps speaking that API through the proxy. For
-client setup, see [Connect your application](../../getting-started/connect-your-application/).
+client setup, see
+[Connect your application](/docs/llm-proxy/getting-started/connect-your-application/).
+
+## At a glance
+
+- **Default behavior:** the proxy reads the JSON `model` field, picks a
+  provider, and forwards the request. It does not change the response.
+- **Failure mode:** authentication and model access fail closed. A request
+  for an endpoint that the proxy cannot meter fails closed when a budget or
+  limit applies. A response whose usage the proxy cannot read fails open for
+  token limits, with a warning.
+
+| Page | What it covers |
+| --- | --- |
+| [OpenAI Chat Completions](/docs/llm-proxy/api-compatibility/openai-chat-completions/) | `POST .../chat/completions`: routing, streaming usage, usage fields. |
+| [OpenAI Responses](/docs/llm-proxy/api-compatibility/openai-responses/) | `POST .../responses`: routing and metering. |
+| [Anthropic Messages](/docs/llm-proxy/api-compatibility/anthropic-messages/) | `POST .../messages`: headers, client authentication, metering. |
+| [Realtime](/docs/llm-proxy/api-compatibility/realtime/) | WebSocket sessions on `.../realtime`. |
+| [Errors](/docs/llm-proxy/api-compatibility/errors/) | Every reply that the proxy makes itself. |
 
 ## Passthrough model
 
@@ -44,8 +65,34 @@ record.
 | OpenAI Embeddings | `POST .../embeddings` | Metered. |
 | Anthropic Messages | `POST .../messages` | Metered. The proxy does not add `stream_options`. |
 
-The proxy recognizes `POST .../messages/count_tokens` and treats it as free. It
-recognizes image and audio endpoints, but it does not meter them.
+The proxy recognizes `POST .../messages/count_tokens` as free. A free path
+costs nothing, so no budget or limit refuses it.
+
+A WebSocket session on a path that ends in `/realtime` is also metered. See
+[Realtime](/docs/llm-proxy/api-compatibility/realtime/).
+
+### What each control counts
+
+| Endpoint | Token limit | Spend budget |
+| --- | --- | --- |
+| Chat Completions, Completions, Responses, Messages, Embeddings | Counts tokens. | Counts cost. |
+| Realtime session | Counts tokens. | Counts cost. |
+| Image generation, image edits, speech, transcription, translation | Refuses the request. | Counts cost, if the proxy can count the request. |
+| `GET /v1/models`, `GET /v1/usage`, `POST .../messages/count_tokens` | Allows the request. | Allows the request. |
+| Every other path | Refuses the request. | Refuses the request. |
+
+A control refuses a path only if it applies to the caller. See
+[Other paths](#other-paths).
+
+Image generation, image edits, speech, transcription and translation
+(`POST .../images/generations`, `.../images/edits`, `.../audio/speech`,
+`.../audio/transcriptions`, `.../audio/translations`) are metered for spend
+budgets, in provider units: images, characters or audio duration, or tokens
+when the provider reports them. A budget refuses a request whose cost the
+proxy cannot count from its shape, such as a translation without
+`response_format: verbose_json`. Token limits count tokens only, so they
+refuse these endpoints. See
+[Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/).
 
 ## Endpoints the proxy answers
 
@@ -60,7 +107,7 @@ The model list uses the OpenAI list shape. Each entry has `id`, `object:
 ## Other paths
 
 The proxy forwards every other path to the provider the model selects. This
-includes files, batches, images, and audio. The proxy does not meter these
+includes files, batches and image variations. The proxy does not meter these
 paths. Two controls change what happens:
 
 - **Budget or limit.** If a spend budget or token limit applies to the caller,
@@ -77,6 +124,19 @@ A request with no JSON `model`, such as a `GET` or a multipart upload, gets
 `tenants_without_policy` is `allow`.
 
 ## Request bodies
+
+The proxy reads the `model` field from a body that has a JSON content type
+(`application/json`). It scans the first 64 KiB of the body. If it does not
+find a `model` there, it treats the request as having no model. The request
+then follows the `*` rule, or gets the `404` `model_not_found` reply. A body
+with another content type, such as `text/plain`, also has no model. A
+`multipart/form-data` body (transcription, translation, image edits) is read
+for its `model` part.
+
+Before the proxy forwards a request, it checks the whole buffered body against
+the model it routed on. A body with a repeated `model` key, or a `model` that
+differs from the routed model, gets `400`. See
+[Errors](/docs/llm-proxy/api-compatibility/errors/).
 
 The proxy buffers the whole request body. The limit is
 `listen.max_request_body_bytes`. The default is 1048576 bytes (1 MiB). A larger
@@ -120,7 +180,7 @@ Two kinds of key exist. They never travel together.
 After authentication, the proxy removes the inbound `Authorization` header. The
 virtual key never reaches any provider. The provider key comes from the
 cluster, so the provider the proxy selects decides which key it sends. See
-[Virtual keys](../../authentication/virtual-keys/).
+[Virtual keys](/docs/llm-proxy/authentication/virtual-keys/).
 
 ## Model names
 
@@ -133,7 +193,7 @@ cluster, so the provider the proxy selects decides which key it sends. See
   The loader warns.
 - `auto` resolves for each tenant. If no rule exists, the proxy returns `400`
   with `no model is configured for` `` `auto` ``. See
-  [The auto model](../../providers-and-routing/auto-model/).
+  [The auto model](/docs/llm-proxy/providers-and-routing/auto-model/).
 - If no rule matches and there is no `*` rule, the proxy returns `404` with the
   type `model_not_found`.
 
@@ -144,7 +204,7 @@ cluster, so the provider the proxy selects decides which key it sends. See
 | Request body | Forwards it unchanged, except for the `model` rewrite and the `stream_options` injection above. |
 | `model` | Rewrites it if a `models:` entry maps it. |
 | `Authorization` | Removes the virtual key and adds the provider credential. |
-| `anthropic-version` | Adds it for `anthropic` providers if the config does not set it. |
+| `anthropic-version` | For `anthropic` providers, sets `2023-06-01` unless `extra_headers` sets a value. It replaces any value the client sent. |
 | `x-llmproxy-model` | Sets it from the body `model` for routing. It removes any value the client sent. |
 | Response body | Passes it through unchanged. |
 
@@ -163,9 +223,12 @@ keeps the client query string.
 
 ## Limitations
 
+See also [Limitations](/docs/llm-proxy/help/limitations/).
+
 - No translation between OpenAI and Anthropic formats.
 - No CORS support. Browser clients cannot call the proxy.
-- Image and audio endpoints are not metered, so a budget or limit refuses them.
+- Image variations are not metered, so a budget or limit refuses them. Image
+  and audio endpoints count toward spend budgets but not token limits.
 - Files and batches are forwarded only when no budget or limit applies, and
   only for the tenant that owns the object.
 - The listener caps the request body (1 MiB by default).
@@ -185,7 +248,11 @@ keeps the client query string.
 - Path rewrites: `crates/proxy-simple-config/src/lower.rs`;
   Vertex and Bedrock paths in `crates/proxy-http/src/router.rs`.
 - Provider header names: `crates/proxy-simple-config/src/lower.rs`;
-  `anthropic-version`: `lower.rs`.
+  `anthropic-version`: `lower.rs` (`provider_headers_to_add`). The router
+  replaces a client header of the same name (`OverwriteIfExistsOrAdd`).
+- Model scan: `crates/proxy-filters/src/body_rewrite_filter.rs` (JSON content
+  type, 64 KiB prefix); body check against the routed model:
+  `reconcile_request_body` in `crates/proxy-http/src/router.rs`.
 - Virtual key header: `crates/proxy-control/src/auth.rs`; test
   `the_virtual_key_never_reaches_any_provider_type`.
 - Body limit: `crates/proxy-http/src/filter_manager.rs`.

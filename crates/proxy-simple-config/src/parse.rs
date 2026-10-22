@@ -6,8 +6,9 @@ use proxy_config::{ConfigError, ConfigFrontEnd, ConfigWarning};
 
 use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
-    is_valid_provider_name, Listen, ListenerSpec, ModelDef, ModelProviderRef, OAuth2JwtBearerDef,
-    Provider, ProviderModelRef, ProviderType, SimpleConfig, SimpleDuration, RESERVED_KEYS,
+    is_valid_provider_name, Listen, ListenerSpec, ModelDef, ModelProviderRef, ModelSelection,
+    OAuth2JwtBearerDef, Provider, ProviderModelRef, ProviderType, SimpleConfig, SimpleDuration,
+    RESERVED_KEYS,
 };
 
 /// Parse dialect YAML from a file.
@@ -444,6 +445,7 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         }
         check_model_weights(name, model, &path)?;
         check_session_affinity(config, model, &path)?;
+        check_selection(model, &path)?;
     }
 
     // Validate model entries first so dialect lookup cannot mask a more
@@ -1170,6 +1172,22 @@ fn check_session_affinity(
             field_path: format!("{field_path}.identity"),
             reason: "an authenticated identity needs the `auth` block; without it no request \
                      carries one"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `models.<name>.selection: latency` only on a weighted alias: without
+/// weights there is no split for latency to bias (AGENTS.md invariant 1).
+fn check_selection(model: &ModelDef, path: &str) -> Result<(), ConfigError> {
+    if model.selection == ModelSelection::Latency
+        && model.providers.iter().all(|entry| entry.weight().is_none())
+    {
+        return Err(ConfigError::InvalidValue {
+            field_path: format!("{path}.selection"),
+            reason: "latency selection biases a weighted split; set `weight` on every entry of \
+                     `providers`"
                 .to_string(),
         });
     }

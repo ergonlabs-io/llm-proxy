@@ -3,13 +3,12 @@ title: Draining and shutdown
 description: "Stop the proxy without dropping in-flight requests: drain on SIGTERM and the shutdown sequence."
 summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
   changes, and what the drain deadline cuts.
-lastUpdated: 2026-10-20
+lastUpdated: 2026-10-21
 related:
   - operations/config-reload
+  - operations/deployment
   - reference/cli
 ---
-
-# Draining and shutdown
 
 Use a drain to stop the proxy without dropping requests that are in flight.
 Send `SIGTERM` or `SIGINT`, or call `POST /drain_listeners`. Both start a drain
@@ -17,12 +16,18 @@ instead of killing the process. No config is needed to enable it. Signal
 handlers are installed before any listener binds, so a signal at startup never
 falls back to the OS default.
 
+## At a glance
+
+- **Default when unset:** `--drain-strategy immediate` and `--drain-time-s 600`.
+- **Failure mode:** a connection that is still open at the deadline is cut.
+  The process exits `0`. A second signal cuts at once and exits `1`.
+
 ## What happens, in order
 
 1. `/ready` on the admin port answers `503 DRAINING` at once. Your load
    balancer or Kubernetes stops sending new traffic.
 2. Every worker closes its listening sockets. New connections are refused.
-   A config reload (SIGHUP or xDS) during the drain does not open them again.
+   A config reload (`SIGHUP`) during the drain does not open them again.
 3. Each HTTP connection is told to close. With `--drain-strategy immediate`
    (the default), this happens to every connection now. With `gradual`, it is
    spread over the window: see [Gradual drain](#gradual-drain). An idle
@@ -39,8 +44,6 @@ falls back to the OS default.
    `error_category: downstream_local_disconnect`. A client that disconnects
    gets `error_category: downstream_remote_disconnect` instead.
 
-TCP proxy connections are not closed early. They run until the window ends.
-
 An upgrade tunnel, for example a WebSocket, counts as an active connection. The
 drain start does not close it. The drain stays open until a peer closes the
 tunnel or the drain deadline passes.
@@ -49,7 +52,7 @@ tunnel or the drain deadline passes.
 
 Behind a load balancer, `immediate` closes every keep-alive connection at the
 same moment, and all clients reconnect at once. Use `--drain-strategy gradual`
-to spread the closes, as Envoy does:
+to spread the closes:
 
 - The proxy tells its HTTP connections to close one at a time, at even
   intervals over the first quarter of `--drain-time-s`. The first one closes at
@@ -58,7 +61,7 @@ to spread the closes, as Envoy does:
 - A request that arrives during the drain can also close its connection after
   its response. The chance starts at 0 at drain start and grows to 1 at the
   deadline.
-- A config reload (SIGHUP or xDS) during a gradual drain still closes every
+- A config reload (`SIGHUP`) during a gradual drain still closes every
   HTTP connection at once, so a rotated provider key is not sent on a
   kept-alive connection.
 
@@ -69,7 +72,7 @@ window.
 ## Access-log lines at exit
 
 The proxy writes access-log lines from background writer threads (see
-[Access logs](../../observability/access-logs/#where-a-line-goes)). After the
+[Access logs](/docs/llm-proxy/observability/access-logs/#where-a-line-goes)). After the
 workers stop, the process waits for those queues to empty. It waits at most
 5 seconds. After a second signal it waits at most 1 second. If a queue is not
 empty at the end, the proxy logs `access-log writers did not drain before the
@@ -99,20 +102,19 @@ the token is unset they answer `403`; a wrong token gets `401`.
 | `POST /drain_listeners` | Starts the same drain as `SIGTERM`. The process keeps running until a signal arrives. |
 
 After `POST /drain_listeners` the process keeps serving in-flight connections
-(HTTP streams and TCP proxy sessions) past `--drain-time-s` until a signal
-arrives. The deadline is enforced only from a signal, which is the point where
-the process exits and cuts whatever is still open. Envoy's server drain
-likewise closes connections only at exit.
+(HTTP streams) past `--drain-time-s` until a signal arrives. The deadline is
+enforced only from a signal, which is the point where the process exits and
+cuts whatever is still open.
 
 `/drain_listeners` accepts `?graceful` and `?inboundonly` and treats both as
 no-ops. Any other query parameter is a `400`.
 
 ## Readiness at startup
 
-`/ready` answers `503 INITIALIZING` until at least one listener is bound. A
-proxy with no listener, for example one that never receives LDS, never becomes
-ready. After a listener binds, `/ready` also waits for clusters that are still
-warming, until `initial_fetch_timeout`.
+`/ready` answers `503 INITIALIZING` until at least one listener is bound.
+After a listener binds, `/ready` also waits for providers that are still
+warming. It waits at most 15 seconds, then answers `200 LIVE` and logs one
+warning. The 15-second limit is fixed. The config file has no field for it.
 
 ## Flags
 
@@ -121,7 +123,15 @@ warming, until `initial_fetch_timeout`.
 | `--drain-time-s` | `600` | Seconds to wait for connections to finish before cutting them. |
 | `--drain-strategy` | `immediate` | `immediate` tells every connection to close at drain start. `gradual` spreads the closes over the window (see [Gradual drain](#gradual-drain)). |
 
-See [CLI reference](../../reference/cli/) for the full flag list.
+See [CLI reference](/docs/llm-proxy/reference/cli/) for the full flag list.
+
+## Limitations
+
+- The proxy has no hot restart. The `--base-id` flag is accepted and ignored.
+- `/drain_listeners` accepts `?graceful` and `?inboundonly`, but they change
+  nothing.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Implementation notes
 
@@ -129,8 +139,7 @@ This section is for maintainers.
 
 - Shutdown sequence and the access-log flush budget: `crates/proxy/src/main.rs`.
 - Drain strategy schedule: `connection_drain_delay` and `drain_close` in
-  `crates/proxy-core/src/drain.rs`; deviations from Envoy are row 1 of
-  `internal-docs/envoy-divergences.md`.
+  `crates/proxy-core/src/drain.rs`.
 - Upgrade tunnel during a drain:
   `an_upgraded_tunnel_survives_drain_start_and_holds_drain_open_until_it_closes`
   in `crates/proxy-core/src/listener_drain_tests.rs`.

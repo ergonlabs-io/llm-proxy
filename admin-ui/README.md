@@ -43,7 +43,28 @@ npm run build
   as is the Overview's `GET /keys` read. Unscoped by default.
 - Request bodies send exactly the documented fields (the server rejects unknown
   fields). The minted key plaintext is shown once in a dialog with a copy button.
-- The Overview tab lists every key (`GET /keys`, bearer-gated: id, tenant,
-  revocation, budget) and every model pattern the config routes on
-  (`GET /models`). Tenants still have no list endpoint: the Tenants tab is
-  lookup-by-id plus create forms, and the Keys tab is mint/revoke/budget forms.
+- Pages: **Get started** (a checklist built from `/ready`, `GET /keys`, `/clusters`,
+  `/models`, `/pricing` and the token counters in `/stats/prometheus`), **Keys**
+  (list, create with optional limits, edit limits, revoke), **Models & pricing**
+  (routing from `/models`, the team's model allow-list, the rate card), and
+  **Billing** (newest billing-ledger entries; read-only, never acknowledges),
+  **Traces** (body-export switch, per-tenant opt-in, counters), and **Advanced**
+  (tenants, clusters and config dump, raw status and stats). Billing and Traces
+  appear only when `/ledger/entries` and `/traces/capture` answer for the token.
+- Gated reads run only after `GET /keys` accepts the token, stop once a token
+  is rejected, and the token field is debounced: the admin server locks a peer
+  out after 10 bad tokens a minute.
+- The Keys page creates keys in the `team` tenant: the admin API reserves
+  `default`. The team model allow-list is written to both `team` and `default`
+  (the tenant of the key `llm-proxy init` configures).
+- Every page stays mounted, so switching pages keeps form input.
+
+## Tests
+
+```sh
+npm test
+```
+
+Pure logic lives in `src/lib/onboarding.ts` and is unit-tested with vitest
+(`src/lib/onboarding.test.ts`). The tests use response bodies captured from a
+starter-config proxy.

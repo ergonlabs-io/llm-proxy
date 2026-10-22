@@ -4,7 +4,7 @@ description: "Call GET /v1/usage to read the token budget that remains for the t
 summary: How an authenticated caller reads the current-window token usage of
   its own tenant, the response fields, the status codes, and what the
   endpoint does not report.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - limits-and-budgets/token-rate-limiting
   - authentication/virtual-keys
@@ -12,33 +12,35 @@ related:
   - configuration/configuration-file
 ---
 
-# Read current usage
-
 `GET /v1/usage` returns the token usage of the tenant that owns the key you
 present. The proxy answers the call itself. It never sends the call to a
 provider. Use it to show a caller how much of its token limit remains in the
 current window, without an operator reading logs.
 
 To set the limits that this endpoint reports, see
-[Configure rate limits](../token-rate-limiting/).
+[Configure rate limits](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/).
+
+## At a glance
+
+- **Default when unset:** the proxy does not answer the call. It routes
+  `GET /v1/usage` as an ordinary request.
+- **Needs:** an `auth:` block and a token limiter in the filter chain.
+- **Failure mode:** fails closed. With no authenticated tenant, the answer is
+  `401`. With a `shared` store that cannot be read, the answer is `503`. The
+  endpoint never answers with a guess.
 
 ## What the endpoint reports
 
-The endpoint reports the standing of the current window. It reports two kinds
-of row:
-
-- Each `limits` entry with `key: tenant` and `tokens_per_minute`. Such a rule
-  does not depend on the route, so its row has `route` set to `*`. A rule
-  with `models` adds its scope to the name, for example
-  `*|models=gpt-4o`. Two rules on the same bucket give one row with the
-  lower limit.
-- The per-route rule of a bootstrap `TokenLimit` (the rule set with
-  `max_tokens` and `fill_rate`). This gives one row for each route.
+The endpoint reports the standing of the current window. It reports each
+`limits` entry with `key: tenant` and `tokens_per_minute`. Such a rule does not
+depend on the route, so its row has `route` set to `*`. A rule with `models`
+adds its scope to the name, for example `*|models=gpt-4o`. Two rules on the
+same bucket give one row with the lower limit.
 
 Entries keyed on `global`, `client-ip`, or a header do not appear. Request
 limits, concurrent-stream limits, and tenant and key limits set through the
 admin API do not appear. To see that usage, read the `429` headers or the
-[access log](../../observability/access-logs/).
+[access log](/docs/llm-proxy/observability/access-logs/).
 
 ## Requirements
 
@@ -48,11 +50,11 @@ Two conditions must be true.
    identity that the `llmproxy.auth` filter verified. Without `auth:`, no
    tenant exists, and the endpoint answers `401`. It never answers `200` on a
    listener with no `auth:` block.
-2. **Put the token limiter in the filter chain.** The endpoint is part of the
-   `llmproxy.token_limit` filter. The dialect adds that filter when the config
-   has a `limits` entry. It also adds the filter when `auth:` is set and
-   `auth.enforce.limits` is `true`. With neither, `GET /v1/usage` is an
-   ordinary request and the proxy does not answer it.
+2. **Have a token limiter.** The endpoint is part of the token limiter. The
+   proxy adds the limiter when the config has a `limits` entry. It also adds
+   the limiter when `auth:` is set and `auth.enforce.limits` is `true`. With
+   neither, `GET /v1/usage` is an ordinary request and the proxy does not
+   answer it.
 
 ### The key scopes the answer
 
@@ -67,8 +69,9 @@ normal request.
 The dialect config below enforces a tenant limit. The endpoint reports it as
 the route `*`.
 
-```yaml
+```yaml title="llmproxy.yaml"
 version: 0
+listen: 127.0.0.1:53421
 auth:
   hmac_secret: ${LLMPROXY_AUTH_SECRET}
   keys:
@@ -88,7 +91,7 @@ routes:
 ```
 
 ```sh
-curl --max-time 5 -s http://127.0.0.1:8080/v1/usage \
+curl --max-time 5 -s http://127.0.0.1:53421/v1/usage \
   -H "Authorization: Bearer llmp_<the key>"
 ```
 
@@ -98,15 +101,6 @@ window:
 
 ```json
 {"routes":[{"limit":100000.0,"remaining":97800.0,"reset_after_seconds":17,"route":"*","used":2200.0}],"tenant":"acme","window":"fixed"}
-```
-
-With the bootstrap in
-[Configure rate limits](../token-rate-limiting/#bootstrap-configuration), a
-tenant `acme` that spent 2,200 of its 100,000 tokens on a route named `chat`
-gets this body:
-
-```json
-{"routes":[{"limit":100000.0,"remaining":97800.0,"reset_after_seconds":17,"route":"chat","used":2200.0}],"tenant":"acme","window":"fixed"}
 ```
 
 The proxy writes the fields in alphabetical order. Parse the response as
@@ -149,18 +143,21 @@ If the store read fails, the endpoint answers `503`. It does not use the
 counters of the replica. A replica that has not served a route would report 0
 for it, and that number is wrong.
 
-## What the endpoint does not do
+## Limitations
 
 - **No history.** It reports only the current fixed window. You cannot ask for
   the usage of an earlier hour or week. A historical export is not available.
 - **No cost.** The response has no dollar or currency field. The rate card
   prices each completed request, and the access log shows the price in
   nanodollars as `%LLM_LIST_COST%`. To total the cost of one tenant, sum
-  `%LLM_LIST_COST%` by `%LLM_TENANT%` in your log pipeline. The rate card is
-  the `pricing` section of the configuration file. See
-  [`pricing`](../../configuration/reference/#pricing). The
-  operators are in the
-  [access log reference](../../observability/access-logs/#the-operator-set).
+  `%LLM_LIST_COST%` by `%LLM_TENANT%` in your log pipeline. See
+  [Pricing and cost tracking](/docs/llm-proxy/limits-and-budgets/pricing-and-cost-tracking/)
+  and the
+  [access log reference](/docs/llm-proxy/observability/access-logs/#the-operator-set).
+  For a dollar total from the proxy, read the spend reports. See
+  [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/).
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Implementation notes
 

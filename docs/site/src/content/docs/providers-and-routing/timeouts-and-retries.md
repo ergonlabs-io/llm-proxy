@@ -3,16 +3,14 @@ title: Timeouts and retries
 description: "Set request and idle timeouts, and configure when llm-proxy retries a failed provider request."
 summary: The timeouts a route and a listener have, exactly which failures
   trigger a retry, and what bounds a slow or silent provider.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
-  - providers-and-routing/providers-and-clusters
+  - providers/overview
   - providers-and-routing/failover-and-aggregates
   - configuration/configuration-file
   - observability/access-logs
   - operations/tls
 ---
-
-# Timeouts and retries
 
 Use these settings to bound a slow or silent provider and to control which
 failures the proxy retries. A route has two independent timeouts, and they
@@ -84,8 +82,7 @@ an idle-based guard is the correct one for the response direction.
 
 `routes[].retries.attempts` (default `1`, maximum `5`) sets how many extra
 attempts a route gets. Every retry in this configuration format's routes
-uses the same fixed trigger set — you cannot widen or narrow it, unlike a
-raw bootstrap configuration's `retry_on`:
+uses the same fixed trigger set. You cannot widen or narrow it:
 
 | Outcome | Retried? |
 |---|---|
@@ -95,7 +92,7 @@ raw bootstrap configuration's `retry_on`:
 | Response status `429` | Yes |
 | Response status `500`, `502`, `503` | Yes |
 | Response status `501`, `504`, or any other status | **No** |
-| Circuit-breaker / queue overflow | Yes (synthesized as a 503) |
+| Provider over its concurrency ceiling (the proxy answers `503` with the flag `UO`) | **No** |
 | Anything after the client has started receiving the stream | Never |
 
 The dialect uses the retry tokens `connect-failure`, `refused-stream`,
@@ -149,85 +146,32 @@ alert that still matches on `502` for this case.
 
 ## Downstream timeouts: how long a client has
 
-The timeouts above bound the provider. Three more bound the client. They
+The timeouts above bound the provider. These bound the client. They
 protect the listener from slow clients. The page
-[Listener TLS and downstream admission](../../operations/tls/) has the full
+[TLS](/docs/llm-proxy/operations/tls/) has the full
 detail.
 
 | Timeout | Field | Default | On expiry |
 |---|---|---|---|
-| TLS handshake | `transport_socket_connect_timeout` (Envoy mode only) | `10s` | The proxy closes the connection. |
 | Request headers | `listen.request_headers_timeout` | `10s` | HTTP/1: the proxy closes the connection, with no `408`. HTTP/2: not enforced. |
 | Whole request | `listen.request_timeout` | `60s` | The proxy answers `408` (`request_overall_timeout`) and closes the HTTP/1 connection. |
-| No activity | `listen.stream_idle_timeout` | `10m` | Before response headers: `408` (`stream_idle_timeout`, flag `SI`). On a route with no `idle_timeout`, also cuts a response body that goes quiet. |
+| No activity | `listen.stream_idle_timeout` | `10m` | Before response headers: `408` (`stream_idle_timeout`, flag `SI`). The route `idle_timeout` bounds the gap between response chunks. |
 | Total life | `listen.max_stream_duration` | none | Before response headers: `504` (flag `UMSDR`). After: the stream ends without a clean finish. |
 
-Set a request timeout to `0s` to disable it. The defaults above are the
-`llmproxy` dialect defaults. A raw bootstrap
-configuration has both HTTP timeouts disabled until it sets them. The
-handshake default of `10s` applies in both front-ends.
+Set a request timeout to `0s` to disable it.
 
 The request timeout stops when the proxy has the whole request body. It does
-not bound the response, so it does not cut a long generation. It also does
-not bound the wait for the provider either: `listen.stream_idle_timeout` does
+not bound the response, so it does not cut a long generation. It does
+not bound the wait for the provider. `listen.stream_idle_timeout` does
 that (see above).
 
 ## Retries and fallbacks share one budget
 
 If a route also has `fallbacks`, the same retry count governs moving to the
 next provider in the chain — see
-[Failover and aggregates](../../providers-and-routing/failover-and-aggregates/)
+[Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/)
 for exactly how `attempts` and the fallback chain interact, and the
 non-obvious case where `attempts: 0` does *not* disable failover.
-
-## Bootstrap configuration
-
-The same engine exposes `per_try_timeout`, a configurable `retry_on` token
-set, `retriable_status_codes`, and a configurable backoff — all reachable
-directly on a raw bootstrap configuration's route `retry_policy`, none of
-them exposed by this configuration format's `routes[].retries`. Raw bootstrap
-routes can also use Envoy's `previous_hosts` retry-host predicate with its
-empty typed config. The router records each dispatched socket address and
-re-runs load balancing up to `host_selection_retry_max_attempts`; if no new
-host is found, the final selection is used, matching Envoy's fallback rather
-than turning a retriable request into `no healthy upstream`. Other retry-host
-predicates are rejected at config load. The `envoy-ratelimited` `retry_on`
-token is also rejected because nothing yet sets the
-`x-envoy-ratelimited` response header it watches for.
-
-### Retry concurrency budget
-
-At the upstream cluster, a raw Envoy bootstrap may set
-`circuit_breakers.thresholds[].retry_budget`. It overrides that threshold's
-fixed `max_retries` cap. The maximum active retries is
-`max(min_retry_concurrency, floor(budget_percent × (active requests + pending requests)))`.
-Omitted fields use Envoy's defaults: 20% and a minimum of 3. Both ordinary
-retries and per-try-timeout hedges consume this same budget.
-
-```yaml
-circuit_breakers:
-  thresholds:
-    - priority: DEFAULT
-      retry_budget:
-        budget_percent: { value: 20.0 }
-        min_retry_concurrency: 3
-```
-
-### `x-envoy-attempt-count`
-
-A raw bootstrap configuration's `VirtualHost` has two more fields with no
-equivalent in this configuration format's schema, both `bool`, both default
-`false`:
-
-| Field | What it does |
-|---|---|
-| `include_request_attempt_count` | Sets `x-envoy-attempt-count` on the request forwarded upstream, to this attempt's own number (`1` on the first try, `2` on the first retry, and so on). |
-| `include_attempt_count_in_response` | Sets `x-envoy-attempt-count` on the response sent to the downstream client, to the *total* number of attempts the request took. |
-
-Both flags are off by default. A retry that lands on a `fallbacks` member (see
-[Failover and aggregates](../../providers-and-routing/failover-and-aggregates/))
-increments the same counter — a fallback attempt is a retry against a
-different member, not a separate count.
 
 ## Implementation notes
 
@@ -256,10 +200,3 @@ This section is for maintainers.
   `crates/proxy-http/tests/response_flags.rs`:
   `an_upstream_that_closes_before_headers_records_503_and_the_uc_flag` and
   `a_garbled_upstream_response_records_and_renders_the_upe_flag`.
-- Attempt-count flags: `RouteEntry::include_request_attempt_count` and
-  `include_attempt_count_in_response` in `crates/proxy-config/src/ir.rs`.
-  Tests in `crates/proxy-http/tests/router_retry.rs`:
-  `attempt_count_request_header_is_1_on_the_first_attempt`,
-  `attempt_count_request_header_increments_on_retry`,
-  `attempt_count_response_header_carries_the_total_attempts_made`, and
-  `attempt_count_headers_are_absent_when_both_flags_are_off`.

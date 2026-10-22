@@ -5,17 +5,16 @@ summary: Opt-in export of request and response bodies for analytics and
   fine-tuning. Covers the two consent switches, what a trace holds, the line
   format, local and S3 storage, sizing, every loss reason and metric, the
   emergency switch, and what is not available.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - observability/overview
   - observability/request-capture
   - observability/metrics-and-stats
-  - observability/admin-endpoints
+  - observability/tracing
+  - administration/admin-api
   - authentication/virtual-keys
   - configuration/reference
 ---
-
-# Request and response body export
 
 Body export writes the raw body of each request and the raw body of its
 response to compressed JSON-lines files. You use the files to analyse agent
@@ -24,7 +23,9 @@ behaviour and to fine-tune your own models. You enable it with the
 
 Body export is not OTLP distributed tracing. Distributed tracing sends spans
 with no bodies to a collector, and you enable it with `observability.tracing`.
-See [Observability overview](../overview/) for the difference. This page uses
+See [Distributed tracing](/docs/llm-proxy/observability/tracing/) and
+[Observability overview](/docs/llm-proxy/observability/overview/) for the
+difference. This page uses
 "trace" only for one exported record, because the config field and the metric
 names use that word.
 
@@ -39,7 +40,16 @@ completions, tool arguments, and any secret inside them go into the files
 unchanged. Protect the directory and the bucket.
 
 For the record that holds no bodies, see
-[Request capture](../request-capture/).
+[Request capture](/docs/llm-proxy/observability/request-capture/).
+
+## At a glance
+
+- **How to turn on**: set `observability.traces`, give the proxy a unique
+  `--service-node`, and opt a tenant in.
+- **Default when unset**: the proxy captures no body.
+- **Failure mode**: fails open. A full queue, a full disk, or a failed upload
+  drops traces and counts them. Forwarding never waits. A consent that cannot
+  propagate fails closed for JWT requests.
 
 ## Two switches, both required
 
@@ -81,7 +91,7 @@ These rules apply to the opt-in:
 - An absent flag is not consent. A new tenant is not opted in.
 - With the default `in_memory` store, the flag resets to off when the proxy
   restarts. Use the `persistent` or `shared` store to keep it. See
-  [Virtual keys](../../authentication/virtual-keys/).
+  [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/).
 - An opt-out reaches the other replicas on their next policy poll. The
   default poll interval is 48 seconds.
 - A request keeps the flag it had when it was admitted. An opt-out does not
@@ -134,8 +144,8 @@ compress, or write. A separate exporter thread does that work.
 
 ```yaml
 version: 0
-listen: 127.0.0.1:8080
-admin: 127.0.0.1:9901
+listen: 127.0.0.1:53421
+admin: 127.0.0.1:53422
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -161,13 +171,13 @@ observability:
 4. Create a tenant, mint a key, and opt the tenant in.
 
    ```bash
-   curl -X POST http://127.0.0.1:9901/tenants \
+   curl -X POST http://127.0.0.1:53422/tenants \
      -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
      -d '{"tenant":"acme"}'
-   curl -X POST http://127.0.0.1:9901/keys \
+   curl -X POST http://127.0.0.1:53422/keys \
      -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
      -d '{"tenant":"acme","key_id":"acme-1"}'
-   curl -X PUT http://127.0.0.1:9901/tenants/acme/trace_export \
+   curl -X PUT http://127.0.0.1:53422/tenants/acme/trace_export \
      -H "authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
      -d '{"schema_version":1,"enabled":true}'
    ```
@@ -177,7 +187,8 @@ observability:
    default), or when the proxy stops. To see a file at once, stop the proxy
    with `SIGTERM`.
 
-The proxy refuses to start in these cases:
+The proxy refuses to start in these cases. The messages name the internal key
+`node.metadata["io.llmproxy.traces"]`, also for a `--config` file:
 
 | Cause | Message starts with |
 |---|---|
@@ -186,34 +197,15 @@ The proxy refuses to start in these cases:
 
 The node id must be 1 to 128 bytes, and not `-`.
 
-The block is fixed at start. A reload that changes it is refused, the proxy
-logs `cannot change on reload`, and the previous configuration keeps serving. Restart the proxy to change it.
-
-### Envoy mode
-
-Envoy mode takes the same fields in `node.metadata["io.llmproxy.traces"]` of
-a `-c` bootstrap. Durations are numbers of seconds. The `s3` field is a
-nested object. `--permissive` does not relax this block. The dialect lowers
-to this key, so the two modes run the same engine.
-
-```yaml
-node:
-  id: proxy-a
-  metadata:
-    io.llmproxy.traces:
-      directory: /var/lib/llmproxy/traces
-      max_disk_bytes: 10737418240
-      max_age: 604800
-```
-
-Envoy mode does not check for an `auth` filter when it loads the block. With
-no `auth` filter, no tenant can opt in, and the block captures nothing.
+The block is fixed at start. A reload that changes it is refused. The proxy
+logs `cannot change on reload`, and the previous configuration keeps serving.
+Restart the proxy to change it.
 
 ## Configuration
 
 All fields are in `observability.traces`. The schema
 (`schema/llmproxy-v0.schema.json`, `$defs/Traces`) and the
-[configuration reference](../../configuration/reference/) are the source for
+[configuration reference](/docs/llm-proxy/configuration/reference/) are the source for
 this table. An unknown field is an error with its full path.
 
 | Field | Type | Default | Required | What it does |
@@ -385,8 +377,8 @@ uploaded.
 
 ```yaml
 version: 0
-listen: 127.0.0.1:8080
-admin: 127.0.0.1:9901
+listen: 127.0.0.1:53421
+admin: 127.0.0.1:53422
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -623,7 +615,7 @@ Each series below is registered at start, so an idle exporter shows zeros.
 On `/stats/prometheus`, the proxy adds the prefix `envoy_`. For example,
 `llmproxy_trace_dropped_total` is `envoy_llmproxy_trace_dropped_total`. These
 metrics are not in `/stats`. See
-[Metrics and /stats](../metrics-and-stats/).
+[Metrics and /stats](/docs/llm-proxy/observability/metrics-and-stats/).
 
 | Metric | Type | Labels | Counts |
 |---|---|---|---|
@@ -777,7 +769,9 @@ user from inside a segment is not supported.
 | Many small objects in the bucket. | More active tenants than `max_open_segments`. | Raise `max_open_segments`. |
 | `llmproxy_trace_upload_failures_total` rises. | The store refuses or is not reachable. | Check the `reason` label, the credentials, the bucket policy, and the endpoint. |
 
-## Not available
+## Limitations
+
+These are not available:
 
 - Metadata export of traces to OTLP or Kafka.
 - Capture of upstream requests and responses.
@@ -785,6 +779,8 @@ user from inside a segment is not supported.
 - Deletion of one user inside a segment.
 - Credentials from an instance role.
 - Direct writes to a warehouse.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Implementation notes
 

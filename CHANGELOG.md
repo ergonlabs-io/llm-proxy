@@ -32,9 +32,41 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
     trace lines, so no schema version changes. It is always `null`.
   - The `proxy-capture-spool` crate stays, with its on-disk format unchanged:
     the billing ledger is built on it.
+- A key budget counts operator spend, and BYOK spend too with
+  `include_byok_in_limit: true`, as on OpenRouter (WP-136, ADR-0007
+  amendment 1). Tenant budgets keep their `credential_source` scope.
+  - `PUT /keys/{id}/budget` takes `include_byok_in_limit` (default `false`)
+    and returns `400` for `credential_source`. `PUT /tenants/{id}/budget`
+    returns `400` for `include_byok_in_limit`.
+  - `GET /keys` (in each `budget`) and `GET /keys/{id}/spend` report
+    `include_byok_in_limit` instead of `credential_source`.
+  - Stored key budgets load with a mapping, so none stops counting what it
+    counted: absent or `platform` becomes `false`; `tenant` becomes `true`,
+    so it now also counts platform spend and applies to platform-mode
+    requests.
+  - A rollback to an earlier build reads a key budget written by this build
+    as platform-scoped.
 
 ### Added
 
+- The admin UI is organised for a small team getting started: a **Get started**
+  checklist (proxy ready, token accepted, provider and route, key, prices,
+  first request) with token usage per tenant; a **Keys** page that lists every
+  key with its model list, spend limit and spend, and creates keys with
+  optional limits; **Models & pricing** with routing, the models the team's
+  keys may use, and a rate-card editor with a template and prices per 1M
+  tokens. Tenants, clusters and raw stats move under **Advanced**. A new key is
+  shown with a ready-to-run curl, Python or Node request. With a `ledger`
+  block, a **Billing** page lists the newest requests from the billing ledger
+  (key, model, provider, status, tokens, charge); with `observability.traces`,
+  a **Traces** page shows the body-export switch, per-tenant opt-in and
+  counters. Each page appears only when its feature is configured.
+- `llm-proxy init` writes an `admin-token` file and prints the admin UI
+  address. The installer uses that token for the service.
+- `GET /models` reports each pattern's `target` cluster and lists path-only
+  routes in `path_routes`, so a catch-all route no longer reads as no routing.
+- The admin server redirects `GET /` to `/ui/` when the UI is loaded. Startup
+  logs the UI address, and warns when `LLMPROXY_ADMIN_TOKEN` is not set.
 - `--drain-strategy gradual` works as in Envoy. During a drain, HTTP connections
   are told to close one at a time over the first quarter of `--drain-time-s`
   instead of all at once, and a request handled during the drain closes its
@@ -58,6 +90,23 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   only that of its aggregate, as Envoy does; an aggregate in front of a
   configured provider is sized to its members' sum so it does not cap them.
   See [Providers and clusters](docs/site/src/content/docs/providers-and-routing/providers-and-clusters.md#concurrency-ceilings).
+- Routing response headers. `observability.routing_headers: true` names the
+  provider cluster that served each response (`x-llmproxy-provider`), the
+  attempt count (`x-envoy-attempt-count`) and the provider clusters tried in
+  order (`x-llmproxy-providers-tried`), on the response head, so streams
+  carry them too. Values are cluster names only. Off by default. Envoy mode:
+  virtual-host metadata `io.llmproxy.routing_headers: { enabled: true }` with
+  `include_attempt_count_in_response` (`internal-docs/envoy-divergences.md`
+  row 49). See the failover guide.
+- Latency-aware selection for weighted models. `models.<name>.selection:
+  latency` multiplies each provider's weight by the fastest provider's
+  average latency divided by its own, between 0.1 and 1, so a slow provider
+  gets less traffic and keeps enough to be measured. The average is per
+  replica and per provider: time to the first event of a stream, time to the
+  full response otherwise, successful responses only. Requests pinned by
+  `session_affinity` keep the plain weights. Envoy mode: route metadata
+  `io.llmproxy.selection: { mode: latency }` on a `weighted_clusters` route
+  (`internal-docs/envoy-divergences.md` row 48). See the load-balancing guide.
 - Session affinity for weighted models. `models.<name>.session_affinity`
   (`header`, `identity: key | user | tenant`) pins a session to one of the
   model's weighted providers, so the provider's prompt cache stays warm: the
@@ -124,6 +173,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- A weighted route no longer draws a member that has no healthy host. Before,
+  in Envoy mode, a `weighted_clusters` member whose hosts were all ejected by
+  outlier detection kept its share, and its requests went to the ejected
+  hosts. Now the draw goes to the other members by their weights. A session
+  pinned by `session_affinity` moves to one fixed substitute, and sessions on
+  other members do not move. When no member has a healthy host, the behavior
+  is as before. Models in the `llmproxy` dialect already passed over an
+  ejected provider (`internal-docs/envoy-divergences.md` row 47).
 - Envoy mode: with `use_remote_address: true` and `xff_num_trusted_hops` of 1 or
   more, `client-ip` limits and `%DOWNSTREAM_REMOTE_ADDRESS%` now use the trusted
   `x-forwarded-for` entry, as Envoy does. Before, they used the TCP peer. An

@@ -4,15 +4,14 @@ description: "Send each request body to an HTTP check that allows or denies the 
 summary: How the top-level `guardrails` block sends request bodies to an
   external HTTP check, the wire format, the failure modes, the status codes
   the client sees, and what the check can and cannot do.
-lastUpdated: 2026-10-19
+lastUpdated: 2026-10-21
 related:
   - configuration/configuration-file
+  - providers-and-routing/auto-model
   - authentication/virtual-keys
   - observability/access-logs
   - observability/metrics-and-stats
 ---
-
-# Request guardrails
 
 A guardrail is an external HTTP service that reads a request body and
 answers `allow` or `deny`. The proxy asks the service before it dials a
@@ -24,10 +23,11 @@ each tenant. The schema is `schema/llmproxy-v0.schema.json` (property
 `guardrails`, and `$defs/Guardrails`, `$defs/GuardrailCheck`,
 `$defs/HttpGuardrail`).
 
-The block lowers to the `llmproxy.guardrail` HTTP filter
-(`type.llmproxy.dev/llmproxy.filters.v0.Guardrail`). In Envoy mode, configure
-that filter directly; its fields are in
-`crates/proxy-api/vendor/llmproxy/filters/v0/guardrail.proto`.
+## At a glance
+
+- **Default when unset:** no `guardrails` block means no request is checked.
+- **Failure mode:** you choose. Each check must set `failure_mode` to `open`
+  or `closed`. There is no default.
 
 ## Read this first
 
@@ -52,7 +52,7 @@ What a guardrail does and does not do:
 - The proxy does not check a request with an empty body.
 - Only an `http` check exists. `http` is the only backend.
 
-## Simple config
+## Example
 
 ```yaml
 version: 0
@@ -111,7 +111,7 @@ The proxy sends `POST <url>` with a JSON object.
 |---|---|
 | `tenant` | The authenticated tenant, or `null`. |
 | `requested_model` | The `model` from the request body, or `null`. |
-| `resolved_model` | The model that [the auto model](../../providers-and-routing/auto-model/) chose, or `null`. |
+| `resolved_model` | The model that [the auto model](/docs/llm-proxy/providers-and-routing/auto-model/) chose, or `null`. |
 | `body` | The request body as text. |
 | `body_base64` | The request body in base64. The proxy sends this key instead of `body` when the body is not UTF-8. |
 
@@ -187,6 +187,14 @@ The proxy checks the block at load time. Each error names its field path.
 ## Observe the checks
 
 Each request that a check decides sets `%LLM_GUARDRAIL%` in the
-[access log](../../observability/access-logs/). The counter
+[access log](/docs/llm-proxy/observability/access-logs/). The counter
 `llmproxy_guardrail_checks_total{scope,outcome}` counts the outcomes. See
-[Metrics and /stats](../../observability/metrics-and-stats/).
+[Metrics and /stats](/docs/llm-proxy/observability/metrics-and-stats/).
+
+## Limitations
+
+- A check allows or denies. It cannot change a request.
+- The proxy checks requests only, not responses.
+- Only the `http` backend exists.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.

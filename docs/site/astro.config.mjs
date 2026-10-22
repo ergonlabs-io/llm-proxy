@@ -11,6 +11,16 @@ export default defineConfig({
 	// per product, so `base` has to match where the built `dist/` is copied to.
 	site: 'https://ergonlabs.io',
 	base: '/docs/llm-proxy',
+	// Slugs that moved in the docs restructure (DOCS_STRUCTURE.md, "moved"),
+	// so inbound links keep working. Sources are relative to `base`; destinations
+	// include it.
+	redirects: {
+		'/providers-and-routing/providers-and-clusters': '/docs/llm-proxy/providers/overview/',
+		'/providers-and-routing/websocket-and-upgrades': '/docs/llm-proxy/api-compatibility/realtime/',
+		'/observability/admin-endpoints': '/docs/llm-proxy/administration/admin-api/',
+		'/authentication/external-authorization': '/docs/llm-proxy/help/limitations/',
+		'/operations/xds-conformance': '/docs/llm-proxy/help/limitations/',
+	},
 	integrations: [
 		starlight({
 			title: 'llm-proxy',
@@ -28,12 +38,9 @@ export default defineConfig({
 				// doc generator. See docs/site/README.md.
 				starlightLlmsTxt(),
 			],
-			// The sidebar spine is specified (WP doc-scaffold) as nine groups.
+			// The sidebar follows docs/site/DOCS_STRUCTURE.md, group for group.
 			// A sidebar entry that points at a page that doesn't exist fails the
-			// build, so a group (or an item within it) stays commented out until
-			// its page lands. Uncomment an item (and add its page under
-			// src/content/docs/<slug>/) as content arrives; keep the group order
-			// and item labels as specified.
+			// build. Change DOCS_STRUCTURE.md in the same commit as this list.
 			sidebar: [
 				// Way back to the site that serves these docs. External links are
 				// left untouched by `base`, so this one is written in full.
@@ -44,55 +51,70 @@ export default defineConfig({
 						{ label: 'Introduction', slug: 'getting-started/introduction' },
 						{ label: 'Quickstart', slug: 'getting-started/quickstart' },
 						{ label: 'Install llm-proxy', slug: 'getting-started/installation' },
+						{ label: 'Core concepts', slug: 'getting-started/core-concepts' },
 						{ label: 'Connect your application', slug: 'getting-started/connect-your-application' },
-						// {
-						// 	label: 'Choosing a config front-end',
-						// 	slug: 'getting-started/choosing-a-config-front-end',
-						// },
+						{ label: 'Coming from LiteLLM or OpenRouter', slug: 'getting-started/coming-from-litellm-or-openrouter' },
+					],
+				},
+				{
+					label: 'Providers',
+					items: [
+						{ label: 'Overview', slug: 'providers/overview' },
+						{ label: 'OpenAI', slug: 'providers/openai' },
+						{ label: 'Anthropic', slug: 'providers/anthropic' },
+						{ label: 'OpenRouter', slug: 'providers/openrouter' },
+						{ label: 'Azure OpenAI', slug: 'providers/azure-openai' },
+						{ label: 'Vertex AI', slug: 'providers/vertex-ai' },
+						{ label: 'Amazon Bedrock', slug: 'providers/amazon-bedrock' },
+						{ label: 'OpenAI-compatible servers', slug: 'providers/openai-compatible' },
+					],
+				},
+				{
+					label: 'API compatibility',
+					items: [
+						{ label: 'Overview', slug: 'api-compatibility/overview' },
+						{ label: 'OpenAI Chat Completions', slug: 'api-compatibility/openai-chat-completions' },
+						{ label: 'OpenAI Responses', slug: 'api-compatibility/openai-responses' },
+						{ label: 'Anthropic Messages', slug: 'api-compatibility/anthropic-messages' },
+						{ label: 'Realtime sessions', slug: 'api-compatibility/realtime' },
+						{ label: 'Errors', slug: 'api-compatibility/errors' },
 					],
 				},
 				{
 					label: 'Configuration',
 					items: [
 						{ label: 'Configuration file', slug: 'configuration/configuration-file' },
-						{ label: 'Field reference', slug: 'configuration/reference' },
-						// { label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
+						{ label: 'Models and routes', slug: 'configuration/models-and-routes' },
+						{ label: 'Strict config mode', slug: 'configuration/strict-config-mode' },
 					],
 				},
 				{
-					label: 'Providers and routing',
+					label: 'Routing and reliability',
 					items: [
-						{ label: 'Providers and clusters', slug: 'providers-and-routing/providers-and-clusters' },
 						{ label: 'Failover and aggregates', slug: 'providers-and-routing/failover-and-aggregates' },
-						{ label: 'The auto model', slug: 'providers-and-routing/auto-model' },
 						{ label: 'Load balancing', slug: 'providers-and-routing/load-balancing' },
+						{ label: 'The auto model', slug: 'providers-and-routing/auto-model' },
 						{ label: 'Timeouts and retries', slug: 'providers-and-routing/timeouts-and-retries' },
-						{ label: 'WebSocket and other upgrades', slug: 'providers-and-routing/websocket-and-upgrades' },
 					],
 				},
 				{
-					label: 'API compatibility',
-					items: [{ label: 'API compatibility', slug: 'api-compatibility/overview' }],
-				},
-				{
-					label: 'Authentication',
+					label: 'Access control',
 					items: [
 						{ label: 'Virtual keys', slug: 'authentication/virtual-keys' },
 						{ label: 'Manage configured virtual keys', slug: 'authentication/managing-secrets' },
 						{ label: 'Tenant provider credentials', slug: 'authentication/tenant-provider-credentials' },
-						{ label: 'External authorization', slug: 'authentication/external-authorization' },
 						{ label: 'Request guardrails', slug: 'authentication/guardrails' },
 					],
 				},
 				{
-					label: 'Limits and budgets',
+					label: 'Limits and spend',
 					items: [
 						{ label: 'Configure rate limits', slug: 'limits-and-budgets/token-rate-limiting' },
-						{ label: 'Read current usage', slug: 'limits-and-budgets/current-usage' },
+						{ label: 'Pricing and cost tracking', slug: 'limits-and-budgets/pricing-and-cost-tracking' },
 						{ label: 'Spend policies', slug: 'limits-and-budgets/spend-policies' },
+						{ label: 'Read current usage', slug: 'limits-and-budgets/current-usage' },
 						{ label: 'Billing ledger', slug: 'limits-and-budgets/billing-ledger' },
 						{ label: 'Chargeback tags', slug: 'limits-and-budgets/chargeback-tags' },
-						// { label: 'Tenants', slug: 'limits-and-budgets/tenants' },
 					],
 				},
 				{
@@ -101,27 +123,45 @@ export default defineConfig({
 						{ label: 'Observability overview', slug: 'observability/overview' },
 						{ label: 'Access logs', slug: 'observability/access-logs' },
 						{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
-						{ label: 'Admin endpoints', slug: 'observability/admin-endpoints' },
-						{ label: 'Request capture', slug: 'observability/request-capture' },
+						{ label: 'Tracing', slug: 'observability/tracing' },
+						{ label: 'Request records', slug: 'observability/request-capture' },
 						{ label: 'Request and response body export', slug: 'observability/trace-export' },
+					],
+				},
+				{
+					label: 'Administration',
+					items: [
+						{ label: 'Admin API', slug: 'administration/admin-api' },
+						{ label: 'Admin UI', slug: 'administration/admin-ui' },
 					],
 				},
 				{
 					label: 'Operations',
 					items: [
+						{ label: 'Deployment', slug: 'operations/deployment' },
 						{ label: 'Share state across replicas', slug: 'operations/running-in-production' },
+						{ label: 'TLS', slug: 'operations/tls' },
 						{ label: 'Reload configuration', slug: 'operations/config-reload' },
 						{ label: 'Draining and shutdown', slug: 'operations/draining-and-shutdown' },
-						{ label: 'xDS conformance (advanced)', slug: 'operations/xds-conformance' },
-						{ label: 'TLS', slug: 'operations/tls' },
 					],
 				},
 				{
 					label: 'Reference',
 					items: [
 						{ label: 'CLI', slug: 'reference/cli' },
-						// { label: 'Config schema', slug: 'reference/config-schema' },
-						// { label: 'Response flags', slug: 'reference/response-flags' },
+						{ label: 'Configuration fields', slug: 'configuration/reference' },
+						{ label: 'Response flags', slug: 'reference/response-flags' },
+						{ label: 'Metrics', slug: 'reference/metrics' },
+						{ label: 'Environment variables', slug: 'reference/environment-variables' },
+						{ label: 'Glossary', slug: 'reference/glossary' },
+					],
+				},
+				{
+					label: 'Help',
+					items: [
+						{ label: 'Troubleshooting', slug: 'help/troubleshooting' },
+						{ label: 'FAQ', slug: 'help/faq' },
+						{ label: 'Limitations', slug: 'help/limitations' },
 					],
 				},
 			],

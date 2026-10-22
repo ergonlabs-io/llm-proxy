@@ -2,17 +2,16 @@
 title: The auto model
 description: "Let a client send model \"auto\" and have the proxy replace it with the model the operator chose for the tenant."
 summary: How the reserved model name `auto` resolves to a real model for each
-  tenant, what the provider and the logs see, and the Envoy-mode filter and
-  its ordering rules.
-lastUpdated: 2026-10-18
+  tenant, which load errors the `auto` block can cause, and what the provider
+  and the logs see.
+lastUpdated: 2026-10-21
 related:
   - configuration/configuration-file
+  - configuration/models-and-routes
   - providers-and-routing/failover-and-aggregates
   - observability/access-logs
   - authentication/virtual-keys
 ---
-
-# The auto model
 
 A client sends `"model": "auto"`. The proxy replaces `auto` with a model
 name that the operator chose for the caller's tenant. The client does not
@@ -21,7 +20,7 @@ provider.
 
 Use `auto` when the operator, not the client, must decide which model a
 tenant gets. To enable it in the `llmproxy` dialect, add a top-level `auto`
-block with a `default` model. See [Simple config](#simple-config).
+block with a `default` model. See [Configure the auto model](#configure-the-auto-model).
 
 `auto` is a model alias, not a provider selector. The resolver picks a model
 name. The `routes` and `models` entries then pick the provider and the
@@ -46,7 +45,7 @@ is dialled.
 The resolver runs at the end of the request body, because the model is read
 from the body. It decides once for each request.
 
-## Simple config
+## Configure the auto model
 
 Use the top-level `auto` key. The schema is `schema/llmproxy-v0.schema.json`
 (property `auto` and `$defs/AutoModel`).
@@ -79,7 +78,7 @@ The `providers` and `routes` fields follow the schema (`$defs/Provider`,
 
 Use `auto.tenants` to give each tenant its own model. The tenant is the
 `tenant` of the `auth.keys` entry (see
-[Virtual keys](../../authentication/virtual-keys/)) that authenticated the request.
+[Virtual keys](/docs/llm-proxy/authentication/virtual-keys/)) that authenticated the request.
 
 ```yaml
 auth:
@@ -132,60 +131,22 @@ served, not `auto`.
 **Logs.** `requested_model` stays `auto`. A new field, `resolved_model`,
 holds the resolved name. It is `-` in a text log, and `null` in a usage
 record, when nothing was resolved. See
-[Access logs](../../observability/access-logs/).
+[Access logs](/docs/llm-proxy/observability/access-logs/).
 
 **Price and budgets.** The proxy prices and authorizes the resolved model.
 
-## Envoy mode
+## Authorization of the resolved model
 
-The filter is `llmproxy.model_resolver`. Its `typed_config` type is
-`llmproxy.filters.v0.ModelResolver`. The `llmproxy` dialect lowers `auto` to
-this filter.
-
-```yaml
-http_filters:
-  - name: llmproxy.auth
-    # ...
-  - name: llmproxy.body_rewrite
-    # ...
-  - name: llmproxy.model_resolver
-    typed_config:
-      "@type": type.llmproxy.dev/llmproxy.filters.v0.ModelResolver
-      rules:
-        default_model: gpt-4o-mini
-        tenants:
-          - tenant: acme
-            model: claude-sonnet
-  - name: llmproxy.model_authz
-    # ...
-```
-
-| Field | Meaning |
-|---|---|
-| `rules.default_model` | The model for an unlisted tenant or no tenant. Empty means no default. |
-| `rules.tenants[].tenant` | Required and unique. Matches the tenant that `llmproxy.auth` wrote. |
-| `rules.tenants[].model` | Required. Must not be `auto` and must not contain `*`. |
-
-Exactly one resolver branch must be set. The only branch is `rules`.
-
-### Filter order
-
-The proxy checks the order at load time. A wrong order is a load error.
-
-- `llmproxy.auth` must come before `llmproxy.model_resolver`.
-- `llmproxy.body_rewrite` must come before `llmproxy.model_resolver`.
-- `llmproxy.model_resolver` must come before `llmproxy.model_authz`.
-- `llmproxy.body_rewrite` is required. Without it the load fails.
-
-`llmproxy.model_authz` authorizes the resolved model, not `auto`. The
-resolver never widens a grant. The simple config does not
-emit `model_authz`, so this applies in Envoy mode only.
+With `auth` set and `auth.enforce.model_policy` on (the default), the proxy
+authorizes the resolved model, not `auto`. A tenant limited to `gpt-4*` can use
+`auto` only while `auto` resolves inside that grant. The resolver never widens
+a grant. The proxy runs the resolver before the model policy check.
 
 ## Limits of this feature
 
 - The rules are static. Change them, then reload the config.
-- There is no external resolver. The proto has a `oneof` for one later, but
-  `rules` is the only branch.
+- There is no external resolver. The rules in the `auto` block are the only
+  source.
 - The rule key is the tenant only. The resolver does not read the user, the
   prompt, or a header.
 
@@ -198,8 +159,10 @@ This section is for maintainers.
   `crates/proxy-api/vendor/llmproxy/filters/v0/model_resolver.proto`.
 - Dialect lowering: `model_resolver_typed_config` in
   `crates/proxy-simple-config/src/lower.rs`. Load checks: `validate_auto` in
-  `crates/proxy-simple-config/src/parse.rs`. Envoy filter order:
-  `check_lane_h_filter_order` in `crates/proxy-config/src/lower.rs`.
+  `crates/proxy-simple-config/src/parse.rs`. The check that the resolver runs
+  after `llmproxy.auth` and `llmproxy.body_rewrite` and before
+  `llmproxy.model_authz`: `check_lane_h_filter_order` in
+  `crates/proxy-config/src/lower.rs`.
 - Body rewrite: `rewrite_cluster_provider_model` in
   `crates/proxy-http/src/router.rs`. Pricing model:
   `StreamInfo::routing_model` in `crates/proxy-http/src/stream_info.rs`.

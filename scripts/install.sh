@@ -272,7 +272,13 @@ init_config() {
   # cannot manage anything. Generate one per install and keep it.
   NEW_TOKEN=false
   if [ ! -f "$ENV_FILE" ]; then
-    token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    # `llm-proxy init` writes an admin token next to the config; reuse it so
+    # the file and the service agree on one token.
+    if [ -f "${DATA_DIR}/admin-token" ]; then
+      token="$(head -c 64 "${DATA_DIR}/admin-token")"
+    else
+      token="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    fi
     [ "${#token}" -eq 64 ] || die "could not generate an admin token"
     (umask 077 && printf 'LLMPROXY_ADMIN_TOKEN=%s\n' "$token" >"$ENV_FILE")
     NEW_TOKEN=true

@@ -3,24 +3,42 @@ title: Access logs
 description: "Write one access log line per request, with token counts, timing, tenant, and selected provider."
 summary: The format-string engine behind observability.access_logs, the
   operators it supports, and when a line is written.
-lastUpdated: 2026-10-18
+lastUpdated: 2026-10-21
 related:
   - observability/overview
   - configuration/configuration-file
   - observability/metrics-and-stats
+  - reference/response-flags
+  - reference/metrics
 ---
 
-# Access logs
+## At a glance
+
+- **How to turn on**: set `observability.access_logs`.
+- **Default when unset**: the proxy writes no access log. When you set the
+  block and omit `output`, the destination is `stdout` and the format is
+  `text`.
+- **Failure mode**: fails open. A full queue or a broken destination never
+  fails a request. The proxy drops the line and counts it.
 
 Configure `observability.access_logs` to have llm-proxy write one line per
 completed request. If you omit it, the proxy writes no access log. There is
 no default destination.
 
-```yaml
+```yaml title="llmproxy.yaml"
+version: 0
+listen: 127.0.0.1:53421
+admin: 127.0.0.1:53422
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+routes:
+  - model: "*"
+    provider: openai
 observability:
   access_logs:
     output: stdout    # stdout, stderr, or a file path
-    format: json       # text (default) or json
+    format: json      # text (default) or json
 ```
 
 ## When a line is written
@@ -44,8 +62,7 @@ body.
 
 The default. One line per request. The `llmproxy` config file does not let
 you supply your own format string: it offers only `text` and `json`, and both
-use a fixed format. In Envoy mode you can set `log_format` yourself. See
-[Envoy mode](#envoy-mode-log_format).
+use a fixed format.
 
 The fixed text format of the `llmproxy` config file is:
 
@@ -93,7 +110,7 @@ Both fixed formats include `%LLM_CREDENTIAL_SOURCE%`, `%LLM_SERVED_MODEL%`,
 `%LLM_USAGE_COMPLETENESS%`, `%LLM_COST_KIND%`, and `%LLM_UPSTREAM_ID%`. Only the
 JSON format includes `%LLM_UPSTREAM_USAGE%`, because raw JSON breaks the
 quoting of the text line.
-See [Tenant provider credentials](../../authentication/tenant-provider-credentials/#access-log).
+See [Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/#access-log).
 
 ## JSON format
 
@@ -119,7 +136,7 @@ The fixed JSON format of the `llmproxy` config file has these keys:
 | `request_id` | `%REQ(X-REQUEST-ID)%` |
 | `authority` | `%REQ(:AUTHORITY)%` |
 | `upstream_host` | `%UPSTREAM_HOST%` |
-| `client_address` | `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%`: the client address, without the port. Behind [`listen.trusted_hops`](../../configuration/reference/#listener), it is the address from `x-forwarded-for` that the trusted proxies vouch for. |
+| `client_address` | `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%`: the client address, without the port. Behind [`listen.trusted_hops`](/docs/llm-proxy/configuration/reference/#listener), it is the address from `x-forwarded-for` that the trusted proxies vouch for. |
 | `selected_provider` | `%UPSTREAM_CLUSTER%` |
 | `llm_input_tokens`, `llm_cached_tokens`, `llm_cache_creation_tokens`, `llm_output_tokens`, `llm_total_tokens` | The matching `%LLM_*_TOKENS%` operators |
 | `llm_input_image_tokens`, `llm_output_image_tokens`, `llm_input_audio_tokens`, `llm_output_audio_tokens` | The matching `%LLM_*_IMAGE_TOKENS%` and `%LLM_*_AUDIO_TOKENS%` operators |
@@ -144,22 +161,11 @@ The text format uses the same names without the `llm_` prefix for `key_id`,
 `llm_usage_completeness`, `llm_cost_kind`, and `llm_upstream_id` are the same
 in both formats.
 
-### Envoy mode: `log_format`
-
-In Envoy mode, the file, stdout, and stderr access loggers accept `log_format`
-with `text_format` or `json_format`. If you omit `log_format`, the logger uses
-Envoy's default format. `text_format_source` is not implemented. Any operator in the table below is valid in
-`log_format`.
-
 ## The operator set
 
-The table below documents every operator the engine understands. Use it to
-read the two fixed formats above field by field. In Envoy mode you can build
-your own format string from these operators.
-The proxy resolves every operator once, at config-load time, into a
-pre-built list. It does not parse the format again for each request. An
-unknown `%OPERATOR%` is a load error. The proxy never drops it silently or
-writes it as literal text.
+The table below documents every operator in the two fixed formats above. Use
+it to read a line field by field. The proxy resolves every operator once, at
+config-load time. It does not parse the format again for each request.
 
 | Operator | Renders |
 |---|---|
@@ -175,7 +181,7 @@ writes it as literal text.
 | `%COMMON_DURATION(START:END)%` / `%COMMON_DURATION(START:END:PRECISION)%` | The time from time point `START` to time point `END`. `PRECISION` is `ms` (the default), `us`, or `ns`; the value is truncated, not rounded. `-` when the request did not reach one of the two points, or when `END` is before `START`. See [Request phases](#request-phases). |
 | `%BYTES_RECEIVED%` / `%BYTES_SENT%` | Request/response body byte counts. |
 | `%UPSTREAM_HOST%` / `%UPSTREAM_CLUSTER%` | The dialed upstream host and the cluster it belongs to. |
-| `%DOWNSTREAM_REMOTE_ADDRESS%` | The client address. It is the TCP peer address and port, except behind trusted hops (`listen.trusted_hops`, or `xff_num_trusted_hops` in Envoy mode): then it is the address from `x-forwarded-for` that the trusted proxies vouch for, with port `0`, as in Envoy. |
+| `%DOWNSTREAM_REMOTE_ADDRESS%` | The client address. It is the TCP peer address and port, except behind trusted hops (`listen.trusted_hops`): then it is the address from `x-forwarded-for` that the trusted proxies vouch for, with port `0`, as in Envoy. |
 | `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%` | The same address without the port. |
 | `%LLM_INPUT_TOKENS%` / `%LLM_CACHED_TOKENS%` / `%LLM_CACHE_CREATION_TOKENS%` / `%LLM_OUTPUT_TOKENS%` / `%LLM_TOTAL_TOKENS%` | Token counts from the provider's own usage report. `-` when the provider reported none. It is never `0` in that case. |
 | `%LLM_INPUT_IMAGE_TOKENS%` / `%LLM_OUTPUT_IMAGE_TOKENS%` / `%LLM_INPUT_AUDIO_TOKENS%` / `%LLM_OUTPUT_AUDIO_TOKENS%` | Image or audio tokens that the provider counted inside the input or output tokens. They are part of those counts, not extra tokens. `-` when the provider reported no tokens. `0` when it reported tokens and none were of this kind. |
@@ -189,12 +195,12 @@ writes it as literal text.
 | `%LLM_MAX_STALL%` | The largest gap between two consecutive response chunks, in milliseconds — the tail of the per-token latency distribution, not the mean. |
 | `%LLM_RESPONSE_CHUNKS%` | Number of response body chunks observed. |
 | `%LLM_TENANT%` | The authenticated tenant id the auth filter resolved. `-` when the request is not authenticated. |
-| `%LLM_CREDENTIAL_SOURCE%` | The source of the last provider credential applied to this request: `platform` (the operator's) or `tenant` (the tenant's own key). `-` when no credential was applied, for example after a `403 tenant_credential_missing`. See [Tenant provider credentials](../../authentication/tenant-provider-credentials/#access-log). |
+| `%LLM_CREDENTIAL_SOURCE%` | The source of the last provider credential applied to this request: `platform` (the operator's) or `tenant` (the tenant's own key). `-` when no credential was applied, for example after a `403 tenant_credential_missing`. See [Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/#access-log). |
 | `%LLM_KEY_ID%` | The `key_id` of the credential the auth filter resolved. This is the key's configured identifier, not the key itself. `-` when the request is not authenticated. |
-| `%LLM_USER_ID%` | Always `-` in this release. The proxy does not publish an authenticated user, so there is no value to render. |
+| `%LLM_USER_ID%` | The user identity that the auth filter resolved. For a virtual key it is the key ID, because one key is one user. For a JWT it is the synthetic key ID, and only when the JWT config names a subject claim. `-` when the request is not authenticated. |
 | `%LLM_REQUESTED_MODEL%` | The `model` value the body-rewrite filter read from the request body, before any provider model mapping. `-` when no filter set it. |
-| `%LLM_RESOLVED_MODEL%` | The model a resolver chose when the requested model was `auto` (see [The auto model](../../providers-and-routing/auto-model/)). `-` when nothing was resolved. Takes no argument. `%LLM_REQUESTED_MODEL%` stays `auto`. |
-| `%LLM_GUARDRAIL%` | The outcome of the request guardrail: `allowed`, `denied`, `error`, `timeout`, `over_limit`, or `failure_mode_allowed`. `-` when no guardrail checked the request. See [Request guardrails](../../authentication/guardrails/). |
+| `%LLM_RESOLVED_MODEL%` | The model a resolver chose when the requested model was `auto` (see [The auto model](/docs/llm-proxy/providers-and-routing/auto-model/)). `-` when nothing was resolved. Takes no argument. `%LLM_REQUESTED_MODEL%` stays `auto`. |
+| `%LLM_GUARDRAIL%` | The outcome of the request guardrail: `allowed`, `denied`, `error`, `timeout`, `over_limit`, or `failure_mode_allowed`. `-` when no guardrail checked the request. See [Request guardrails](/docs/llm-proxy/authentication/guardrails/). |
 | `%LLM_SELECTED_MODEL%` | The model name sent to the provider that served the response, after any provider model mapping. If no mapping matches, it is the requested model. `-` when there is no requested model. |
 | `%LLM_RATE_CARD_VERSION%` | The version of the rate card used for `%LLM_LIST_COST%`. `-` when no list cost was computed. |
 | `%LLM_USAGE_COMPLETENESS%` | `complete`, or `partial` for a stream cut off before the provider's final usage (its tokens and cost are then estimates). `-` when no usage filter ran. |
@@ -242,36 +248,12 @@ no route, has no upstream points.
 A response that does not end correctly has no `DS_TX_END`. For example, the
 client disconnects, or the provider resets the stream.
 
-Envoy accepts other names as custom points that a filter sets. No filter in
-this proxy sets a custom point, so a name that is not in the table above is a
-config error.
-
 ## Response flags
 
-`%RESPONSE_FLAGS%` renders zero or more of these short codes, comma-joined:
-
-| Code | Meaning |
-|---|---|
-| `UH` | No healthy upstream host in the cluster. |
-| `UF` | Upstream connection failure. |
-| `UO` | Upstream overflow (circuit breaker open). |
-| `NR` | No route matched. |
-| `URX` | Upstream retry limit exceeded. |
-| `NC` | Matched route's cluster not found. |
-| `DC` | Downstream connection terminated. |
-| `LH` | Local service failed health check. |
-| `UT` | Upstream request timeout. |
-| `LR` | Connection local reset. |
-| `UR` | Upstream remote reset. |
-| `UC` | Upstream connection terminated. |
-| `RL` | Rate limited locally. |
-| `UAEX` | Unauthorized by external authorization service. |
-| `RLSE` | Rate limit service error. |
-| `IH` | Invalid request header (strict header check). |
-| `SI` | Stream idle timeout. |
-| `DPE` | Downstream protocol error. |
-| `UPE` | Upstream protocol error. |
-| `UMSDR` | Upstream request reached max stream duration. |
+`%RESPONSE_FLAGS%` renders zero or more short codes, joined with `,` in the
+order the proxy set them, for example `UF,URX`. It renders `-` if no flag was
+set. For the meaning of each code and the codes that the proxy never sets,
+see [Response flags](/docs/llm-proxy/reference/response-flags/).
 
 ## Where a line goes
 
@@ -292,14 +274,28 @@ Each dropped line adds 1 to `llmproxy_access_log_dropped_lines`. This counter
 appears on `/stats/prometheus` and in OTLP export. It does not appear on
 `/stats`. The proxy also logs a warning that names the destination. It logs at
 most one such warning every 5 seconds. See
-[Metrics and /stats](../../observability/metrics-and-stats/#telemetry-health-metrics).
+[Metrics and /stats](/docs/llm-proxy/observability/metrics-and-stats/#telemetry-health-metrics).
 
 At shutdown the proxy flushes the queues that still hold lines. It waits at most
-5 seconds. See [Draining and shutdown](../../operations/draining-and-shutdown/#access-log-lines-at-exit).
+5 seconds. See [Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/#access-log-lines-at-exit).
 
 A broken destination (disk full, a deleted stdout pipe) never fails a request.
-The writer thread swallows the write error. It logs a warning at most once every
-5 seconds, so a failing destination does not become a performance problem.
+The writer thread does not retry the line. Each failed write adds 1 to
+`llmproxy_access_log_write_failures`. The writer logs a warning at most once
+every 5 seconds, so a failing destination does not become a performance
+problem.
+
+## Limitations
+
+- The `llmproxy` config file has no field for a custom format string. It
+  offers only the two fixed formats.
+- The proxy has no access-log sampling and no filter by status. It writes one
+  line for each request.
+- The proxy writes one destination. The `observability.access_logs` block has
+  one `output`.
+- Delivery is best effort. A full queue drops the new line.
+
+See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 ## Implementation notes
 
@@ -309,11 +305,10 @@ For maintainers. Each behavior above has this source.
   rendering: `render_json` in the same file.
 - Fixed formats: `ACCESS_LOG_TEXT_FORMAT` and `lower_access_log` in
   `crates/proxy-simple-config/src/lower.rs`.
-- Envoy mode `log_format`: `FileAccessLog`, `StdoutAccessLog`,
-  `StderrAccessLog`, and `convert_substitution_format` in
-  `crates/proxy-config/src/lower.rs`.
 - Operator resolution: `crates/proxy-observability/src/access_log.rs`.
 - Response flags: `crates/proxy-observability/src/flags.rs`.
+- Write failure counter: `ACCESS_LOG_WRITE_FAILURES` in
+  `crates/proxy-observability/src/stats.rs`.
 - Queue, size limit, path keys, and warning rate limit: `QueuedSink`,
   `QUEUE_MAX_BYTES`, `canonical_key`, and `RateLimiter` in
   `crates/proxy-observability/src/sink.rs`.
