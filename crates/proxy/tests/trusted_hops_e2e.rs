@@ -116,6 +116,43 @@ fn zero_trusted_hops_keys_on_the_peer_and_leaves_x_forwarded_for_alone() {
     proxy.finish(&dir);
 }
 
+/// S9: `x-envoy-*` request headers are trusted only from an internal source.
+/// A request relayed by more than one hop is external, so a client's forged
+/// `x-envoy-attempt-count` never reaches the provider. The same headers from
+/// an internal source (a private peer, one forwarded entry) pass, which shows
+/// the external case is stripped by the S9 rule and not lost on the way.
+#[test]
+fn an_external_clients_x_envoy_headers_do_not_reach_the_provider() {
+    start_away_from_a_window_edge();
+    let dir = scratch_dir("x-envoy");
+    let (upstream, heads) = spawn_upstream();
+    let proxy = Proxy::dialect(&dir, upstream, Some(1));
+    let forged = [
+        ("x-envoy-attempt-count", "7"),
+        ("x-envoy-client-probe", "1"),
+    ];
+
+    let external = [("x-forwarded-for", "198.51.100.66, 203.0.113.1")];
+    assert_admitted(&chat(&proxy, &[&external[..], &forged[..]].concat()));
+    let internal = [("x-forwarded-for", "203.0.113.2")];
+    assert_admitted(&chat(&proxy, &[&internal[..], &forged[..]].concat()));
+
+    let seen: Vec<String> = heads.try_iter().collect();
+    assert_eq!(seen.len(), 2, "{seen:#?}");
+    for (head, kept) in seen.iter().zip([false, true]) {
+        for (name, value) in forged {
+            assert_eq!(
+                head.lines()
+                    .any(|line| line.trim_end() == format!("{name}: {value}")),
+                kept,
+                "{name} {} reach the provider:\n{head}",
+                if kept { "must" } else { "must not" }
+            );
+        }
+    }
+    proxy.finish(&dir);
+}
+
 /// Envoy mode resolves the same address from `use_remote_address` and
 /// `xff_num_trusted_hops`, and `%DOWNSTREAM_REMOTE_ADDRESS%` renders it with
 /// port 0, as Envoy does for an address taken from `x-forwarded-for`.

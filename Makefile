@@ -172,6 +172,8 @@ endif
 .PHONY: lint
 lint: ## Clippy with warnings denied (what CI enforces)
 	cargo clippy --workspace --all-targets -- -D warnings
+	# The optional allocator is off by default, so lint its build too.
+	cargo clippy -p proxy --features mimalloc -- -D warnings
 
 .PHONY: ci
 ci: ## Everything CI runs: format check, lint, citations, tests (incl. schema gate), doctests, dep audit, config reference, black-box QA
@@ -179,6 +181,8 @@ ci: ## Everything CI runs: format check, lint, citations, tests (incl. schema ga
 	@$(MAKE) version-check
 	@$(MAKE) citations-check
 	cargo clippy --workspace --all-targets -- -D warnings
+	# The optional allocator is off by default, so lint its build too.
+	cargo clippy -p proxy --features mimalloc -- -D warnings
 	cargo nextest run --workspace
 	@$(MAKE) tq-doc
 	@$(MAKE) deps-check

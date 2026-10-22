@@ -13,6 +13,26 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Breaking
 
+- Provider credential and extra header values are checked when the config
+  loads. Before, a value the proxy could not send was dropped on every request
+  with a warning, so the provider call went out without its credential.
+  - `--config`: an `api_key`, `api_key_file` contents, or `extra_headers`
+    name or value that is not valid HTTP fails at
+    `providers.<name>.api_key`, `providers.<name>.api_key_file`, or
+    `providers.<name>.extra_headers.<key>`. The error never shows the value.
+  - `extra_headers` refuses `host` and the provider's own credential header
+    when `api_key`/`api_key_file` or a Vertex or Bedrock credential also sets
+    it. Before, the later value replaced the other without a word.
+  - A `${VAR}` whose value holds a control character now fails naming the
+    variable, instead of a YAML byte position.
+  - Envoy mode: an invalid `key` or `value` under
+    `metadata.filter_metadata["io.llmproxy.provider_auth"].headers[i]` is a
+    load error, or a NACK over xDS, at that path.
+  - A `SIGHUP` reload with such a value is refused, and the previous config
+    keeps serving with the previous key.
+  - A route-level `request_headers_to_add` entry the proxy cannot send is
+    still dropped, but now logs one error naming the header, not one warning
+    per request.
 - The capture agent is retired. Use [trace export](docs/site/src/content/docs/observability/trace-export.md)
   for bodies and `--request-records-file` for request metadata records.
   - The `llm-capture-agent` binary is no longer in the release tarballs or
@@ -214,6 +234,30 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   bytes still go straight through (`internal-docs/envoy-divergences.md` row 44). A
   listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
   buffer response bytes.
+
+### Fixed
+
+- JWT `discovery_url` key refresh reached only one worker. The other workers
+  kept the keys they started with, and after a SIGHUP reload no worker got
+  refreshed keys. When the identity provider rotated its signing key, most
+  requests got 401; with no seed keys, they got 401 from the start (WP-140).
+  All workers now share one refreshed key set per provider, and a reload keeps
+  it and its refresh.
+- A provider that sent `503` or `429` headers and then stalled its body held up
+  failover until the stream idle timeout (10 minutes in the dialect), and held
+  its `max_requests` permit for that time (WP-150). The next attempt now
+  releases that permit first, waits at most 250 ms for the failed body, and
+  otherwise closes the connection (`internal-docs/envoy-divergences.md` row 50).
+  When no member is left and the last provider's answer is returned, it keeps
+  that provider's permit until its body ends.
+- Router local replies (no route, `403 tenant_credential_missing`, a `400`
+  request-field refusal, direct responses and redirects) are recorded with
+  termination `local_reply`, not `complete`. The "local 503 response" warning
+  no longer fires for a provider's own `503`.
+- `x-envoy-*` request headers from an external client no longer reach the
+  provider (envoy-semantics.md S9). A request is external when it comes from a
+  public address or carries more than one `x-forwarded-for` entry
+  (`internal-docs/envoy-divergences.md` row 51).
 
 ## [0.6.1] - 2026-10-20
 

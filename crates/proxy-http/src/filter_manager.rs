@@ -736,6 +736,14 @@ impl StreamHandler for FilterChainHandler {
                 None => req.downstream.remote.to_string(),
             };
 
+            // S9: `x-envoy-*` request headers are control headers this proxy
+            // trusts only from an internal source. An external client's are
+            // dropped before any filter, the router or the provider sees them
+            // (`internal-docs/envoy-divergences.md` row 51). Decided on the
+            // headers as they arrived, before `apply_xff` adds the peer.
+            if !crate::headers::is_internal_request(&req.head.headers, req.downstream.remote.ip()) {
+                crate::headers::strip_envoy_headers_from_external(&mut req.head.headers);
+            }
             // S9: apply `x-request-id` before the decode filter chain runs, so
             // every decode filter (and the router terminal) observes it. Runs
             // ahead of `FilterManager` construction rather than as a filter

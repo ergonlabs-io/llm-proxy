@@ -218,6 +218,40 @@ static_resources:
     );
 }
 
+/// A header the router cannot send fails at load rather than being dropped on
+/// every request, which would send the provider call without its
+/// credential. Neither error renders the value.
+#[test]
+fn header_entry_the_router_cannot_send_is_a_hard_error() {
+    let entry = "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.provider_auth\"].headers[0]";
+    for (header, field) in [
+        (r#"{ key: "x org", value: "sk-metadata-secret" }"#, "key"),
+        (
+            r#"{ key: authorization, value: "Bearer sk-metadata-secret\u0001" }"#,
+            "value",
+        ),
+    ] {
+        let yaml = format!(
+            r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.provider_auth:
+            headers:
+              - {header}
+"#
+        );
+        let err = snapshot_from(&yaml).expect_err("an unsendable header must fail");
+        assert_eq!(err_path(&err), format!("{entry}.{field}"));
+        assert!(
+            !err.to_string().contains("sk-metadata-secret"),
+            "the error must not render the value: {err}"
+        );
+    }
+}
+
 /// A cluster without `tenant_credential` (and without any other runtime
 /// metadata) keeps `provider_runtime` unset.
 #[test]
