@@ -1,0 +1,9 @@
+# helm lint / helm template coverage: the install guide's minimal example.
+existingSecret: llm-proxy-env
+config:
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+  routes:
+    - model: "*"
+      provider: openai

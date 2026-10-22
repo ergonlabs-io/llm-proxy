@@ -547,7 +547,8 @@ Stated plainly, because a feature list without this is not much use:
   against the last confirmed total plus its own spend.
 - **Token-usage metrics do not appear on `/stats`.** They have no data-plane
   equivalent, so they render on `/stats/prometheus` and over OTLP only.
-- **No Kubernetes controller or CRDs.**
+- **No Kubernetes controller or CRDs.** The Helm chart
+  (`deploy/helm/llm-proxy`) is plain manifests.
 
 ## Layout
 

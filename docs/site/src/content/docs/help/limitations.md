@@ -91,8 +91,8 @@ Use the status words this way:
 
 | Gap | Status | What happens today | Workaround |
 |---|---|---|---|
-| Docker image, Helm chart, Kubernetes controller | Not built | The repository ships release archives and `scripts/install.sh`. It ships no Dockerfile or chart for the proxy. | Build your own image from the archive. |
-| Other platforms | Not built | Release builds exist for Linux amd64 and macOS arm64 only (`.github/workflows/release.yml`). `install.sh` accepts Linux arm64, but no archive exists, so the download fails. It stops with `Intel macOS has no prebuilt release; build from source with cargo` on Intel macOS, and with `unsupported operating system` on other systems. | Build from source. |
+| Kubernetes controller | Not built | Releases publish a container image and a Helm chart (see [Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/)). There is no operator and no custom resource. | Configure the proxy through the chart's values. |
+| Other platforms | Not built | Release builds exist for Linux amd64, Linux arm64 and macOS arm64 only (`.github/workflows/release.yml`). Releases up to v0.6.1 have no Linux arm64 archive. `install.sh` stops with `Intel macOS has no prebuilt release; build from source with cargo` on Intel macOS, and with `unsupported operating system` on other systems. | Build from source. |
 | More than one listener | Not built | The file has one `listen` address and one `admin` address. | Run a second process. |
 
 ## Observability and data

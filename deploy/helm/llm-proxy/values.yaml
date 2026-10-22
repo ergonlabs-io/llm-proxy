@@ -1,0 +1,206 @@
+# Default values for the llm-proxy chart.
+# The install guide is docs/site/src/content/docs/operations/kubernetes.md.
+
+image:
+  repository: ghcr.io/ergonlabs-io/llm-proxy
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Deployment or StatefulSet. A StatefulSet gives each pod a name that survives
+# a restart, which the proxy uses as its node ID (`--service-node`). Use it
+# with `sharedStore`: with a Deployment every rollout gives each pod a new
+# node ID, and each new ID leaves per-writer state in Redis.
+workload: Deployment
+
+replicaCount: 2
+
+# The llm-proxy configuration file, in the `--config` dialect
+# (schema/llmproxy-v0.schema.json). The chart writes it to a ConfigMap and
+# mounts it at /etc/llm-proxy/llmproxy.yaml.
+#
+# The chart fills in three keys when you leave them out:
+#   version: 0
+#   listen:  0.0.0.0:<ports.http>
+#   admin:   0.0.0.0:<ports.admin>
+# If you set `listen` or `admin`, use the ports in `ports` below.
+#
+# Put no secret in this block. Write `${NAME}` and set NAME in `secret.env` or
+# in `existingSecret`: the proxy reads `${NAME}` from its environment when it
+# loads the file, and an unset variable is a load error.
+#
+# Required: set this or `configFile`. It is empty here because Helm merges
+# your maps into the defaults, so a default provider would stay in every
+# config. For example:
+#
+#   config:
+#     providers:
+#       openai:
+#         api_key: ${OPENAI_API_KEY}
+#     routes:
+#       - model: "*"
+#         provider: openai
+config: {}
+
+# The same file as a string. When set, it replaces `config` and the chart
+# fills in nothing: set `listen`, `admin` and, with `sharedStore`,
+# `auth.store` yourself. Use it to keep a file exactly as you wrote it, with
+# its comments and key order.
+configFile: ""
+
+ports:
+  # Client traffic (`listen`).
+  http: 8080
+  # Admin server (`admin`): /ready, /stats, the admin API and the admin UI.
+  # The kubelet probes it on the pod IP, so it binds 0.0.0.0. The Service does
+  # not expose it. Admin writes need LLMPROXY_ADMIN_TOKEN.
+  admin: 9901
+
+# Environment variables for `${NAME}` references in the config: provider
+# keys, `LLMPROXY_AUTH_SECRET`, `LLMPROXY_ADMIN_TOKEN`. With `create: true`
+# the chart writes them into a Secret. Prefer `existingSecret` in production,
+# so the values are not in your Helm values.
+secret:
+  create: true
+  env: {}
+  #   OPENAI_API_KEY: sk-...
+  #   LLMPROXY_ADMIN_TOKEN: ...
+
+# The name of a Secret you manage. Every key becomes an environment variable.
+# It is used together with `secret.env` when both are set.
+existingSecret: ""
+
+# Share keys, tenant policy, limits, spend and the rate card across replicas
+# through Redis (`auth.store: shared`). Without it each replica counts alone,
+# so N replicas admit up to N times each limit. Needs an `auth` block in
+# `config`. The chart sets `auth.store.shared` in the config, mounts the URL
+# from a Secret as a file, and passes `--service-node <pod name>`.
+sharedStore:
+  enabled: false
+  # A Secret that holds the Redis URL, for example
+  # redis://:password@redis-master:6379/0.
+  existingSecret: ""
+  # The key in that Secret.
+  key: redis-url
+  # Alternatively, the URL itself. The chart then writes it into its own
+  # Secret. Ignored when existingSecret is set.
+  url: ""
+  # Prefixes every Redis key. Defaults to the release's full name, so two
+  # releases can share one Redis.
+  namespace: ""
+
+# Whether to pass `--service-node <pod name>`. `auto` passes it with
+# sharedStore, which requires it, and with more than one replica, where a
+# config with `auth` then logs that limits apply per replica unless the store
+# is shared.
+# Set `always` when `configFile` sets a shared store itself.
+serviceNode: auto
+
+drain:
+  # immediate or gradual (`--drain-strategy`). `gradual` spreads keep-alive
+  # closes over the first quarter of the window, so clients do not all
+  # reconnect at once.
+  strategy: gradual
+  # `--drain-time-s`: how long an in-flight request or stream may run after
+  # SIGTERM. A process with no connection left exits sooner.
+  timeSeconds: 300
+
+# Seconds the preStop hook waits before Kubernetes sends SIGTERM. During that
+# time the pod is removed from the Service endpoints while it still accepts
+# connections, so no client is sent to a closed listener.
+preStopSleepSeconds: 10
+
+# Defaults to preStopSleepSeconds + drain.timeSeconds + 15. A value below
+# preStopSleepSeconds + drain.timeSeconds is a template error, because the
+# kubelet would kill streams the drain still allows.
+terminationGracePeriodSeconds: null
+
+# `--concurrency`: worker runtimes. Unset uses the CPUs the container may use
+# (the CPU limit when one is set, else the node's cores).
+concurrency: null
+
+# info, debug, warn, error, trace, critical (`--log-level`).
+logLevel: info
+
+extraArgs: []
+extraEnv: []
+# Extra volumes and mounts, for example TLS certificates for `listen.tls` or
+# a file for `auth.hmac_secret_file`.
+extraVolumes: []
+extraVolumeMounts: []
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# Disruption budget for voluntary evictions (node drains, upgrades).
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Deployment rollouts surge one pod and never drop below replicaCount.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: admin
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2
+
+# /server_info answers 200 for as long as the admin server runs, including
+# during a drain. /ready answers 503 while draining and after
+# POST /healthcheck/fail, so it must not be the liveness check.
+livenessProbe:
+  httpGet:
+    path: /server_info
+    port: admin
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""

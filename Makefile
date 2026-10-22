@@ -47,6 +47,14 @@ redb-retention-check: ## Check production redb qualification reporting without w
 install-check: ## Run scripts/install.sh end to end against the local debug build
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_install.py
 
+.PHONY: helm-check
+helm-check: ## helm lint and helm template the chart (deploy/helm/llm-proxy) for each ci/ values file; set LLM_PROXY_BIN to also validate the rendered configs
+	testing/helm/check.sh
+
+.PHONY: helm-e2e
+helm-e2e: ## Install the chart on a throwaway kind or minikube cluster, send a request, roll it under load (needs docker)
+	testing/helm/e2e.sh
+
 .PHONY: check
 check: ## Fast type-check of the whole workspace (no codegen)
 	cargo check --workspace

@@ -131,6 +131,7 @@ Reference). It replaces the hand-written `reference/config-schema` page.
 | Slug | Status |
 |---|---|
 | `operations/deployment` | new |
+| `operations/kubernetes` | new |
 | `operations/running-in-production` | existing |
 | `operations/tls` | existing |
 | `operations/config-reload` | existing |

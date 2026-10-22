@@ -9,24 +9,24 @@ related:
 ---
 
 You can install llm-proxy with the install script or build it from source.
-The release workflow builds two archives: Linux on x86-64 and macOS on Apple
-Silicon. The script installs the binary and starts the proxy as a service.
-Intel macOS and Linux on arm64 have no prebuilt release. Build from source on
-those platforms.
+The release workflow builds three archives: Linux on x86-64, Linux on arm64,
+and macOS on Apple Silicon. The script installs the binary and starts the
+proxy as a service. Intel macOS has no prebuilt release. Build from source on
+that platform. For Kubernetes, see
+[Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/).
 
 ## At a glance
 
-- Prebuilt platforms: Linux x86-64 and macOS Apple Silicon.
+- Prebuilt platforms: Linux x86-64, Linux arm64, and macOS Apple Silicon.
 - Default binary path: `~/.local/bin/llm-proxy`.
 - Default data directory: `~/.config/llm-proxy`.
 - The script refuses to continue if the SHA-256 sum of the archive does not
   match.
 
 :::caution
-The script accepts Linux on arm64. It asks for the asset
-`llm-proxy-linux-arm64.tar.gz`, which the release workflow does not build.
-The download fails with `There may be no linux/arm64 build in this release.`
-Build from source on that platform.
+Releases up to v0.6.1 have no Linux arm64 archive. On Linux arm64 the script
+asks for `llm-proxy-linux-arm64.tar.gz`, and for those releases the download
+fails with `There may be no linux/arm64 build in this release.`
 :::
 
 ## Install with the script
@@ -195,7 +195,8 @@ error names the dotted path of the field at fault.
 
 ## Limitations
 
-- No prebuilt release for Intel macOS, Linux on arm64, or Windows.
-- No Docker image and no Helm chart.
+- No prebuilt release for Intel macOS or Windows.
+- For Kubernetes, use the container image and the Helm chart instead of an
+  archive. See [Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/).
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.

@@ -190,6 +190,18 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   (`LIVE-SKIP`); `LIVE_SMOKE_STRICT=1` makes that a failure. The workflow
   `.github/workflows/live-smoke.yml` runs the target weekly and on demand,
   never on pull requests. See `testing/diffrig/README.md`.
+- A container image and a Helm chart. Each release tag publishes
+  `ghcr.io/ergonlabs-io/llm-proxy:<version>` for linux/amd64 and linux/arm64
+  (non-root, distroless, with the admin UI bundle) and the chart
+  `oci://ghcr.io/ergonlabs-io/charts/llm-proxy`
+  (`deploy/helm/llm-proxy`). The chart reads the `--config` file from a
+  ConfigMap and secrets from a Secret, probes `/ready` and `/server_info`,
+  sleeps in preStop before the drain, sets the grace period above the drain,
+  adds a PodDisruptionBudget, and offers a shared Redis store with
+  `sharedStore`. CI runs `make helm-check` (`helm lint`, `helm template`);
+  `make helm-e2e` installs it on a local kind or minikube cluster and rolls it
+  under load. The release workflow also builds a Linux arm64 archive now. See
+  the Kubernetes and Helm docs page.
 
 ### Changed
 

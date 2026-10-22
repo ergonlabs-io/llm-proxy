@@ -1,0 +1,48 @@
+# The provider for the chart test: the repo's mock-upstream (testing/mockupstream).
+# Model `mock-slow` streams 40 tokens one second apart, so a request outlives
+# the pod that serves it during a rollout. Any other model answers at once.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-upstream-profiles
+data:
+  profiles.json: |
+    {"profiles": {"mock-slow": {
+      "ttft_ms": {"min": 1000, "max": 1000},
+      "inter_token_ms": {"min": 1000, "max": 1000},
+      "length": {"min": 40, "max": 40}
+    }}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-upstream
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mock-upstream}
+  template:
+    metadata:
+      labels: {app: mock-upstream}
+    spec:
+      containers:
+        - name: mock-upstream
+          image: llm-proxy-mock-upstream:helm-e2e
+          imagePullPolicy: Never
+          args: ["--listen", "0.0.0.0:8080", "--profiles", "/etc/mock/profiles.json"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 2
+          volumeMounts: [{name: profiles, mountPath: /etc/mock}]
+      volumes:
+        - name: profiles
+          configMap: {name: mock-upstream-profiles}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-upstream
+spec:
+  selector: {app: mock-upstream}
+  ports: [{name: http, port: 8080, targetPort: http}]
