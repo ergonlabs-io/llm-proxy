@@ -592,6 +592,57 @@ s7() {
     UPSTREAM_PROTOCOL=http2; upstream_protocol_line
 }
 
+# S8: syscalls per request, the cost the S7 profiles put in the kernel send
+# path. For each upstream protocol: 40 s of open-loop non-streaming load at
+# S8_RATE (default 1k rps), and 20 s into it a 10 s `perf stat` of the proxy's
+# syscall tracepoints. Requests in the window come from the proxy's own
+# upstream request count, so the ratio needs no assumption about the load.
+s8() {
+    local d="$OUT/s8" rate="${S8_RATE:-1000}" proto
+    have perf || { echo "s8 needs perf" >&2; return 0; }
+    mkdir -p "$d"
+    local events="syscalls:sys_enter_writev,syscalls:sys_enter_write,syscalls:sys_enter_sendto"
+    events="$events,syscalls:sys_enter_sendmsg,syscalls:sys_enter_recvfrom,syscalls:sys_enter_read"
+    events="$events,syscalls:sys_enter_readv,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_epoll_ctl"
+    events="$events,syscalls:sys_enter_futex,syscalls:sys_enter_accept4,syscalls:sys_enter_connect"
+    for proto in http2 http1; do
+        echo "=== S8 syscalls per request: ${rate} rps, upstream $proto ==="
+        UPSTREAM_PROTOCOL="$proto"; upstream_protocol_line
+        mkdir -p "$d/$proto"
+        start_mock "$d/$proto" --tokens 16 --ttft-ms 5 --inter-token-ms 0
+        start_replicas "$d/$proto" 1 none
+        loadgen --target "http://127.0.0.1:${LISTEN[0]}" \
+            --endpoint chat --model mock-model --no-stream --rate "$rate" \
+            --downstream-mode h1-pool --downstream-h1-pool-size 256 \
+            --duration 40 --warmup 5 --out "$d/$proto/loadgen.json" >"$d/$proto/loadgen.txt" 2>&1 &
+        LOADGEN_PIDS+=($!); PIDS+=($!)
+        sleep 20
+        scrape_all "$d/$proto" before
+        perf stat -x, -e "$events" -p "${PROXY_PID[0]}" -o "$d/$proto/perf-stat.csv" -- sleep 10 \
+            >/dev/null 2>&1 || echo "perf stat failed" >&2
+        scrape_all "$d/$proto" after
+        wait_loadgens
+        python3 - "$d/$proto" <<'PY2' | tee "$d/$proto/per-request.txt"
+import re, sys
+d = sys.argv[1]
+def rq(tag):
+    total = 0
+    for line in open(f"{d}/prom-r1-{tag}.txt"):
+        if line.startswith("envoy_upstream_rq_time_count{"):
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+n = rq("after") - rq("before")
+print(f"requests in window: {n:.0f}")
+for line in open(f"{d}/perf-stat.csv"):
+    parts = line.strip().split(",")
+    if len(parts) > 2 and parts[0].replace(".", "").isdigit():
+        print(f"{parts[2].split(':')[-1]:<24} {int(float(parts[0])):>9}  {float(parts[0]) / max(n, 1):6.2f}/req")
+PY2
+        stop_all
+    done
+    UPSTREAM_PROTOCOL=http2; upstream_protocol_line
+}
+
 s6() {
     local d="$OUT/s6"; mkdir -p "$d"
     local rate="${S6_RATE:-150}" i
@@ -617,8 +668,8 @@ s6() {
 for s in $SCENARIOS; do
     case "$s" in
         all) manifest; s0; s1; s2; s3; s4a; s4b; s5; s5b; s6; s7 ;;
-        s0|s1|s2|s3|s4a|s4b|s5|s5b|s6|s7) "$s" ;;
-        *) echo "unknown scenario: $s (s0 s1 s2 s3 s4a s4b s5 s5b s6 s7 all)" >&2; exit 2 ;;
+        s0|s1|s2|s3|s4a|s4b|s5|s5b|s6|s7|s8) "$s" ;;
+        *) echo "unknown scenario: $s (s0 s1 s2 s3 s4a s4b s5 s5b s6 s7 s8 all)" >&2; exit 2 ;;
     esac
 done
 echo "results: $OUT"
