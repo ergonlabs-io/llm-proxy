@@ -36,6 +36,13 @@ use tokio::sync::{mpsc, oneshot, Notify};
 mod init;
 mod keygen;
 
+// Opt-in (`--features mimalloc`): glibc malloc/free show up as about a tenth
+// of proxy CPU in profiles at 5k rps, but mimalloc costs resident memory.
+// The trade is measured in internal-docs/capacity/2026-10-21-allocator-ab.md.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "llm-proxy", version, about = "Proxy for LLM inference APIs")]
 // Rust note: no `.required(true)`, because `--mode keygen` takes neither
