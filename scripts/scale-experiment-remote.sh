@@ -50,6 +50,11 @@ PROVIDER_EXTRA_YAML="${PROVIDER_EXTRA_YAML:-}"
 S2_RATES="${S2_RATES:-1000 2000 5000 10000 20000}"
 S4_RPM="${S4_RPM:-6000}"
 S4_STREAMS="${S4_STREAMS:-300}"
+# A mock --profiles file for S4b/S5/S5b. The default mock streams last exactly
+# 3.45 s, so streams admitted together finish together; a profile that draws
+# the length from a range (same mean) tests whether the fleet ceiling's
+# over-admission comes from that synchronisation. Unset: fixed lengths.
+S4_MOCK_PROFILES="${S4_MOCK_PROFILES:-}"
 
 # LLM-shaped mock defaults, the same as scripts/capacity-sweep.sh.
 TOKENS=128 TTFT_MS=250 INTER_TOKEN_MS=25
@@ -460,9 +465,12 @@ s4b() {
     local faults="${2:-}" persist="${3:-}" label=""
     [[ -n "$faults" && -n "$persist" ]] && label=" + faults, Redis returns WITH ITS DATA (AOF)"
     [[ -n "$faults" && -z "$persist" ]] && label=" + faults, Redis returns EMPTY (no persistence)"
+    [[ -n "$S4_MOCK_PROFILES" ]] && label="$label, mock profiles $S4_MOCK_PROFILES"
     echo "=== ${1:-s4b} fleet stream ceiling: concurrent_streams=$S4_STREAMS, offered 2x$label ===" \
         | tee "$d/label.txt"
-    start_mock "$d" --tokens "$TOKENS" --ttft-ms "$TTFT_MS" --inter-token-ms "$INTER_TOKEN_MS"
+    local profiles=()
+    [[ -n "$S4_MOCK_PROFILES" ]] && profiles=(--profiles "$S4_MOCK_PROFILES")
+    start_mock "$d" --tokens "$TOKENS" --ttft-ms "$TTFT_MS" --inter-token-ms "$INTER_TOKEN_MS" "${profiles[@]}"
     start_redis "$d" "$persist"
     start_replicas "$d" 3 shared
     mint_tenant_key 0
