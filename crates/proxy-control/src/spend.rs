@@ -378,6 +378,16 @@ impl PeriodKey {
     /// renders. Parsed rather than carried so a key read back from a journal
     /// or the store needs no side channel; callers cache the result.
     pub(crate) fn ends_at(&self) -> Option<DateTime<Utc>> {
+        self.bounds().map(|(_, end)| end)
+    }
+
+    /// The UTC instant the period this key names starts, under the same
+    /// rules as [`Self::ends_at`].
+    pub(crate) fn starts_at(&self) -> Option<DateTime<Utc>> {
+        self.bounds().map(|(start, _)| start)
+    }
+
+    fn bounds(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         let (period, start) = match self.0.len() {
             10 => (
                 Period::Daily,
@@ -392,7 +402,7 @@ impl PeriodKey {
         let start = start.and_hms_opt(0, 0, 0)?.and_utc();
         // chrono accepts spellings like "2026-8-1"; only the canonical one
         // names this period, so reject anything `key_for` would not render.
-        (period.key_for(start) == *self).then(|| period.next_boundary(start))
+        (period.key_for(start) == *self).then(|| (start, period.next_boundary(start)))
     }
 
     /// Test-only: builds a `PeriodKey` directly from an already-rendered
@@ -652,7 +662,27 @@ struct Bucket {
     /// it is a function of the key, recomputed on restore.
     #[serde(skip)]
     period_end: Option<DateTime<Utc>>,
+    /// When this bucket's period starts; `None` exactly when `period_end` is.
+    /// Not journaled, for the same reason.
+    #[serde(skip)]
+    period_start: Option<DateTime<Utc>>,
+    /// The ceiling, in micro-dollars, of the budget that last consulted this
+    /// row: set by the startup prefetch for a budgeted subject and by every
+    /// admission under a budget. `None` for a row no budget reads, which the
+    /// flusher therefore never reads back while it is idle. Not journaled:
+    /// the next admission sets it again.
+    #[serde(skip)]
+    limit_micros: Option<u64>,
+    /// When `base_micros` last came from the store (a load, a read-back or a
+    /// confirmed delivery), on the clock the flusher was given. `None` for a
+    /// row created memory-only, whose base is not the store's.
+    #[serde(skip)]
+    synced_at: Option<DateTime<Utc>>,
 }
+
+/// The longest a budgeted row below half its ceiling goes without a
+/// read-back while idle. See [`Bucket::wants_read`].
+const IDLE_REFRESH_SECS: i64 = 60;
 
 /// How long a settled bucket stays readable in memory after its period ends.
 /// One hour.
@@ -681,8 +711,50 @@ impl Bucket {
         Bucket {
             base_micros,
             period_end: period_key.ends_at(),
+            period_start: period_key.starts_at(),
             ..Bucket::default()
         }
+    }
+
+    /// Whether the flusher reads back this row, which has nothing to deliver.
+    ///
+    /// A read exists so admission sees what the other replicas spent, so it
+    /// is spent only where admission can use it:
+    ///
+    /// - An ended period is read once more, so the figure kept for reads is
+    ///   final before the bucket settles (see [`Self::is_settled`]). That is
+    ///   one read per row per period, not per tick.
+    /// - A row no budget consults is never read. Its spend still reaches the
+    ///   store with each delivery, and every delivery returns the fleet
+    ///   total. This covers keys and tenants with no budget, revoked keys,
+    ///   and rows of another period than the budget's.
+    /// - A row whose period has not started (tomorrow's, which the prefetch
+    ///   loads so that midnight needs no store read) is not read before it
+    ///   starts.
+    /// - A budgeted row is read every tick once it holds half its ceiling,
+    ///   and otherwise at most every [`IDLE_REFRESH_SECS`]. Below half, the
+    ///   other replicas would have to spend the other half unseen before a
+    ///   stale base admitted anything the ceiling had no room for, and the
+    ///   refresh bounds how long that can go unseen.
+    ///
+    /// Reading every live row every tick made store load grow with the
+    /// number of keys rather than with traffic: the prefetch alone made
+    /// three or four rows per key.
+    fn wants_read(&self, now: DateTime<Utc>) -> bool {
+        if self.is_ended(now) {
+            return true;
+        }
+        let Some(limit) = self.limit_micros else {
+            return false;
+        };
+        if self.period_start.is_some_and(|start| start > now) {
+            return false;
+        }
+        let used = self.base_micros.saturating_add(self.pending_delta_micros);
+        used.saturating_mul(2) >= limit
+            || self.synced_at.is_none_or(|at| {
+                now.signed_duration_since(at) >= chrono::Duration::seconds(IDLE_REFRESH_SECS)
+            })
     }
 
     fn is_ended(&self, now: DateTime<Utc>) -> bool {
@@ -725,6 +797,7 @@ impl BucketMap {
         let mut map = BucketMap::default();
         for (key, mut bucket) in restored {
             bucket.period_end = key.1.ends_at();
+            bucket.period_start = key.1.starts_at();
             map.active.insert(key, bucket);
         }
         map
@@ -969,20 +1042,23 @@ impl Inner {
         if buckets.activate(key) {
             return buckets;
         }
-        let base = if self.memory_only_requests.load(Ordering::Relaxed) {
-            0
+        let (base, synced_at) = if self.memory_only_requests.load(Ordering::Relaxed) {
+            (0, None)
         } else {
             drop(buckets);
-            let base = self.load_base(key);
+            let loaded = self.load_base(key);
             buckets = self.lock_buckets();
             if buckets.activate(key) {
                 return buckets;
             }
-            base
+            match loaded {
+                Some(base) => (base, Some(Utc::now())),
+                None => (0, None),
+            }
         };
-        buckets
-            .active
-            .insert(key.clone(), Bucket::new(base, &key.1));
+        let mut bucket = Bucket::new(base, &key.1);
+        bucket.synced_at = synced_at;
+        buckets.active.insert(key.clone(), bucket);
         buckets
     }
 
@@ -992,9 +1068,10 @@ impl Inner {
             .expect("spend accumulator mutex poisoned")
     }
 
-    fn load_base(&self, (tenant, period_key): &BucketKey) -> u64 {
+    /// The stored total, or `None` (logged) when the store cannot answer.
+    fn load_base(&self, (tenant, period_key): &BucketKey) -> Option<u64> {
         match self.store.load_spend(&self.stat_prefix, tenant, period_key) {
-            Ok(total) => total,
+            Ok(total) => Some(total),
             Err(err) => {
                 tracing::warn!(
                     stat_prefix = %self.stat_prefix,
@@ -1005,7 +1082,7 @@ impl Inner {
                      period; resuming from zero in this process rather than \
                      refusing the request"
                 );
-                0
+                None
             }
         }
     }
@@ -1093,15 +1170,18 @@ impl Inner {
     /// against its own spend alone, which is the old non-additive behaviour wearing
     /// a new signature.
     ///
-    /// A bucket in a LIVE period with NOTHING to add still costs one READ
-    /// ([`ControlPlaneStore::load_spend_batch`]) and adopts the total it
-    /// returns. That is deliberate and is not a wasted call: a replica
-    /// serving no traffic still has to learn what the others spent, or it
-    /// admits requests against a ceiling it thinks is empty. It is a read and
-    /// not a zero-delta `add_spend` because a write would take a flush
-    /// sequence and rewrite the dedup row for nothing. The same read is what
-    /// gives a bucket created memory-only after boot (a key minted later, or
-    /// a row the prefetch could not load) its real base within one tick. There is
+    /// A bucket in a LIVE period with NOTHING to add costs one READ
+    /// ([`ControlPlaneStore::load_spend_batch`]) where admission can use it,
+    /// and adopts the total it returns: a replica serving no traffic on a
+    /// budgeted row still has to learn what the others spent, or it admits
+    /// requests against a ceiling it thinks is empty. [`Bucket::wants_read`]
+    /// decides which idle rows that is (a budget consults them, and they are
+    /// near the ceiling or not synced for a while); the rest cost no call. It
+    /// is a read and not a zero-delta `add_spend` because a write would take a
+    /// flush sequence and rewrite the dedup row for nothing. The same read is
+    /// what gives a budgeted bucket created memory-only after boot (a key
+    /// minted later, or a row the prefetch could not load) its real base
+    /// within one tick. There is
     /// likewise no single-replica short circuit -- the embedded store
     /// implements the same contract, and skipping the path in embedded mode
     /// would leave the multi-replica path exercised only in production
@@ -1134,7 +1214,8 @@ impl Inner {
     /// 1. One pass under the buckets mutex lists every bucket and freezes the
     ///    ones whose sequence is already seeded. Nothing is copied but the
     ///    keys.
-    ///    A bucket with nothing pending is only listed for a read.
+    ///    A bucket with nothing pending is only listed for a read, and only
+    ///    if [`Bucket::wants_read`].
     /// 2. Buckets that have never flushed in this process seed their sequence
     ///    from the store in one batch, with the mutex released.
     /// 3. With a journal, ONE copy of the map is made and ONE durable commit
@@ -1209,8 +1290,10 @@ impl Inner {
             // are not here, so this pass does not grow with them.
             for (key, bucket) in buckets.active.iter_mut() {
                 if bucket.attempt.is_none() && bucket.pending_delta_micros == 0 {
-                    // Nothing to deliver: only learn the total.
-                    reads.push(key.clone());
+                    // Nothing to deliver: learn the total, where it matters.
+                    if bucket.wants_read(now) {
+                        reads.push(key.clone());
+                    }
                     continue;
                 }
                 match bucket.next_seq {
@@ -1312,6 +1395,7 @@ impl Inner {
                 }
                 let bucket = buckets.active.get_mut(&key).expect("known bucket");
                 bucket.base_micros = total;
+                bucket.synced_at = Some(now);
                 bucket.pending_delta_micros =
                     bucket.pending_delta_micros.saturating_sub(attempt.delta);
                 bucket.next_seq = attempt.seq.checked_add(1);
@@ -1337,6 +1421,7 @@ impl Inner {
                 // twice.
                 let bucket = buckets.active.get_mut(&key).expect("known bucket");
                 bucket.base_micros = total;
+                bucket.synced_at = Some(now);
                 if bucket.is_settled(now) {
                     buckets.settle(&key);
                 }
@@ -1560,73 +1645,96 @@ impl SpendAccumulator {
         Ok(self)
     }
 
-    /// Startup prefetch: loads today's and tomorrow's daily and monthly rows
-    /// for every key, then puts request workers in memory-only mode, where a
-    /// first touch never reads the store.
+    /// Startup prefetch: loads today's and tomorrow's rows of each budgeted
+    /// key's budget period, then puts request workers in memory-only mode,
+    /// where a first touch never reads the store.
+    ///
+    /// Only subjects with a budget are passed, and only their budget's
+    /// period is loaded: no admission reads any other row, so loading it
+    /// would only cost the boot read. Revoked keys are left out by the caller
+    /// for the same reason. Tomorrow's row is loaded so that midnight, when
+    /// every budgeted subject's row changes at once, needs no store read on
+    /// the request path. Each loaded row remembers its budget's ceiling, so
+    /// the flusher knows a budget consults it (see [`Bucket::wants_read`]).
     ///
     /// All rows go to the store as ONE [`ControlPlaneStore::load_spend_batch`],
-    /// so a store with a network hop answers 20k keys (80k rows) in a few
-    /// pipelined round trips rather than 80k sequential ones (review H5).
+    /// so a store with a network hop answers 20k keys (40k rows) in a few
+    /// pipelined round trips rather than 40k sequential ones (review H5).
     ///
     /// # A failed prefetch fails OPEN
     ///
     /// Request workers are memory-only afterwards whether or not the reads
     /// succeeded. A row that could not be read is left out, so its first
     /// touch starts at zero and the next flush adopts the store's total (the
-    /// flusher reads every live row it owes nothing; see [`Self::flush_now`]).
-    /// Until then this replica enforces that row against its own accrual
-    /// only, the same exposure as a replica past its reconciliation bound.
-    /// The error is returned so the caller can say so loudly; it is not a
-    /// reason to refuse the config, because a store blip during a rollout
-    /// would otherwise leave the replica with no listener at all.
-    pub fn prepare_request_workers(&self, keys: &[KeyId]) -> Result<(), StoreError> {
-        self.prepare_request_subjects(keys.iter().map(key_spend_subject))
+    /// flusher reads a budgeted row that has never synced; see
+    /// [`Self::flush_now`]). Until then this replica enforces that row
+    /// against its own accrual only, the same exposure as a replica past its
+    /// reconciliation bound. The error is returned so the caller can say so
+    /// loudly; it is not a reason to refuse the config, because a store blip
+    /// during a rollout would otherwise leave the replica with no listener at
+    /// all.
+    pub fn prepare_request_workers(&self, keys: &[(KeyId, KeyBudget)]) -> Result<(), StoreError> {
+        self.prepare_request_subjects(
+            keys.iter().map(|(key_id, budget)| {
+                (key_spend_subject(key_id), budget.period, budget.max_micros)
+            }),
+        )
     }
 
     /// [`Self::prepare_request_workers`] for tenant aggregates.
-    pub fn prepare_tenant_request_workers(&self, tenants: &[TenantId]) -> Result<(), StoreError> {
-        self.prepare_request_subjects(tenants.iter().cloned())
+    pub fn prepare_tenant_request_workers(
+        &self,
+        tenants: &[(TenantId, TenantBudget)],
+    ) -> Result<(), StoreError> {
+        self.prepare_request_subjects(
+            tenants
+                .iter()
+                .map(|(tenant, budget)| (tenant.clone(), budget.period, budget.max_micros)),
+        )
     }
 
     fn prepare_request_subjects(
         &self,
-        subjects: impl IntoIterator<Item = TenantId>,
+        subjects: impl IntoIterator<Item = (TenantId, Period, MicroUsd)>,
     ) -> Result<(), StoreError> {
         let now = Utc::now();
-        let periods: Vec<PeriodKey> = [Period::Daily, Period::Monthly]
-            .into_iter()
-            .flat_map(|period| {
-                [
-                    period.key_for(now),
-                    period.key_for(now + chrono::Duration::days(1)),
-                ]
-            })
-            .collect();
-        let rows: Vec<BucketKey> = {
-            let buckets = self.inner.lock_buckets();
+        let rows: Vec<(BucketKey, u64)> = {
+            let mut buckets = self.inner.lock_buckets();
             let mut seen = std::collections::HashSet::new();
-            subjects
-                .into_iter()
-                .flat_map(|subject| periods.iter().map(move |p| (subject.clone(), p.clone())))
-                .filter(|row| buckets.get(row).is_none() && seen.insert(row.clone()))
-                .collect()
+            let mut rows = Vec::new();
+            for (subject, period, limit) in subjects {
+                for when in [now, now + chrono::Duration::days(1)] {
+                    let row = (subject.clone(), period.key_for(when));
+                    if let Some(bucket) = buckets.active.get_mut(&row) {
+                        // Restored from the journal: already in memory, and
+                        // now known to be budgeted.
+                        bucket.limit_micros = Some(limit.as_micros());
+                    } else if buckets.get(&row).is_none() && seen.insert(row.clone()) {
+                        rows.push((row, limit.as_micros()));
+                    }
+                }
+            }
+            rows
         };
         // The store is read with the buckets mutex released.
         let totals = if rows.is_empty() {
             Vec::new()
         } else {
+            let keys: Vec<BucketKey> = rows.iter().map(|(row, _)| row.clone()).collect();
             self.inner
                 .store
-                .load_spend_batch(&self.inner.stat_prefix, &rows)
+                .load_spend_batch(&self.inner.stat_prefix, &keys)
         };
         let mut first_err = None;
         {
             let mut buckets = self.inner.lock_buckets();
-            for (row, total) in rows.into_iter().zip(totals) {
+            for ((row, limit), total) in rows.into_iter().zip(totals) {
                 match total {
                     Ok(total) => {
                         if buckets.get(&row).is_none() {
-                            let bucket = Bucket::new(total, &row.1);
+                            let mut bucket = Bucket::new(total, &row.1);
+                            bucket.limit_micros = Some(limit);
+                            bucket.synced_at = Some(now);
                             buckets.active.insert(row, bucket);
                         }
                     }
@@ -1760,6 +1868,16 @@ impl SpendAccumulator {
         self.current_total(&key_spend_subject(key_id), period)
     }
 
+    /// [`Self::admission_total`] for one stable API key.
+    pub fn admission_total_key(
+        &self,
+        key_id: &KeyId,
+        period: &PeriodKey,
+        limit_micros: u64,
+    ) -> u64 {
+        self.admission_total(&key_spend_subject(key_id), period, limit_micros)
+    }
+
     pub fn report_key(&self, key_id: &KeyId, period: &PeriodKey) -> SpendReport {
         self.report(&key_spend_subject(key_id), period)
     }
@@ -1778,7 +1896,21 @@ impl SpendAccumulator {
     /// the flusher or its state, so the flusher's liveness cannot affect
     /// what it returns.
     pub fn current_total(&self, tenant: &TenantId, period: &PeriodKey) -> u64 {
-        let buckets = self.inner.lock_buckets();
+        self.total(tenant, period, None)
+    }
+
+    /// [`Self::current_total`] for an admission held to a budget of
+    /// `limit_micros`. It also records that a budget consults this row and
+    /// with what ceiling, which is what makes the flusher read the row back
+    /// while it is idle (see [`Bucket::wants_read`]). Call it only where a
+    /// budget applies: a row read through [`Self::current_total`] alone is
+    /// never read back.
+    pub fn admission_total(&self, tenant: &TenantId, period: &PeriodKey, limit_micros: u64) -> u64 {
+        self.total(tenant, period, Some(limit_micros))
+    }
+
+    fn total(&self, tenant: &TenantId, period: &PeriodKey, limit_micros: Option<u64>) -> u64 {
+        let mut buckets = self.inner.lock_buckets();
         // A bucket already in memory answers from where it is, settled or
         // not, so a read never moves one back into the set the flusher
         // visits. Only a miss creates, as a first touch always has. A miss
@@ -1788,14 +1920,25 @@ impl SpendAccumulator {
         // an ended period (enforcement uses the period `now` falls in), and
         // `report` answers such a period from the store instead.
         let key = (tenant.clone(), period.clone());
-        if let Some(bucket) = buckets.get(&key) {
+        if let Some(bucket) = buckets.active.get_mut(&key) {
+            if limit_micros.is_some() {
+                bucket.limit_micros = limit_micros;
+            }
+            return bucket
+                .base_micros
+                .saturating_add(bucket.pending_delta_micros);
+        }
+        if let Some(bucket) = buckets.settled.get(&key) {
             return bucket
                 .base_micros
                 .saturating_add(bucket.pending_delta_micros);
         }
         drop(buckets);
-        let buckets = self.inner.lock_with_bucket(&key);
-        let bucket = &buckets.active[&key];
+        let mut buckets = self.inner.lock_with_bucket(&key);
+        let bucket = buckets.active.get_mut(&key).expect("just ensured");
+        if limit_micros.is_some() {
+            bucket.limit_micros = limit_micros;
+        }
         // Everything the store has confirmed, plus what this replica has
         // recorded since. Enforcement reads THIS, not the store -- see this
         // section's "Enforcement reads live memory" note -- so a replica
@@ -1918,24 +2061,28 @@ impl SpendAccumulator {
     /// need to lock the buckets map itself or reason about torn reads across
     /// several separate calls.
     ///
-    /// A `(tenant, period)` this process has never touched reports ZEROS,
-    /// not an error -- it goes through the same [`Inner::lock_with_bucket`]
-    /// [`Self::current_total`] does, which resumes from the store (itself
-    /// `0` for a row nothing has ever written, per
-    /// [`ControlPlaneStore::load_spend`]'s doc) rather than treating "never
-    /// spent" as a failure. An operator asking about a tenant that has not
-    /// made a request yet gets a valid, boring answer.
+    /// A `(tenant, period)` this process has never touched reports the
+    /// store's total (itself `0` for a row nothing has ever written, per
+    /// [`ControlPlaneStore::load_spend`]'s doc) and empty unpriced detail,
+    /// not an error, and creates no bucket. An operator asking about a tenant
+    /// that has not made a request yet gets a valid, boring answer.
+    ///
+    /// # Which figure: memory or the store
+    ///
+    /// A bucket with spend not yet delivered answers from memory: the store
+    /// does not have that spend yet. So does a bucket of an ended period,
+    /// whose figure was reconciled once after the end. A live bucket with
+    /// nothing undelivered reports the store's total instead, which is exact
+    /// then, because the flusher reads back only rows a budget consults (see
+    /// [`Bucket::wants_read`]): an unbudgeted row's memory figure is only as
+    /// fresh as its last delivery. A store failure is logged and falls back
+    /// to the memory figure, or to zero where there is none.
     ///
     /// # A period that has ended and been evicted
     ///
-    /// Nothing in the admin API asks about one (it reports the period `now`
-    /// falls in), but this method takes any key. A bucket for an ended period
-    /// is evicted an hour after it settles, and recreating it here would
-    /// answer zero in request-worker mode, which is silently wrong. So for an
-    /// ended period with no bucket in memory the total is read from the
-    /// store, no bucket is created, and a store failure is logged and read as
-    /// zero, the same loud fail-open the first touch of a live period uses.
-    /// What does NOT survive eviction is the unpriced-request detail
+    /// A bucket for an ended period is evicted an hour after it settles; its
+    /// total is then read from the store like any row with no bucket. What
+    /// does NOT survive eviction is the unpriced-request detail
     /// (`unpriced_requests`, `unpriced_pairs`): it lives only in the bucket
     /// and the store never held it, so those fields read empty for such a
     /// period.
@@ -1964,21 +2111,20 @@ impl SpendAccumulator {
             unpriced_pairs_truncated: bucket.unpriced_pairs_truncated,
         };
         let key = (tenant.clone(), period.clone());
+        let ended = period.ends_at().is_some_and(|end| end <= now);
+        // `None`: read the total from the store. `Some((view, true))`: also
+        // read it, but keep the view's unpriced detail and fall back to its
+        // total if the store cannot answer.
         let from_memory = {
             let buckets = self.inner.lock_buckets();
-            if let Some(bucket) = buckets.get(&key) {
-                Some(view(bucket))
-            } else if period.ends_at().is_some_and(|end| end <= now) {
-                None
-            } else {
-                drop(buckets);
-                Some(view(&self.inner.lock_with_bucket(&key).active[&key]))
-            }
+            buckets.get(&key).map(|bucket| {
+                let idle = bucket.pending_delta_micros == 0 && bucket.attempt.is_none();
+                (view(bucket), idle && !ended)
+            })
         };
         // The store is read with the buckets mutex released.
-        let view = from_memory.unwrap_or_else(|| {
-            let total_micros = self
-                .inner
+        let read_store = |fallback: u64, what: &str| {
+            self.inner
                 .store
                 .load_spend(&self.inner.stat_prefix, tenant, period)
                 .unwrap_or_else(|err| {
@@ -1987,18 +2133,31 @@ impl SpendAccumulator {
                         tenant = tenant.as_str(),
                         period = period.as_str(),
                         error = %err,
-                        "spend report: failed to read the stored total of an ended period \
-                         that is no longer in memory; reporting zero"
+                        fallback_micros = fallback,
+                        "spend report: failed to read the stored total of {what}; \
+                         reporting this replica's figure"
                     );
-                    0
-                });
-            View {
-                total_micros,
+                    fallback
+                })
+        };
+        let view = match from_memory {
+            // Undelivered spend, or an ended period whose figure is final:
+            // memory is the answer.
+            Some((view, false)) => view,
+            // Nothing undelivered, so the store's total is exact, and the
+            // flusher may not be reading this row back (an unbudgeted row
+            // never is), so memory may be missing other replicas' spend.
+            Some((view, true)) => View {
+                total_micros: read_store(view.total_micros, "an idle row"),
+                ..view
+            },
+            None => View {
+                total_micros: read_store(0, "a row this replica holds no bucket for"),
                 unpriced_requests: 0,
                 unpriced_pairs: Vec::new(),
                 unpriced_pairs_truncated: false,
-            }
-        });
+            },
+        };
         SpendReport {
             journal_checkpoint_at: DateTime::<Utc>::from_timestamp_millis(
                 self.inner.journal_checkpoint_millis.load(Ordering::Acquire),
@@ -2503,6 +2662,14 @@ pub(crate) mod tests {
         (accumulator, store)
     }
 
+    fn daily_budget(max_micros: u64) -> KeyBudget {
+        KeyBudget {
+            max_micros: MicroUsd::from_micros(max_micros),
+            period: Period::Daily,
+            include_byok_in_limit: false,
+        }
+    }
+
     // --- Period keys ----------------------------------------------------
 
     #[test]
@@ -2590,11 +2757,21 @@ pub(crate) mod tests {
             Period::Monthly,
             "restart-node".to_string(),
         );
+        let tenant_budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(1_000),
+            period: Period::Daily,
+            credential_source: CredentialSource::Platform,
+        };
+        let key_budget = KeyBudget {
+            max_micros: MicroUsd::from_micros(1_000),
+            period: Period::Monthly,
+            include_byok_in_limit: false,
+        };
         restored
-            .prepare_tenant_request_workers(std::slice::from_ref(&tenant))
+            .prepare_tenant_request_workers(&[(tenant.clone(), tenant_budget)])
             .unwrap();
         restored
-            .prepare_request_workers(std::slice::from_ref(&key))
+            .prepare_request_workers(&[(key.clone(), key_budget)])
             .unwrap();
         assert_eq!(
             restored.current_total(&tenant, &Period::Daily.key_for(now)),
@@ -3571,7 +3748,10 @@ pub(crate) mod tests {
         );
 
         // One more tick and A, which has recorded nothing since, has caught
-        // up too. A replica converges by FLUSHING, not by serving traffic.
+        // up too. A replica converges by FLUSHING, not by serving traffic,
+        // on a row a budget consults: here A's next admission reads the row
+        // against a ceiling it is past half of.
+        replica_a.admission_total(&tenant, &period_key, 20_000_000);
         replica_a.inner.flush_at(now).unwrap();
         assert_eq!(replica_a.current_total(&tenant, &period_key), 15_000_000);
 
@@ -4266,9 +4446,9 @@ pub(crate) mod tests {
                 store.add_spend_calls(),
                 store.load_spend_calls() - first_touch_reads
             ),
-            (3, 3),
-            "the first tick delivered the 3 buckets; the second owed nothing, so it \
-             only read their totals"
+            (3, 0),
+            "the first tick delivered the 3 buckets; the second owed nothing and no \
+             budget reads them, so it made no call"
         );
     }
 
@@ -4351,7 +4531,7 @@ pub(crate) mod tests {
         store.fail_load_spend.store(true, SeqCst);
         assert!(
             accumulator
-                .prepare_request_workers(std::slice::from_ref(&key))
+                .prepare_request_workers(&[(key.clone(), daily_budget(1_000))])
                 .is_err(),
             "the failure is reported, not swallowed"
         );
@@ -4545,10 +4725,11 @@ pub(crate) mod tests {
         assert_eq!(counts(&accumulator), (0, 0), "and was evicted again");
     }
 
-    /// A live bucket with nothing to deliver costs a read and no write (an
-    /// idle replica must still learn what the others spent, and a zero-delta
-    /// write would only burn a sequence); an ended period gets exactly one
-    /// final reconciliation and then costs the store nothing.
+    /// A live budgeted bucket near its ceiling with nothing to deliver costs
+    /// a read and no write (an idle replica must still learn what the others
+    /// spent, and a zero-delta write would only burn a sequence); an ended
+    /// period gets exactly one final reconciliation and then costs the store
+    /// nothing.
     ///
     /// Mutation: drop `self.is_ended(now)` from `Bucket::is_settled`, so a
     /// live idle bucket settles and stops syncing.
@@ -4558,6 +4739,8 @@ pub(crate) mod tests {
         let accumulator = accumulator_over(&store);
         let tenant = TenantId::new("tenant-a");
         record_micros(&accumulator, &tenant, dt(2026, 9, 3, 12, 0, 0), 5);
+        let key = Period::Daily.key_for(dt(2026, 9, 3, 12, 0, 0));
+        accumulator.admission_total(&tenant, &key, 10);
         let first_touch_reads = store.load_spend_calls();
         let calls = || {
             (
@@ -4744,11 +4927,138 @@ pub(crate) mod tests {
         assert!(evicted.unpriced_pairs.is_empty());
         assert_eq!(counts(&accumulator), (0, 0), "and a read created nothing");
 
-        // The current period is unchanged: a live miss still creates.
+        // A live miss is answered from the store the same way.
         let live_key = Period::Daily.key_for(dt(2026, 9, 4, 2, 10, 0));
         let live = accumulator.report_at(&tenant, &live_key, dt(2026, 9, 4, 2, 10, 0));
         assert_eq!(live.total_micros, 0);
-        assert_eq!(counts(&accumulator), (1, 0));
+        assert_eq!(counts(&accumulator), (0, 0), "and creates nothing either");
+    }
+
+    // --- which idle rows the flusher reads back -----------------------------
+
+    /// The store load that motivated this: every idle live row was read back
+    /// every tick, so a replica with many keys and no traffic still read each
+    /// one every five seconds. A key with no budget is never read: its spend
+    /// reaches the store with each delivery, and nothing admits against it.
+    ///
+    /// Mutation: make `Bucket::wants_read` return `true` for a row with no
+    /// limit.
+    #[test]
+    fn an_idle_key_with_no_budget_costs_no_store_read_per_tick() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        accumulator.prepare_request_workers(&[]).unwrap();
+        let key = KeyId::new("key-a");
+        let noon = dt(2026, 9, 3, 12, 0, 0);
+        accumulator.record_key(
+            &key,
+            noon,
+            Period::Daily,
+            Charge::Priced(MicroUsd::from_micros(5)),
+            None,
+            None,
+        );
+        accumulator.inner.flush_at(noon).unwrap();
+        assert_eq!(store.add_spend_calls(), 1, "the 5 is delivered");
+
+        for minute in 1..=30 {
+            accumulator
+                .inner
+                .flush_at(noon + chrono::Duration::minutes(minute))
+                .unwrap();
+        }
+
+        assert_eq!(
+            (store.add_spend_calls(), store.load_spend_calls()),
+            (1, 0),
+            "thirty idle ticks, past any refresh interval, made no store call"
+        );
+    }
+
+    /// A row a budget consults is read back while idle, but every tick only
+    /// once it holds half its ceiling; below that, once per
+    /// `IDLE_REFRESH_SECS`, which bounds how stale its base gets.
+    ///
+    /// Mutations: drop the half-ceiling term from `Bucket::wants_read` (the
+    /// near row is not read on the next tick); drop the refresh term (the far
+    /// row is never read again).
+    #[test]
+    fn a_budgeted_idle_row_is_read_back_near_its_ceiling_or_when_stale() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        accumulator.prepare_request_workers(&[]).unwrap();
+        let tenant = TenantId::new("tenant-a");
+        let noon = dt(2026, 9, 3, 12, 0, 0);
+        let key = Period::Daily.key_for(noon);
+        let at = |secs| noon + chrono::Duration::seconds(secs);
+        accumulator.admission_total(&tenant, &key, 100);
+        record_micros(&accumulator, &tenant, noon, 10);
+        accumulator.inner.flush_at(noon).unwrap();
+        let reads = || store.load_spend_calls();
+
+        accumulator.inner.flush_at(at(5)).unwrap();
+        assert_eq!(reads(), 0, "10 of 100, synced 5 s ago: not read");
+        accumulator.inner.flush_at(at(IDLE_REFRESH_SECS)).unwrap();
+        assert_eq!(reads(), 1, "the refresh is due");
+        accumulator
+            .inner
+            .flush_at(at(IDLE_REFRESH_SECS + 5))
+            .unwrap();
+        assert_eq!(reads(), 1, "and resets");
+
+        record_micros(&accumulator, &tenant, at(70), 40);
+        accumulator.inner.flush_at(at(70)).unwrap();
+        accumulator.inner.flush_at(at(75)).unwrap();
+        assert_eq!(reads(), 2, "50 of 100: read every tick");
+    }
+
+    /// The prefetch loads tomorrow's row so that midnight needs no store read
+    /// on the request path. It is not read back before tomorrow starts:
+    /// nothing admits against it yet.
+    ///
+    /// Mutation: drop the `period_start` check from `Bucket::wants_read`.
+    #[test]
+    fn a_budgeted_row_is_not_read_back_before_its_period_starts() {
+        let store = ProbeStore::new();
+        let accumulator = accumulator_over(&store);
+        accumulator.prepare_request_workers(&[]).unwrap();
+        let tenant = TenantId::new("tenant-a");
+        let tomorrow = Period::Daily.key_for(dt(2026, 9, 4, 0, 0, 0));
+        accumulator.admission_total(&tenant, &tomorrow, 100);
+
+        accumulator
+            .inner
+            .flush_at(dt(2026, 9, 3, 23, 59, 0))
+            .unwrap();
+        assert_eq!(store.load_spend_calls(), 0, "tomorrow has not started");
+        accumulator.inner.flush_at(dt(2026, 9, 4, 0, 0, 5)).unwrap();
+        assert_eq!(store.load_spend_calls(), 1, "now it is today's row");
+    }
+
+    /// The flusher no longer reads back an unbudgeted row, so its memory
+    /// figure is only as fresh as its last delivery. The admin report reads
+    /// the store for an idle row instead, which then holds everything.
+    ///
+    /// Mutation: answer `Some((view, true))` in `report_at` from memory.
+    #[test]
+    fn a_report_of_an_idle_row_includes_what_other_replicas_spent() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let tenant = TenantId::new("tenant-a");
+        let now = Utc::now();
+        let key = Period::Daily.key_for(now);
+        let replica_a = accumulator_on(&store, "node-a", Period::Daily);
+        let replica_b = accumulator_on(&store, "node-b", Period::Daily);
+        record_micros(&replica_a, &tenant, now, 10);
+        replica_a.flush_now().unwrap();
+        record_micros(&replica_b, &tenant, now, 7);
+        replica_b.flush_now().unwrap();
+
+        assert_eq!(
+            replica_a.current_total(&tenant, &key),
+            10,
+            "A never read it back"
+        );
+        assert_eq!(replica_a.report_at(&tenant, &key, now).total_micros, 17);
     }
 
     #[test]

@@ -60,6 +60,11 @@ enum Gate {
 struct State {
     /// Connections accepted so far, which is also the next connection's id.
     accepted: usize,
+    /// Times a connection had answered everything the client had sent and
+    /// had to wait on the socket for more. Every round trip the client makes
+    /// is one of these, so it bounds round trips from above; a large request
+    /// that arrives in several reads counts more than once.
+    drained: usize,
     /// `(connection id, command)` in the order the server read them. The
     /// client library's own connect-time `CLIENT` commands are not logged.
     log: Vec<(usize, String)>,
@@ -443,7 +448,13 @@ fn serve(shared: Arc<Shared>, conn: usize, stream: TcpStream) {
     let mut writer = stream;
     // `Some` between `MULTI` and `EXEC`: the commands queued so far.
     let mut queued: Option<Vec<String>> = None;
-    while let Some(args) = read_command(&mut reader) {
+    loop {
+        if reader.buffer().is_empty() {
+            shared.lock().drained += 1;
+        }
+        let Some(args) = read_command(&mut reader) else {
+            break;
+        };
         let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
         if name != "CLIENT" {
             let mut state = shared.lock();
@@ -571,6 +582,10 @@ impl FakeRedis {
 
     fn accepted(&self) -> usize {
         self.shared.lock().accepted
+    }
+
+    fn drained(&self) -> usize {
+        self.shared.lock().drained
     }
 }
 
@@ -838,6 +853,32 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
         ),
     ];
 
+    let window_row = crate::control::WindowRow {
+        subject: "subject-a".into(),
+        dimension: crate::control::WindowDimension::TotalTokens,
+        window: crate::control::WindowKey::containing(1_000_000, 60),
+    };
+    let window_calls: Vec<Call> = vec![
+        (
+            "last_window_seq_batch",
+            Box::new(|| {
+                store
+                    .last_window_seq_batch("chain", "node-a", std::slice::from_ref(&window_row))
+                    .iter()
+                    .all(Result::is_ok)
+            }),
+        ),
+        (
+            "load_window_batch",
+            Box::new(|| {
+                store
+                    .load_window_batch("chain", std::slice::from_ref(&window_row))
+                    .iter()
+                    .all(Result::is_ok)
+            }),
+        ),
+    ];
+
     // The first call of each tier opens that tier's connection; every other
     // call of the tier must reuse it.
     assert!(store.policy_generation().is_ok());
@@ -845,6 +886,20 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
     assert!(store.add_spend("chain", &tenant, &period, 5, node).is_ok());
     let spend = fake.last_conn();
     assert_ne!(control, spend, "policy and spend calls shared a connection");
+    let delivery = crate::control::WindowDelta {
+        row: &window_row,
+        delta: 1,
+        seq: 1,
+    };
+    assert!(store
+        .add_window_batch("chain", "node-a", &[delivery])
+        .iter()
+        .all(Result::is_ok));
+    let windows = fake.last_conn();
+    assert!(
+        windows != control && windows != spend,
+        "window reconciliation shared a connection with another tier"
+    );
 
     for (name, call) in &control_calls {
         assert!(call(), "{name}: the store rejected the fake's canned reply");
@@ -862,9 +917,17 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
             "{name} must use the spend connection"
         );
     }
+    for (name, call) in &window_calls {
+        assert!(call(), "{name}: the store rejected the fake's canned reply");
+        assert_eq!(
+            fake.last_conn(),
+            windows,
+            "{name} must use the windows connection"
+        );
+    }
     assert_eq!(
         fake.accepted(),
-        2,
+        3,
         "one connection per lane, opened on first use and never replaced"
     );
 }
@@ -1267,9 +1330,9 @@ fn accumulator_over(fake: &FakeRedis) -> crate::spend::SpendAccumulator {
 }
 
 /// Review H5's boot: 20k keys used to cost one blocking read per row before
-/// the listener could bind (80k round trips). The rows now go out as
-/// pipelines of a thousand, each led by one `SCRIPT LOAD`, so counting
-/// those counts round trips.
+/// the listener could bind. The rows now go out as pipelines of a thousand,
+/// so the client waits on the server a few dozen times, not once per row.
+/// Read-only pipelines load no script.
 ///
 /// Mutation: set `SPEND_PIPELINE_ROWS` to 1; the round trips equal the
 /// rows again.
@@ -1277,31 +1340,34 @@ fn accumulator_over(fake: &FakeRedis) -> crate::spend::SpendAccumulator {
 fn a_boot_prefetch_of_20k_keys_reads_in_pipelines_of_a_thousand_rows() {
     let fake = FakeRedis::start();
     let accumulator = accumulator_over(&fake);
-    let keys: Vec<KeyId> = (0..20_000)
-        .map(|i| KeyId::new(format!("key-{i}")))
+    let budget = crate::spend::KeyBudget {
+        max_micros: MicroUsd::from_micros(1_000_000),
+        period: Period::Daily,
+        include_byok_in_limit: false,
+    };
+    let keys: Vec<(KeyId, crate::spend::KeyBudget)> = (0..20_000)
+        .map(|i| (KeyId::new(format!("key-{i}")), budget))
         .collect();
+    let before = fake.drained();
 
     // No deadline of its own: nothing here waits on another thread, and a
     // loaded machine must not fail it on time alone. A hang is nextest's
     // terminate-after.
     assert_eq!(accumulator.prepare_request_workers(&keys), Ok(()));
 
-    // Today and tomorrow, daily and monthly: 3 distinct rows per key, or 4
-    // on the last day of a month.
+    // Today's and tomorrow's row of each key's daily budget.
     let reads = fake.count("GET");
+    assert_eq!(reads, 40_000, "one read per distinct row");
+    let round_trips = fake.drained() - before;
     assert!(
-        reads == 60_000 || reads == 80_000,
-        "one read per distinct row: {reads}"
+        round_trips < reads / 10,
+        "the rows went out in pipelines: {round_trips} waits for {reads} rows"
     );
-    assert_eq!(
-        fake.count("SCRIPT"),
-        reads / 1000,
-        "one pipeline per 1000 rows"
-    );
+    assert_eq!(fake.count("SCRIPT"), 0, "a read-only batch loads no script");
     // The rows landed in memory with the store's total, so serving reads none.
     let today = Period::Daily.key_for_now();
     assert_eq!(
-        accumulator.current_total_key(&keys[19_999], &today),
+        accumulator.current_total_key(&keys[19_999].0, &today),
         STORED_SPEND
     );
     assert_eq!(
@@ -1341,8 +1407,8 @@ fn a_flush_pipelines_its_deliveries_and_each_carries_its_periods_expiry() {
     let names: Vec<&str> = sent.iter().map(|args| args[0].as_str()).collect();
     assert_eq!(
         names,
-        ["SCRIPT", "HGET", "HGET", "HGET", "SCRIPT", "EVALSHA", "EVALSHA", "EVALSHA"],
-        "two pipelines: the seeds, then the deliveries"
+        ["HGET", "HGET", "HGET", "SCRIPT", "EVALSHA", "EVALSHA", "EVALSHA"],
+        "two pipelines: the seeds, then the deliveries, which load their script"
     );
     // The day after `now`, at midnight UTC, plus the 32-day retention.
     let expires_at = (now.date_naive() + chrono::Duration::days(1 + 32))
@@ -1351,12 +1417,89 @@ fn a_flush_pipelines_its_deliveries_and_each_carries_its_periods_expiry() {
         .and_utc()
         .timestamp()
         .to_string();
-    for args in &sent[5..] {
+    for args in &sent[4..] {
         // EVALSHA sha 2 spend_key seq_key node seq delta expires_at
         assert_eq!(args[6], (LAST_SEQ + 1).to_string(), "seeded from the store");
         assert_eq!(args[7], "7");
         assert_eq!(args[8], expires_at, "{args:?}");
     }
+}
+
+/// One canned spend delivery per tenant, for the batch tests.
+fn spend_rows<'a>(tenants: &'a [TenantId], period: &'a PeriodKey) -> Vec<SpendDelta<'a>> {
+    tenants
+        .iter()
+        .map(|tenant| SpendDelta {
+            tenant,
+            period,
+            delta_micros: 5,
+            seq: 1,
+        })
+        .collect()
+}
+
+/// A pipeline only names a script's hash, so the script must be loaded on
+/// the connection first. Once per connection is enough: Redis keeps it. A
+/// reconnect may reach a restarted server, so it loads again.
+///
+/// Mutation: drop the `has_loaded` filter in `pipelined`; every pipeline
+/// loads the script again.
+#[test]
+fn a_script_is_loaded_once_per_connection_and_again_after_a_reconnect() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    let (tenants, period) = ([TenantId::new("tenant-a")], PeriodKey::for_test("2026-10"));
+    let rows = spend_rows(&tenants, &period);
+
+    for _ in 0..3 {
+        assert_eq!(
+            store.add_spend_batch("chain", "node-a", &rows),
+            vec![Ok(SPEND_TOTAL)]
+        );
+    }
+    assert_eq!(fake.count("SCRIPT"), 1, "three pipelines, one load");
+    assert_eq!(fake.count("EVALSHA"), 3);
+
+    fake.kill_next(Gate::SpendFlush);
+    assert!(store.add_spend_batch("chain", "node-a", &rows)[0].is_err());
+    assert_eq!(
+        store.add_spend_batch("chain", "node-a", &rows),
+        vec![Ok(SPEND_TOTAL)]
+    );
+    assert_eq!(fake.accepted(), 2, "the failure reconnected");
+    assert_eq!(
+        fake.count("SCRIPT"),
+        2,
+        "the new connection loaded the script before using it"
+    );
+}
+
+/// Against a dead Redis every pipeline dials again and can wait out a full
+/// I/O timeout, so a batch of many pipelines held the flusher (and shutdown)
+/// for one timeout per pipeline. The first failure now ends the batch: every
+/// row gets the error and nothing more is dialled.
+///
+/// Mutation: drop the `break` in `pipelined`; the second and third
+/// pipelines dial again and succeed.
+#[test]
+fn a_failed_first_pipeline_fails_the_rest_of_the_batch_without_dialling_again() {
+    let fake = FakeRedis::start();
+    let store = fake.store();
+    let tenants: Vec<TenantId> = (0..2_500)
+        .map(|i| TenantId::new(format!("tenant-{i}")))
+        .collect();
+    let period = PeriodKey::for_test("2026-10");
+    let rows = spend_rows(&tenants, &period);
+
+    fake.kill_next(Gate::SpendFlush);
+    let results = store.add_spend_batch("chain", "node-a", &rows);
+
+    assert_eq!(results.len(), rows.len(), "one result per row");
+    assert!(
+        results.iter().all(Result::is_err),
+        "every row from the failed pipeline on carries the error"
+    );
+    assert_eq!(fake.accepted(), 1, "nothing was dialled after the failure");
 }
 
 /// `SET` drops a key's expiry, so the operator's correction restates it in
@@ -1384,9 +1527,9 @@ fn an_operator_overwrite_keeps_the_rows_expiry() {
     );
 }
 
-/// A window batch is pipelined like spend's: one `SCRIPT LOAD`, then one
-/// `EVALSHA` per row, and every delivery carries `EXPIREAT` window end plus
-/// the grace, on the spend lane.
+/// A window batch is pipelined like spend's: one `SCRIPT LOAD` on a fresh
+/// connection, then one `EVALSHA` per row, and every delivery carries
+/// `EXPIREAT` window end plus the grace.
 #[test]
 fn a_window_batch_is_pipelined_and_each_delivery_expires_after_its_window() {
     use crate::control::{WindowDelta, WindowDimension, WindowKey, WindowRow};

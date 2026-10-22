@@ -300,13 +300,22 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                             invalid("typed_config.recovery_journal_path", err.to_string())
                         })?;
                 }
+                // Only budgeted subjects: no admission reads anyone else's
+                // row. A revoked key never admits again.
                 let keys: Vec<_> = control_plane
                     .list_keys()
                     .into_iter()
-                    .map(|key| key.key_id)
+                    .filter(|key| !key.revoked)
+                    .filter_map(|key| Some((key.key_id, key.budget?)))
                     .collect();
                 let snapshot = control_plane.handle().load_full();
-                let tenants: Vec<_> = snapshot.key_tenants.values().cloned().collect();
+                let tenants: Vec<_> = snapshot
+                    .policies
+                    .iter()
+                    .filter_map(|(tenant, policy)| {
+                        Some((TenantId::new(tenant.clone()), policy.budget?))
+                    })
+                    .collect();
                 // A failed prefetch fails open, loudly: see
                 // `SpendAccumulator::prepare_request_workers`.
                 if let Err(err) = accumulator
@@ -1011,19 +1020,23 @@ impl HttpFilter for SpendLimitFilterInstance {
                 (
                     budget.max_micros,
                     budget.period,
-                    self.accumulator
-                        .current_total_key(&key_id, &budget.period.key_for(now)),
+                    self.accumulator.admission_total_key(
+                        &key_id,
+                        &budget.period.key_for(now),
+                        budget.max_micros.as_micros(),
+                    ),
                 )
             }),
             tenant_budget.map(|budget| {
                 (
                     budget.max_micros,
                     budget.period,
-                    self.accumulator.current_total(
+                    self.accumulator.admission_total(
                         tenant
                             .as_ref()
                             .expect("tenant budget requires tenant identity"),
                         &budget.period.key_for(now),
+                        budget.max_micros.as_micros(),
                     ),
                 )
             }),
@@ -2714,8 +2727,10 @@ mod tests {
         .expect("the policy load does not read spend");
         let tenant = TenantId::new("tenant-a");
         cp.create_tenant(&tenant).unwrap();
-        cp.mint_key(&tenant, &KeyId::new("key-secret-looking-id"))
-            .unwrap();
+        let key = KeyId::new("key-secret-looking-id");
+        cp.mint_key(&tenant, &key).unwrap();
+        // Only budgeted keys are prefetched.
+        cp.set_key_budget(&key, Some(&dollar_budget())).unwrap();
         let ctx = FactoryContext::default();
         ctx.shared
             .get_or_try_init(&ctx.scope, &ctx.stat_prefix, auth_filter::TYPE_URL, || {
@@ -2739,6 +2754,63 @@ mod tests {
             "{}",
             warnings[0]
         );
+    }
+
+    /// The startup prefetch reads only rows an admission will read: a key
+    /// with no budget never consults its row, and a revoked key never admits
+    /// again. Reading them cost a boot read each, and each became a row the
+    /// flusher kept live.
+    ///
+    /// Mutation: drop the `!key.revoked` filter in the factory.
+    #[test]
+    fn the_startup_prefetch_skips_revoked_and_unbudgeted_keys() {
+        use crate::spend::test_support::ProbeStore;
+        let probe = Arc::try_unwrap(ProbeStore::new())
+            .ok()
+            .expect("nothing else holds the new store");
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *probe.before_load_spend.lock().unwrap() = Some(Box::new({
+            let reads = Arc::clone(&reads);
+            move || {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        let cp = ControlPlane::new(
+            Box::new(probe),
+            HmacSecret::new(b"test-secret-value-long-enough"),
+            KeySet::default(),
+        )
+        .expect("the policy load does not read spend");
+        let tenant = TenantId::new("tenant-a");
+        cp.create_tenant(&tenant).unwrap();
+        for (key, budgeted, revoked) in [
+            ("live-budgeted", true, false),
+            ("revoked-budgeted", true, true),
+            ("unbudgeted", false, false),
+        ] {
+            let key = KeyId::new(key);
+            cp.mint_key(&tenant, &key).unwrap();
+            if budgeted {
+                cp.set_key_budget(&key, Some(&dollar_budget())).unwrap();
+            }
+            if revoked {
+                cp.revoke_key(&key).unwrap();
+            }
+        }
+        let ctx = FactoryContext::default();
+        ctx.shared
+            .get_or_try_init(&ctx.scope, &ctx.stat_prefix, auth_filter::TYPE_URL, || {
+                Ok(Arc::new(cp) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+
+        SpendLimitFilterFactory
+            .create(&spend_limit_config(), &ctx)
+            .expect("the filter builds");
+
+        // Today's and tomorrow's row of the one live, budgeted key's daily
+        // budget.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

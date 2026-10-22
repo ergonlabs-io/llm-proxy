@@ -58,6 +58,10 @@ const STREAM_RETRY_HINT: Duration = Duration::from_secs(1);
 /// `last_flush_millis` before the first successful reconcile.
 const NEVER: i64 = i64::MIN;
 
+/// The longest an idle row below half its limit goes without a read-back.
+/// See [`Bucket::wants_read`].
+const IDLE_REFRESH_SECS: u64 = 10;
+
 fn unix_millis(now: SystemTime) -> i64 {
     now.duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -102,11 +106,32 @@ struct Bucket {
     attempt: Option<FlushAttempt>,
     /// The next seq to use; `None` until seeded from the store.
     next_seq: Option<u64>,
+    /// The limit this row was last counted against.
+    limit: u64,
+    /// When the store last confirmed `base`, as Unix seconds.
+    synced_at: Option<u64>,
 }
 
 impl Bucket {
     fn used(&self) -> u64 {
         self.base.saturating_add(self.pending)
+    }
+
+    /// Whether the flusher reads back this row, which has nothing to deliver.
+    ///
+    /// The read only matters for admission, and only near the limit: a row
+    /// well below it admits whatever the other replicas added since the last
+    /// read, unless they added half the limit. So a row is read every tick
+    /// once it holds half its limit, and otherwise at most every
+    /// [`IDLE_REFRESH_SECS`], which bounds how stale its base gets. Reading
+    /// every idle row every tick made store load grow with the number of
+    /// rows rather than with traffic. A row that sees traffic delivers each
+    /// tick, and a delivery returns the fleet total anyway.
+    fn wants_read(&self, now_secs: u64) -> bool {
+        self.used().saturating_mul(2) >= self.limit
+            || self
+                .synced_at
+                .is_none_or(|at| now_secs.saturating_sub(at) >= IDLE_REFRESH_SECS)
     }
 }
 
@@ -287,6 +312,7 @@ impl WindowAccumulator {
             let (key, first_fold) = buckets.bounded(key);
             let bucket = buckets.entry((key, dimension, window));
             bucket.pending = bucket.pending.saturating_add(amount);
+            bucket.limit = limit;
             (needs_early_flush(bucket, limit), first_fold)
         };
         if first_fold {
@@ -316,6 +342,7 @@ impl WindowAccumulator {
             } else {
                 let bucket = buckets.entry(row);
                 bucket.pending = bucket.pending.saturating_add(1);
+                bucket.limit = limit;
                 let wake = needs_early_flush(bucket, limit);
                 (
                     Admission::Admitted {
@@ -564,9 +591,9 @@ impl Inner {
     }
 
     /// One reconcile: deliver every bucket's pending count as an additive,
-    /// sequenced delta, read back the total for buckets with nothing
-    /// pending, adopt each total as the new base, and drop buckets whose
-    /// window has ended with nothing left to deliver. Store calls run without
+    /// sequenced delta, read back the total for buckets with nothing pending
+    /// that [`Bucket::wants_read`], adopt each total as the new base, and drop
+    /// buckets whose window has ended with nothing left to deliver. Store calls run without
     /// the bucket lock, so admission never waits on the store.
     fn flush_at(&self, now: SystemTime) -> Result<(), StoreError> {
         let _flush = self
@@ -594,7 +621,7 @@ impl Inner {
                         }
                         (None, None) => unseeded.push(key.clone()),
                     }
-                } else if key.2.end_secs() > now_secs {
+                } else if key.2.end_secs() > now_secs && bucket.wants_read(now_secs) {
                     reads.push(key.clone());
                 }
             }
@@ -652,6 +679,7 @@ impl Inner {
                         if let Some(bucket) = buckets.by_key.get_mut(key) {
                             if bucket.attempt == Some(*attempt) {
                                 bucket.base = total;
+                                bucket.synced_at = Some(now_secs);
                                 bucket.pending = bucket.pending.saturating_sub(attempt.delta);
                                 bucket.next_seq = Some(attempt.seq.saturating_add(1));
                                 bucket.attempt = None;
@@ -680,6 +708,7 @@ impl Inner {
                             // as `base` loses nothing.
                             if bucket.attempt.is_none() {
                                 bucket.base = total;
+                                bucket.synced_at = Some(now_secs);
                             }
                         }
                     }
@@ -1230,8 +1259,10 @@ mod tests {
         let key = tenant("r", "t");
         let w = window_at(t0());
 
-        a.add(&key, TOTAL, w, 30, 1_000);
-        b.add(&key, TOTAL, w, 12, 1_000);
+        // A limit both replicas are past half of, so an idle row is read back
+        // every tick.
+        a.add(&key, TOTAL, w, 30, 60);
+        b.add(&key, TOTAL, w, 12, 60);
         a.flush_at(t0()).unwrap();
         b.flush_at(t0()).unwrap();
         // `a` delivered before `b`, so it learns `b`'s share on its next read.
@@ -1240,9 +1271,46 @@ mod tests {
         assert_eq!(b.used(&key, TOTAL, w), 42);
 
         // Counts recorded after a reconcile stay local until the next one.
-        a.add(&key, TOTAL, w, 1, 1_000);
+        a.add(&key, TOTAL, w, 1, 60);
         assert_eq!(a.used(&key, TOTAL, w), 43);
         assert_eq!(b.used(&key, TOTAL, w), 42);
+    }
+
+    /// Reading back every idle row every second made store load grow with
+    /// the number of rows. An idle row below half its limit is read at most
+    /// every `IDLE_REFRESH_SECS`; at half or more, every tick.
+    ///
+    /// Mutations: drop the half-limit term from `Bucket::wants_read` (the
+    /// near row stays stale); drop the refresh term (the far row never
+    /// catches up).
+    #[test]
+    fn an_idle_row_is_read_back_near_its_limit_or_when_stale() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let a = accumulator(&store, "a");
+        let b = accumulator(&store, "b");
+        let (far, near) = (tenant("r", "far"), tenant("r", "near"));
+        let w = window_at(t0());
+        let at = |secs| t0() + Duration::from_secs(secs);
+        a.add(&far, TOTAL, w, 10, 100);
+        a.add(&near, TOTAL, w, 50, 100);
+        a.flush_at(t0()).unwrap();
+        b.add(&far, TOTAL, w, 5, 100);
+        b.add(&near, TOTAL, w, 5, 100);
+        b.flush_at(t0()).unwrap();
+
+        a.flush_at(at(1)).unwrap();
+        assert_eq!(
+            a.used(&near, TOTAL, w),
+            55,
+            "half the limit: read every tick"
+        );
+        assert_eq!(
+            a.used(&far, TOTAL, w),
+            10,
+            "a tenth, synced a second ago: not read"
+        );
+        a.flush_at(at(IDLE_REFRESH_SECS)).unwrap();
+        assert_eq!(a.used(&far, TOTAL, w), 15, "the refresh is due");
     }
 
     #[test]
@@ -1583,8 +1651,8 @@ mod tests {
         proxy_observability::stats::StatsControl::new(1).registry()
     }
 
-    /// A window that has not ended, so every reconcile reads it back from
-    /// the store whatever minute the test runs in.
+    /// A window that has not ended whatever minute the test runs in, so a
+    /// reconcile reads back a row in it that is near its limit.
     fn open_window() -> WindowKey {
         WindowKey::containing(unix_secs(SystemTime::now()) + 3_600, MINUTE)
     }
@@ -1610,7 +1678,8 @@ mod tests {
             age()
         );
 
-        acc.add(&tenant("chat", "acme"), TOTAL, open_window(), 5, 100);
+        // Half the limit, so every reconcile reads it back.
+        acc.add(&tenant("chat", "acme"), TOTAL, open_window(), 5, 10);
         acc.flush_at(now).unwrap();
         acc.publish_reconciliation_age(now);
         assert_eq!(age(), Some(0));
@@ -1632,7 +1701,8 @@ mod tests {
             "a".to_string(),
             Duration::MAX,
         );
-        acc.add(&tenant("chat", "acme"), TOTAL, open_window(), 5, 100);
+        // Half the limit, so every reconcile reads it back.
+        acc.add(&tenant("chat", "acme"), TOTAL, open_window(), 5, 10);
         acc.flush_now().unwrap();
         store.fail.store(true, Ordering::SeqCst);
         let registry = registry();

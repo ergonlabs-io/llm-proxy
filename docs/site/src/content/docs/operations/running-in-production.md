@@ -207,16 +207,17 @@ The 60-second propagation bound assumes successful store reads.
 
 ## Redis connections and the policy load log
 
-A replica opens up to two Redis connections to the shared store. It opens each
-one on first use. The policy lane carries the generation poll, the policy load,
-and every admin write. The spend lane carries spend reconciliation and the
-spend reads at bind time. A slow call on one lane does not delay a call on the
-other. Each lane has a 1 second timeout for connect, read, and write. After an
+A replica opens up to five Redis connections to the shared store, one for each
+lane. It opens each one on first use. The policy lane carries the generation
+poll, the policy load, and every admin write. The spend lane carries spend
+reconciliation and the spend reads at bind time. The windows lane carries
+rate-window reconciliation and usage reads. The lease lane carries
+concurrent-stream leases, and the objects lane carries file and batch
+ownership. A slow call on one lane does not delay a call on another. Each lane has a 1 second timeout for connect, read, and write. After an
 error, the lane drops its own connection and reconnects on the next call. The
-other lane keeps its connection.
+other lanes keep their connections.
 
-A Redis that stops answering still stalls both lanes, because both lanes use
-it.
+A Redis that stops answering still stalls all lanes, because all lanes use it.
 
 Each successful policy load logs one `info` line:
 `loaded control-plane state from redis`. The line has these fields:
