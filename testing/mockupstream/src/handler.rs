@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::frames::{self, AnthropicFrames, Draw, OpenAiFrames, ResponseBody, StreamConfig};
 use crate::profiles::{Profile, ProfileSet};
 use crate::request::{self, MAX_BODY_BYTES};
-use crate::stats::Stats;
+use crate::stats::{InFlightGuard, Stats};
 
 /// Everything one accepted connection's request handlers share: the
 /// pre-rendered frame sets (one build per process, at startup), the profile
@@ -92,6 +92,12 @@ pub async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Re
             handle_dialect(req, &state, Dialect::OpenAi).await
         }
         (Method::POST, "/v1/messages") => handle_dialect(req, &state, Dialect::Anthropic).await,
+        // Read by scripts/scale-experiment-remote.sh's stream sampler. The
+        // underscore prefix keeps it clear of every provider API path.
+        (Method::GET, "/_mock/stats") => json_response(Bytes::from(
+            serde_json::to_vec(&state.stats.take_snapshot())
+                .expect("snapshot is always serializable"),
+        )),
         (Method::GET, "/health") => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain")
@@ -117,6 +123,7 @@ async fn handle_dialect(
     state: &AppState,
     dialect: Dialect,
 ) -> Response<ResponseBody> {
+    let guard = state.stats.enter();
     let body = match read_capped_body(req).await {
         Ok(bytes) => bytes,
         Err(resp) => {
@@ -135,7 +142,7 @@ async fn handle_dialect(
     // `"default"` entry, never removable). See `crate::profiles`.
     let profile = state.profiles.resolve(&meta.model);
 
-    match dialect {
+    let response = match dialect {
         Dialect::OpenAi => {
             if meta.stream {
                 let draw = draw_response_shape(profile);
@@ -166,7 +173,28 @@ async fn handle_dialect(
                 ))
             }
         }
-    }
+    };
+    hold_until_body_ends(response, guard)
+}
+
+/// Move the in-flight guard into the response body, so the request stays
+/// counted until hyper drops the body: when the last frame is written, or
+/// when the client disconnects mid-stream.
+///
+/// Rust note: `map_frame`'s closure owns `guard` (`move`), and the closure
+/// lives inside the boxed body, so dropping the body drops the guard. The
+/// `let _ = &guard;` only makes the closure capture it.
+fn hold_until_body_ends(
+    response: Response<ResponseBody>,
+    guard: InFlightGuard,
+) -> Response<ResponseBody> {
+    response.map(|body| {
+        body.map_frame(move |frame| {
+            let _ = &guard;
+            frame
+        })
+        .boxed()
+    })
 }
 
 /// Read the whole request body, capped at [`MAX_BODY_BYTES`]. Returns the
@@ -265,6 +293,37 @@ mod tests {
             a.ttft != b.ttft || a.k() != b.k() || a.inter_token_delays != b.inter_token_delays,
             "two differently-seeded draws against the same profile produced identical output"
         );
+    }
+
+    /// A request stays counted while its body is alive: through a finished
+    /// read of every frame, and through a body dropped mid-stream (the
+    /// client went away).
+    #[tokio::test]
+    async fn in_flight_lasts_as_long_as_the_response_body() {
+        let in_flight = |s: &Stats| s.in_flight.load(std::sync::atomic::Ordering::Relaxed);
+        let stats = Arc::new(Stats::default());
+        let frames = OpenAiFrames::new();
+        let draw = || Draw {
+            ttft: std::time::Duration::ZERO,
+            inter_token_delays: vec![std::time::Duration::ZERO; 3],
+        };
+
+        let read_to_end = hold_until_body_ends(
+            sse_response(frames.stream_body("m", 10, draw())),
+            stats.enter(),
+        );
+        assert_eq!(in_flight(&stats), 1);
+        read_to_end.into_body().collect().await.unwrap();
+        assert_eq!(in_flight(&stats), 0);
+
+        let abandoned = hold_until_body_ends(
+            sse_response(frames.stream_body("m", 10, draw())),
+            stats.enter(),
+        );
+        assert_eq!(in_flight(&stats), 1);
+        drop(abandoned);
+        assert_eq!(in_flight(&stats), 0);
+        assert_eq!(stats.take_snapshot().peak_in_flight, 1);
     }
 
     /// Same property for the non-streaming length draw.

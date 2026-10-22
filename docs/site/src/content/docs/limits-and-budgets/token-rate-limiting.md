@@ -214,7 +214,7 @@ once a second, and sooner when a caller nears its limit.
 | `shared` | Token and request counts are shared by every replica. The fleet can admit a little over a limit between reconciles. |
 
 With a `shared` store, each replica also publishes its count of concurrent
-streams about once a second. The count of a replica that stops expires after 5
+streams four times a second. The count of a replica that stops expires after 5
 seconds. A `limits` entry on a proxy with no `auth:` block counts per process.
 
 If the store cannot be reached, the proxy keeps enforcing against the last

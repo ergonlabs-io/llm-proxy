@@ -37,9 +37,9 @@ const HOLD_TIMEOUT: Duration = Duration::from_secs(120);
 const WAIT: Duration = Duration::from_secs(20);
 
 /// `DEFAULT_LEASE_TTL` and `DEFAULT_LEASE_PUBLISH_INTERVAL` in
-/// `proxy-filters`' `window_counter.rs`.
+/// `proxy-control`'s `window_counter.rs`.
 const LEASE_TTL: Duration = Duration::from_secs(5);
-const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 const HMAC_SECRET: &str = "shared-limits-e2e-secret";
 const ADMIN_TOKEN: &str = "shared-limits-e2e-admin-token";

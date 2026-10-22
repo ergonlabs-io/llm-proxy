@@ -330,15 +330,15 @@ in tenant and key limits.
 - Each replica admits a stream against its own in-flight count plus the
   count that the other replicas last published. Admission never waits for
   Redis.
-- Once a second, each replica writes its in-flight count per limit to Redis
-  as a lease row with a 5-second TTL, and reads the fleet total for every
+- Four times a second, each replica writes its in-flight count per limit to
+  Redis as a lease row with a 5-second TTL, and reads the fleet total for every
   limit, including limits it has not served yet.
 - A replica that stops (a crash or `SIGKILL`) does not release its slots.
   Its lease rows expire 5 seconds after its last write, and the other
   replicas then admit again.
 - Between two writes, replicas do not see each other's new streams. The
-  fleet can admit up to about one second of stream arrivals on the other
-  replicas over a ceiling.
+  fleet can admit up to about a quarter second of stream arrivals on the
+  other replicas over a ceiling.
 - If Redis cannot be reached, each replica keeps enforcing against the last
   fleet counts it read, plus its own streams (fail open). It logs one
   `stream-lease publish failed` warning per filter chain per minute, and the

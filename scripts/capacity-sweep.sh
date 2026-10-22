@@ -50,6 +50,7 @@ INTER_TOKEN_MS=25
 HOLD_SECS=30
 WARMUP_SECS=3
 MAX_CONCURRENCY=""
+PROVIDER_YAML=""
 ACCESS_LOGS=off
 SLO_P99_MS=""
 SLO_TTFT_P99_MS=""
@@ -73,6 +74,10 @@ Options:
                                     generation time -- see the note below)
   --slo-ttft-p99-ms N               TTFT SLO (default: 2x the mock's own TTFT + 500ms)
   --access-logs on|off              Enable proxy access logging (default: off)
+  --provider-yaml LINES             Extra lines for the mock provider block,
+                                    indented 4 spaces (e.g. a higher circuit
+                                    breaker, so the sweep is not capped at the
+                                    default max_requests of 1024)
   --out-dir DIR                     Where the report lands (default: target/capacity)
 USAGE
 }
@@ -90,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --slo-p99-ms)        SLO_P99_MS="$2"; shift 2 ;;
         --slo-ttft-p99-ms)   SLO_TTFT_P99_MS="$2"; shift 2 ;;
         --access-logs)       ACCESS_LOGS="$2"; shift 2 ;;
+        --provider-yaml)     PROVIDER_YAML="$2"; shift 2 ;;
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
         -h|--help)           usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage; exit 2 ;;
@@ -123,7 +129,9 @@ cleanup() {
     echo
     echo "--- teardown ---"
     local leftover
-    leftover="$(pgrep -f 'mock-upstream|llm-proxy' || true)"
+    # By process name: `pgrep -f llm-proxy` also matches any command line
+    # that contains the repository path, such as the shell running this.
+    leftover="$( { pgrep -x mock-upstream; pgrep -x llm-proxy; } || true)"
     if [[ -n "$leftover" ]]; then
         echo "WARNING: processes still running after teardown:"
         ps -o pid,command -p $leftover || true
@@ -192,6 +200,7 @@ providers:
   mock:
     base_url: http://$MOCK_ADDR
 $PROTOCOL_LINE
+$PROVIDER_YAML
 
 routes:
   - model: "*"

@@ -58,8 +58,13 @@ load_state() {
     source "$STATE"
 }
 
+# DO_SSH_IDENTITY: a private key file for a droplet whose key is not in the
+# ssh agent or ~/.ssh/config (one created outside 'up').
+SSH_ID_ARGS=()
+[[ -n "${DO_SSH_IDENTITY:-}" ]] && SSH_ID_ARGS=(-i "$DO_SSH_IDENTITY" -o IdentitiesOnly=yes)
+
 ssh_vm() {
-    ssh -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
+    ssh "${SSH_ID_ARGS[@]}" -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new \
         -o ServerAliveInterval=30 -o ConnectTimeout=10 "root@$DROPLET_IP" "$@"
 }
 
@@ -135,13 +140,23 @@ cmd_ship() {
     ssh_vm 'cd /root/llm-proxy && . "$HOME/.cargo/env" && cargo build --release -p proxy -p mockupstream -p loadgen'
 }
 
+# The runner's knobs that `run` forwards from this shell, when set, e.g.
+#   S4_RPM=600 scripts/scale-experiment.sh run s0 s4a
+RUNNER_KNOBS="S2_RATES S3_RATE S3_STORES S4_RPM S4_STREAMS S4_MOCK_PROFILES S6_RATE S7_RATE PERF_SECS CORES_PROXY
+    CORES_UPSTREAM CORES_REDIS CORES_LOADGEN PROXY_WORKERS PROXY_BIN UPSTREAM_PROTOCOL PROVIDER_EXTRA_YAML"
+
 cmd_run() {
     load_state
-    local run_id; run_id="$(date -u +%Y%m%dT%H%M%SZ)"
-    # Detached, so a dropped ssh session does not kill the run.
+    local run_id knob env_args=""; run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+    for knob in $RUNNER_KNOBS; do
+        [[ -n "${!knob:-}" ]] && env_args+=" $knob=$(printf '%q' "${!knob}")"
+    done
+    # Detached, so a dropped ssh session does not kill the run. The whole
+    # backgrounded list is redirected too: otherwise its subshell holds the
+    # ssh channel open and this command waits for the whole run.
     ssh_vm "cd /root/llm-proxy && mkdir -p target/scale/$run_id && . \"\$HOME/.cargo/env\" \
-        && RUN_ID=$run_id nohup scripts/scale-experiment-remote.sh ${*:-all} \
-           > target/scale/$run_id/runner.log 2>&1 < /dev/null & echo started $run_id"
+        && { RUN_ID=$run_id$env_args setsid nohup scripts/scale-experiment-remote.sh ${*:-all} \
+           > target/scale/$run_id/runner.log 2>&1 < /dev/null & } > /dev/null 2>&1 < /dev/null; echo started $run_id"
     echo "RUN_ID=$run_id" >>"$STATE"
     echo "follow with: $0 tail"
 }
@@ -155,7 +170,7 @@ cmd_tail() {
 cmd_fetch() {
     load_state
     mkdir -p "$STATE_DIR/remote"
-    rsync -az -e "ssh -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new" \
+    rsync -az -e "ssh ${SSH_ID_ARGS[*]} -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=accept-new" \
         "root@$DROPLET_IP:/root/llm-proxy/target/scale/" "$STATE_DIR/remote/"
     echo "results in $STATE_DIR/remote/"
 }

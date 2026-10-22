@@ -434,6 +434,10 @@ bench-added-latency: bench-build ## Added p50/p99 latency: direct vs proxy contr
 bench-added-latency-check: ## Check the added-latency reporter without starting servers
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_added_latency.py
 
+.PHONY: scale-verdict-check
+scale-verdict-check: ## Check the scale-run S4/S5 verdicts without starting servers
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_scale_verdict.py
+
 .PHONY: sweep-docker
 sweep-docker: ## Docker Desktop capacity baseline: proxy pinned to 2 CPUs and 1 GiB
 	./scripts/docker-capacity-sweep.sh $(ARGS)

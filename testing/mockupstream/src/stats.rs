@@ -1,5 +1,5 @@
-//! Served-request counters, and the optional periodic stderr printer
-//! (`--stats-interval-secs`).
+//! Served-request counters, the in-flight gauge, and the optional periodic
+//! stderr printer (`--stats-interval-secs`).
 //!
 //! Rust note: plain `AtomicU64`s with `Ordering::Relaxed`, never a `Mutex`.
 //! Nothing here needs cross-field consistency -- a reader may observe one
@@ -22,6 +22,34 @@ pub struct Stats {
     /// Requests that never reached a dialect handler: unknown path/method
     /// (404) or an oversized body (413).
     pub requests_rejected: AtomicU64,
+    /// Dialect requests whose response body is still alive: from the moment
+    /// the handler accepts the request until the body finishes or the
+    /// client goes away. For a streaming request that is the whole stream.
+    /// A proxy-side ceiling (a fleet `concurrent_streams` limit) is checked
+    /// against this: a refused stream never reaches the upstream, so this
+    /// gauge cannot count it, which a downstream connection count can.
+    pub in_flight: AtomicU64,
+    /// Highest `in_flight` since the last [`Stats::take_snapshot`], so a
+    /// sampler polling every 500 ms still sees a spike between two polls.
+    peak_in_flight: AtomicU64,
+}
+
+/// Decrements [`Stats::in_flight`] when dropped. The handler moves it into
+/// the response body, so it lives exactly as long as the response does.
+pub struct InFlightGuard(Arc<Stats>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// One read of the gauge, served at `GET /_mock/stats`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Snapshot {
+    pub in_flight: u64,
+    pub peak_in_flight: u64,
+    pub requests_total: u64,
 }
 
 impl Stats {
@@ -39,13 +67,34 @@ impl Stats {
         self.requests_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one request in flight until the returned guard drops.
+    pub fn enter(self: &Arc<Self>) -> InFlightGuard {
+        let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::Relaxed);
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Read the gauge and start a new peak window at the current value.
+    /// Meant for one sampler; two concurrent readers split the peaks
+    /// between them.
+    pub fn take_snapshot(&self) -> Snapshot {
+        let in_flight = self.in_flight.load(Ordering::Relaxed);
+        let peak = self.peak_in_flight.swap(in_flight, Ordering::Relaxed);
+        Snapshot {
+            in_flight,
+            peak_in_flight: peak.max(in_flight),
+            requests_total: self.requests_total.load(Ordering::Relaxed),
+        }
+    }
+
     fn snapshot_line(&self) -> String {
         format!(
-            "mock-upstream stats: total={} streaming={} non_streaming={} rejected={}",
+            "mock-upstream stats: total={} streaming={} non_streaming={} rejected={} in_flight={}",
             self.requests_total.load(Ordering::Relaxed),
             self.requests_streaming.load(Ordering::Relaxed),
             self.requests_non_streaming.load(Ordering::Relaxed),
             self.requests_rejected.load(Ordering::Relaxed),
+            self.in_flight.load(Ordering::Relaxed),
         )
     }
 }
@@ -104,5 +153,22 @@ mod tests {
         assert!(line.contains("streaming=1"));
         assert!(line.contains("non_streaming=0"));
         assert!(line.contains("rejected=1"));
+        assert!(line.contains("in_flight=0"));
+    }
+
+    #[test]
+    fn guards_count_in_flight_and_the_peak_survives_until_read() {
+        let stats = Arc::new(Stats::default());
+        let a = stats.enter();
+        let b = stats.enter();
+        drop(a);
+        drop(b);
+        let _c = stats.enter();
+        // Two were in flight between reads; one is now.
+        let first = stats.take_snapshot();
+        assert_eq!((first.in_flight, first.peak_in_flight), (1, 2));
+        // The next window starts at the current value, not at the old peak.
+        let second = stats.take_snapshot();
+        assert_eq!((second.in_flight, second.peak_in_flight), (1, 1));
     }
 }

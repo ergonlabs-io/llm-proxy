@@ -227,6 +227,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
     for each of the rest.
   - With `auth.store: persistent`, a spend flush writes all its rows in one
     transaction, so one disk sync, not one per row.
+- With a `shared` store, each replica publishes its concurrent-stream lease
+  rows every 250 ms instead of every second. The fleet can now go over a
+  `concurrent_streams` or `concurrent_sessions` limit by about a quarter second
+  of stream arrivals on the other replicas, not a full second. In a 3-replica
+  test at twice the offered load of a 300-stream limit, the fleet peak fell
+  from 417 to 330 streams with no added refusals. Redis receives four times as
+  many lease writes. The lease TTL stays 5 seconds.
 - A weighted route no longer draws a member that has no healthy host. Before,
   in Envoy mode, a `weighted_clusters` member whose hosts were all ejected by
   outlier detection kept its share, and its requests went to the ejected
