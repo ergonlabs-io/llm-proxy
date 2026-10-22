@@ -8,7 +8,14 @@ license.workspace = true
 name = "llm-proxy"
 path = "src/main.rs"
 
+[features]
+# Replace the system allocator with mimalloc in the `llm-proxy` binary only;
+# libraries keep whatever allocator their final binary picks. Off by default:
+# see internal-docs/capacity/2026-10-21-allocator-ab.md.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+mimalloc = { workspace = true, optional = true }
 clap = { workspace = true }
 proxy-admin = { workspace = true }
 proxy-cluster = { workspace = true }
