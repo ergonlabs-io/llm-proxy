@@ -3398,6 +3398,31 @@ fn path_segment(value: &str) -> String {
     encoded
 }
 
+/// Set once the first malformed header mutation has been logged.
+static DROPPED_HEADER_MUTATION_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Log a header mutation the router cannot send. Provider credential and
+/// `extra_headers` values are checked at load, so this is reachable only from
+/// an Envoy route's `request_headers_to_add`, which Envoy's own validation
+/// lets through for a few bytes the `http` crate refuses. The header is
+/// dropped and the request still goes out (fail open), so the first drop is
+/// an error and later drops log at debug: one line per request would become
+/// the incident (AGENTS.md "Fail-open controls"). The value is never logged.
+/// The flag is read only on this error path, never on a healthy request.
+fn warn_dropped_header_mutation(key: &str, reason: &'static str) {
+    if DROPPED_HEADER_MUTATION_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(key, reason, "request_headers_to_add: dropping header");
+    } else {
+        tracing::error!(
+            key,
+            reason,
+            "request_headers_to_add: dropping a header the proxy cannot send; the request goes \
+             out without it; later drops log at debug"
+        );
+    }
+}
+
 /// Apply a route's `request_headers_to_add` mutations, in config order, to
 /// the outgoing request headers -- this is what actually gets a
 /// dialect-injected provider credential (`Authorization`/`x-api-key`/
@@ -3417,11 +3442,11 @@ pub(crate) fn apply_header_mutations(
 
     for mutation in mutations {
         let Ok(name) = http::HeaderName::from_bytes(mutation.key.as_bytes()) else {
-            tracing::warn!(key = %mutation.key, "request_headers_to_add: invalid header name, skipping");
+            warn_dropped_header_mutation(&mutation.key, "invalid header name");
             continue;
         };
         let Ok(value) = HeaderValue::from_str(&mutation.value) else {
-            tracing::warn!(key = %mutation.key, "request_headers_to_add: invalid header value, skipping");
+            warn_dropped_header_mutation(&mutation.key, "invalid header value");
             continue;
         };
 

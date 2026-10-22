@@ -125,6 +125,18 @@ fn interpolate_env(
             )));
         }
         match env(name) {
+            // YAML refuses these bytes and would report only a byte
+            // position, so name the variable instead. The value is never
+            // quoted: it is often a credential.
+            Some(value)
+                if value
+                    .chars()
+                    .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r')) =>
+            {
+                return Err(ConfigError::Parse(format!(
+                    "environment variable `{name}` contains a control character"
+                )));
+            }
             Some(value) => out.push_str(&value),
             None if first_unset.is_none() => {
                 first_unset = Some(name);

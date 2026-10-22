@@ -625,12 +625,12 @@
         },
         "api_key": {
           "type": "string",
-          "description": "API key, sent using provider type's native auth header (`api-key` for Azure OpenAI, `Authorization: Bearer` for other OpenAI-shaped APIs, `x-api-key` for Anthropic). Use `${ENV_VAR}` interpolation rather than inlining secrets.",
+          "description": "API key, sent using provider type's native auth header (`api-key` for Azure OpenAI, `Authorization: Bearer` for other OpenAI-shaped APIs, `x-api-key` for Anthropic). Use `${ENV_VAR}` interpolation rather than inlining secrets. A value that is not a valid HTTP header value (a CR, LF, or other control character) is a load error at this path; the error never shows the value.",
           "examples": ["${OPENAI_API_KEY}"]
         },
         "api_key_file": {
           "type": "string",
-          "description": "Read the API key from this file (trailing whitespace trimmed). Nothing watches the file; a `SIGHUP` reload reads it again, and requests that start after the reload use the new key. Preferred over `api_key` for secret managers that mount files."
+          "description": "Read the API key from this file (trailing whitespace trimmed). Nothing watches the file; a `SIGHUP` reload reads it again, and requests that start after the reload use the new key. Preferred over `api_key` for secret managers that mount files. File contents that are not a valid HTTP header value (for example a second line) are a load error at this path, and a `SIGHUP` reload that reads them is refused."
         },
         "project": {
           "type": "string",
@@ -755,7 +755,7 @@
         },
         "extra_headers": {
           "type": "object",
-          "description": "Additional headers to send on every request to this provider (e.g. org/project headers). Anthropic providers are sent a default `anthropic-version` automatically; setting it here overrides that default (header names are matched case-insensitively).",
+          "description": "Additional headers to send on every request to this provider (e.g. org/project headers). Anthropic providers are sent a default `anthropic-version` automatically; setting it here overrides that default (header names are matched case-insensitively). Each name and value must be valid HTTP; an invalid one is a load error at `extra_headers.<name>`. `host` is refused (it comes from `base_url`), and so is the provider's own credential header when `api_key`/`api_key_file` or a Vertex or Bedrock credential sets it.",
           "additionalProperties": { "type": "string" }
         },
         "ca_file": {

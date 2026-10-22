@@ -147,6 +147,15 @@ for `azure-openai`. The proxy applies headers in this order:
 A later header replaces an earlier header of the same name. A header from the
 client with the same name is replaced too.
 
+The proxy checks every header name and value when the config loads. A value
+that is not valid HTTP, such as a key file with a second line, fails at its own
+path (`providers.<name>.api_key`, `providers.<name>.api_key_file`, or
+`providers.<name>.extra_headers.<key>`). The error does not show the value.
+`extra_headers` cannot set `host`, because `host` comes from `base_url`. It
+also cannot set the provider's auth header when `api_key` or `api_key_file`
+sets it. For Vertex and Bedrock providers, it cannot set `authorization`,
+because their credential replaces that header.
+
 An `https://` `base_url` gets upstream TLS. The proxy checks the certificate
 chain and the host name. It verifies the chain against `ca_file` if you set
 one, and against the platform trust store otherwise. A

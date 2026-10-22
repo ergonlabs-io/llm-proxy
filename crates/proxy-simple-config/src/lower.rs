@@ -2416,7 +2416,16 @@ fn provider_headers_to_add(
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<Vec<Value>, ConfigError> {
     let mut headers_to_add = Vec::new();
-    if let Some((key, value)) = auth_header(provider_name, provider, warnings)? {
+    let auth = auth_header(provider_name, provider, warnings)?;
+    if let Some((key, value)) = &auth {
+        // The key source names the field: a bad value read from the file is
+        // the file's fault, not `api_key`'s.
+        let field = if provider.api_key_file.is_some() {
+            "api_key_file"
+        } else {
+            "api_key"
+        };
+        check_header_value(format!("providers.{provider_name}.{field}"), value)?;
         headers_to_add.push(json!({ "key": key, "value": value }));
     }
     // Anthropic rejects any request without `anthropic-version`, so the
@@ -2442,10 +2451,48 @@ fn provider_headers_to_add(
             "value": DEFAULT_ANTHROPIC_VERSION,
         }));
     }
+    let credential_header = match provider.effective_type(provider_name) {
+        // The runtime credential (OAuth2 token or SigV4 signature) is written
+        // after these headers and replaces them.
+        ProviderType::Vertex | ProviderType::Bedrock => Some("authorization"),
+        _ => auth.as_ref().map(|(key, _)| key.as_str()),
+    };
     for (key, value) in &provider.extra_headers {
+        let field_path = format!("providers.{provider_name}.extra_headers.{key}");
+        if http::HeaderName::from_bytes(key.as_bytes()).is_err() {
+            return Err(invalid(field_path, "must be a valid HTTP header name"));
+        }
+        // `host` is set from `base_url` after these headers, so a value here
+        // would be replaced without a word.
+        if key.eq_ignore_ascii_case("host") {
+            return Err(invalid(
+                field_path,
+                "`host` is set from `base_url` and cannot be overridden here",
+            ));
+        }
+        if credential_header.is_some_and(|credential| key.eq_ignore_ascii_case(credential)) {
+            return Err(invalid(
+                field_path,
+                "collides with the provider's own credential header; set the credential in one place",
+            ));
+        }
+        check_header_value(field_path, value)?;
         headers_to_add.push(json!({ "key": key, "value": value }));
     }
     Ok(headers_to_add)
+}
+
+/// Refuse a provider header value the router could never send. Without this
+/// the router drops it on every request and the provider call goes out
+/// without it. The reason never quotes the value: it is often a credential.
+fn check_header_value(field_path: String, value: &str) -> Result<(), ConfigError> {
+    if http::HeaderValue::from_str(value).is_err() {
+        return Err(invalid(
+            field_path,
+            "must be a valid HTTP header value (no CR, LF, or other control characters)",
+        ));
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------- models --
