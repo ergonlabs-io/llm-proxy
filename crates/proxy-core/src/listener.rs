@@ -426,6 +426,18 @@ pub enum InitialBindError {
     Http(#[from] HttpFilterChainBuildError),
 }
 
+/// The accept-queue length when `tcp_backlog_size` is unset: Envoy's documented default
+/// (`config/listener/v3/listener.proto`, `tcp_backlog_size`) is `net.core.somaxconn` on Linux and 128
+/// elsewhere. Linux clamps a negative or oversized backlog to `somaxconn`, so -1 asks for exactly that.
+///
+/// A fixed 128 overflowed under bursty reconnects: per worker, a cohort of streams that end together
+/// reconnects at once, the kernel drops the SYNs past the queue, and each dropped client waits out
+/// the 1 s SYN retransmit (`internal-docs/capacity/2026-10-22-digitalocean-dedicated.md`, "Day 3").
+#[cfg(target_os = "linux")]
+const DEFAULT_TCP_BACKLOG: i32 = -1;
+#[cfg(not(target_os = "linux"))]
+const DEFAULT_TCP_BACKLOG: i32 = 128;
+
 /// Bind a `socket2` socket for `listener` and hand it to tokio.
 ///
 /// Rust note: `socket2` exposes `SO_REUSEADDR` and `SO_REUSEPORT`, which `std` and `tokio` do not.
@@ -442,7 +454,11 @@ fn bind_listener(listener: &ListenerConfig) -> io::Result<TcpListener> {
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
     socket.bind(&addr.into())?;
-    let backlog = listener.tcp_backlog_size.unwrap_or(128) as i32;
+    let backlog = listener
+        .tcp_backlog_size
+        .map_or(DEFAULT_TCP_BACKLOG, |size| {
+            i32::try_from(size).unwrap_or(i32::MAX)
+        });
     socket.listen(backlog)?;
     socket.set_nonblocking(true)?;
     let std_listener: std::net::TcpListener = socket.into();
@@ -2346,6 +2362,37 @@ mod tests {
 
     fn match_all_listener(name: &str, addr: SocketAddr, cluster: &str) -> IrListenerConfig {
         match_all_listener_with_filter(name, addr, tcp_proxy_filter(cluster))
+    }
+
+    /// With `tcp_backlog_size` unset, the accept queue holds Envoy's Linux default of
+    /// `net.core.somaxconn` connections, not 128 (see [`DEFAULT_TCP_BACKLOG`]). Nothing accepts here,
+    /// so every completed connect sits in the queue; past a 128 queue the kernel drops the SYN and
+    /// the connect stalls in retransmits, which the 5 s bound catches.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unset_backlog_queues_somaxconn_connections() {
+        const QUEUED: usize = 256;
+        let somaxconn: usize = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .expect("Linux exposes net.core.somaxconn")
+            .trim()
+            .parse()
+            .expect("somaxconn is an integer");
+        if somaxconn <= QUEUED {
+            eprintln!("skipped: somaxconn {somaxconn} cannot hold {QUEUED} queued connections");
+            return;
+        }
+        let ir = match_all_listener("backlog", "127.0.0.1:0".parse().unwrap(), "unused");
+        let listener = bind_listener(&ir).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut clients = Vec::with_capacity(QUEUED);
+        for i in 0..QUEUED {
+            let connect = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr));
+            let client = connect
+                .await
+                .unwrap_or_else(|_| panic!("connect {i} stalled: the accept queue held only {i}"));
+            clients.push(client.unwrap());
+        }
     }
 
     fn sni_only_listener(name: &str, addr: SocketAddr, cluster: &str) -> IrListenerConfig {
