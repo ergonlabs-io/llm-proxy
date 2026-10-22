@@ -13,6 +13,26 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Breaking
 
+- Provider credential and extra header values are checked when the config
+  loads. Before, a value the proxy could not send was dropped on every request
+  with a warning, so the provider call went out without its credential.
+  - `--config`: an `api_key`, `api_key_file` contents, or `extra_headers`
+    name or value that is not valid HTTP fails at
+    `providers.<name>.api_key`, `providers.<name>.api_key_file`, or
+    `providers.<name>.extra_headers.<key>`. The error never shows the value.
+  - `extra_headers` refuses `host` and the provider's own credential header
+    when `api_key`/`api_key_file` or a Vertex or Bedrock credential also sets
+    it. Before, the later value replaced the other without a word.
+  - A `${VAR}` whose value holds a control character now fails naming the
+    variable, instead of a YAML byte position.
+  - Envoy mode: an invalid `key` or `value` under
+    `metadata.filter_metadata["io.llmproxy.provider_auth"].headers[i]` is a
+    load error, or a NACK over xDS, at that path.
+  - A `SIGHUP` reload with such a value is refused, and the previous config
+    keeps serving with the previous key.
+  - A route-level `request_headers_to_add` entry the proxy cannot send is
+    still dropped, but now logs one error naming the header, not one warning
+    per request.
 - The capture agent is retired. Use [trace export](docs/site/src/content/docs/observability/trace-export.md)
   for bodies and `--request-records-file` for request metadata records.
   - The `llm-capture-agent` binary is no longer in the release tarballs or

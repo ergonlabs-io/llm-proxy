@@ -144,6 +144,15 @@ if `extra_headers` already sets it, matched case-insensitively), then every
 the same name rather than duplicating it, so `extra_headers` can deliberately
 override the default `anthropic-version`.
 
+Every header name and value is checked when the config loads. A value that
+is not valid HTTP, such as a key file with a second line, fails at its own
+path (`providers.<name>.api_key`, `providers.<name>.api_key_file`, or
+`providers.<name>.extra_headers.<key>`), and the error does not show the
+value. `extra_headers` cannot set `host`, which comes from `base_url`. It also
+cannot set the provider's credential header when `api_key` or `api_key_file`
+sets it, or for Vertex and Bedrock providers, whose credential replaces
+`authorization`.
+
 An `https://` `base_url` gets upstream TLS. The proxy checks the upstream's
 certificate against the hostname (subject-alternative-name match). It verifies
 the chain against `ca_file` if set, or against the platform trust store
