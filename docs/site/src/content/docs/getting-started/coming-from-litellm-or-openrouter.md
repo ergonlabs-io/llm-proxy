@@ -87,7 +87,6 @@ You can put OpenRouter behind llm-proxy as one provider. See
 - No response caching.
 - No translation between dialects.
 - No routing by latency or cost.
-- No prebuilt Docker image or Helm chart.
 - Token counters are shared between replicas only with `auth.store: shared`.
 
 See [Limitations](/docs/llm-proxy/help/limitations/).

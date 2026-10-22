@@ -1,0 +1,19 @@
+# Values for testing/helm/e2e.sh. The image is built locally and loaded into
+# the cluster, so it is never pulled.
+image:
+  repository: llm-proxy
+  tag: helm-e2e
+  pullPolicy: Never
+replicaCount: 2
+config:
+  providers:
+    mock:
+      base_url: http://mock-upstream:8080
+  routes:
+    - model: "*"
+      provider: mock
+# Long enough for a mock-slow stream (about 41 s) to finish inside the drain.
+drain:
+  strategy: gradual
+  timeSeconds: 90
+preStopSleepSeconds: 5

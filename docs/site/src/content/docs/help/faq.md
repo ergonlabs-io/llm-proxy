@@ -157,8 +157,10 @@ See [Running in production](/docs/llm-proxy/operations/running-in-production/).
 
 ### Is there a Docker image or Helm chart?
 
-No. The project ships release archives and an install script. See
-[Installation](/docs/llm-proxy/getting-started/installation/).
+Yes. Each release publishes a container image,
+`ghcr.io/ergonlabs-io/llm-proxy`, and a Helm chart,
+`oci://ghcr.io/ergonlabs-io/charts/llm-proxy`. See
+[Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/).
 
 ### Can I reload config without downtime?
 

@@ -1,0 +1,171 @@
+{{- if not (has .Values.workload (list "Deployment" "StatefulSet")) }}
+{{- fail (printf "workload must be Deployment or StatefulSet, not %q" .Values.workload) }}
+{{- end }}
+{{- if not (has .Values.drain.strategy (list "immediate" "gradual")) }}
+{{- fail (printf "drain.strategy must be immediate or gradual, not %q" .Values.drain.strategy) }}
+{{- end }}
+apiVersion: apps/v1
+kind: {{ .Values.workload }}
+metadata:
+  name: {{ include "llm-proxy.fullname" . }}
+  labels:
+    {{- include "llm-proxy.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "llm-proxy.selectorLabels" . | nindent 6 }}
+  {{- if eq .Values.workload "Deployment" }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  {{- else }}
+  serviceName: {{ include "llm-proxy.fullname" . }}-headless
+  # Pods start and stop together; a rollout still replaces one at a time.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  {{- end }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pods when the config changes. A SIGHUP reload is not used,
+        # because some settings need a restart (operations/config-reload).
+        checksum/config: {{ include "llm-proxy.configFile" . | sha256sum }}
+        {{- if and .Values.secret.create .Values.secret.env }}
+        checksum/secret: {{ toJson .Values.secret.env | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "llm-proxy.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "llm-proxy.serviceAccountName" . }}
+      # The proxy does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Above preStop + drain, so the kubelet never kills a stream the drain
+      # still allows.
+      terminationGracePeriodSeconds: {{ include "llm-proxy.terminationGracePeriodSeconds" . }}
+      containers:
+        - name: llm-proxy
+          image: {{ include "llm-proxy.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - --config=/etc/llm-proxy/llmproxy.yaml
+            - --drain-strategy={{ .Values.drain.strategy }}
+            - --drain-time-s={{ int .Values.drain.timeSeconds }}
+            - --log-level={{ .Values.logLevel }}
+            {{- if include "llm-proxy.passNodeId" . }}
+            - --service-node=$(POD_NAME)
+            {{- end }}
+            {{- with .Values.concurrency }}
+            - --concurrency={{ int . }}
+            {{- end }}
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or (and .Values.secret.create .Values.secret.env) .Values.existingSecret }}
+          envFrom:
+            {{- if and .Values.secret.create .Values.secret.env }}
+            - secretRef:
+                name: {{ include "llm-proxy.secretName" . }}
+            {{- end }}
+            {{- with .Values.existingSecret }}
+            - secretRef:
+                name: {{ . }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.ports.admin }}
+              protocol: TCP
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- if gt (int .Values.preStopSleepSeconds) 0 }}
+          lifecycle:
+            # The endpoint leaves the Service while the proxy still accepts
+            # connections. SIGTERM, which closes the listeners and starts the
+            # drain, comes after the sleep. The image has no shell, so this is
+            # the sleep action, not an exec of sleep.
+            preStop:
+              sleep:
+                seconds: {{ int .Values.preStopSleepSeconds }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/llm-proxy
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.sharedStore.enabled }}
+            - name: redis-url
+              mountPath: {{ include "llm-proxy.redisMountDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "llm-proxy.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.sharedStore.enabled }}
+        - name: redis-url
+          secret:
+            secretName: {{ include "llm-proxy.redisSecretName" . }}
+            items:
+              - key: {{ .Values.sharedStore.key }}
+                path: {{ .Values.sharedStore.key }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

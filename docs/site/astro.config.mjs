@@ -139,6 +139,7 @@ export default defineConfig({
 					label: 'Operations',
 					items: [
 						{ label: 'Deployment', slug: 'operations/deployment' },
+						{ label: 'Kubernetes and Helm', slug: 'operations/kubernetes' },
 						{ label: 'Share state across replicas', slug: 'operations/running-in-production' },
 						{ label: 'TLS', slug: 'operations/tls' },
 						{ label: 'Reload configuration', slug: 'operations/config-reload' },

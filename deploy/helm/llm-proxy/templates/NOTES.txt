@@ -1,0 +1,25 @@
+llm-proxy is listening on the Service {{ include "llm-proxy.fullname" . }}, port {{ .Values.service.port }}.
+
+Send a request from inside the cluster:
+
+  kubectl --namespace {{ .Release.Namespace }} run llm-proxy-curl --rm -it --restart=Never \
+    --image=curlimages/curl -- \
+    curl --max-time 30 http://{{ include "llm-proxy.fullname" . }}:{{ .Values.service.port }}/v1/chat/completions \
+      -H 'content-type: application/json' \
+      -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":"hi"}]}'
+
+The admin server (/ready, /stats, the admin UI) is on port {{ .Values.ports.admin }} of each pod:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward {{ lower .Values.workload }}/{{ include "llm-proxy.fullname" . }} {{ .Values.ports.admin }}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.sharedStore.enabled) }}
+
+WARNING: {{ .Values.replicaCount }} replicas without sharedStore. Each replica enforces limits
+and budgets alone, so the fleet admits up to {{ .Values.replicaCount }} times each limit, and keys
+minted through the admin API exist on one replica only. Set sharedStore to share them.
+{{- end }}
+{{- if and .Values.sharedStore.enabled (eq .Values.workload "Deployment") }}
+
+NOTE: sharedStore with a Deployment. The proxy uses the pod name as its node ID, and every
+rollout gives each pod a new name, which leaves per-writer state in Redis. Set
+workload=StatefulSet for node IDs that survive a restart.
+{{- end }}

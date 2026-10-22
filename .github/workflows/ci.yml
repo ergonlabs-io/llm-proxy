@@ -33,5 +33,16 @@ jobs:
       - name: Redb retention reporter checks
         run: make redb-retention-check
 
+  helm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: helm lint and helm template
+        run: make helm-check
+
   # The differential rig job is not wired into CI yet; it would go here (docker-compose: llm-proxy vs pinned
   # Envoy image digest + shared upstreams). Smoke subset on PR, full on merge queue.

@@ -27,16 +27,18 @@ is ready, and what to plan when you run more than one copy.
   in plaintext. With no `admin`, no admin listener exists.
 - **Failure mode:** a config that fails to load stops the process at start.
   A config that fails on `SIGHUP` leaves the previous config in service.
-- **Shipped artifacts:** a release archive for each platform and
-  `scripts/install.sh`. The installer writes a service. The project does not
-  ship a Dockerfile, a Helm chart, or a Compose file. The unit and image
-  recipes below are examples that you adapt.
+- **Shipped artifacts:** a release archive for each platform,
+  `scripts/install.sh`, a container image and a Helm chart. The installer
+  writes a service. For Kubernetes, see
+  [Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/). The project
+  does not ship a Compose file. The systemd unit below is an example that you
+  adapt.
 
 ## What you run
 
-The release archive is `llm-proxy-linux-amd64.tar.gz` or
-`llm-proxy-darwin-arm64.tar.gz`. The workflow does not build other
-platforms. The archive holds two items:
+The release archive is `llm-proxy-linux-amd64.tar.gz`,
+`llm-proxy-linux-arm64.tar.gz`, or `llm-proxy-darwin-arm64.tar.gz`. The
+workflow does not build other platforms. The archive holds two items:
 
 | File | Purpose |
 |---|---|
@@ -170,34 +172,29 @@ Reload after a config change:
 sudo systemctl reload llm-proxy
 ```
 
-### Example: container image
+### Container image
 
-This is an example recipe built from the release archive. The project does
-not publish an image. The proxy verifies provider certificates against the
-platform trust store when a provider has no `ca_file`. The image must
-therefore contain CA certificates.
+Each release publishes `ghcr.io/ergonlabs-io/llm-proxy:<version>` for
+`linux/amd64` and `linux/arm64`. The image holds the release binary, the
+admin UI bundle (`LLMPROXY_ADMIN_UI_DIR` is set) and CA certificates, on a
+distroless base with no shell. It runs as user `65532`. Its Dockerfile is
+`deploy/container/Dockerfile`.
 
-```dockerfile title="Dockerfile (example)"
-FROM debian:bookworm-slim
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
-ARG VERSION
-ADD https://github.com/ergonlabs-io/llm-proxy/releases/download/${VERSION}/llm-proxy-linux-amd64.tar.gz /tmp/lp.tgz
-RUN mkdir /opt/llm-proxy \
- && tar -xzf /tmp/lp.tgz -C /opt/llm-proxy \
- && ln -s /opt/llm-proxy/llm-proxy /usr/local/bin/llm-proxy \
- && rm /tmp/lp.tgz
-ENV LLMPROXY_ADMIN_UI_DIR=/opt/llm-proxy/admin-ui-dist
-EXPOSE 53421
-ENTRYPOINT ["llm-proxy", "--config", "/etc/llm-proxy/llmproxy.yaml"]
+The image runs `llm-proxy --config /etc/llm-proxy/llmproxy.yaml`. Mount
+your config there and pass secrets as environment variables:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$PWD/llmproxy.yaml:/etc/llm-proxy/llmproxy.yaml:ro" \
+  -e OPENAI_API_KEY \
+  ghcr.io/ergonlabs-io/llm-proxy:0.7.0
 ```
 
-Mount the config at `/etc/llm-proxy/llmproxy.yaml` and pass secrets as
-environment variables. Set `listen` in the config to a port that the image
-exposes. The container runtime sends `SIGTERM` on stop. Set the stop grace
-period (for example, Kubernetes `terminationGracePeriodSeconds`) above
-`--drain-time-s`.
+Set `listen` in the config to an address on all interfaces, such as
+`0.0.0.0:8080`. The container runtime sends `SIGTERM` on stop. Set the stop
+grace period above `--drain-time-s`, for example
+`docker stop --time 660`. On Kubernetes, use the Helm chart, which sets the
+grace period for you.
 
 ## Readiness and health checks
 
@@ -228,12 +225,13 @@ Read these limits before you rely on `/ready`:
 - **`/ready` does not test providers.** It does not call any provider. A
   provider outage does not turn `/ready` red. Use the `/stats` counters to
   watch provider health.
-- **There is no separate liveness endpoint.** Use `/ready`, or a TCP check on
-  the client listener.
+- **There is no separate liveness endpoint.** Do not use `/ready` for
+  liveness: it answers `503` for the whole drain. Use `GET /server_info`,
+  which answers `200` while the admin server runs, or a TCP check.
 - **The probe must reach the admin listener.** If admin stays on loopback,
-  run the probe inside the container or on the host. For example, a
-  Kubernetes `exec` probe that runs `curl --max-time 2 -f
-  http://127.0.0.1:53422/ready`.
+  run the probe inside the container or on the host. The published image has
+  no shell or curl, so the Helm chart binds admin to `0.0.0.0` and probes it
+  over HTTP.
 
 ## Sizing
 
@@ -332,7 +330,7 @@ before an upgrade. Changes to the config surface are listed there.
 
 ## Limitations
 
-- The project ships no Dockerfile, Helm chart, or Compose file.
+- The project ships no Compose file.
 - The proxy has no hot restart. Replace the process to change the binary.
 - `/ready` has no provider-level check.
 - The installer unit does not set `TimeoutStopSec`. Set it yourself.
