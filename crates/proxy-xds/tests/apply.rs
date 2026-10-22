@@ -595,6 +595,59 @@ async fn a_cds_response_where_one_of_two_clusters_fails_to_lower_rejects_and_pub
     assert_eq!(applier.current().version.0, 0);
 }
 
+/// A CDS cluster whose provider credential the router could never send is
+/// NACKed naming the metadata entry. The NACK goes back to the control plane,
+/// so it must not carry the credential.
+#[tokio::test]
+async fn a_cds_cluster_with_an_unsendable_provider_header_is_nacked_without_the_value() {
+    use prost_types::value::Kind;
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+
+    let string = |s: &str| prost_types::Value {
+        kind: Some(Kind::StringValue(s.to_string())),
+    };
+    let entry = prost_types::Struct {
+        fields: [
+            ("key".to_string(), string("authorization")),
+            ("value".to_string(), string("Bearer sk-xds-secret\r\nx: y")),
+        ]
+        .into(),
+    };
+    let auth = prost_types::Struct {
+        fields: [(
+            "headers".to_string(),
+            prost_types::Value {
+                kind: Some(Kind::ListValue(prost_types::ListValue {
+                    values: vec![prost_types::Value {
+                        kind: Some(Kind::StructValue(entry)),
+                    }],
+                })),
+            },
+        )]
+        .into(),
+    };
+    let mut cluster = minimal_cluster("provider", 8080);
+    cluster.metadata = Some(core_v3::Metadata {
+        filter_metadata: [("io.llmproxy.provider_auth".to_string(), auth)].into(),
+        ..Default::default()
+    });
+
+    let verdict = applier.on_response(&cds_response("v1", &[cluster])).await;
+    let Verdict::Reject(message) = verdict else {
+        panic!("expected Reject, got {verdict:?}");
+    };
+    assert!(
+        message.contains("headers[0].value"),
+        "the NACK must name the entry: {message}"
+    );
+    assert!(
+        !message.contains("sk-xds-secret"),
+        "the NACK must not carry the credential: {message}"
+    );
+    assert!(published.lock().unwrap().is_empty());
+}
+
 /// Same claim as above, for listeners.
 #[tokio::test]
 async fn an_lds_response_where_one_of_two_listeners_fails_to_lower_rejects_and_publishes_nothing() {

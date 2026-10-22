@@ -670,3 +670,75 @@ async fn cluster_level_mutation_overrides_route_level_and_route_value_does_not_l
         })
         .await;
 }
+
+/// A `tracing` writer that appends to a shared buffer.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The fail-open path (AGENTS.md "Fail-open controls"): a mutation the router
+/// cannot send is dropped and the request still goes out with the others.
+/// Provider credentials are checked at load, so only an Envoy route mutation
+/// reaches here. The first drop logs an error naming the key, never the
+/// value; later drops do not repeat it, or the log would grow per request.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unsendable_mutation_is_dropped_and_logged_once_without_its_value() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _default = tracing::subscriber::set_default(subscriber);
+
+    LocalSet::new()
+        .run_until(async {
+            for _ in 0..2 {
+                let (addr, rx) = spawn_reflecting_upstream().await;
+                let router = build_router(
+                    addr,
+                    forward_to_up(None),
+                    vec![
+                        mutation(
+                            "x-bad",
+                            "secret-mutation-value\u{1}",
+                            HeaderAppendAction::OverwriteIfExistsOrAdd,
+                        ),
+                        mutation("x-good", "kept", HeaderAppendAction::OverwriteIfExistsOrAdd),
+                    ],
+                )
+                .await;
+                let resp = router.handle(request("/v1/chat/completions")).await;
+                assert_eq!(resp.head.status, StatusCode::OK);
+                let upstream_request = rx.await.unwrap().to_ascii_lowercase();
+                assert_eq!(count_header_line(&upstream_request, "x-good: kept"), 1);
+                assert!(
+                    !upstream_request.contains("x-bad"),
+                    "got: {upstream_request:?}"
+                );
+            }
+        })
+        .await;
+
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let drops: Vec<&str> = log.lines().filter(|l| l.contains("dropping")).collect();
+    assert_eq!(drops.len(), 1, "expected one drop line, got:\n{log}");
+    assert!(
+        drops[0].contains("ERROR") && drops[0].contains("x-bad"),
+        "got: {}",
+        drops[0]
+    );
+    assert!(
+        !log.contains("secret-mutation-value"),
+        "the value must not be logged:\n{log}"
+    );
+}

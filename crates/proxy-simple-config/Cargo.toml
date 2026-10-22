@@ -12,6 +12,9 @@ serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 serde_yaml = { workspace = true }
 chrono = { workspace = true }
+# Header names and values are checked at load with the same parser the router
+# uses, so a value the router cannot send is a load error.
+http = { workspace = true }
 
 [features]
 default = []
@@ -39,7 +42,6 @@ proxy-cluster = { workspace = true }
 # `RouterStats`, built here the same way `crates/proxy/src/main.rs` does at
 # boot.
 proxy-observability = { workspace = true }
-http = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "io-util", "net", "time"] }

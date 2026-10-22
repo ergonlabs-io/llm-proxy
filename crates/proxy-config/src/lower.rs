@@ -4742,9 +4742,26 @@ fn convert_provider_auth_metadata(
                 "only `key` and `value` are supported",
             ));
         }
+        let key = provider_auth_string_field(entry, "key", &item_path)?;
+        let value = provider_auth_string_field(entry, "value", &item_path)?;
+        // The router cannot send a malformed header, so it would drop the
+        // credential on every request; refuse it here instead. The reason
+        // never quotes the value, which is usually a credential.
+        if http::HeaderName::from_bytes(key.as_bytes()).is_err() {
+            return Err(invalid(
+                format!("{item_path}.key"),
+                "must be a valid HTTP header name",
+            ));
+        }
+        if http::HeaderValue::from_str(&value).is_err() {
+            return Err(invalid(
+                format!("{item_path}.value"),
+                "must be a valid HTTP header value (no CR, LF, or other control characters)",
+            ));
+        }
         out.push(HeaderMutation {
-            key: provider_auth_string_field(entry, "key", &item_path)?,
-            value: provider_auth_string_field(entry, "value", &item_path)?,
+            key,
+            value,
             action: HeaderAppendAction::OverwriteIfExistsOrAdd,
         });
     }
