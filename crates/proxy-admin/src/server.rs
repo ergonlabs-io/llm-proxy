@@ -641,81 +641,133 @@ async fn handle(
         Err(resp) => return resp,
     };
 
+    // `body` moves into the handler so the handler can wipe the buffer holding the plaintext key. It stays async
+    // for its save-time probe and offloads its own store calls.
+    //
+    // Rust note: `Option<Arc<dyn Trait>>::as_deref()` borrows the trait object out of the `Arc` without cloning it.
+    if let WriteRoute::TenantCredentialPut(id, provider)
+    | WriteRoute::ScopedTenantCredentialPut(_, id, provider) = route
+    {
+        return handle_put_tenant_credential(
+            &control_plane,
+            config,
+            runtime.credential_probe.as_deref(),
+            id,
+            provider,
+            body,
+        )
+        .await;
+    }
+
+    // Every other route here reads or writes the store, so it runs off the control runtime. The closure must own
+    // what it uses, and `route` borrows `path`, so it moves `path` in and matches it again.
+    let factory_state = Arc::clone(factory_state);
+    run_store(move || {
+        let trimmed = path.strip_prefix('/').unwrap_or(path.as_str());
+        let segments: Vec<&str> = trimmed.split('/').collect();
+        let route =
+            match_write_route(&segments, &method).expect("the same path matched a route above");
+        dispatch_store_route(route, &factory_state, &control_plane, &body, &path)
+    })
+    .await
+}
+
+/// Runs a handler that does blocking store I/O (a Redis round trip, a redb fsync, a full policy load) on tokio's
+/// blocking pool. The admin server shares the 2-thread control runtime with ADS, the signal loop and `/ready`; a
+/// slow store answered inline would stall all of them.
+async fn run_store<F>(handler: F) -> Response<Full<Bytes>>
+where
+    F: FnOnce() -> Response<Full<Bytes>> + Send + 'static,
+{
+    off_runtime(handler)
+        .await
+        .unwrap_or_else(|response| response)
+}
+
+/// [`run_store`] for a step inside an async handler: the value, or the 500 to answer if the step panicked.
+#[allow(clippy::result_large_err)]
+async fn off_runtime<T, F>(step: F) -> Result<T, Response<Full<Bytes>>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(step).await.map_err(|err| {
+        tracing::error!(error = %err, "admin handler panicked");
+        text(StatusCode::INTERNAL_SERVER_ERROR, "admin handler failed")
+    })
+}
+
+/// The control-plane routes [`handle`] runs through [`run_store`]: everything except the credential `PUT`.
+fn dispatch_store_route(
+    route: WriteRoute<'_>,
+    factory_state: &SharedFactoryState,
+    control_plane: &ControlPlane,
+    body: &[u8],
+    path: &str,
+) -> Response<Full<Bytes>> {
+    let stat_prefix_opt = route.stat_prefix();
     match route {
         // `GET /keys` and `GET /chains/{p}/keys`: the gated list read, through the same three gates as the writes.
-        WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => handle_list_keys(&control_plane),
-        WriteRoute::Keys | WriteRoute::ScopedKeys(_) => handle_mint_key(&control_plane, &body),
+        WriteRoute::KeyList | WriteRoute::ScopedKeyList(_) => handle_list_keys(control_plane),
+        WriteRoute::Keys | WriteRoute::ScopedKeys(_) => handle_mint_key(control_plane, body),
         WriteRoute::KeyById(id) | WriteRoute::ScopedKeyById(_, id) => {
-            handle_revoke_key(&control_plane, id)
+            handle_revoke_key(control_plane, id)
         }
         WriteRoute::KeyBudget(id) | WriteRoute::ScopedKeyBudget(_, id) => {
-            handle_set_key_budget(&control_plane, id, &body)
+            handle_set_key_budget(control_plane, id, body)
         }
         WriteRoute::KeyLimits(id) | WriteRoute::ScopedKeyLimits(_, id) => {
-            handle_set_key_limits(factory_state, stat_prefix_opt, &control_plane, id, &body)
+            handle_set_key_limits(factory_state, stat_prefix_opt, control_plane, id, body)
         }
         WriteRoute::KeyTags(id) | WriteRoute::ScopedKeyTags(_, id) => {
-            handle_set_key_tags(&control_plane, id, &body)
+            handle_set_key_tags(control_plane, id, body)
         }
         WriteRoute::KeyPolicy(id) | WriteRoute::ScopedKeyPolicy(_, id) => {
-            handle_set_key_policy(factory_state, stat_prefix_opt, &control_plane, id, &body)
+            handle_set_key_policy(factory_state, stat_prefix_opt, control_plane, id, body)
         }
         WriteRoute::KeySpend(id) | WriteRoute::ScopedKeySpend(_, id) => {
-            handle_get_key_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
+            handle_get_key_spend_route(factory_state, stat_prefix_opt, control_plane, id, path)
         }
         WriteRoute::Tenants | WriteRoute::ScopedTenants(_) => {
-            handle_create_tenant(&control_plane, &body)
+            handle_create_tenant(control_plane, body)
         }
         WriteRoute::TenantById(id) | WriteRoute::ScopedTenantById(_, id) => {
-            handle_delete_tenant(&control_plane, id)
+            handle_delete_tenant(control_plane, id)
         }
         WriteRoute::TenantPolicy(id) | WriteRoute::ScopedTenantPolicy(_, id) => {
-            handle_set_policy(factory_state, stat_prefix_opt, &control_plane, id, &body)
+            handle_set_policy(factory_state, stat_prefix_opt, control_plane, id, body)
         }
         WriteRoute::TenantBudget(id) | WriteRoute::ScopedTenantBudget(_, id) => {
-            handle_set_budget(factory_state, stat_prefix_opt, &control_plane, id, &body)
+            handle_set_budget(factory_state, stat_prefix_opt, control_plane, id, body)
         }
         WriteRoute::TenantLimits(id) | WriteRoute::ScopedTenantLimits(_, id) => {
-            handle_set_tenant_limits(factory_state, stat_prefix_opt, &control_plane, id, &body)
+            handle_set_tenant_limits(factory_state, stat_prefix_opt, control_plane, id, body)
         }
         WriteRoute::TenantTraceExport(id) | WriteRoute::ScopedTenantTraceExport(_, id) => {
-            handle_set_trace_export(&control_plane, id, &body)
+            handle_set_trace_export(control_plane, id, body)
         }
         WriteRoute::TenantTraceExportGet(id) | WriteRoute::ScopedTenantTraceExportGet(_, id) => {
-            handle_get_trace_export(&control_plane, id)
+            handle_get_trace_export(control_plane, id)
         }
         WriteRoute::TenantObject(id, object) | WriteRoute::ScopedTenantObject(_, id, object) => {
-            handle_assign_object(factory_state, stat_prefix_opt, &control_plane, id, object)
+            handle_assign_object(factory_state, stat_prefix_opt, control_plane, id, object)
         }
         WriteRoute::TenantObjectGet(id, object)
         | WriteRoute::ScopedTenantObjectGet(_, id, object) => {
-            handle_get_object(&control_plane, id, object)
+            handle_get_object(control_plane, id, object)
         }
         WriteRoute::TenantSpend(id) | WriteRoute::ScopedTenantSpend(_, id) => {
-            handle_get_spend_route(factory_state, stat_prefix_opt, &control_plane, id, &path)
+            handle_get_spend_route(factory_state, stat_prefix_opt, control_plane, id, path)
         }
         WriteRoute::TenantCredentials(id) | WriteRoute::ScopedTenantCredentials(_, id) => {
-            handle_list_tenant_credentials(&control_plane, id)
+            handle_list_tenant_credentials(control_plane, id)
         }
-        // `body` moves into the handler (unlike the arms above, which borrow it) so the handler can wipe the buffer
-        // holding the plaintext key. Only one arm runs, so the move is fine.
-        //
-        // Rust note: `Option<Arc<dyn Trait>>::as_deref()` borrows the trait object out of the `Arc` without cloning it.
-        WriteRoute::TenantCredentialPut(id, provider)
-        | WriteRoute::ScopedTenantCredentialPut(_, id, provider) => {
-            handle_put_tenant_credential(
-                &control_plane,
-                config,
-                runtime.credential_probe.as_deref(),
-                id,
-                provider,
-                body,
-            )
-            .await
+        WriteRoute::TenantCredentialPut(..) | WriteRoute::ScopedTenantCredentialPut(..) => {
+            unreachable!("the credential PUT returns before the store dispatch")
         }
         WriteRoute::TenantCredentialDelete(id, provider)
         | WriteRoute::ScopedTenantCredentialDelete(_, id, provider) => {
-            handle_delete_tenant_credential(&control_plane, id, provider)
+            handle_delete_tenant_credential(control_plane, id, provider)
         }
         WriteRoute::HealthCheckFail | WriteRoute::HealthCheckOk | WriteRoute::DrainListeners => {
             unreachable!("lifecycle routes return before the control-plane gate")
@@ -1841,13 +1893,23 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(
 }
 
 /// Maps a [`StoreError`] to a response. `NotFound` (for example, revoking an unknown `key_id`) is a 404.
-/// Anything else is a 500 with the error's `Display`, which [`StoreError`] documents as store-failure text,
-/// never key material.
+/// `NotApplied` is a 503 that says the write is durable but not yet live on this replica, so a revoke whose
+/// reload failed is never reported as done. Anything else is a 500 with the error's `Display`, which
+/// [`StoreError`] documents as store-failure text, never key material.
 fn store_error_response(endpoint: &str, err: StoreError) -> Response<Full<Bytes>> {
     match err {
         StoreError::NotFound => text(StatusCode::NOT_FOUND, "not found"),
         StoreError::Conflict(reason) => text(StatusCode::CONFLICT, &reason),
         StoreError::InvalidInput(reason) => bad_request(&reason),
+        StoreError::NotApplied(_) => {
+            tracing::error!(
+                endpoint,
+                error = %err,
+                "admin write stored but not applied on this replica; it serves the previous policy until \
+                 its next successful poll"
+            );
+            text(StatusCode::SERVICE_UNAVAILABLE, &err.to_string())
+        }
         other => {
             tracing::warn!(endpoint, error = %other, "admin write failed: control-plane store error");
             text(StatusCode::INTERNAL_SERVER_ERROR, &other.to_string())
@@ -2150,20 +2212,32 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
                 endpoint = "/keys",
                 key_id = minted.key_id.as_str(),
                 tenant = minted.tenant.as_str(),
+                applied = minted.applied,
                 "admin: minted a virtual key"
             );
             // `minted.plaintext` is returned here exactly once. The store keeps only its digest (see `MintedKey`), so
-            // this body is the only place the value will ever exist.
-            json(
-                StatusCode::CREATED,
-                &serde_json::json!({
-                    "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
-                    "key_id": minted.key_id.as_str(),
-                    "tenant": minted.tenant.as_str(),
-                    "tags": &minted.tags,
-                    "key": minted.plaintext,
-                }),
-            )
+            // this body is the only place the value will ever exist. That is why a mint whose reload failed still
+            // answers with the key: a 202 with `applied: false`, since the key 401s on this replica until its next
+            // successful poll.
+            let mut body = serde_json::json!({
+                "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
+                "key_id": minted.key_id.as_str(),
+                "tenant": minted.tenant.as_str(),
+                "tags": &minted.tags,
+                "key": minted.plaintext,
+            });
+            if minted.applied {
+                json(StatusCode::CREATED, &body)
+            } else {
+                tracing::error!(
+                    endpoint = "/keys",
+                    key_id = minted.key_id.as_str(),
+                    "admin: minted key stored but not applied on this replica; it is refused here until the \
+                     next successful poll"
+                );
+                body["applied"] = serde_json::Value::Bool(false);
+                json(StatusCode::ACCEPTED, &body)
+            }
         }
         Err(err) => store_error_response("/keys", err),
     }
@@ -2350,7 +2424,7 @@ fn wipe_body(body: Bytes) {
 /// `tenant_credentials` is not configured). The body is never logged or echoed. serde errors can quote input,
 /// so this handler maps them to fixed text by [`serde_json::Error::classify`].
 async fn handle_put_tenant_credential(
-    control_plane: &ControlPlane,
+    control_plane: &Arc<ControlPlane>,
     config: &WorkerConfigHandle,
     probe: Option<&dyn TenantCredentialProbe>,
     tenant: &str,
@@ -2372,7 +2446,7 @@ fn tenant_credentials_not_configured() -> Response<Full<Bytes>> {
 }
 
 async fn put_tenant_credential_inner(
-    control_plane: &ControlPlane,
+    control_plane: &Arc<ControlPlane>,
     config: &WorkerConfigHandle,
     probe: Option<&dyn TenantCredentialProbe>,
     tenant: &str,
@@ -2435,10 +2509,15 @@ async fn put_tenant_credential_inner(
     }
 
     let tenant_id = TenantId::new(tenant);
-    match tenant_exists(control_plane, &tenant_id) {
-        Ok(true) => {}
-        Ok(false) => return tenant_not_found(),
-        Err(err) => return store_error_response("/tenants/{id}/provider_credentials", err),
+    let exists = {
+        let (control_plane, tenant_id) = (Arc::clone(control_plane), tenant_id.clone());
+        off_runtime(move || tenant_exists(&control_plane, &tenant_id)).await
+    };
+    match exists {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return tenant_not_found(),
+        Ok(Err(err)) => return store_error_response("/tenants/{id}/provider_credentials", err),
+        Err(response) => return response,
     }
 
     // A credential no cluster slot would use is a typo the operator should hear about now, not an inert row.
@@ -2552,7 +2631,19 @@ async fn put_tenant_credential_inner(
         false
     };
 
-    match control_plane.store_tenant_secret(&tenant_id, provider, &request.api_key, verified) {
+    // The secret moves into the blocking task and is dropped there.
+    let stored = {
+        let (control_plane, provider) = (Arc::clone(control_plane), provider.to_string());
+        off_runtime(move || {
+            control_plane.store_tenant_secret(&tenant_id, &provider, &request.api_key, verified)
+        })
+        .await
+    };
+    let stored = match stored {
+        Ok(stored) => stored,
+        Err(response) => return response,
+    };
+    match stored {
         Ok(metadata) => {
             tracing::info!(
                 endpoint = "/tenants/{id}/provider_credentials/{provider}",

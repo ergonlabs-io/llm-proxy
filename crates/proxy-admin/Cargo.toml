@@ -45,6 +45,9 @@ fuzzing = []
 # `ledger::testing`: a real ledger writer over an encrypted spool in a temp
 # dir, so `/ledger/*` tests read and acknowledge real committed entries.
 proxy-observability = { workspace = true, features = ["test-support"] }
+# `SharedMemoryStore` and its hooks: a store a test can make fail or stall
+# inside a real admin write.
+proxy-control = { workspace = true, features = ["test-support"] }
 tempfile = { version = "=3.27.0", default-features = false }
 # The write-API tests build a `ControlPlane` directly and want to name the
 # type of `ControlPlane::handle()` (`Arc<ArcSwap<ControlPlaneSnapshot>>`) in

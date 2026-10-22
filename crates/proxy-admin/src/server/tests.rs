@@ -3519,6 +3519,7 @@ mod key_tags;
 mod ledger;
 mod limits;
 mod object_owners;
+mod policy_publish;
 mod pricing;
 mod tenant_budget_cutover;
 mod trace_export;

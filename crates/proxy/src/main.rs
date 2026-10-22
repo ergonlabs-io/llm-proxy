@@ -420,7 +420,7 @@ fn load(args: &Args) -> Result<(String, LoadedBootstrap), (String, String)> {
 /// The config front-end and file that `serve` started with. It is captured
 /// once after argument parsing and passed to the SIGHUP reload path. A reload
 /// therefore always uses the same loader the process booted with.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ConfigSource {
     /// `-c`/`--config-path`: an Envoy bootstrap file, loaded with `strict`
     /// (mirrors `--permissive` at boot; a reload keeps the same strictness
@@ -1720,7 +1720,16 @@ async fn reload(
     ),
     factory_state: &proxy_http::filter::SharedFactoryState,
 ) -> Option<SnapshotVersion> {
-    let mut snapshot = match source.load() {
+    // The parse and lowering are blocking file I/O and CPU work. Run inline,
+    // they would hold a worker of the 2-thread control runtime that also
+    // serves the admin API and ADS.
+    let loaded = {
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || source.load())
+            .await
+            .unwrap_or_else(|err| Err(format!("config reload task failed: {err}")))
+    };
+    let mut snapshot = match loaded {
         Ok(snapshot) => snapshot,
         Err(err) => {
             // Requirement 1: this is the one log line an operator's typo has

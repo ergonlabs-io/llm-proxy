@@ -237,6 +237,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Fixed
 
+- An admin key or tenant write and the policy poller could publish their
+  snapshots out of order. The older snapshot then won, and a key revoked
+  through the admin API could authenticate again until the next poll
+  (WP-142). Publishes are now serialised and happen in generation order.
+- An admin write whose reload failed after the store write answered success,
+  and the change was not live on that replica. It now answers `503` with a
+  body that starts `written to the control-plane store, but not yet applied
+  on this replica`. `POST /keys` answers `202` with the key text and
+  `"applied": false` instead, because that answer is the only copy of the
+  key.
+- Admin key and tenant writes and the SIGHUP config parse no longer run store
+  I/O on the 2-thread control runtime. A slow store no longer delays `/ready`,
+  ADS, or SIGTERM handling. `DELETE /tenants/{id}` revokes the tenant's keys
+  in one store write on the `persistent` store.
 - JWT `discovery_url` key refresh reached only one worker. The other workers
   kept the keys they started with, and after a SIGHUP reload no worker got
   refreshed keys. When the identity provider rotated its signing key, most

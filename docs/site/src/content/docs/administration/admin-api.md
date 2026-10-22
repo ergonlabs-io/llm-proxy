@@ -127,8 +127,17 @@ only a caller with the token can send a large body.
 | `405` | The path exists but the method is wrong. The body is `<path> only accepts <METHOD>`. |
 | `409` | The write would be stored and never enforced. The body is `{"error":"not_enforced", ...}`. See below. |
 | `503` | A key, tenant, or spend route, and the config has no `auth` section. |
+| `503` | A key or tenant write reached the store, but this replica could not reload it. |
 
-The `503` body is `the auth control plane is not initialized yet: ...`.
+For a missing `auth` section, the `503` body is `the auth control plane is
+not initialized yet: ...`.
+
+For a write that this replica could not reload, the `503` body starts with
+`written to the control-plane store, but not yet applied on this replica`.
+The write is stored. This replica serves the previous policy until its next
+successful poll, so for example a revoked key still works here until then.
+Other replicas that share the store apply the write on their own poll. A
+retry is safe.
 
 A `409` `not_enforced` answer means the matching control is off. These
 writes need the matching `auth.enforce` field to stay `true` (the default):
@@ -225,7 +234,10 @@ for the key model and examples.
 | `/traces/capture` | POST, GET | `200` | Closes or opens the trace-export emergency switch, or reads it. Body: `{"disabled": true, "expected_generation": N}`. A stale generation gives `409`. Without trace export configured, both answer `404`. See [Request and response body export](/docs/llm-proxy/observability/trace-export/). |
 
 The mint answer is the only time the proxy returns the key text. The store
-keeps a digest only. A second `POST /keys` with the same `tenant` and
+keeps a digest only. Thus, if the key is stored but this replica cannot
+reload it, the mint answers `202` and not `503`. The `202` body holds the
+key text and `"applied": false`. The key gets `401` on this replica until
+its next successful poll. A second `POST /keys` with the same `tenant` and
 `key_id` replaces the key text. The old text stops working on the next
 request. If the body leaves out `tags`, the key keeps its tags.
 
