@@ -1,0 +1,33 @@
+# Command-line surface of `llm-proxy`, from its clap definition: one line per
+# flag (`--long [-s] [<VALUE>] [{possible|values}]`), positional argument and
+# subcommand; subcommand arguments are prefixed with the subcommand name.
+# Help text and defaults are not covered.
+# NOT COVERED: environment variables (LLMPROXY_ADMIN_TOKEN,
+# LLMPROXY_ADMIN_UI_DIR, LLMPROXY_AUTH_SECRET and others), exit codes, and the
+# output of `--mode translate`/`keygen`.
+# Regenerate with `make golden`; review every changed line.
+--base-id <N>
+--concurrency <N>
+--config <PATH>
+--config-path -c <PATH>
+--drain-strategy <DRAIN_STRATEGY> {gradual|immediate}
+--drain-time-s <SECS>
+--help -h
+--hmac-secret-file <PATH>
+--key-id <ID>
+--log-level -l <LOG_LEVEL> {trace|debug|info|warn|error|critical|off}
+--mode <MODE> {serve|validate|translate|keygen}
+--permissive
+--request-record-max-attempts <REQUEST_RECORD_MAX_ATTEMPTS>
+--request-records-file <PATH>
+--reveal-secrets
+--service-cluster <NAME>
+--service-node <NAME>
+--tenant <TENANT>
+--version -V
+help (subcommand)
+help help (subcommand)
+help init (subcommand)
+init (subcommand)
+init --help -h
+init <DIRECTORY>

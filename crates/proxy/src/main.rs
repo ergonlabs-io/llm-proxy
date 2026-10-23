@@ -3867,3 +3867,76 @@ routes:
         assert_eq!(state.node_id(), "bootstrap-id");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/common/golden.rs"]
+mod golden;
+
+/// The CLI is stable surface: operators' unit files and scripts name these
+/// flags and values. The list comes from the same clap definition `main()`
+/// parses with and is compared with `tests/golden/cli_flags.golden`; see
+/// `tests/common/golden.rs` for regeneration (`make golden`).
+#[cfg(test)]
+mod cli_contract_tests {
+    use super::{golden, Args};
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+
+    const CLI_HEADER: &str = "\
+Command-line surface of `llm-proxy`, from its clap definition: one line per
+flag (`--long [-s] [<VALUE>] [{possible|values}]`), positional argument and
+subcommand; subcommand arguments are prefixed with the subcommand name.
+Help text and defaults are not covered.
+NOT COVERED: environment variables (LLMPROXY_ADMIN_TOKEN,
+LLMPROXY_ADMIN_UI_DIR, LLMPROXY_AUTH_SECRET and others), exit codes, and the
+output of `--mode translate`/`keygen`.
+Regenerate with `make golden`; review every changed line.";
+
+    #[test]
+    fn golden_cli_flags() {
+        let mut command = Args::command();
+        command.build();
+        let mut lines = BTreeSet::new();
+        describe(&command, "", &mut lines);
+        golden::check("cli_flags.golden", CLI_HEADER, &lines);
+    }
+
+    fn describe(command: &clap::Command, prefix: &str, lines: &mut BTreeSet<String>) {
+        for arg in command.get_arguments() {
+            let mut line = prefix.to_string();
+            match arg.get_long() {
+                Some(long) => {
+                    line.push_str("--");
+                    line.push_str(long);
+                    if let Some(short) = arg.get_short() {
+                        line.push_str(&format!(" -{short}"));
+                    }
+                    if arg.get_action().takes_values() {
+                        for name in arg.get_value_names().unwrap_or_default() {
+                            line.push_str(&format!(" <{name}>"));
+                        }
+                    }
+                }
+                None => {
+                    let names = arg.get_value_names().unwrap_or_default();
+                    let name = names.first().map_or(arg.get_id().as_str(), |n| n.as_str());
+                    line.push_str(&format!("<{name}>"));
+                }
+            }
+            let values: Vec<String> = arg
+                .get_possible_values()
+                .iter()
+                .map(|value| value.get_name().to_string())
+                .collect();
+            if !values.is_empty() && arg.get_action().takes_values() {
+                line.push_str(&format!(" {{{}}}", values.join("|")));
+            }
+            lines.insert(line);
+        }
+        for subcommand in command.get_subcommands() {
+            let name = subcommand.get_name();
+            lines.insert(format!("{prefix}{name} (subcommand)"));
+            describe(subcommand, &format!("{prefix}{name} "), lines);
+        }
+    }
+}

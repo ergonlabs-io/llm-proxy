@@ -27,6 +27,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- The admin 404 body ("unknown admin endpoint") now lists `/stats` and
+  `/stats/prometheus`, which it omitted although both are served.
+- Contract tests pin the names operators build on: the metric families and
+  label names of `/stats/prometheus`, the admin routes and their methods, the
+  JSON access-log keys, and the CLI flags. Each is read from the running code
+  and compared with a golden file in `crates/proxy/tests/golden/`, so a rename
+  fails `make ci`. Each file's header names what it does not cover. After an
+  intended change, `make golden` regenerates the files for review.
 - A `limits` entry with `models` no longer skips a request whose model the
   proxy cannot read: a body not sent as `application/json`, a `model` key past
   the scan cap, or no `model`. On an endpoint that runs a model, the request

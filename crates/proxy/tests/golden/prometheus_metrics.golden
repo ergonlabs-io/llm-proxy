@@ -1,0 +1,81 @@
+# Metric families rendered by GET /stats/prometheus, one line per family and
+# distinct label-name set: `<name> <type> [<label>,...]`. Label values are not
+# part of the contract. Histograms list `_bucket`/`_sum`/`_count` under the
+# family name, without `le`.
+#
+# Produced by contract_golden_e2e.rs from the --config dialect after served
+# traffic (auth, tenant and key budgets, token limit, pricing, fallback, ledger,
+# trace export, non-streamed and streamed chat, one 401).
+#
+# NOT COVERED: a family renders only once something records into it, so the
+# families below exist in the code but this scenario never reaches them. They
+# are not yet stable surface:
+#   llmproxy_control_plane_load_{duration,payload_bytes,rows} (Redis auth store)
+#   llmproxy_realtime_usage_missing_total (realtime/WebSocket sessions)
+#   llmproxy_guardrail_checks_total (guardrails)
+#   llmproxy_chargeback_tags_dropped_total (chargeback tags)
+#   llmproxy_tenant_credential_requests_total,
+#   llmproxy_provider_credential_requests_total (tenant/minted credentials)
+#   llmproxy_router_max_output_tokens_rejected_total (max_output_tokens)
+#   llmproxy_router_session_affinity_total (session affinity)
+#   llmproxy_trace_segments_uploaded_total, llmproxy_trace_upload_failures_total
+#   (trace upload to S3)
+#   llmproxy_unmetered_endpoint_refused_total (unmetered endpoints)
+#   ext_authz (Envoy mode only)
+# A label that only another outcome would add is not covered, and neither is
+# Envoy mode (-c, xDS).
+# Regenerate with `make golden`; review every changed line.
+envoy_downstream_cx_total counter listener
+envoy_downstream_cx_transport_socket_connect_timeout counter listener
+envoy_downstream_global_cx_overflow counter listener
+envoy_downstream_rq_active gauge scope
+envoy_gen_ai_client_operation_duration histogram gen_ai_operation_name,gen_ai_provider_name,gen_ai_request_model
+envoy_gen_ai_client_token_usage histogram gen_ai_operation_name,gen_ai_provider_name,gen_ai_request_model,gen_ai_token_type
+envoy_gen_ai_server_time_per_output_token histogram gen_ai_operation_name,gen_ai_provider_name,gen_ai_request_model
+envoy_gen_ai_server_time_to_first_token histogram gen_ai_operation_name,gen_ai_provider_name,gen_ai_request_model
+envoy_llm_client_token_usage counter provider,tenant,type
+envoy_llmproxy_access_log_dropped_lines counter
+envoy_llmproxy_access_log_write_failures counter
+envoy_llmproxy_control_plane_store_info gauge node_id,scope,store
+envoy_llmproxy_counter_reconciliation_age_seconds gauge scope,seam
+envoy_llmproxy_ledger_entries_committed_total counter
+envoy_llmproxy_ledger_entries_lost_total counter reason
+envoy_llmproxy_ledger_rejected_total counter reason
+envoy_llmproxy_ledger_spend_written_micro_usd_total counter
+envoy_llmproxy_ledger_unclean_epochs_total counter
+envoy_llmproxy_ledger_unledgered_total counter reason
+envoy_llmproxy_metadata_admission counter outcome
+envoy_llmproxy_metadata_queue_capacity gauge
+envoy_llmproxy_metadata_queue_depth gauge
+envoy_llmproxy_metadata_write_failures counter
+envoy_llmproxy_metadata_written counter
+envoy_llmproxy_otel_export_failures counter signal
+envoy_llmproxy_otel_spans_dropped counter
+envoy_llmproxy_policy_snapshot_age_seconds gauge scope
+envoy_llmproxy_policy_store_emptied_total counter scope
+envoy_llmproxy_policy_store_rows gauge kind,scope
+envoy_llmproxy_spend_charged_micro_usd_total counter
+envoy_llmproxy_token_limit_unknown_model_total counter
+envoy_llmproxy_trace_capture_disabled gauge
+envoy_llmproxy_trace_captured_total counter
+envoy_llmproxy_trace_consent_stale_total counter
+envoy_llmproxy_trace_disk_bytes gauge
+envoy_llmproxy_trace_dropped_total counter reason
+envoy_llmproxy_trace_exporter_up gauge
+envoy_llmproxy_trace_memory_bytes gauge
+envoy_llmproxy_trace_partial_total counter reason
+envoy_llmproxy_trace_segments_expired_total counter reason
+envoy_llmproxy_trace_segments_lost_total counter reason
+envoy_llmproxy_trace_segments_sealed_total counter reason
+envoy_llmproxy_trace_slots gauge
+envoy_llmproxy_trace_written_total counter capture
+envoy_llmproxy_usage_estimated_total counter scope
+envoy_llmproxy_usage_oversized_body_unmetered_total counter scope
+envoy_llmproxy_usage_partial_total counter scope
+envoy_llmproxy_usage_rate_card_active gauge scope,version
+envoy_llmproxy_usage_served_model_repriced_total counter scope
+envoy_llmproxy_usage_underpriced_modality_requests_total counter scope
+envoy_llmproxy_usage_upstream_id_oversized_total counter scope
+envoy_llmproxy_usage_upstream_usage_oversized_total counter scope
+envoy_upstream_rq counter cluster
+envoy_upstream_rq_time histogram cluster
