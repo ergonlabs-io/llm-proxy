@@ -2118,6 +2118,17 @@ fn enforces_spend(config: &SimpleConfig) -> bool {
     config.auth.as_ref().is_some_and(|auth| auth.enforce.spend)
 }
 
+/// `auth.spend.recovery_journal_path`, validated by `lower_auth`.
+fn recovery_journal_path(config: &SimpleConfig) -> Option<&str> {
+    config
+        .auth
+        .as_ref()?
+        .spend
+        .as_ref()?
+        .recovery_journal_path
+        .as_deref()
+}
+
 /// Owned `llmproxy.filters.v0.BodyRewrite` `typed_config` for the body-rewrite
 /// filter: `enabled` is the on/off switch for consumer A (the
 /// `include_usage` splice) ONLY -- consumer B (body-based model routing)
@@ -3067,6 +3078,35 @@ fn lower_auth(
         }
         typed_config["tenant_credentials"] = lowered;
     }
+    // Lowered onto `llmproxy.spend_limit` by `recovery_journal_path`; only
+    // checked here, where the store is known.
+    if let Some(path) = auth
+        .spend
+        .as_ref()
+        .and_then(|spend| spend.recovery_journal_path.as_deref())
+    {
+        let reason = if path.is_empty() {
+            Some("must not be empty; remove the field to run without a journal")
+        } else if !auth.enforce.spend {
+            Some(
+                "has no effect with `enforce.spend: false`, which omits the filter that reads \
+                 it; remove one of the two",
+            )
+        } else if !store_is_durable {
+            // The journal holds only what the store has not confirmed. Over
+            // `in_memory`, a restart replays that tail into an empty store,
+            // which looks like recovery while every flushed total is gone.
+            Some(RECOVERY_JOURNAL_NEEDS_DURABLE_STORE)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(ConfigError::InvalidValue {
+                field_path: "auth.spend.recovery_journal_path".to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
 
     Ok(Some(json!({
         "name": AUTH_FILTER_NAME,
@@ -3145,26 +3185,41 @@ fn lower_auth_store(
     }
 }
 
-/// Refuses `auth.store.shared` when this replica has no configured node id
-/// (ADR-0006 addendum "Admission stays local" §5). The dialect has no node id
-/// field, so `--service-node` is the only source; the caller passes its
-/// value. Lowering cannot check this itself: the node id is a CLI input, not
-/// part of the config. The Envoy-mode check in `proxy-filters`' `auth_filter`
-/// is the backstop and reports `typed_config.store.shared`.
-pub fn require_node_id_for_shared_store(
+/// Refuses the settings that need this replica's node id when none is
+/// configured. The dialect has no node id field, so `--service-node` is the
+/// only source; the caller passes its value. Lowering cannot check this
+/// itself: the node id is a CLI input, not part of the config.
+///
+/// - `auth.store.shared` (ADR-0006 addendum "Admission stays local" §5). The
+///   Envoy-mode backstop in `proxy-filters`' `auth_filter` reports
+///   `typed_config.store.shared`.
+/// - `auth.spend.recovery_journal_path`: the journal records the node id and
+///   refuses to replay under another one, so a per-boot id would make every
+///   restart fail. The Envoy-mode backstop in `spend_limit_filter` reports
+///   `typed_config.recovery_journal_path`.
+pub fn require_service_node(
     config: &SimpleConfig,
     service_node: Option<&str>,
 ) -> Result<(), ConfigError> {
+    let configured = service_node.is_some_and(|id| !id.is_empty() && id != "-");
+    if configured {
+        return Ok(());
+    }
     let shared = config
         .auth
         .as_ref()
         .and_then(|auth| auth.store.as_ref())
         .is_some_and(|store| store.shared.is_some());
-    let configured = service_node.is_some_and(|id| !id.is_empty() && id != "-");
-    if shared && !configured {
+    if shared {
         return Err(ConfigError::InvalidValue {
             field_path: "auth.store.shared".to_string(),
             reason: SHARED_STORE_NEEDS_NODE_ID.to_string(),
+        });
+    }
+    if recovery_journal_path(config).is_some() {
+        return Err(ConfigError::InvalidValue {
+            field_path: "auth.spend.recovery_journal_path".to_string(),
+            reason: RECOVERY_JOURNAL_NEEDS_NODE_ID.to_string(),
         });
     }
     Ok(())
@@ -3176,6 +3231,17 @@ pub fn require_node_id_for_shared_store(
 const SHARED_STORE_NEEDS_NODE_ID: &str = "a shared store requires a configured node id: pass \
      --service-node <name> with a name unique to this replica and stable across its restarts \
      (the dialect has no node id field)";
+
+/// Why `auth.spend.recovery_journal_path` needs `--service-node`.
+const RECOVERY_JOURNAL_NEEDS_NODE_ID: &str = "a spend recovery journal requires a configured \
+     node id: pass --service-node <name> with a name unique to this replica and stable across \
+     its restarts (the dialect has no node id field)";
+
+/// Why `auth.spend.recovery_journal_path` needs `auth.store.persistent` or
+/// `shared`.
+const RECOVERY_JOURNAL_NEEDS_DURABLE_STORE: &str = "a spend recovery journal requires a durable \
+     store (`persistent` or `shared`): over in_memory a restart replays only the unconfirmed \
+     tail into an empty store";
 
 /// Why `auth.tenant_credentials` needs `auth.store.persistent` or `shared`. The same words
 /// as the Envoy-mode check in `proxy-filters`' `auth_filter`, so both entry
@@ -3855,12 +3921,17 @@ fn lower_listener(
         // START_KEYS_FRESH is unconditional: the dialect never had legacy
         // tenant budgets, so there is no history to cut over from, and without
         // it a stored tenant budget would block the next start.
+        let mut spend_config = json!({
+            "@type": SPEND_LIMIT_FILTER_TYPE_URL,
+            "legacy_tenant_budget_cutover": "START_KEYS_FRESH",
+        });
+        // Absent adds no field, so configs without it lower byte-identically.
+        if let Some(path) = recovery_journal_path(config) {
+            spend_config["recovery_journal_path"] = json!(path);
+        }
         http_filters.push(json!({
             "name": "llmproxy.spend_limit",
-            "typed_config": {
-                "@type": SPEND_LIMIT_FILTER_TYPE_URL,
-                "legacy_tenant_budget_cutover": "START_KEYS_FRESH",
-            },
+            "typed_config": spend_config,
         }));
     }
     let mut usage_config = json!({

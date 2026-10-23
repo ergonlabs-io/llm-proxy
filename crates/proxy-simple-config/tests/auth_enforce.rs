@@ -580,3 +580,139 @@ fn a_limits_entry_keeps_one_token_limit_with_its_static_rule() {
         lowered.warnings
     );
 }
+
+/// A fresh path under the temp dir, unique to this process and `tag`.
+fn temp_path(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "llm-proxy-spend-journal-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos()
+    ))
+}
+
+/// `auth.spend.recovery_journal_path` lowers to exactly the Envoy bootstrap an
+/// operator would write by hand: the same bootstrap plus the one
+/// `SpendLimit.recovery_journal_path` field. Pushed through the strict loader
+/// and the real factories under a node id, the journal file is created.
+#[test]
+fn recovery_journal_path_lowers_onto_the_spend_limit_bootstrap_field() {
+    let store = temp_path("store.redb");
+    let journal = temp_path("journal.redb");
+    let store_line = format!(
+        "  store: {{ persistent: {{ path: {} }} }}\n",
+        store.display()
+    );
+    let without = parse(&with_auth(&store_line, PRICING)).expect("must parse");
+    let with = parse(&with_auth(
+        &format!(
+            "{store_line}  spend: {{ recovery_journal_path: {} }}\n",
+            journal.display()
+        ),
+        PRICING,
+    ))
+    .expect("must parse");
+
+    let mut expected = lower(&without).expect("must lower").bootstrap;
+    let filters = expected["static_resources"]["listeners"][0]["filter_chains"][0]["filters"][0]
+        ["typed_config"]["http_filters"]
+        .as_array_mut()
+        .expect("http_filters");
+    let spend = filters
+        .iter_mut()
+        .find(|f| f["name"] == "llmproxy.spend_limit")
+        .expect("spend_limit in the chain");
+    spend["typed_config"]["recovery_journal_path"] =
+        serde_json::json!(journal.display().to_string());
+    assert_eq!(lower(&with).expect("must lower").bootstrap, expected);
+
+    let loaded = lower_to_loaded(&with).expect("strict loader must accept the field");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    let listener = snapshot.listeners.values().next().expect("one listener");
+    let proxy_config::ir::NetworkFilterSpec::HttpConnectionManager(hcm) =
+        &listener.filter_chains[0].filters[0]
+    else {
+        panic!("expected an HTTP connection manager");
+    };
+    let config_of = |type_url: &str| {
+        hcm.http_filters
+            .iter()
+            .find(|f| f.type_url == type_url)
+            .unwrap_or_else(|| panic!("{type_url} must be in the chain"))
+            .config
+            .clone()
+            .expect("typed_config survives to the IR")
+    };
+    let ctx = FactoryContext {
+        shared: std::sync::Arc::new(proxy_http::filter::SharedFactoryState::for_node(
+            "replica-a".to_string(),
+        )),
+        ..Default::default()
+    };
+    AuthFilterFactory
+        .create(&config_of(proxy_filters::auth_filter::TYPE_URL), &ctx)
+        .expect("auth over the persistent store");
+    SpendLimitFilterFactory
+        .create(
+            &config_of(proxy_filters::spend_limit_filter::TYPE_URL),
+            &ctx,
+        )
+        .expect("spend_limit opens the journal");
+    assert!(
+        journal.exists(),
+        "the factory must create the journal at {}",
+        journal.display()
+    );
+    let _ = std::fs::remove_file(&journal);
+    let _ = std::fs::remove_file(&store);
+}
+
+/// Every refusal names `auth.spend.recovery_journal_path`.
+#[test]
+fn invalid_recovery_journal_path_fails_with_its_dotted_path() {
+    let durable = "  store: { persistent: { path: /tmp/unused-spend-journal-store.redb } }\n";
+    for (extra, why) in [
+        (
+            format!("{durable}  spend: {{ recovery_journal_path: \"\" }}\n"),
+            "must not be empty",
+        ),
+        (
+            format!(
+                "{durable}  enforce: {{ spend: false }}\n  \
+                 spend: {{ recovery_journal_path: /tmp/j.redb }}\n"
+            ),
+            "no effect",
+        ),
+        (
+            "  spend: { recovery_journal_path: /tmp/j.redb }\n".to_string(),
+            "durable store",
+        ),
+        (
+            "  store: { in_memory: {} }\n  spend: { recovery_journal_path: /tmp/j.redb }\n"
+                .to_string(),
+            "durable store",
+        ),
+    ] {
+        let err =
+            lower(&parse(&with_auth(&extra, PRICING)).expect("must parse")).expect_err(&extra);
+        let ConfigError::InvalidValue { field_path, reason } = err else {
+            panic!("{extra}: {err:?}");
+        };
+        assert_eq!(field_path, "auth.spend.recovery_journal_path", "{extra}");
+        assert!(reason.contains(why), "{extra}: {reason}");
+    }
+
+    let err = parse(&with_auth(
+        "  spend: { recovery_journal: /tmp/j.redb }\n",
+        "",
+    ))
+    .expect_err("unknown key must fail");
+    match err {
+        ConfigError::UnknownField { field_path, .. } => {
+            assert_eq!(field_path, "auth.spend.recovery_journal");
+        }
+        other => panic!("expected UnknownField, got {other:?}"),
+    }
+}

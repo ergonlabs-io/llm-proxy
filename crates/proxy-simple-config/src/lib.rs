@@ -16,7 +16,7 @@ pub mod parse;
 pub mod fuzzing;
 
 pub use lower::{
-    has_inline_secrets, lower, lower_to_loaded, require_node_id_for_shared_store, to_envoy_yaml,
+    has_inline_secrets, lower, lower_to_loaded, require_service_node, to_envoy_yaml,
     to_envoy_yaml_with_secrets, Lowered, MODEL_HEADER, REDACTED,
 };
 pub use model::SimpleConfig;

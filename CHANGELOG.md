@@ -9,6 +9,17 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- `--config`: `auth.spend.recovery_journal_path` turns on the spend recovery
+  journal, which was reachable only from an Envoy bootstrap. Each flush writes
+  the spend the store has not confirmed to this local file, and the next start
+  replays it, so a crash or `kill -9` during a store outage no longer loses
+  that spend. It lowers onto `SpendLimit.recovery_journal_path`. It requires
+  `--service-node` and a `persistent` or `shared` store, and is a load error
+  with `auth.enforce.spend: false`; each refusal names
+  `auth.spend.recovery_journal_path`.
+
 ## [0.7.0] - 2026-10-22
 
 ### Breaking

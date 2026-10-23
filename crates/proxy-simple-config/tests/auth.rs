@@ -6,8 +6,7 @@ use proxy_config::ConfigError;
 use proxy_filters::auth_filter::AuthFilterFactory;
 use proxy_http::filter::{FactoryContext, HttpFilterFactory};
 use proxy_simple_config::{
-    lower, lower_to_loaded, parse_simple_config_with_env, require_node_id_for_shared_store,
-    SimpleConfig,
+    lower, lower_to_loaded, parse_simple_config_with_env, require_service_node, SimpleConfig,
 };
 
 fn test_env(name: &str) -> Option<String> {
@@ -702,7 +701,7 @@ fn shared_store_without_a_service_node_is_refused_naming_the_flag() {
     ))
     .expect("must parse");
     for service_node in [None, Some(""), Some("-")] {
-        match require_node_id_for_shared_store(&shared, service_node) {
+        match require_service_node(&shared, service_node) {
             Err(ConfigError::InvalidValue { field_path, reason }) => {
                 assert_eq!(field_path, "auth.store.shared", "for {service_node:?}");
                 assert!(reason.contains("--service-node"), "{reason}");
@@ -710,12 +709,42 @@ fn shared_store_without_a_service_node_is_refused_naming_the_flag() {
             other => panic!("expected InvalidValue for {service_node:?}, got {other:?}"),
         }
     }
-    require_node_id_for_shared_store(&shared, Some("replica-a"))
+    require_service_node(&shared, Some("replica-a"))
         .expect("a configured node id satisfies the check");
 
     let in_memory = parse(&config_with_store("{ in_memory: {} }")).expect("must parse");
-    require_node_id_for_shared_store(&in_memory, None)
-        .expect("a per-replica store needs no node id");
+    require_service_node(&in_memory, None).expect("a per-replica store needs no node id");
+}
+
+/// The spend recovery journal records the node id and refuses to replay
+/// under another, so it needs `--service-node` even over a per-replica store.
+#[test]
+fn recovery_journal_without_a_service_node_is_refused_naming_the_flag() {
+    let journaled = parse(&format!(
+        "{}  spend: {{ recovery_journal_path: /var/lib/llm-proxy/spend.redb }}\n",
+        config_with_store("{ persistent: { path: /var/lib/llm-proxy/store.redb } }")
+    ))
+    .expect("must parse");
+    for service_node in [None, Some(""), Some("-")] {
+        match require_service_node(&journaled, service_node) {
+            Err(ConfigError::InvalidValue { field_path, reason }) => {
+                assert_eq!(
+                    field_path, "auth.spend.recovery_journal_path",
+                    "for {service_node:?}"
+                );
+                assert!(reason.contains("--service-node"), "{reason}");
+            }
+            other => panic!("expected InvalidValue for {service_node:?}, got {other:?}"),
+        }
+    }
+    require_service_node(&journaled, Some("replica-a"))
+        .expect("a configured node id satisfies the check");
+
+    let unjournaled = parse(&config_with_store(
+        "{ persistent: { path: /var/lib/llm-proxy/store.redb } }",
+    ))
+    .expect("must parse");
+    require_service_node(&unjournaled, None).expect("no journal needs no node id");
 }
 
 #[test]

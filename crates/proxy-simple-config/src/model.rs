@@ -598,6 +598,10 @@ pub struct Auth {
     /// Which tenant controls the proxy enforces. Absent means both on.
     #[serde(default)]
     pub enforce: AuthEnforce,
+    /// Spend-budget settings. Mirrors the settable fields of
+    /// `llmproxy.filters.v0.SpendLimit`. Absent changes nothing.
+    #[serde(default)]
+    pub spend: Option<AuthSpend>,
     /// How old the policy snapshot may get while the store cannot be read
     /// before virtual-key authentication fails closed (503). Absent means
     /// 4m (5 x the 48 s policy poll). Whole seconds, at least 96s.
@@ -616,6 +620,19 @@ pub struct Auth {
     /// tag header is never read.
     #[serde(default)]
     pub chargeback_tags: Option<ChargebackTagsDef>,
+}
+
+/// `auth.spend`: settings of the `llmproxy.spend_limit` filter that
+/// `enforce.spend` adds.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSpend {
+    /// A local file where this replica checkpoints the spend the store has
+    /// not yet confirmed, replayed at the next start. Lowers onto
+    /// `SpendLimit.recovery_journal_path`. Absent means no journal: spend
+    /// accrued while the store cannot be written is lost on a crash.
+    #[serde(default)]
+    pub recovery_journal_path: Option<String>,
 }
 
 /// `auth.chargeback_tags`: the operator's tag allow-list and caps.

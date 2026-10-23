@@ -23,6 +23,13 @@ admin: 127.0.0.1:9901
 #     - id: alice-laptop
 #       tenant: acme
 #       digest: 3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a
+#   # Keys, policy and spend survive a restart in this file.
+#   store: { persistent: { path: /var/lib/llm-proxy/store.redb } }
+#   # Spend the store has not confirmed is written here on each flush and
+#   # replayed at the next start, so a crash during a store outage does not
+#   # lose it. One file per replica; needs --service-node.
+#   spend:
+#     recovery_journal_path: /var/lib/llm-proxy/spend-journal.redb
 
 providers:
   # `openai` and `anthropic` infer their type and base_url from the name.
