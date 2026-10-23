@@ -1,21 +1,214 @@
 ---
 title: Install llm-proxy
-description: "Install llm-proxy with the install script or from source, run it as a service, and upgrade or remove it."
-lastUpdated: 2026-10-21
+description: "Install llm-proxy from a release archive, a container image, or source. Send a first request in about five minutes, then run it as a service."
+lastUpdated: 2026-10-22
 related:
   - getting-started/quickstart
   - reference/cli
   - operations/running-in-production
+  - operations/kubernetes
 ---
 
-You can install llm-proxy with the install script or build it from source.
-The release workflow builds three archives: Linux on x86-64, Linux on arm64,
-and macOS on Apple Silicon. The script installs the binary and starts the
-proxy as a service. Intel macOS has no prebuilt release. Build from source on
-that platform. For Kubernetes, see
+This page has two parts. The quick start gets you to one proxied request in
+about five minutes, with no authentication. The service section installs the
+proxy with a script and runs it in the background.
+
+## Quick start
+
+You need a provider API key, or a local Ollama. The quick start uses one
+OpenAI-compatible provider and sends every model to it. The config file has
+no `auth` section, so the proxy does not check callers. Run it on your own
+machine only.
+
+### Step 1: Get llm-proxy
+
+Choose one option.
+
+#### Option A: Release binary
+
+Release archives exist for Linux x86-64, Linux arm64, and macOS Apple
+silicon. Intel macOS and Windows have no archive. Use option C on those
+platforms.
+
+:::caution
+Releases up to v0.6.1 have no Linux arm64 archive. On Linux arm64 the
+download fails for those releases. Use option C instead.
+:::
+
+Download and unpack the archive. It holds `llm-proxy` and `admin-ui-dist/`.
+
+```sh
+os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSLO "https://github.com/ergonlabs-io/llm-proxy/releases/latest/download/llm-proxy-$os-$arch.tar.gz"
+tar -xzf "llm-proxy-$os-$arch.tar.gz"
+./llm-proxy --version
+```
+
+Then download the quick-start config:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart.yaml
+```
+
+Each archive has a `.sha256` file next to it on the release page. Use it to
+check the download.
+
+#### Option B: Container image
+
+:::caution
+The image is published for releases after v0.6.1.
+:::
+
+The image is `ghcr.io/ergonlabs-io/llm-proxy`. It has two kinds of tag: the
+version without `v` (for example `0.6.1`) and `latest`. A pre-release does
+not move `latest`. The image supports `linux/amd64` and `linux/arm64`.
+
+The image runs `llm-proxy --config /etc/llm-proxy/llmproxy.yaml` as user
+`65532`. It exposes ports `8080` and `9901`. It has no shell.
+
+Download the container config. It listens on `0.0.0.0:8080` inside the
+container. The admin address stays on `127.0.0.1`.
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart-container.yaml
+```
+
+Set the two variables from step 2. Then run the container:
+
+```sh
+docker run --rm -p 127.0.0.1:8080:8080 -e UPSTREAM_BASE_URL -e UPSTREAM_API_KEY \
+  -v "$PWD/llmproxy-quickstart-container.yaml:/etc/llm-proxy/llmproxy.yaml:ro" \
+  ghcr.io/ergonlabs-io/llm-proxy:latest
+```
+
+When the container runs, go to step 4. Publish the port on `127.0.0.1` only, as the command does. The config has no
+authentication. For Ollama on the Docker host, set
+`UPSTREAM_BASE_URL=http://host.docker.internal:11434`. For Kubernetes, see
 [Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/).
 
-## At a glance
+#### Option C: Build from source
+
+You need [rustup](https://rustup.rs), a C toolchain, and `protoc`. The file
+`rust-toolchain.toml` pins Rust 1.99.0, and `rustup` installs that version on
+the first build. Rust needs the C toolchain to link. Without it, the build
+fails with ``error: linker `cc` not found``. Install the C toolchain and
+`protoc` first:
+
+```sh
+xcode-select --install; brew install protobuf        # macOS
+sudo apt install build-essential protobuf-compiler   # Debian and Ubuntu
+```
+
+Then build. A clean release build takes a few minutes.
+
+```sh
+git clone https://github.com/ergonlabs-io/llm-proxy.git
+cd llm-proxy
+cargo build --release -p proxy
+```
+
+The binary is `target/release/llm-proxy`. The config is
+`examples/llmproxy-quickstart.yaml` in the checkout. Run the commands below
+from the checkout, and use `./target/release/llm-proxy` in place of
+`./llm-proxy`.
+
+### Step 2: Set the provider
+
+The config reads two environment variables. Set both in the terminal where
+you run the proxy.
+
+```sh
+export UPSTREAM_BASE_URL=https://api.openai.com   # scheme, host and port only, no /v1
+export UPSTREAM_API_KEY=sk-...                     # your provider key
+```
+
+Do not add `/v1` to `UPSTREAM_BASE_URL`. The OpenAI SDK variable
+`OPENAI_BASE_URL` includes `/v1`, so this config uses its own names.
+
+For a local Ollama, set `UPSTREAM_BASE_URL=http://127.0.0.1:11434`. Set
+`UPSTREAM_API_KEY` to any value. Ollama ignores it.
+
+### Step 3: Validate and start the proxy
+
+Validate the config:
+
+```sh
+./llm-proxy --config llmproxy-quickstart.yaml --mode validate
+```
+
+Expected output:
+
+```text
+configuration 'llmproxy-quickstart.yaml' OK (1 listener(s), 1 cluster(s), 0 warning(s))
+```
+
+Start the proxy. It runs in the foreground. Press Ctrl+C to stop it.
+
+```sh
+./llm-proxy --config llmproxy-quickstart.yaml
+```
+
+The proxy listens on `127.0.0.1:8080`. The admin address is
+`127.0.0.1:9901`. To check readiness, run
+`curl http://127.0.0.1:9901/ready` in a second terminal.
+
+The start-up log has some lines that you can ignore in the quick start:
+
+- On macOS, one `failed to pin worker to core, continuing unpinned` warning
+  for each worker.
+- A warning that `LLMPROXY_ADMIN_TOKEN` is not set. The admin API then
+  refuses writes.
+- An info line `admin UI not loaded`. The admin UI is off.
+
+If validation fails, the message names the field. Two common errors:
+
+```text
+invalid value at `providers.upstream.base_url`: environment variable `UPSTREAM_BASE_URL` is not set (referenced as ${UPSTREAM_BASE_URL})
+```
+
+Export the variable in the same terminal and run the command again.
+
+```text
+invalid value at `providers.upstream.base_url`: `https://api.openai.com/v1` has a path prefix; v0 does not support base_url paths
+```
+
+Remove `/v1` from `UPSTREAM_BASE_URL`.
+
+### Step 4: Send a request
+
+Open a second terminal. Use a model name that your provider serves. For
+Ollama, use a model that you have pulled.
+
+```sh
+curl --max-time 60 http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+The request needs no `Authorization` header. The proxy sends
+`UPSTREAM_API_KEY` to the provider as `Authorization: Bearer`.
+
+Expected outcome: an HTTP 200 response with a JSON body from the provider.
+The proxy also prints one JSON access-log line on standard output. The line
+has the fields `llm_input_tokens`, `llm_output_tokens`, and
+`llm_total_tokens`. Each value is a string.
+
+### Next steps
+
+- Add virtual keys before you expose the proxy. See
+  [Virtual keys](/docs/llm-proxy/authentication/virtual-keys/).
+- Run `llm-proxy init` for a starter config with authentication and an admin
+  UI. See [Quickstart](/docs/llm-proxy/getting-started/quickstart/).
+- Point your application at the proxy. See
+  [Connect your application](/docs/llm-proxy/getting-started/connect-your-application/).
+- Run the proxy as a service. Continue with the next section.
+
+## Install as a service
+
+The install script installs the binary and starts the proxy as a service.
+Intel macOS has no prebuilt release. Build from source on that platform.
+
+### At a glance
 
 - Prebuilt platforms: Linux x86-64, Linux arm64, and macOS Apple Silicon.
 - Default binary path: `~/.local/bin/llm-proxy`.
@@ -29,7 +222,7 @@ asks for `llm-proxy-linux-arm64.tar.gz`, and for those releases the download
 fails with `There may be no linux/arm64 build in this release.`
 :::
 
-## Install with the script
+### Install with the script
 
 Run the script from any directory:
 
@@ -59,7 +252,7 @@ To pass options, add them after `sh -s --`:
 curl -fsSL https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/scripts/install.sh | sh -s -- --version v0.5.0 --port 8080
 ```
 
-### Options
+#### Options
 
 | Option | Default | What it does |
 |---|---|---|
@@ -93,7 +286,7 @@ reach the port can read `/config_dump`, `/stats`, and `/clusters` without the
 token. Use this address only on a network you trust. The script prints this
 warning on every run.
 
-### Where the files go
+#### Where the files go
 
 | Item | Normal user | Root on Linux |
 |---|---|---|
@@ -108,7 +301,7 @@ is not on your `PATH`, the script tells you to add it.
 
 On macOS, you must run the script as your own user. It refuses to run as root.
 
-### The service on each platform
+#### The service on each platform
 
 | Platform | Service | Logs |
 |---|---|---|
@@ -132,12 +325,12 @@ systemctl --user restart llm-proxy                           # Linux, normal use
 sudo systemctl restart llm-proxy                             # Linux, root
 ```
 
-### Upgrade
+#### Upgrade
 
 Run the same install command again. The script replaces the binary and keeps
 the existing config, secret, and admin token. It restarts the service.
 
-### Uninstall
+#### Uninstall
 
 Run the script with `--uninstall`. It stops the service and removes the
 service file and the binaries. It keeps the data directory.
@@ -151,19 +344,12 @@ your authentication secret. Keys that you issued stop working.
 
 ## Build from source
 
-Install a Rust toolchain and `protoc`. The `proxy-api` crate compiles bundled
-protobuf definitions at build time, so the build fails without `protoc`.
-
-```sh
-brew install protobuf          # macOS
-apt install protobuf-compiler  # Debian and Ubuntu
-```
+Option C of the quick start shows the build. This section adds a debug build
+and the `init` command.
 
 Run the build from the repository root:
 
 ```sh
-git clone https://github.com/ergonlabs-io/llm-proxy.git
-cd llm-proxy
 cargo build -p proxy
 ```
 
@@ -171,11 +357,12 @@ The binary is `target/debug/llm-proxy`. For an optimized binary, add
 `--release`. The binary is then `target/release/llm-proxy`.
 
 ```sh
-./target/debug/llm-proxy --version
+./target/release/llm-proxy --version
 ```
 
-A source build does not start a service. To create a config, run
-`./target/debug/llm-proxy init ./llmproxy-home`. Then continue at step 3 of the
+A source build does not start a service. To create a config with
+authentication, run `./target/release/llm-proxy init ./llmproxy-home`. Then
+continue at step 3 of the
 [Quickstart](/docs/llm-proxy/getting-started/quickstart/), with this binary
 path in place of `llm-proxy`. For the command-line flags, see the
 [CLI reference](/docs/llm-proxy/reference/cli/).

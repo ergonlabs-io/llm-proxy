@@ -3,6 +3,8 @@ name = "proxy-xds"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # The ADS gRPC pump (client.rs) does not use `proxy-config`: validation is
 # injected as a callback. apply.rs is the one place a `DiscoveryResponse`

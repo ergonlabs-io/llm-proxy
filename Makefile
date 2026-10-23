@@ -389,6 +389,10 @@ docs-dev: ## Run the docs site dev server (docs/site), http://localhost:4321
 docs-build: ## Production build of the docs site to docs/site/dist/
 	cd docs/site && npm run build
 
+.PHONY: docs-check
+docs-check: docs-build ## Build the docs site and fail on a broken internal or repository link
+	cd docs/site && npm run check-links
+
 # -------------------------------------------------------------------- deps --
 
 .PHONY: deps-check

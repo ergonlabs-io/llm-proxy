@@ -17,7 +17,7 @@ admin: 127.0.0.1:9901
 
 providers:
   ollama:
-    base_url: http://ollama.internal:11434
+    base_url: http://127.0.0.1:11434
 
 # One provider, so one catch-all rule. Ollama's model names carry a tag
 # (`llama3.1:8b`), and `*` matches any run of characters, so a per-family

@@ -3,6 +3,8 @@ name = "proxy-credentials"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # A tenant's own provider credentials as the request path sees them
 # (ADR-0007). Both the router (proxy-http) and the store that decrypts them

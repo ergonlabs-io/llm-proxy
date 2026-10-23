@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only token for every job. Pull requests from forks get a read-only
+# token and no secrets anyway; this keeps pushes to main the same.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -43,6 +48,21 @@ jobs:
           version: v3.16.3
       - name: helm lint and helm template
         run: make helm-check
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/site/package-lock.json
+      - name: Install docs dependencies
+        run: cd docs/site && npm ci
+      - name: Build the docs site and check its links
+        run: make docs-check
 
   # The differential rig job is not wired into CI yet; it would go here (docker-compose: llm-proxy vs pinned
   # Envoy image digest + shared upstreams). Smoke subset on PR, full on merge queue.

@@ -3,6 +3,8 @@ name = "proxy-control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # The control plane under the filters: the `ControlPlaneStore` trait and its
 # in-memory, redb and Redis stores, the published snapshot and its poller,

@@ -26,6 +26,8 @@ members = [
 version = "0.6.1"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/ergonlabs-io/llm-proxy"
+homepage = "https://ergonlabs.io/docs/llm-proxy/"
 rust-version = "1.78"
 
 [workspace.dependencies]
