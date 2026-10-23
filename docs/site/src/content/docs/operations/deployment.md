@@ -235,31 +235,36 @@ Read these limits before you rely on `/ready`:
 
 ## Sizing
 
-The project measured one capacity sweep. Treat it as one data point. The
-setup was an open-loop driver against a mock upstream, HTTP/2 on both hops,
-128-token chat completions with 250 ms time to first token and 25 ms between
-tokens. It ran on an 8-core, 16 GB MacBook Pro on 2026-08-23. The proxy had no
-TLS, and access logs were off.
+The project measured capacity on a dedicated host: a DigitalOcean droplet with
+16 vCPU (Intel Xeon Platinum 8168) and no CPU steal. One proxy replica ran on 4
+pinned cores. The mock upstream and the load generator ran on other cores. The
+driver was open-loop, with 128-token chat completions, 250 ms time to first
+token and 25 ms between tokens. The latency gate was p99 at or below 6900 ms
+and time-to-first-token p99 at or below 1000 ms. `circuit_breakers` allowed
+16384 requests and 16384 connections. The proxy had no TLS.
 
-| Result | Value |
-|---|---|
-| Highest concurrency within the latency gate (p99 at or below 6900 ms) | 808 concurrent streams (237 requests/s) |
-| Peak resident memory at that level | 84.4 MB |
-| Mean CPU at that level | 22% |
-| Memory model | about 31.5 MB base plus 63.8 KB per concurrent stream |
-| CPU model | about 544 ms base plus 0.871 ms per request |
-| Error rate | 0.00 at every level, including the levels that failed the gate |
+| Upstream protocol | Highest concurrency within the gate | Memory per stream | CPU per stream |
+|---|---|---|---|
+| HTTP/2 | 7,927 concurrent streams | 72 KB | 2.0 ms |
+| HTTP/1.1 | 3,608 concurrent streams | 131 KB | 4.8 ms |
+
+At both limits the proxy used all 4 cores. The error rate was 0 at every level
+within the gate.
+
+On the same type of host, at a fixed request rate, the proxy added less than
+5 ms at p99 up to 20,000 requests/s for each replica on 4 cores. At
+5,000 requests/s it added 0.44 ms at p50 and 2.34 ms at p99. A 30-minute soak
+of 225,000 streams had no errors, and memory stayed flat.
 
 What this means for planning:
 
-- **Streams hold memory, not CPU.** A long generation costs about 64 KB of
-  memory while it runs.
+- **CPU sets the limit.** Plan about 2 ms of CPU and 72 KB of memory for each
+  HTTP/2 stream, and about twice that for HTTP/1.1.
 - **Workers equal cores by default.** `--concurrency N` sets the number of
   worker runtimes. The default is the number of available cores. In a
   container with a CPU limit, check that the proxy sees the limit, or set
   `--concurrency`.
-- **Overload queues.** The levels that failed the gate failed on latency, not
-  on errors.
+- **Overload queues.** Past the limit, latency increases before errors occur.
 - **Use HTTP/2 to providers that support it.** Set `protocol: http2` on the
   provider so the proxy reuses connections.
 

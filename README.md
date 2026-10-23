@@ -34,9 +34,8 @@ else.
 > [!NOTE]
 > **Pre-1.0.** The data plane serves real traffic, but interfaces still change
 > between releases and there are no backports to earlier tags. Read
-> [What is not built yet](#what-is-not-built-yet) before you depend on it —
-> that section is deliberately specific — and [Roadmap](#roadmap) for where
-> each release stands.
+> [Limitations](https://ergonlabs.io/docs/llm-proxy/help/limitations/) before
+> you depend on it: it lists what is not built or only partly built.
 
 ---
 
@@ -160,7 +159,9 @@ provider on failover. That has been a real key-disclosure bug here twice.
   specific models from that grant. The effective access is allow minus deny,
   enforced before routing. It fails closed on an unauthenticated request. It
   also refuses an authenticated tenant with no stored policy (403), unless
-  `auth.enforce.tenants_without_policy` is `allow`. The dialect's `auth:` block turns this on; `auth.enforce.model_policy: false` turns it off, and the admin API then refuses policy writes with `409`.
+  `auth.enforce.tenants_without_policy` is `allow`. The dialect's `auth:` block
+  turns this on; `auth.enforce.model_policy: false` turns it off, and the admin
+  API then refuses policy writes with `409`.
 
 - **Mints and revokes keys at runtime.** A bearer-gated admin write API creates
   tenants, mints and revokes virtual keys, and sets per-tenant policies and
@@ -203,16 +204,16 @@ provider on failover. That has been a real key-disclosure bug here twice.
   that fails to parse leaves the previous one serving, with the error logged
   against its exact field path. SIGTERM drains connections instead of dropping
   them: `/ready` turns 503, the listeners close, idle connections close, and
-  in-flight streams finish until `--drain-time-s`. A config swap under live traffic is covered by a differential test that
-  asserts every in-flight SSE stream still reaches its terminal frame.
+  in-flight streams finish until `--drain-time-s`. A config swap under live
+  traffic is covered by a differential test that asserts every in-flight SSE
+  stream still reaches its terminal frame.
 
 - **Takes configuration from a control plane.** ADS state-of-the-world for
   clusters, listeners, and endpoints, with correct ACK/NACK, reconnect with
   backoff, and last-good config retained on failure. Conformance is checked
   against go-control-plane (`make xds-conformance`), not only against our own
   harness — a harness we wrote both sides of cannot catch us agreeing with
-  ourselves and both being wrong. The v0.3.2 gate shipped in tag v0.3.5; see
-  [Roadmap](#roadmap).
+  ourselves and both being wrong.
 
 ## Quick start
 
@@ -228,10 +229,8 @@ tar -xzf "llm-proxy-$os-$arch.tar.gz"
 curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart.yaml
 ```
 
-Releases before v0.7.0 have no Linux arm64 archive; build from source there.
-
 **Container image** (`ghcr.io/ergonlabs-io/llm-proxy`, linux/amd64 and
-linux/arm64; published from v0.7.0):
+linux/arm64):
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart-container.yaml
@@ -374,22 +373,23 @@ lowers onto it.
 
 ## Measured capacity
 
-One published sweep, so the numbers are not a claim. Open-loop,
-coordinated-omission-aware driver against a mock upstream, HTTP/2 on both hops,
-128-token chat completions with 250 ms TTFT and 25 ms inter-token pacing; SLO
-gate p99 ≤ 6900 ms and TTFT p99 ≤ 1000 ms. 80,507 requests over 20 levels on an
-8-core, 16 GB MacBook Pro.
+Measured on a dedicated host (DigitalOcean, 16 vCPU Xeon Platinum 8168, CPU
+steal 0), with one proxy replica pinned to 4 cores and the mock upstream and
+load generator on cores of their own. Open-loop, coordinated-omission-aware
+driver; 128-token chat completions with 250 ms TTFT and 25 ms inter-token
+pacing; SLO gate p99 ≤ 6900 ms and TTFT p99 ≤ 1000 ms.
 
-**Max sustainable concurrency within SLO: 808** (237 rps at that level, p99
-3793 ms, TTFT p99 397 ms, peak RSS 84.4 MB, 22% mean CPU).
+| Upstream protocol | Concurrent streams within SLO | Per stream |
+|---|---|---|
+| HTTP/2 | **7,927** (CPU-bound) | 72 KB RSS, 2.0 ms CPU |
+| HTTP/1.1 | **3,608** (CPU-bound) | 131 KB RSS, 4.8 ms CPU |
 
-- RSS ≈ 31.5 MB baseline + **63.8 KB per concurrent stream** (R² = 0.981)
-- CPU ≈ 544 ms baseline + **0.871 ms per request** (R² = 0.973)
-- Error rate **0.00 at every level, including every failing one** — levels fail
-  the SLO on latency, never on correctness. Nothing is dropped or truncated;
-  requests queue.
-
-Reproduce with `make sweep`.
+Commit `b4355084`, with `circuit_breakers` raised to 16384 requests and
+connections. Errors were zero at every level within the gate. At a request
+rate, the proxy keeps its added p99 under 5 ms up to 20k requests/s per
+replica on 4 cores (2.34 ms at 5k), and a 30-minute soak of 225,000 streams
+ran with zero errors and flat memory. Reproduce the concurrency sweep with
+`make sweep`.
 
 ### Added latency with controls on
 
@@ -398,7 +398,7 @@ same mock upstream, with auth, token and request limits, a spend budget and
 the billing ledger on. Minimum of 5 alternated rounds, open loop at 200
 requests/s, on a quiet dedicated host (DigitalOcean, 16 vCPU Xeon Platinum
 8168, CPU steal 0; 1-minute load average 0.1 for most runs), commit
-`bf196879`.
+`df7350d8`.
 
 | | p50 | p99 |
 |---|---|---|
@@ -409,78 +409,6 @@ requests/s, on a quiet dedicated host (DigitalOcean, 16 vCPU Xeon Platinum
 Against a mock, added latency is a floor: a real provider adds far more
 latency and variance than this. The full control chain costs about 0.08 ms
 over the proxy alone. Reproduce with `make bench-added-latency`.
-
-## Roadmap
-
-| Release | Theme | |
-|---|---|---|
-| **v0.0.1** | First light — pass-through to OpenAI and Anthropic, streaming and not | Shipped 2026-08-01 |
-| **v0.1.0** | LLM gateway — token metering, rate limits, provider failover | Shipped 2026-08-08 |
-| **v0.2.0** | Production-ready serving — capacity report, admin endpoints, swap-under-load | Shipped 2026-08-29 |
-| **v0.3.0** | ADS/xDS delivery | Shipped 2026-09-29; tagged with the dynamic-configuration gate still open |
-| **v0.3.1** | Follow-up fixes, OpenRouter defaults, local metadata capture | Shipped 2026-10-09 |
-| **v0.3.2** | Dynamic configuration — ADS/xDS gate, plus live-defect fixes | Shipped 2026-10-14 in tag v0.3.5 |
-| **v0.3.3** | Tenant provider credentials — tenants send traffic on their own provider keys | Shipped 2026-10-11 as tag v0.3.2; follow-ups in tag v0.3.3 |
-| **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Shipped 2026-10-14 in tag v0.3.5 |
-| **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Shipped 2026-10-16 in tag v0.4.0; follow-up tag v0.4.1 |
-| **v0.5.0** | Billing ledger and trace export — a durable, encrypted billing ledger a consumer pulls and reconciles, and opt-in raw trace export for analytics | Shipped 2026-10-18 in tag v0.5.0 |
-| **v0.6.0** | Metering completeness — every request a budgeted tenant can send is charged in the units the provider bills or refused, with chargeback tags and OTel GenAI semantic conventions | Shipped 2026-10-20 in tag v0.6.0; follow-up tag v0.6.1 |
-| **v0.7.0** | Production deployment — several replicas behind a load balancer on Kubernetes: Helm chart and image, trusted hops for `client-ip`, gradual drain, and the overhead and scale numbers taken on a dedicated host | Shipped 2026-10-22 in tag v0.7.0 (latest release) |
-| — | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Unscheduled |
-| **v1.0.0** | To be re-planned. The old theme (Gateway API Inference Extension, realtime sessions) was retired on 2026-10-15 | No gate, no scope |
-
-Data-plane parity is not scheduled. Its Envoy differential rig work and corpus scorecard were closed as not needed on 2026-10-17.
-
-## What is not built yet
-
-Stated plainly, because a feature list without this is not much use:
-
-- **HTTP/1.1 upstream reuse is bounded and not multiplexed.** Both protocols
-  are cached per (cluster, address, protocol) on each worker thread. h1 keeps
-  up to 8 idle keep-alive connections per key, and each one carries one request
-  at a time. Concurrent h1 load past that still dials — and, where TLS is configured, handshakes — per request. Set
-  `protocol: http2` where the provider supports it. There is no fallback: an
-  HTTP/2 provider is offered `h2` and nothing else, so a backend that cannot
-  speak it fails the TLS handshake rather than downgrading, which rules out most
-  local plaintext servers. Upgrade requests bypass the cache by design.
-- **Realtime sessions are metered from `response.done` events only.** Usage is
-  read in the OpenAI Realtime event shape; a provider that reports it otherwise
-  is counted as missing usage and warned about, not charged. A response cut
-  before its `response.done` is not charged, and client frames are never
-  inspected. There are no per-session gauges or mid-session log checkpoints.
-- **The Envoy-baselined rename-churn comparison was waived.** The v0.3.2 gate
-  is met without it. A zero-5xx run on a capacity host passed, but no run
-  compares the proxy with Envoy at 5k requests per second. Static config plus SIGHUP
-  remains supported; SIGHUP is refused when `dynamic_resources` is set.
-- **Nothing watches files, and some auth settings need a restart.** A `SIGHUP`
-  reload reads `api_key_file` and the TLS `cert_file`/`key_file` again. It does
-  not apply changes to `auth.keys`, the HMAC secret, the auth store, or the
-  OTLP `tracing`/`metrics` blocks; a change to any of them refuses the whole
-  reload, and the proxy keeps serving the previous snapshot until a restart.
-  See the reload table in
-  [Reload configuration](docs/site/src/content/docs/operations/config-reload.md).
-- **Authorization covers models only.** There is no per-provider
-  authorization. An authenticated tenant with no stored model policy is refused
-  with 403 unless `auth.enforce.tenants_without_policy` is `allow`.
-- **A JWT caller's chargeback tags come only from mapped claims and the header.**
-  `auth.jwt` (and `jwt_providers` in Envoy mode) admits a verified token as a
-  tenant, with that tenant's stored provider credentials as for a virtual key
-  (ADR-0014). Its tags come from the claims its provider maps
-  (`auth.jwt[].claim_tags`) and from the `x-cost-tags` header; there is no
-  per-JWT key metadata.
-- **Limits apply to the fleet only with a `shared` store, and loosely.**
-  With `auth.store: shared`, token and request windows reconcile through Redis
-  about once a second, and each replica publishes its concurrent streams as a
-  lease row once a second. The fleet can admit a little over a limit between
-  reconciles. With another store each replica counts alone, so N replicas
-  admit up to N times a limit.
-- **Spend over-admission is bounded, not zero.** With a `shared` store,
-  replicas share spend totals. During a store outage each replica enforces
-  against the last confirmed total plus its own spend.
-- **Token-usage metrics do not appear on `/stats`.** They have no data-plane
-  equivalent, so they render on `/stats/prometheus` and over OTLP only.
-- **No Kubernetes controller or CRDs.** The Helm chart
-  (`deploy/helm/llm-proxy`) is plain manifests.
 
 ## Layout
 
