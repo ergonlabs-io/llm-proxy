@@ -91,7 +91,7 @@ fn config_text(listen: u16, admin: u16, upstream: SocketAddr, limit: Option<usiz
         .map(|l| format!(", max_request_body_bytes: {l}"))
         .unwrap_or_default();
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: {{ address: "127.0.0.1:{listen}"{limit} }}
 admin: 127.0.0.1:{admin}
 providers:

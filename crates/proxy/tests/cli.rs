@@ -55,7 +55,7 @@ fn translate_redacts_interpolated_secrets_unless_asked_to_reveal_them() {
     std::fs::write(
         &path,
         format!(
-            "version: 0\n\
+            "version: 1\n\
              providers:\n  openai: {{ api_key: ${{TRANSLATE_TEST_OPENAI_KEY}} }}\n  \
              other:\n    type: openai-compatible\n    base_url: http://127.0.0.1:9\n    \
              extra_headers: {{ x-api-key: {header_key} }}\n\
@@ -590,7 +590,7 @@ fn shared_store_dialect_config(tag: &str) -> std::path::PathBuf {
     ));
     std::fs::write(
         &path,
-        "version: 0\n\
+        "version: 1\n\
          listen: 127.0.0.1:0\n\
          providers:\n  openai:\n    type: openai\n    base_url: http://127.0.0.1:9\n    api_key: sk-x\n\
          routes:\n  - { model: \"*\", provider: openai }\n\

@@ -21,7 +21,7 @@ fn no_env(_: &str) -> Option<String> {
 
 fn openai(provider_body: &str) -> String {
     format!(
-        "version: 0\nproviders:\n  openai:\n{provider_body}routes:\n  - {{ model: \"*\", provider: openai }}\n"
+        "version: 1\nproviders:\n  openai:\n{provider_body}routes:\n  - {{ model: \"*\", provider: openai }}\n"
     )
 }
 
@@ -115,7 +115,7 @@ fn host_in_extra_headers_is_refused() {
 #[test]
 fn the_providers_own_credential_header_in_extra_headers_is_refused() {
     let anthropic = format!(
-        "version: 0\nproviders:\n  anthropic:\n    api_key: k\n    extra_headers: {{ X-Api-Key: \"{SECRET}\" }}\nroutes:\n  - {{ model: \"*\", provider: anthropic }}\n"
+        "version: 1\nproviders:\n  anthropic:\n    api_key: k\n    extra_headers: {{ X-Api-Key: \"{SECRET}\" }}\nroutes:\n  - {{ model: \"*\", provider: anthropic }}\n"
     );
     assert_eq!(
         failed_path(load(&anthropic, &no_env)),
@@ -135,7 +135,7 @@ fn the_providers_own_credential_header_in_extra_headers_is_refused() {
 #[test]
 fn a_credential_header_in_extra_headers_without_an_api_key_loads() {
     let text = format!(
-        "version: 0\nproviders:\n  other:\n    type: openai-compatible\n    base_url: http://127.0.0.1:9\n    extra_headers: {{ authorization: \"Bearer {SECRET}\" }}\nroutes:\n  - {{ model: \"*\", provider: other }}\n"
+        "version: 1\nproviders:\n  other:\n    type: openai-compatible\n    base_url: http://127.0.0.1:9\n    extra_headers: {{ authorization: \"Bearer {SECRET}\" }}\nroutes:\n  - {{ model: \"*\", provider: other }}\n"
     );
     load(&text, &no_env).expect("a sole credential in extra_headers must load");
 }

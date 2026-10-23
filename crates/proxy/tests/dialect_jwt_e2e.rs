@@ -454,7 +454,7 @@ fn assert_every_request(proxy: &Proxy, token: &str, expected: &str, what: &str) 
 /// The dialect file; `auth_extra` is appended inside the `auth` block.
 fn config_text(upstream: &Upstream, auth_extra: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

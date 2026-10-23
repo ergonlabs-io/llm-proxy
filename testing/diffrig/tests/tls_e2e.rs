@@ -35,7 +35,7 @@ use serde_json::json;
 
 // ------------------------------------------------------------------ config --
 
-/// Render the dialect (`llmproxy-v0`) config for this test: one listener,
+/// Render the dialect (`llmproxy-v1`) config for this test: one listener,
 /// an `openai` provider and an `anthropic` provider (named exactly that so
 /// the dialect infers their type without an explicit `type:` field), each
 /// pointed at a TLS mock upstream with its own `ca_file`. Routing matches
@@ -54,7 +54,7 @@ fn dialect_config(
 ) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{listener_port}"
 providers:
   openai:

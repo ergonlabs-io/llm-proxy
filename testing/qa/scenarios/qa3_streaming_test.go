@@ -55,7 +55,7 @@ func TestQA3_StreamingArrivesIncrementally(t *testing.T) {
 
 	port := harness.FreePort(t)
 	cfg := fmt.Sprintf(`
-version: 0
+version: 1
 listen: 127.0.0.1:%d
 providers:
   openai:

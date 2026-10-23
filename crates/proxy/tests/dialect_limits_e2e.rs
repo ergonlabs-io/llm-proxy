@@ -263,7 +263,7 @@ fn config_text(upstream: SocketAddr, limits: &str, auth: bool) -> String {
         String::new()
     };
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 providers:
   openai:

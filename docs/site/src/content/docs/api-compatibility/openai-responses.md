@@ -30,7 +30,7 @@ This config routes `gpt-4o` to OpenAI. The same model serves both
 `/v1/chat/completions` and `/v1/responses`.
 
 ```yaml title="responses.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 

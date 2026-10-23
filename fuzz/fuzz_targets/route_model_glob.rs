@@ -38,7 +38,7 @@ fuzz_target!(|data: &[u8]| {
 
     let quoted = serde_json::to_string(pattern).expect("a str serializes");
     let text = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  a: {{ base_url: \"http://a.test:1\" }}\n  b: {{ base_url: \"http://b.test:1\" }}\n\
          routes:\n  - model: {quoted}\n    provider: a\n  - model: \"*\"\n    provider: b\n"
     );

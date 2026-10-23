@@ -40,7 +40,7 @@ never receives the virtual key.
 ## Configure `auth:`
 
 ```yaml
-version: 0
+version: 1
 auth:
   hmac_secret: ${LLMPROXY_AUTH_SECRET}
   keys:
@@ -336,7 +336,7 @@ table in
 ## Limitations
 
 - **Model allow-lists and budgets are not config-file fields.** The `Auth` type
-  in `schema/llmproxy-v0.schema.json` has no such field. The `auth:` block
+  in `schema/llmproxy-v1.schema.json` has no such field. The `auth:` block
   enforces them, and you set them through the admin write API. See "Managing
   keys and tenants at runtime".
 - **JWT accepts RS256 only.** The filter rejects other algorithms.

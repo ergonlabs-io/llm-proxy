@@ -47,7 +47,7 @@ func TestQA17_WeightedAliasSplitsAndSkipsAnEjectedProvider(t *testing.T) {
 
 	port := harness.FreePort(t)
 	cfg := fmt.Sprintf(`
-version: 0
+version: 1
 listen: 127.0.0.1:%d
 providers:
   a:

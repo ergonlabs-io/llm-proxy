@@ -19,7 +19,7 @@ provider. A denied request never reaches a provider.
 
 To enable guardrails in the `llmproxy` dialect, add a top-level `guardrails`
 block. The block has a required `default` check. It can also have a check for
-each tenant. The schema is `schema/llmproxy-v0.schema.json` (property
+each tenant. The schema is `schema/llmproxy-v1.schema.json` (property
 `guardrails`, and `$defs/Guardrails`, `$defs/GuardrailCheck`,
 `$defs/HttpGuardrail`).
 
@@ -55,7 +55,7 @@ What a guardrail does and does not do:
 ## Example
 
 ```yaml
-version: 0
+version: 1
 providers:
   openai:
     type: openai

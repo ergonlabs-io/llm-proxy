@@ -37,7 +37,7 @@ while the replicas catch up or the store is unreachable.
 In the config file, set Redis and give each replica a unique, stable node ID:
 
 ```yaml
-version: 0
+version: 1
 auth:
   hmac_secret: ${LLMPROXY_AUTH_SECRET}
   store:

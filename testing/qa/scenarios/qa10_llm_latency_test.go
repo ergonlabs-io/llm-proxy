@@ -55,7 +55,7 @@ func TestQA10_LLMLatencyReachesAccessLog(t *testing.T) {
 	// Deliberately no hand-written `format` operator list: the dialect's
 	// default json format is what's under test, per SCENARIOS.md.
 	cfg := fmt.Sprintf(`
-version: 0
+version: 1
 listen: 127.0.0.1:%d
 providers:
   openai:

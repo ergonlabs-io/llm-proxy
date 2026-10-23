@@ -56,7 +56,7 @@ together:
 - **Delivery is at least once.** The proxy returns an entry again until you
   acknowledge it, so the consumer must deduplicate on `record.event_id`.
 
-Source: `schema/llmproxy-v0.schema.json`, `ledger` description.
+Source: `schema/llmproxy-v1.schema.json`, `ledger` description.
 
 Two further rules:
 
@@ -130,7 +130,7 @@ schema is normative. See the
 | `on_unavailable` | `reject` or `admit` | `reject` | no | What a request gets when no slot is available. |
 
 The encryption key is mandatory. The proxy has no unencrypted ledger.
-Source: `schema/llmproxy-v0.schema.json`, `$defs/Ledger`.
+Source: `schema/llmproxy-v1.schema.json`, `$defs/Ledger`.
 
 In the `llmproxy` file, write `group_commit_interval` as a duration string such
 as `50ms` or `1s`. The dialect accepts whole numbers with the unit `ms`, `s`,
@@ -150,7 +150,7 @@ The file `examples/llmproxy-ledger.yaml` in the repository has a similar
 config with comments.
 
 ```yaml
-version: 0
+version: 1
 
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422

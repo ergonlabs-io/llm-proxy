@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+# yaml-language-server: $schema=../schema/llmproxy-v1.schema.json
 #
 # llm-proxy metering image, speech and transcription requests under a tenant
 # spend budget (ADR-0010). Each rate-card entry declares the unit the provider
@@ -26,7 +26,7 @@
 #
 # Run:       llm-proxy --config llmproxy-media.yaml
 # Inspect:   llm-proxy --config llmproxy-media.yaml --mode translate
-version: 0
+version: 1
 
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901

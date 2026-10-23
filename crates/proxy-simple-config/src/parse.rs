@@ -8,7 +8,7 @@ use crate::lower::{classify_model_key, dialect_from_models, resolved_dialect};
 use crate::model::{
     is_valid_provider_name, Listen, ListenerSpec, ModelDef, ModelProviderRef, ModelSelection,
     OAuth2JwtBearerDef, Provider, ProviderModelRef, ProviderType, SimpleConfig, SimpleDuration,
-    RESERVED_KEYS,
+    DEPRECATED_SCHEMA_VERSION, RESERVED_KEYS, SCHEMA_VERSION,
 };
 
 /// Parse dialect YAML from a file.
@@ -43,7 +43,7 @@ fn parse_interpolated(text: &str) -> Result<SimpleConfig, ConfigError> {
 }
 
 /// Turn a serde error into our error currency, keeping the field path and
-/// special-casing v0's reserved top-level keys.
+/// special-casing the reserved top-level keys.
 fn map_serde_error(err: serde_path_to_error::Error<serde_yaml::Error>) -> ConfigError {
     let path = err.path().to_string();
     let message = err.inner().to_string();
@@ -59,7 +59,7 @@ fn map_serde_error(err: serde_path_to_error::Error<serde_yaml::Error>) -> Config
                 field_path,
                 reason: format!(
                     "`{field}` is reserved for a future schema version; \
-                     v0 rejects it so it can be added compatibly later"
+                     this version rejects it so it can be added compatibly later"
                 ),
             };
         }
@@ -304,11 +304,12 @@ fn starts_block_scalar(after: &[u8]) -> bool {
 }
 
 fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
-    if config.version != 0 {
+    if config.version != SCHEMA_VERSION && config.version != DEPRECATED_SCHEMA_VERSION {
         return Err(ConfigError::InvalidValue {
             field_path: "version".to_string(),
             reason: format!(
-                "this build understands schema version 0, not {}",
+                "this build understands schema version {SCHEMA_VERSION} \
+                 (and the deprecated {DEPRECATED_SCHEMA_VERSION}), not {}",
                 config.version
             ),
         });

@@ -39,7 +39,7 @@ fn sigusr1_after_a_rename_moves_access_log_and_records_to_new_files() {
     std::fs::write(
         &config,
         format!(
-            r#"version: 0
+            r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

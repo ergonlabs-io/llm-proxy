@@ -77,7 +77,7 @@ fn auth_block() -> String {
 /// Catalogue config with the given extra top-level YAML appended.
 fn config_with(extra: &str) -> String {
     format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  a: {{ base_url: \"http://127.0.0.1:1\" }}\n  b: {{ base_url: \"http://127.0.0.1:2\" }}\n\
          models:\n  fast: {{ providers: [a] }}\n  smart: {{ providers: [{{ provider: b, model: provider-smart-v2 }}] }}\n\
          routes: []\n\
@@ -175,7 +175,7 @@ fn without_an_auto_block_no_resolver_is_emitted_and_a_model_named_auto_is_accept
 fn each_invalid_auto_config_names_its_field_path() {
     let with_routes = |extra: &str| {
         format!(
-            "version: 0\nproviders:\n  a: {{ base_url: \"http://127.0.0.1:1\" }}\n\
+            "version: 1\nproviders:\n  a: {{ base_url: \"http://127.0.0.1:1\" }}\n\
              routes:\n  - {{ model: \"gpt-*\", provider: a }}\n{extra}"
         )
     };
@@ -357,7 +357,7 @@ async fn build_handler(
     let (addr_a, rx_a) = spawn_capturing_upstream().await;
     let (addr_b, rx_b) = spawn_capturing_upstream().await;
     let text = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  a: {{ base_url: \"http://{addr_a}\" }}\n  b: {{ base_url: \"http://{addr_b}\" }}\n\
          models:\n  fast: {{ providers: [a] }}\n  smart: {{ providers: [{{ provider: b, model: provider-smart-v2 }}] }}\n\
          routes: []\n\

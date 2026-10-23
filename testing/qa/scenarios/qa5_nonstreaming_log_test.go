@@ -38,7 +38,7 @@ func TestQA5_NonStreamingLogsBytesAndTokens(t *testing.T) {
 	// As QA-1. The dialect's default json format already includes
 	// bytes_sent ('%BYTES_SENT%'), so no hand-written format is needed.
 	cfg := fmt.Sprintf(`
-version: 0
+version: 1
 listen: 127.0.0.1:%d
 providers:
   openai:

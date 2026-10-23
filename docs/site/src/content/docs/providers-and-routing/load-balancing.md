@@ -33,7 +33,7 @@ provider.
 ## Minimal example
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}

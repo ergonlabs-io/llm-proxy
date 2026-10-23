@@ -176,7 +176,7 @@ fn config(upstream: SocketAddr, ledger: Option<&LedgerConfig>, extra: &str) -> S
         })
         .unwrap_or_default();
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

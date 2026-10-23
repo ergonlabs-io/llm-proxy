@@ -109,7 +109,7 @@ Use the status words this way:
 
 Some code in the repository is reachable only through an Envoy bootstrap
 (`llm-proxy -c bootstrap.yaml`). The `--config` file has no field for it. The
-schema `schema/llmproxy-v0.schema.json` is the proof: none of these names
+schema `schema/llmproxy-v1.schema.json` is the proof: none of these names
 appear in it. This site does not document Envoy mode.
 
 | Capability | Why the `--config` file lacks it | What to do |

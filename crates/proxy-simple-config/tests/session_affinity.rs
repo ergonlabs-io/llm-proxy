@@ -19,7 +19,7 @@ fn config(auth: bool, providers: &str, affinity: &str) -> String {
     };
     format!(
         r#"
-version: 0
+version: 1
 {auth}providers:
   a: {{ type: openai-compatible, base_url: "http://a.internal:8000" }}
   b: {{ type: openai-compatible, base_url: "http://b.internal:8000" }}

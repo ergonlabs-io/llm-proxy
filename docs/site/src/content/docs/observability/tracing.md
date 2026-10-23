@@ -44,7 +44,7 @@ This file is a complete `llmproxy` config. Set `OPENAI_API_KEY` before you
 start the proxy.
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 providers:

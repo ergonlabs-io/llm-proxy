@@ -11,6 +11,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- `--config`: `version: 1` is the current schema version, and the version that
+  the 1.x releases keep. It has the same fields as `version: 0`, so the only
+  change to an existing file is that one line. The examples, the Helm chart's
+  default config and the docs now use it. A test loads every dialect example
+  that v0.7.0 shipped, unedited, through `--mode validate`.
 - `--config`: `admin` takes an object form, `{ address, tls: { cert_file,
   key_file } }`, that serves the admin API over TLS, so the admin token no
   longer has to cross a pod network in clear text. A `SIGHUP` reload reads
@@ -36,6 +41,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Changed
 
+- The `--config` schema file is now `schema/llmproxy-v1.schema.json` (was
+  `schema/llmproxy-v0.schema.json`), and its `$id` is
+  `https://ergonlabs.io/docs/llm-proxy/schema/llmproxy-v1.schema.json`
+  (was `https://llmproxy.dev/schema/llmproxy-v0.schema.json`). The docs site
+  serves the file at that URL, so a `yaml-language-server` header can point at
+  it. Update a header or tool that names the old file.
 - The admin 404 body ("unknown admin endpoint") now lists `/stats` and
   `/stats/prometheus`, which it omitted although both are served.
 - Contract tests pin the names operators build on: the metric families and
@@ -60,6 +71,12 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   unauthenticated-credential buckets at 10000 distinct values per filter chain.
   Past the cap, new values for one entry share one bucket. Before, each
   distinct value got its own window with no limit.
+
+### Deprecated
+
+- `--config`: `version: 0`. A file with it still loads, and logs one warning at
+  `version` that says to set `version: 1`. Any other version is a load error
+  at `version`, as before.
 
 ### Fixed
 

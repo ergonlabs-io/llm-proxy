@@ -10,7 +10,7 @@ use proxy_simple_config::{lower_to_loaded, parse_simple_config};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const BASE: &str = r#"version: 0
+const BASE: &str = r#"version: 1
 providers:
   openai: { type: openai, base_url: "http://127.0.0.1:1", api_key: sk-test }
 routes:

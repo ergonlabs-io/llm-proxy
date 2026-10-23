@@ -89,7 +89,7 @@ serves a request: `providers` and `models`. The docs do not use the word
 : The wire format of a provider: OpenAI-shaped or Anthropic-shaped. It
   decides how the proxy reads token usage. The docs use *wire dialect* where
   the meaning is not clear. Do not confuse it with the *`llmproxy` dialect*,
-  which is the config file format (`version: 0`).
+  which is the config file format (`version: 1`).
 
 **Digest**
 : The 64-character hex value `HMAC-SHA256(secret, key)` of a virtual key. The

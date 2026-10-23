@@ -164,7 +164,7 @@ fn an_ambiguous_limit_is_refused_and_never_reaches_the_upstream() {
 
 fn config_text(listen: u16, admin: u16, upstream: SocketAddr) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: "127.0.0.1:{listen}"
 admin: 127.0.0.1:{admin}
 providers:

@@ -47,11 +47,11 @@ from the body. It decides once for each request.
 
 ## Configure the auto model
 
-Use the top-level `auto` key. The schema is `schema/llmproxy-v0.schema.json`
+Use the top-level `auto` key. The schema is `schema/llmproxy-v1.schema.json`
 (property `auto` and `$defs/AutoModel`).
 
 ```yaml
-version: 0
+version: 1
 providers:
   openai:
     type: openai

@@ -6,7 +6,7 @@ writing rules. `astro.config.mjs` holds the sidebar; it must match this file.
 
 ## Audience and goals
 
-Scope: the user docs cover only the `llmproxy` v0 config dialect
+Scope: the user docs cover only the `llmproxy` v1 config dialect
 (`llm-proxy --config <file>`), the dialect that production runs. They never
 document Envoy configuration, Envoy bootstrap files, xDS, or features that only
 those reach. A feature the dialect does not expose is listed as not available

@@ -20,11 +20,11 @@ workload: Deployment
 replicaCount: 2
 
 # The llm-proxy configuration file, in the `--config` dialect
-# (schema/llmproxy-v0.schema.json). The chart writes it to a ConfigMap and
+# (schema/llmproxy-v1.schema.json). The chart writes it to a ConfigMap and
 # mounts it at /etc/llm-proxy/llmproxy.yaml.
 #
 # The chart fills in three keys when you leave them out:
-#   version: 0
+#   version: 1
 #   listen:  0.0.0.0:<ports.http>
 #   admin:   0.0.0.0:<ports.admin>
 # If you set `listen` or `admin`, use the ports in `ports` below.

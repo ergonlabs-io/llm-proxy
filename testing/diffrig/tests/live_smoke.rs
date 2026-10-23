@@ -248,7 +248,7 @@ fn assert_first_frame_early(events: &[TimedEvent]) {
 fn openrouter_config(port: u16, api_key: &str, model: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{port}"
 providers:
   openrouter:
@@ -419,7 +419,7 @@ async fn openrouter_bad_key_returns_provider_401() {
 fn vertex_config(port: u16, location: &str, model: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{port}"
 providers:
   vertex:
@@ -471,7 +471,7 @@ fn bedrock_config(port: u16, region: &str, model: &str, session_token: bool) -> 
     };
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{port}"
 providers:
   bedrock:
@@ -546,7 +546,7 @@ fn assert_anthropic_message(res: &RawResponse, provider: &str) {
 fn named_provider_config(port: u16, provider: &str, key_var: &str, pattern: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{port}"
 providers:
   {provider}:

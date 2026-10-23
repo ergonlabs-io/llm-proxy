@@ -165,7 +165,7 @@ fn finish(proxy: Proxy, dir: &Path) {
 /// `capped-model`, `open` serves `open-model`. `extra` is appended as is.
 fn config_text(capped: SocketAddr, open: SocketAddr, capped_block: &str, extra: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 providers:
   capped:

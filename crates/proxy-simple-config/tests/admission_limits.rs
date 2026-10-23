@@ -22,7 +22,7 @@ fn test_env(name: &str) -> Option<String> {
 fn config_with_listen(listen: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: {listen}
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}

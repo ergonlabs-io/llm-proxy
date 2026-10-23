@@ -156,7 +156,7 @@ fn the_virtual_key_never_reaches_any_provider_type() {
 
     let digest = digest_hex(&HmacSecret::new(HMAC_SECRET.as_bytes()), VIRTUAL_KEY);
     let config = format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen_port}
 admin: 127.0.0.1:{admin_port}
 providers:

@@ -143,7 +143,7 @@ that cannot decrypt a row answers that tenant's requests with `503` and never
 uses the operator key.
 
 ```yaml
-version: 0
+version: 1
 auth:
   hmac_secret: ${LLMPROXY_AUTH_SECRET}
   store:

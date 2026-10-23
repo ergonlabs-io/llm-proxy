@@ -18,7 +18,7 @@ import (
 // message like "invalid config".
 func TestQA2_BadConfigFailsWithFieldPath(t *testing.T) {
 	cfg := `
-version: 0
+version: 1
 listen: 127.0.0.1:18080
 providers:
   openai:
@@ -52,7 +52,7 @@ routes:
 func TestQA2_BadConfigFailsInServeModeToo(t *testing.T) {
 	port := harness.FreePort(t)
 	cfg := `
-version: 0
+version: 1
 listen: 127.0.0.1:` + strconv.Itoa(port) + `
 providers:
   openai:

@@ -1,4 +1,4 @@
-//! The schema gate: `schema/llmproxy-v0.schema.json` is normative for the
+//! The schema gate: `schema/llmproxy-v1.schema.json` is normative for the
 //! dialect (AGENTS.md "Architecture Invariants", 5), so every dialect config
 //! the repository ships as valid must validate against it, and the parser
 //! must accept it too. A violation names the file, the JSON pointer and the
@@ -9,8 +9,8 @@
 //! - `examples/llmproxy*.yaml`
 //! - `testing/perf/proxy.yaml`
 //! - every fenced `yaml` block in the docs site and `README.md` that has a
-//!   top-level `version: 0` line, which marks it as a complete config rather
-//!   than a fragment.
+//!   top-level `version: 1` (or deprecated `version: 0`) line, which marks
+//!   it as a complete config rather than a fragment.
 
 mod schema_support;
 
@@ -66,7 +66,7 @@ fn markdown_configs(path: &Path) -> Vec<Fixture> {
                 block = Some((i + 1, String::new()));
             }
             Some((start, body)) if trimmed.starts_with("```") => {
-                if body.lines().any(|l| l == "version: 0") {
+                if body.lines().any(|l| l == "version: 1" || l == "version: 0") {
                     out.push(Fixture {
                         label: format!("{rel}:{start}"),
                         text: std::mem::take(body),
@@ -155,7 +155,7 @@ fn every_shipped_dialect_config_validates_against_the_schema_and_parses() {
 fn a_violation_is_reported_with_its_json_pointer() {
     let validator = schema_support::validator(&schema());
     let instance: serde_json::Value = serde_yaml::from_str(
-        "version: 0\nproviders:\n  openai: {}\nroutes:\n  - model: '*'\n    provider: openai\n    idle_timeout: soon\n",
+        "version: 1\nproviders:\n  openai: {}\nroutes:\n  - model: '*'\n    provider: openai\n    idle_timeout: soon\n",
     )
     .unwrap();
     let errors = validation_errors(&validator, &instance);

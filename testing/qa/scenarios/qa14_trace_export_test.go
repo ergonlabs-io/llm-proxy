@@ -44,7 +44,7 @@ func TestQA14_TraceExportCapturesOnlyAnOptedInTenant(t *testing.T) {
 	adminPort := harness.FreePort(t)
 	traceDir := filepath.Join(t.TempDir(), "traces")
 	cfg := fmt.Sprintf(`
-version: 0
+version: 1
 listen: 127.0.0.1:%d
 admin: 127.0.0.1:%d
 providers:

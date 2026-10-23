@@ -253,7 +253,7 @@ fn drain_closes_an_open_session_with_1001() {
 
 fn config_text(dir: &Path, upstream: SocketAddr, extra: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 realtime: {{ enabled: true }}

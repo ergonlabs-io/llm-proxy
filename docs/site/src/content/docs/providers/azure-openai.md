@@ -27,7 +27,7 @@ OpenAI clients work without a change.
 ## Minimal example
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 

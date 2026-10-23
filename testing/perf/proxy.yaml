@@ -1,6 +1,6 @@
 # Docker capacity topology. Compose substitutes only the upstream
 # protocol line at startup; this default remains a valid standalone config.
-version: 0
+version: 1
 
 listen: 0.0.0.0:8080
 admin: 0.0.0.0:8901

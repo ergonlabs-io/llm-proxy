@@ -305,7 +305,7 @@ func qa21Start(t *testing.T, upstream string) *qa21Proxy {
 	}
 	listen := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
 	admin := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
-	config := fmt.Sprintf(`version: 0
+	config := fmt.Sprintf(`version: 1
 listen: %s
 admin: %s
 realtime: { enabled: true }

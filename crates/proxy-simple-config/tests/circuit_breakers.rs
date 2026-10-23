@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 fn config(a_block: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   a:
     type: openai-compatible

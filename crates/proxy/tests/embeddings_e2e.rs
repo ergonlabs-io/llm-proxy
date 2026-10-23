@@ -263,7 +263,7 @@ fn models_without_auth_lists_the_whole_catalogue() {
     let listen = free_port();
     let admin = free_port();
     let config = format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:
@@ -316,7 +316,7 @@ fn config_text(listen: u16, admin: u16, access_log: &Path, setup: &Setup) -> Str
         format!("limits:\n{}", setup.limits)
     };
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

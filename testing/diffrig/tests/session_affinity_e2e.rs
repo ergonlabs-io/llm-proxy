@@ -89,7 +89,7 @@ fn alias_config(
 ) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "{{listen}}"
 admin: "{{admin}}"
 {extra}

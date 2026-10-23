@@ -124,7 +124,7 @@ def start_mock(procs, directory, args):
 def proxy_config(arm, listen, admin, mock_addr, run_dir):
     """The dialect config for one proxy arm. Published verbatim by the page."""
     lines = [
-        "version: 0",
+        "version: 1",
         f"listen: 127.0.0.1:{listen}",
         f"admin: 127.0.0.1:{admin}",
         "providers:",

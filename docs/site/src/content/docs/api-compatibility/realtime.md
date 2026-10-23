@@ -36,7 +36,7 @@ Save this file as `realtime.yaml`. The client asks for the model `voice`. The
 proxy asks the provider for `gpt-realtime-2026`.
 
 ```yaml title="realtime.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 

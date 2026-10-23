@@ -56,7 +56,7 @@ No end-to-end test covers a budget on a JWT user.
 This file enforces budgets for one provider. The rate in the card is an example.
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 auth:

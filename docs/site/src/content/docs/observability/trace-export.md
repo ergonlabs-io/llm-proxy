@@ -143,7 +143,7 @@ compress, or write. A separate exporter thread does that work.
 2. Write the config. This example writes segments to a local directory.
 
 ```yaml
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 providers:
@@ -204,7 +204,7 @@ Restart the proxy to change it.
 ## Configuration
 
 All fields are in `observability.traces`. The schema
-(`schema/llmproxy-v0.schema.json`, `$defs/Traces`) and the
+(`schema/llmproxy-v1.schema.json`, `$defs/Traces`) and the
 [configuration reference](/docs/llm-proxy/configuration/reference/) are the source for
 this table. An unknown field is an error with its full path.
 
@@ -376,7 +376,7 @@ The proxy keeps the directory as a buffer for segments that are not yet
 uploaded.
 
 ```yaml
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 providers:

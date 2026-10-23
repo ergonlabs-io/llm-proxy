@@ -44,7 +44,7 @@ provider's prices. Check the file with `llm-proxy --config llmproxy.yaml
 --mode validate`.
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 providers:

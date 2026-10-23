@@ -33,7 +33,7 @@ fn key_file() -> PathBuf {
 fn config(provider_type: &str, extra: &str, oauth2: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   vertex:
     type: {provider_type}
@@ -198,7 +198,7 @@ fn bad_blocks_fail_with_their_dialect_path() {
 
     let openai = format!(
         r#"
-version: 0
+version: 1
 providers:
   openai:
     type: openai

@@ -297,7 +297,7 @@ model catalog and token rates. See
 A configuration with failover and a token limit is still small:
 
 ```yaml
-version: 0
+version: 1
 listen: 0.0.0.0:53421
 admin: 127.0.0.1:53422
 
@@ -320,8 +320,10 @@ limits:
 ```
 
 `examples/llmproxy.yaml` is the annotated version of the same file, and
-`schema/llmproxy-v0.schema.json` is the authority on every field — editors that
-understand `yaml-language-server` autocomplete against it. `--mode translate`
+`schema/llmproxy-v1.schema.json` is the authority on every field — editors that
+understand `yaml-language-server` autocomplete against it. The docs site serves
+the same file at its `$id`,
+`https://ergonlabs.io/docs/llm-proxy/schema/llmproxy-v1.schema.json`. `--mode translate`
 prints the data-plane bootstrap a dialect file lowers to.
 
 ## Configuration surfaces
@@ -412,7 +414,7 @@ crates/
 admin-ui/                 the single-page admin console served at /ui
 docs/site/                Astro Starlight user documentation
 examples/                 runnable configurations
-schema/                   llmproxy-v0.schema.json — normative for the dialect
+schema/                   llmproxy-v1.schema.json — normative for the dialect
 testing/                  diffrig, loadgen, mockupstream, controlplane,
                           xds-conformance, Go QA suite
 ```

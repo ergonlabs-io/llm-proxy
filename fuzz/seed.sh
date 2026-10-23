@@ -50,7 +50,7 @@ for f in "$root"/examples/llmproxy*.yaml; do
     [ "$(wc -c < "$f")" -le 65536 ] || continue
     cp "$f" "$corpus/dialect_config/seed-$(basename "$f")"
 done
-printf 'version: 0\n# api_key: ${UNSET_KEY}\nnote: "a # not a comment ${X}"\nblock: |\n  # ${UNSET_IN_BLOCK}\n' \
+printf 'version: 1\n# api_key: ${UNSET_KEY}\nnote: "a # not a comment ${X}"\nblock: |\n  # ${UNSET_IN_BLOCK}\n' \
     > "$corpus/dialect_config/seed-comment-mask.yaml"
 
 # model_wildcard and route_model_glob: pattern, 0xFF, model name. Patterns are

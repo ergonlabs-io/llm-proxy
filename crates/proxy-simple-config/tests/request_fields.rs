@@ -14,7 +14,7 @@ fn test_env(name: &str) -> Option<String> {
 }
 
 const WITH_FALLBACK: &str = r#"
-version: 0
+version: 1
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -27,7 +27,7 @@ routes:
 fn provider(fields: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   openai:
     api_key: ${{OPENAI_API_KEY}}
@@ -89,7 +89,7 @@ fn strict_envoy_loader_builds_the_policy_into_the_ir() {
 fn every_cluster_lowered_from_the_provider_carries_it() {
     // A provider reached by several models still gets one policy per cluster.
     let text = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, request_fields: { deny: [models] } }
 models:

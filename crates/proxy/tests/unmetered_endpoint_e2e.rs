@@ -560,7 +560,7 @@ const CATCH_ALL: &str = "  - { model: \"*\", provider: openai }\n";
 /// The dialect file. No model policy, so `model_authz` is not in the chain.
 fn config_text(dir: &Path, upstream: SocketAddr, routes: &str, extra: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

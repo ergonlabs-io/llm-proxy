@@ -22,7 +22,7 @@ fn parse(text: &str) -> Result<SimpleConfig, ConfigError> {
 }
 
 const BASE: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -413,7 +413,7 @@ fn tenants_without_policy_lowers_deny_by_default_and_allow_loudly() {
 #[test]
 fn the_model_catalogue_reaches_model_authz_and_the_catalogue_route() {
     let text = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:

@@ -9,7 +9,7 @@ pub fn repo_root() -> PathBuf {
 }
 
 pub fn schema() -> serde_json::Value {
-    let path = repo_root().join("schema/llmproxy-v0.schema.json");
+    let path = repo_root().join("schema/llmproxy-v1.schema.json");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     serde_json::from_str(&text).expect("schema is JSON")
 }

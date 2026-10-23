@@ -530,7 +530,7 @@ impl Drop for Run {
 
 fn config_text(upstream: SocketAddr) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

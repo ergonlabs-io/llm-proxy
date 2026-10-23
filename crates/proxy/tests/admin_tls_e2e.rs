@@ -111,7 +111,7 @@ fn start_proxy(dir: PathBuf, admin: &str) -> Proxy {
         .replace("{key}", &dir.join("admin.key").display().to_string());
     // The provider points at a closed port: these tests only talk to admin.
     let config = format!(
-        "version: 0\n\
+        "version: 1\n\
          listen: 127.0.0.1:{listen}\n\
          admin: {admin}\n\
          providers:\n  local:\n    type: openai\n    base_url: http://127.0.0.1:{dead}\n\

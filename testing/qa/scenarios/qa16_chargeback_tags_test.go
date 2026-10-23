@@ -60,7 +60,7 @@ func qa16Setup(t *testing.T) func() *qa16Proxy {
 	}
 	listen := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
 	admin := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
-	config := fmt.Sprintf(`version: 0
+	config := fmt.Sprintf(`version: 1
 listen: %s
 admin: %s
 providers:

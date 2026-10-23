@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+# yaml-language-server: $schema=../schema/llmproxy-v1.schema.json
 #
 # The quick-start configuration: one OpenAI-compatible provider, and every
 # model routed to it. The file holds no secrets and no URLs. Set two
@@ -14,7 +14,7 @@
 # The proxy listens on loopback only and has no `auth` section, so it does not
 # check callers. Anyone who can reach the port uses your provider key. Add
 # virtual keys before you expose it (docs: Authentication > Virtual keys).
-version: 0
+version: 1
 
 listen: 127.0.0.1:8080
 admin: 127.0.0.1:9901
