@@ -903,7 +903,7 @@ fn warn_h2_header_timeout_not_enforced_once(listener: &str) {
     // Rust note: `Once::call_once` runs its closure once per process, with no lock on later calls.
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
-        tracing::warn!(%listener, "request_headers_timeout is not enforced on HTTP/2 connections; it applies to HTTP/1 only (internal-docs/envoy-divergences.md)");
+        tracing::warn!(%listener, "request_headers_timeout is not enforced on HTTP/2 connections; it applies to HTTP/1 only");
     });
 }
 

@@ -51,7 +51,7 @@ operators, retry-on conditions, outlier ejection, cluster warming — these
 follow that ecosystem's documented behaviour rather than a convenient
 reinterpretation of it, so operators who already run one of these data planes
 do not have to learn a second set of rules, and divergences have to be argued
-for in writing (`internal-docs/` keeps the divergence log).
+for in writing.
 
 **A small LLM-native dialect that lowers onto it.** Nobody wants to write a
 full data-plane bootstrap to put a rate limit in front of OpenAI. `--config`
@@ -389,8 +389,7 @@ gate p99 ≤ 6900 ms and TTFT p99 ≤ 1000 ms. 80,507 requests over 20 levels on
   the SLO on latency, never on correctness. Nothing is dropped or truncated;
   requests queue.
 
-Full method, the not-harness-bound argument, and what is *not* saturated:
-`internal-docs/capacity/README.md`. Reproduce with `make sweep`.
+Reproduce with `make sweep`.
 
 ### Added latency with controls on
 
@@ -409,9 +408,7 @@ requests/s, on a quiet dedicated host (DigitalOcean, 16 vCPU Xeon Platinum
 
 Against a mock, added latency is a floor: a real provider adds far more
 latency and variance than this. The full control chain costs about 0.08 ms
-over the proxy alone. Method, exact configs, a row per control group, and raw
-results: `internal-docs/capacity/added-latency.md`.
-Reproduce with `make bench-added-latency`.
+over the proxy alone. Reproduce with `make bench-added-latency`.
 
 ## Roadmap
 
@@ -432,9 +429,7 @@ Reproduce with `make bench-added-latency`.
 | — | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Unscheduled |
 | **v1.0.0** | To be re-planned. The old theme (Gateway API Inference Extension, realtime sessions) was retired on 2026-10-15 | No gate, no scope |
 
-Ship gates, evidence, and deliberate caveats for each release:
-[`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md). Data-plane parity
-is not scheduled. Its Envoy differential rig work and corpus scorecard were closed as not needed on 2026-10-17.
+Data-plane parity is not scheduled. Its Envoy differential rig work and corpus scorecard were closed as not needed on 2026-10-17.
 
 ## What is not built yet
 
@@ -455,8 +450,7 @@ Stated plainly, because a feature list without this is not much use:
   inspected. There are no per-session gauges or mid-session log checkpoints.
 - **The Envoy-baselined rename-churn comparison was waived.** The v0.3.2 gate
   is met without it. A zero-5xx run on a capacity host passed, but no run
-  compares the proxy with Envoy at 5k requests per second
-  (`internal-docs/MILESTONES.md`, v0.3.2 section). Static config plus SIGHUP
+  compares the proxy with Envoy at 5k requests per second. Static config plus SIGHUP
   remains supported; SIGHUP is refused when `dynamic_resources` is set.
 - **Nothing watches files, and some auth settings need a restart.** A `SIGHUP`
   reload reads `api_key_file` and the TLS `cert_file`/`key_file` again. It does
@@ -514,8 +508,6 @@ examples/                 runnable configurations
 schema/                   llmproxy-v0.schema.json — normative for the dialect
 testing/                  diffrig, loadgen, mockupstream, controlplane,
                           xds-conformance, Go QA suite
-internal-docs/            architecture, Envoy semantics and divergences,
-                          milestones, ADRs, capacity
 ```
 
 ## Documentation
@@ -540,8 +532,7 @@ make xds-conformance   # xDS behaviour against a real go-control-plane server
 make sweep             # the capacity sweep behind the numbers above
 ```
 
-Release gates and architecture decision records are in `internal-docs/`; the
-code conventions are in [`AGENTS.md`](AGENTS.md).
+The code conventions are in [`AGENTS.md`](AGENTS.md).
 
 ## Contributing and security
 

@@ -1,8 +1,6 @@
 # Changelog
 
-All notable changes to this project are recorded here. Releases and their ship gates are
-defined in [`internal-docs/MILESTONES.md`](internal-docs/MILESTONES.md); open work packages are tracked in
-[`internal-docs/boards/backlog.yaml`](internal-docs/boards/backlog.yaml). This file records _what shipped_, not
+All notable changes to this project are recorded here. This file records _what shipped_, not
 what is planned.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This

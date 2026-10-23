@@ -10,8 +10,7 @@ Scope: the user docs cover only the `llmproxy` v0 config dialect
 (`llm-proxy --config <file>`), the dialect that production runs. They never
 document Envoy configuration, Envoy bootstrap files, xDS, or features that only
 those reach. A feature the dialect does not expose is listed as not available
-in `help/limitations`. Envoy-mode material that earlier pages carried lives in
-`internal-docs/envoy-mode/`, for contributors.
+in `help/limitations`.
 
 Readers are platform engineers who evaluate or run an LLM gateway, often
 comparing llm-proxy with OpenRouter (a hosted router) or the LiteLLM proxy

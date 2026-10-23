@@ -58,9 +58,8 @@ that reviews check most often:
   panic is correct, use `expect("...")` and state the invariant.
 - **Comments explain why.** Do not cite issue numbers or plans in comments; git
   history records where a change came from.
-- **Envoy semantics.** The proxy follows Envoy v1.38 behaviour.
-  `internal-docs/envoy-semantics.md` is normative, and
-  `internal-docs/envoy-divergences.md` records every deliberate departure.
+- **Envoy semantics.** The proxy follows Envoy v1.38 behaviour. A deliberate
+  departure needs a test that pins it and a note in the pull request.
 
 ## Test your change
 

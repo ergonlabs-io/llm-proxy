@@ -72,7 +72,7 @@ an error with its full dotted path.
 
 **Cause.** These top-level keys are reserved. Version 0 of the file rejects
 them. The message ends with `(strict mode; see
-internal-docs/envoy-divergences.md)`. That file is in the repository.
+https://ergonlabs.io/docs/llm-proxy/help/limitations/)`.
 
 **Fix.** Remove the key. To export traces, use `observability.tracing`.
 

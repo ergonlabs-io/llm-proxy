@@ -135,9 +135,6 @@ appear in it. This site does not document Envoy mode.
 | Hash policies other than `session_affinity`, including `filter_state` | `models.<name>.session_affinity` (`header` or `identity`) is the only hash policy. | Use `session_affinity`. |
 | xDS conformance check (`make xds-conformance`) | It tests the xDS client, which the file does not use. | None. It is contributor material. |
 
-Envoy-mode material is kept for contributors in `internal-docs/envoy-mode/`
-in the repository.
-
 ## What to do next
 
 If your plan depends on a gap above, check two things first:

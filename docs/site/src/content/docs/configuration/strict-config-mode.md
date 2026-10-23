@@ -68,7 +68,7 @@ The format reserves three top-level keys for a later schema version: `envoy`,
 `tracing`, and `clusters`. Version 0 rejects them:
 
 ```text
-unsupported field `clusters`: `clusters` is reserved for a future schema version; v0 rejects it so it can be added compatibly later (strict mode; see internal-docs/envoy-divergences.md)
+unsupported field `clusters`: `clusters` is reserved for a future schema version; v0 rejects it so it can be added compatibly later (strict mode; see https://ergonlabs.io/docs/llm-proxy/help/limitations/)
 ```
 
 To export traces, use `observability.tracing`.

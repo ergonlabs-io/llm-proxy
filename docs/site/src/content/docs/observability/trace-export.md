@@ -811,4 +811,3 @@ For maintainers. Each behavior above has this source or test.
 - Emergency switch: `crates/proxy-observability/src/traces/gate.rs`. End to
   end test: `the_emergency_switch_stops_capture` in
   `crates/proxy/tests/trace_export_e2e.rs`.
-- Design notes: `internal-docs/trace-export-design.md`.

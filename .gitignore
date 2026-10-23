@@ -37,10 +37,6 @@ testing/diffrig/captures/
 # The spec the Go QA suite is written from — reviewable alongside the tests
 # that cite its case IDs.
 !testing/qa/SCENARIOS.md
-# Normative plan, milestone/ship-gate definitions, and architecture decisions.
-!internal-docs/**/*.md
-!internal-docs/**/*.yaml
-!internal-docs/**/*.json
 # Implementation contracts cited by the operational telemetry code.
 !docs/telemetry-design.md
 # The published documentation site. Every page under here is Markdown, so
@@ -71,6 +67,6 @@ __pycache__/
 # macOS Finder metadata
 .DS_Store
 
-# Local research output (competitor reports and notes); not tracked.
-/internal-docs/reports/
-/internal-docs/research_notes/
+# Maintainer notes: plans, ADRs, capacity runs, boards and research. Kept
+# locally, never published.
+/internal-docs/
