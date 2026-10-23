@@ -71,6 +71,8 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/config_dump",
     "/clusters",
     "/server_info",
+    "/stats",
+    "/stats/prometheus",
     "/ui",
     // Gated list reads live next to their write shapes below; `/models` is a
     // plain read (config data, like `/config_dump`).

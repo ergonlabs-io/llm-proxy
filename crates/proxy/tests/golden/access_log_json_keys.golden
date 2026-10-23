@@ -1,0 +1,59 @@
+# Keys of each `observability.access_logs.format: json` line, one key per line.
+# Produced by contract_golden_e2e.rs from the same served traffic as the metrics
+# golden; every line carries the same keys. Values are not covered.
+# NOT COVERED: the `text` format string, and lines written for realtime
+# sessions.
+# Regenerate with `make golden`; review every changed line.
+authority
+bytes_received
+bytes_sent
+client_address
+ds_rx_us
+ds_tx_us
+duration_ms
+llm_audio_ms
+llm_cache_creation_tokens
+llm_cached_tokens
+llm_cost_kind
+llm_credential_source
+llm_guardrail
+llm_images
+llm_input_audio_tokens
+llm_input_characters
+llm_input_image_tokens
+llm_input_tokens
+llm_key_id
+llm_list_cost_nanodollars
+llm_max_stall_ms
+llm_output_audio_tokens
+llm_output_image_tokens
+llm_output_tokens
+llm_price_basis
+llm_rate_card_version
+llm_requested_model
+llm_resolved_model
+llm_response_chunks
+llm_selected_model
+llm_served_model
+llm_tenant
+llm_total_tokens
+llm_tpot_ms
+llm_ttft_ms
+llm_upstream_id
+llm_upstream_usage
+llm_usage_completeness
+llm_user_id
+method
+path
+pre_upstream_us
+protocol
+request_id
+resp_head_us
+response_code
+response_code_details
+response_flags
+selected_provider
+start_time
+upstream_host
+us_tx_us
+us_wait_us

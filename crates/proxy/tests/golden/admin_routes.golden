@@ -1,0 +1,62 @@
+# Admin routes: `<path> <METHOD>,...`, the methods the admin router answers
+# on that path (not 404 "unknown admin endpoint" and not 405). Paths come from
+# the router's own endpoint list in its 404 body; `{id}`-style segments are
+# probed with sample values. Paths matched on path alone answer every method.
+# Methods probed: GET, POST, PUT, DELETE.
+#
+# Produced by contract_golden_e2e.rs against the --config dialect binary with
+# LLMPROXY_ADMIN_TOKEN unset, so every gated route refuses with 403 and no probe
+# changes state. Response bodies and status codes are not covered here.
+# NOT COVERED: `/ui/<asset>` paths and the `/` redirect (present only when the
+# admin UI bundle is loaded), query parameters, and request/response bodies.
+# Regenerate with `make golden`; review every changed line.
+/chains/{stat_prefix}/keys GET,POST
+/chains/{stat_prefix}/keys/{id} DELETE
+/chains/{stat_prefix}/keys/{id}/budget PUT
+/chains/{stat_prefix}/keys/{id}/limits PUT
+/chains/{stat_prefix}/keys/{id}/policy PUT
+/chains/{stat_prefix}/keys/{id}/spend GET
+/chains/{stat_prefix}/keys/{id}/tags PUT
+/chains/{stat_prefix}/pricing GET,PUT
+/chains/{stat_prefix}/tenants POST
+/chains/{stat_prefix}/tenants/{id} DELETE
+/chains/{stat_prefix}/tenants/{id}/budget PUT
+/chains/{stat_prefix}/tenants/{id}/limits PUT
+/chains/{stat_prefix}/tenants/{id}/objects/{object_id} GET,PUT
+/chains/{stat_prefix}/tenants/{id}/policy PUT
+/chains/{stat_prefix}/tenants/{id}/provider_credentials GET
+/chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider} PUT,DELETE
+/chains/{stat_prefix}/tenants/{id}/spend GET
+/chains/{stat_prefix}/tenants/{id}/trace_export GET,PUT
+/clusters GET,POST,PUT,DELETE
+/config_dump GET,POST,PUT,DELETE
+/drain_listeners POST
+/healthcheck/fail POST
+/healthcheck/ok POST
+/keys GET,POST
+/keys/{id} DELETE
+/keys/{id}/budget PUT
+/keys/{id}/limits PUT
+/keys/{id}/policy PUT
+/keys/{id}/spend GET
+/keys/{id}/tags PUT
+/ledger/ack POST
+/ledger/entries GET
+/models GET,POST,PUT,DELETE
+/pricing GET,PUT
+/ready GET,POST,PUT,DELETE
+/server_info GET,POST,PUT,DELETE
+/stats GET,POST,PUT,DELETE
+/stats/prometheus GET,POST,PUT,DELETE
+/tenants POST
+/tenants/{id} DELETE
+/tenants/{id}/budget PUT
+/tenants/{id}/limits PUT
+/tenants/{id}/objects/{object_id} GET,PUT
+/tenants/{id}/policy PUT
+/tenants/{id}/provider_credentials GET
+/tenants/{id}/provider_credentials/{provider} PUT,DELETE
+/tenants/{id}/spend GET
+/tenants/{id}/trace_export GET,PUT
+/traces/capture GET,POST
+/ui GET

@@ -141,6 +141,12 @@ tq-redis: ## Run Redis store tests (requires LLM_PROXY_TEST_REDIS)
 	@test -n "$$LLM_PROXY_TEST_REDIS" || (echo "LLM_PROXY_TEST_REDIS is required"; exit 1)
 	cargo nextest run -p proxy-control -p proxy-filters -p proxy --run-ignored all -E 'test(redis)'
 
+# The stable-surface golden files (crates/proxy/tests/golden/). Rewrites them
+# from the running code; review and commit the diff as a deliberate change.
+.PHONY: golden
+golden: ## Regenerate the stable-surface golden files, then review the diff
+	UPDATE_GOLDEN=1 cargo nextest run -p proxy -E 'test(/(^|::)golden_/)'
+
 tq-%: ## Test one crate via nextest, e.g. make tq-proxy-http
 	cargo nextest run -p $*
 
