@@ -209,6 +209,41 @@ fn models_scope_limits_only_matching_models() {
     finish(proxy, &dir);
 }
 
+/// A body not sent as JSON publishes no model, but a provider may still read
+/// it as JSON. Such a request must count against every model-scoped limit,
+/// here one for another model, and be counted on `/stats/prometheus`.
+#[test]
+fn a_body_not_sent_as_json_counts_against_every_model_scoped_limit() {
+    start_away_from_a_window_edge();
+    let dir = scratch_dir("unknown-model");
+    let mock = Mock::start(Duration::ZERO);
+    let config = config_text(
+        mock.addr,
+        "  - { key: global, requests_per_minute: 1, models: [\"gpt-4*\"] }\n",
+        false,
+    );
+    let config = format!("admin: 127.0.0.1:{}\n{config}", free_port());
+    let proxy = Proxy::start(&dir, &config);
+    let text_plain = http_request_typed(
+        "POST",
+        proxy.listen,
+        "/v1/chat/completions",
+        &[],
+        "text/plain",
+        r#"{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_admitted(&text_plain);
+    assert_eq!(mock.count(), 1);
+    assert_refused(&chat(&proxy, "gpt-4o", &[]), RATE);
+    assert_eq!(mock.count(), 1, "the refused request reached the upstream");
+    let stats = http_request("GET", proxy.admin(), "/stats/prometheus", &[], "");
+    assert!(
+        stats.contains("envoy_llmproxy_token_limit_unknown_model_total 1"),
+        "the unknown-model request must be counted:\n{stats}"
+    );
+    finish(proxy, &dir);
+}
+
 // ------------------------------------------------------------------ helpers --
 
 fn finish(proxy: Proxy, dir: &Path) {
@@ -373,6 +408,17 @@ fn http_request(
     headers: &[(&str, &str)],
     body: &str,
 ) -> String {
+    http_request_typed(method, addr, path, headers, "application/json", body)
+}
+
+fn http_request_typed(
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+    content_type: &str,
+    body: &str,
+) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
@@ -385,7 +431,7 @@ fn http_request(
         .write_all(
             format!(
                 "{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n{extra}\
-                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Content-Type: {content_type}\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
                 body.len()
             )

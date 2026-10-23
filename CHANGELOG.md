@@ -9,6 +9,31 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Changed
+
+- A `limits` entry with `models` no longer skips a request whose model the
+  proxy cannot read: a body not sent as `application/json`, a `model` key past
+  the scan cap, or no `model`. On an endpoint that runs a model, the request
+  now counts against every such entry that applies to it by `key`, so an entry
+  for another model can refuse it. Each one increments the new counter
+  `llmproxy_token_limit_unknown_model_total`, and a warning is logged at most
+  once a minute per filter chain. Before, these requests skipped every
+  per-model limit with no log.
+- Token-limit admission is all or nothing. A request that one limit refuses no
+  longer counts against the tenant's or key's `requests_per_minute`, or against
+  another `limits` entry. Before, a client refused by a `limits` entry still
+  used its tenant and key request quota.
+- `key: client-ip` and `key: header:<name>` buckets are now capped with the
+  unauthenticated-credential buckets at 10000 distinct values per filter chain.
+  Past the cap, new values for one entry share one bucket. Before, each
+  distinct value got its own window with no limit.
+
+### Fixed
+
+- A JSON request body that ends in trailers before its top-level object closes
+  is no longer dropped. Before, such a request reached the provider with an
+  empty body and no model.
+
 ## [0.7.0] - 2026-10-22
 
 ### Breaking

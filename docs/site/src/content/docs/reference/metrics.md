@@ -104,6 +104,7 @@ listener scope.
 | `llmproxy_usage_rate_card_active` | gauge | cards | `scope`, `version` | One series for each rate-card version this process has held. The value is 1 for the active card and 0 for each retired card. No series has the value 1 while the chain has no card. |
 | `llmproxy_realtime_usage_missing_total` | counter | responses | `scope`, `reason` | Realtime session responses whose usage was not metered. `reason` is `no_usage`, `unreadable`, `compressed`, or `cut` (in flight when the session ended). |
 | `llmproxy_unmetered_endpoint_refused_total` | counter | requests | `endpoint`, `control` | Requests that a spend budget or a token limit refused because the proxy cannot count their endpoint. `control` is `spend` or `token_limit`. `endpoint` is `image_generation`, `image_edit`, `speech`, `transcription`, `translation`, or `unmetered`. |
+| `llmproxy_token_limit_unknown_model_total` | counter | requests | none | Requests with no model the proxy could read that a token limit counted against every `limits` entry with `models`. See [Requests with no model the proxy can read](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/#requests-with-no-model-the-proxy-can-read). |
 
 ## Routing and request checks
 

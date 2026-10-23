@@ -21,7 +21,7 @@ use crate::control::{
 };
 use crate::reconciliation_age::{ReconciliationAgeGauge, Seam};
 use crate::token_limit::{
-    LeaseRelease, LimitDecision, LimitKey, StreamLease, MAX_CREDENTIAL_WINDOWS,
+    LeaseRelease, LimitDecision, LimitKey, StreamLease, MAX_CLIENT_KEYED_WINDOWS,
 };
 use proxy_observability::stats::Registry;
 
@@ -142,23 +142,26 @@ impl Bucket {
 #[derive(Default)]
 struct Buckets {
     by_key: HashMap<BucketKey, Bucket>,
-    /// Buckets held per credential-keyed [`LimitKey`]; its length is the
-    /// number of distinct credentials tracked, which is capped.
-    credential_refs: HashMap<LimitKey, usize>,
+    /// Buckets held per client-keyed [`LimitKey`] (credentials and
+    /// client-keyed rule values); its length is the number of distinct
+    /// client-chosen subjects tracked, which is capped.
+    client_refs: HashMap<LimitKey, usize>,
     overflow_warned: bool,
 }
 
 impl Buckets {
-    /// The key a bucket for `key` lives under: itself, or the route's shared
-    /// overflow key once [`MAX_CREDENTIAL_WINDOWS`] distinct credentials are
-    /// already tracked. Returns whether this call is the first fold.
+    /// The key a bucket for `key` lives under: itself, or its shared
+    /// overflow key (the route's for a credential, the rule's for a
+    /// client-keyed rule) once [`MAX_CLIENT_KEYED_WINDOWS`] distinct
+    /// client-chosen subjects are already tracked. Returns whether this call
+    /// is the first fold.
     fn bounded(&mut self, key: &LimitKey) -> (LimitKey, bool) {
-        if key.is_credential()
-            && !self.credential_refs.contains_key(key)
-            && self.credential_refs.len() >= MAX_CREDENTIAL_WINDOWS
+        if key.is_client_keyed()
+            && !self.client_refs.contains_key(key)
+            && self.client_refs.len() >= MAX_CLIENT_KEYED_WINDOWS
         {
             let first = !std::mem::replace(&mut self.overflow_warned, true);
-            (key.credential_overflow(), first)
+            (key.client_overflow(), first)
         } else {
             (key.clone(), false)
         }
@@ -166,29 +169,29 @@ impl Buckets {
 
     /// Read-only form of [`Self::bounded`].
     fn bounded_ref(&self, key: &LimitKey) -> LimitKey {
-        if key.is_credential()
-            && !self.credential_refs.contains_key(key)
-            && self.credential_refs.len() >= MAX_CREDENTIAL_WINDOWS
+        if key.is_client_keyed()
+            && !self.client_refs.contains_key(key)
+            && self.client_refs.len() >= MAX_CLIENT_KEYED_WINDOWS
         {
-            key.credential_overflow()
+            key.client_overflow()
         } else {
             key.clone()
         }
     }
 
     fn entry(&mut self, key: BucketKey) -> &mut Bucket {
-        if !self.by_key.contains_key(&key) && key.0.is_credential() {
-            *self.credential_refs.entry(key.0.clone()).or_insert(0) += 1;
+        if !self.by_key.contains_key(&key) && key.0.is_client_keyed() {
+            *self.client_refs.entry(key.0.clone()).or_insert(0) += 1;
         }
         self.by_key.entry(key).or_default()
     }
 
     fn remove(&mut self, key: &BucketKey) {
-        if self.by_key.remove(key).is_some() && key.0.is_credential() {
-            if let Some(refs) = self.credential_refs.get_mut(&key.0) {
+        if self.by_key.remove(key).is_some() && key.0.is_client_keyed() {
+            if let Some(refs) = self.client_refs.get_mut(&key.0) {
                 *refs -= 1;
                 if *refs == 0 {
-                    self.credential_refs.remove(&key.0);
+                    self.client_refs.remove(&key.0);
                 }
             }
         }
@@ -197,9 +200,10 @@ impl Buckets {
 
 fn warn_overflow_fold() {
     tracing::warn!(
-        max_credential_windows = MAX_CREDENTIAL_WINDOWS,
-        "llmproxy.token_limit: the credential cap is full; further credentials share one \
-         overflow counter per route"
+        max_client_keyed_windows = MAX_CLIENT_KEYED_WINDOWS,
+        "llmproxy.token_limit: the client-keyed window cap is full; further credentials \
+         share one overflow counter per route, and further client-ip or header values one \
+         per rule"
     );
 }
 
@@ -249,6 +253,14 @@ pub enum Admission {
     Admitted { used: u64 },
     /// Refused and not counted; the window's total.
     Refused { used: u64 },
+}
+
+/// The row [`WindowAccumulator::admit_all`] refused: its index in the rows
+/// passed, and the window's total. Nothing was counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowRefused {
+    pub index: usize,
+    pub used: u64,
 }
 
 impl WindowAccumulator {
@@ -364,6 +376,53 @@ impl WindowAccumulator {
             self.inner.request_early_flush();
         }
         admission
+    }
+
+    /// Check every row, then count one unit on each, under one lock: either
+    /// every row is below its limit and all are counted, or none is. A
+    /// request that one limit refuses therefore spends nothing against the
+    /// others it was checked against. Returns the first refusing row's index
+    /// in `rows` and its total.
+    pub fn admit_all(
+        &self,
+        dimension: WindowDimension,
+        window: WindowKey,
+        rows: &[(&LimitKey, u64)],
+    ) -> Result<(), RowRefused> {
+        let (wake, first_fold) = {
+            let mut buckets = self.inner.lock_buckets();
+            let mut first_fold = false;
+            let mut bounded = Vec::with_capacity(rows.len());
+            for (index, (key, limit)) in rows.iter().enumerate() {
+                let (key, fold) = buckets.bounded(key);
+                first_fold |= fold;
+                let row = (key, dimension, window);
+                let used = buckets.by_key.get(&row).map_or(0, Bucket::used);
+                if used >= *limit {
+                    drop(buckets);
+                    if first_fold {
+                        warn_overflow_fold();
+                    }
+                    return Err(RowRefused { index, used });
+                }
+                bounded.push((row, *limit));
+            }
+            let mut wake = false;
+            for (row, limit) in bounded {
+                let bucket = buckets.entry(row);
+                bucket.pending = bucket.pending.saturating_add(1);
+                bucket.limit = limit;
+                wake |= needs_early_flush(bucket, limit);
+            }
+            (wake, first_fold)
+        };
+        if first_fold {
+            warn_overflow_fold();
+        }
+        if wake {
+            self.inner.request_early_flush();
+        }
+        Ok(())
     }
 
     /// Every current-window total this replica holds for `tenant` on the
@@ -846,7 +905,7 @@ struct Slots {
     /// slot for. A new slot starts from its entry here, so the first stream
     /// a replica sees for a subject still counts the rest of the fleet.
     unserved: FleetLeases,
-    credential_entries: usize,
+    client_entries: usize,
     overflow_warned: bool,
 }
 
@@ -899,12 +958,12 @@ impl LeaseGauge {
     ) -> Result<StreamLease, LimitDecision> {
         let (outcome, first_fold) = {
             let mut slots = self.inner.lock_slots();
-            let overflow = key.is_credential()
+            let overflow = key.is_client_keyed()
                 && !slots.by_key.contains_key(key)
-                && slots.credential_entries >= MAX_CREDENTIAL_WINDOWS;
+                && slots.client_entries >= MAX_CLIENT_KEYED_WINDOWS;
             let first_fold = overflow && !std::mem::replace(&mut slots.overflow_warned, true);
             let key = if overflow {
-                key.credential_overflow()
+                key.client_overflow()
             } else {
                 key.clone()
             };
@@ -926,8 +985,8 @@ impl LeaseGauge {
                     retry_after: STREAM_RETRY_HINT,
                 })
             } else {
-                if is_new && key.is_credential() {
-                    slots.credential_entries += 1;
+                if is_new && key.is_client_keyed() {
+                    slots.client_entries += 1;
                 }
                 let slot = slots.by_key.entry(key.clone()).or_default();
                 slot.local = slot.local.saturating_add(1);
@@ -1034,8 +1093,8 @@ impl LeaseRelease for GaugeInner {
         };
         if remove {
             slots.by_key.remove(key);
-            if key.is_credential() {
-                slots.credential_entries = slots.credential_entries.saturating_sub(1);
+            if key.is_client_keyed() {
+                slots.client_entries = slots.client_entries.saturating_sub(1);
             }
         }
     }
@@ -1158,8 +1217,8 @@ impl GaugeInner {
             .collect();
         for key in idle {
             slots.by_key.remove(&key);
-            if key.is_credential() {
-                slots.credential_entries = slots.credential_entries.saturating_sub(1);
+            if key.is_client_keyed() {
+                slots.client_entries = slots.client_entries.saturating_sub(1);
             }
         }
         // A slot opened while the publish was in flight took its `others`
@@ -1390,7 +1449,7 @@ mod tests {
         let store = Arc::new(InMemoryControlPlaneStore::default());
         let acc = accumulator(&store, "a");
         let w = window_at(t0());
-        for i in 0..MAX_CREDENTIAL_WINDOWS {
+        for i in 0..MAX_CLIENT_KEYED_WINDOWS {
             acc.add(
                 &LimitKey::for_credential("r", &format!("sk-{i}")),
                 TOTAL,
@@ -1407,7 +1466,68 @@ mod tests {
             4,
             "both fold into the overflow bucket"
         );
-        assert_eq!(acc.tracked_buckets(), MAX_CREDENTIAL_WINDOWS + 1);
+        assert_eq!(acc.tracked_buckets(), MAX_CLIENT_KEYED_WINDOWS + 1);
+    }
+
+    /// A rule keyed on a client-chosen value (an address, a header) is
+    /// capped like a credential, and past the cap its values share one
+    /// overflow bucket per rule, not per route and not across rules.
+    #[test]
+    fn client_keyed_rule_values_past_the_cap_share_one_overflow_bucket_per_rule() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let acc = accumulator(&store, "a");
+        let w = window_at(t0());
+        let ip =
+            |i: usize| LimitKey::for_client_rule(format!("ip=10.0.{i}"), "ip=overflow".to_string());
+        let header = |v: &str| {
+            LimitKey::for_client_rule(format!("header=x-u:{v}"), "header=x-u:overflow".to_string())
+        };
+        for i in 0..MAX_CLIENT_KEYED_WINDOWS {
+            assert_eq!(acc.admit_all(REQUESTS, w, &[(&ip(i), 100)]), Ok(()));
+        }
+        let (late_1, late_2) = (
+            ip(MAX_CLIENT_KEYED_WINDOWS),
+            ip(MAX_CLIENT_KEYED_WINDOWS + 1),
+        );
+        assert_eq!(acc.admit_all(REQUESTS, w, &[(&late_1, 100)]), Ok(()));
+        assert_eq!(
+            acc.used(&late_2, REQUESTS, w),
+            1,
+            "a second late address must read the first one's overflow count"
+        );
+        assert_eq!(
+            acc.used(&header("v"), REQUESTS, w),
+            0,
+            "another rule's values must not share this rule's overflow bucket"
+        );
+        assert_eq!(
+            acc.used(&ip(0), REQUESTS, w),
+            1,
+            "tracked values keep their own bucket"
+        );
+        assert_eq!(acc.tracked_buckets(), MAX_CLIENT_KEYED_WINDOWS + 1);
+    }
+
+    #[test]
+    fn admit_all_counts_every_row_or_none() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let acc = accumulator(&store, "a");
+        let w = window_at(t0());
+        let tenant = LimitKey::for_tenant_policy("acme");
+        let key = LimitKey::for_key_policy("k1");
+        assert_eq!(
+            acc.admit_all(REQUESTS, w, &[(&tenant, 5), (&key, 1)]),
+            Ok(())
+        );
+        assert_eq!(
+            acc.admit_all(REQUESTS, w, &[(&tenant, 5), (&key, 1)]),
+            Err(RowRefused { index: 1, used: 1 })
+        );
+        assert_eq!(
+            acc.used(&tenant, REQUESTS, w),
+            1,
+            "the key's refusal must not count against the tenant checked before it"
+        );
     }
 
     #[test]

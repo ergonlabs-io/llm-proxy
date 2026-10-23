@@ -110,10 +110,11 @@
 //! carries a tenant. Without one, there is no assigned identity in the system
 //! at all and the hashed header is the only key available — the same
 //! best-effort behavior as before, and no worse. Because the caller picks
-//! that header, the store caps how many credential buckets exist at once
-//! ([`crate::token_limit::MAX_CREDENTIAL_WINDOWS`]); past the cap, new
-//! credentials share one overflow budget per route, and expired windows are
-//! evicted (review M8).
+//! that header, the store caps how many client-keyed buckets exist at once
+//! ([`crate::token_limit::MAX_CLIENT_KEYED_WINDOWS`], shared with `client-ip`
+//! and `header` rule values); past the cap, new credentials share one
+//! overflow budget per route, new rule values one per rule, and expired
+//! windows are evicted (review M8).
 //!
 //! **Which means the ordering requirement is a security property, not a
 //! preference.** Decoder callbacks run in **config order** (S2.1), so
@@ -168,8 +169,8 @@
 //! [`crate::token_limit::TenantUsage`] carries only a route name and plain
 //! numbers, by construction.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use http::header::AUTHORIZATION;
@@ -184,6 +185,7 @@ use proxy_http::filter::{
     RequestTrailers, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::LlmTokenUsage;
+use proxy_observability::stats::{instruments, Handle, Registry, WorkerId};
 use proxy_observability::ResponseFlag;
 
 use arc_swap::ArcSwap;
@@ -195,14 +197,16 @@ use crate::control::{
     WindowDimension, WindowKey, WindowRow,
 };
 use crate::model_authz::ModelPattern;
+use crate::repeat_warner::{Due, RepeatWarner};
 use crate::token_limit::{
     CredentialDigest, LimitDecision, LimitKey, LimitOn, LimitRule, StreamLease, TenantUsage,
 };
 use crate::unmetered::{self, RefusalCounter};
 use crate::usage::TokenUsage;
 use crate::window_counter::{
-    unconfigured_node_id, Admission, InMemoryLeaseStore, LeaseGauge, LeaseStore, WindowAccumulator,
-    DEFAULT_LEASE_PUBLISH_INTERVAL, DEFAULT_LEASE_TTL, DEFAULT_WINDOW_FLUSH_INTERVAL,
+    unconfigured_node_id, InMemoryLeaseStore, LeaseGauge, LeaseStore, RowRefused,
+    WindowAccumulator, DEFAULT_LEASE_PUBLISH_INTERVAL, DEFAULT_LEASE_TTL,
+    DEFAULT_WINDOW_FLUSH_INTERVAL,
 };
 use crate::window_usage::{
     ChainRouteNames, RouteTotals, UsageAnswer, UsageReader, ROUTE_NAMES_KEY, USAGE_READ_TIMEOUT,
@@ -701,6 +705,10 @@ fn create_filter_factory_with_clock(
                 streams.export_reconciliation_age(Arc::clone(registry));
             }
             let usage_missing_warner = Arc::new(UsageMissingWarner::new());
+            let unknown_model = Arc::new(UnknownModelLog::new(
+                stat_prefix.clone(),
+                stats_registry.clone(),
+            ));
             // Only a shared store holds counts this replica's counters lack
             // (ADR-0006 addendum §4); otherwise the local answer is exact
             // and no reader thread is started.
@@ -711,6 +719,7 @@ fn create_filter_factory_with_clock(
                 counters,
                 streams,
                 usage_missing_warner,
+                unknown_model,
                 usage_reader,
             }) as Arc<dyn std::any::Any + Send + Sync>)
         })?
@@ -725,6 +734,7 @@ fn create_filter_factory_with_clock(
         rules,
         policy,
         usage_missing_warner: Arc::clone(&shared.usage_missing_warner),
+        unknown_model: Arc::clone(&shared.unknown_model),
         usage_reader: shared.usage_reader.clone(),
         route_names,
         unmetered: stats_registry_for_refusals.map(|r| Arc::new(RefusalCounter::new(r))),
@@ -741,6 +751,7 @@ struct SharedTokenLimitState {
     counters: Arc<WindowAccumulator>,
     streams: Arc<LeaseGauge>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    unknown_model: Arc<UnknownModelLog>,
     /// `Some` exactly when the store is shared.
     usage_reader: Option<Arc<UsageReader>>,
 }
@@ -753,6 +764,7 @@ struct TokenLimitInstanceFactory {
     rules: Arc<[KeyedRule]>,
     policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     usage_missing_warner: Arc<UsageMissingWarner>,
+    unknown_model: Arc<UnknownModelLog>,
     usage_reader: Option<Arc<UsageReader>>,
     route_names: Option<Arc<ChainRouteNames>>,
     unmetered: Option<Arc<RefusalCounter>>,
@@ -767,9 +779,10 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
             rule: self.rule,
             rules: Arc::clone(&self.rules),
             scoped_pending: Vec::new(),
-            scoped_decided: false,
+            deferred: None,
             policy: self.policy.clone(),
             usage_missing_warner: Arc::clone(&self.usage_missing_warner),
+            unknown_model: Arc::clone(&self.unknown_model),
             usage_reader: self.usage_reader.clone(),
             route_names: self.route_names.clone(),
             unmetered: self.unmetered.clone(),
@@ -781,6 +794,13 @@ impl FilterInstanceFactory for TokenLimitInstanceFactory {
             recorded: false,
         })
     }
+}
+
+/// Whether `endpoint` runs a model, so a request on it whose model is unknown
+/// is still for some model. Model lists, files, batches and unknown paths
+/// name none.
+fn runs_a_model(endpoint: Endpoint) -> bool {
+    !matches!(endpoint, Endpoint::Free | Endpoint::Unmetered)
 }
 
 /// Whether a token limit can admit `endpoint`: it counts its tokens, or no
@@ -795,6 +815,15 @@ const POLICY_WINDOW: Duration = Duration::from_secs(60);
 
 /// A control-plane limits row and the counter key it is enforced under.
 type PolicyBucket = (LimitKey, LimitPolicy);
+
+/// The buckets `decode_headers` chose for a request that model-scoped rules
+/// may still refuse, admitted with them once the body names the model.
+struct Deferred {
+    tenant: Option<PolicyBucket>,
+    key: Option<PolicyBucket>,
+    /// The unscoped keyed rules' buckets, merged.
+    rules: Vec<PolicyBucket>,
+}
 
 fn policy_window(now_secs: u64) -> WindowKey {
     WindowKey::containing(now_secs, POLICY_WINDOW.as_secs())
@@ -833,132 +862,36 @@ impl Refusal {
     }
 }
 
-/// Warns, at most once per [`LimitKey`] per [`Self::REPEAT_INTERVAL`], when a
-/// budget applied to a request but its usage could not be read — see the
-/// module doc's "Loud on unreadable usage" section for what this is
-/// answering and [`TokenLimitFilterInstance::record_if_present`] for the one
-/// call site.
+/// Warns, at most once per [`LimitKey`] per [`crate::repeat_warner::REPEAT_INTERVAL`],
+/// when a budget applied to a request but its usage could not be read. The
+/// one call site is [`TokenLimitFilterInstance::record_if_present`]; see the
+/// module doc for what this answers and [`crate::repeat_warner`] for the
+/// suppression and the cap on tracked keys.
 ///
-/// # Why a `Mutex<HashMap<..>>`
-///
-/// A `Mutex`-guarded dedup structure touched only on the rare path (here,
-/// "usage came back `None`"), never on a request that had usage to record.
 /// One instance is shared, via `Arc`, across every per-stream
-/// `TokenLimitFilterInstance` `TokenLimitInstanceFactory::create_filter`
-/// hands out — same lifetime as `store`, and for the same reason: the
-/// dedup state has to outlive any single stream to mean anything.
-///
-/// # Once per key, but not once ever
-///
-/// Usage can come back `None` for the whole life of a long-running process
-/// (a provider that never changed its response shape, or a usage-filter
-/// dialect misconfigured at boot and never fixed), and an operator who
-/// starts reading logs an hour in must still be able to see it. So this
-/// repeats — capped at once per key per [`Self::REPEAT_INTERVAL`] — rather
-/// than going silent after the first occurrence.
-///
-/// The repeat costs one extra `Instant` read and comparison, on the same
-/// rare, already-locked path the dedup check itself is on — not a
-/// background task or a timer, both of which would add machinery the
-/// warner is meant to avoid.
-///
-/// # Bounded by expiry, then by a cap
-///
-/// Keys come from tenants and credentials, so they keep arriving for the
-/// life of the process. An entry older than [`Self::REPEAT_INTERVAL`]
-/// behaves exactly like no entry (the key is due either way), so when the
-/// map is full the warner first drops expired entries, which changes no
-/// warning. If [`Self::MAX_TRACKED_KEYS`] keys all warned within the last
-/// interval, a new key is not tracked: its warning folds into one overflow
-/// line, itself repeated at most once per interval, that names no key. The
-/// fail-open stays loud (AGENTS.md "Fail-open controls") without the dedup
-/// state, or the log, growing with the number of callers. The sweep runs
-/// only when the map is full and the oldest entry could have expired, so a
-/// burst past the cap does not rescan the map on every request.
+/// `TokenLimitFilterInstance` of a chain, since the dedup state has to
+/// outlive any single stream to mean anything.
 struct UsageMissingWarner {
-    state: Mutex<WarnerState>,
-}
-
-#[derive(Default)]
-struct WarnerState {
-    last_warned: HashMap<LimitKey, Instant>,
-    /// No entry can expire before this instant, so a sweep before it would
-    /// free nothing. `None` until the first sweep.
-    next_sweep: Option<Instant>,
-    /// When the overflow line last fired.
-    overflow_warned_at: Option<Instant>,
-}
-
-impl WarnerState {
-    /// Drops entries older than [`UsageMissingWarner::REPEAT_INTERVAL`], if
-    /// any could have expired by `now`.
-    fn sweep_expired(&mut self, now: Instant) {
-        if self.next_sweep.is_some_and(|at| now < at) {
-            return;
-        }
-        let interval = UsageMissingWarner::REPEAT_INTERVAL;
-        self.last_warned
-            .retain(|_, last| now.saturating_duration_since(*last) < interval);
-        self.next_sweep = self
-            .last_warned
-            .values()
-            .min()
-            .map(|oldest| *oldest + interval);
-    }
-}
-
-fn is_due(last: Option<Instant>, now: Instant) -> bool {
-    match last {
-        Some(last) => now.saturating_duration_since(last) >= UsageMissingWarner::REPEAT_INTERVAL,
-        None => true,
-    }
+    warner: RepeatWarner<LimitKey>,
 }
 
 impl UsageMissingWarner {
-    /// How long a key's warning is suppressed before it may fire again. Not
-    /// configurable — this is an operability aid, not a tunable knob, and a
-    /// fixed value keeps this doc's "at most once per key per minute" claim
-    /// actually true.
-    const REPEAT_INTERVAL: Duration = Duration::from_secs(60);
-
-    /// How many keys the warner remembers at once, per filter config. See
-    /// "Bounded by expiry, then by a cap" above.
+    /// How many keys the warner remembers at once, per filter config.
     const MAX_TRACKED_KEYS: usize = 1024;
 
     fn new() -> Self {
         UsageMissingWarner {
-            state: Mutex::new(WarnerState::default()),
+            warner: RepeatWarner::new(Self::MAX_TRACKED_KEYS),
         }
     }
 
-    /// Warns for `key` if this is the first time it has been seen on this
-    /// path, or if [`Self::REPEAT_INTERVAL`] has elapsed since the last time
-    /// it warned. Never called from a request that had usage to record (see
-    /// the call site in `record_if_present`), so this `Mutex` is never
-    /// contended by the healthy path.
+    /// Warns for `key` when [`RepeatWarner::check`] says a line is due.
+    /// Never called from a request that had usage to record, so the healthy
+    /// path never takes the warner's lock.
     fn warn_if_due(&self, key: &LimitKey, now: Instant) {
-        // Rust note: `unwrap_or_else(PoisonError::into_inner)` recovers the
-        // guard from a poisoned `Mutex` rather than panicking -- same
-        // convention as `RouterStats::warn_unknown_cluster_once`. A panic
-        // while holding this lock elsewhere would otherwise turn "we
-        // couldn't warn about a metering gap" into "the whole filter now
-        // panics on every request", which is a worse outage than the one
-        // this section exists to make visible.
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let last = state.last_warned.get(key).copied();
-        if !is_due(last, now) {
-            return;
-        }
-        if last.is_none() && state.last_warned.len() >= Self::MAX_TRACKED_KEYS {
-            state.sweep_expired(now);
-        }
-        if last.is_none() && state.last_warned.len() >= Self::MAX_TRACKED_KEYS {
-            if !is_due(state.overflow_warned_at, now) {
-                return;
-            }
-            state.overflow_warned_at = Some(now);
-            drop(state);
-            tracing::warn!(
+        match self.warner.check(key, now) {
+            Due::Suppressed => {}
+            Due::Overflow => tracing::warn!(
                 tracked_keys = Self::MAX_TRACKED_KEYS,
                 "token_limit: the token budget for a request was NOT enforced and the \
                  request was allowed uncharged -- usage could not be extracted from the \
@@ -967,25 +900,72 @@ impl UsageMissingWarner {
                  and repeats at most once a minute. The most likely cause is that the \
                  llmproxy.usage filter's configured `dialect` does not match this \
                  provider's actual response shape; check that first."
-            );
-            return;
+            ),
+            Due::Key => tracing::warn!(
+                budget_key = %key,
+                "token_limit: the token budget for this request was NOT enforced and the \
+                 request was allowed uncharged -- usage could not be extracted from the \
+                 response (StreamInfo::llm.usage was None), so there was nothing to charge \
+                 against this budget. The most likely cause is that the llmproxy.usage \
+                 filter's configured `dialect` does not match this provider's actual response \
+                 shape for this route; check that first."
+            ),
         }
-        state.last_warned.insert(key.clone(), now);
-        // Rust note: drop the guard before logging -- nothing below needs
-        // it, and holding a lock across a macro call some future edit might
-        // extend (e.g. to format something expensive) is worth avoiding on
-        // principle even though `tracing::warn!` itself doesn't block.
-        drop(state);
+    }
+}
 
-        tracing::warn!(
-            budget_key = %key,
-            "token_limit: the token budget for this request was NOT enforced and the \
-             request was allowed uncharged -- usage could not be extracted from the \
-             response (StreamInfo::llm.usage was None), so there was nothing to charge \
-             against this budget. The most likely cause is that the llmproxy.usage \
-             filter's configured `dialect` does not match this provider's actual response \
-             shape for this route; check that first."
-        );
+/// Counts, and warns about, requests on a model endpoint whose model the
+/// proxy could not read when model-scoped rules applied to them: a body not
+/// declared as JSON, a `model` key past the scan cap, or a body with no
+/// `model`. Such a request is counted against every model-scoped rule that
+/// applies to it by key, so no per-model limit is skipped; it is never
+/// silently treated as matching none (AGENTS.md "Fail-open controls").
+///
+/// Touched only on that path, never by a request whose model was read. One
+/// per chain, shared by every worker. The line repeats at most once a
+/// minute per chain; the counter counts every occurrence.
+struct UnknownModelLog {
+    chain: String,
+    warner: RepeatWarner<()>,
+    /// `llmproxy_token_limit_unknown_model_total`; `None` only where no
+    /// stats registry exists (unit tests).
+    counter: Option<(Arc<Registry>, Handle)>,
+}
+
+impl UnknownModelLog {
+    fn new(chain: String, registry: Option<Arc<Registry>>) -> Self {
+        let counter = registry.map(|registry| {
+            // No attributes, so the cap is never reached; `resolve_capped`
+            // is how a filter without the control-side `StatsControl`
+            // resolves (as `spend_limit_filter`'s charged counter does).
+            let handle =
+                registry.resolve_capped(&instruments::TOKEN_LIMIT_UNKNOWN_MODEL, &[], 1, &[]);
+            (registry, handle)
+        });
+        UnknownModelLog {
+            chain,
+            warner: RepeatWarner::new(1),
+            counter,
+        }
+    }
+
+    fn note(&self, endpoint: Endpoint, now: Instant) {
+        if let Some((registry, handle)) = &self.counter {
+            registry.incr(WorkerId(0), *handle, 1);
+        }
+        if self.warner.check(&(), now) == Due::Key {
+            tracing::warn!(
+                chain = %self.chain,
+                endpoint = endpoint.label(),
+                "token_limit: a request reached model-scoped limits with no model the proxy \
+                 could read (a body not sent as application/json, a `model` key past the scan \
+                 cap, or no `model` at all). It was counted against EVERY model-scoped limit \
+                 that applies to it, so it may be refused by a limit for another model. Send \
+                 a JSON body with `model` near its start. Counted in \
+                 llmproxy_token_limit_unknown_model_total; logged at most once a minute per \
+                 chain."
+            );
+        }
     }
 }
 
@@ -1007,14 +987,16 @@ struct TokenLimitFilterInstance {
     /// Model-scoped rules that apply to this request by key, with their
     /// bucket, waiting for the body to name the model.
     scoped_pending: Vec<(usize, LimitKey)>,
-    /// Set once the model-scoped rules have been decided.
-    scoped_decided: bool,
+    /// The admission waiting on `scoped_pending`; taken once decided.
+    deferred: Option<Deferred>,
     /// The published control-plane snapshot holding tenant and key limits;
     /// `None` when no `llmproxy.auth` precedes this filter.
     policy: Option<Arc<ArcSwap<ControlPlaneSnapshot>>>,
     /// Shared across every stream this listener serves -- see
     /// [`UsageMissingWarner`]'s doc for why it needs to outlive one stream.
     usage_missing_warner: Arc<UsageMissingWarner>,
+    /// Shared across the chain; see [`UnknownModelLog`].
+    unknown_model: Arc<UnknownModelLog>,
     /// Reads `GET /v1/usage` totals from the store; `Some` exactly when the
     /// store is shared.
     usage_reader: Option<Arc<UsageReader>>,
@@ -1044,55 +1026,63 @@ struct TokenLimitFilterInstance {
 }
 
 impl TokenLimitFilterInstance {
-    /// Admit a request against its tenant's and key's control-plane limits.
-    /// Returns the refusal when one applies; on admission, keeps the leases
-    /// and the token buckets to charge at stream end.
-    ///
-    /// Both levels are enforced, so a key only narrows its tenant (a key
-    /// with no row adds no bucket and is bounded by the tenant alone). Token
-    /// budgets are checked first because the check counts nothing; stream
-    /// permits and request counts are taken only after. Stream permits are
-    /// taken tenant first, then key, and a refused key drops the tenant
-    /// permit with it (ADR-0006 amendment E). Request counts are taken key
-    /// first, so a key refusal leaves the count its sibling keys share
-    /// untouched; a tenant refusal after the key was admitted still counts
-    /// that one request against the key, which errs toward the narrower
-    /// bucket.
-    ///
-    /// Admission reads only local counters (ADR-0006 addendum §1).
-    fn admit_policy(
-        &mut self,
+    /// The tenant's and key's control-plane limits rows that apply to this
+    /// request, with their buckets. Both levels are enforced, so a key only
+    /// narrows its tenant; a key with no row adds no bucket and is bounded by
+    /// the tenant alone. Control-plane limits apply only to an authenticated
+    /// tenant.
+    fn policy_buckets(
+        &self,
         tenant: Option<&str>,
         key_id: Option<&str>,
+    ) -> (Option<PolicyBucket>, Option<PolicyBucket>) {
+        let (Some(tenant), Some(policy)) = (tenant, self.policy.as_ref()) else {
+            return (None, None);
+        };
+        let snapshot = policy.load();
+        let tenant_bucket = snapshot
+            .tenant_limits
+            .get(&TenantId::new(tenant))
+            .map(|limits| (LimitKey::for_tenant_policy(tenant), *limits));
+        let key_bucket = key_id.and_then(|id| {
+            snapshot
+                .key_limits
+                .get(&KeyId::new(id))
+                .map(|limits| (LimitKey::for_key_policy(id), *limits))
+        });
+        (tenant_bucket, key_bucket)
+    }
+
+    /// Admit a request against every bucket that applies to it, all or
+    /// nothing: the tenant and key buckets, then the keyed rules' buckets.
+    /// A refusal from any one counts nothing against the others, so a
+    /// client refused by a rule does not spend its tenant's or key's request
+    /// quota.
+    ///
+    /// Stream permits are taken tenant first, then key, then rules, and a
+    /// refusal drops the permits already taken (ADR-0006 amendment E).
+    /// Request limits are checked key first, so of two refusing limits the
+    /// narrower one is reported. On admission keeps the permits and the token
+    /// buckets to charge at stream end.
+    ///
+    /// Admission reads only local counters (ADR-0006 addendum §1).
+    fn admit_set(
+        &mut self,
+        tenant: Option<PolicyBucket>,
+        key: Option<PolicyBucket>,
+        rules: &[PolicyBucket],
         now_secs: u64,
     ) -> Option<(LimitDecision, Refusal)> {
-        let tenant = tenant?;
-        let (tenant_bucket, key_bucket): (Option<PolicyBucket>, Option<PolicyBucket>) = {
-            let snapshot = self.policy.as_ref()?.load();
-            let key_bucket = key_id.and_then(|id| {
-                snapshot
-                    .key_limits
-                    .get(&KeyId::new(id))
-                    .map(|limits| (LimitKey::for_key_policy(id), *limits))
-            });
-            let tenant_bucket = snapshot
-                .tenant_limits
-                .get(&TenantId::new(tenant))
-                .map(|limits| (LimitKey::for_tenant_policy(tenant), *limits));
-            (tenant_bucket, key_bucket)
-        };
-        if tenant_bucket.is_none() && key_bucket.is_none() {
-            return None;
-        }
         let tenant_first: Vec<&PolicyBucket> =
-            tenant_bucket.iter().chain(key_bucket.iter()).collect();
-        let key_first: Vec<&PolicyBucket> = key_bucket.iter().chain(tenant_bucket.iter()).collect();
+            tenant.iter().chain(key.iter()).chain(rules).collect();
+        let key_first: Vec<&PolicyBucket> = key.iter().chain(tenant.iter()).chain(rules).collect();
         self.admit_buckets(&tenant_first, &key_first, now_secs)
     }
 
     /// Admit against `buckets`: token budgets first (the check counts
-    /// nothing), then stream permits in `streams_order`, then request counts
-    /// in `requests_order`. On admission keeps the permits and the token
+    /// nothing), then stream permits in `streams_order`, then every request
+    /// count in one all-or-nothing step, reporting the first refusal in
+    /// `requests_order`. On admission keeps the permits and the token
     /// buckets to charge at stream end, alongside any already held.
     fn admit_buckets(
         &mut self,
@@ -1101,10 +1091,8 @@ impl TokenLimitFilterInstance {
         now_secs: u64,
     ) -> Option<(LimitDecision, Refusal)> {
         let window = policy_window(now_secs);
-        let tenant_first = streams_order;
-        let key_first = requests_order;
 
-        for (key, limits) in tenant_first {
+        for (key, limits) in streams_order {
             if let Some(tokens) = limits.tokens_per_minute {
                 let used = self
                     .counters
@@ -1117,7 +1105,7 @@ impl TokenLimitFilterInstance {
         }
 
         let mut leases = Vec::new();
-        for (key, limits) in tenant_first {
+        for (key, limits) in streams_order {
             if let Some(max_streams) = limits.concurrent_streams {
                 match self.streams.try_acquire(key, max_streams) {
                     Ok(lease) => leases.push(lease),
@@ -1127,21 +1115,22 @@ impl TokenLimitFilterInstance {
             }
         }
 
-        for (key, limits) in key_first {
-            if let Some(max_requests) = limits.requests_per_minute {
-                if let Admission::Refused { used } =
-                    self.counters
-                        .admit(key, WindowDimension::Requests, window, max_requests)
-                {
-                    let decision = LimitDecision::for_window(used, max_requests, window, now_secs);
-                    return Some((decision, Refusal::Requests));
-                }
-            }
+        let requests: Vec<(&LimitKey, u64)> = requests_order
+            .iter()
+            .filter_map(|(key, limits)| limits.requests_per_minute.map(|max| (key, max)))
+            .collect();
+        if let Err(RowRefused { index, used }) =
+            self.counters
+                .admit_all(WindowDimension::Requests, window, &requests)
+        {
+            let max_requests = requests.get(index).map_or(0, |(_, max)| *max);
+            let decision = LimitDecision::for_window(used, max_requests, window, now_secs);
+            return Some((decision, Refusal::Requests));
         }
 
         self.leases.extend(leases);
         self.policy_charges
-            .extend(tenant_first.iter().filter_map(|(key, limits)| {
+            .extend(streams_order.iter().filter_map(|(key, limits)| {
                 limits.tokens_per_minute.map(|tokens| (key.clone(), tokens))
             }));
         None
@@ -1156,27 +1145,40 @@ impl TokenLimitFilterInstance {
         client: Option<std::net::IpAddr>,
         headers: &RequestHeaders,
     ) -> Option<LimitKey> {
-        let subject = match &rule.key {
-            RuleKey::Global => "global".to_string(),
-            RuleKey::ClientIp => format!("ip={}", client?),
-            RuleKey::Tenant => format!("tenant={}", tenant?),
+        let scope = &rule.scope;
+        // A value the client chose gets a capped bucket, and past the cap
+        // shares the rule's overflow bucket (review M8). The overflow subject
+        // cannot collide with a value: an address never reads `overflow`, and
+        // a header value is always a 16-digit hex digest.
+        let client_keyed = |prefix: String, value: String| {
+            LimitKey::for_client_rule(
+                format!("{prefix}{value}{scope}"),
+                format!("{prefix}overflow{scope}"),
+            )
+        };
+        let key = match &rule.key {
+            RuleKey::Global => LimitKey::for_rule(format!("global{scope}")),
+            RuleKey::ClientIp => client_keyed("ip=".to_string(), client?.to_string()),
+            RuleKey::Tenant => LimitKey::for_rule(format!("tenant={}{scope}", tenant?)),
             // Hashed like an unauthenticated credential: the header may carry
             // a secret, and the bucket key reaches logs and the shared store.
             RuleKey::Header(name) => match headers.headers.get(name) {
                 Some(value) => {
                     let digest = CredentialDigest::hash(&String::from_utf8_lossy(value.as_bytes()));
-                    format!("header={name}:{digest}")
+                    client_keyed(format!("header={name}:"), digest.to_string())
                 }
                 // `llmproxy.auth` removes the `authorization` header once it
                 // has verified it (auth_filter, "The verified credential is
                 // removed before forwarding"). The authenticated key id names
                 // that credential one to one, so it keeps "one bucket per
-                // distinct value".
-                None if *name == AUTHORIZATION => format!("header={name}:key={}", key_id?),
+                // distinct value", and is not client-chosen.
+                None if *name == AUTHORIZATION => {
+                    LimitKey::for_rule(format!("header={name}:key={}{scope}", key_id?))
+                }
                 None => return None,
             },
         };
-        Some(LimitKey::for_rule(format!("{subject}{}", rule.scope)))
+        Some(key)
     }
 
     /// Whether a token limit binds this request before its model is known:
@@ -1194,7 +1196,7 @@ impl TokenLimitFilterInstance {
             return true;
         }
         // Control-plane limits apply only to an authenticated tenant, as in
-        // `admit_policy`.
+        // `policy_buckets`.
         if let (Some(tenant), Some(policy)) = (tenant, self.policy.as_ref()) {
             let snapshot = policy.load();
             let tenant_tokens = snapshot
@@ -1227,43 +1229,72 @@ impl TokenLimitFilterInstance {
         );
     }
 
-    /// Admit the model-scoped rules once the model is known (the request
-    /// body has been read, as for `llmproxy.model_authz`). A request whose
-    /// model is unknown matches no scoped rule.
+    /// Decide the admission deferred from `decode_headers` once the model is
+    /// known (the request body has been read, as for `llmproxy.model_authz`):
+    /// every bucket the headers chose plus the model-scoped rules the model
+    /// matches, admitted in one all-or-nothing step.
+    ///
+    /// On an endpoint that runs a model, a request whose model is unknown
+    /// counts against every scoped rule that applies to it by key, and is
+    /// logged and counted ([`UnknownModelLog`]); a missing model never
+    /// skips a per-model limit. Other endpoints (model lists, files,
+    /// batches, unknown paths) name no model, so scoped rules do not apply.
     fn admit_scoped(&mut self, cb: &mut dyn DecoderCallbacks) {
-        if self.scoped_decided || self.scoped_pending.is_empty() {
-            return;
-        }
-        self.scoped_decided = true;
-        let model: Option<String> = cb.stream_info().routing_model().map(str::to_owned);
-        let Some(model) = model else {
+        let Some(deferred) = self.deferred.take() else {
             return;
         };
-        let buckets = merge_buckets(
-            self.scoped_pending
+        let model: Option<String> = cb.stream_info().routing_model().map(str::to_owned);
+        let scoped: Vec<PolicyBucket> = match &model {
+            Some(model) => self
+                .scoped_pending
                 .iter()
-                .filter(|(i, _)| self.rules[*i].models.iter().any(|p| p.matches(&model)))
+                .filter(|(i, _)| self.rules[*i].models.iter().any(|p| p.matches(model)))
                 .map(|(i, key)| (key.clone(), self.rules[*i].limits))
                 .collect(),
-        );
-        if buckets.is_empty() {
-            return;
-        }
+            None if runs_a_model(self.endpoint) => {
+                self.unknown_model.note(self.endpoint, Instant::now());
+                self.scoped_pending
+                    .iter()
+                    .map(|(i, key)| (key.clone(), self.rules[*i].limits))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         if !can_count(self.endpoint)
-            && buckets
+            && scoped
                 .iter()
                 .any(|(_, limits)| limits.tokens_per_minute.is_some())
         {
             self.refuse_unmetered(cb);
             return;
         }
-        let order: Vec<&PolicyBucket> = buckets.iter().collect();
+        let mut rules = deferred.rules;
+        rules.extend(scoped);
+        let rules = merge_buckets(rules);
         let now = (self.clock)();
-        match self.admit_buckets(&order, &order, unix_secs(now)) {
+        self.admit_now(cb, deferred.tenant, deferred.key, &rules, now);
+    }
+
+    /// Admit the request against `tenant`, `key` and `rules` now: refuse on
+    /// the first limit that refuses, else note the admission.
+    fn admit_now(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        tenant: Option<PolicyBucket>,
+        key: Option<PolicyBucket>,
+        rules: &[PolicyBucket],
+        now: SystemTime,
+    ) {
+        let limited = self.key.is_some() || tenant.is_some() || key.is_some() || !rules.is_empty();
+        match self.admit_set(tenant, key, rules, unix_secs(now)) {
             Some((deny, refusal)) => self.refuse(cb, deny, refusal),
-            None => {
+            // Counted (and warned about) only while the counters are past
+            // their reconciliation bound; see `window_counter`'s "Store
+            // outage".
+            None if limited => {
                 self.counters.note_admission(now);
             }
+            None => {}
         }
     }
 
@@ -1772,16 +1803,10 @@ impl HttpFilter for TokenLimitFilterInstance {
             }
         }
 
-        if let Some((deny, refusal)) =
-            self.admit_policy(tenant.as_deref(), key_id.as_deref(), now_secs)
-        {
-            self.refuse(cb, deny, refusal);
-            return FilterHeadersStatus::Continue;
-        }
-
+        let (tenant_bucket, key_bucket) = self.policy_buckets(tenant.as_deref(), key_id.as_deref());
+        let mut unscoped = Vec::new();
         if !self.rules.is_empty() {
             let client: Option<std::net::IpAddr> = cb.stream_info().client_address;
-            let mut unscoped = Vec::new();
             for (i, rule) in self.rules.iter().enumerate() {
                 let Some(key) =
                     Self::rule_key(rule, tenant.as_deref(), key_id.as_deref(), client, headers)
@@ -1794,17 +1819,18 @@ impl HttpFilter for TokenLimitFilterInstance {
                     self.scoped_pending.push((i, key));
                 }
             }
-            let buckets = merge_buckets(unscoped);
-            let order: Vec<&PolicyBucket> = buckets.iter().collect();
-            if let Some((deny, refusal)) = self.admit_buckets(&order, &order, now_secs) {
-                self.refuse(cb, deny, refusal);
-                return FilterHeadersStatus::Continue;
-            }
         }
-        // Counted (and warned about) only while the counters are past their
-        // reconciliation bound; see `window_counter`'s "Store outage".
-        if self.key.is_some() || !self.policy_charges.is_empty() || !self.leases.is_empty() {
-            self.counters.note_admission(now);
+        let rules = merge_buckets(unscoped);
+        if self.scoped_pending.is_empty() {
+            self.admit_now(cb, tenant_bucket, key_bucket, &rules, now);
+        } else {
+            // A model-scoped rule may still refuse once the body names the
+            // model, so nothing is counted until then.
+            self.deferred = Some(Deferred {
+                tenant: tenant_bucket,
+                key: key_bucket,
+                rules,
+            });
         }
         FilterHeadersStatus::Continue
     }
@@ -1925,6 +1951,9 @@ mod tests {
 
     use std::cell::{RefCell, RefMut};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::repeat_warner;
 
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, Uri};
@@ -2329,12 +2358,13 @@ mod tests {
             rule: Some(store.rule),
             rules: Arc::from(Vec::new()),
             scoped_pending: Vec::new(),
-            scoped_decided: false,
+            deferred: None,
             counters: Arc::clone(&store.counters),
             streams: Arc::clone(&store.streams),
             clock,
             policy: None,
             usage_missing_warner: Arc::new(UsageMissingWarner::new()),
+            unknown_model: Arc::new(UnknownModelLog::new("test".to_string(), None)),
             usage_reader: None,
             route_names: None,
             unmetered: None,
@@ -2882,9 +2912,8 @@ mod tests {
             "the overflow line must still say the budget was not enforced: {:?}",
             overflow[0]
         );
-        let state = warner.state.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(
-            state.last_warned.len(),
+            warner.warner.tracked(),
             UsageMissingWarner::MAX_TRACKED_KEYS
         );
     }
@@ -2906,7 +2935,7 @@ mod tests {
         warner.warn_if_due(&key(100_000), start + Duration::from_secs(1));
         warner.warn_if_due(&key(100_001), start + Duration::from_secs(2));
         // Every tracked key has expired: a new key gets its own warning.
-        let later = start + UsageMissingWarner::REPEAT_INTERVAL;
+        let later = start + repeat_warner::REPEAT_INTERVAL;
         warner.warn_if_due(&key(100_002), later);
 
         drop(guard);
@@ -2919,9 +2948,8 @@ mod tests {
             .map(|m| m.contains(OVERFLOW_LINE))
             .collect();
         assert_eq!(tail, [true, false], "overflow once, then a per-key warning");
-        let state = warner.state.lock().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(state.last_warned.len(), 1, "expired keys were dropped");
-        assert!(state.last_warned.contains_key(&key(100_002)));
+        assert_eq!(warner.warner.tracked(), 1, "expired keys were dropped");
+        assert!(warner.warner.is_tracked(&key(100_002)));
     }
 
     // --- independent budgets -------------------------------------------------
@@ -3649,6 +3677,7 @@ mod tests {
 
     use crate::auth::{HmacSecret, KeySet};
     use crate::control::InMemoryControlPlaneStore;
+    use crate::token_limit::MAX_CLIENT_KEYED_WINDOWS;
 
     fn control_plane() -> Arc<ControlPlane> {
         Arc::new(
@@ -3999,6 +4028,11 @@ mod tests {
                 &mut request_headers(Some("Bearer llmp_x")),
                 true,
             );
+            // The filter manager delivers the (empty) body even to a request
+            // that ended on its headers; scoped rules decide there, on a
+            // model none of them is scoped to.
+            cb.stream_info.borrow_mut().requested_model = Some("claude-3".to_string());
+            filter.decode_data(&mut cb, &mut Bytes::new(), true);
             assert!(cb.local_reply.is_none(), "setup request must be admitted");
             cb.set_usage(usage(tokens));
             filter.encode_headers(&mut cb, &mut response_headers(), true);
@@ -4281,18 +4315,27 @@ mod tests {
     /// test can hold its stream slots.
     struct RuleRequest<'a> {
         tenant: Option<&'a str>,
+        key_id: Option<&'a str>,
         client: Option<&'a str>,
         header: Option<(&'a str, &'a str)>,
         model: Option<&'a str>,
+        method: Method,
+        path: &'static str,
+        /// End the request in trailers rather than an end-of-stream body.
+        trailers: bool,
     }
 
     impl Default for RuleRequest<'_> {
         fn default() -> Self {
             RuleRequest {
                 tenant: None,
+                key_id: None,
                 client: Some("10.0.0.1"),
                 header: None,
                 model: None,
+                method: Method::POST,
+                path: "/v1/chat/completions",
+                trailers: false,
             }
         }
     }
@@ -4306,8 +4349,11 @@ mod tests {
         if let Some(tenant) = req.tenant {
             cb.set_authenticated_tenant(tenant);
         }
+        cb.stream_info.borrow_mut().auth.key_id = req.key_id.map(str::to_owned);
         cb.stream_info.borrow_mut().client_address = req.client.map(|ip| ip.parse().unwrap());
         let mut head = request_headers(None);
+        head.method = req.method;
+        head.uri = Uri::from_static(req.path);
         if let Some((name, value)) = req.header {
             head.headers.insert(
                 http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
@@ -4319,7 +4365,12 @@ mod tests {
             if let Some(model) = req.model {
                 cb.stream_info.borrow_mut().requested_model = Some(model.to_string());
             }
-            filter.decode_data(&mut cb, &mut Bytes::new(), true);
+            if req.trailers {
+                filter.decode_data(&mut cb, &mut Bytes::new(), false);
+                filter.decode_trailers(&mut cb, &mut RequestTrailers(HeaderMap::new()));
+            } else {
+                filter.decode_data(&mut cb, &mut Bytes::new(), true);
+            }
         }
         let refused = cb.local_reply.as_ref().map(|(status, _, body)| {
             assert_eq!(*status, StatusCode::TOO_MANY_REQUESTS);
@@ -4515,9 +4566,9 @@ mod tests {
             refused(&*factory, model(Some("gpt-4o-mini"))).as_deref(),
             Some("request rate exceeded")
         );
-        // Another model, or none named, is not counted by this rule.
+        // Another model is not counted by this rule.
         assert_eq!(refused(&*factory, model(Some("claude-3"))), None);
-        assert_eq!(refused(&*factory, model(None)), None);
+        assert_eq!(refused(&*factory, model(Some("claude-3"))), None);
     }
 
     #[test]
@@ -4658,5 +4709,265 @@ mod tests {
         );
         // Any other missing header is still not counted, key id or not.
         assert_eq!(key(&rule("x-api-key"), Some("k-a")), None);
+    }
+
+    // --- unknown models, client-keyed caps, all-or-nothing admission ----------
+
+    /// One `gpt-4*` and one `claude*` request limit of 1, over a factory
+    /// whose chain has a stats registry, so the unknown-model counter
+    /// renders.
+    fn scoped_pair_factory() -> (Box<dyn FilterInstanceFactory>, Arc<Registry>) {
+        let ctx = FactoryContext {
+            stat_prefix: "ingress".to_string(),
+            ..FactoryContext::default()
+        };
+        let registry = proxy_observability::stats::StatsControl::new(1).registry();
+        ctx.shared
+            .get_or_try_init("", "", crate::usage_filter::STATS_REGISTRY_KEY, || {
+                Ok(Arc::clone(&registry) as Arc<dyn std::any::Any + Send + Sync>)
+            })
+            .unwrap();
+        let config = rules_config(vec![
+            limit_rule(GLOBAL, "", None, Some(1), None, &["gpt-4*"]),
+            limit_rule(GLOBAL, "", None, Some(1), None, &["claude*"]),
+        ]);
+        match pinned_factory(&config, &ctx) {
+            Ok(factory) => (factory, registry),
+            Err(e) => panic!("valid rules config must build: {e:?}"),
+        }
+    }
+
+    fn unknown_model_count(registry: &Registry) -> Option<String> {
+        proxy_observability::stats::prometheus_render::render(registry)
+            .lines()
+            .find(|line| {
+                line.contains("llmproxy_token_limit_unknown_model_total") && !line.starts_with('#')
+            })
+            .map(str::to_owned)
+    }
+
+    /// A body the proxy could not read a model from (not sent as JSON, a
+    /// `model` past the scan cap) publishes no model. On a model endpoint
+    /// that request must count against every scoped rule, never skip them,
+    /// and say so once per chain.
+    #[test]
+    fn an_unknown_model_counts_against_every_scoped_rule_and_warns_once() {
+        let (factory, registry) = scoped_pair_factory();
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+
+        assert_eq!(refused(&*factory, RuleRequest::default()), None);
+        let second = refused(&*factory, RuleRequest::default());
+
+        drop(guard);
+        assert_eq!(
+            second.as_deref(),
+            Some("request rate exceeded"),
+            "the first unknown-model request must have used both scoped limits"
+        );
+        for model in ["gpt-4o", "claude-3"] {
+            let req = RuleRequest {
+                model: Some(model),
+                ..Default::default()
+            };
+            assert_eq!(
+                refused(&*factory, req).as_deref(),
+                Some("request rate exceeded"),
+                "{model}: its scoped limit must already hold the unknown-model request"
+            );
+        }
+        // The pinned clock never reconciles, so the stale-counter line also
+        // fires; only the unknown-model line is counted here.
+        let messages: Vec<String> = capture
+            .messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|m| m.contains("model-scoped"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "two unknown-model requests must warn once, not per request: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("EVERY model-scoped limit"),
+            "the warning must say what was done with the request: {:?}",
+            messages[0]
+        );
+        assert_eq!(
+            unknown_model_count(&registry).as_deref(),
+            Some("envoy_llmproxy_token_limit_unknown_model_total 2"),
+            "the counter counts every unknown-model request, not only the logged one"
+        );
+    }
+
+    /// A request on an endpoint that names no model (a file retrieval) has
+    /// no model to scope by: scoped rules do not apply, and nothing warns.
+    #[test]
+    fn an_endpoint_that_names_no_model_skips_scoped_rules_without_warning() {
+        let (factory, registry) = scoped_pair_factory();
+        let capture = Arc::new(WarnCapture::new());
+        let guard = tracing::subscriber::set_default(capture.clone());
+        let files = || RuleRequest {
+            method: Method::GET,
+            path: "/v1/files/file-1",
+            ..Default::default()
+        };
+
+        assert_eq!(refused(&*factory, files()), None);
+        assert_eq!(refused(&*factory, files()), None);
+
+        drop(guard);
+        let messages = capture
+            .messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !messages.iter().any(|m| m.contains("model-scoped")),
+            "a request for no model must not warn: {messages:?}"
+        );
+        assert_eq!(
+            unknown_model_count(&registry).as_deref(),
+            Some("envoy_llmproxy_token_limit_unknown_model_total 0")
+        );
+        let gpt = RuleRequest {
+            model: Some("gpt-4o"),
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, gpt), None, "nothing was counted");
+    }
+
+    /// A request ending in trailers never sends an end-of-stream body; the
+    /// deferred admission is decided on the trailers.
+    #[test]
+    fn a_request_ending_in_trailers_decides_its_scoped_rules() {
+        let (factory, _) = scoped_pair_factory();
+        let gpt = || RuleRequest {
+            model: Some("gpt-4o"),
+            trailers: true,
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, gpt()), None);
+        assert_eq!(
+            refused(&*factory, gpt()).as_deref(),
+            Some("request rate exceeded")
+        );
+    }
+
+    /// Past the client-keyed cap, new header values share one overflow
+    /// bucket per rule instead of each getting a window (review M8), while
+    /// values already tracked keep their own.
+    #[test]
+    fn header_values_past_the_cap_share_one_overflow_bucket_per_rule() {
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(HEADER, "x-user", None, Some(2), None, &[])]),
+            None,
+        );
+        let user = |value: &str| {
+            let mut filter = factory.create_filter();
+            let mut cb = TestCallbacks::new(Some(route_named("r1")));
+            let mut head = request_headers(None);
+            head.headers
+                .insert("x-user", HeaderValue::from_str(value).unwrap());
+            decode(&mut *filter, &mut cb, &mut head, true);
+            cb.local_reply.map(|(_, _, body)| body)
+        };
+        for i in 0..MAX_CLIENT_KEYED_WINDOWS {
+            assert_eq!(user(&format!("u-{i}")), None, "value {i} is under the cap");
+        }
+        // Three values the cap has no room for: the overflow bucket's limit
+        // of 2 refuses the third.
+        assert_eq!(user("late-1"), None);
+        assert_eq!(user("late-2"), None);
+        assert_eq!(
+            user("late-3").as_deref(),
+            Some("request rate exceeded"),
+            "late values must share one bucket, not get a window each"
+        );
+        assert_eq!(user("u-0"), None, "a tracked value keeps its own bucket");
+    }
+
+    /// A request refused by a model-scoped rule must not spend the tenant's
+    /// or key's request quota it was checked against first.
+    #[test]
+    fn a_scoped_refusal_spends_no_tenant_or_key_request_quota() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(None, Some(3), None)),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(None, Some(3), None)))
+            .unwrap();
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(
+                GLOBAL,
+                "",
+                None,
+                Some(1),
+                None,
+                &["gpt-4*"],
+            )]),
+            Some(&cp),
+        );
+        let req = |model| RuleRequest {
+            tenant: Some("tenant-a"),
+            key_id: Some("key-a"),
+            model: Some(model),
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, req("gpt-4o")), None);
+        for _ in 0..5 {
+            assert_eq!(
+                refused(&*factory, req("gpt-4o")).as_deref(),
+                Some("request rate exceeded")
+            );
+        }
+        // Had the refusals counted, the key and tenant would be exhausted.
+        assert_eq!(refused(&*factory, req("claude-3")), None);
+        assert_eq!(refused(&*factory, req("claude-3")), None);
+        assert_eq!(
+            refused(&*factory, req("claude-3")).as_deref(),
+            Some("request rate exceeded"),
+            "the third admitted request reaches the limit of 3"
+        );
+    }
+
+    /// The same for an unscoped keyed rule, decided in `decode_headers`.
+    #[test]
+    fn a_keyed_rule_refusal_spends_no_tenant_or_key_request_quota() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_tenant_limits(
+            &TenantId::new("tenant-a"),
+            Some(&limits(None, Some(3), None)),
+        )
+        .unwrap();
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&limits(None, Some(3), None)))
+            .unwrap();
+        let factory = rules_factory(
+            &rules_config(vec![limit_rule(CLIENT_IP, "", None, Some(1), None, &[])]),
+            Some(&cp),
+        );
+        let from = |ip| RuleRequest {
+            tenant: Some("tenant-a"),
+            key_id: Some("key-a"),
+            client: Some(ip),
+            ..Default::default()
+        };
+        assert_eq!(refused(&*factory, from("10.0.0.1")), None);
+        for _ in 0..5 {
+            assert!(refused(&*factory, from("10.0.0.1")).is_some());
+        }
+        assert_eq!(refused(&*factory, from("10.0.0.2")), None);
+        assert_eq!(refused(&*factory, from("10.0.0.3")), None);
+        assert_eq!(
+            refused(&*factory, from("10.0.0.4")).as_deref(),
+            Some("request rate exceeded"),
+            "the tenant and key limit of 3 is reached by admitted requests only"
+        );
     }
 }

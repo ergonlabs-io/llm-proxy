@@ -407,6 +407,89 @@ impl BodyRewriteFilterInstance {
             cb.stream_info().max_output_tokens = Some(cap);
         }
     }
+
+    /// Decide on what the scanner has read: publish the model and request
+    /// facts, splice `include_usage` when it applies, and return the held
+    /// body to send on. Runs at the end of the body, or on the trailers when
+    /// a request ends in them while still scanning.
+    fn finish_scan(
+        &mut self,
+        cb: &mut dyn DecoderCallbacks,
+        scanner: Box<BodyPrefixScanner>,
+        mut pending: BytesMut,
+        content_length: Option<u64>,
+    ) -> Bytes {
+        let facts = scanner.finish();
+
+        // Consumer A: OpenAI-only, and only when the operator hasn't turned
+        // it off (`cfg.enabled`). Unlike the old gate, `cfg` is resolved
+        // fresh here rather than in `decode_headers` -- scanning itself no
+        // longer depends on it (consumer B needs every dialect), so only
+        // the splice decision reads it.
+        let cfg = self.resolve_config(cb);
+        if cfg.enabled && cfg.dialect == Dialect::OpenAi && self.takes_usage_option {
+            if facts.splice_at.is_some() {
+                // The router reconciles the whole buffered body against this,
+                // so a client opt-out or a key beyond the scan window cannot
+                // switch metering off.
+                cb.stream_info().force_include_usage = true;
+            }
+            if let Some(inject) = include_usage_injection(&facts) {
+                let splice_at = facts
+                    .splice_at
+                    .expect("include_usage_injection only returns Some when a splice point exists");
+                let tail = pending.split_off(splice_at);
+                pending.extend_from_slice(inject.as_bytes());
+                pending.unsplit(tail);
+
+                if let Some(len) = content_length {
+                    // Saturating, not `+`: `len` was parsed out of a CLIENT-supplied
+                    // `content-length` header, so it is untrusted input rather than a
+                    // number we computed. A client sending a near-`u64::MAX`
+                    // content-length would otherwise panic the worker in debug builds
+                    // and wrap in release. Same defect class as `TokenUsage::total()`,
+                    // and reachable from the downstream side rather than the upstream
+                    // one, which makes it strictly worse.
+                    let new_len = len.saturating_add(inject.len() as u64);
+                    cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
+                        headers.headers.insert(
+                            CONTENT_LENGTH,
+                            HeaderValue::from_str(&new_len.to_string())
+                                .expect("a decimal integer is always a valid header value"),
+                        );
+                    });
+                }
+                // A chunked request (`content_length == None`) needs no header
+                // fix-up at all -- there is nothing to recompute.
+            }
+        }
+
+        // Consumer B: unconditional -- publish the scanned `model`, or remove
+        // any client-supplied value when none was found (`CapExceeded` with
+        // no `model` seen yet means absence is NOT proven, so this
+        // deliberately still clears the header and lets routing fall through
+        // to the `*` backstop, rather than trusting a client-supplied value).
+        // `model_authz_filter` reads the same `requested_model`, so the scan
+        // is reused rather than adding a second body buffer.
+        //
+        // A fact that only counts when it is the last word on its key (the
+        // speech `input`, the response and stream formats that admission
+        // decides on) is kept only when the whole object was read: past the
+        // cap, a later duplicate key could replace it.
+        let complete = facts.outcome == ScanOutcome::Complete;
+        let request_facts = RequestFacts {
+            // The image attributes select a price row when the response does
+            // not echo them.
+            size: facts.size.clone(),
+            quality: facts.quality.clone(),
+            response_format: facts.response_format.clone().filter(|_| complete),
+            stream_format: facts.stream_format.clone().filter(|_| complete),
+            input_characters: facts.input_characters.filter(|_| complete),
+            complete,
+        };
+        self.publish(cb, facts.model.clone(), request_facts);
+        pending.freeze()
+    }
 }
 
 impl HttpFilter for BodyRewriteFilterInstance {
@@ -546,77 +629,7 @@ impl HttpFilter for BodyRewriteFilterInstance {
 
         // Either the scanner reached a decision, or the body just ended
         // without one (truncated/malformed JSON) -- either way, finish now.
-        let facts = scanner.finish();
-
-        // Consumer A: OpenAI-only, and only when the operator hasn't turned
-        // it off (`cfg.enabled`). Unlike the old gate, `cfg` is resolved
-        // fresh here rather than in `decode_headers` -- scanning itself no
-        // longer depends on it (consumer B needs every dialect), so only
-        // the splice decision reads it.
-        let cfg = self.resolve_config(cb);
-        if cfg.enabled && cfg.dialect == Dialect::OpenAi && self.takes_usage_option {
-            if facts.splice_at.is_some() {
-                // The router reconciles the whole buffered body against this,
-                // so a client opt-out or a key beyond the scan window cannot
-                // switch metering off.
-                cb.stream_info().force_include_usage = true;
-            }
-            if let Some(inject) = include_usage_injection(&facts) {
-                let splice_at = facts
-                    .splice_at
-                    .expect("include_usage_injection only returns Some when a splice point exists");
-                let tail = pending.split_off(splice_at);
-                pending.extend_from_slice(inject.as_bytes());
-                pending.unsplit(tail);
-
-                if let Some(len) = content_length {
-                    // Saturating, not `+`: `len` was parsed out of a CLIENT-supplied
-                    // `content-length` header, so it is untrusted input rather than a
-                    // number we computed. A client sending a near-`u64::MAX`
-                    // content-length would otherwise panic the worker in debug builds
-                    // and wrap in release. Same defect class as `TokenUsage::total()`,
-                    // and reachable from the downstream side rather than the upstream
-                    // one, which makes it strictly worse.
-                    let new_len = len.saturating_add(inject.len() as u64);
-                    cb.modify_decoded_headers(&mut |headers: &mut RequestHeaders| {
-                        headers.headers.insert(
-                            CONTENT_LENGTH,
-                            HeaderValue::from_str(&new_len.to_string())
-                                .expect("a decimal integer is always a valid header value"),
-                        );
-                    });
-                }
-                // A chunked request (`content_length == None`) needs no header
-                // fix-up at all -- there is nothing to recompute.
-            }
-        }
-
-        // Consumer B: unconditional -- publish the scanned `model`, or remove
-        // any client-supplied value when none was found (`CapExceeded` with
-        // no `model` seen yet means absence is NOT proven, so this
-        // deliberately still clears the header and lets routing fall through
-        // to the `*` backstop, rather than trusting a client-supplied value).
-        // `model_authz_filter` reads the same `requested_model`, so the scan
-        // is reused rather than adding a second body buffer.
-        //
-        // A fact that only counts when it is the last word on its key (the
-        // speech `input`, the response and stream formats that admission
-        // decides on) is kept only when the whole object was read: past the
-        // cap, a later duplicate key could replace it.
-        let complete = facts.outcome == ScanOutcome::Complete;
-        let request_facts = RequestFacts {
-            // The image attributes select a price row when the response does
-            // not echo them.
-            size: facts.size.clone(),
-            quality: facts.quality.clone(),
-            response_format: facts.response_format.clone().filter(|_| complete),
-            stream_format: facts.stream_format.clone().filter(|_| complete),
-            input_characters: facts.input_characters.filter(|_| complete),
-            complete,
-        };
-        self.publish(cb, facts.model.clone(), request_facts);
-
-        *data = pending.freeze();
+        *data = self.finish_scan(cb, scanner, pending, content_length);
         // `self.state` is already `PassThrough` from the `mem::replace`
         // above; every later `decode_data` call on this stream now takes
         // the early-return path.
@@ -630,10 +643,25 @@ impl HttpFilter for BodyRewriteFilterInstance {
         cb: &mut dyn DecoderCallbacks,
         _trailers: &mut RequestTrailers,
     ) -> FilterTrailersStatus {
-        if let State::Form { boundary, pending } =
-            std::mem::replace(&mut self.state, State::PassThrough)
-        {
-            self.publish_form(cb, multipart::scan(&pending, &boundary));
+        match std::mem::replace(&mut self.state, State::PassThrough) {
+            State::Form { boundary, pending } => {
+                self.publish_form(cb, multipart::scan(&pending, &boundary));
+            }
+            // A JSON body still undecided when trailers arrive: finish the
+            // scan as at the end of the body, or the request would reach the
+            // upstream with no body and no model. The held bytes go to the
+            // filters after this one ahead of the trailers (S2.7).
+            State::Scanning {
+                scanner,
+                pending,
+                content_length,
+            } => {
+                let body = self.finish_scan(cb, scanner, pending, content_length);
+                if !body.is_empty() {
+                    cb.inject_decoded_data_to_filter_chain(body, false);
+                }
+            }
+            State::PassThrough => {}
         }
         FilterTrailersStatus::Continue
     }
@@ -673,6 +701,8 @@ mod tests {
         /// tests that want to pin that can inspect this instead of only
         /// inferring it from the header outcome.
         route_cache_cleared: std::cell::Cell<u32>,
+        /// What the filter handed to the filters after it out of band.
+        injected: Vec<(Bytes, bool)>,
     }
 
     impl TestCallbacks {
@@ -682,6 +712,7 @@ mod tests {
                 per_route_config: None,
                 stream_info: RefCell::new(StreamInfo::default()),
                 route_cache_cleared: std::cell::Cell::new(0),
+                injected: Vec::new(),
             }
         }
 
@@ -707,8 +738,8 @@ mod tests {
         fn add_decoded_data(&mut self, _data: Bytes, _streaming: bool) {
             unimplemented!("body_rewrite_filter must never buffer via add_decoded_data")
         }
-        fn inject_decoded_data_to_filter_chain(&mut self, _data: Bytes, _end_stream: bool) {
-            unimplemented!("body_rewrite_filter must not inject data out of band")
+        fn inject_decoded_data_to_filter_chain(&mut self, data: Bytes, end_stream: bool) {
+            self.injected.push((data, end_stream));
         }
         fn decoding_buffer(&self) -> Option<&BufferedBody> {
             unimplemented!("body_rewrite_filter must not consult the decoding buffer")
@@ -771,6 +802,36 @@ mod tests {
             state: State::PassThrough,
             takes_usage_option: false,
         }
+    }
+
+    /// A request that ends in trailers delivers its body with
+    /// `end_stream = false`. A JSON object still open at that point is held
+    /// while scanning; the trailers must finish the scan, publish the model,
+    /// and send the held body on, or the request reaches the upstream with
+    /// no body and every model-keyed control sees no model.
+    #[test]
+    fn a_json_body_still_scanning_when_trailers_arrive_is_published_and_sent_on() {
+        let body = br#"{"model":"gpt-4o","messages":["#;
+        let mut filter = filter_for(Dialect::OpenAi);
+        let mut head = request_headers(Some("application/json"), None);
+        let mut cb = TestCallbacks::new(head.clone());
+        filter.decode_headers(&mut cb, &mut head, false);
+        let mut data = Bytes::from_static(body);
+        filter.decode_data(&mut cb, &mut data, false);
+        assert!(data.is_empty(), "an undecided body is held while scanning");
+
+        filter.decode_trailers(&mut cb, &mut RequestTrailers(HeaderMap::new()));
+
+        assert_eq!(
+            cb.stream_info.borrow().requested_model.as_deref(),
+            Some("gpt-4o"),
+            "the trailers must publish the model the held prefix names"
+        );
+        assert_eq!(
+            cb.injected,
+            vec![(Bytes::from_static(body), false)],
+            "the held body must be sent on to the filters after this one"
+        );
     }
 
     /// `content-length` is CLIENT-supplied, so the fix-up arithmetic is done

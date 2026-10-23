@@ -64,7 +64,7 @@ pub enum LimitSubject {
     /// hold; there is no way to construct it from a raw, unhashed value.
     Credential(CredentialDigest),
     /// The one bucket per route that unauthenticated credentials share once
-    /// [`MAX_CREDENTIAL_WINDOWS`] distinct ones are already tracked.
+    /// [`MAX_CLIENT_KEYED_WINDOWS`] client-keyed subjects are already tracked.
     CredentialOverflow,
     /// A tenant's control-plane limit (`PUT /tenants/{id}/limits`). One
     /// bucket per tenant across every route, and a key space separate from
@@ -78,6 +78,11 @@ pub enum LimitSubject {
     /// the rule's canonical subject (key kind, key value, model scope);
     /// header values in it are already hashed.
     Rule(String),
+    /// A keyed rule whose value the client chose (its address, or a header's
+    /// hashed value). Rendered and stored like [`Self::Rule`], but capped
+    /// like [`Self::Credential`]: past [`MAX_CLIENT_KEYED_WINDOWS`], new
+    /// values share the rule's `overflow` bucket, itself a [`Self::Rule`].
+    ClientRule { subject: String, overflow: String },
 }
 
 impl LimitKey {
@@ -130,6 +135,17 @@ impl LimitKey {
         }
     }
 
+    /// The bucket for a keyed rule's `subject` when the client chose its
+    /// value; see [`LimitSubject::ClientRule`]. `overflow` names the bucket
+    /// the rule's values share once the cap is full, and must be distinct
+    /// from every `subject` the rule can produce.
+    pub fn for_client_rule(subject: String, overflow: String) -> Self {
+        LimitKey {
+            route: String::new(),
+            subject: LimitSubject::ClientRule { subject, overflow },
+        }
+    }
+
     /// The route name this key was bucketed under.
     pub fn route(&self) -> &str {
         &self.route
@@ -165,7 +181,9 @@ impl std::fmt::Display for LimitKey {
             // Key ids, like tenant ids, are operator-chosen identifiers.
             LimitSubject::TenantPolicy(tenant) => write!(f, "tenant-policy={tenant}"),
             LimitSubject::KeyPolicy(key_id) => write!(f, "key-policy={key_id}"),
-            LimitSubject::Rule(subject) => write!(f, "rule={subject}"),
+            LimitSubject::Rule(subject) | LimitSubject::ClientRule { subject, .. } => {
+                write!(f, "rule={subject}")
+            }
         }
     }
 }
@@ -266,17 +284,28 @@ pub struct LimitRule {
 }
 
 impl LimitKey {
-    /// Whether this key is bucketed on an unauthenticated credential digest,
-    /// the side of the key space that is capped.
-    pub(crate) fn is_credential(&self) -> bool {
-        matches!(self.subject, LimitSubject::Credential(_))
+    /// Whether the client chose this key's value (an unauthenticated
+    /// credential digest, an address, a header value): the side of the key
+    /// space that is capped.
+    pub(crate) fn is_client_keyed(&self) -> bool {
+        matches!(
+            self.subject,
+            LimitSubject::Credential(_) | LimitSubject::ClientRule { .. }
+        )
     }
 
-    /// The route's shared bucket for credentials past the cap.
-    pub(crate) fn credential_overflow(&self) -> LimitKey {
+    /// The shared bucket this key folds into past the cap: the route's for a
+    /// credential, the rule's for a client-keyed rule. Any other key is its
+    /// own bucket.
+    pub(crate) fn client_overflow(&self) -> LimitKey {
+        let subject = match &self.subject {
+            LimitSubject::Credential(_) => LimitSubject::CredentialOverflow,
+            LimitSubject::ClientRule { overflow, .. } => LimitSubject::Rule(overflow.clone()),
+            other => other.clone(),
+        };
         LimitKey {
             route: self.route.clone(),
-            subject: LimitSubject::CredentialOverflow,
+            subject,
         }
     }
 }
@@ -404,10 +433,11 @@ pub struct TenantUsage {
     pub reset_after: Duration,
 }
 
-/// The most distinct [`LimitSubject::Credential`] keys one counter tracks at
-/// once. A bucket is a few hundred bytes, so this bounds the credential side
-/// of the map to a few megabytes.
-pub const MAX_CREDENTIAL_WINDOWS: usize = 10_000;
+/// The most distinct client-keyed keys ([`LimitSubject::Credential`] and
+/// [`LimitSubject::ClientRule`], together) one counter tracks at once. A
+/// bucket is a few hundred bytes, so this bounds the client-chosen side of
+/// the map to a few megabytes.
+pub const MAX_CLIENT_KEYED_WINDOWS: usize = 10_000;
 
 #[cfg(test)]
 mod tests {
@@ -498,12 +528,12 @@ mod tests {
     #[test]
     fn a_credential_key_hashes_and_folds_into_its_route_overflow() {
         let key = LimitKey::for_credential("r1", "sk-secret");
-        assert!(key.is_credential());
+        assert!(key.is_client_keyed());
         assert!(!key.to_string().contains("sk-secret"));
-        let overflow = key.credential_overflow();
+        let overflow = key.client_overflow();
         assert_eq!(overflow.route(), "r1");
         assert_eq!(overflow.to_string(), "route=r1|cred=overflow");
-        assert!(!LimitKey::for_tenant("r1", "t").is_credential());
+        assert!(!LimitKey::for_tenant("r1", "t").is_client_keyed());
         let _ = usage(1, 1);
     }
 }
