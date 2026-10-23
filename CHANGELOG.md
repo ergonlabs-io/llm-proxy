@@ -46,6 +46,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Fixed
 
+- When the proxy rewrites a request body, it now forwards every field it does
+  not change exactly as the client sent it. This applies to the forced
+  `stream_options.include_usage`, `request_field_policy.strip` and the
+  provider model rewrite. Before, these rewrites re-encoded every number: an
+  integer above the 64-bit range (a large `seed`, for example) reached the
+  provider as a float, and a decimal with more than 17 significant digits
+  was rounded. Found by fuzzing.
+
 - A JSON request body that ends in trailers before its top-level object closes
   is no longer dropped. Before, such a request reached the provider with an
   empty body and no model.
@@ -73,6 +81,25 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 - The `llmproxy_metadata_dropped{reason="drained_after_close"}` series. A write
   failure no longer closes the records lane, so nothing is drained unwritten.
+
+### Security
+
+- Dependency updates for RustSec advisories, lock file only:
+  - `h2` 0.4.20 (RUSTSEC-2026-0258): a downstream HTTP/2 client could queue
+    empty DATA frames without limit.
+  - `rustls` 0.23.46 (RUSTSEC-2026-0285, RUSTSEC-2026-0349): TLS 1.3 handshake
+    messages accepted across key changes, and an unauthenticated ServerHello
+    could downgrade later upstream connections to classical key exchange.
+    RUSTSEC-2026-0346 and RUSTSEC-2026-0348 are also fixed; the proxy does not
+    use the affected session-store `Debug` output or the `brotli` feature.
+  - `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382): upstream certificate
+    verification could accept paths through distrusted emSign intermediates.
+  - `tokio` 1.54.1 (RUSTSEC-2026-0386). The proxy does not use `AsyncFd`.
+- CI checks every pull request and push to `main` with `cargo-deny`
+  (`make deny-check`, policy in `deny.toml`). The three advisories it ignores,
+  each with its reason in `deny.toml`: `rsa` (RUSTSEC-2023-0071, test code
+  only), and the unmaintained `rustls-pemfile` (RUSTSEC-2025-0134) and
+  `unsafe-libyaml` (RUSTSEC-2024-0449).
 
 ## [0.7.0] - 2026-10-22
 

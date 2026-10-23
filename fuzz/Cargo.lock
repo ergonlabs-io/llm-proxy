@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-admin"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-api"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "prost",
  "prost-reflect",
@@ -1318,17 +1318,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "proxy-capture-protocol"
-version = "0.5.0"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "proxy-capture-spool"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "redb",
  "ring",
@@ -1338,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-cluster"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1361,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-config"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1382,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-control"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1405,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1421,6 +1412,7 @@ dependencies = [
  "proxy-http",
  "proxy-observability",
  "proxy-xds",
+ "rand",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -1436,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-credentials"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "proxy-observability",
  "zeroize",
@@ -1444,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-filters"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1476,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-http"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1499,11 +1491,12 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
 name = "proxy-observability"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1515,7 +1508,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proxy-api",
- "proxy-capture-protocol",
  "proxy-capture-spool",
  "rand",
  "ring",
@@ -1524,7 +1516,6 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
- "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -1535,9 +1526,10 @@ dependencies = [
 
 [[package]]
 name = "proxy-simple-config"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
+ "http",
  "proxy-config",
  "regex",
  "serde",
@@ -1548,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-xds"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "futures",
  "prost",
@@ -2634,6 +2626,12 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

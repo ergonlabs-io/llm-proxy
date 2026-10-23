@@ -109,6 +109,9 @@ fn print(format: &FormatString) -> String {
             FormatOp::UpstreamHost => "UPSTREAM_HOST",
             FormatOp::UpstreamCluster => "UPSTREAM_CLUSTER",
             FormatOp::DownstreamRemoteAddress => "DOWNSTREAM_REMOTE_ADDRESS",
+            FormatOp::DownstreamRemoteAddressWithoutPort => {
+                "DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT"
+            }
             FormatOp::LlmInputTokens => "LLM_INPUT_TOKENS",
             FormatOp::LlmCachedTokens => "LLM_CACHED_TOKENS",
             FormatOp::LlmCacheCreationTokens => "LLM_CACHE_CREATION_TOKENS",
@@ -125,6 +128,7 @@ fn print(format: &FormatString) -> String {
             FormatOp::LlmUserId => "LLM_USER_ID",
             FormatOp::LlmRequestedModel => "LLM_REQUESTED_MODEL",
             FormatOp::LlmResolvedModel => "LLM_RESOLVED_MODEL",
+            FormatOp::LlmGuardrail => "LLM_GUARDRAIL",
             FormatOp::LlmSelectedModel => "LLM_SELECTED_MODEL",
             FormatOp::LlmServedModel => "LLM_SERVED_MODEL",
             FormatOp::LlmUpstreamId => "LLM_UPSTREAM_ID",
@@ -187,6 +191,7 @@ fn context<'a>(
         llm_user_id: Some("user-1"),
         llm_requested_model: Some("gpt-4o"),
         llm_resolved_model: None,
+        llm_guardrail: Some("allowed"),
         llm_selected_model: Some("gpt-4o"),
         llm_served_model: Some("gpt-4o-2024-08-06"),
         llm_upstream_id: Some("chatcmpl-1"),

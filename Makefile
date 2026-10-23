@@ -388,6 +388,17 @@ deps-check: ## Fail on an unused dependency or an edge against the layering tabl
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_check_deps.py
 	python3 scripts/check-deps.py
 
+# cargo-deny checks the lock file against the RustSec advisory database, plus
+# licenses, bans and sources; the policy and every ignored advisory's reason
+# are in deny.toml. The Advisories workflow pins the same version.
+CARGO_DENY_VERSION := 0.20.2
+
+.PHONY: deny-check
+deny-check: ## Fail on a dependency advisory, license, ban or source outside deny.toml (cargo-deny)
+	@cargo deny --version 2>/dev/null | grep -qx 'cargo-deny $(CARGO_DENY_VERSION)' || { \
+		echo "need cargo-deny $(CARGO_DENY_VERSION): cargo install cargo-deny@$(CARGO_DENY_VERSION) --locked" >&2; exit 1; }
+	cargo deny check
+
 .PHONY: version-check
 version-check: ## Fail if VERSION differs from the workspace version in Cargo.toml
 	@cargo_v=$$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml); \
@@ -480,6 +491,14 @@ FUZZ_TOOLCHAIN ?= nightly
 .PHONY: fuzz-build
 fuzz-build: ## Build every fuzz target (nightly + cargo-fuzz)
 	cargo +$(FUZZ_TOOLCHAIN) fuzz build
+
+# fuzz/ is outside the workspace, so `make ci` never compiles it and an API
+# change in a crate can break a target unnoticed until the scheduled run. This
+# type-checks every target on the stable toolchain, without cargo-fuzz or
+# sanitizers; the Fuzz build workflow runs it on every pull request.
+.PHONY: fuzz-check
+fuzz-check: ## Type-check every fuzz target on stable (no nightly or cargo-fuzz needed)
+	cargo check --manifest-path fuzz/Cargo.toml --bins
 
 .PHONY: fuzz
 fuzz: ## Run every fuzz target for FUZZ_SECONDS each (default 300)

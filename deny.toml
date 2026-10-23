@@ -1,0 +1,61 @@
+# cargo-deny policy for the root workspace (`make deny`, and the Advisories
+# workflow on every pull request and push to main). The tool version is pinned
+# in the Makefile and the workflow; bump both together.
+#
+# fuzz/ is its own workspace with its own lock file and is not checked here.
+# It builds only on nightly from the crates in this workspace, so a vulnerable
+# crate that matters reaches this lock file first.
+
+[graph]
+# Include optional dependencies (the mimalloc allocator feature, for one), so
+# a crate that only an opt-in build links is still checked. No `targets` list,
+# so every platform's dependencies are checked.
+all-features = true
+
+[advisories]
+# Vulnerabilities, unsound and unmaintained crates all fail the check. An
+# entry below silences one advisory and must say why it does not apply or
+# why it cannot be fixed yet.
+yanked = "deny"
+ignore = [
+    # rsa: Marvin timing side channel, no patched release. Only test code
+    # depends on rsa (dev-dependencies in proxy, proxy-cluster, proxy-config,
+    # proxy-filters, proxy-simple-config) to parse a committed test key and
+    # sign test tokens. No production build links it; the JWT verifier checks
+    # RSA signatures through ring via jsonwebtoken.
+    { id = "RUSTSEC-2023-0071", reason = "dev-dependency only; production RSA goes through ring" },
+    # rustls-pemfile: unmaintained, not vulnerable. Its PEM parsing is the
+    # code in rustls-pki-types (PemObject); moving the TLS loaders in
+    # proxy-core and proxy-filters to that API removes the dependency.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained, no vulnerability; migration to rustls-pki-types PemObject pending" },
+    # unsafe-libyaml: unmaintained, not vulnerable; reached through
+    # serde_yaml, which parses operator-supplied config files. Replacing the
+    # YAML parser is a change of its own.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no vulnerability; serde_yaml replacement pending" },
+]
+
+[licenses]
+# Every license a dependency uses today, all permissive. A new license fails
+# the check until someone reviews it and adds it here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Duplicate versions are reported, not fatal: most come from the upstream
+# hyper/tonic/rustls graph and cannot be removed here.
+multiple-versions = "warn"
+
+[sources]
+# Crates come from crates.io only.
+unknown-registry = "deny"
+unknown-git = "deny"
