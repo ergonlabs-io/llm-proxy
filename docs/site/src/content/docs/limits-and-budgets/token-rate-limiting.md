@@ -91,12 +91,48 @@ is the safer key.
 
 The proxy never stores or logs the raw header value.
 
+The client chooses its address and its header values, so the proxy limits how
+many it tracks. Each filter chain tracks at most 10000 distinct client
+addresses, header values, and unauthenticated credentials in one window. Past
+that number, new values for one `limits` entry share one bucket, and each
+value that the proxy already tracks keeps its own bucket. The proxy logs one
+warning when this starts.
+
 ### How entries combine
 
 Every entry that applies to a request must pass. If entries share a bucket,
 the proxy merges them and uses the lowest limit, so it counts the request one
 time. An entry with `models` is decided when the proxy has read the request
 body and found the model.
+
+The proxy admits a request against all its limits in one step. A request that
+one limit refuses does not count against the other limits. This includes the
+limits for the tenant and the key. When an entry with `models` applies to the
+request, the proxy counts nothing until it has read the model.
+
+### Requests with no model the proxy can read
+
+The proxy reads the model from a JSON request body. Sometimes it cannot find
+the model:
+
+- The `content-type` of the body is not `application/json`.
+- The `model` key is after the first part of the body that the proxy scans.
+- The body has no `model` key.
+
+On a chat completions, completions, Responses, Messages, embeddings, images,
+audio, or `realtime` request, the proxy then counts the request against every
+entry with `models` that applies to it by `key`. Thus a client cannot avoid a
+limit for one model when it hides the model. As a result, an entry for a
+different model can refuse the request. Send a JSON body with the `model` key
+near its start.
+
+Each such request increments `llmproxy_token_limit_unknown_model_total`. The
+proxy logs a warning at most one time each minute for each filter chain.
+
+A request to an endpoint that names no model is not counted against entries
+with `models`. These endpoints are `GET .../models`, `GET .../usage`,
+`POST .../messages/count_tokens`, batches, files, and paths that the proxy does
+not know.
 
 ## The 429 response
 
@@ -246,7 +282,9 @@ For maintainers. Each behavior above has this source.
 
 - Keyed rules, windows, and refusals:
   `crates/proxy-filters/src/token_limit_filter.rs` (`refuse`, `Refusal`,
-  `admit_buckets`, `admit_policy`).
+  `admit_buckets`, `admit_set`, `admit_scoped`, `UnknownModelLog`).
+- One-step admission and the cap on client-chosen values: `admit_all` and
+  `Buckets::bounded` in `crates/proxy-control/src/window_counter.rs`.
 - Unmetered endpoint refusal: `metered_under_token_limit` in
   `crates/proxy-filters/src/unmetered.rs`.
 - When the dialect adds the filter, and the load error for `key: tenant`
@@ -258,7 +296,13 @@ For maintainers. Each behavior above has this source.
   `tenant_tokens_per_minute_charges_actual_usage`,
   `header_authorization_buckets_per_key_even_with_auth`,
   `concurrent_sessions_holds_a_slot_while_a_response_is_in_flight`,
-  `models_scope_limits_only_matching_models`);
+  `models_scope_limits_only_matching_models`,
+  `a_body_not_sent_as_json_counts_against_every_model_scoped_limit`);
+  `token_limit_filter.rs` tests
+  (`an_unknown_model_counts_against_every_scoped_rule_and_warns_once`,
+  `header_values_past_the_cap_share_one_overflow_bucket_per_rule`,
+  `a_scoped_refusal_spends_no_tenant_or_key_request_quota`,
+  `a_keyed_rule_refusal_spends_no_tenant_or_key_request_quota`);
   `crates/proxy/tests/shared_limits_redis_e2e.rs`
   (`redis_two_processes_share_tenant_and_key_stream_ceilings_and_a_killed_replica_releases`);
   `crates/proxy/tests/trusted_hops_e2e.rs`.

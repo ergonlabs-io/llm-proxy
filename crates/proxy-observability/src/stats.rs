@@ -1297,6 +1297,16 @@ pub mod instruments {
         attribute_keys: &["endpoint", "control"],
         buckets: None,
     };
+    /// Requests on a model endpoint that reached `llmproxy.token_limit`'s
+    /// model-scoped rules with no model the proxy could read, and so were
+    /// counted against every scoped rule that applies to them.
+    pub const TOKEN_LIMIT_UNKNOWN_MODEL: Instrument = Instrument {
+        name: "llmproxy_token_limit_unknown_model_total",
+        kind: InstrumentKind::Counter,
+        unit: "{request}",
+        attribute_keys: &[],
+        buckets: None,
+    };
     /// ADR-0009 decision 7, the other side: micro-USD of spend charges in
     /// committed ledger entries (entries with charged scopes). Equal to
     /// [`SPEND_CHARGED`] unless entries were lost or served under `admit`.

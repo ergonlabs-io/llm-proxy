@@ -149,6 +149,13 @@ counts requests that a spend budget or a token limit refused because the
 proxy cannot count their endpoint. See
 [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/#endpoints-a-budget-cannot-count).
 
+### Token-limit requests with no model
+
+`llmproxy_token_limit_unknown_model_total` counts requests with no model the
+proxy could read that a token limit counted against every `limits` entry with
+`models`. See
+[Token rate limiting](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/#requests-with-no-model-the-proxy-can-read).
+
 ### Unknown names
 
 A recorder that gets a cluster or listener name with no resolved handle does

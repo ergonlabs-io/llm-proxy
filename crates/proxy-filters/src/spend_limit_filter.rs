@@ -21,7 +21,6 @@
 //! endpoints (`GET .../models`, `GET .../usage`,
 //! `POST .../messages/count_tokens`) pass without a missing-usage warning.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -46,6 +45,7 @@ use proxy_observability::ResponseFlag;
 use crate::auth::{KeyId, TenantId};
 use crate::auth_filter;
 use crate::control::{ControlPlane, ControlPlaneSnapshot};
+use crate::repeat_warner::{Due, RepeatWarner};
 use crate::spend::{
     self, Charge, KeyBudget, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy,
     SpendAccumulator,
@@ -488,53 +488,47 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
     }
 }
 
-/// Warns, at most once per key per [`Self::REPEAT_INTERVAL`], when a
-/// budget actually applied to a request but its usage could not be read at
-/// encode time -- see the module doc's "Loud on unreadable usage" section.
-/// Mirrors `token_limit_filter::UsageMissingWarner` structurally; kept as a
-/// separate type because it dedups on [`KeyId`], not `token_limit`'s
-/// `LimitKey`, and needs no credential hashing (see the module doc for why).
+/// Warns, at most once per key per [`crate::repeat_warner::REPEAT_INTERVAL`],
+/// when a budget actually applied to a request but its usage could not be
+/// read at encode time -- see the module doc's "Loud on unreadable usage"
+/// section. Shares [`RepeatWarner`] with `token_limit_filter`'s warner; this
+/// one dedups on [`KeyId`] and needs no credential hashing (see the module
+/// doc for why).
 struct UsageMissingWarner {
-    last_warned: Mutex<HashMap<KeyId, Instant>>,
+    warner: RepeatWarner<KeyId>,
 }
 
 impl UsageMissingWarner {
-    /// See `token_limit_filter::UsageMissingWarner::REPEAT_INTERVAL`'s doc
-    /// for why this repeats rather than warning once ever.
-    const REPEAT_INTERVAL: Duration = Duration::from_secs(60);
+    /// How many keys the warner remembers at once, per chain.
+    const MAX_TRACKED_KEYS: usize = 1024;
 
     fn new() -> Self {
         UsageMissingWarner {
-            last_warned: Mutex::new(HashMap::new()),
+            warner: RepeatWarner::new(Self::MAX_TRACKED_KEYS),
         }
     }
 
     fn warn_if_due(&self, key_id: &KeyId, now: Instant) {
-        // Rust note: `unwrap_or_else(PoisonError::into_inner)` recovers from
-        // a poisoned lock rather than panicking -- same convention as
-        // `token_limit_filter::UsageMissingWarner::warn_if_due`.
-        let mut last_warned = self
-            .last_warned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let due = match last_warned.get(key_id) {
-            Some(&last) => now.saturating_duration_since(last) >= Self::REPEAT_INTERVAL,
-            None => true,
-        };
-        if !due {
-            return;
+        match self.warner.check(key_id, now) {
+            Due::Suppressed => {}
+            Due::Overflow => tracing::warn!(
+                tracked_keys = Self::MAX_TRACKED_KEYS,
+                "spend_limit: a key's spend budget was NOT enforced for a request and nothing \
+                 was charged against it -- usage could not be extracted from the response. More \
+                 keys hit this within the last minute than are tracked individually, so this \
+                 line stands for all of the untracked ones and repeats at most once a minute. \
+                 The most likely cause is that the llmproxy.usage filter's configured `dialect` \
+                 does not match this provider's actual response shape; check that first."
+            ),
+            Due::Key => tracing::warn!(
+                key_id = key_id.as_str(),
+                "spend_limit: this key's spend budget was NOT enforced for this request and \
+                 nothing was charged against it -- usage could not be extracted from the response \
+                 (StreamInfo::llm.usage was None). The most likely cause is that the llmproxy.usage \
+                 filter's configured `dialect` does not match this provider's actual response shape \
+                 for this route; check that first."
+            ),
         }
-        last_warned.insert(key_id.clone(), now);
-        drop(last_warned);
-
-        tracing::warn!(
-            key_id = key_id.as_str(),
-            "spend_limit: this key's spend budget was NOT enforced for this request and \
-             nothing was charged against it -- usage could not be extracted from the response \
-             (StreamInfo::llm.usage was None). The most likely cause is that the llmproxy.usage \
-             filter's configured `dialect` does not match this provider's actual response shape \
-             for this route; check that first."
-        );
     }
 }
 
@@ -1485,7 +1479,7 @@ mod tests {
         /// `is_empty`.
         fn set_tenant_mode(&self) {
             let mut info = self.stream_info.borrow_mut();
-            let mut by_provider = HashMap::new();
+            let mut by_provider = std::collections::HashMap::new();
             by_provider.insert(
                 "provider-x".to_owned(),
                 TenantCredential::Usable(TenantSecret::new("test-secret".to_owned())),
