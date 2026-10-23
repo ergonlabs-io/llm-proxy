@@ -329,6 +329,38 @@ fn normalize_admin_token(token: Option<String>) -> Option<String> {
     }
 }
 
+/// Pause after a failed admin `accept()`.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// At most one accept-failure warning per interval, so fd exhaustion cannot
+/// flood the log (AGENTS.md "Fail-open controls").
+const ACCEPT_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Rate limit for the admin accept-failure warning. Touched only after an
+/// accept fails.
+#[derive(Default)]
+struct AcceptWarnings {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl AcceptWarnings {
+    /// `Some(n)` when a warning is due now, `n` being the failures suppressed
+    /// since the previous one; `None` inside the interval.
+    fn should_warn(&mut self, now: Instant) -> Option<u64> {
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < ACCEPT_WARN_INTERVAL => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
 /// Binds `addr` and starts answering admin requests on the control runtime.
 ///
 /// `config` is read per request via `load()`, an `Arc` clone of the last published snapshot (ADR-0005's
@@ -354,11 +386,24 @@ pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServe
         .map_err(|source| AdminError::Bind { addr, source })?;
 
     let accept_task = tokio::spawn(async move {
+        let mut accept_warnings = AcceptWarnings::default();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(err) => {
-                    tracing::warn!(error = %err, "admin server: accept failed, continuing");
+                    if let Some(suppressed) = accept_warnings.should_warn(Instant::now()) {
+                        tracing::warn!(
+                            error = %err,
+                            suppressed,
+                            "admin server: accept failed; retrying after a pause, and repeats in \
+                             the next {}s are suppressed",
+                            ACCEPT_WARN_INTERVAL.as_secs()
+                        );
+                    }
+                    // A persistent error (EMFILE/ENFILE) leaves the listener
+                    // readable, so an immediate retry would spin the control
+                    // runtime. Same pause as the data-plane accept loop.
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
             };

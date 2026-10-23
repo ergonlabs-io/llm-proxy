@@ -857,19 +857,6 @@ pub mod instruments {
     /// The record failed schema validation (a producer bug, not load).
     pub const METADATA_ADMISSION_INVALID: &str = "invalid";
 
-    /// Records that were admitted (counted `accepted`) and later discarded by
-    /// the collector without being written. Without this a biller sees
-    /// `accepted` exceed `written + write_failures` with no explanation.
-    pub const METADATA_DROPPED: Instrument = Instrument {
-        name: "llmproxy_metadata_dropped",
-        kind: InstrumentKind::Counter,
-        unit: "{record}",
-        attribute_keys: &["reason"],
-        buckets: None,
-    };
-    /// Queued behind a failed write after the file lane closed.
-    pub const METADATA_DROPPED_DRAINED_AFTER_CLOSE: &str = "drained_after_close";
-
     /// Access-log lines a destination failed to write or flush (disk full,
     /// closed pipe). Distinct from `ACCESS_LOG_DROPPED_LINES`, which counts
     /// queue overflow. **No Envoy equivalent**; Prometheus and OTLP only.
@@ -1428,7 +1415,6 @@ pub struct MetadataDeliveryStats {
     oversize: Handle,
     invalid: Handle,
     closed: Handle,
-    drained_after_close: Handle,
     queue_depth: Handle,
     queue_capacity: Handle,
     written: Handle,
@@ -1461,10 +1447,6 @@ impl MetadataDeliveryStats {
             closed: control.resolve(
                 &instruments::METADATA_ADMISSION,
                 &[("outcome", instruments::METADATA_ADMISSION_CLOSED)],
-            ),
-            drained_after_close: control.resolve(
-                &instruments::METADATA_DROPPED,
-                &[("reason", instruments::METADATA_DROPPED_DRAINED_AFTER_CLOSE)],
             ),
             queue_depth: control.resolve(&instruments::METADATA_QUEUE_DEPTH, &[]),
             queue_capacity: control.resolve(&instruments::METADATA_QUEUE_CAPACITY, &[]),
@@ -1508,12 +1490,6 @@ impl MetadataDeliveryStats {
         }
     }
 
-    /// Lifecycle point: an already-accepted record discarded unwritten after
-    /// the file lane closed on a write failure.
-    pub fn record_drained_after_close(&self) {
-        self.registry.incr(WorkerId(0), self.drained_after_close, 1);
-    }
-
     /// After obtaining a channel permit, before publishing the record. This
     /// ordering prevents dequeue from subtracting an unpublished increment.
     pub fn record_enqueued(&self) {
@@ -1521,7 +1497,7 @@ impl MetadataDeliveryStats {
     }
 
     /// Lifecycle point: immediately after the collector removes a record from
-    /// the bounded channel, including records discarded after a write failure.
+    /// the bounded channel.
     pub fn record_dequeued(&self) {
         self.registry.add(WorkerId(0), self.queue_depth, -1);
     }

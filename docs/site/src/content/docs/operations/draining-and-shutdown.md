@@ -3,7 +3,7 @@ title: Draining and shutdown
 description: "Stop the proxy without dropping in-flight requests: drain on SIGTERM and the shutdown sequence."
 summary: What SIGTERM, SIGINT, and POST /drain_listeners do, how /ready
   changes, and what the drain deadline cuts.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-23
 related:
   - operations/config-reload
   - operations/deployment
@@ -88,6 +88,19 @@ status `1`.
 The same holds at any point after the first signal, including while telemetry
 is being flushed: a second `SIGTERM` or `SIGINT` abandons the remaining flushes
 and exits promptly with status `1`.
+
+## A signal during startup
+
+The proxy can wait at startup before it binds its listeners. In Envoy mode
+with `dynamic_resources`, it waits for the first response of the control
+plane, for at most `initial_fetch_timeout` (default 15 seconds).
+
+- A `SIGTERM` or `SIGINT` in that wait stops the proxy at once. No listener
+  was bound, so there is nothing to drain. The proxy flushes its logs and
+  telemetry as at any exit and exits `0`.
+- A `SIGTERM` or `SIGINT` while the workers bind their listeners starts the
+  normal drain. A listener that is already bound drains like any other.
+- A `SIGHUP` at startup waits until startup is done, then reloads.
 
 ## Admin endpoints
 

@@ -390,25 +390,58 @@ static_resources:
 
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
     if fail_collector {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let scrape = get(admin_addr, "/stats/prometheus", "admin.local");
-            if scrape.contains("envoy_llmproxy_metadata_write_failures 1") {
-                break;
+        // Every append past the one-block limit fails, so the lane stays
+        // broken: each later record is still admitted and tried again.
+        // Waits until the writer has dealt with `records` records, and
+        // returns how many of them failed.
+        let failures_after = |records: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let scrape = get(admin_addr, "/stats/prometheus", "admin.local");
+                let failed = metric(&scrape, "envoy_llmproxy_metadata_write_failures");
+                let written = metric(&scrape, "envoy_llmproxy_metadata_written");
+                if failed + written >= records {
+                    return failed;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the collector never handled {records} records: {scrape}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
             }
+        };
+        let before = failures_after(2);
+        assert!(before >= 1, "the one-block limit must fail a write");
+        // The failure is logged while the process runs, not only at exit.
+        let mut stderr_lines = drain_available_lines(&rx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !stderr_lines
+            .iter()
+            .any(|line| line.contains("request_records_write_failed"))
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "collector never reported its write failure: {scrape}"
+                "no write-failure line before shutdown: {stderr_lines:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
+            stderr_lines.extend(drain_available_lines(&rx));
         }
         assert!(get(listener_addr, "/after-failure", "test.local").starts_with("HTTP/1.1 200"));
+        let after = failures_after(3);
+        assert_eq!(
+            after,
+            before + 1,
+            "the post-failure record was admitted and tried"
+        );
         assert!(get(admin_addr, "/ready", "admin.local").starts_with("HTTP/1.1 200"));
         let scrape = get(admin_addr, "/stats/prometheus", "admin.local");
-        assert!(
-            scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"closed\"} 1")
-                || scrape.contains("envoy_llmproxy_metadata_admission{outcome=\"closed\"} 2"),
-            "the post-failure request must encounter closed capture admission: {scrape}"
+        assert_eq!(
+            metric(
+                &scrape,
+                "envoy_llmproxy_metadata_admission{outcome=\"closed\"}"
+            ),
+            0,
+            "a write failure must not close capture admission: {scrape}"
         );
         assert!(scrape.contains("envoy_llmproxy_metadata_queue_depth 0"));
         // The exit summary reports the loss loudly (ADR-0011 decision 2).
@@ -417,7 +450,7 @@ static_resources:
             .status();
         let summary = summary_line(&rx);
         assert!(summary.contains("WARN"), "{summary}");
-        assert!(summary.contains("failed=1"), "{summary}");
+        assert!(summary.contains(&format!("failed={after}")), "{summary}");
         drop(child);
         let _ = std::fs::remove_file(&records_path);
         let _ = std::fs::remove_file(&config_path);
@@ -541,6 +574,15 @@ static_resources:
 
 /// The `metadata_delivery_summary` line from the proxy's stderr, with ANSI
 /// styling removed. Reads until the line arrives or stderr closes (bounded).
+/// The value of one Prometheus series in `scrape`; 0 when it is absent.
+fn metric(scrape: &str, series: &str) -> u64 {
+    scrape
+        .lines()
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '))
+        .map(|value| value.trim().parse().unwrap())
+        .unwrap_or(0)
+}
+
 fn summary_line(rx: &mpsc::Receiver<String>) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut seen = String::new();

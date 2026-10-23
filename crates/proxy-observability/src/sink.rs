@@ -419,6 +419,60 @@ pub fn flush_all_queued(timeout: Duration) -> bool {
     all
 }
 
+/// Reopen the destination of every live [`QueuedSink`]: SIGUSR1 after
+/// logrotate renamed the files. Each reopen is queued behind the lines before
+/// it, so those still reach the old file. Waits at most `timeout` overall.
+/// Returns how many destinations reopened, and the label and error of each
+/// that failed or did not answer in time. stdout and stderr reopen as a no-op.
+/// Control paths only.
+pub fn reopen_all_queued(timeout: Duration) -> (usize, Vec<(String, io::Error)>) {
+    let live: Vec<Arc<QueueShared>> = {
+        let mut guard = LIVE_QUEUES
+            .lock()
+            .expect("lock poisoned: a holder panicked");
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(Weak::upgrade).collect()
+    };
+    reopen_queues(&live, timeout)
+}
+
+/// [`reopen_all_queued`] over a given set of queues. Enqueues every reopen
+/// first, so slow destinations reopen in parallel.
+fn reopen_queues(
+    live: &[Arc<QueueShared>],
+    timeout: Duration,
+) -> (usize, Vec<(String, io::Error)>) {
+    let acks: Vec<(&str, mpsc::Receiver<io::Result<()>>)> = live
+        .iter()
+        .filter_map(|q| {
+            let (tx, rx) = mpsc::channel();
+            q.submit_control(Item::Reopen(tx))
+                .then_some((q.label.as_str(), rx))
+        })
+        .collect();
+    let deadline = Instant::now() + timeout;
+    let mut reopened = 0;
+    let mut failed = Vec::new();
+    for (label, rx) in acks {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Ok(())) => reopened += 1,
+            Ok(Err(err)) => failed.push((label.to_string(), err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => failed.push((
+                label.to_string(),
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "access-log writer did not service reopen in time",
+                ),
+            )),
+            // The writer exited after draining: its sink is gone, so there
+            // is nothing left to reopen.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    }
+    (reopened, failed)
+}
+
 impl QueueShared {
     /// Queue a control item. `false` if the writer thread has already gone.
     fn submit_control(&self, item: Item) -> bool {
@@ -1064,6 +1118,59 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&renamed).unwrap();
+    }
+
+    #[test]
+    fn reopen_all_moves_a_file_sink_to_a_fresh_file() {
+        let path = temp_path("reopen-all");
+        let renamed = temp_path("reopen-all-renamed");
+        let sink = QueuedSink::new("reopen-all", Arc::new(FileSink::new(&path).unwrap())).unwrap();
+        sink.write_line("before rotate\n");
+        sink.flush();
+        std::fs::rename(&path, &renamed).unwrap();
+        sink.write_line("queued before reopen\n");
+
+        // Only this test's queue: `cargo test` shares `LIVE_QUEUES` across
+        // tests, and a reopen queued on another test's gated sink would
+        // stall that test.
+        let (reopened, failed) =
+            reopen_queues(std::slice::from_ref(&sink.shared), Duration::from_secs(5));
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(reopened, 1);
+        sink.write_line("after rotate\n");
+        sink.flush();
+
+        assert_eq!(read_to_string(&path), "after rotate\n");
+        assert_eq!(
+            read_to_string(&renamed),
+            "before rotate\nqueued before reopen\n"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&renamed).unwrap();
+    }
+
+    #[test]
+    fn reopen_all_names_the_destination_that_failed() {
+        struct FailingReopen;
+        impl AccessLogWriter for FailingReopen {
+            fn write_line(&self, _: &str) {}
+            fn flush(&self) {}
+            fn reopen(&self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope"))
+            }
+        }
+        let failing = QueuedSink::new("failing", Arc::new(FailingReopen)).unwrap();
+        let path = temp_path("reopen-all-ok");
+        let healthy = QueuedSink::new("healthy", Arc::new(FileSink::new(&path).unwrap())).unwrap();
+        let (reopened, failed) = reopen_queues(
+            &[failing.shared.clone(), healthy.shared.clone()],
+            Duration::from_secs(5),
+        );
+        assert_eq!(reopened, 1, "one failure does not stop the others");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].0, "failing");
+        assert_eq!(failed[0].1.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

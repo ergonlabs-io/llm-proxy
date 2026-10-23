@@ -127,8 +127,7 @@ The request-records file records its own metrics. They are in
 each is on [Request capture](/docs/llm-proxy/observability/request-capture/).
 
 - Record admission and the writer queue: `llmproxy_metadata_admission`
-  (label `outcome`), `llmproxy_metadata_dropped` (label `reason`),
-  `llmproxy_metadata_queue_depth`, `llmproxy_metadata_queue_capacity`,
+  (label `outcome`), `llmproxy_metadata_queue_depth`, `llmproxy_metadata_queue_capacity`,
   `llmproxy_metadata_written`, `llmproxy_metadata_write_failures`.
 
 ### Ledger metrics
