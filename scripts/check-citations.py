@@ -40,7 +40,6 @@ SCANNED = [
 ]
 
 EXCLUDED = (
-    "scripts/board-templates/",  # board data: WP IDs are the content
     "scripts/check-citations.py",  # this file names the patterns
 )
 

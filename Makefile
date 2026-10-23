@@ -347,18 +347,6 @@ qa-tidy: ## go mod tidy for the Go QA suite
 vendor-protos: ## Re-vendor the pinned Envoy protos (see scripts/vendor-protos.sh)
 	./scripts/vendor-protos.sh
 
-# ------------------------------------------------------------------- boards --
-# Tracking artifacts are GENERATED. Edit internal-docs/boards/*.yaml, never the HTML --
-# the HTML is overwritten by `make boards` and any hand edit is lost.
-
-.PHONY: boards
-boards: ## Render the build board + release tracker from internal-docs/boards/*.yaml
-	python3 scripts/render-boards.py
-
-.PHONY: boards-check
-boards-check: ## Fail if the rendered HTML has drifted from the YAML
-	python3 scripts/render-boards.py --check
-
 # ------------------------------------------------------------ dialect schema --
 # schema/llmproxy-v0.schema.json is normative for the --config dialect
 # (AGENTS.md "Architecture Invariants", 5). The gate tests run in every
