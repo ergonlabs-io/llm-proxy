@@ -1,0 +1,35 @@
+# Type-checks every fuzz target (`make fuzz-check`) on every pull request and
+# push to main. fuzz/ is its own workspace, so the CI workflow never compiles
+# it, and a crate API change can otherwise break a target unnoticed until the
+# scheduled Fuzz workflow fails to build. Stable toolchain, no cargo-fuzz:
+# this catches compile errors only; fuzz.yml does the fuzzing.
+name: Fuzz build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz-check
+      - name: Type-check fuzz targets
+        run: make fuzz-check

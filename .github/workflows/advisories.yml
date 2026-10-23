@@ -1,0 +1,36 @@
+# Dependency advisories. Runs cargo-deny (`make deny-check`) against the root
+# lock file on every pull request and push to main: RustSec advisories
+# (vulnerable, unsound, unmaintained and yanked crates), licenses, bans and
+# sources. Policy and the reason for each ignored advisory are in deny.toml.
+#
+# The advisory database changes without a commit here, so a green PR can go
+# red on main when a new advisory lands. The fix is a lock-file bump or a
+# reasoned ignore in deny.toml, not a retry.
+name: Advisories
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@v2
+        with:
+          # Same version as CARGO_DENY_VERSION in the Makefile.
+          tool: cargo-deny@0.20.2
+      - name: cargo-deny check
+        run: make deny-check

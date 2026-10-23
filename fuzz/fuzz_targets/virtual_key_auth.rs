@@ -46,6 +46,7 @@ fuzz_target!(|data: &[u8]| {
             key_id: KeyId::new("key-1"),
             tenant: TenantId::new("tenant-a"),
             revoked: false,
+            tags: Default::default(),
         },
     );
     keys.insert(
@@ -55,6 +56,7 @@ fuzz_target!(|data: &[u8]| {
             key_id: KeyId::new("key-revoked"),
             tenant: TenantId::new("tenant-a"),
             revoked: true,
+            tags: Default::default(),
         },
     );
     let authenticator = VirtualKeyAuthenticator::from_static_keys(HmacSecret::new(SECRET), keys);

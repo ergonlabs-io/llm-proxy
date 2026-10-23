@@ -11,7 +11,7 @@
 //! end-of-stream mutations from encoder filters.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -3192,27 +3192,36 @@ fn reconcile_request_body(
     }
     // Deliberate: when the operator forces usage reporting, a client opt-out
     // does not switch metering off.
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Ok(mut object) = serde_json::from_slice::<RawObject>(body) else {
         return Ok(None);
     };
-    let Some(object) = value.as_object_mut() else {
-        return Ok(None);
+    let unserializable = |_| Refusal::body("request body could not be serialized");
+    let include_usage = serde_json::value::to_raw_value(&true).map_err(unserializable)?;
+    let options = match object
+        .get("stream_options")
+        .and_then(|raw| serde_json::from_str::<RawObject>(raw.get()).ok())
+    {
+        Some(mut options) => {
+            options.insert("include_usage".to_string(), include_usage);
+            options
+        }
+        None => RawObject::from([("include_usage".to_string(), include_usage)]),
     };
-    match object.get_mut("stream_options") {
-        Some(serde_json::Value::Object(options)) => {
-            options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
-        }
-        _ => {
-            object.insert(
-                "stream_options".to_string(),
-                serde_json::json!({"include_usage": true}),
-            );
-        }
-    }
-    serde_json::to_vec(&value)
+    object.insert(
+        "stream_options".to_string(),
+        serde_json::value::to_raw_value(&options).map_err(unserializable)?,
+    );
+    serde_json::to_vec(&object)
         .map(|bytes| Some(Bytes::from(bytes)))
-        .map_err(|_| Refusal::body("request body could not be serialized"))
+        .map_err(unserializable)
 }
+
+/// A JSON object whose member values keep the client's exact bytes, for the
+/// body rewrites. Going through `serde_json::Value` instead turns an integer
+/// outside `i64`/`u64` into a float and can move a long decimal by one ulp,
+/// so a rewrite would change fields it does not name. Keys come out sorted
+/// and a duplicate key keeps its last value, as with `Value`.
+type RawObject = BTreeMap<String, Box<serde_json::value::RawValue>>;
 
 /// Why the selected cluster's body preparation refused the request.
 enum BodyRefusal {
@@ -3310,11 +3319,13 @@ fn prepare_attempt_body(
         return Ok(body.clone());
     }
 
-    let mut value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|err| BodyRefusal::Invalid(format!("request body is not valid JSON: {err}")))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| BodyRefusal::Invalid("request body must be a JSON object".to_string()))?;
+    let mut object: RawObject = serde_json::from_slice(body).map_err(|err| {
+        BodyRefusal::Invalid(match err.classify() {
+            // Valid JSON of another type.
+            serde_json::error::Category::Data => "request body must be a JSON object".to_string(),
+            _ => format!("request body is not valid JSON: {err}"),
+        })
+    })?;
     if must_strip {
         if let Some(policy) = policy {
             for field in &policy.strip {
@@ -3323,7 +3334,10 @@ fn prepare_attempt_body(
         }
     }
     if let (Some(requested_model), Some(upstream_model)) = (requested_model, upstream_model) {
-        match object.get("model").and_then(serde_json::Value::as_str) {
+        let model = object
+            .get("model")
+            .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
+        match model {
             Some(model) if model == requested_model => {}
             Some(_) => {
                 return Err(BodyRefusal::Invalid(
@@ -3336,12 +3350,12 @@ fn prepare_attempt_body(
                 ))
             }
         }
-        object.insert(
-            "model".to_string(),
-            serde_json::Value::String(upstream_model.to_string()),
-        );
+        let upstream_model = serde_json::value::to_raw_value(upstream_model).map_err(|err| {
+            BodyRefusal::Invalid(format!("request body could not be serialized: {err}"))
+        })?;
+        object.insert("model".to_string(), upstream_model);
     }
-    serde_json::to_vec(&value)
+    serde_json::to_vec(&object)
         .map(Bytes::from)
         .map_err(|err| BodyRefusal::Invalid(format!("request body could not be serialized: {err}")))
 }
@@ -4811,6 +4825,52 @@ mod tests {
             reconcile_request_body(&over, None, true, Some(100), Endpoint::ChatCompletions)
                 .is_err()
         );
+    }
+
+    /// Both body rewrites forward every field they do not name as the client
+    /// wrote it. Through `serde_json::Value`, an integer past `u64` became a
+    /// float and a long decimal could move by one ulp.
+    #[test]
+    fn body_rewrites_keep_unnamed_fields_byte_exact() {
+        const FIELDS: [&str; 3] = [
+            r#""seed":18446744073709551616"#,
+            r#""temperature":0.1000000000000000055511151231257827"#,
+            r#""x":77000000000000000000000000000006040730264889662229"#,
+        ];
+        let fields = FIELDS.join(",");
+        let forced = reconcile_request_body(
+            &Bytes::from(format!(r#"{{"stream":true,{fields}}}"#)),
+            None,
+            true,
+            None,
+            Endpoint::ChatCompletions,
+        )
+        .unwrap()
+        .expect("usage is forced on a streaming body");
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "fast-*".to_string(),
+                upstream_model: "provider-fast-v2".to_string(),
+            }],
+            policy(&[], &["user"]),
+        );
+        let attempt = prepare_attempt_body(
+            Some(&runtime),
+            Some("fast-alias"),
+            None,
+            &Bytes::from(format!(r#"{{"model":"fast-alias","user":"u",{fields}}}"#)),
+        )
+        .unwrap_or_else(|_| panic!("strip and model rewrite must succeed"));
+
+        for (rewrite, body) in [("forced usage", forced), ("attempt", attempt)] {
+            let text = std::str::from_utf8(&body).expect("rewritten body is UTF-8 JSON");
+            for field in FIELDS {
+                assert!(
+                    text.contains(field),
+                    "{rewrite} rewrite changed {field}: {text}"
+                );
+            }
+        }
     }
 
     #[test]
