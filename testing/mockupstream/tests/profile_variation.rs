@@ -12,8 +12,8 @@ use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
 use mockupstream::frames::StreamConfig;
 use mockupstream::handler::{self, AppState};
-use mockupstream::profiles::{DEFAULT_PROFILE, Dist, Profile, ProfileSet};
-use serde_json::{Value, json};
+use mockupstream::profiles::{Dist, Profile, ProfileSet, DEFAULT_PROFILE};
+use serde_json::{json, Value};
 use tokio::io::duplex;
 
 /// Runs an HTTP/1.1 server and Hyper client over an in-memory duplex pipe.

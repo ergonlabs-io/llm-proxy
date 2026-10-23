@@ -280,8 +280,8 @@ fn json_error(status: StatusCode, message: &str) -> Response<ResponseBody> {
 mod tests {
     use super::*;
     use crate::profiles::Dist;
-    use rand::SeedableRng;
     use rand::rngs::SmallRng;
+    use rand::SeedableRng;
 
     fn profile(
         name: &str,
