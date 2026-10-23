@@ -316,6 +316,11 @@ impl CircuitBreakerState {
         Arc::clone(&self.connections.active)
     }
 
+    /// The `max_connections` limit the connections budget enforces.
+    pub(crate) fn max_connections(&self) -> u32 {
+        self.connections.limit
+    }
+
     /// Builds all four budgets from a cluster's lowered [`CircuitBreakerThresholds`].
     pub fn from_thresholds(t: proxy_config::ir::CircuitBreakerThresholds) -> Self {
         let connections = BudgetHandle::new_with_notify(t.max_connections);

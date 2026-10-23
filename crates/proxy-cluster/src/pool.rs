@@ -9,7 +9,7 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,19 +33,35 @@ use crate::{CircuitBreakerState, HttpConnPool, PoolError, UpstreamStream};
 /// Rust note: equality is `Arc::ptr_eq`, and the id holds a strong `Arc` clone. That stops an address from being
 /// freed and reused by a later build while the old id is still in a map.
 #[derive(Clone)]
-pub struct ClusterBuildId(Arc<AtomicU32>);
+pub struct ClusterBuildId {
+    connections: Arc<AtomicU32>,
+    /// The build's `max_connections`, read by [`Self::has_connection_headroom`]. Part of the build, so it never
+    /// differs between two ids that compare equal.
+    max_connections: u32,
+}
 
 impl ClusterBuildId {
     /// The id of the build that owns `breaker`. Pass the budget the cluster's pools charge dials to, or two builds
     /// can collide on one id.
     pub fn of(breaker: &CircuitBreakerState) -> Self {
-        Self(breaker.connections_counter())
+        Self {
+            connections: breaker.connections_counter(),
+            max_connections: breaker.max_connections(),
+        }
+    }
+
+    /// Whether the build's `max_connections` budget has a free slot right now. Advisory: another worker can take
+    /// the slot before a dial claims it. An h2 cache that already holds a connection asks this before dialing
+    /// another, because a dial against a full budget parks in the pending queue (`ConnectPool::new_stream`) while
+    /// the existing connection could carry the stream.
+    pub fn has_connection_headroom(&self) -> bool {
+        self.connections.load(Ordering::Acquire) < self.max_connections
     }
 }
 
 impl PartialEq for ClusterBuildId {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.connections, &other.connections)
     }
 }
 
@@ -55,7 +71,7 @@ impl Hash for ClusterBuildId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Must agree with `eq`: the address, never the counter's value, which
         // changes with every dial.
-        Arc::as_ptr(&self.0).hash(state);
+        Arc::as_ptr(&self.connections).hash(state);
     }
 }
 
@@ -63,7 +79,7 @@ impl fmt::Debug for ClusterBuildId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The derived `Debug` would print the gauge's live value, which says
         // nothing about which build this is.
-        write!(f, "ClusterBuildId({:p})", Arc::as_ptr(&self.0))
+        write!(f, "ClusterBuildId({:p})", Arc::as_ptr(&self.connections))
     }
 }
 
