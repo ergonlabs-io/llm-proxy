@@ -39,33 +39,6 @@ else.
 
 ---
 
-## Why this shape
-
-Two design decisions explain most of the code.
-
-**Real data-plane semantics, not an approximation.** The proxy reads a
-standard proxy bootstrap configuration and speaks xDS — the config format and
-protocol the industry's mainstream data planes use. Response flags, access-log
-operators, retry-on conditions, outlier ejection, cluster warming — these
-follow that ecosystem's documented behaviour rather than a convenient
-reinterpretation of it, so operators who already run one of these data planes
-do not have to learn a second set of rules, and divergences have to be argued
-for in writing.
-
-**A small LLM-native dialect that lowers onto it.** Nobody wants to write a
-full data-plane bootstrap to put a rate limit in front of OpenAI. `--config`
-takes a compact dialect — providers, routes, limits — which lowers to standard
-data-plane resources and then flows through the identical parse → validate → IR
-pipeline as bootstrap mode. `--mode translate` prints exactly what it lowered
-to. The rule that keeps this honest: **a capability must exist in the
-bootstrap-mode surface before the dialect may expose it.** The dialect is a
-front end, never a second config system.
-
-Both surfaces are **strict**. An unknown or misspelled field is an error
-carrying its full dotted path, never a silent no-op — a silently ignored field
-is treated as a P0 bug in this repo, because a limit you think you configured
-and did not is worse than no limit at all.
-
 ## Architecture
 
 ```
@@ -358,9 +331,15 @@ prints the data-plane bootstrap a dialect file lowers to.
 | `--config PATH` | The LLM-native dialect. Always strict. |
 | `-c, --config-path PATH` | A data-plane bootstrap (`.yaml`/`.json`/`.pb`). Strict unless `--permissive`. |
 
-Bootstrap mode is where the full standard surface lives, including
-`dynamic_resources` for xDS. Dialect mode covers the common gateway shape and
-lowers onto it.
+The dialect is a front end, not a second config system. It lowers to standard
+data-plane resources, which then take the same parse, validate and IR path as
+a bootstrap file; `--mode translate` prints the result. The dialect exposes a
+capability only once the bootstrap surface has it. Bootstrap mode carries the
+full standard surface, including `dynamic_resources` for xDS.
+
+Both surfaces are strict. An unknown or misspelled field is an error that
+names its full dotted path, never a silent no-op: a limit you think you
+configured and did not is worse than no limit at all.
 
 ## Modes
 
