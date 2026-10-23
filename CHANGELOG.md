@@ -278,6 +278,10 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Fixed
 
+- `--config`: a `listen.tls` listener now offers ALPN `h2` and `http/1.1`.
+  Before, it offered no ALPN, so the handshake never selected h2. Clients
+  that offer both protocols used HTTP/1.1, and a client that requires h2
+  could not connect.
 - An admin key or tenant write and the policy poller could publish their
   snapshots out of order. The older snapshot then won, and a key revoked
   through the admin API could authenticate again until the next poll

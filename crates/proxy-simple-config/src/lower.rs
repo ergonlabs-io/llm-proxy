@@ -3946,14 +3946,20 @@ fn lower_listener(
 
     let mut filter_chain = json!({ "filters": [hcm] });
     if let Some(tls) = tls {
+        // Offer h2 first, then HTTP/1.1. The HCM's codec is `AUTO`, which
+        // picks the codec from the negotiated ALPN, so without this list
+        // the handshake never selects h2 and an h2-only client is refused.
         filter_chain["transport_socket"] = json!({
             "name": "envoy.transport_sockets.tls",
             "typed_config": {
                 "@type": DOWNSTREAM_TLS_TYPE_URL,
-                "common_tls_context": { "tls_certificates": [ {
-                    "certificate_chain": { "filename": tls.cert_file },
-                    "private_key": { "filename": tls.key_file },
-                } ] }
+                "common_tls_context": {
+                    "tls_certificates": [ {
+                        "certificate_chain": { "filename": tls.cert_file },
+                        "private_key": { "filename": tls.key_file },
+                    } ],
+                    "alpn_protocols": ["h2", "http/1.1"],
+                }
             }
         });
     }

@@ -25,7 +25,7 @@ struct Cli {
     #[arg(long = "downstream-h1-pool-size", default_value_t = 32)]
     downstream_h1_pool_size: usize,
 
-    /// PEM CA bundle for a private TLS target (used by h2 mode).
+    /// PEM CA bundle for a private TLS (https) target, in any mode.
     #[arg(long = "downstream-ca-file")]
     downstream_ca_file: Option<PathBuf>,
 

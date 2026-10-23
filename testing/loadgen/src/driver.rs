@@ -219,7 +219,7 @@ fn request(cfg: &RunConfig, target: &Target) -> Request<Full<Bytes>> {
         .expect("valid request")
 }
 
-fn tls_config(ca_file: Option<&PathBuf>) -> Result<rustls::ClientConfig, ExecError> {
+fn tls_config(ca_file: Option<&PathBuf>, alpn: &[u8]) -> Result<rustls::ClientConfig, ExecError> {
     let mut roots = rustls::RootCertStore::empty();
     if let Some(path) = ca_file {
         let file = std::fs::File::open(path).map_err(|_| ExecError::Transport)?;
@@ -240,21 +240,50 @@ fn tls_config(ca_file: Option<&PathBuf>) -> Result<rustls::ClientConfig, ExecErr
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
 }
 
-async fn new_h1(target: &Target, counters: &TransportCounters) -> Result<H1Sender, ExecError> {
-    if target.tls {
-        return Err(ExecError::Transport);
-    }
+/// Connects with `TCP_NODELAY`, as the proxy does on both of its hops. hyper's
+/// h2 client writes a request's HEADERS and DATA in two writes; with Nagle on,
+/// the DATA waits for the server's ACK of the HEADERS, which a delayed ACK
+/// holds for milliseconds, and loadgen would charge that wait to the target.
+async fn connect_nodelay(target: &Target) -> Result<TcpStream, ExecError> {
     let stream = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .map_err(|_| ExecError::Transport)?;
+    stream.set_nodelay(true).map_err(|_| ExecError::Transport)?;
+    Ok(stream)
+}
+
+/// An HTTP/1.1 connection, over TLS (ALPN `http/1.1`) for an https target,
+/// so a TLS listener can be measured with the same pooled and short modes.
+async fn new_h1(
+    target: &Target,
+    cfg: &TransportConfig,
+    counters: &TransportCounters,
+) -> Result<H1Sender, ExecError> {
+    let stream = connect_nodelay(target).await?;
+    if !target.tls {
+        counters.opened.fetch_add(1, Ordering::Relaxed);
+        return h1_handshake(stream).await;
+    }
+    let server_name =
+        ServerName::try_from(target.host.clone()).map_err(|_| ExecError::Transport)?;
+    let tls = TlsConnector::from(Arc::new(tls_config(cfg.ca_file.as_ref(), b"http/1.1")?))
+        .connect(server_name, stream)
+        .await
+        .map_err(|_| ExecError::Transport)?;
     counters.opened.fetch_add(1, Ordering::Relaxed);
-    let io = TokioIo::new(stream);
+    h1_handshake(tls).await
+}
+
+async fn h1_handshake<T>(io: T) -> Result<H1Sender, ExecError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake::<_, Full<Bytes>>(io)
+        .handshake::<_, Full<Bytes>>(TokioIo::new(io))
         .await
         .map_err(|_| ExecError::Transport)?;
     tokio::spawn(conn);
@@ -269,12 +298,10 @@ async fn new_h2(
     if !target.tls {
         return Err(ExecError::Transport);
     }
-    let tcp = TcpStream::connect((target.host.as_str(), target.port))
-        .await
-        .map_err(|_| ExecError::Transport)?;
+    let tcp = connect_nodelay(target).await?;
     let server_name =
         ServerName::try_from(target.host.clone()).map_err(|_| ExecError::Transport)?;
-    let tls = TlsConnector::from(Arc::new(tls_config(cfg.ca_file.as_ref())?))
+    let tls = TlsConnector::from(Arc::new(tls_config(cfg.ca_file.as_ref(), b"h2")?))
         .connect(server_name, tcp)
         .await
         .map_err(|_| ExecError::Transport)?;
@@ -385,7 +412,7 @@ async fn execute(
     state.counters.streams.fetch_add(1, Ordering::Relaxed);
     match state.cfg.mode {
         DownstreamMode::Short => {
-            let mut sender = new_h1(target, &state.counters).await?;
+            let mut sender = new_h1(target, &state.cfg, &state.counters).await?;
             consume_response(
                 cfg,
                 sender
@@ -411,7 +438,7 @@ async fn execute(
                     state.counters.reused.fetch_add(1, Ordering::Relaxed);
                 }
                 if slot.is_none() {
-                    *slot = Some(new_h1(target, &state.counters).await?);
+                    *slot = Some(new_h1(target, &state.cfg, &state.counters).await?);
                 }
                 let result = slot
                     .as_mut()
