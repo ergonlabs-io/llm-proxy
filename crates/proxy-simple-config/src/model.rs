@@ -28,7 +28,7 @@ pub struct SimpleConfig {
     #[serde(default)]
     pub listen: Option<Listen>,
     #[serde(default)]
-    pub admin: Option<String>,
+    pub admin: Option<Admin>,
     /// Downstream authentication. Absent means the
     /// proxy admits every request unauthenticated, same as today. Present,
     /// even with `keys: []`, switches the listener to fail-closed.
@@ -354,6 +354,43 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// finishes, short enough that a provider which accepts and never answers
 /// cannot hold a client and a `max_requests` permit forever.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// `admin`: shorthand `host:port` string, or an object to enable TLS. Same
+/// shape as [`Listen`].
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Admin {
+    Address(String),
+    Full(AdminSpec),
+}
+
+impl Admin {
+    /// The bind address, and the dotted path that names it in errors.
+    pub fn address(&self) -> (&str, &'static str) {
+        match self {
+            Admin::Address(a) => (a, "admin"),
+            Admin::Full(spec) => (&spec.address, "admin.address"),
+        }
+    }
+
+    pub fn tls(&self) -> Option<&ListenTls> {
+        match self {
+            Admin::Address(_) => None,
+            Admin::Full(spec) => spec.tls.as_ref(),
+        }
+    }
+}
+
+/// `admin` object form. `tls` lowers to
+/// `node.metadata["io.llmproxy.admin_tls"]`, since Envoy's admin has no TLS
+/// of its own.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSpec {
+    pub address: String,
+    #[serde(default)]
+    pub tls: Option<ListenTls>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

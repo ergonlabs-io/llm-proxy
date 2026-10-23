@@ -65,6 +65,16 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "ListenTls",
             parser_fields::<ListenTls>,
         ),
+        (
+            "#/$defs/AdminListener",
+            "AdminSpec",
+            parser_fields::<AdminSpec>,
+        ),
+        (
+            "#/$defs/AdminListener/properties/tls",
+            "ListenTls",
+            parser_fields::<ListenTls>,
+        ),
         ("#/$defs/Auth", "Auth", parser_fields::<Auth>),
         (
             "#/$defs/AuthEnforce",

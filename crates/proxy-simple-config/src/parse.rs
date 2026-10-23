@@ -541,7 +541,8 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
         }
     }
     if let Some(admin) = &config.admin {
-        parse_host_port(admin, "admin")?;
+        let (address, path) = admin.address();
+        parse_host_port(address, path)?;
     }
     validate_auto(config)?;
     validate_guardrails(config)?;

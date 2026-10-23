@@ -23,7 +23,7 @@ The configuration format for llm-proxy. This file is the single source of truth 
 |---|---|---|---|---|
 | `version` | constant `0` | yes | none | Schema version. Must be 0. Future schema revisions bump this; llm-proxy refuses configs whose version it does not understand. |
 | `listen` | [HostPort](#hostport) or [Listener](#listener) | no | `0.0.0.0:8080` | Where the proxy accepts client traffic. Shorthand string `host:port`, or an object to enable TLS. Default: `0.0.0.0:8080` (plaintext). Examples: `0.0.0.0:8080`, `{"address": "0.0.0.0:8443", "tls": {"cert_file": "/etc/llmproxy/tls.crt", "key_file": "/etc/llmproxy/tls.key"}}`. |
-| `admin` | [HostPort](#hostport) | no | none | Admin/observability endpoint (`/ready`, `/config_dump`, `/clusters`, `/server_info`, `/stats`). `/stats` renders a flat text format, one `name: value` line per counter or histogram. Disabled when omitted. Bind to loopback unless you know why not. Examples: `127.0.0.1:9901`. |
+| `admin` | [HostPort](#hostport) or [AdminListener](#adminlistener) | no | none | Admin/observability endpoint (`/ready`, `/config_dump`, `/clusters`, `/server_info`, `/stats`). `/stats` renders a flat text format, one `name: value` line per counter or histogram. Disabled when omitted. Shorthand string `host:port` (plain HTTP), or an object to enable TLS. Bind to loopback unless you know why not: on any other address without `tls`, `LLMPROXY_ADMIN_TOKEN` crosses the network in clear text. With the token set, the proxy serves anyway and logs one warning at start that names `admin.address`. Examples: `127.0.0.1:9901`, `{"address": "0.0.0.0:9901", "tls": {"cert_file": "/etc/llmproxy/admin.crt", "key_file": "/etc/llmproxy/admin.key"}}`. |
 | `auth` | [Auth](#auth) | no | none | Downstream authentication: verifies inbound requests carry a known virtual key or a valid JWT (`auth.jwt`) before any provider is reached. Fails CLOSED -- with this block present, a request with no recognized credential is refused (401), never admitted anonymously. Authorization is a separate axis: an authenticated tenant with no stored model policy is refused (403) unless `enforce.tenants_without_policy` is `allow`. Omit `auth` entirely to keep today's behavior (no application-level authentication). |
 | `providers` | map of [Provider](#provider), keys match `^[a-z0-9][a-z0-9-]*$`; minimum entries 1 | yes | none | Named upstream LLM API providers. The key is the provider name referenced by `routes` (lowercase letters, digits, hyphens). Names `openai`, `anthropic`, and `openrouter` infer their `type` and `base_url` automatically — a working OpenAI provider is just `openai: { api_key: ${OPENAI_API_KEY} }`. |
 | `models` | map of [ModelDef](#modeldef), keys match `^([^*]+\*?\|\*)$` | no | `{}` | Logical model catalogue: a client-facing model name mapped to an ordered list of providers able to serve it -- e.g. Claude served by Anthropic directly or by Vertex, or Kimi-K2 served by Nebius. Each entry gets an implicit route matching its name, evaluated after `routes` and before the 404 backstop; `routes` still work unchanged. A key may be an exact model name, a single TRAILING wildcard (`gpt-4*`), or the bare catch-all `*` -- a `*` anywhere else (leading, mid-string, or more than one) is a load error, which is a narrower grammar than `routes[].model`'s (that one falls back to a general regex). Precedence when more than one key matches a request is total and exact match always wins, then the LONGEST matching prefix, then the bare `*` catch-all; two keys that could ever tie (a literal duplicate, since two distinct prefixes of equal length can never both match the same name) is a load error naming the duplicate. The providers are tried in order: `providers[0]` serves the request, and each later entry is a fallback with the same retry rules as `routes[].fallbacks`. With `weight` set on every entry, the first provider is picked in proportion to weight instead, and the other entries stay the fallback chain. Weighting spreads load across providers that serve the same model; it never changes the model. Cost-aware selection is not supported. Examples: `{"claude-sonnet-4-5": {"providers": ["anthropic/claude-sonnet-4-5-20250929", {"provider": "vertex-us", "model": "claude-sonnet-4-5@20250929", "dialect": "anthropic"}]}, "claude-*": {"providers": ["anthropic/claude-3-5-haiku-latest"]}, "*": {"providers": ["openai/gpt-4o-mini"]}}`. |
@@ -59,6 +59,17 @@ Used at: `listen`.
 | `max_request_headers_count` | integer; minimum 1 | no | `100` | The most headers a request may carry. On HTTP/1.1 a request with more gets `431` and the connection is closed. On HTTP/2 the count includes the pseudo-headers and each `cookie` header, and a request with more has its stream reset. Default: 100 (Envoy's default). Lowers to the HTTP connection manager's `common_http_protocol_options.max_headers_count`. Examples: `200`. |
 | `trusted_hops` | integer; minimum 0, maximum 4294967295 | no | `0` | How many proxies in front of llm-proxy append the client address to `x-forwarded-for`. Set it to 1 behind one load balancer. With N trusted hops, `client-ip` limits, request records and access logs use the Nth address from the right of the `x-forwarded-for` that the request arrived with. This is the address that the outermost trusted proxy saw. The client writes the entries to the left of it, and llm-proxy never uses them. If the header has fewer than N addresses, or that entry is not an IP address, llm-proxy uses the TCP peer address. Set it only when all connections come through those proxies: a client that connects to llm-proxy directly can choose its address. Default: 0. With 0, llm-proxy uses the TCP peer address and does not read `x-forwarded-for`. With 1 or more, llm-proxy also adds the TCP peer address to the `x-forwarded-for` that it sends to the provider, and sets `x-forwarded-proto`. Lowers to the HTTP connection manager's `use_remote_address: true` and `xff_num_trusted_hops`. Examples: `1`. |
 | `tls` | [object](#listentls) | no | none | Terminate TLS for client connections. Nothing watches the certificate files. After a `SIGHUP` reload, the next accepted connection reads `cert_file` and `key_file` again, so a renewed certificate is served to new connections; existing connections keep the old one. A reload does not check the files: if one cannot be read, the listener resets every new TLS connection until a later reload succeeds, so check the files before you send `SIGHUP`. |
+
+Any other field is a load error.
+
+## `AdminListener`
+
+Used at: `admin`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `address` | [HostPort](#hostport) | yes | none | A bind address in `host:port` form. IPv6 hosts use brackets: `[::1]:8080`. |
+| `tls` | [object](#admintls) | no | none | Serve the admin API over TLS (HTTP/1.1, TLS 1.2 and 1.3, no client certificate). A plaintext request on the port gets no HTTP answer. Lowers to `node.metadata["io.llmproxy.admin_tls"]`, since Envoy's admin has no TLS. A file that cannot be read at start stops the process. Nothing watches the files: after a `SIGHUP` reload, the next accepted admin connection reads `cert_file` and `key_file` again, the same as `listen.tls`. If one cannot be read then, the admin port closes every new connection until a later reload succeeds; it never falls back to plain HTTP. |
 
 Any other field is a load error.
 
@@ -265,6 +276,17 @@ Any other field is a load error.
 ## `listen.tls`
 
 Terminate TLS for client connections. Nothing watches the certificate files. After a `SIGHUP` reload, the next accepted connection reads `cert_file` and `key_file` again, so a renewed certificate is served to new connections; existing connections keep the old one. A reload does not check the files: if one cannot be read, the listener resets every new TLS connection until a later reload succeeds, so check the files before you send `SIGHUP`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `cert_file` | string | yes | none | Path to the PEM certificate chain. |
+| `key_file` | string | yes | none | Path to the PEM private key. |
+
+Any other field is a load error.
+
+## `admin.tls`
+
+Serve the admin API over TLS (HTTP/1.1, TLS 1.2 and 1.3, no client certificate). A plaintext request on the port gets no HTTP answer. Lowers to `node.metadata["io.llmproxy.admin_tls"]`, since Envoy's admin has no TLS. A file that cannot be read at start stops the process. Nothing watches the files: after a `SIGHUP` reload, the next accepted admin connection reads `cert_file` and `key_file` again, the same as `listen.tls`. If one cannot be read then, the admin port closes every new connection until a later reload succeeds; it never falls back to plain HTTP.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -792,7 +814,7 @@ Type: string; pattern `^([0-9A-Za-z_.-]+|\[[0-9A-Fa-f:.]+\]):[0-9]{1,5}$`.
 
 A bind address in `host:port` form. IPv6 hosts use brackets: `[::1]:8080`.
 
-Used at: `listen`, `admin`, `listen.address`.
+Used at: `listen`, `admin`, `listen.address`, `admin.address`.
 
 Examples: `0.0.0.0:8080`, `127.0.0.1:9901`, `[::]:8080`.
 

@@ -2806,6 +2806,7 @@ async fn start_admin(
     let Some(addr) = admin else {
         return Ok(None);
     };
+    let tls = runtime.snapshot.admin_tls.is_some();
     let config = runtime.snapshot_handles.register(runtime.snapshot);
     let admin_token = std::env::var(ADMIN_TOKEN_ENV_VAR).ok();
     let token_set = admin_token
@@ -2850,7 +2851,7 @@ async fn start_admin(
     )
     .await
     .map_err(|err| err.to_string())?;
-    let notes = admin_startup_notes(server.local_addr(), ui_loaded, token_set);
+    let notes = admin_startup_notes(server.local_addr(), tls, ui_loaded, token_set);
     if let Some(info) = notes.ui {
         tracing::info!("{info}");
     }
@@ -2868,13 +2869,19 @@ struct AdminStartupNotes {
     token: Option<String>,
 }
 
-fn admin_startup_notes(addr: SocketAddr, ui_loaded: bool, token_set: bool) -> AdminStartupNotes {
+fn admin_startup_notes(
+    addr: SocketAddr,
+    tls: bool,
+    ui_loaded: bool,
+    token_set: bool,
+) -> AdminStartupNotes {
+    let scheme = if tls { "https" } else { "http" };
     let ui = if ui_loaded {
-        Some(format!("admin UI: http://{addr}/ui/"))
+        Some(format!("admin UI: {scheme}://{addr}/ui/"))
     } else {
         Some(format!(
             "admin UI not loaded: set {ADMIN_UI_DIR_ENV_VAR} to the UI bundle (the release archive's admin-ui-dist) \
-             to serve it at http://{addr}/ui/"
+             to serve it at {scheme}://{addr}/ui/"
         ))
     };
     let token = (!token_set).then(|| {
@@ -3203,14 +3210,26 @@ mod tests {
     fn admin_startup_notes_name_the_ui_and_warn_only_without_a_token() {
         let addr: SocketAddr = "127.0.0.1:53422".parse().unwrap();
 
-        let ready = admin_startup_notes(addr, true, true);
+        let ready = admin_startup_notes(
+            addr, /* tls */ false, /* ui_loaded */ true, /* token_set */ true,
+        );
         assert_eq!(
             ready.ui.as_deref(),
             Some("admin UI: http://127.0.0.1:53422/ui/")
         );
         assert!(ready.token.is_none(), "a set token must not warn");
+        let tls = admin_startup_notes(
+            addr, /* tls */ true, /* ui_loaded */ true, /* token_set */ true,
+        );
+        assert_eq!(
+            tls.ui.as_deref(),
+            Some("admin UI: https://127.0.0.1:53422/ui/"),
+            "a TLS admin port must not be advertised as http"
+        );
 
-        let bare = admin_startup_notes(addr, false, false);
+        let bare = admin_startup_notes(
+            addr, /* tls */ false, /* ui_loaded */ false, /* token_set */ false,
+        );
         let ui = bare.ui.expect("an unloaded UI says how to load it");
         assert!(
             ui.contains(ADMIN_UI_DIR_ENV_VAR) && ui.contains("admin-ui-dist"),

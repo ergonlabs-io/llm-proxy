@@ -26,6 +26,8 @@ production.
 
 - **Client-side TLS:** off. Set `listen.tls` with `cert_file` and `key_file`
   to turn it on. The shorthand `listen: host:port` is plaintext.
+- **Admin TLS:** off. Set `admin.tls` with `cert_file` and `key_file` to turn
+  it on. See [TLS on the admin port](/docs/llm-proxy/administration/admin-api/#tls-on-the-admin-port).
 - **Provider certificate check:** on for every `https://` provider. No
   setting turns it off.
 - **Failure mode:** a certificate or key file that cannot be read at start
@@ -97,7 +99,7 @@ Nothing watches the certificate files. The proxy reads `cert_file` and
    `openssl s_client -connect localhost:8443 -servername localhost </dev/null 2>/dev/null | openssl x509 -noout -enddate`.
 
 After the reload, the next accepted connection gets the new certificate.
-Existing connections keep the old one. See
+Existing connections keep the old one. `admin.tls` rotates the same way. See
 [Reload configuration](/docs/llm-proxy/operations/config-reload/#what-a-reload-applies).
 
 ## Provider TLS

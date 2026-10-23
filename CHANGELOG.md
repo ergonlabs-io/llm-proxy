@@ -11,6 +11,15 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- `--config`: `admin` takes an object form, `{ address, tls: { cert_file,
+  key_file } }`, that serves the admin API over TLS, so the admin token no
+  longer has to cross a pod network in clear text. A `SIGHUP` reload reads
+  the files again, the same as `listen.tls`. The shorthand `host:port` string
+  is unchanged and stays plain HTTP. In Envoy mode the same setting is
+  `node.metadata["io.llmproxy.admin_tls"]`, since Envoy's admin has no TLS. A
+  plain-HTTP admin on a non-loopback address with `LLMPROXY_ADMIN_TOKEN` set
+  logs one warning at start that names `admin.address`. See
+  [TLS on the admin port](docs/site/src/content/docs/administration/admin-api.md#tls-on-the-admin-port).
 - `SIGUSR1` reopens the access-log file and the `--request-records-file` file
   at their configured paths, as Envoy does, so a logrotate `postrotate
   kill -USR1` works. Before, `SIGUSR1` ended the process. Lines queued before

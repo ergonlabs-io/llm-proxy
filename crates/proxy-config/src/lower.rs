@@ -68,6 +68,8 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
     snapshot.metrics = convert_metrics_metadata(b.node.as_ref(), "node")?;
     snapshot.ledger = crate::ledger::convert(b.node.as_ref(), "node")?;
     snapshot.traces = crate::traces::convert(b.node.as_ref(), "node")?;
+    snapshot.admin_tls =
+        crate::admin_tls::convert(b.node.as_ref(), "node", b.admin.is_some())?.map(Arc::new);
     // The capture agent was retired in favour of trace export. A bootstrap
     // that still sets its namespace fails loudly rather than being ignored
     // (AGENTS.md invariant 1).
