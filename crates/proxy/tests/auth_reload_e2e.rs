@@ -1,6 +1,7 @@
-//! A SIGHUP reload of a `--config` file that changes `auth.hmac_secret` or
-//! `auth.keys` is refused, and the proxy keeps authenticating with the
-//! configuration it started with. A restart applies the change.
+//! A SIGHUP reload of a `--config` file that changes `auth.hmac_secret`,
+//! `auth.keys` or `auth.spend.recovery_journal_path` is refused, and the proxy
+//! keeps serving the configuration it started with. A restart applies the
+//! change.
 //!
 //! The auth control plane (store, bootstrap keys, the secret keys are minted
 //! with) is built once per serve. Before the refusal existed, a reload that
@@ -125,6 +126,57 @@ fn a_reload_that_removes_or_revokes_a_configured_key_is_refused_until_a_restart(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The spend accumulator opens its recovery journal once per serve and
+/// outlives a reload, so a reload that moves or drops the journal could only
+/// be ignored. It is refused instead, naming the dialect field.
+#[test]
+fn a_reload_that_changes_the_spend_recovery_journal_is_refused() {
+    let dir = scratch_dir("journal");
+    let ports = Ports::new();
+    let store = dir.join("store.redb");
+    let first = dir.join("journal-a.redb");
+    let moved = dir.join("journal-b.redb");
+    let with_journal = |journal: Option<&Path>, extra_routes: &str| {
+        let spend = journal.map_or(String::new(), |path| {
+            format!(
+                "  spend: {{ recovery_journal_path: \"{}\" }}\n",
+                path.display()
+            )
+        });
+        format!(
+            "{}  store: {{ persistent: {{ path: \"{}\" }} }}\n{spend}",
+            ports.config(SECRET, &[(KEY_1, false)], extra_routes),
+            store.display()
+        )
+    };
+    let mut proxy = Proxy::start(&dir, &with_journal(Some(&first), ""));
+    assert!(first.exists(), "the journal is opened at startup");
+
+    for (journal, what) in [(Some(moved.as_path()), "moved"), (None, "removed")] {
+        proxy.reload(&with_journal(journal, ""));
+        let refusal = proxy.wait_for_log(REFUSED);
+        assert!(
+            refusal.contains("auth.spend.recovery_journal_path"),
+            "the refusal of a {what} journal must name the field: {refusal}"
+        );
+    }
+    assert!(
+        !moved.exists(),
+        "a refused reload must not open the new journal"
+    );
+    assert_status(&proxy, KEY_1, 200, "the running chain after the refusals");
+
+    // A reload that leaves the journal alone still applies.
+    proxy.reload(&with_journal(
+        Some(&first),
+        "  - { model: \"other-*\", provider: openai }\n",
+    ));
+    proxy.wait_for_log(SUCCEEDED);
+    assert_status(&proxy, KEY_1, 200, "after an unrelated reload");
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ------------------------------------------------------------------ helpers --
 
 /// The ports one test's proxy keeps across reloads and restarts.
@@ -215,6 +267,9 @@ impl Proxy {
                 path.to_str().expect("utf-8 path"),
                 "--concurrency",
                 "1",
+                // The spend recovery journal requires a node id.
+                "--service-node",
+                "auth-reload-e2e",
             ])
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())

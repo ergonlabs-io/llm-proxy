@@ -104,6 +104,7 @@ that start after a successful reload.
 | `auth.keys` (add, remove, `revoked: true`) | A change makes the proxy refuse the whole reload. A removed or revoked configured key keeps authenticating until a restart. | Yes |
 | `auth.hmac_secret` / `auth.hmac_secret_file` | A changed secret makes the proxy refuse the whole reload. Keys keep working with the secret from startup. | Yes |
 | `auth.store`, `auth.tenant_credentials` | A change makes the proxy refuse the whole reload. A rotated key file at the same path is a change. | Yes |
+| `auth.spend.recovery_journal_path` | A change makes the proxy refuse the whole reload. This includes adding or removing the field. The proxy keeps the journal from startup. | Yes |
 | `observability.tracing`, `observability.metrics` | A change makes the proxy refuse the whole reload. | Yes |
 | `ledger`, `observability.traces` | A change makes the proxy refuse the whole reload. | Yes |
 | Command-line flags (such as `--service-node`) | Not part of the file. They are fixed when the process starts. | Yes |
@@ -116,9 +117,10 @@ SIGHUP: config reload refused; continuing to serve the previous snapshot
 ```
 
 Its `detail` field names the field that changed and says to restart. The
-auth fields appear under their internal names, for example
+auth and spend fields appear under their internal names, for example
 `typed_config.hmac_secret (the dialect's `auth.hmac_secret` /
-`auth.hmac_secret_file`)`. For `ledger`, `observability.traces`,
+`auth.hmac_secret_file`)` or `typed_config.recovery_journal_path (the
+dialect's `auth.spend.recovery_journal_path`)`. For `ledger`, `observability.traces`,
 `observability.tracing`, and `observability.metrics`, the log line names the
 field in parentheses. The log never contains the secret.
 

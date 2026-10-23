@@ -19,6 +19,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   `--service-node` and a `persistent` or `shared` store, and is a load error
   with `auth.enforce.spend: false`; each refusal names
   `auth.spend.recovery_journal_path`.
+- A `SIGHUP` reload that changes, adds or removes the spend recovery journal
+  path (`auth.spend.recovery_journal_path`, or `SpendLimit.recovery_journal_path`
+  in Envoy mode) is refused, and the previous snapshot keeps serving. Before,
+  the reload succeeded and the proxy kept the journal it opened at startup
+  without a word. The refusal names the field.
 
 ## [0.7.0] - 2026-10-22
 

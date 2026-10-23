@@ -56,6 +56,54 @@ use crate::usage_filter::PricingRegistry;
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.SpendLimit";
 
+/// The singleton key under which each chain records the recovery journal path
+/// its accumulator opened ([`RunningJournal`]), beside the accumulator itself.
+pub const JOURNAL_PATH_KEY: &str = "llmproxy.spend_limit/recovery_journal_path";
+
+/// `typed_config.recovery_journal_path` as the chain's first build opened it;
+/// empty when it opened none. The accumulator singleton outlives a reload, so
+/// a changed path cannot apply: [`check_reload`] refuses the whole reload
+/// instead of keeping the old journal without a word.
+struct RunningJournal(String);
+
+/// The reason a changed journal path is refused, on reload and on a chain
+/// rebuild alike.
+fn journal_path_refusal(reloaded: &str, running: &RunningJournal) -> Option<ConfigError> {
+    (reloaded != running.0).then(|| {
+        invalid(
+            "typed_config.recovery_journal_path",
+            "this field (the dialect's `auth.spend.recovery_journal_path`) is fixed at \
+             startup and cannot change on reload; restart the process to apply it",
+        )
+    })
+}
+
+fn journal_path(config: &DynamicMessage) -> String {
+    config
+        .get_field_by_name("recovery_journal_path")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Refuses a reloaded `llmproxy.spend_limit` config for the chain `scope`
+/// when it changes the recovery journal the running accumulator opened at
+/// startup. Called before a snapshot is published, so a refused reload leaves
+/// every worker on the previous one. A `scope` with no running accumulator
+/// yet is new and has nothing to conflict with.
+pub fn check_reload(
+    config: &DynamicMessage,
+    scope: &str,
+    shared: &proxy_http::filter::SharedFactoryState,
+) -> Result<(), ConfigError> {
+    let Some(running) = shared
+        .get(scope, JOURNAL_PATH_KEY)
+        .and_then(|any| any.downcast::<RunningJournal>().ok())
+    else {
+        return Ok(());
+    };
+    journal_path_refusal(&journal_path(config), &running).map_or(Ok(()), Err)
+}
+
 /// The `%RESPONSE_CODE_DETAILS%`/body value for this filter's one refusal
 /// reason -- unlike `model_authz_filter`'s deliberately generic denial, this
 /// one names spend specifically: nothing about a spend ceiling is sensitive
@@ -195,10 +243,7 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
         let default_period = parse_default_period(config)?;
         let flush_interval = parse_flush_interval(config);
         let reconciliation = parse_reconciliation(config)?;
-        let journal_path = config
-            .get_field_by_name("recovery_journal_path")
-            .and_then(|v| v.as_str().map(str::to_owned))
-            .unwrap_or_default();
+        let journal_path = journal_path(config);
         let cutover = config
             .get_field_by_name("legacy_tenant_budget_cutover")
             .and_then(|v| v.as_enum_number())
@@ -214,6 +259,18 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                 "typed_config.recovery_journal_path",
                 "recovery requires an explicit stable service_node or bootstrap node.id",
             ));
+        }
+
+        // The reload path checks this before publish (`check_reload`); a
+        // chain rebuilt by another route fails here rather than keep the old
+        // journal silently.
+        if let Some(running) = ctx
+            .get(JOURNAL_PATH_KEY)
+            .and_then(|any| any.downcast::<RunningJournal>().ok())
+        {
+            if let Some(refusal) = journal_path_refusal(&journal_path, &running) {
+                return Err(refusal);
+            }
         }
 
         // Resolve the SAME `ControlPlane` singleton
@@ -339,6 +396,13 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
             })?
             .downcast::<SharedSpendLimitState>()
             .expect("spend_limit singleton is always a SharedSpendLimitState");
+        // Recorded on the first build only, after the accumulator exists, so a
+        // failed first build leaves nothing for a later reload to be compared
+        // against.
+        ctx.get_or_try_init(JOURNAL_PATH_KEY, || {
+            Ok(Arc::new(RunningJournal(journal_path.clone()))
+                as Arc<dyn std::any::Any + Send + Sync>)
+        })?;
         // The singleton outlives a reload, so record what THIS build's
         // configuration says: the admin API answers from it.
         shared

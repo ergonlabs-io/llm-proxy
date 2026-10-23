@@ -303,8 +303,10 @@ fn chain_context(listener: &str, index: Option<usize>) -> String {
 /// Refuses `snapshot` when an HTTP filter on a chain that is already built
 /// would change state that filter fixed at its first build, so the reload or
 /// xDS update is rejected before publish instead of failing per worker as
-/// connection resets. Only `llmproxy.auth` has such state today (see
-/// `proxy_filters::auth_filter::check_reload`). Every refusal is returned,
+/// connection resets. `llmproxy.auth` (see
+/// `proxy_filters::auth_filter::check_reload`) and `llmproxy.spend_limit`
+/// (see `proxy_filters::spend_limit_filter::check_reload`) have such state.
+/// Every refusal is returned,
 /// sorted, as `<chain>: http filter '<name>': <field>: <reason>`.
 pub fn check_reload_compatible(
     snapshot: &ConfigSnapshot,
@@ -329,13 +331,22 @@ pub fn check_reload_compatible(
             };
             let context = chain_context(&listener.name, index);
             for f in &hcm.http_filters {
-                if f.type_url != proxy_filters::auth_filter::TYPE_URL {
-                    continue;
-                }
+                type Check = fn(
+                    &prost_reflect::DynamicMessage,
+                    &str,
+                    &SharedFactoryState,
+                ) -> Result<(), proxy_config::ConfigError>;
+                let check: Check = match f.type_url.as_str() {
+                    proxy_filters::auth_filter::TYPE_URL => {
+                        proxy_filters::auth_filter::check_reload
+                    }
+                    proxy_filters::spend_limit_filter::TYPE_URL => {
+                        proxy_filters::spend_limit_filter::check_reload
+                    }
+                    _ => continue,
+                };
                 let Some(config) = &f.config else { continue };
-                if let Err(e) =
-                    proxy_filters::auth_filter::check_reload(config, &context, factory_state)
-                {
+                if let Err(e) = check(config, &context, factory_state) {
                     refusals.push(format!("{context}: http filter '{}': {e}", f.name));
                 }
             }
