@@ -432,7 +432,7 @@ pub enum InitialBindError {
 ///
 /// A fixed 128 overflowed under bursty reconnects: per worker, a cohort of streams that end together
 /// reconnects at once, the kernel drops the SYNs past the queue, and each dropped client waits out
-/// the 1 s SYN retransmit (`internal-docs/capacity/2026-10-22-digitalocean-dedicated.md`, "Day 3").
+/// the 1 s SYN retransmit.
 #[cfg(target_os = "linux")]
 const DEFAULT_TCP_BACKLOG: i32 = -1;
 #[cfg(not(target_os = "linux"))]

@@ -248,9 +248,8 @@ impl AsyncWrite for SlotIo {
 ///
 /// There is no fixed cap on connections per key. One was tried (4), and it
 /// became the replica's stream ceiling: 4 connections x 200 streams = 800
-/// per worker, measured at 808 on one worker and about 3,000 on four
-/// (`internal-docs/capacity/README.md`; `internal-docs/capacity/2026-10-22-digitalocean-dedicated.md`,
-/// "Day 3"), with CPU to spare. Dialing only when every connection is at this
+/// per worker, measured at 808 on one worker and about 3,000 on four, with
+/// CPU to spare. Dialing only when every connection is at this
 /// soft limit already bounds the set by demand, at one connection per 100
 /// in-flight streams, and in-flight streams are bounded by the cluster's
 /// `max_requests`. The cluster's `max_connections` is the hard bound, as in
@@ -2135,8 +2134,7 @@ mod tests {
     /// `SOFT_STREAMS_PER_CONNECTION` in-flight streams. A fixed cap of 4
     /// connections per key held one worker to 4 x the peer's
     /// `max_concurrent_streams` (800 against hyper's server default) with CPU
-    /// to spare (`internal-docs/capacity/2026-10-22-digitalocean-dedicated.md`,
-    /// "Day 3").
+    /// to spare.
     #[tokio::test(flavor = "current_thread")]
     async fn connections_grow_past_four_while_every_one_is_at_the_soft_limit() {
         LocalSet::new()
