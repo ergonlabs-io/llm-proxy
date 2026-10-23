@@ -3,7 +3,7 @@ title: Request capture
 description: "Write one metadata record for each request (no bodies) to a JSON-lines file."
 summary: Opt-in request metadata records written to a JSON-lines file, then
   the record fields, loss accounting, and metrics.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-23
 related:
   - observability/overview
   - observability/access-logs
@@ -106,13 +106,17 @@ mode of an existing file yourself.
 ### Rotation and retention
 
 You rotate the file. The proxy does not rotate, expire, or compress it. The
-proxy opens the file once at start and appends to it. It does not reopen the
-file on `SIGHUP`.
+proxy opens the file at start and appends to it. It does not reopen the file
+on `SIGHUP`.
 
-- A file that you rename keeps receiving records, because the proxy holds the
-  open file. Renaming alone does not start a new file.
-- A copy-then-truncate rotation works with the append mode of the proxy.
-- To start on a new file, change the path and restart the proxy.
+- A file that you rename keeps receiving records until the proxy gets
+  `SIGUSR1`, because the proxy holds the open file.
+- On `SIGUSR1` the proxy opens the path again before it writes the next
+  record, and creates a new file there. Records written before that stay in
+  the renamed file. The same signal reopens the access-log file: see
+  [Rotating the file](/docs/llm-proxy/observability/access-logs/#rotating-the-file).
+- A copy-then-truncate rotation also works with the append mode of the proxy,
+  and needs no signal.
 
 Set the retention and the access control of the old files in your own tooling.
 
@@ -126,10 +130,14 @@ File delivery is best effort. It is not a billing record. For billing, use the
   not wait.
 - The proxy does not call `fsync`. A successful write is not a durability
   acknowledgement.
-- After one failed write, the proxy stops accepting records for the rest of
-  the process. It discards the queued records and counts them in
-  `llmproxy_metadata_dropped{reason="drained_after_close"}`. Forwarding
-  continues.
+- A failed write loses that one record. Its `record_seq` is missing from
+  the file, and `llmproxy_metadata_write_failures` counts it. The proxy logs
+  one error with the file path and the error, `cannot write request records`,
+  when the first write fails. Then it waits (10 ms at first, doubling to at
+  most 1 second), opens the file again, and tries the next record. When a
+  write succeeds again, it logs one warning, `request records are being
+  written again`, with the number of records lost. Forwarding continues
+  throughout, and the queue keeps accepting records.
 - On shutdown, the proxy writes the queued records for up to 5 seconds
   (less on a fast exit). A process that `SIGKILL` stops loses the queued
   records.
@@ -196,7 +204,6 @@ so an idle proxy shows `0` and not a missing series.
 | Metric | Labels | Meaning |
 |---|---|---|
 | `llmproxy_metadata_admission` | `outcome`: `accepted`, `capacity_exceeded`, `closed`, `oversize`, `invalid` | Whether the queue took the record. `oversize`: the record alone passed the size limit. `invalid`: the record failed schema validation. |
-| `llmproxy_metadata_dropped` | `reason`: `drained_after_close` | Records that the queue accepted and the proxy later discarded without a write. |
 | `llmproxy_metadata_queue_depth` | none | Records in the queue. |
 | `llmproxy_metadata_queue_capacity` | none | Queue size. `0` means capture is not configured. |
 | `llmproxy_metadata_written` | none | Records delivered. An append to the file. |
@@ -208,7 +215,8 @@ Alert on a rising `llmproxy_metadata_write_failures` and on
 ## Limitations
 
 - The `llmproxy` config file has no field for request records. Use the flag.
-- The proxy does not rotate, expire, compress, or reopen the file.
+- The proxy does not rotate, expire, or compress the file. It reopens the
+  file only on `SIGUSR1` or after a failed write.
 - Delivery is best effort. A `SIGKILL` loses the queued records.
 - A record holds no request body and no response body.
 

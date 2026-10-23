@@ -9,6 +9,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+### Added
+
+- `SIGUSR1` reopens the access-log file and the `--request-records-file` file
+  at their configured paths, as Envoy does, so a logrotate `postrotate
+  kill -USR1` works. Before, `SIGUSR1` ended the process. Lines queued before
+  the signal go to the renamed file. See
+  [Rotating the file](docs/site/src/content/docs/observability/access-logs.md#rotating-the-file).
+
 ### Changed
 
 - A `limits` entry with `models` no longer skips a request whose model the
@@ -33,6 +41,25 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - A JSON request body that ends in trailers before its top-level object closes
   is no longer dropped. Before, such a request reached the provider with an
   empty body and no model.
+
+- The request-records file no longer stops for the rest of the process after
+  one failed write. The failed record is lost and counted in
+  `llmproxy_metadata_write_failures`, one error naming the file is logged when
+  it happens, and the writer backs off (at most 1 second), reopens the file,
+  and continues. A warning reports the records lost when writes succeed again.
+  Before, the only log line was the summary at exit.
+- `SIGTERM` or `SIGINT` while the proxy waits for its control plane at startup
+  (`initial_fetch_timeout`) now stops it at once, and during the initial
+  listener bind it starts the normal drain. Before, the signal waited until
+  startup finished.
+- The admin listener pauses 100 ms after a failed `accept` (for example
+  `EMFILE`) and warns at most once every 10 seconds. Before, it retried in a
+  tight loop and logged every attempt.
+
+### Removed
+
+- The `llmproxy_metadata_dropped{reason="drained_after_close"}` series. A write
+  failure no longer closes the records lane, so nothing is drained unwritten.
 
 ## [0.7.0] - 2026-10-22
 

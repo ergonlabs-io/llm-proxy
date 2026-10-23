@@ -72,10 +72,12 @@ cover that input. The `-c` text in the error above is a fixed string. See
 llm-proxy --config llmproxy.yaml
 ```
 
-A running `serve` process handles `SIGHUP` (config reload) and `SIGTERM` or
-`SIGINT` (graceful shutdown). See
-[Reload configuration](/docs/llm-proxy/operations/config-reload/) and
-[Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/).
+A running `serve` process handles `SIGHUP` (config reload), `SIGTERM` or
+`SIGINT` (graceful shutdown), and `SIGUSR1` (reopen the access-log and
+request-records files). See
+[Reload configuration](/docs/llm-proxy/operations/config-reload/),
+[Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/), and
+[Rotating the file](/docs/llm-proxy/observability/access-logs/#rotating-the-file).
 
 If a listener cannot bind, `serve` exits with status 1. The message has this
 form:

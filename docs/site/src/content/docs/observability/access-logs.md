@@ -3,7 +3,7 @@ title: Access logs
 description: "Write one access log line per request, with token counts, timing, tenant, and selected provider."
 summary: The format-string engine behind observability.access_logs, the
   operators it supports, and when a line is written.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-23
 related:
   - observability/overview
   - configuration/configuration-file
@@ -278,6 +278,28 @@ most one such warning every 5 seconds. See
 
 At shutdown the proxy flushes the queues that still hold lines. It waits at most
 5 seconds. See [Draining and shutdown](/docs/llm-proxy/operations/draining-and-shutdown/#access-log-lines-at-exit).
+
+### Rotating the file
+
+The proxy does not rotate the file. To rotate it, rename the file, then send
+`SIGUSR1` to the proxy. Envoy uses the same signal.
+
+```sh
+mv /var/log/llmproxy/access.log /var/log/llmproxy/access.log.1
+kill -USR1 <pid>
+```
+
+- Lines that were queued before the signal go to the renamed file. Later
+  lines go to a new file at the configured path.
+- The same signal reopens the request-records file of `--request-records-file`.
+- The proxy logs `SIGUSR1: reopened log files` with the count. If it cannot
+  open the path again, it logs an error that names the file and keeps writing
+  to the file that is already open.
+- `stdout` and `stderr` are not reopened.
+- With logrotate, use `postrotate` with `kill -USR1`. A
+  `copytruncate` rotation also works and needs no signal.
+
+The admin port has no `/reopen_logs` endpoint. Use the signal.
 
 A broken destination (disk full, a deleted stdout pipe) never fails a request.
 The writer thread does not retry the line. Each failed write adds 1 to

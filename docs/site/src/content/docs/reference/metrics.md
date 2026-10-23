@@ -163,7 +163,6 @@ means the file is not set. See
 | Metric | Type | Unit | Labels | What it counts |
 |---|---|---|---|---|
 | `llmproxy_metadata_admission` | counter | records | `outcome` | Whether the queue took a record. `outcome` is `accepted`, `capacity_exceeded`, `closed`, `oversize` (the record alone passed the size limit), or `invalid` (the record failed schema validation). |
-| `llmproxy_metadata_dropped` | counter | records | `reason` | Records that the queue accepted and the proxy later discarded without a write. `reason` is `drained_after_close`. |
 | `llmproxy_metadata_queue_depth` | gauge | records | none | Records in the queue. |
 | `llmproxy_metadata_queue_capacity` | gauge | records | none | Queue size. |
 | `llmproxy_metadata_written` | counter | records | none | Records appended to the file. |

@@ -1043,12 +1043,19 @@ async fn run_serve(
         service_node = service_node.as_deref().unwrap_or("-"),
         service_cluster = service_cluster.as_deref().unwrap_or("-"),
         listeners = %listener_summary.join(", "),
-        "llm-proxy started, waiting for SIGTERM/SIGINT/SIGHUP"
+        "llm-proxy started, waiting for SIGTERM/SIGINT/SIGHUP/SIGUSR1"
     );
+
+    let records_reopen = metadata_delivery
+        .as_ref()
+        .map(proxy_observability::metadata::MetadataDelivery::reopen_handle);
+    let mut startup = Startup::Running;
 
     // Startup gate: consume initial xDS responses before allowing workers to
     // bind. A timeout releases this gate without marking unresolved resources
     // initialized; request admission continues to distinguish warming.
+    // SIGTERM here stops the proxy at once: the initial fetch can wait out a
+    // long `initial_fetch_timeout` on a control plane that never answers.
     let init_deadline = Instant::now() + initial_fetch_timeout;
     while !init_manager.ready() {
         let remaining = init_deadline.saturating_duration_since(Instant::now());
@@ -1088,6 +1095,14 @@ async fn run_serve(
                     ads_apply_rx = None;
                 }
             }
+            signal = control_signals.recv_during_startup() => match signal {
+                ControlSignal::Shutdown => {
+                    startup = Startup::StoppedBeforeBind;
+                    break;
+                }
+                ControlSignal::ReopenLogs => reopen_logs(records_reopen.as_ref()).await,
+                ControlSignal::Reload => {}
+            },
             _ = tokio::time::sleep(remaining) => {}
         }
     }
@@ -1097,7 +1112,30 @@ async fn run_serve(
     // at startup (AGENTS.md invariant 1 -- see `proxy_core::listener::initial_bind`'s
     // doc comment), so on the first failure (or a timeout) we tear the pool
     // down and exit nonzero instead of proceeding to the signal-wait loop.
-    if let Err(message) = wait_for_initial_binds(&mut bind_rx, concurrency).await {
+    let binds = async {
+        if matches!(startup, Startup::StoppedBeforeBind) {
+            return Ok(());
+        }
+        let binds = wait_for_initial_binds(&mut bind_rx, concurrency);
+        tokio::pin!(binds);
+        loop {
+            tokio::select! {
+                result = &mut binds => return result,
+                // Workers bind quickly, but a SIGTERM here must not wait out
+                // `INITIAL_BIND_TIMEOUT`. Listeners already bound drain like
+                // any other.
+                signal = control_signals.recv_during_startup() => match signal {
+                    ControlSignal::Shutdown => {
+                        startup = Startup::StoppedDuringBind;
+                        return Ok(());
+                    }
+                    ControlSignal::ReopenLogs => reopen_logs(records_reopen.as_ref()).await,
+                    ControlSignal::Reload => {}
+                },
+            }
+        }
+    };
+    if let Err(message) = binds.await {
         eprintln!("{message}");
         publisher.shutdown();
         publisher.join_async().await;
@@ -1123,87 +1161,95 @@ async fn run_serve(
     // Rust note: `tokio::select!` picks whichever branch is ready first, so
     // this is what turns two independent producers of "apply a new snapshot"
     // (SIGHUP and ADS) into one control loop that never applies both at once.
+    if !matches!(startup, Startup::Running) {
+        tracing::info!(
+            "termination signal while starting: stopping before the proxy finished starting"
+        );
+    }
     let mut drain_deadline: Option<Instant> = None;
-    loop {
-        tokio::select! {
-            signal = control_signals.recv() => match signal {
-                ControlSignal::Shutdown => break,
-                // Review C4: the reloaded file yields a static-only snapshot,
-                // which would drop every xDS-delivered resource, and the
-                // applier's static base would bring the boot-time file back
-                // on its next publish. Refused instead; see
-                // internal-docs/envoy-divergences.md "SIGHUP with dynamic_resources".
-                ControlSignal::Reload if dynamic_resources_configured => {
-                    tracing::error!(
-                        "SIGHUP ignored: this bootstrap configures dynamic_resources, so the \
-                         control plane owns the dynamic configuration and a file reload would \
-                         replace it; the running configuration is unchanged. Restart the \
-                         process to apply bootstrap changes"
-                    );
-                }
-                ControlSignal::Reload => {
-                    if let Some(new_version) = reload(
-                        &config_source,
-                        current_version,
-                        &publisher,
-                        &cluster_manager_for_reload,
-                        &stats_control,
-                        &stat_handle_tables_for_reload,
-                        running_ledger.as_ref(),
-                        running_traces.as_ref(),
-                        &running_otlp,
-                        &factory_state_for_reload,
-                    )
-                    .await
-                    {
-                        current_version = new_version;
+    if matches!(startup, Startup::Running) {
+        loop {
+            tokio::select! {
+                signal = control_signals.recv() => match signal {
+                    ControlSignal::Shutdown => break,
+                    ControlSignal::ReopenLogs => reopen_logs(records_reopen.as_ref()).await,
+                    // Review C4: the reloaded file yields a static-only snapshot,
+                    // which would drop every xDS-delivered resource, and the
+                    // applier's static base would bring the boot-time file back
+                    // on its next publish. Refused instead; see
+                    // internal-docs/envoy-divergences.md "SIGHUP with dynamic_resources".
+                    ControlSignal::Reload if dynamic_resources_configured => {
+                        tracing::error!(
+                            "SIGHUP ignored: this bootstrap configures dynamic_resources, so the \
+                             control plane owns the dynamic configuration and a file reload would \
+                             replace it; the running configuration is unchanged. Restart the \
+                             process to apply bootstrap changes"
+                        );
                     }
+                    ControlSignal::Reload => {
+                        if let Some(new_version) = reload(
+                            &config_source,
+                            current_version,
+                            &publisher,
+                            &cluster_manager_for_reload,
+                            &stats_control,
+                            &stat_handle_tables_for_reload,
+                            running_ledger.as_ref(),
+                            running_traces.as_ref(),
+                            &running_otlp,
+                            &factory_state_for_reload,
+                        )
+                        .await
+                        {
+                            current_version = new_version;
+                        }
+                    }
+                },
+                // Rust note: the `if` guard disables this branch once the drain
+                // has started, so a later `Notify` permit cannot start it twice.
+                _ = lifecycle.drain_requested(), if drain_deadline.is_none() => {
+                    drain_deadline = Some(begin_drain(
+                        &lifecycle,
+                        &publisher,
+                        drain_time,
+                        drain_strategy,
+                        "POST /drain_listeners",
+                    ));
                 }
-            },
-            // Rust note: the `if` guard disables this branch once the drain
-            // has started, so a later `Notify` permit cannot start it twice.
-            _ = lifecycle.drain_requested(), if drain_deadline.is_none() => {
-                drain_deadline = Some(begin_drain(
-                    &lifecycle,
-                    &publisher,
-                    drain_time,
-                    drain_strategy,
-                    "POST /drain_listeners",
-                ));
+                ads_msg = recv_ads_apply(&mut ads_apply_rx) => match ads_msg {
+                    Some((ads_snapshot, reply)) => {
+                        if let Some(version) = apply_ads_snapshot(
+                            ads_snapshot,
+                            reply,
+                            current_version,
+                            &publisher,
+                            &cluster_manager_for_reload,
+                            &stats_control,
+                            &stat_handle_tables_for_reload,
+                            &factory_state_for_reload,
+                        )
+                        .await
+                        {
+                            current_version = version;
+                        }
+                    }
+                    None => {
+                        // Reachable ONLY when the ADS task dropped its sender,
+                        // which should never happen: `AdsClient::run` is `-> !`,
+                        // so the task ends only if it panics. (The "no ADS client
+                        // was started" case does NOT arrive here -- there
+                        // `ads_apply_rx` is already `None` and `recv_ads_apply`
+                        // pends forever, so this arm is simply never ready.)
+                        // Setting it to `None` stops selecting on a channel that
+                        // would otherwise resolve to `None` again immediately,
+                        // turning this loop into a spin.
+                        tracing::error!(
+                            "the ADS client task ended, which it should not be able to do;                          continuing to serve the last-good config with no control-plane                          connection"
+                        );
+                        ads_apply_rx = None;
+                    }
+                },
             }
-            ads_msg = recv_ads_apply(&mut ads_apply_rx) => match ads_msg {
-                Some((ads_snapshot, reply)) => {
-                    if let Some(version) = apply_ads_snapshot(
-                        ads_snapshot,
-                        reply,
-                        current_version,
-                        &publisher,
-                        &cluster_manager_for_reload,
-                        &stats_control,
-                        &stat_handle_tables_for_reload,
-                        &factory_state_for_reload,
-                    )
-                    .await
-                    {
-                        current_version = version;
-                    }
-                }
-                None => {
-                    // Reachable ONLY when the ADS task dropped its sender,
-                    // which should never happen: `AdsClient::run` is `-> !`,
-                    // so the task ends only if it panics. (The "no ADS client
-                    // was started" case does NOT arrive here -- there
-                    // `ads_apply_rx` is already `None` and `recv_ads_apply`
-                    // pends forever, so this arm is simply never ready.)
-                    // Setting it to `None` stops selecting on a channel that
-                    // would otherwise resolve to `None` again immediately,
-                    // turning this loop into a spin.
-                    tracing::error!(
-                        "the ADS client task ended, which it should not be able to do;                          continuing to serve the last-good config with no control-plane                          connection"
-                    );
-                    ads_apply_rx = None;
-                }
-            },
         }
     }
 
@@ -1220,7 +1266,11 @@ async fn run_serve(
     // waiting". Rust note: the wait future is pinned OUTSIDE the loop so a
     // SIGHUP iteration does not restart it and lose the workers that already
     // reported; the block ends its `&mut publisher` borrow.
-    let drain_result = {
+    let drain_result = if matches!(startup, Startup::StoppedBeforeBind) {
+        // Every worker is still parked at the startup gate: nothing is bound
+        // and nothing is in flight, so there is nothing to wait for.
+        Some(proxy_core::drain::DrainOutcome::Completed)
+    } else {
         let wait = publisher.wait_drained(deadline);
         tokio::pin!(wait);
         loop {
@@ -1231,6 +1281,7 @@ async fn run_serve(
                     ControlSignal::Reload => tracing::warn!(
                         "SIGHUP ignored: the proxy is draining and will not bind new listeners"
                     ),
+                    ControlSignal::ReopenLogs => reopen_logs(records_reopen.as_ref()).await,
                 },
             }
         }
@@ -1392,6 +1443,9 @@ async fn run_serve(
                 }
                 ControlSignal::Reload => tracing::warn!(
                     "SIGHUP ignored: the proxy is shutting down and will not reload"
+                ),
+                ControlSignal::ReopenLogs => tracing::warn!(
+                    "SIGUSR1 ignored: the proxy is flushing its logs and exiting"
                 ),
             },
         }
@@ -2883,7 +2937,13 @@ async fn worker_main(
     // cloned from.
     secret_registry: Arc<SdsSecretRegistry>,
 ) {
-    startup_gate.wait().await;
+    // A shutdown while the gate is still closed (SIGTERM during the initial
+    // xDS fetch) ends the worker here, or joining it would hang.
+    let mut shutdown = ctx.shutdown.clone();
+    tokio::select! {
+        () = startup_gate.wait() => {}
+        _ = shutdown.wait_for(|stop| *stop) => return,
+    }
     // The upstream pool's sweep closes idle connections to endpoints that
     // left their cluster, so a replaced DNS or EDS endpoint does not hold
     // `max_connections` slots until the idle timeout. The caches are
@@ -3012,6 +3072,51 @@ async fn worker_main(
     let _ = listener_manager.await;
 }
 
+/// SIGUSR1: reopen every access-log file and the request-records file at
+/// their configured paths, as Envoy reopens its access logs on SIGUSR1, so
+/// logrotate's `postrotate kill -USR1` works. Lines queued before the signal
+/// still go to the old file. The records file reopens before its next record.
+async fn reopen_logs(records: Option<&proxy_observability::metadata::ReopenHandle>) {
+    if let Some(records) = records {
+        records.request();
+    }
+    // Bounded, so a destination stuck in a kernel write cannot hold the
+    // signal loop for longer than this.
+    let budget = Duration::from_secs(5);
+    match tokio::task::spawn_blocking(move || proxy_observability::sink::reopen_all_queued(budget))
+        .await
+    {
+        Ok((reopened, failed)) => {
+            for (destination, error) in &failed {
+                tracing::error!(
+                    %destination,
+                    %error,
+                    "SIGUSR1: cannot reopen access log; lines keep going to the file already open"
+                );
+            }
+            tracing::info!(
+                access_logs_reopened = reopened,
+                access_logs_failed = failed.len(),
+                request_records = records.is_some(),
+                "SIGUSR1: reopened log files"
+            );
+        }
+        Err(err) => tracing::error!(error = %err, "SIGUSR1: the log reopen task failed"),
+    }
+}
+
+/// How far startup got before the signal loop.
+enum Startup {
+    /// Startup finished; the signal loop runs.
+    Running,
+    /// SIGTERM or SIGINT while workers waited at the startup gate: no
+    /// listener was bound.
+    StoppedBeforeBind,
+    /// SIGTERM or SIGINT while workers bound their listeners: some may serve,
+    /// so they drain.
+    StoppedDuringBind,
+}
+
 /// What [`ControlSignals::recv`] resolved on -- either begin the drain
 /// sequence, or run a config reload and keep serving.
 enum ControlSignal {
@@ -3019,9 +3124,12 @@ enum ControlSignal {
     Shutdown,
     /// SIGHUP: see [`reload`].
     Reload,
+    /// SIGUSR1: see [`reopen_logs`].
+    ReopenLogs,
 }
 
-/// SIGTERM, SIGINT, and SIGHUP, with their handlers already **installed**.
+/// SIGTERM, SIGINT, SIGHUP, and SIGUSR1, with their handlers already
+/// **installed**.
 ///
 /// The distinction that matters: `tokio::signal::unix::signal()` registers the
 /// handler with the OS when it is *called*, not when the returned stream is
@@ -3045,27 +3153,43 @@ struct ControlSignals {
     sigterm: tokio::signal::unix::Signal,
     sigint: tokio::signal::unix::Signal,
     sighup: tokio::signal::unix::Signal,
+    sigusr1: tokio::signal::unix::Signal,
 }
 
 impl ControlSignals {
-    /// Installs all three handlers. Failing to install one is a startup
-    /// failure, not something to discover at shutdown/reload time.
+    /// Installs every handler. Failing to install one is a startup
+    /// failure, not something to discover at shutdown/reload time. SIGUSR1's
+    /// default disposition also terminates, so logrotate's
+    /// `postrotate kill -USR1` would otherwise kill the proxy.
     fn install() -> std::io::Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(Self {
             sigterm: signal(SignalKind::terminate())?,
             sigint: signal(SignalKind::interrupt())?,
             sighup: signal(SignalKind::hangup())?,
+            sigusr1: signal(SignalKind::user_defined1())?,
         })
     }
 
-    /// Resolves on the first of the three signals, and says which kind it
-    /// was so the caller's loop can tell a reload from a shutdown.
+    /// Resolves on the first signal, and says which kind it was so the
+    /// caller's loop can tell a reload from a shutdown.
     async fn recv(&mut self) -> ControlSignal {
         tokio::select! {
             _ = self.sigterm.recv() => ControlSignal::Shutdown,
             _ = self.sigint.recv() => ControlSignal::Shutdown,
             _ = self.sighup.recv() => ControlSignal::Reload,
+            _ = self.sigusr1.recv() => ControlSignal::ReopenLogs,
+        }
+    }
+
+    /// As [`Self::recv`], but SIGHUP stays pending: a reload asked for while
+    /// the proxy starts runs once the signal loop is up, as it did before
+    /// startup listened for signals.
+    async fn recv_during_startup(&mut self) -> ControlSignal {
+        tokio::select! {
+            _ = self.sigterm.recv() => ControlSignal::Shutdown,
+            _ = self.sigint.recv() => ControlSignal::Shutdown,
+            _ = self.sigusr1.recv() => ControlSignal::ReopenLogs,
         }
     }
 }
