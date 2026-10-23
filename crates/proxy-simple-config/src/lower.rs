@@ -574,7 +574,8 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
         } ]
     });
     if let Some(admin) = &config.admin {
-        let (host, port) = parse_host_port(admin, "admin")?;
+        let (address, path) = admin.address();
+        let (host, port) = parse_host_port(address, path)?;
         bootstrap["admin"] = json!({
             "address": { "socket_address": { "address": host, "port_value": port } }
         });
@@ -602,6 +603,12 @@ pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     }
     if let Some(ledger) = &config.ledger {
         metadata.insert(LEDGER_METADATA_KEY.to_string(), lower_ledger(ledger)?);
+    }
+    if let Some(tls) = config.admin.as_ref().and_then(Admin::tls) {
+        metadata.insert(
+            ADMIN_TLS_METADATA_KEY.to_string(),
+            json!({ "cert_file": tls.cert_file, "key_file": tls.key_file }),
+        );
     }
     if let Some(traces) = config
         .observability
@@ -3573,6 +3580,11 @@ fn lower_tracing(tracing: &crate::model::Tracing) -> Result<Value, ConfigError> 
 }
 
 // ------------------------------------------------------------------ ledger --
+
+/// Must equal `proxy_config`'s `ADMIN_TLS_METADATA_KEY`; `tests/admin_tls.rs`
+/// round-trips the dialect through the real Envoy-mode loader, so a drift
+/// here shows up as an admin listener without TLS.
+const ADMIN_TLS_METADATA_KEY: &str = "io.llmproxy.admin_tls";
 
 /// Must equal `proxy_config`'s `LEDGER_METADATA_KEY`; `tests/ledger.rs`
 /// round-trips the dialect through the real Envoy-mode loader, so a drift

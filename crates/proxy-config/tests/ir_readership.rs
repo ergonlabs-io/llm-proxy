@@ -161,10 +161,13 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
         field_name: "admin_tls",
-        kind: EntryKind::KnownInert,
-        reason: "TLS on the admin listener. Lowered from \
-                  node.metadata[\"io.llmproxy.admin_tls\"]; the admin server does not \
-                  read it yet.",
+        kind: EntryKind::ReadOutsideRuntimeCrates,
+        reason: "TLS on the admin listener, from \
+                  node.metadata[\"io.llmproxy.admin_tls\"]. Read by \
+                  `proxy-admin/src/server/transport.rs`'s `TransportCache`, which builds \
+                  the admin port's TLS acceptor from it at start and on each new snapshot \
+                  version, and by `crates/proxy/src/main.rs`'s `start_admin`. Neither crate \
+                  is in RUNTIME_CRATES.",
     },
     AllowlistEntry {
         struct_name: "ConfigSnapshot",

@@ -99,6 +99,7 @@ that start after a successful reload.
 | `${ENV}` values | Read again from the environment of the running process, which does not change. | Yes, to change the value |
 | `listen.tls` `cert_file` / `key_file` | Read again on the next accepted connection. New connections get the new certificate. A file that cannot be read makes the listener reset every new TLS connection until a later reload succeeds. | No |
 | Listener admission limits | Active from the next accepted connection. | No |
+| `admin.tls` (add, remove, `cert_file` / `key_file`) | Read again on the next accepted admin connection, the same as `listen.tls`. A file that cannot be read makes the admin port close every new connection until a later reload succeeds. Removing `admin.tls` serves plain HTTP. | No |
 | `pricing` | Installed if the chain has no auth store. With an `auth:` block, the stored card wins; use `PUT /pricing`. | No |
 | `auth.max_policy_staleness` | Active. | No |
 | `auth.keys` (add, remove, `revoked: true`) | A change makes the proxy refuse the whole reload. A removed or revoked configured key keeps authenticating until a restart. | Yes |

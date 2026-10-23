@@ -55,6 +55,8 @@ use tokio::task::JoinHandle;
 
 mod auth_limit;
 use auth_limit::{AuthFailureLimiter, Verdict};
+mod transport;
+use transport::{AdminTransport, TransportCache, HANDSHAKE_TIMEOUT};
 
 use crate::dump::{
     clusters_from_snapshot_and_live, models_from_snapshot, ClusterDump, ConfigDump, LiveCluster,
@@ -165,6 +167,9 @@ pub enum AdminError {
         #[source]
         source: std::io::Error,
     },
+    /// `admin_tls` names a certificate or key that cannot be loaded.
+    #[error("admin server: {0}")]
+    Tls(#[from] proxy_core::tls::TlsBuildError),
 }
 
 /// A running admin server. Dropping it does not stop the server; call [`AdminServer::abort`].
@@ -384,6 +389,10 @@ pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServe
     let local_addr = listener
         .local_addr()
         .map_err(|source| AdminError::Bind { addr, source })?;
+    // Built before the first accept, so a certificate that cannot be loaded
+    // fails the start instead of the first connection.
+    let mut transports =
+        TransportCache::new(&runtime.config.load(), local_addr, admin_token.is_some())?;
 
     let accept_task = tokio::spawn(async move {
         let mut accept_warnings = AcceptWarnings::default();
@@ -407,26 +416,26 @@ pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServe
                     continue;
                 }
             };
-            let io = TokioIo::new(stream);
+            let transport = transports.current(&runtime.config.load());
             let mut runtime = runtime.clone();
-            let admin_token = admin_token.clone();
-            runtime.admin_token = admin_token;
-            let auth_limiter = Arc::clone(&auth_limiter);
+            runtime.admin_token = admin_token.clone();
+            let gate = GatePeer {
+                ip: peer.ip(),
+                limiter: Arc::clone(&auth_limiter),
+            };
             tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let runtime = runtime.clone();
-                    let auth_limiter = Arc::clone(&auth_limiter);
-                    let gate = GatePeer {
-                        ip: peer.ip(),
-                        limiter: auth_limiter,
-                    };
-                    async move { Ok::<_, std::convert::Infallible>(handle(req, &runtime, &gate).await) }
-                });
-                if let Err(err) = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await
-                {
-                    tracing::debug!(error = %err, "admin server: connection error");
+                match transport {
+                    AdminTransport::Plain => serve_connection(stream, runtime, gate).await,
+                    AdminTransport::Tls(factory) => {
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, factory.wrap(stream)).await {
+                            Ok(Ok(tls)) => serve_connection(tls, runtime, gate).await,
+                            Ok(Err(err)) => {
+                                tracing::debug!(error = %err, "admin server: TLS handshake failed");
+                            }
+                            Err(_) => tracing::debug!("admin server: TLS handshake timed out"),
+                        }
+                    }
+                    AdminTransport::Unavailable => drop(stream),
                 }
             });
         }
@@ -436,6 +445,24 @@ pub async fn serve(addr: SocketAddr, runtime: AdminRuntime) -> Result<AdminServe
         local_addr,
         accept_task,
     })
+}
+
+/// Answers admin requests on one accepted connection, plain or TLS.
+async fn serve_connection<IO>(io: IO, runtime: AdminRuntime, gate: GatePeer)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| {
+        let runtime = runtime.clone();
+        let gate = gate.clone();
+        async move { Ok::<_, std::convert::Infallible>(handle(req, &runtime, &gate).await) }
+    });
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(io), service)
+        .await
+    {
+        tracing::debug!(error = %err, "admin server: connection error");
+    }
 }
 
 async fn handle(
@@ -1459,6 +1486,7 @@ fn admin_gate(
 
 /// The connection a request arrived on, as the admin gate needs it: the peer
 /// address it logs and limits by, and the server's shared limiter.
+#[derive(Clone)]
 struct GatePeer {
     ip: IpAddr,
     limiter: Arc<AuthFailureLimiter>,

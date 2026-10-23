@@ -33,6 +33,8 @@ and response details that other pages already own.
   or only spaces, every gated route answers `403`.
 - **Open routes:** the read routes for probes, config, stats, and the rate
   card need no token.
+- **Transport:** plain HTTP by default. Set `admin.tls` to serve the admin
+  API over TLS. See [TLS on the admin port](#tls-on-the-admin-port).
 
 ```yaml title="llmproxy.yaml"
 version: 0
@@ -67,6 +69,44 @@ routes are open to any caller that can reach the admin port.
 **Warning.** The admin port has no other access control. Bind it to a
 loopback address, or put it behind a network you trust. Open routes such as
 `/config_dump` answer any caller.
+
+### TLS on the admin port
+
+Use the object form of `admin` to serve the admin API over TLS. The shorthand
+string `host:port` is plain HTTP.
+
+```yaml
+admin:
+  address: 0.0.0.0:9901
+  tls:
+    cert_file: /etc/llmproxy/admin.crt
+    key_file: /etc/llmproxy/admin.key
+```
+
+```sh
+curl --max-time 5 --cacert /etc/llmproxy/ca.crt https://localhost:9901/ready
+```
+
+- The port speaks only TLS. A plaintext request gets no HTTP answer.
+- The port offers TLS 1.2 and TLS 1.3, and ALPN `http/1.1`. It does not ask
+  clients for a certificate.
+- A certificate or key file that cannot be read at start stops the process.
+- A `SIGHUP` reload reads the files again on the next accepted admin
+  connection, the same as `listen.tls`. If a file cannot be read then, the
+  admin port closes every new connection until a later reload succeeds. It
+  never falls back to plain HTTP. See
+  [Rotate the certificate](/docs/llm-proxy/operations/tls/#rotate-the-certificate).
+
+If `LLMPROXY_ADMIN_TOKEN` is set, `admin.address` is not a loopback address,
+and `admin.tls` is not set, the token crosses the network in clear text. The
+proxy still serves the admin API, and it logs this warning once at start:
+
+```text
+admin.address 0.0.0.0:9901 is not a loopback address and the admin API has no TLS: ...
+```
+
+A reload that removes `admin.tls` logs the warning again. A loopback address
+does not log it.
 
 A gated route passes two checks in this order:
 
@@ -475,9 +515,8 @@ active pricing rate card` if no card is active. See
 
 ## Limitations
 
-- The admin port uses plain HTTP, and the dialect has no TLS setting for it.
-  The admin token crosses the network unencrypted if you bind the port to a
-  non-loopback address.
+- `admin.tls` takes one certificate. The admin port does not check client
+  certificates.
 - One token has full admin rights. There are no roles.
 - The admin API has no audit log. The proxy writes an info log line for most
   writes.
@@ -490,6 +529,11 @@ See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 
 For maintainers. Route table, handlers, gate, and limits are in
 `crates/proxy-admin/src/server.rs`.
+
+- Admin TLS: `TransportCache` in `crates/proxy-admin/src/server/transport.rs`
+  builds the acceptor from `ConfigSnapshot.admin_tls`
+  (`node.metadata["io.llmproxy.admin_tls"]`) and owns the exposure warning.
+  Tests: `crates/proxy/tests/admin_tls_e2e.rs`.
 
 - Gate: `admin_gate` and `secrets_match`. Failure limiter:
   `crates/proxy-admin/src/server/auth_limit.rs` (`MAX_FAILURES`, `WINDOW`).

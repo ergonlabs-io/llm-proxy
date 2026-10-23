@@ -8,6 +8,7 @@
 //! AGENTS.md invariant 1: strict mode is the default. Every Envoy config field is
 //! either mapped or rejected with its full field path — never silently ignored.
 
+mod admin_tls;
 pub mod authorization;
 pub mod error;
 pub mod ir;

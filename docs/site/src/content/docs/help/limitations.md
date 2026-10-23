@@ -75,7 +75,7 @@ Use the status words this way:
 | Credential files | Partly built | The proxy reads a credential file at start and again at each `SIGHUP`. It does not watch the file. | Send `SIGHUP` after you change a provider credential file. |
 | Automatic certificate renewal | Not built | No file watching and no ACME. A renewed certificate needs a `SIGHUP`. | See [TLS](/docs/llm-proxy/operations/tls/). |
 | Client certificates (mTLS) | Not built | `listen.tls` takes `cert_file` and `key_file` only. | End mTLS in a layer in front of the proxy. |
-| TLS on the admin address | Not built | The admin listener is plain HTTP. The admin token crosses it in clear text. | Bind it to loopback, or put a TLS proxy in front. |
+| Client certificates on the admin address | Not built | `admin.tls` takes `cert_file` and `key_file` only. Any client that reaches the port can call the open routes, such as `/config_dump`. | Bind the admin address to a network you trust. Gated routes still need the admin token. |
 | Rate card from a changed file | By design | With an `auth` block, the store holds the rate card. A changed `pricing` block does not replace a stored card. | Use `PUT /pricing`. |
 
 ## Limits and spend
