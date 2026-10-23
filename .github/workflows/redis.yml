@@ -1,0 +1,51 @@
+name: Redis store tests
+
+# The shared auth store tests and the spend recovery journal kill -9 test are
+# #[ignore]d behind LLM_PROXY_TEST_REDIS, so the main CI workflow never runs
+# them. This workflow gives them a real Redis and runs `make tq-redis`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tq-redis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      redis:
+        # Pinned by digest; the tag is for readers. Bump both together.
+        image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
+        # Container port only: the runner picks a free host port, read below
+        # from job.services (AGENTS.md "Running The Product").
+        ports:
+          - 6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Toolchain versions
+        run: rustc --version && cargo --version && cargo nextest --version
+      - name: Redis store tests
+        # Step-level env: the job context is not available at job level. The
+        # tests parse redis://host:port[/db].
+        env:
+          LLM_PROXY_TEST_REDIS: redis://127.0.0.1:${{ job.services.redis.ports['6379'] }}
+        run: make tq-redis
