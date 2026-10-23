@@ -228,10 +228,10 @@ tar -xzf "llm-proxy-$os-$arch.tar.gz"
 curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart.yaml
 ```
 
-Releases up to v0.6.1 have no Linux arm64 archive; build from source there.
+Releases before v0.7.0 have no Linux arm64 archive; build from source there.
 
 **Container image** (`ghcr.io/ergonlabs-io/llm-proxy`, linux/amd64 and
-linux/arm64; published for releases after v0.6.1):
+linux/arm64; published from v0.7.0):
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart-container.yaml
@@ -397,19 +397,20 @@ Full method, the not-harness-bound argument, and what is *not* saturated:
 What the proxy adds to one non-streaming request over a direct call to the
 same mock upstream, with auth, token and request limits, a spend budget and
 the billing ledger on. Minimum of 5 alternated rounds, open loop at 200
-requests/s, M1 Pro MacBook Pro. **Measured under load** (1-minute load average
-5-50 on 8 cores, from other builds): a quiet-machine run is still to come.
+requests/s, on a quiet dedicated host (DigitalOcean, 16 vCPU Xeon Platinum
+8168, CPU steal 0; 1-minute load average 0.1 for most runs), commit
+`bf196879`.
 
 | | p50 | p99 |
 |---|---|---|
-| Direct to the mock (baseline) | 0.29 ms | 2.45 ms |
-| Proxy, controls off: added | +0.17 ms | +1.18 ms |
-| Proxy, controls on: added | +0.23 ms | +0.97 ms |
+| Direct to the mock (baseline) | 0.21 ms | 0.36 ms |
+| Proxy, controls off: added | +0.32 ms | +0.42 ms |
+| Proxy, controls on: added | +0.40 ms | +0.50 ms |
 
 Against a mock, added latency is a floor: a real provider adds far more
-latency and variance than this. On this box, controls on and controls off
-differ by less than the spread between rounds. Method, exact configs, a row
-per control group, and raw results: `internal-docs/capacity/added-latency.md`.
+latency and variance than this. The full control chain costs about 0.08 ms
+over the proxy alone. Method, exact configs, a row per control group, and raw
+results: `internal-docs/capacity/added-latency.md`.
 Reproduce with `make bench-added-latency`.
 
 ## Roadmap
@@ -426,7 +427,8 @@ Reproduce with `make bench-added-latency`.
 | **v0.3.4** | Hardening — production hardening from the 2026-10-10 design review | Shipped 2026-10-14 in tag v0.3.5 |
 | **v0.4.0** | Gateway completeness — every control enforced as written; tenant limits and model access flow down to keys, which can only narrow them | Shipped 2026-10-16 in tag v0.4.0; follow-up tag v0.4.1 |
 | **v0.5.0** | Billing ledger and trace export — a durable, encrypted billing ledger a consumer pulls and reconciles, and opt-in raw trace export for analytics | Shipped 2026-10-18 in tag v0.5.0 |
-| **v0.6.0** | Metering completeness — every request a budgeted tenant can send is charged in the units the provider bills or refused, with chargeback tags and OTel GenAI semantic conventions | Shipped 2026-10-20 in tag v0.6.0; latest release is tag v0.6.1 |
+| **v0.6.0** | Metering completeness — every request a budgeted tenant can send is charged in the units the provider bills or refused, with chargeback tags and OTel GenAI semantic conventions | Shipped 2026-10-20 in tag v0.6.0; follow-up tag v0.6.1 |
+| **v0.7.0** | Production deployment — several replicas behind a load balancer on Kubernetes: Helm chart and image, trusted hops for `client-ip`, gradual drain, and the overhead and scale numbers taken on a dedicated host | Shipped 2026-10-22 in tag v0.7.0 (latest release) |
 | — | Data-plane parity — widen the set of standard bootstrap configs accepted, without migration | Unscheduled |
 | **v1.0.0** | To be re-planned. The old theme (Gateway API Inference Extension, realtime sessions) was retired on 2026-10-15 | No gate, no scope |
 

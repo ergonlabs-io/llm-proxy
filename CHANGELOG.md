@@ -11,6 +11,8 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-22
+
 ### Breaking
 
 - Provider credential and extra header values are checked when the config
@@ -203,6 +205,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   under load. The release workflow also builds a Linux arm64 archive now. See
   the Kubernetes and Helm docs page.
 
+- An optional `mimalloc` global allocator for the `llm-proxy` binary
+  (`cargo build -p proxy --features mimalloc`). It is off by default and the
+  release builds do not enable it. On a dedicated 16-vCPU host at 20k
+  requests/s it used 7.5% less CPU, with a 13% lower p50, for about 29 MB more
+  RSS per replica. It stays off by default until a soak longer than 30
+  minutes.
+
 ### Changed
 
 - Shared spend and rate-window counters now cost the store calls in proportion
@@ -275,6 +284,20 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   bytes still go straight through (`internal-docs/envoy-divergences.md` row 44). A
   listener with an enabled upgrade type now refuses, at load, an HTTP filter that can
   buffer response bytes.
+
+- The h2 connection pool to a provider grows with demand: each worker opens
+  another connection when every connection it holds carries 100 in-flight
+  streams, up to the cluster's `max_connections`. Before, a worker held at most
+  4 connections per provider, which capped one 4-core replica at about 3,000
+  concurrent h2 streams with CPU to spare. On the dedicated benchmark host the
+  ceiling is now 7,927 streams, bound by CPU. When `max_connections` is spent,
+  a worker shares its least-loaded connection instead of waiting to dial.
+- An unset listener `tcp_backlog_size` now means `net.core.somaxconn` on
+  Linux, as in Envoy, instead of 128. Bursts of reconnecting clients
+  overflowed a 128-entry accept queue, and each dropped client waited out a
+  1 s SYN retransmit.
+- The usage filter parses each JSON response body once, not once per field
+  group: about 5% less proxy CPU at 20k non-streaming requests/s.
 
 ### Fixed
 

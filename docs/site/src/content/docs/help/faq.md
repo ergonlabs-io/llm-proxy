@@ -157,7 +157,7 @@ See [Running in production](/docs/llm-proxy/operations/running-in-production/).
 
 ### Is there a Docker image or Helm chart?
 
-Yes, for releases after v0.6.1. The release workflow publishes a container image,
+Yes, from v0.7.0. The release workflow publishes a container image,
 `ghcr.io/ergonlabs-io/llm-proxy`, and a Helm chart,
 `oci://ghcr.io/ergonlabs-io/charts/llm-proxy`. See
 [Kubernetes and Helm](/docs/llm-proxy/operations/kubernetes/).

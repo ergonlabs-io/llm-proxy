@@ -23,7 +23,7 @@ not fail a request that is in flight. The chart has no operator and no
 custom resources.
 
 :::caution
-The image and the chart are published for releases after v0.6.1.
+The image and the chart are published from v0.7.0.
 :::
 
 ## At a glance

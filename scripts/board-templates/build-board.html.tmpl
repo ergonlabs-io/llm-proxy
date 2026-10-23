@@ -198,11 +198,11 @@
     <button class="chip" data-prio="P3">P3 · later<span class="n" id="n-P3"></span></button>
   </div>
   <p class="now">
-    <b>State 2026-10-21.</b> Current milestone: <b>v0.7.0 Production deployment</b> (approved 2026-10-21): WP-128
+    <b>State 2026-10-22.</b> <b>v0.7.0 Production deployment</b> is complete and prepared as tag v0.7.0: WP-128
     (Helm chart and container image), WP-129 (trusted hops for client-ip), WP-130 (--drain-strategy gradual), WP-116
-    (quiet-machine benchmark run), WP-139 (DigitalOcean scale rerun on a dedicated c-16 after the TCP_NODELAY fix), WP-137 (per-provider concurrency in the dialect) and WP-138
-    (an emptied shared store is loud); WP-137 and WP-138 come from the 2026-10-16 DigitalOcean scale run. The latest release is tag v0.6.1 (2026-10-20), v0.6.0 (Metering completeness) plus
-    the QA-13 billing-ledger cap fix.
+    (added-latency on a quiet dedicated host: controls-on adds 0.40 ms p50, 0.50 ms p99), WP-139 (dedicated c-16 scale
+    run: S2 at 5k rps adds p99 2.34 ms), WP-137 (per-provider concurrency in the dialect) and WP-138 (an emptied shared
+    store is loud). The next planned milestone is v0.8.0 Cache-aware routing.
     <b>Also merged 2026-10-21, outside the gate:</b> WP-126 (JWT principals carry BYOK credentials), WP-127 (JWT claims
     to chargeback tags), WP-131 (filter chain on upgraded streams), WP-37 (realtime WebSocket sessions) and WP-132 (capture
     agent retired in favour of trace export; WP-88 closed). WP-109 (live smoke tests against an OpenRouter free model) merged 2026-10-20.

@@ -31,7 +31,7 @@ silicon. Intel macOS and Windows have no archive. Use option C on those
 platforms.
 
 :::caution
-Releases up to v0.6.1 have no Linux arm64 archive. On Linux arm64 the
+Releases before v0.7.0 have no Linux arm64 archive. On Linux arm64 the
 download fails for those releases. Use option C instead.
 :::
 
@@ -56,11 +56,11 @@ check the download.
 #### Option B: Container image
 
 :::caution
-The image is published for releases after v0.6.1.
+The image is published from v0.7.0.
 :::
 
 The image is `ghcr.io/ergonlabs-io/llm-proxy`. It has two kinds of tag: the
-version without `v` (for example `0.6.1`) and `latest`. A pre-release does
+version without `v` (for example `0.7.0`) and `latest`. A pre-release does
 not move `latest`. The image supports `linux/amd64` and `linux/arm64`.
 
 The image runs `llm-proxy --config /etc/llm-proxy/llmproxy.yaml` as user
@@ -217,7 +217,7 @@ Intel macOS has no prebuilt release. Build from source on that platform.
   match.
 
 :::caution
-Releases up to v0.6.1 have no Linux arm64 archive. On Linux arm64 the script
+Releases before v0.7.0 have no Linux arm64 archive. On Linux arm64 the script
 asks for `llm-proxy-linux-arm64.tar.gz`, and for those releases the download
 fails with `There may be no linux/arm64 build in this release.`
 :::

@@ -20,7 +20,7 @@ the installation page.
 ## Prerequisites
 
 - macOS on Apple Silicon, or Linux on x86-64. The release workflow also
-  builds Linux arm64, but releases up to v0.6.1 have no arm64 archive. For
+  builds Linux arm64, but releases before v0.7.0 have no arm64 archive. For
   Intel macOS, Linux on arm64 with an older release, or another platform,
   build from source. See
   [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
@@ -52,7 +52,7 @@ llm-proxy --version
 ```
 
 Expected output: one line that starts with `llm-proxy`, for example
-`llm-proxy 0.6.1`. For all installer options, upgrade, and source builds, see
+`llm-proxy 0.7.0`. For all installer options, upgrade, and source builds, see
 [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
 
 ## Step 2: Create a starter config
