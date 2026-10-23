@@ -16,6 +16,14 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
   kill -USR1` works. Before, `SIGUSR1` ended the process. Lines queued before
   the signal go to the renamed file. See
   [Rotating the file](docs/site/src/content/docs/observability/access-logs.md#rotating-the-file).
+- `--config`: `auth.spend.recovery_journal_path` turns on the spend recovery
+  journal, which was reachable only from an Envoy bootstrap. Each flush writes
+  the spend the store has not confirmed to this local file, and the next start
+  replays it, so a crash or `kill -9` during a store outage no longer loses
+  that spend. It lowers onto `SpendLimit.recovery_journal_path`. It requires
+  `--service-node` and a `persistent` or `shared` store, and is a load error
+  with `auth.enforce.spend: false`; each refusal names
+  `auth.spend.recovery_journal_path`.
 
 ### Changed
 
@@ -55,6 +63,11 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 - The admin listener pauses 100 ms after a failed `accept` (for example
   `EMFILE`) and warns at most once every 10 seconds. Before, it retried in a
   tight loop and logged every attempt.
+- A `SIGHUP` reload that changes, adds or removes the spend recovery journal
+  path (`auth.spend.recovery_journal_path`, or `SpendLimit.recovery_journal_path`
+  in Envoy mode) is refused, and the previous snapshot keeps serving. Before,
+  the reload succeeded and the proxy kept the journal it opened at startup
+  without a word. The refusal names the field.
 
 ### Removed
 

@@ -71,6 +71,7 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "AuthEnforce",
             parser_fields::<AuthEnforce>,
         ),
+        ("#/$defs/AuthSpend", "AuthSpend", parser_fields::<AuthSpend>),
         ("#/$defs/AuthStore", "AuthStore", parser_fields::<AuthStore>),
         (
             "#/$defs/AuthStore/properties/in_memory",

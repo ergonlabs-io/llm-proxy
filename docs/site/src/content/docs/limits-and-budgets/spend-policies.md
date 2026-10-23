@@ -377,9 +377,27 @@ With `auth.store: shared`, each live replica needs a distinct, stable
 days after their period ends.
 
 The flusher sends pending charges as numbered attempts. Redis drops a repeated
-attempt, so a retry after an unclear reply does not count a charge twice. The
-dialect has no recovery journal. A `SIGKILL` loses the charges that the replica
-did not flush yet, up to about one flush interval of spend.
+attempt, so a retry after an unclear reply does not count a charge twice.
+
+A `SIGKILL` loses the charges that the replica did not flush yet, up to about
+one flush interval of spend. During a store outage it also loses every charge
+the store did not confirm, which is the whole outage backlog. To keep that
+backlog, set `auth.spend.recovery_journal_path`:
+
+```yaml
+auth:
+  store: { shared: { url: "${LLMPROXY_REDIS_URL}" } }
+  spend:
+    recovery_journal_path: /var/lib/llm-proxy/spend-journal.redb
+```
+
+On each flush the replica writes its unconfirmed charges to this local file
+before it writes to the store. At the next start it replays the file into the
+store before it serves, or on a later flush if the store is still down. A `SIGKILL` then loses only the charges since the last
+flush. Give each replica its own file on storage that survives a restart of
+the process. The journal needs `--service-node`, because it records the node
+ID and refuses to replay under another one, and a `persistent` or `shared`
+store.
 
 Startup prefetch and the flusher load shared totals. If the startup prefetch
 cannot read Redis, the listener still starts and logs one warning. Until the
@@ -441,7 +459,9 @@ metric labels.
   budget counts requests on the tenant's own provider key only with
   `include_byok_in_limit: true`.
 - A request with no price adds $0. Give every model a price.
-- The dialect has no recovery journal. A `SIGKILL` loses unflushed charges.
+- A `SIGKILL` loses the charges since the last flush. Without
+  `auth.spend.recovery_journal_path` it also loses the backlog of a store
+  outage.
 - A budget has a period of `daily` or `monthly`. There is no other period.
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.

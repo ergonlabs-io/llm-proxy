@@ -321,6 +321,7 @@
           "description": "The key ring that seals tenant provider credentials at rest. Required when any `providers` entry sets `tenant_credentials: true`. Absent means the proxy cannot seal or open tenant credentials. Requires a durable `store`, `persistent` or `shared`; with `store` absent or `in_memory` this block is a load error. Fixed at startup: a `SIGHUP` reload that changes it, including new key bytes in a file at the same path, is refused."
         },
         "enforce": { "$ref": "#/$defs/AuthEnforce" },
+        "spend": { "$ref": "#/$defs/AuthSpend" },
         "max_policy_staleness": {
           "$ref": "#/$defs/Duration",
           "default": "4m",
@@ -420,6 +421,18 @@
       "properties": {
         "claim": { "type": "string", "minLength": 1, "description": "The top-level claim whose string value becomes the tag value.", "examples": ["department"] },
         "tag": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$", "description": "The tag key. Must be in `auth.chargeback_tags.allowed`, and may appear once per provider.", "examples": ["team"] }
+      }
+    },
+    "AuthSpend": {
+      "type": "object",
+      "description": "Settings of the spend-budget filter that `enforce.spend` adds. A load error with `enforce.spend: false`, which omits that filter.",
+      "additionalProperties": false,
+      "properties": {
+        "recovery_journal_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to a local `redb` file where this replica records the spend the store has not yet confirmed. The proxy writes it on each spend flush, before the store write, and replays it at the next start, so spend accrued while the store cannot be written survives a crash or `kill -9`. Absent means no journal: that spend is lost when the process stops. The file is created if missing. Each replica needs its own file, kept on storage that survives a restart of the process. Requires `--service-node`, because the journal records the node id and refuses to replay under another one, and a durable `store` (`persistent` or `shared`); otherwise the proxy does not start. Fixed at startup: a `SIGHUP` reload that changes it, adds it or removes it is refused, and the proxy keeps the journal it opened when it started. Restart to apply a change."
+        }
       }
     },
     "AuthEnforce": {

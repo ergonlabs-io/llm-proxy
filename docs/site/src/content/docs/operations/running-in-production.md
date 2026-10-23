@@ -265,9 +265,10 @@ Alert on `reconciliation_expired: true`, not on the raw age.
 The ledger heals once the store comes back. Every replica flushes its
 accumulated delta on recovery, and the additive write of the store composes
 the backlog, so the total becomes correct. The outage delays spend records.
-It does not lose them, unless a replica stops before it flushes. The config
-file has no recovery journal. The backlog that a replica has not flushed is
-volatile. See
+It does not lose them, unless a replica stops before it flushes. The backlog
+that a replica has not flushed is volatile unless
+`auth.spend.recovery_journal_path` is set: the replica then keeps it in a
+local file and replays it into the store at the next start. See
 [Spend policies and recovery](/docs/llm-proxy/limits-and-budgets/spend-policies/)
 for key lifecycle and concurrent admission limits.
 
@@ -426,7 +427,6 @@ command.
   reconciliation bound (60 seconds) have no config field.
 - During a store outage, spend and stream limits fail open. Only
   authentication fails closed.
-- The config file has no spend recovery journal.
 - `persistent` cannot serve more than one replica.
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
