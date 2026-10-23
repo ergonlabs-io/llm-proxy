@@ -243,8 +243,13 @@ docker run --rm -p 127.0.0.1:8080:8080 -e UPSTREAM_BASE_URL -e UPSTREAM_API_KEY 
 
 Then skip to step 3.
 
-**From source** (needs `protoc`: `brew install protobuf` or
-`apt install protobuf-compiler`; `rustup` installs the pinned Rust toolchain):
+**From source.** Install [rustup](https://rustup.rs), a C toolchain, and `protoc`.
+`rustup` then installs the pinned Rust version on the first build.
+
+```sh
+xcode-select --install; brew install protobuf                 # macOS
+sudo apt install build-essential protobuf-compiler            # Debian and Ubuntu
+```
 
 ```sh
 git clone https://github.com/ergonlabs-io/llm-proxy.git && cd llm-proxy

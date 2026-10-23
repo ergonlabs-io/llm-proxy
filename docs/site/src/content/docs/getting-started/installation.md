@@ -88,12 +88,15 @@ authentication. For Ollama on the Docker host, set
 
 #### Option C: Build from source
 
-You need Rust and `protoc`. The file `rust-toolchain.toml` pins Rust 1.99.0,
-and `rustup` installs that version for you. Install `protoc` first:
+You need [rustup](https://rustup.rs), a C toolchain, and `protoc`. The file
+`rust-toolchain.toml` pins Rust 1.99.0, and `rustup` installs that version on
+the first build. Rust needs the C toolchain to link. Without it, the build
+fails with ``error: linker `cc` not found``. Install the C toolchain and
+`protoc` first:
 
 ```sh
-brew install protobuf          # macOS
-apt install protobuf-compiler  # Debian and Ubuntu
+xcode-select --install; brew install protobuf        # macOS
+sudo apt install build-essential protobuf-compiler   # Debian and Ubuntu
 ```
 
 Then build. A clean release build takes a few minutes.

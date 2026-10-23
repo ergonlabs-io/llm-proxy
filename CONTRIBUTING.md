@@ -30,12 +30,13 @@ which other crates depend on.
 
 ## Set up
 
-You need a Rust toolchain and `protoc`. `rust-toolchain.toml` pins the Rust
-version, so `rustup` installs it on the first build.
+You need [rustup](https://rustup.rs), a C toolchain, and `protoc`.
+`rust-toolchain.toml` pins the Rust version, so `rustup` installs it on the
+first build.
 
 ```sh
-brew install protobuf          # macOS
-apt install protobuf-compiler  # Debian and Ubuntu
+xcode-select --install; brew install protobuf        # macOS
+sudo apt install build-essential protobuf-compiler   # Debian and Ubuntu
 cargo build -p proxy
 ```
 
