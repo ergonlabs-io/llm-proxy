@@ -68,7 +68,8 @@ kill %1
 `listen.tls` takes one certificate and nothing else:
 
 - The listener does not ask clients for a certificate.
-- You cannot set an ALPN list.
+- The listener offers ALPN `h2` and then `http/1.1`. A client that offers
+  h2 gets HTTP/2. You cannot change the list.
 - The listener offers TLS 1.2 and TLS 1.3.
 - You cannot serve different certificates by SNI.
 

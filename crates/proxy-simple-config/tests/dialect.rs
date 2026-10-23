@@ -4344,3 +4344,35 @@ observability:
         }
     }
 }
+
+/// A TLS listener offers ALPN h2 then http/1.1, in that order, so the
+/// listener's `AUTO` codec can serve h2 clients; without the list the
+/// handshake never selects h2.
+#[test]
+fn tls_listener_offers_h2_then_http1_via_alpn() {
+    let config = parse(
+        r#"
+version: 0
+listen:
+  address: 127.0.0.1:8443
+  tls: { cert_file: /etc/llmproxy/tls.crt, key_file: /etc/llmproxy/tls.key }
+providers:
+  openai: { api_key: ${OPENAI_API_KEY} }
+routes:
+  - model: "*"
+    provider: openai
+"#,
+    )
+    .expect("TLS listener config must parse");
+    let loaded = lower_to_loaded(&config).expect("TLS listener must lower and validate");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must lower to IR");
+    let listener = snapshot
+        .listeners
+        .get("llmproxy_listener")
+        .expect("simple lowering names its listener");
+    let tls = listener.filter_chains[0]
+        .transport_socket
+        .as_ref()
+        .expect("listen.tls must lower to a transport socket");
+    assert_eq!(tls.alpn_protocols, ["h2", "http/1.1"]);
+}

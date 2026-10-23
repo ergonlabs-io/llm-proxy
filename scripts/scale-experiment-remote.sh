@@ -679,12 +679,13 @@ PY2
 # request, plain and TLS, which prices the handshake. Proxy CPU comes from
 # /proc utime+stime around each run (S9_SECS, default 60 s); at S9_PROFILE_RATE a 15 s on-CPU
 # profile is taken 20 s in (point PROXY_BIN at a frame-pointer build).
+# S9_CASES picks a subset of the cases.
 s9() {
     local d="$OUT/s9" case mode tls rates rate dir pid t0 t1 lg
     local profile_rate="${S9_PROFILE_RATE:-5000}"
     mkdir -p "$d/certs"; make_tls_certs "$d/certs"
     local hz; hz="$(getconf CLK_TCK)"
-    for case in h1-plain h1-tls h2-tls short-plain short-tls; do
+    for case in ${S9_CASES:-h1-plain h1-tls h2-tls short-plain short-tls}; do
         case "$case" in
             h1-*) mode=h1-pool; rates="${S9_RATES:-1000 5000 10000}" ;;
             h2-*) mode=h2; rates="${S9_RATES:-1000 5000 10000}" ;;
