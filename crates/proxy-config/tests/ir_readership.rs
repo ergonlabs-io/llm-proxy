@@ -160,6 +160,14 @@ const ALLOWLIST: &[AllowlistEntry] = &[
     },
     AllowlistEntry {
         struct_name: "ConfigSnapshot",
+        field_name: "admin_tls",
+        kind: EntryKind::KnownInert,
+        reason: "TLS on the admin listener. Lowered from \
+                  node.metadata[\"io.llmproxy.admin_tls\"]; the admin server does not \
+                  read it yet.",
+    },
+    AllowlistEntry {
+        struct_name: "ConfigSnapshot",
         field_name: "secrets",
         kind: EntryKind::KnownInertNameCollision,
         reason: "No runtime code looks up a TlsSecret by name \

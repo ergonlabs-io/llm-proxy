@@ -369,6 +369,7 @@ fn snapshot_with_secret() -> Arc<ConfigSnapshot> {
         routes: HashMap::new(),
         secrets: HashMap::new(),
         admin: Some("127.0.0.1:9901".parse().unwrap()),
+        admin_tls: None,
         tracing: None,
         // Metric export is a separate IR field from trace
         // export precisely so the two are independently configurable; these
@@ -541,6 +542,7 @@ fn snapshot_with_model_routes() -> Arc<ConfigSnapshot> {
         routes: HashMap::from([("rds_route".to_string(), rds)]),
         secrets: HashMap::new(),
         admin: None,
+        admin_tls: None,
         tracing: None,
         // See the other snapshot fixture in this file.
         metrics: None,

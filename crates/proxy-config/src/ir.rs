@@ -44,6 +44,12 @@ pub struct ConfigSnapshot {
     pub secrets: HashMap<SecretName, Arc<TlsSecret>>,
     /// Admin endpoint bind address, when configured.
     pub admin: Option<SocketAddr>,
+    /// TLS on the admin endpoint, from `node.metadata["io.llmproxy.admin_tls"]`
+    /// (the dialect's `admin.tls`). Envoy's admin has no TLS of its own.
+    /// `None` serves plain HTTP. Re-read like a listener's transport socket:
+    /// the admin accept loop rebuilds it when the snapshot version changes,
+    /// so a reload serves a renewed certificate to new connections.
+    pub admin_tls: Option<Arc<DownstreamTlsSpec>>,
     /// OTLP trace export, when configured. `None` (the
     /// default) means tracing is off entirely -- no exporter runs, and no
     /// span is ever created, regardless of an inbound `traceparent`.
@@ -170,6 +176,7 @@ impl ConfigSnapshot {
             routes,
             secrets: self.secrets.clone(),
             admin: self.admin,
+            admin_tls: self.admin_tls.clone(),
             tracing: self.tracing.clone(),
             // Carried forward for the same reason `tracing` is: metric export
             // is bootstrap-scoped (a collector endpoint), not an xDS resource,
