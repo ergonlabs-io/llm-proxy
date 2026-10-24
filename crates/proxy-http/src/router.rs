@@ -3195,12 +3195,15 @@ fn reconcile_request_body(
     let Ok(mut object) = serde_json::from_slice::<RawObject>(body) else {
         return Ok(None);
     };
+    let options = object
+        .get("stream_options")
+        .and_then(|raw| serde_json::from_str::<RawObject>(raw.get()).ok());
+    if has_serde_raw_value_key(&object) || options.as_ref().is_some_and(has_serde_raw_value_key) {
+        return Err(Refusal::body("request body uses a reserved key"));
+    }
     let unserializable = |_| Refusal::body("request body could not be serialized");
     let include_usage = serde_json::value::to_raw_value(&true).map_err(unserializable)?;
-    let options = match object
-        .get("stream_options")
-        .and_then(|raw| serde_json::from_str::<RawObject>(raw.get()).ok())
-    {
+    let options = match options {
         Some(mut options) => {
             options.insert("include_usage".to_string(), include_usage);
             options
@@ -3222,6 +3225,18 @@ fn reconcile_request_body(
 /// so a rewrite would change fields it does not name. Keys come out sorted
 /// and a duplicate key keeps its last value, as with `Value`.
 type RawObject = BTreeMap<String, Box<serde_json::value::RawValue>>;
+
+/// The key `serde_json` reserves for `RawValue`. The workspace enables its
+/// `raw_value` feature, and with it `serde_json::Value` reads an object whose
+/// first key is this one as the JSON text in that key's string, not as an
+/// object. A rewrite emits keys sorted, so `$` moves this key first and the
+/// rewritten body means something else to the proxy's own decoder than the
+/// client's body did. No API defines the key, so a rewrite refuses it.
+const SERDE_RAW_VALUE_KEY: &str = "$serde_json::private::RawValue";
+
+fn has_serde_raw_value_key(object: &RawObject) -> bool {
+    object.contains_key(SERDE_RAW_VALUE_KEY)
+}
 
 /// Why the selected cluster's body preparation refused the request.
 enum BodyRefusal {
@@ -3326,6 +3341,11 @@ fn prepare_attempt_body(
             _ => format!("request body is not valid JSON: {err}"),
         })
     })?;
+    if has_serde_raw_value_key(&object) {
+        return Err(BodyRefusal::Invalid(
+            "request body uses a reserved key".to_string(),
+        ));
+    }
     if must_strip {
         if let Some(policy) = policy {
             for field in &policy.strip {
@@ -4868,6 +4888,57 @@ mod tests {
                 assert!(
                     text.contains(field),
                     "{rewrite} rewrite changed {field}: {text}"
+                );
+            }
+        }
+    }
+
+    /// Fuzz crash input (`router_body`): sorted on output, the reserved key
+    /// came first and `Value` no longer read the attempt body as an object.
+    #[test]
+    fn body_rewrites_refuse_the_serde_raw_value_key() {
+        let runtime = runtime_with(
+            vec![proxy_config::ir::ProviderModelRewrite {
+                pattern: "*".to_string(),
+                upstream_model: "upstream-model".to_string(),
+            }],
+            policy(&[], &["user"]),
+        );
+        for key in [
+            "$serde_json::private::RawValue",
+            r"\u0024serde_json::private::RawValue",
+        ] {
+            // The key's position does not matter: only the input order hides it.
+            let body = format!(r#"{{"model":"m","user":"u","{key}":25}}"#);
+            let as_value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+            assert!(
+                as_value.is_object(),
+                "the client body reads as an object: {body}"
+            );
+            match prepare_attempt_body(Some(&runtime), Some("m"), None, &Bytes::from(body.clone()))
+            {
+                Err(BodyRefusal::Invalid(message)) => {
+                    assert_eq!(message, "request body uses a reserved key", "{body}")
+                }
+                Err(BodyRefusal::FieldNotPermitted(field)) => panic!("{body}: denied {field}"),
+                Ok(out) => panic!("{body} rewritten to {}", String::from_utf8_lossy(&out)),
+            }
+
+            for forced in [
+                format!(r#"{{"stream":true,"{key}":25}}"#),
+                format!(r#"{{"stream":true,"stream_options":{{"{key}":"{{}}"}}}}"#),
+            ] {
+                let result = reconcile_request_body(
+                    &Bytes::from(forced.clone()),
+                    None,
+                    true,
+                    None,
+                    Endpoint::ChatCompletions,
+                );
+                assert_eq!(
+                    result.map_err(|r| r.message),
+                    Err("request body uses a reserved key".to_string()),
+                    "{forced}"
                 );
             }
         }
