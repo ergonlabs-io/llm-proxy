@@ -169,6 +169,7 @@ a path that does not end in `/realtime` also gets it. See
 | 400 | ``` `max_tokens` must be a non-negative integer ``` or ``` request body has duplicate `max_tokens` keys ``` | The output limit is not a non-negative integer, or the key repeats. The field name changes. | Send one integer. |
 | 413 | `request body exceeds buffer limit` | The body is larger than `listen.max_request_body_bytes`. | Send a smaller body, or raise the limit. The default is 1 MiB. |
 | 400 | `invalid request body` | The proxy could not read the request body. | Check the client. |
+| 400 | `request body uses a reserved key` | The body has the key `$serde_json::private::RawValue` at any depth, in any escaped spelling. No client API uses this key. The proxy refuses it because its JSON reader would read such a body differently from the provider. `response_code_details` is `request_body_reserved_json_key`. | Remove the key. |
 | 408 | `request timeout` | The client did not send the whole request within `listen.request_timeout`. | Send the request faster, or raise the timeout. |
 
 ## Provider objects (files and batches)
