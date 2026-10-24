@@ -12,7 +12,8 @@ related:
   - help/troubleshooting
 ---
 
-Each answer describes the current code in the repository. The project is before 1.0. See
+Each answer describes the current code in the repository. The 1.x releases follow the
+[stability policy](/docs/llm-proxy/reference/stability/). See
 [Limitations](/docs/llm-proxy/help/limitations/) for every gap.
 
 ## What it is
