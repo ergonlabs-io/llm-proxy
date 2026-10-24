@@ -137,10 +137,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
     verification could accept paths through distrusted emSign intermediates.
   - `tokio` 1.54.1 (RUSTSEC-2026-0386). The proxy does not use `AsyncFd`.
 - CI checks every pull request and push to `main` with `cargo-deny`
-  (`make deny-check`, policy in `deny.toml`). The three advisories it ignores,
+  (`make deny-check`, policy in `deny.toml`). The two advisories it ignores,
   each with its reason in `deny.toml`: `rsa` (RUSTSEC-2023-0071, test code
-  only), and the unmaintained `rustls-pemfile` (RUSTSEC-2025-0134) and
-  `unsafe-libyaml` (RUSTSEC-2024-0449).
+  only) and the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449).
+- PEM certificates and keys are read with `rustls-pki-types` instead of the
+  unmaintained `rustls-pemfile` (RUSTSEC-2025-0134). The accepted formats do
+  not change: PKCS#8, PKCS#1 and SEC1 private keys, and certificate chains in
+  file order.
 
 ## [0.7.0] - 2026-10-22
 

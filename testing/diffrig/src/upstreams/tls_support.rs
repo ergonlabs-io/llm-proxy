@@ -10,7 +10,6 @@
 //! since that file lives in a different crate and, being itself a `tests/`
 //! integration test, has nothing to export.
 
-use std::io::Cursor;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -20,6 +19,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -80,11 +81,10 @@ impl MockTls {
 /// process-wide default crypto provider ever having been installed (nothing
 /// else in this crate installs one).
 fn build_acceptor(tls: &MockTls) -> TlsAcceptor {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut Cursor::new(tls.cert_pem.as_bytes()))
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(tls.cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .expect("mock leaf cert PEM parses");
-    let key = rustls_pemfile::private_key(&mut Cursor::new(tls.key_pem.as_bytes()))
-        .expect("mock leaf key PEM parses")
+    let key = PrivateKeyDer::from_pem_slice(tls.key_pem.as_bytes())
         .expect("mock leaf key PEM contains a private key");
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());

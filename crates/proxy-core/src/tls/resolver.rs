@@ -5,12 +5,12 @@
 //! can be replaced afterwards by swapping the `ArcSwap<CertSet>` underneath
 //! it -- no rebuild, no dropped connections.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use proxy_config::ir::{DataSourceIR, TlsCertificateIR};
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -44,8 +44,7 @@ fn parse_cert_chain(
     bytes: &[u8],
     context: &str,
 ) -> Result<Vec<CertificateDer<'static>>, TlsBuildError> {
-    let mut reader = Cursor::new(bytes);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+    let certs: Result<Vec<_>, _> = CertificateDer::pem_slice_iter(bytes).collect();
     let certs =
         certs.map_err(|e| TlsBuildError::new(context, format!("parsing PEM chain: {e}")))?;
     if certs.is_empty() {
@@ -57,13 +56,13 @@ fn parse_cert_chain(
     Ok(certs)
 }
 
-/// Parse a PEM private key (any of PKCS8/RSA/SEC1 -- `rustls_pemfile::private_key`
-/// tries them all).
+/// Parse the first PEM private key: PKCS#8 (`PRIVATE KEY`), PKCS#1
+/// (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`).
 fn parse_private_key(bytes: &[u8], context: &str) -> Result<PrivateKeyDer<'static>, TlsBuildError> {
-    let mut reader = Cursor::new(bytes);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| TlsBuildError::new(context, format!("parsing PEM private key: {e}")))?
-        .ok_or_else(|| TlsBuildError::new(context, "no private key found in PEM data"))
+    PrivateKeyDer::from_pem_slice(bytes).map_err(|e| match e {
+        pem::Error::NoItemsFound => TlsBuildError::new(context, "no private key found in PEM data"),
+        e => TlsBuildError::new(context, format!("parsing PEM private key: {e}")),
+    })
 }
 
 /// Load one [`TlsCertificateIR`] into a chain + key, resolving `DataSourceIR`
@@ -171,5 +170,124 @@ impl ResolvesServerCert for SwapCertResolver {
             }
         }
         set.rsa.clone().or_else(|| set.ecdsa.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PEM block of `label` around the DER `30 03 02 01 01`. The loaders
+    /// never inspect the DER; the label alone picks the key format.
+    fn block(label: &str) -> String {
+        format!("-----BEGIN {label}-----\nMAMCAQE=\n-----END {label}-----\n")
+    }
+
+    fn load(
+        chain: &str,
+        key: &str,
+    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsBuildError> {
+        let cert = TlsCertificateIR {
+            cert_chain: DataSourceIR::Inline(chain.to_string()),
+            private_key: DataSourceIR::Inline(key.to_string()),
+        };
+        load_cert_and_key(&cert, "test")
+    }
+
+    /// Operators supply PKCS#8, PKCS#1 and SEC1 keys; each loads as its own
+    /// format, and the first key in the file wins over later sections.
+    #[test]
+    fn each_private_key_format_loads_and_the_first_key_wins() {
+        let chain = block("CERTIFICATE");
+        let cases = [
+            ("PRIVATE KEY", "pkcs8"),
+            ("RSA PRIVATE KEY", "pkcs1"),
+            ("EC PRIVATE KEY", "sec1"),
+        ];
+        for (label, want) in cases {
+            // A certificate before the key and another key after it.
+            let key_pem = format!(
+                "{}{}{}",
+                block("CERTIFICATE"),
+                block(label),
+                block("PRIVATE KEY")
+            );
+            let (_, key) =
+                load(&chain, &key_pem).unwrap_or_else(|e| panic!("{label}: {}", e.reason));
+            let got = match &key {
+                PrivateKeyDer::Pkcs8(_) => "pkcs8",
+                PrivateKeyDer::Pkcs1(_) => "pkcs1",
+                PrivateKeyDer::Sec1(_) => "sec1",
+                _ => "other",
+            };
+            assert_eq!(
+                got, want,
+                "a `{label}` block must load as {want}, got {got}"
+            );
+            assert_eq!(
+                key.secret_der(),
+                [0x30, 0x03, 0x02, 0x01, 0x01],
+                "{label}: DER changed in loading"
+            );
+        }
+    }
+
+    /// The chain is served in file order (leaf first); key sections in the
+    /// chain file are skipped, not refused.
+    #[test]
+    fn a_cert_chain_keeps_file_order_and_skips_other_sections() {
+        let leaf = "-----BEGIN CERTIFICATE-----\nAQ==\n-----END CERTIFICATE-----\n";
+        let intermediate = "-----BEGIN CERTIFICATE-----\nAg==\n-----END CERTIFICATE-----\n";
+        let chain = format!(
+            "{}{leaf}{}{intermediate}",
+            block("PRIVATE KEY"),
+            block("EC PRIVATE KEY")
+        );
+        let (certs, _) =
+            load(&chain, &block("PRIVATE KEY")).unwrap_or_else(|e| panic!("{}", e.reason));
+        let ders: Vec<&[u8]> = certs.iter().map(|c| c.as_ref()).collect();
+        assert_eq!(
+            ders,
+            [&[1u8][..], &[2u8][..]],
+            "chain must be leaf then intermediate, keys skipped"
+        );
+    }
+
+    /// A PEM with nothing usable, or a block that is not base64, is refused
+    /// with a reason that names what is wrong (AGENTS.md invariant 1).
+    #[test]
+    fn missing_or_malformed_pem_is_refused_with_a_named_reason() {
+        let good_chain = block("CERTIFICATE");
+        let good_key = block("PRIVATE KEY");
+        let malformed = "-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----\n";
+        let malformed_cert = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        let cases = [
+            (
+                good_chain.as_str(),
+                block("CERTIFICATE"),
+                "no private key found in PEM data",
+            ),
+            (
+                good_chain.as_str(),
+                malformed.to_string(),
+                "parsing PEM private key: ",
+            ),
+            (
+                good_key.as_str(),
+                good_key.clone(),
+                "no certificates found in PEM data",
+            ),
+            (malformed_cert, good_key.clone(), "parsing PEM chain: "),
+        ];
+        for (chain, key, want) in cases {
+            let Err(err) = load(chain, &key) else {
+                panic!("expected a refusal starting {want:?} for chain {chain:?} key {key:?}");
+            };
+            assert!(
+                err.reason.starts_with(want),
+                "reason {:?} must start with {want:?}",
+                err.reason
+            );
+        }
     }
 }

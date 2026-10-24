@@ -1,8 +1,9 @@
 use std::convert::Infallible;
-use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use rustls::pki_types::pem::PemObject as _;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -123,11 +124,10 @@ fn tls_acceptor(alpn: &[u8]) -> (TlsAcceptor, String) {
         .expect("leaf params")
         .signed_by(&leaf_key, &ca, &ca_key)
         .expect("leaf cert");
-    let certs = rustls_pemfile::certs(&mut Cursor::new(leaf.pem()))
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(leaf.pem().as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .expect("cert");
-    let key = rustls_pemfile::private_key(&mut Cursor::new(leaf_key.serialize_pem()))
-        .expect("key parse")
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(leaf_key.serialize_pem().as_bytes())
         .expect("key");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server = rustls::ServerConfig::builder_with_provider(provider)

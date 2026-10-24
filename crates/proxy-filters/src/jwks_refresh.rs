@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use rustls::pki_types::pem::PemObject as _;
 
 use crate::jwt_auth::{JwkRsaKey, JwtKeySet};
 
@@ -222,7 +223,7 @@ pub fn tls_roots(ca_pem: Option<&[u8]>) -> Result<rustls::RootCertStore, String>
     let mut store = rustls::RootCertStore::empty();
     match ca_pem {
         Some(pem) => {
-            let certs: Vec<_> = rustls_pemfile::certs(&mut &pem[..])
+            let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(pem)
                 .collect::<Result<_, _>>()
                 .map_err(|e| format!("trusted_ca is not valid PEM: {e}"))?;
             if certs.is_empty() {

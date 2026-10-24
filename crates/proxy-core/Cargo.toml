@@ -32,7 +32,6 @@ prost-reflect = { workspace = true }
 # The gradual drain's per-request close draw (`drain::drain_close`).
 rand = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }

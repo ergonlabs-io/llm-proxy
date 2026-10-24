@@ -72,7 +72,6 @@ serde_path_to_error = "0.1"
 # need a cmake/NASM toolchain; `logging` wires rustls into the `log` facade.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 rcgen = "0.13"
 # Rust note: only used to pull Subject Alternative Names out of the raw DER

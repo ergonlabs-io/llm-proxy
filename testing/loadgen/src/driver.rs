@@ -14,6 +14,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::ServerName;
 use serde::Serialize;
 use tokio::net::TcpStream;
@@ -223,7 +224,7 @@ fn tls_config(ca_file: Option<&PathBuf>, alpn: &[u8]) -> Result<rustls::ClientCo
     let mut roots = rustls::RootCertStore::empty();
     if let Some(path) = ca_file {
         let file = std::fs::File::open(path).map_err(|_| ExecError::Transport)?;
-        for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(file)) {
+        for cert in rustls::pki_types::CertificateDer::pem_reader_iter(file) {
             roots
                 .add(cert.map_err(|_| ExecError::Transport)?)
                 .map_err(|_| ExecError::Transport)?;

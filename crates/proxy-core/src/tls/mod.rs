@@ -28,7 +28,8 @@ use proxy_config::ir::{
 };
 use rustls::crypto::ring::{cipher_suite, kx_group};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::server::{ResolvesServerCert, WebPkiClientVerifier};
 use rustls::{version, ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -159,8 +160,7 @@ fn build_root_store(ca: &CaSource, context: &str) -> Result<RootCertStore, TlsBu
     match ca {
         CaSource::TrustedCa(source) => {
             let bytes = resolver::read_data_source(source, context)?;
-            let mut reader = std::io::Cursor::new(&bytes);
-            let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+            let certs: Result<Vec<_>, _> = CertificateDer::pem_slice_iter(&bytes).collect();
             let certs = certs
                 .map_err(|e| TlsBuildError::new(context, format!("parsing trusted_ca PEM: {e}")))?;
             let (added, ignored) = roots.add_parsable_certificates(certs);

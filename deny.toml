@@ -24,10 +24,6 @@ ignore = [
     # sign test tokens. No production build links it; the JWT verifier checks
     # RSA signatures through ring via jsonwebtoken.
     { id = "RUSTSEC-2023-0071", reason = "dev-dependency only; production RSA goes through ring" },
-    # rustls-pemfile: unmaintained, not vulnerable. Its PEM parsing is the
-    # code in rustls-pki-types (PemObject); moving the TLS loaders in
-    # proxy-core and proxy-filters to that API removes the dependency.
-    { id = "RUSTSEC-2025-0134", reason = "unmaintained, no vulnerability; migration to rustls-pki-types PemObject pending" },
     # unsafe-libyaml: unmaintained, not vulnerable; reached through
     # serde_yaml, which parses operator-supplied config files. Replacing the
     # YAML parser is a change of its own.

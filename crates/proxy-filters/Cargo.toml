@@ -61,7 +61,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 # OIDC discovery + background JWKS refresh. All
 # network crates here were already in the tree (hyper, tokio-rustls, rustls,
-# rustls-pemfile, rustls-native-certs) -- this adds edges, not new crates, and
+# rustls-native-certs) -- this adds edges, not new crates, and
 # stays on the workspace's `ring` crypto provider (see `jwt_auth`'s own note
 # on why `jsonwebtoken` 9.x is pinned).
 tokio = { workspace = true }
@@ -70,7 +70,6 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
 
 [dev-dependencies]
