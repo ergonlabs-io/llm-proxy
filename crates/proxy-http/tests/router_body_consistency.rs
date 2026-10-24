@@ -255,3 +255,37 @@ async fn escaped_duplicate_model_is_refused_before_reaching_the_upstream() {
         })
         .await;
 }
+
+/// With serde_json's `raw_value` feature on, `Value` reads this `model` as the
+/// string "cheap", so the router's model check would agree with the route,
+/// while the provider gets an object. The filter manager refuses the reserved
+/// key before the router reads the body.
+#[tokio::test(flavor = "current_thread")]
+async fn a_model_hidden_behind_the_serde_raw_value_key_is_refused() {
+    LocalSet::new()
+        .run_until(async {
+            let (addr, seen) = spawn_upstream().await;
+            let handler = build(addr).await;
+
+            let agreeing = post(&handler, r#"{"model":"cheap","messages":[]}"#).await;
+            assert_eq!(agreeing, StatusCode::OK);
+            assert_eq!(seen.lock().unwrap().len(), 1);
+
+            for smuggled in [
+                r#"{"model":{"$serde_json::private::RawValue":"\"cheap\""},"messages":[]}"#,
+                r#"{"model":{"\u0024serde_json::private::RawValue":"\"cheap\""},"messages":[]}"#,
+            ] {
+                assert_eq!(
+                    post(&handler, smuggled).await,
+                    StatusCode::BAD_REQUEST,
+                    "{smuggled}"
+                );
+            }
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "a smuggled model must never reach the upstream"
+            );
+        })
+        .await;
+}

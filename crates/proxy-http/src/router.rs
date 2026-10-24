@@ -3226,16 +3226,12 @@ fn reconcile_request_body(
 /// and a duplicate key keeps its last value, as with `Value`.
 type RawObject = BTreeMap<String, Box<serde_json::value::RawValue>>;
 
-/// The key `serde_json` reserves for `RawValue`. The workspace enables its
-/// `raw_value` feature, and with it `serde_json::Value` reads an object whose
-/// first key is this one as the JSON text in that key's string, not as an
-/// object. A rewrite emits keys sorted, so `$` moves this key first and the
-/// rewritten body means something else to the proxy's own decoder than the
-/// client's body did. No API defines the key, so a rewrite refuses it.
-const SERDE_RAW_VALUE_KEY: &str = "$serde_json::private::RawValue";
-
+/// The filter manager already refuses a request body with this key (see
+/// `json_reserved`). The rewrites check again because they emit keys sorted,
+/// so `$` would move the key first, where `serde_json::Value` misreads the
+/// object, and they should not rely on their caller having checked.
 fn has_serde_raw_value_key(object: &RawObject) -> bool {
-    object.contains_key(SERDE_RAW_VALUE_KEY)
+    object.contains_key(crate::json_reserved::SERDE_RAW_VALUE_KEY)
 }
 
 /// Why the selected cluster's body preparation refused the request.

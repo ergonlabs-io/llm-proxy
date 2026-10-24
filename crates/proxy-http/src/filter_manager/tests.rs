@@ -858,6 +858,51 @@ fn decode_buffer_overflow_yields_413() {
     });
 }
 
+/// A request body with serde_json's reserved `RawValue` key is a 400 before
+/// any filter decodes it (see `json_reserved`), and still runs through the
+/// encoder chain like every other local reply.
+#[test]
+fn a_body_with_the_serde_raw_value_key_is_refused_before_decode() {
+    block_on(async {
+        let log = log_of();
+        let seen_head = Rc::new(RefCell::new(None));
+        let mut a = ProbeFilter::new("a", log.clone());
+        a.seen_response_head = Some(seen_head.clone());
+        let filters: Vec<Box<dyn HttpFilter>> = vec![Box::new(a)];
+        let (status, _, resp_body) = run_chain(
+            filters,
+            log.clone(),
+            br#"{"model":{"$serde_json::private::RawValue":"\"gpt-4o\""}}"#,
+            DEFAULT_BUFFER_LIMIT,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp_body,
+            Bytes::from_static(b"request body uses a reserved key\n")
+        );
+        assert_eq!(
+            seen_head.borrow().as_ref().map(|(s, _)| *s),
+            Some(StatusCode::BAD_REQUEST),
+            "the encoder chain must see the 400"
+        );
+        let entries = log.borrow().clone();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e == "a:decode_data" || e == "terminal"),
+            "no filter or terminal may read the body; log: {entries:?}"
+        );
+
+        // The same text as a string value is not a key, and passes.
+        let body: &'static [u8] = br#"{"model":"m","note":"$serde_json::private::RawValue"}"#;
+        let (status, seen, _) = run_chain(vec![], log_of(), body, DEFAULT_BUFFER_LIMIT).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen, Bytes::from_static(body));
+    });
+}
+
 /// S2.2/S2.3: overflowing the encode buffer limit yields **500** (not 413 —
 /// the client didn't cause it).
 #[test]

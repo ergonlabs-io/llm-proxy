@@ -1606,6 +1606,19 @@ impl FilterManager {
             }
         };
 
+        // Refused before any filter or the router decodes the body: the key
+        // makes every `serde_json::Value` decode in the proxy read the body
+        // differently from the provider (see `json_reserved`). Not an Envoy
+        // behavior; no client API defines the key.
+        if crate::json_reserved::contains_serde_raw_value_key(&body) {
+            let reply = LocalReply::new(
+                http::StatusCode::BAD_REQUEST,
+                "request body uses a reserved key",
+                "request_body_reserved_json_key",
+            );
+            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+        }
+
         // Trace export (ADR-0008): keep the body as received across the
         // decode chain, which may replace it. A reference-count clone, taken
         // only while export is configured and its gate is open; it is
