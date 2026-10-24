@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+# yaml-language-server: $schema=../schema/llmproxy-v1.schema.json
 #
 # llm-proxy against a local Ollama — the no-API-key, no-network example.
 #
@@ -10,7 +10,7 @@
 #
 # Run:       llm-proxy --config llmproxy-ollama.yaml
 # Inspect:   llm-proxy --config llmproxy-ollama.yaml --mode translate
-version: 0
+version: 1
 
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901

@@ -1,0 +1,92 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy metering image, speech and transcription requests under a tenant
+# spend budget (ADR-0010). Each rate-card entry declares the unit the provider
+# bills in: `tokens`, `images`, `characters` or `audio_seconds`.
+#
+# The rates are OpenAI's published list prices on 2026-10-17, in nanodollars
+# (1 USD = 1,000,000,000). Check them before you use this card for money.
+#
+# ASSUMPTIONS. Three provider facts are not yet pinned against a recorded
+# response. Until one is recorded, treat the entries that depend on them as
+# estimates:
+#
+#   1. Character rule (tts-1, tts-1-hd). The proxy counts the Unicode code
+#      points of the request's `input`, after JSON unescaping. OpenAI does not
+#      say whether it counts code points or bytes. For ASCII text the two
+#      agree; for other scripts a byte count would be higher.
+#   2. `speech.audio.done` usage (gpt-4o-mini-tts). Tokens are reported only
+#      when the request sets `stream_format: sse`, on the `speech.audio.done`
+#      event, in the documented shape {input_tokens, output_tokens}. Without
+#      SSE the response is audio with no usage, so the request is unpriced
+#      ($0, and a warning) under this tokens entry.
+#   3. Cached image rate (gpt-image-1). OpenAI lists a cached image input
+#      rate, but the Images API usage reports no cached figure, so no request
+#      is priced at it. The cached rate below is the cached text rate.
+#
+# Run:       llm-proxy --config llmproxy-media.yaml
+# Inspect:   llm-proxy --config llmproxy-media.yaml --mode translate
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+
+routes:
+  - model: "*"
+    provider: openai
+
+# Mint keys and set tenant budgets through the admin API (`POST /keys`,
+# `PUT /tenants/{id}/budget`). The startup warning about an empty
+# `auth.keys` concerns static keys only.
+auth:
+  hmac_secret: ${LLMPROXY_HMAC_SECRET}
+
+pricing:
+  price_list:
+    version: openai-media-2026-10
+    effective_from: "2026-10-17T00:00:00Z"
+    entries:
+      # Image generation and edits: text and image tokens, from `usage`.
+      # Assumption 3 applies to the cached rate.
+      - provider_type: openai
+        model: gpt-image-1
+        tier_mode: whole_request
+        tiers:
+          - input_nanodollars_per_token: 5000
+            cached_input_nanodollars_per_token: 1250
+            cache_write_nanodollars_per_token: 0
+            output_nanodollars_per_token: 40000
+            image_input_nanodollars_per_token: 10000
+            image_output_nanodollars_per_token: 40000
+      # Speech, per character of `input`: 15 and 30 USD per million.
+      # Assumption 1.
+      - provider_type: openai
+        model: tts-1
+        basis: characters
+        nanodollars_per_character: 15000
+      - provider_type: openai
+        model: tts-1-hd
+        basis: characters
+        nanodollars_per_character: 30000
+      # Speech in tokens: 0.60 USD per million text input tokens, 12 USD per
+      # million audio output tokens. Assumption 2.
+      - provider_type: openai
+        model: gpt-4o-mini-tts
+        tier_mode: whole_request
+        tiers:
+          - input_nanodollars_per_token: 600
+            cached_input_nanodollars_per_token: 600
+            cache_write_nanodollars_per_token: 0
+            output_nanodollars_per_token: 12000
+      # Transcription and translation, per second of audio: 0.006 USD per
+      # minute. A transcription is counted only when its `response_format`
+      # carries usage (json, verbose_json, diarized_json); a translation
+      # only with verbose_json. Other formats are refused under a budget.
+      - provider_type: openai
+        model: whisper-1
+        basis: audio_seconds
+        nanodollars_per_second: 100000

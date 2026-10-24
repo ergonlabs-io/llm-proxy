@@ -126,7 +126,7 @@ fn write_new_secret(path: &Path, contents: &[u8]) -> Result<(), String> {
 fn starter_config(digest: &str) -> String {
     format!(
         r#"# llm-proxy starter configuration
-version: 0
+version: 1
 
 listen: 0.0.0.0:53421
 admin: {ADMIN_ADDRESS}

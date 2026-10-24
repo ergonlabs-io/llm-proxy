@@ -39,7 +39,7 @@ reaches an Anthropic-shaped provider.
 ## Minimal example
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 
@@ -102,7 +102,7 @@ is one example.
 ## Fields common to all types
 
 The generated [field reference](/docs/llm-proxy/configuration/reference/)
-lists every field. Defaults come from `schema/llmproxy-v0.schema.json`
+lists every field. Defaults come from `schema/llmproxy-v1.schema.json`
 (`Provider`).
 
 | Field | Type | Default | Description |

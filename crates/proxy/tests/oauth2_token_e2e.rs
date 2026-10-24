@@ -354,7 +354,7 @@ fn config_with_admin(
 ) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{port}"
 admin: "127.0.0.1:{admin}"
 providers:
@@ -492,7 +492,7 @@ fn failover_config(
 ) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{port}"
 admin: "127.0.0.1:{admin}"
 providers:

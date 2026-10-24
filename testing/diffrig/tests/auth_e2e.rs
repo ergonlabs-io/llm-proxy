@@ -628,7 +628,7 @@ async fn two_virtual_keys_on_the_same_tenant_share_one_token_budget() {
 
 // ------------------------------------- the dialect path, with a secret FILE --
 
-/// Render an `llmproxy-v0` **dialect** config (the surface real operators
+/// Render an `llmproxy-v1` **dialect** config (the surface real operators
 /// write) with an `auth:` block whose secret comes from a FILE.
 ///
 /// `secret_path` is written by the caller into the scratch dir; the dialect
@@ -639,7 +639,7 @@ fn dialect_config(listener_port: u16, upstream_port: u16, secret_path: &std::pat
     let key_live_digest = digest_hex(HMAC_SECRET, KEY_LIVE);
     format!(
         r#"
-version: 0
+version: 1
 listen: 127.0.0.1:{listener_port}
 auth:
   hmac_secret_file: {secret_file}

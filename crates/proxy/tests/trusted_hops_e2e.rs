@@ -192,7 +192,7 @@ impl Proxy {
         let listen = free_port();
         let hops = trusted_hops.map_or(String::new(), |n| format!(", trusted_hops: {n}"));
         let config = format!(
-            r#"version: 0
+            r#"version: 1
 listen: {{ address: "127.0.0.1:{listen}"{hops} }}
 providers:
   openai:

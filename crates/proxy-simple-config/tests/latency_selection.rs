@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 fn config(providers: &str, selection: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   a: {{ type: openai-compatible, base_url: "http://a.internal:8000" }}
   b: {{ type: openai-compatible, base_url: "http://b.internal:8000" }}

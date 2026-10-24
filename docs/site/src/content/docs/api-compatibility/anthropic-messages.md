@@ -33,7 +33,7 @@ Save this file as `messages.yaml`. A provider named `anthropic` has the type
 `anthropic` and the base URL `https://api.anthropic.com` by default.
 
 ```yaml title="messages.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 

@@ -25,7 +25,7 @@ fn config(key_tags: &str, extra: &str) -> String {
         format!(", tags: {key_tags}")
     };
     format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"test-operator-secret\"\n  \

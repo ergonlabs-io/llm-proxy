@@ -354,7 +354,7 @@ vendor-protos: ## Re-vendor the pinned Envoy protos (see scripts/vendor-protos.s
 	./scripts/vendor-protos.sh
 
 # ------------------------------------------------------------ dialect schema --
-# schema/llmproxy-v0.schema.json is normative for the --config dialect
+# schema/llmproxy-v1.schema.json is normative for the --config dialect
 # (AGENTS.md "Architecture Invariants", 5). The gate tests run in every
 # `cargo nextest run --workspace`; schema-check runs only them.
 

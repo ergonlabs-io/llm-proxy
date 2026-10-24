@@ -56,7 +56,7 @@ dotted path. List positions are in square brackets.
 A misspelled key, such as `api_keyy`, gives this error:
 
 ```text
-unknown field at `providers.openai.api_keyy`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)
+unknown field at `providers.openai.api_keyy`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v1.schema.json for valid fields)
 ```
 
 The valid fields are in the [field reference](/docs/llm-proxy/configuration/reference/).
@@ -65,10 +65,10 @@ That page is generated from the schema.
 ### Reserved top-level key
 
 The format reserves three top-level keys for a later schema version: `envoy`,
-`tracing`, and `clusters`. Version 0 rejects them:
+`tracing`, and `clusters`. Version 1 rejects them:
 
 ```text
-unsupported field `clusters`: `clusters` is reserved for a future schema version; v0 rejects it so it can be added compatibly later (strict mode; see https://ergonlabs.io/docs/llm-proxy/help/limitations/)
+unsupported field `clusters`: `clusters` is reserved for a future schema version; this version rejects it so it can be added compatibly later (strict mode; see https://ergonlabs.io/docs/llm-proxy/help/limitations/)
 ```
 
 To export traces, use `observability.tracing`.
@@ -83,7 +83,7 @@ These are other texts that you can meet:
 
 | Cause | Path | Reason text |
 |---|---|---|
-| `version` is not `0` | `version` | `this build understands schema version 0, not <n>` |
+| `version` is not `1` or `0` | `version` | `this build understands schema version 1 (and the deprecated 0), not <n>` |
 | No providers | `providers` | `at least one provider is required` |
 | No routes and no models | `routes` | `at least one route or model is required` |
 | Two key sources | `providers.<name>` | `set either api_key or api_key_file, not both` |
@@ -121,6 +121,7 @@ The `llmproxy` dialect produces these warnings:
 
 | Path | When | Meaning |
 |---|---|---|
+| `version` | The file has `version: 0`. | Version 0 is deprecated. It has the same fields as version 1 and still loads. Set `version: 1`; no other change is necessary. |
 | `auth.keys` | `auth` has no keys, no JWT provider, no `admin` address, and no `persistent` or `shared` store. | The block authenticates nothing. It refuses every request (fails closed). Add a key or remove `auth`. |
 | `auth.enforce.model_policy` | You set it to `false`. | Tenant model allow-lists are not enforced. Every tenant can call every routed model. The admin API refuses `PUT /tenants/{id}/policy`. |
 | `auth.enforce.tenants_without_policy` | You set it to `allow` while model policy is on. | A tenant with no stored model policy can use every model. |

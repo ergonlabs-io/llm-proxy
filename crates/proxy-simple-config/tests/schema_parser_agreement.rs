@@ -530,7 +530,7 @@ fn schema_and_parser_agree_on_map_key_names() {
     let validator = schema_support::validator(&schema);
     let provider_config = |key: &str| {
         serde_json::json!({
-            "version": 0,
+            "version": 1,
             // The key is referenced nowhere else, so only the map's key
             // grammar decides (a route reference has its own pattern).
             "providers": { "openai": {}, key: { "base_url": "http://127.0.0.1:1" } },
@@ -539,7 +539,7 @@ fn schema_and_parser_agree_on_map_key_names() {
     };
     let model_config = |key: &str| {
         serde_json::json!({
-            "version": 0,
+            "version": 1,
             "providers": { "openai": {} },
             "models": { key: { "providers": ["openai"] } },
             // `routes` may be empty when `models` has an entry.

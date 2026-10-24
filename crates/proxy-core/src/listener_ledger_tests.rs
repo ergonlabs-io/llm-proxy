@@ -149,7 +149,7 @@ struct Chain {
 async fn chain_with(spend: bool, listen: &str, ledger: TempLedger) -> Chain {
     let provider = Provider::spawn().await;
     let text = format!(
-        r#"version: 0
+        r#"version: 1
 listen: {listen}
 providers:
   openai:

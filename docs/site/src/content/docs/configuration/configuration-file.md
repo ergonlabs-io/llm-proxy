@@ -17,9 +17,16 @@ check a file before you start the proxy.
 
 Field definitions are not on this page. Each field, its type, its default and
 its rules are in the [Configuration field reference](/docs/llm-proxy/configuration/reference/). That page
-is generated from `schema/llmproxy-v0.schema.json`, the normative schema. If
+is generated from `schema/llmproxy-v1.schema.json`, the normative schema. If
 this page and the reference disagree, the reference is right. Report the
 difference.
+
+Your editor can check the file as you type. Put this line at the top of the
+file for editors that use `yaml-language-server`:
+
+```text
+# yaml-language-server: $schema=https://ergonlabs.io/docs/llm-proxy/schema/llmproxy-v1.schema.json
+```
 
 ## How the file is structured
 
@@ -28,7 +35,7 @@ Each block builds on the one before it.
 
 | Block | Job | Depends on |
 |---|---|---|
-| [`version`](/docs/llm-proxy/configuration/reference/#top-level) | Names the schema version. Always `0`. | Nothing |
+| [`version`](/docs/llm-proxy/configuration/reference/#top-level) | Names the schema version. Set `1`. Version `0` still loads, with a deprecation warning. | Nothing |
 | [`providers`](/docs/llm-proxy/configuration/reference/#provider) | Names each upstream LLM API and holds its credentials. | Nothing |
 | [`routes`](/docs/llm-proxy/configuration/reference/#route) and [`models`](/docs/llm-proxy/configuration/reference/#modeldef) | Choose a provider (or an ordered list of providers) for each requested model name. | `providers` |
 | [`auto`](/docs/llm-proxy/configuration/reference/#automodel) | Resolves the reserved model name `auto` to a real model. | `routes` or `models`; `auth` for per-tenant entries |
@@ -69,17 +76,17 @@ silently, and no option turns this off for a `--config` file.
 For example, `api_keyy` instead of `api_key` gives this error:
 
 ```text
-unknown field at `providers.openai.api_keyy`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)
+unknown field at `providers.openai.api_keyy`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v1.schema.json for valid fields)
 ```
 
 The top-level keys `envoy`, `tracing` and `clusters` are reserved for a future
-schema version. The proxy rejects them in version 0. To export traces, use
+schema version. The proxy rejects them in version 1. To export traces, use
 `observability.tracing`. The page
 [Strict config mode](/docs/llm-proxy/configuration/strict-config-mode/) lists
 the error texts and every load-time warning.
 
 The editor can check the file while you type. Point a YAML language server at
-`schema/llmproxy-v0.schema.json`.
+`schema/llmproxy-v1.schema.json`.
 
 ## Environment variables
 
@@ -146,7 +153,7 @@ This file sends every request to OpenAI. The provider name `openai` implies the
 provider type and the base URL.
 
 ```yaml
-version: 0
+version: 1
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -171,7 +178,7 @@ This file adds three things to the smallest file. A virtual key identifies the
 caller. Two limits protect the providers. A rate card prices each request.
 
 ```yaml
-version: 0
+version: 1
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901
 
@@ -246,7 +253,7 @@ entry sends `gpt-4*` requests to OpenAI. If OpenAI fails, the proxy tries
 `claude-sonnet` entry maps one client name to a dated upstream model name.
 
 ```yaml
-version: 0
+version: 1
 
 providers:
   anthropic:

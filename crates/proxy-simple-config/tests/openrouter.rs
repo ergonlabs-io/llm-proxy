@@ -25,7 +25,7 @@ fn openrouter_example_builds_cluster_owned_auth_and_path_rewrite() {
 #[test]
 fn explicit_openrouter_type_works_with_custom_provider_name() {
     let config = parse_simple_config_with_env(
-        "version: 0\nproviders:\n  gateway: { type: openrouter, api_key: test }\nroutes:\n  - { model: '*', provider: gateway }\n",
+        "version: 1\nproviders:\n  gateway: { type: openrouter, api_key: test }\nroutes:\n  - { model: '*', provider: gateway }\n",
         &|_| None,
     ).unwrap();
     let loaded = lower_to_loaded(&config).unwrap();
@@ -43,7 +43,7 @@ fn explicit_openrouter_type_works_with_custom_provider_name() {
 #[test]
 fn openrouter_rejects_endpoint_path_in_base_url() {
     let config = parse_simple_config_with_env(
-        "version: 0\nproviders:\n  openrouter: { base_url: 'https://openrouter.ai/api/v1' }\nroutes:\n  - { model: '*', provider: openrouter }\n",
+        "version: 1\nproviders:\n  openrouter: { base_url: 'https://openrouter.ai/api/v1' }\nroutes:\n  - { model: '*', provider: openrouter }\n",
         &|_| None,
     ).unwrap();
     let error = lower_to_loaded(&config).err().unwrap().to_string();
@@ -53,7 +53,7 @@ fn openrouter_rejects_endpoint_path_in_base_url() {
 #[test]
 fn configured_catalog_lists_aliases_and_excludes_wildcards() {
     let config = parse_simple_config_with_env(
-        "version: 0\nproviders:\n  openrouter: {}\nroutes: []\nmodels:\n  local-alias: { providers: [openrouter/upstream/model] }\n  vendor/model: { providers: [openrouter] }\n  '*': { providers: [openrouter] }\n",
+        "version: 1\nproviders:\n  openrouter: {}\nroutes: []\nmodels:\n  local-alias: { providers: [openrouter/upstream/model] }\n  vendor/model: { providers: [openrouter] }\n  '*': { providers: [openrouter] }\n",
         &|_| None,
     ).unwrap();
     let lowered = proxy_simple_config::lower(&config).unwrap();

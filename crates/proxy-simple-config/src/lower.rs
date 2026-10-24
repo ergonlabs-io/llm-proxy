@@ -446,6 +446,9 @@ fn redact_secrets(value: &mut Value, secrets: &[String]) {
 
 pub fn lower(config: &SimpleConfig) -> Result<Lowered, ConfigError> {
     let mut warnings = Vec::new();
+    if config.version == DEPRECATED_SCHEMA_VERSION {
+        warnings.push(warning("version", DEPRECATED_VERSION_WARNING));
+    }
 
     let mut clusters = Vec::new();
     for (name, provider) in &config.providers {
@@ -4099,6 +4102,12 @@ fn max_connections(config: &SimpleConfig) -> u64 {
         .and_then(|s| s.max_connections)
         .unwrap_or(crate::model::DEFAULT_MAX_CONNECTIONS)
 }
+
+/// Emitted once per load of a `version: 0` config. Version 0 has the same
+/// shape as version 1, so the fix is the one-line bump this message names.
+pub const DEPRECATED_VERSION_WARNING: &str =
+    "`version: 0` is deprecated; set `version: 1`. The rest of the file is \
+     valid for version 1 unchanged, and version 0 still loads in every 1.x release";
 
 fn warning(field_path: impl Into<String>, message: impl Into<String>) -> ConfigWarning {
     ConfigWarning {

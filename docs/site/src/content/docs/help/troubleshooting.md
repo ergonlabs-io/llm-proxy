@@ -59,7 +59,7 @@ one.
 
 ```text
 configuration 'llmproxy.yaml' INVALID
-  unknown field at `routes[0].fallback`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)
+  unknown field at `routes[0].fallback`: not a recognized llm-proxy configuration field at this position (the configuration is always strict; see schema/llmproxy-v1.schema.json for valid fields)
 ```
 
 **Cause.** The parser is always strict. A misspelled or unsupported field is
@@ -70,7 +70,7 @@ an error with its full dotted path.
 
 ### `unsupported field` for `envoy`, `tracing`, or `clusters`
 
-**Cause.** These top-level keys are reserved. Version 0 of the file rejects
+**Cause.** These top-level keys are reserved. Version 1 of the file rejects
 them. The message ends with `(strict mode; see
 https://ergonlabs.io/docs/llm-proxy/help/limitations/)`.
 

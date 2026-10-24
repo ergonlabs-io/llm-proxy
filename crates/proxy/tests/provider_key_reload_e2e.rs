@@ -42,7 +42,7 @@ fn a_reload_with_an_unsendable_key_file_is_refused_and_the_previous_key_keeps_se
     std::fs::write(
         &config_path,
         format!(
-            "version: 0\nlisten: {listen}\nproviders:\n  openai:\n    type: openai\n    \
+            "version: 1\nlisten: {listen}\nproviders:\n  openai:\n    type: openai\n    \
              base_url: http://{upstream}\n    api_key_file: {}\nroutes:\n  - {{ model: \"*\", provider: openai }}\n",
             key_file.display()
         ),

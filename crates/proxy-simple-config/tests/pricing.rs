@@ -4,7 +4,7 @@ use proxy_config::ConfigError;
 use proxy_simple_config::{lower, parse_simple_config, SimpleConfig};
 
 const BASE: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: test }
 routes:

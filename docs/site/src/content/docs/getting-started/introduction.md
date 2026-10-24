@@ -2,7 +2,7 @@
 title: Introduction
 description: "What llm-proxy is, what it does today, what it does not do, and how it differs from a hosted router and from the LiteLLM proxy."
 summary: llm-proxy is a self-hosted Rust proxy for LLM inference APIs,
-  configured with one YAML file (schema/llmproxy-v0.schema.json). It forwards
+  configured with one YAML file (schema/llmproxy-v1.schema.json). It forwards
   requests in the provider's own dialect and adds token metering, virtual keys
   and JWT authentication, token limits, spend budgets, guardrails, failover,
   weighted routing, and usage records.
@@ -25,7 +25,7 @@ The project is pre-1.0. Interfaces change between releases.
 ## At a glance
 
 - **Config:** one YAML file, passed with `llm-proxy --config <file>`. The
-  schema is `schema/llmproxy-v0.schema.json`.
+  schema is `schema/llmproxy-v1.schema.json`.
 - **Strict by default:** an unknown or misspelled field is a load error that
   names the dotted path. The proxy does not start.
 - **Authentication:** none unless the file has an `auth` block. With the block,

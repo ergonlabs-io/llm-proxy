@@ -57,7 +57,7 @@ fn spawn_proxy(
     };
     let config = format!(
         r#"
-version: 0
+version: 1
 listen: "{listen}"
 providers:
   a: {{ type: openai-compatible, base_url: "http://127.0.0.1:{a}", api_key: {KEY_A} }}

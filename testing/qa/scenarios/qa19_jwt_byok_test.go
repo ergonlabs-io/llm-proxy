@@ -72,7 +72,7 @@ func qa19Start(t *testing.T, upstream string) *qa19Proxy {
 	b64 := base64.RawURLEncoding.EncodeToString
 	listen := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
 	admin := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
-	config := fmt.Sprintf(`version: 0
+	config := fmt.Sprintf(`version: 1
 listen: %s
 admin: %s
 providers:

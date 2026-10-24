@@ -9,7 +9,7 @@ secret:
   env:
     OPENAI_API_KEY: placeholder
 configFile: |
-  version: 0
+  version: 1
   listen: 0.0.0.0:8080
   admin: 0.0.0.0:9901
   providers:

@@ -61,7 +61,7 @@ fn start_proxy() -> Proxy {
     // The provider points at a closed port: the test needs a response over
     // the negotiated protocol, not a successful upstream call.
     let config = format!(
-        "version: 0\n\
+        "version: 1\n\
          listen:\n  address: 127.0.0.1:{port}\n  tls: {{ cert_file: {crt}, key_file: {key} }}\n\
          providers:\n  local:\n    type: openai\n    base_url: http://127.0.0.1:{dead}\n\
          routes:\n  - model: \"*\"\n    provider: local\n",

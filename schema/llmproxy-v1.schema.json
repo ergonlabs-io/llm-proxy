@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://llmproxy.dev/schema/llmproxy-v0.schema.json",
-  "title": "llm-proxy configuration (v0)",
-  "description": "The configuration format for llm-proxy. This file is the single source of truth for the v0 schema: user-facing documentation, editor autocomplete (yaml-language-server), and the config validator are all generated from it. Strings support environment-variable interpolation with `${VAR_NAME}`, applied before parsing. Parsing is strict: unknown fields are errors, never ignored. The top-level keys `envoy`, `tracing`, and `clusters` are RESERVED for future versions and rejected in v0.",
+  "$id": "https://ergonlabs.io/docs/llm-proxy/schema/llmproxy-v1.schema.json",
+  "title": "llm-proxy configuration (v1)",
+  "description": "The configuration format for llm-proxy. This file is the single source of truth for the v1 schema: user-facing documentation, editor autocomplete (yaml-language-server), and the config validator are all generated from it. Strings support environment-variable interpolation with `${VAR_NAME}`, applied before parsing. Parsing is strict: unknown fields are errors, never ignored. The top-level keys `envoy`, `tracing`, and `clusters` are RESERVED for future versions and rejected today.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "providers", "routes"],
@@ -12,8 +12,8 @@
   ],
   "properties": {
     "version": {
-      "description": "Schema version. Must be 0. Future schema revisions bump this; llm-proxy refuses configs whose version it does not understand.",
-      "const": 0
+      "description": "Schema version. Set 1. Version 0 is deprecated: it has the same shape as 1 and still loads in every 1.x release, with a warning at `version`. Future schema revisions bump this; llm-proxy refuses configs whose version it does not understand.",
+      "oneOf": [{ "const": 1 }, { "const": 0 }]
     },
     "listen": {
       "description": "Where the proxy accepts client traffic. Shorthand string `host:port`, or an object to enable TLS. Default: `0.0.0.0:8080` (plaintext).",

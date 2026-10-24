@@ -96,7 +96,7 @@ fn dialect_config(
     // `claude-*` route is listed before the catch-all.
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{listener_port}"
 providers:
   openai:

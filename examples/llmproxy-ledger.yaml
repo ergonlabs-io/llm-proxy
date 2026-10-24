@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+# yaml-language-server: $schema=../schema/llmproxy-v1.schema.json
 #
 # llm-proxy with the billing ledger on: one encrypted entry for every request
 # dialled to a provider. See docs/site/src/content/docs/limits-and-budgets/billing-ledger.md
@@ -15,7 +15,7 @@
 #     'http://127.0.0.1:9901/ledger/entries?after=0&limit=100'
 #   curl -X POST -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
 #     'http://127.0.0.1:9901/ledger/ack?through=<next_after from the pull>'
-version: 0
+version: 1
 
 listen: 0.0.0.0:8080
 # The /ledger/* endpoints are on the admin listener. Keep it on loopback.

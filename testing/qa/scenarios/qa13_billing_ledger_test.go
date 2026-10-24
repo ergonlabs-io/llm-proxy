@@ -105,7 +105,7 @@ func qa13Setup(t *testing.T, onUnavailable string, maxDiskBytes int) func() *qa1
 	}
 	listen := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
 	admin := fmt.Sprintf("127.0.0.1:%d", harness.FreePort(t))
-	config := fmt.Sprintf(`version: 0
+	config := fmt.Sprintf(`version: 1
 listen: %s
 admin: %s
 providers:

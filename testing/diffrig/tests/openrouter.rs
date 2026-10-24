@@ -84,7 +84,7 @@ fn openrouter_forwards_model_ids_catalog_and_streaming() {
     let scratch = ScratchDir::new("openrouter");
     let port = free_port();
     let admin_port = free_port();
-    let config = scratch.write("proxy.yaml", &format!("version: 0\nlisten: 127.0.0.1:{port}\nadmin: 127.0.0.1:{admin_port}\nproviders:\n  openrouter:\n    base_url: http://127.0.0.1:{upstream_port}\n    api_key: test-router-key\nroutes: []\nmodels:\n  anthropic/claude-test: {{ providers: [openrouter] }}\n  future-vendor/new-model:free: {{ providers: [openrouter] }}\n  local-alias: {{ providers: [{{ provider: openrouter, model: future-vendor/new-model:free }}] }}\n"));
+    let config = scratch.write("proxy.yaml", &format!("version: 1\nlisten: 127.0.0.1:{port}\nadmin: 127.0.0.1:{admin_port}\nproviders:\n  openrouter:\n    base_url: http://127.0.0.1:{upstream_port}\n    api_key: test-router-key\nroutes: []\nmodels:\n  anthropic/claude-test: {{ providers: [openrouter] }}\n  future-vendor/new-model:free: {{ providers: [openrouter] }}\n  local-alias: {{ providers: [{{ provider: openrouter, model: future-vendor/new-model:free }}] }}\n"));
     let mut contents = std::fs::read_to_string(&config).unwrap();
     contents.push_str(
         r#"

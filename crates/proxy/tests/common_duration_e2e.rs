@@ -402,7 +402,7 @@ fn dialect_json_line_carries_the_provider_wait() {
     std::fs::write(
         &config_path,
         format!(
-            r#"version: 0
+            r#"version: 1
 listen: {{ address: "127.0.0.1:{listen}" }}
 admin: 127.0.0.1:{admin}
 providers:

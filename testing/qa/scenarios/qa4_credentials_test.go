@@ -60,7 +60,7 @@ func TestQA4_CredentialsReachUpstreamButNotTheLog(t *testing.T) {
 	logPath := harness.TempFilePath(t, "access.log")
 
 	cfg := fmt.Sprintf(`
-version: 0
+version: 1
 listen: 127.0.0.1:%d
 providers:
   openai:

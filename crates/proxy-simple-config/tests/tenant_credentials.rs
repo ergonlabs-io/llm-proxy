@@ -132,7 +132,7 @@ fn auth_block(current: &str, previous: Option<(&str, &str)>) -> String {
 fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
     let key = key_file("slot-shapes");
     let text = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n\
          \x20 openai: {{ type: openai, tenant_credentials: true }}\n\
          \x20 anthropic: {{ type: anthropic, tenant_credentials: true }}\n\
@@ -232,7 +232,7 @@ fn vertex_and_bedrock_opt_in_is_rejected_at_the_opt_in_field() {
     ];
     for (provider, expected) in cases {
         let text = format!(
-            "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n{provider}\
+            "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n{provider}\
              routes:\n  - {{ model: \"*\", provider: openai }}\n{auth}"
         );
         match lower_text(&text).expect_err("must be rejected") {
@@ -255,11 +255,11 @@ fn vertex_and_bedrock_opt_in_is_rejected_at_the_opt_in_field() {
 fn opt_in_without_a_key_ring_is_rejected_at_the_opt_in_field() {
     // An `auth:` block with no `tenant_credentials`, then no `auth:` at all.
     let no_ring =
-        "version: 0\nproviders:\n  anthropic: { type: anthropic, tenant_credentials: true }\n\
+        "version: 1\nproviders:\n  anthropic: { type: anthropic, tenant_credentials: true }\n\
          routes:\n  - { model: \"*\", provider: anthropic }\n\
          auth:\n  hmac_secret: \"test-operator-secret\"\n";
     let no_auth =
-        "version: 0\nproviders:\n  anthropic: { type: anthropic, tenant_credentials: true }\n\
+        "version: 1\nproviders:\n  anthropic: { type: anthropic, tenant_credentials: true }\n\
          routes:\n  - { model: \"*\", provider: anthropic }\n";
     for text in [no_ring, no_auth] {
         match lower_text(text).expect_err("must be rejected") {
@@ -282,7 +282,7 @@ fn key_ring_block_lowers_verbatim_into_typed_config_and_the_real_filter_loads_it
     let current = key_file("ring-current");
     let previous = key_file("ring-previous");
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{auth}",
         auth = auth_block(
             &current.display().to_string(),
@@ -315,7 +315,7 @@ fn key_ring_block_lowers_verbatim_into_typed_config_and_the_real_filter_loads_it
 fn key_ring_without_an_opted_in_provider_adds_no_slot() {
     let key = key_file("ring-no-opt-in");
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{auth}",
         auth = auth_block(&key.display().to_string(), None),
     );
@@ -366,7 +366,7 @@ fn missing_or_empty_key_ring_fields_are_rejected_at_their_dotted_paths() {
     ];
     for (auth, expected, reason_part) in cases {
         let text = format!(
-            "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+            "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
              routes:\n  - {{ model: \"*\", provider: openai }}\n{auth}"
         );
         match lower_text(&text).expect_err("must be rejected") {
@@ -387,18 +387,18 @@ fn unknown_fields_are_rejected_with_the_full_dotted_path_in_both_places() {
     let key = key_file("unknown-fields").display().to_string();
 
     let provider_typo = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}}, tenant_credential: true }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}}, tenant_credential: true }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
         auth_block(&key, None)
     );
     let ring_typo = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"s\"\n  tenant_credentials:\n    \
          encryption_key_fil: \"{key}\"\n    encryption_key_id: \"kek\"\n"
     );
     let previous_typo = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"s\"\n  tenant_credentials:\n    \
          encryption_key_file: \"{key}\"\n    encryption_key_id: \"kek\"\n    \
@@ -433,7 +433,7 @@ fn unknown_fields_are_rejected_with_the_full_dotted_path_in_both_places() {
 fn absent_tenant_fields_lower_byte_identical_to_the_pre_feature_output() {
     let secret = "test-operator-secret";
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"{secret}\"\n  keys: []\n"
     );
@@ -468,7 +468,7 @@ fn absent_tenant_fields_lower_byte_identical_to_the_pre_feature_output() {
 fn the_slot_reaches_the_ir_cluster_and_the_ring_reaches_the_filter() {
     let key = key_file("ir-reach");
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          \x20 anthropic: {{ type: anthropic, tenant_credentials: true }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n  - {{ model: \"claude-*\", provider: anthropic }}\n{auth}",
         auth = auth_block(&key.display().to_string(), None),
@@ -509,7 +509,7 @@ fn translate_output_carries_the_slot_and_the_ring_and_round_trips() {
     let previous = key_file("translate-previous");
     let current = key_file("translate-current");
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          \x20 openrouter: {{ type: openrouter, tenant_credentials: true }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{auth}",
         auth = auth_block(
@@ -590,7 +590,7 @@ fn tenant_credentials_without_a_durable_store_is_rejected_at_the_block() {
     ];
     for (store, label) in stores {
         let text = format!(
-            "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+            "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
              routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
             auth_with_store(store, &key)
         );
@@ -607,7 +607,7 @@ fn tenant_credentials_without_a_durable_store_is_rejected_at_the_block() {
     }
 
     let opt_in = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}}, tenant_credentials: true }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}}, tenant_credentials: true }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
         auth_with_store("  store:\n    in_memory: {}\n", &key)
     );
@@ -627,7 +627,7 @@ fn tenant_credentials_with_a_persistent_store_lowers_and_loads() {
     let key = key_file("store-persistent");
     let db = key.with_extension("redb");
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
         auth_with_store(
             &format!(
@@ -660,7 +660,7 @@ fn tenant_credentials_with_a_persistent_store_lowers_and_loads() {
 fn tenant_credentials_with_a_shared_store_lowers_and_loads() {
     let key = key_file("store-shared");
     let text = format!(
-        "version: 0\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
+        "version: 1\nproviders:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n{}",
         auth_with_store(
             "  store:\n    shared:\n      url: \"redis://127.0.0.1:6390/0\"\n",
@@ -687,7 +687,7 @@ fn tenant_credentials_with_a_shared_store_lowers_and_loads() {
 /// ring names.
 fn provider_text(key: &std::path::Path, fields: &str) -> String {
     format!(
-        "version: 0\nproviders:\n  p: {{ {fields} }}\nroutes:\n  - {{ model: \"*\", provider: p }}\n{auth}",
+        "version: 1\nproviders:\n  p: {{ {fields} }}\nroutes:\n  - {{ model: \"*\", provider: p }}\n{auth}",
         auth = auth_block(&key.display().to_string(), None),
     )
 }

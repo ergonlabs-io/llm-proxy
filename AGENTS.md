@@ -40,7 +40,7 @@ citations when you rename one.
 4. Keep Rust idiomatic. Add a brief `// Rust note:` only for non-obvious
    constructs that help the repository owner learn Rust.
 5. `proxy-simple-config` exposes only capabilities already available through
-   Envoy mode. `schema/llmproxy-v0.schema.json` is normative for its dialect.
+   Envoy mode. `schema/llmproxy-v1.schema.json` is normative for its dialect.
 6. Values that vary by provider belong on the cluster, never the route. A route
    picks an aggregate, but the member is what gets dialled, so a route-level
    value reaches the wrong provider on failover. Known instances: credentials

@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# The quick-start configuration: one OpenAI-compatible provider, and every
+# model routed to it. The file holds no secrets and no URLs. Set two
+# environment variables, then start the proxy:
+#
+#   export UPSTREAM_BASE_URL=https://api.openai.com   # scheme, host and port only, no /v1
+#   export UPSTREAM_API_KEY=...                        # the provider's API key
+#   llm-proxy --config llmproxy-quickstart.yaml
+#
+# For a local Ollama, set UPSTREAM_BASE_URL=http://127.0.0.1:11434 and set
+# UPSTREAM_API_KEY to any value; Ollama ignores it.
+#
+# The proxy listens on loopback only and has no `auth` section, so it does not
+# check callers. Anyone who can reach the port uses your provider key. Add
+# virtual keys before you expose it (docs: Authentication > Virtual keys).
+version: 0
+
+listen: 127.0.0.1:8080
+admin: 127.0.0.1:9901
+
+providers:
+  # Any name other than openai, anthropic or openrouter is an
+  # OpenAI-compatible provider. The proxy sends the key as
+  # `Authorization: Bearer`, in place of the caller's Authorization header.
+  upstream:
+    base_url: ${UPSTREAM_BASE_URL}
+    api_key: ${UPSTREAM_API_KEY}
+
+routes:
+  - model: "*"
+    provider: upstream
+
+# One JSON line per request on stdout, with the token counts.
+observability:
+  access_logs:
+    output: stdout
+    format: json

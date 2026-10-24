@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+# yaml-language-server: $schema=../schema/llmproxy-v1.schema.json
 #
 # llm-proxy — three frontier providers behind one endpoint.
 #
@@ -11,7 +11,7 @@
 #   export OPENAI_API_KEY=sk-...
 #   export ANTHROPIC_API_KEY=sk-ant-...
 #   export XAI_API_KEY=xai-...
-version: 0
+version: 1
 
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901

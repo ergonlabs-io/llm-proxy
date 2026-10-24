@@ -38,10 +38,10 @@ production.
 ## Terminate TLS on the listener
 
 Use the object form of `listen`. The shorthand string `host:port` is
-plaintext (`schema/llmproxy-v0.schema.json`, `listen`).
+plaintext (`schema/llmproxy-v1.schema.json`, `listen`).
 
 ```yaml
-version: 0
+version: 1
 listen:
   address: 0.0.0.0:8443
   tls:
@@ -209,7 +209,7 @@ Raise `listen.request_timeout` if clients upload large bodies slowly.
 
 ## Listener fields
 
-Source: `schema/llmproxy-v0.schema.json` (`Listener`).
+Source: `schema/llmproxy-v1.schema.json` (`Listener`).
 
 | Field | Type | Default | Description |
 |---|---|---|---|

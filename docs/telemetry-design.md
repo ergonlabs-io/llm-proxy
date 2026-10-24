@@ -264,7 +264,7 @@ Introduce separate IR domains for operational export and end-user capture. Propo
 
 Defaults: existing operational behavior preserved; new transcript capture disabled; no remote destination or storage credentials guessed. Sampling uses a stable hash of internal request ID and policy version so all selected directions agree.
 
-Every field maps to IR or fails with its full dotted path in strict mode. Generated config protos stay within established config/xDS boundaries. Simple configuration may expose only capabilities implemented in Envoy mode; update `schema/llmproxy-v0.schema.json` when that dialect gains support. Do not publish example YAML until parser/schema/tests support it.
+Every field maps to IR or fails with its full dotted path in strict mode. Generated config protos stay within established config/xDS boundaries. Simple configuration may expose only capabilities implemented in Envoy mode; update `schema/llmproxy-v1.schema.json` when that dialect gains support. Do not publish example YAML until parser/schema/tests support it.
 
 Collector credentials belong to deployment/export configuration, not model routes. Provider credentials, Host rewriting, usage dialect, and pricing remain on provider clusters. No telemetry policy can let a tenant choose a provider or weaken identity restrictions.
 

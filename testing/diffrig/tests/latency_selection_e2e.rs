@@ -350,7 +350,7 @@ async fn the_dialect_latency_switch_sends_most_requests_to_the_fast_provider() {
     let listen: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let config = format!(
         r#"
-version: 0
+version: 1
 listen: "{listen}"
 providers:
   a: {{ type: openai-compatible, base_url: "http://127.0.0.1:{}" }}

@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+#
+# llm-proxy simple config — the 2-minute experience.
+# Run:       llm-proxy --config llmproxy.yaml
+version: 0
+
+listen: 0.0.0.0:8080
+admin: 127.0.0.1:9901
+
+# Downstream authentication. Fails closed: with this block present, a
+# request with no recognized key gets a 401, never admitted anonymously.
+# Uncomment to require one of the listed virtual keys on every request.
+# (hmac_secret_file here, not hmac_secret + env-var interpolation, so this
+# example still parses with no extra environment variable set.)
+# Generate a key + its digest together with (reads the same secret file):
+#   llm-proxy --mode keygen --tenant acme --key-id alice-laptop --hmac-secret-file /etc/llmproxy/auth-secret
+# No llm-proxy binary handy? openssl computes the same digest (note `printf
+# %s`, not a here-string -- `<<<` appends a trailing newline that changes it):
+#   printf %s "llmp_yourkey" | openssl dgst -sha256 -hmac "$(cat /etc/llmproxy/auth-secret)" -hex
+# auth:
+#   hmac_secret_file: /etc/llmproxy/auth-secret
+#   keys:
+#     - id: alice-laptop
+#       tenant: acme
+#       digest: 3f2a1e9c7b4d5f6a8e0c2b1d4f6a8c0e2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a
+
+providers:
+  # `openai` and `anthropic` infer their type and base_url from the name.
+  openai:
+    api_key: ${OPENAI_API_KEY}
+  anthropic:
+    api_key: ${ANTHROPIC_API_KEY}
+  # Anything else defaults to openai-compatible (vLLM, Ollama, TGI, ...).
+  local-vllm:
+    base_url: http://vllm.internal:8000
+
+# First matching rule wins, top to bottom — specific patterns above broad ones.
+routes:
+  - model: gpt-5*
+    provider: openai
+    # Fallbacks are tried in order when the primary fails. Every provider in
+    # the chain must speak the same wire dialect: an OpenAI-shaped request
+    # body is not valid for Anthropic, and its response would be parsed for
+    # token counts by the wrong parser. So `openai -> local-vllm` (both
+    # OpenAI-compatible) works, and `openai -> anthropic` is rejected at load
+    # time until request/response translation lands.
+    fallbacks: [local-vllm]
+  - model: llama-*
+    provider: local-vllm
+  - model: "*"
+    provider: openai
+
+limits:
+  - key: header:x-api-key
+    tokens_per_minute: 100k
+    concurrent_sessions: 10
+  - key: global
+    requests_per_minute: 5000
+
+observability:
+  access_logs:
+    output: stdout
+    format: json

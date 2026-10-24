@@ -63,7 +63,7 @@ pub enum ConfigFrontEnd {
     /// `deny_unknown_fields`, but `--permissive` genuinely relaxes
     /// that at boot, so the hint pointing at it is true here.
     Bootstrap,
-    /// `--config`: the llm-proxy dialect (`schema/llmproxy-v0.schema.json`).
+    /// `--config`: the llm-proxy dialect (`schema/llmproxy-v1.schema.json`).
     /// Always strict — `--permissive` has no effect on it, so the message
     /// must not suggest it.
     Dialect,
@@ -80,7 +80,7 @@ pub const UNKNOWN_FIELD_BOOTSTRAP_HINT: &str =
 /// schema instead of a flag, because the flag does nothing here.
 pub const UNKNOWN_FIELD_DIALECT_HINT: &str =
     "not a recognized llm-proxy configuration field at this position \
-     (the configuration is always strict; see schema/llmproxy-v0.schema.json for valid fields)";
+     (the configuration is always strict; see schema/llmproxy-v1.schema.json for valid fields)";
 
 impl ConfigFrontEnd {
     /// The fixed tail of this front end's unknown-field message.

@@ -23,7 +23,7 @@ use serde_json::json;
 
 // ------------------------------------------------------------------ config --
 
-/// Render the dialect (`llmproxy-v0`) config for this suite: one listener, a
+/// Render the dialect (`llmproxy-v1`) config for this suite: one listener, a
 /// plaintext (`http://`) `openai` provider and `anthropic` provider (named
 /// exactly that so the dialect infers their type without an explicit
 /// `type:` field), each pointed at an in-process mock on loopback. Routing
@@ -32,7 +32,7 @@ use serde_json::json;
 fn dialect_config(listener_port: u16, openai_port: u16, anthropic_port: u16) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{listener_port}"
 providers:
   openai:

@@ -12,7 +12,7 @@ use ring::rand::SystemRandom;
 use proxy_control::auth::{digest_hex, generate_plaintext_key, HmacSecret};
 
 /// Env var carrying the HMAC secret, mirroring the dialect's `hmac_secret:
-/// ${VAR}` idiom (`schema/llmproxy-v0.schema.json`'s `Auth.hmac_secret`).
+/// ${VAR}` idiom (`schema/llmproxy-v1.schema.json`'s `Auth.hmac_secret`).
 const SECRET_ENV_VAR: &str = "LLMPROXY_AUTH_SECRET";
 
 /// Resolves the operator's HMAC secret: `--hmac-secret-file` first, then

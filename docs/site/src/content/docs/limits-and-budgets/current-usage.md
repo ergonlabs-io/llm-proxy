@@ -70,7 +70,7 @@ The dialect config below enforces a tenant limit. The endpoint reports it as
 the route `*`.
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 auth:
   hmac_secret: ${LLMPROXY_AUTH_SECRET}

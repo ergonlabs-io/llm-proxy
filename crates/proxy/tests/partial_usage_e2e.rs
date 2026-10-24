@@ -535,7 +535,7 @@ fn config_text(
         listen: listen_extra,
     } = timers;
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: {{ address: "127.0.0.1:{listen}"{listen_extra} }}
 admin: 127.0.0.1:{admin}
 providers:

@@ -26,7 +26,7 @@ The proxy tries it first. Each entry in `fallbacks` is tried in the order
 you write it.
 
 ```yaml
-version: 0
+version: 1
 providers:
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -49,7 +49,7 @@ models:
     providers: [openai, together]
 ```
 
-Source for the fields: `schema/llmproxy-v0.schema.json`, `$defs/Route`
+Source for the fields: `schema/llmproxy-v1.schema.json`, `$defs/Route`
 (`fallbacks`, `retries`) and `$defs/ModelDef` (`providers`). A route with
 no `fallbacks` sends the request to its one provider and has no chain.
 

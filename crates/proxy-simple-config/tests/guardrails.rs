@@ -66,7 +66,7 @@ fn check(url: &str, failure_mode: &str) -> String {
 
 fn config_with(upstream: &str, extra: &str) -> String {
     format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  a: {{ base_url: \"http://{upstream}\" }}\n\
          routes:\n  - {{ model: \"*\", provider: a }}\n\
          {extra}"

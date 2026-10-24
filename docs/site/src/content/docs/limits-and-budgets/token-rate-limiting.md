@@ -39,7 +39,7 @@ whole proxy to 600 requests a minute, and each client address to 10 concurrent
 streams. Check it with `llm-proxy --config llmproxy.yaml --mode validate`.
 
 ```yaml title="llmproxy.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 auth:

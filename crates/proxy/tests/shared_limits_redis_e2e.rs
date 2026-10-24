@@ -174,7 +174,7 @@ fn hold(proxy: &Proxy, auth: &str) -> std::thread::JoinHandle<String> {
 
 fn config_text(upstream: SocketAddr, redis: &str, namespace: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

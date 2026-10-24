@@ -34,7 +34,7 @@ fn digest_hex(secret: &[u8], plaintext: &str) -> String {
 /// A minimal config with no `auth:` block at all -- the shape from before `auth:` existed,
 /// kept as a regression fixture (test 12).
 const NO_AUTH_CONFIG: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -46,7 +46,7 @@ routes:
 /// scaffolding.
 fn config_with_one_key(secret: &str, key_id: &str, tenant: &str, digest: &str) -> String {
     format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"{secret}\"\n  keys:\n    - {{ id: \"{key_id}\", tenant: \"{tenant}\", digest: \"{digest}\" }}\n"
@@ -153,7 +153,7 @@ fn hmac_secret_file_lowers_to_filename_and_warns_and_a_missing_file_errors() {
 
     let digest = digest_hex(b"test-operator-secret", "llmp_test-key");
     let config_text = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret_file: \"{}\"\n  keys:\n    - {{ id: \"k1\", tenant: \"acme\", digest: \"{digest}\" }}\n",
@@ -182,7 +182,7 @@ fn hmac_secret_file_lowers_to_filename_and_warns_and_a_missing_file_errors() {
 
     let missing = dir.join("llm-proxy-simple-config-auth-test-secret-does-not-exist");
     let config_text = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret_file: \"{}\"\n",
@@ -201,7 +201,7 @@ fn hmac_secret_file_lowers_to_filename_and_warns_and_a_missing_file_errors() {
 #[test]
 fn neither_or_both_secret_fields_is_rejected_naming_auth() {
     let neither = parse(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: { api_key: ${OPENAI_API_KEY} }\n\
          routes:\n  - { model: \"*\", provider: openai }\n\
          auth: {}\n",
@@ -215,7 +215,7 @@ fn neither_or_both_secret_fields_is_rejected_naming_auth() {
     }
 
     let both = parse(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: { api_key: ${OPENAI_API_KEY} }\n\
          routes:\n  - { model: \"*\", provider: openai }\n\
          auth: { hmac_secret: \"a\", hmac_secret_file: \"/nonexistent\" }\n",
@@ -312,7 +312,7 @@ fn duplicate_id_and_duplicate_digest_are_each_rejected_naming_index_1() {
     let digest_b = digest_hex(secret.as_bytes(), "llmp_b");
 
     let dup_id = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"{secret}\"\n  keys:\n\
@@ -327,7 +327,7 @@ fn duplicate_id_and_duplicate_digest_are_each_rejected_naming_index_1() {
     }
 
     let dup_digest = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"{secret}\"\n  keys:\n\
@@ -348,7 +348,7 @@ fn duplicate_id_and_duplicate_digest_are_each_rejected_naming_index_1() {
 
 #[test]
 fn empty_keys_lowers_and_warns() {
-    let config_text = "version: 0\n\
+    let config_text = "version: 1\n\
          providers:\n  openai: { api_key: ${OPENAI_API_KEY} }\n\
          routes:\n  - { model: \"*\", provider: openai }\n\
          auth:\n  hmac_secret: \"test-operator-secret\"\n  keys: []\n";
@@ -376,7 +376,7 @@ fn empty_keys_lowers_and_warns() {
 fn empty_keys_warns_only_where_static_keys_are_the_only_source() {
     let with = |admin: &str, store: &str| {
         let text = format!(
-            "version: 0\n{admin}\
+            "version: 1\n{admin}\
              providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
              routes:\n  - {{ model: \"*\", provider: openai }}\n\
              auth:\n  hmac_secret: \"test-operator-secret\"\n  keys: []\n{store}"
@@ -425,7 +425,7 @@ fn no_error_or_warning_message_contains_the_secret_or_a_digest() {
 
     // Duplicate digest, using the distinctive digest twice.
     let dup = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"{distinctive_secret}\"\n  keys:\n\
@@ -442,7 +442,7 @@ fn no_error_or_warning_message_contains_the_secret_or_a_digest() {
     // A config that only warns (empty keys), still with the distinctive
     // secret present.
     let empty_keys = format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"{distinctive_secret}\"\n  keys: []\n"
@@ -470,7 +470,7 @@ fn no_error_or_warning_message_contains_the_secret_or_a_digest() {
 fn tenant_key_without_auth_is_rejected() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -552,7 +552,7 @@ fn no_auth_block_leaves_http_filters_unchanged() {
 /// (`in_memory`, or a flow map such as `{ persistent: { path: "..." } }`).
 fn config_with_store(store: &str) -> String {
     format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: \"test-operator-secret\"\n  store: {store}\n"
@@ -915,7 +915,7 @@ fn translate_output_carries_the_persistent_store() {
 fn max_policy_staleness_lowers_to_seconds_and_refuses_values_under_the_floor() {
     let with = |value: &str| {
         format!(
-            "version: 0\n\
+            "version: 1\n\
              providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
              routes:\n  - {{ model: \"*\", provider: openai }}\n\
              auth:\n  hmac_secret: \"test-operator-secret\"\n  max_policy_staleness: {value}\n"

@@ -73,7 +73,7 @@ fn a_stripped_field_is_removed_before_the_upstream_sees_it() {
 
 fn config_text(listen: u16, admin: u16, upstream: SocketAddr, fields: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: "127.0.0.1:{listen}"
 admin: 127.0.0.1:{admin}
 providers:

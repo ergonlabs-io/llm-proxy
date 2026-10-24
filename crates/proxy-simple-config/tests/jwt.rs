@@ -19,7 +19,7 @@ fn parse(text: &str) -> Result<SimpleConfig, ConfigError> {
 /// `auth` block.
 fn dialect(jwt: &str, extra_auth: &str) -> String {
     format!(
-        "version: 0\n\
+        "version: 1\n\
          providers:\n  openai: {{ api_key: ${{OPENAI_API_KEY}} }}\n\
          routes:\n  - {{ model: \"*\", provider: openai }}\n\
          auth:\n  hmac_secret: test-secret\n{extra_auth}  jwt:\n{jwt}"

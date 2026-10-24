@@ -59,7 +59,7 @@ struct Args {
     #[arg(short = 'c', long = "config-path", value_name = "PATH")]
     config_path: Option<PathBuf>,
 
-    /// Path to a simple llm-proxy config (schema/llmproxy-v0.schema.json).
+    /// Path to a simple llm-proxy config (schema/llmproxy-v1.schema.json).
     /// `serve` and `validate` need exactly one of this or `-c`/`--config-path`;
     /// `translate` needs this one. Unused by `keygen` and `init`.
     #[arg(long = "config", value_name = "PATH")]
@@ -423,7 +423,7 @@ enum ConfigSource {
     /// (mirrors `--permissive` at boot; a reload keeps the same strictness
     /// the process booted with).
     Bootstrap { path: PathBuf, strict: StrictMode },
-    /// `--config`: the simple llm-proxy dialect (schema/llmproxy-v0.schema.json).
+    /// `--config`: the simple llm-proxy dialect (schema/llmproxy-v1.schema.json).
     Dialect { path: PathBuf },
 }
 
@@ -3718,7 +3718,7 @@ static_resources:
 "#;
 
     const DIALECT_ONE_ROUTE_YAML: &str = r#"
-version: 0
+version: 1
 listen: 127.0.0.1:19999
 providers:
   local-vllm:

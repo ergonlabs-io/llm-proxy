@@ -34,7 +34,7 @@ Save this file as `chat.yaml`. It sends two model names to OpenAI. The
 `models` entries also make `GET /v1/models` list both names.
 
 ```yaml title="chat.yaml"
-version: 0
+version: 1
 listen: 127.0.0.1:53421
 admin: 127.0.0.1:53422
 

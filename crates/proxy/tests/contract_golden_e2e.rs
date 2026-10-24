@@ -287,7 +287,7 @@ fn config_text(
 ) -> String {
     let ledger = ledger.config(1024, proxy_observability::ledger::OnUnavailable::Reject);
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

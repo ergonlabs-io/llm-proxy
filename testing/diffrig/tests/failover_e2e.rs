@@ -35,7 +35,7 @@ const ADMIN_TOKEN: &str = "fallback-billing-admin-token";
 fn dialect_config(listener_port: u16, primary_port: u16, standby_port: u16) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{listener_port}"
 providers:
   primary:
@@ -73,7 +73,7 @@ fn billing_dialect_config(
     let digest = digest_hex(HMAC_SECRET, CLIENT_KEY);
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{listener_port}"
 admin: "127.0.0.1:{admin_port}"
 auth:
@@ -635,7 +635,7 @@ fn reload_config(
 ) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "127.0.0.1:{listener_port}"
 providers:
   primary:

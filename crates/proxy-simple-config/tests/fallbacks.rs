@@ -27,7 +27,7 @@ fn parse(text: &str) -> Result<SimpleConfig, ConfigError> {
 /// dialect, different provider, exactly the case the spec calls out as
 /// supported.
 const ONE_FALLBACK_CONFIG: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   fb1: { type: openai-compatible, base_url: http://fb1.internal:8000 }
@@ -40,7 +40,7 @@ routes:
 /// Same as [`ONE_FALLBACK_CONFIG`] but with a second same-dialect fallback,
 /// for the tests that need a three-member chain (retry-count floor).
 const THREE_MEMBER_CONFIG: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   fb1: { type: openai-compatible, base_url: http://fb1.internal:8000 }
@@ -54,7 +54,7 @@ routes:
 
 /// No `fallbacks:` at all -- the pre-2c shape, kept as a regression fixture.
 const NO_FALLBACK_CONFIG: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -65,7 +65,7 @@ routes:
 /// `openai` (dialect `openai`) falling back to `anthropic` (dialect
 /// `anthropic`) -- the cross-dialect case that must be a hard config error.
 const CROSS_DIALECT_CONFIG: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -240,7 +240,7 @@ fn fallback_config_lowers_through_the_real_loader_to_an_aggregate() {
 fn fallback_members_with_protocol_http2_still_load() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, protocol: http2 }
   fb1: { type: openai-compatible, base_url: http://fb1.internal:8000, protocol: http2 }

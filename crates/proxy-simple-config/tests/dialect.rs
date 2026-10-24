@@ -105,7 +105,7 @@ fn example_config_lowers_end_to_end() {
 fn https_provider_without_ca_file_validates_against_system_roots() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -148,7 +148,7 @@ routes:
 fn route_streaming_strict_reaches_the_ir_assertion() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -183,7 +183,7 @@ routes:
 fn https_provider_with_ca_file_uses_trusted_ca() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, ca_file: /etc/ssl/custom-ca.pem }
 routes:
@@ -221,7 +221,7 @@ routes:
 fn provider_protocol_http2_reaches_the_ir() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, protocol: http2 }
 routes:
@@ -245,7 +245,7 @@ routes:
 fn provider_protocol_defaults_to_http1() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -268,7 +268,7 @@ routes:
 fn provider_protocol_bad_value_errors_with_path() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, protocol: http3 }
 routes:
@@ -287,7 +287,7 @@ routes:
 fn model_globs_lower_to_header_matchers() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -331,7 +331,7 @@ routes:
 fn missing_catch_all_gets_404_backstop() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -376,7 +376,7 @@ fn provider_auth_headers<'a>(
 fn auth_headers_per_provider_type() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -428,7 +428,7 @@ routes:
 fn anthropic_provider_gets_the_required_version_header() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -467,7 +467,7 @@ routes:
 fn user_supplied_anthropic_version_overrides_the_default_case_insensitively() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic:
     api_key: ${ANTHROPIC_API_KEY}
@@ -503,7 +503,7 @@ routes:
 fn llm_safe_route_defaults() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -529,7 +529,7 @@ routes:
 fn unknown_field_errors_with_path() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, api_keyy: oops }
 routes:
@@ -555,7 +555,7 @@ routes:
     );
     assert!(!err.to_string().contains("--permissive"));
     assert!(!err.to_string().contains("Envoy"));
-    assert!(err.to_string().contains("llmproxy-v0.schema.json"));
+    assert!(err.to_string().contains("llmproxy-v1.schema.json"));
 }
 
 /// Reserved top-level keys get a dedicated forward-compat error.
@@ -563,7 +563,7 @@ routes:
 fn reserved_key_is_rejected_with_explanation() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -583,7 +583,7 @@ clusters: []
 fn api_key_and_file_are_mutually_exclusive() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: k, api_key_file: /tmp/f }
 routes:
@@ -598,7 +598,7 @@ routes:
 fn route_to_unknown_provider_fails() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -620,7 +620,7 @@ routes:
 fn unknown_provider_without_base_url_fails() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   my-backend: {}
 routes:
@@ -635,7 +635,7 @@ routes:
 fn missing_env_var_names_the_variable_and_its_path() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic:
@@ -660,7 +660,7 @@ routes:
 fn env_references_in_comments_are_ignored() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} } # or ${DEFINITELY_NOT_SET_VAR}
   # spare:
@@ -683,7 +683,7 @@ routes:
 fn hash_inside_a_value_does_not_start_a_comment() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: "a #${OPENAI_API_KEY}" }
   anthropic: { api_key: 'it''s #${ANTHROPIC_API_KEY}' }
@@ -706,7 +706,7 @@ routes:
         "|\n      a # ${DEFINITELY_NOT_SET_VAR}",
     ] {
         let err = parse(&format!(
-            "version: 0\nproviders:\n  openai:\n    api_key: {value}\n\
+            "version: 1\nproviders:\n  openai:\n    api_key: {value}\n\
              routes:\n  - {{ model: \"*\", provider: openai }}\n"
         ))
         .expect_err("a reference inside a value must be interpolated");
@@ -723,7 +723,7 @@ routes:
 fn escaped_env_reference_is_a_literal() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: "x$${DEFINITELY_NOT_SET_VAR}" }
 routes:
@@ -737,18 +737,34 @@ routes:
     );
 }
 
+/// Only 1 and the deprecated 0 load; the next version, and any other, fails
+/// at `version` rather than being read as something it is not.
 #[test]
 fn future_schema_version_is_refused() {
-    let err = parse("version: 7\nproviders: { openai: {} }\nroutes: []")
+    for version in [2, 7] {
+        let err = parse(&format!(
+            "version: {version}\nproviders: {{ openai: {{}} }}\nroutes: []"
+        ))
         .expect_err("future version must fail");
-    assert!(err.to_string().contains("version 0"), "got: {err}");
+        match &err {
+            ConfigError::InvalidValue { field_path, reason } => {
+                assert_eq!(field_path, "version", "version {version}: {err}");
+                assert!(
+                    reason.contains("schema version 1")
+                        && reason.contains(&format!("not {version}")),
+                    "version {version}: {reason}"
+                );
+            }
+            other => panic!("version {version}: expected InvalidValue at `version`, got {other:?}"),
+        }
+    }
 }
 
 #[test]
 fn token_amounts_and_durations_parse() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY}, connect_timeout: 500ms }
 routes:
@@ -813,7 +829,7 @@ fn hcm_typed_config(bootstrap: &serde_json::Value) -> &serde_json::Value {
 fn access_logs_stdout_json_lands_on_the_hcm() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -844,7 +860,7 @@ fn default_access_log_formats_carry_the_credential_source() {
     for format in ["json", "text"] {
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -889,7 +905,7 @@ fn default_access_log_formats_carry_the_request_phase_timings() {
     for format in ["json", "text"] {
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -925,7 +941,7 @@ observability:
 fn access_logs_file_text_lands_on_the_hcm() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -956,7 +972,7 @@ observability:
 fn access_logs_stderr_selects_the_stderr_sink() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -982,7 +998,7 @@ observability:
 fn no_observability_emits_no_access_log() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1015,7 +1031,7 @@ fn generated_access_log_config_is_accepted_by_the_envoy_loader() {
     for format in ["json", "text"] {
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -1058,7 +1074,7 @@ observability:
 fn no_tracing_block_emits_no_node_key() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1085,7 +1101,7 @@ routes:
 fn tracing_block_lowers_end_to_end() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1117,7 +1133,7 @@ observability:
 fn tracing_block_defaults_service_name_and_sample_ratio() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1148,7 +1164,7 @@ observability:
 fn tracing_block_without_otlp_endpoint_is_a_hard_error() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1172,7 +1188,7 @@ observability:
 fn tracing_block_sample_ratio_out_of_range_is_a_hard_error() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1200,7 +1216,7 @@ observability:
 fn top_level_tracing_key_is_still_reserved() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1228,7 +1244,7 @@ tracing:
 fn no_observability_blocks_emit_no_node_key() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1257,7 +1273,7 @@ routes:
 fn metrics_block_lowers_end_to_end_with_tracing_absent() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1303,7 +1319,7 @@ observability:
 fn both_observability_blocks_emit_both_metadata_keys() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1333,7 +1349,7 @@ observability:
 fn metrics_before_tracing_still_keeps_both_blocks() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1364,7 +1380,7 @@ observability:
 fn metrics_block_defaults_service_name_and_durations() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1389,7 +1405,7 @@ observability:
 fn metrics_block_without_otlp_endpoint_is_a_hard_error() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1414,7 +1430,7 @@ observability:
 fn metrics_block_rejects_unknown_keys() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1441,7 +1457,7 @@ observability:
 fn metrics_block_rejects_a_malformed_duration() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1470,7 +1486,7 @@ observability:
 fn deadline_at_or_above_the_interval_is_rejected_end_to_end() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1555,7 +1571,7 @@ fn usage_filter_type_url_matches_the_filter() {
     // `body_rewrite_filter_type_url_matches_the_filter` below.
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1597,7 +1613,7 @@ fn usage_filter_sits_before_the_router_with_per_route_dialects() {
     // is turned on.
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -1645,7 +1661,7 @@ observability:
 fn openai_compatible_provider_gets_the_openai_dialect() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   local-vllm: { base_url: "http://127.0.0.1:8000" }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -1681,7 +1697,7 @@ fn per_route_dialect_survives_into_the_ir() {
     // `http_filters[1]` is the usage filter, the thing under test here.
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -1740,7 +1756,7 @@ observability:
 // ------------------------------------------------------- body-rewrite filter --
 
 const BASIC_CONFIG: &str = r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -1852,7 +1868,7 @@ fn force_usage_reporting_false_disables_the_splice_but_keeps_the_filter_for_rout
 fn body_rewrite_per_route_entries_carry_their_own_dialect() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -1928,7 +1944,7 @@ fn unknown_observability_key_still_errors_with_path() {
 fn body_rewrite_per_route_config_survives_into_the_ir() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
@@ -2285,7 +2301,7 @@ fn token_limit_filter_survives_into_the_ir() {
 fn models_multiple_providers_lower_to_ordered_fallback() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   primary: { base_url: "https://primary.example", api_key: k }
   secondary: { base_url: "https://secondary.example", api_key: k }
@@ -2365,7 +2381,7 @@ models:
 fn model_provider_entry_unknown_provider_fails() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
 routes:
@@ -2392,7 +2408,7 @@ models:
 fn model_with_no_providers_fails() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
 routes:
@@ -2425,7 +2441,7 @@ fn provider_types_lower_to_runtime_config() {
                 .to_string();
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   p1:
     type: {type_name}
@@ -2459,7 +2475,7 @@ routes:
 fn vertex_and_bedrock_runtime_settings_survive_ir_lowering() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   vertex:
     type: vertex
@@ -2526,7 +2542,7 @@ models:
 fn azure_openai_lowers_auth_and_provider_path_rewrite() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   azure:
     type: azure-openai
@@ -2578,7 +2594,7 @@ fn azure_openai_requires_deployment_and_api_version() {
         (
             "deployment",
             r#"
-version: 0
+version: 1
 providers:
   azure:
     type: azure-openai
@@ -2591,7 +2607,7 @@ routes:
         (
             "api_version",
             r#"
-version: 0
+version: 1
 providers:
   azure:
     type: azure-openai
@@ -2618,7 +2634,7 @@ fn azure_openai_rejects_unsafe_path_and_query_values() {
     ] {
         let config = format!(
             r#"
-version: 0
+version: 1
 providers:
   azure:
     type: azure-openai
@@ -2641,7 +2657,7 @@ routes:
 fn vertex_and_bedrock_provider_fields_parse() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   vertex-us:
     type: vertex
@@ -2705,7 +2721,7 @@ fn vertex_and_bedrock_credentials_require_valid_sources() {
 
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   vertex:
     type: vertex
@@ -2720,7 +2736,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   vertex:
     type: vertex
@@ -2737,7 +2753,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   vertex:
     type: vertex
@@ -2752,7 +2768,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2766,7 +2782,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2780,7 +2796,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2796,7 +2812,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2810,7 +2826,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2826,7 +2842,7 @@ routes:
     );
     assert_field(
         r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2848,7 +2864,7 @@ fn vertex_and_bedrock_fields_are_rejected_on_other_provider_types() {
     let cases = [
         (
             r#"
-version: 0
+version: 1
 providers:
   openai:
     project: project
@@ -2859,7 +2875,7 @@ routes:
         ),
         (
             r#"
-version: 0
+version: 1
 providers:
   openai:
     region: us-east-1
@@ -2870,7 +2886,7 @@ routes:
         ),
         (
             r#"
-version: 0
+version: 1
 providers:
   vertex:
     type: vertex
@@ -2887,7 +2903,7 @@ routes:
         ),
         (
             r#"
-version: 0
+version: 1
 providers:
   bedrock:
     type: bedrock
@@ -2922,7 +2938,7 @@ routes:
 fn model_provider_shorthand_on_ambiguous_provider_type_fails() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   vertex-us:
     type: vertex
@@ -2958,7 +2974,7 @@ models:
 fn model_provider_object_form_missing_dialect_on_ambiguous_provider_fails() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   vertex-us:
     type: vertex
@@ -2989,7 +3005,7 @@ models:
 fn model_provider_dialect_derives_for_unambiguous_provider_types() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
 routes:
@@ -3017,7 +3033,7 @@ models:
 fn model_provider_explicit_dialect_overrides_derived_value() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   nebius: { base_url: "https://api.studio.nebius.ai", api_key: k }
 routes:
@@ -3046,7 +3062,7 @@ models:
 fn shorthand_and_object_form_lower_identically() {
     let shorthand = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
 routes:
@@ -3060,7 +3076,7 @@ models:
     .expect("shorthand form must parse");
     let object_form = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
 routes:
@@ -3119,7 +3135,7 @@ fn config_without_models_lowers_exactly_as_before() {
 fn model_provider_survives_into_the_ir() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   anthropic: { api_key: ${ANTHROPIC_API_KEY} }
 routes:
@@ -3191,7 +3207,7 @@ observability:
 fn model_catalog_precedence_ladder() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
   p-gpt4: { base_url: "https://p-gpt4.example.com" }
@@ -3253,7 +3269,7 @@ models:
 fn longest_matching_prefix_wins_between_two_prefixes() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   broad: { base_url: "https://broad.example.com" }
   narrow: { base_url: "https://narrow.example.com" }
@@ -3296,7 +3312,7 @@ models:
 fn catalog_catch_all_serves_what_nothing_else_matches() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   specific: { base_url: "https://specific.example.com" }
   fallback: { base_url: "https://fallback.example.com" }
@@ -3334,7 +3350,7 @@ models:
 fn models_only_with_no_catch_all_still_gets_404_backstop() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -3364,7 +3380,7 @@ fn illegal_model_catalog_key_shapes_fail_at_parse_time() {
     for bad in ["*-4o", "gpt-*-mini", "**", "a*b*"] {
         let err = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -3394,7 +3410,7 @@ models:
 fn duplicate_model_catalog_key_is_rejected() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   a: { base_url: "https://a.example.com" }
   b: { base_url: "https://b.example.com" }
@@ -3426,7 +3442,7 @@ models:
 fn exact_only_catalog_lowers_in_the_same_order_as_before() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -3485,7 +3501,7 @@ models:
 fn provider_credentials_survive_the_dialect_to_ir_round_trip() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: sk-openai-roundtrip }
   anthropic: { type: anthropic, api_key: sk-anthropic-roundtrip }
@@ -3765,7 +3781,7 @@ mod body_routing_e2e {
                 // (plain-http) dialect and need no TLS setup to reach a local
                 // mock upstream.
                 let config_text = format!(
-                    "version: 0\n\
+                    "version: 1\n\
                      providers:\n\
                      \x20\x20provider-a: {{ base_url: \"http://{addr_a}\" }}\n\
                      \x20\x20provider-b: {{ base_url: \"http://{addr_b}\" }}\n\
@@ -3827,7 +3843,7 @@ mod body_routing_e2e {
 fn an_explicit_dialect_reaches_the_cluster_and_not_only_the_route() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   myopenai: { type: openai, api_key: k }
 models:
@@ -3858,7 +3874,7 @@ routes:
 fn with_no_explicit_dialect_the_cluster_falls_back_to_the_provider_type() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   myopenai: { type: openai, api_key: k }
   myanthropic: { type: anthropic, api_key: k }
@@ -3889,7 +3905,7 @@ routes:
 fn two_model_entries_disagreeing_on_a_providers_dialect_is_a_hard_error() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   shared: { type: openai, api_key: k }
 models:
@@ -4007,7 +4023,7 @@ fn both_dialect_carriers_agree_on_the_example_config() {
 fn a_routes_only_ambiguous_provider_is_rejected_with_its_path() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   vertex-us:
     type: vertex
@@ -4039,7 +4055,7 @@ routes:
 fn a_routes_fallback_to_an_ambiguous_provider_is_rejected_at_its_own_path() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   main: { type: anthropic, base_url: "https://a.example.com", api_key: k }
   bedrock-w:
@@ -4071,7 +4087,7 @@ routes:
 fn a_models_entry_makes_an_ambiguous_routes_provider_resolvable() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   vertex-us:
     type: vertex
@@ -4108,7 +4124,7 @@ models:
 fn an_unambiguous_routes_provider_needs_no_models_entry() {
     parse(
         r#"
-version: 0
+version: 1
 providers:
   main: { type: anthropic, base_url: "https://a.example.com", api_key: k }
 routes:
@@ -4127,7 +4143,7 @@ routes:
 fn tracing_export_deadline_lowers_and_defaults() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -4149,7 +4165,7 @@ observability:
     // And the default, when the key is absent.
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -4174,7 +4190,7 @@ observability:
 fn tracing_export_deadline_rejects_a_malformed_duration() {
     let err = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -4205,7 +4221,7 @@ fn tracing_export_deadline_out_of_band_is_rejected_end_to_end() {
     for (value, expect_ok) in [("100ms", true), ("60s", true), ("120s", false)] {
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -4236,7 +4252,7 @@ observability:
 fn tracing_export_deadline_below_the_floor_is_rejected_end_to_end() {
     let config = parse(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: ${OPENAI_API_KEY} }
 routes:
@@ -4267,7 +4283,7 @@ fn default_access_log_formats_carry_upstream_evidence() {
     for format in ["json", "text"] {
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -4317,7 +4333,7 @@ fn default_access_log_formats_carry_the_served_model() {
     for format in ["json", "text"] {
         let config = parse(&format!(
             r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:
@@ -4352,7 +4368,7 @@ observability:
 fn tls_listener_offers_h2_then_http1_via_alpn() {
     let config = parse(
         r#"
-version: 0
+version: 1
 listen:
   address: 127.0.0.1:8443
   tls: { cert_file: /etc/llmproxy/tls.crt, key_file: /etc/llmproxy/tls.key }

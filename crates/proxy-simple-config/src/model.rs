@@ -1,4 +1,4 @@
-//! The v0 dialect data model — a 1:1 mirror of `schema/llmproxy-v0.schema.json`.
+//! The dialect data model — a 1:1 mirror of `schema/llmproxy-v1.schema.json`.
 //!
 //! The schema is normative; strict deserialization rejects undefined fields.
 //! Constrained scalar shapes parse eagerly so errors retain their field paths.
@@ -16,14 +16,23 @@ use serde::{Deserialize, Deserializer};
 mod jwt;
 pub use jwt::*;
 
-/// Top-level keys reserved for future schema versions; rejected in v0 so they
+/// The schema version this build writes in examples and expects: `version: 1`.
+/// It freezes the shape of the v0 dialect for the 1.x releases.
+pub const SCHEMA_VERSION: u64 = 1;
+
+/// The schema version before 1.0. It has the same shape as version 1, so it
+/// still loads in 1.x, with a deprecation warning at `version`.
+pub const DEPRECATED_SCHEMA_VERSION: u64 = 0;
+
+/// Top-level keys reserved for future schema versions; rejected today so they
 /// can be added compatibly later.
 pub const RESERVED_KEYS: &[&str] = &["envoy", "tracing", "clusters"];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimpleConfig {
-    /// Must be 0 (checked in semantic validation for a friendlier error).
+    /// [`SCHEMA_VERSION`], or the deprecated [`DEPRECATED_SCHEMA_VERSION`]
+    /// (checked in semantic validation for a friendlier error).
     pub version: u64,
     #[serde(default)]
     pub listen: Option<Listen>,

@@ -354,7 +354,7 @@ For maintainers. Each behavior above has this source or test.
   `retiring_a_provider_frees_the_cap_slots_of_its_tenant_series`.
 - OTLP export: `crates/proxy-observability/src/otlp.rs`. Lowering:
   `crates/proxy-simple-config/src/lower.rs`. Defaults come from
-  `schema/llmproxy-v0.schema.json`.
+  `schema/llmproxy-v1.schema.json`.
 - OTLP tests in `crates/proxy/tests/otlp_trace_e2e.rs`:
   `a_failing_metric_export_is_counted_and_forwarding_continues`,
   `a_clean_shutdown_delivers_a_final_metric_snapshot`,

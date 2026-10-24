@@ -118,7 +118,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
-# Test-only: validates dialect configs against schema/llmproxy-v0.schema.json
+# Test-only: validates dialect configs against schema/llmproxy-v1.schema.json
 # (proxy-simple-config tests/schema_gate.rs). No default features: the schema
 # is self-contained, so the HTTP and file `$ref` resolvers are not needed.
 jsonschema = { version = "0.58", default-features = false }

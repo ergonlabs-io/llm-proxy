@@ -354,7 +354,7 @@ latency — the opposite of its purpose.
 
 **Config:** **an Envoy-mode bootstrap, not the `llmproxy` dialect.** As proposed
 this case used `circuit_breakers: { max_requests: 1 }` in the dialect; that
-field does not exist in `schema/llmproxy-v0.schema.json` or the dialect model,
+field does not exist in `schema/llmproxy-v1.schema.json` or the dialect model,
 so strict mode would reject the config and the test would fail for the wrong
 reason. QA takes any config file, so use a bootstrap with a cluster-level
 `circuit_breakers.thresholds.max_requests: 1`.

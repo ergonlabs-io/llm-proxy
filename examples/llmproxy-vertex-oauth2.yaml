@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/llmproxy-v0.schema.json
+# yaml-language-server: $schema=../schema/llmproxy-v1.schema.json
 #
 # llm-proxy in front of Claude on Vertex AI, with the access token minted and
 # refreshed by the proxy (the OAuth2 JWT-bearer grant, RFC 7523).
@@ -17,7 +17,7 @@
 #
 # Run:       llm-proxy --config llmproxy-vertex-oauth2.yaml
 # Rotate:    replace the key file, then send SIGHUP.
-version: 0
+version: 1
 
 listen: 0.0.0.0:8080
 admin: 127.0.0.1:9901

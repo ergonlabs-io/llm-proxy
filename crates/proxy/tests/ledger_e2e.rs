@@ -369,7 +369,7 @@ fn billing_config(
     max_reservations: usize,
 ) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:
@@ -443,7 +443,7 @@ fn unledgered(scrape: &str) -> u64 {
 
 fn config_text(ledger: &LedgerConfig, upstream: SocketAddr, extra: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 providers:
   openai:

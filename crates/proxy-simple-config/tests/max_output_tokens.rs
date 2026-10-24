@@ -16,7 +16,7 @@ fn test_env(name: &str) -> Option<String> {
 fn config(extra: &str, capped: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   openai:
     api_key: ${{OPENAI_API_KEY}}

@@ -110,7 +110,7 @@ async fn the_split_follows_the_weights_and_every_request_gets_the_aliass_model()
     let c = spawn_upstream(KEY_C, None).await;
     let config = format!(
         r#"
-version: 0
+version: 1
 listen: "{{listen}}"
 providers:
   a: {{ type: openai-compatible, base_url: "http://127.0.0.1:{}", api_key: {KEY_A} }}
@@ -184,7 +184,7 @@ async fn an_ejected_provider_gets_no_weighted_traffic() {
     let b = spawn_upstream(KEY_B, Some(500)).await;
     let config = format!(
         r#"
-version: 0
+version: 1
 listen: "{{listen}}"
 providers:
   a: {{ type: openai-compatible, base_url: "http://127.0.0.1:{}", api_key: {KEY_A} }}
@@ -244,7 +244,7 @@ async fn an_ejected_provider_gets_weighted_traffic_again_after_it_recovers() {
     .expect("spawn flaky upstream");
     let config = format!(
         r#"
-version: 0
+version: 1
 listen: "{{listen}}"
 providers:
   a: {{ type: openai-compatible, base_url: "http://127.0.0.1:{}", api_key: {KEY_A} }}
@@ -294,7 +294,7 @@ async fn a_fully_down_weighted_alias_returns_the_exhausted_chain_answer() {
     let b = spawn_upstream(KEY_B, Some(503)).await;
     let config = format!(
         r#"
-version: 0
+version: 1
 listen: "{{listen}}"
 providers:
   a:
@@ -346,7 +346,7 @@ models:
 fn billing_config(listen: SocketAddr, openai_port: u16, standby_port: u16, log: &Path) -> String {
     format!(
         r#"
-version: 0
+version: 1
 listen: "{listen}"
 providers:
   openai:

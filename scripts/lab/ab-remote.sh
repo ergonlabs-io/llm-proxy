@@ -97,7 +97,7 @@ start_proxy() {
     format: $ACCESS_LOG"
     fi
     cat >"$dir/config.yaml" <<YAML
-version: 0
+version: 1
 listen: 127.0.0.1:$LISTEN
 admin: 127.0.0.1:$admin
 providers:

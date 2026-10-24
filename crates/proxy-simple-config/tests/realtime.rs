@@ -14,7 +14,7 @@ fn test_env(name: &str) -> Option<String> {
 fn config(realtime: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   openai: {{ api_key: ${{OPENAI_API_KEY}} }}
 routes:

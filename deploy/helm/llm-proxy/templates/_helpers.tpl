@@ -77,7 +77,7 @@ version, listen, admin and (with sharedStore) auth.store filled in.
 {{- end }}
 {{- $cfg := deepCopy .Values.config }}
 {{- if not (hasKey $cfg "version") }}
-{{- $_ := set $cfg "version" 0 }}
+{{- $_ := set $cfg "version" 1 }}
 {{- end }}
 {{- if not (hasKey $cfg "listen") }}
 {{- $_ := set $cfg "listen" (printf "0.0.0.0:%d" (int .Values.ports.http)) }}

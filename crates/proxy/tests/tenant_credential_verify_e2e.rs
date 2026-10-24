@@ -133,7 +133,7 @@ fn config_text(dir: &Path, listen: u16, admin: u16, upstream: SocketAddr) -> Str
     std::fs::write(&kek, b"verify-e2e-kek-0123456789abcdef!").expect("write kek");
     std::fs::set_permissions(&kek, std::fs::Permissions::from_mode(0o600)).expect("chmod kek");
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:

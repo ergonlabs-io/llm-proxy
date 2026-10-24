@@ -64,7 +64,7 @@ fn model_route_action(bootstrap: &Value) -> &Value {
 fn two_provider_config(entries: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   a: {{ type: openai-compatible, base_url: "http://a.internal:8000" }}
   b: {{ type: openai-compatible, base_url: "http://b.internal:8000" }}
@@ -275,7 +275,7 @@ fn a_provider_listed_twice_in_a_weighted_list_is_refused() {
 fn a_cross_dialect_member_of_a_weighted_alias_is_still_refused() {
     let (path, reason) = parse_err(
         r#"
-version: 0
+version: 1
 providers:
   openai: { api_key: sk-test }
   anthropic: { api_key: sk-ant-test }
@@ -294,7 +294,7 @@ models:
 fn outlier_config(block: &str) -> String {
     format!(
         r#"
-version: 0
+version: 1
 providers:
   a:
     type: openai-compatible

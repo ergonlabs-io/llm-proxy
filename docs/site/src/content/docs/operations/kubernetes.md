@@ -109,7 +109,7 @@ When your `config` leaves them out, the chart sets these keys:
 
 | Key | Value |
 |---|---|
-| `version` | `0` |
+| `version` | `1` |
 | `listen` | `0.0.0.0:<ports.http>`, default `0.0.0.0:8080` |
 | `admin` | `0.0.0.0:<ports.admin>`, default `0.0.0.0:9901` |
 

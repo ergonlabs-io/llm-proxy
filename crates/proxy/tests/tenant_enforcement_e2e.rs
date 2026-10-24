@@ -316,7 +316,7 @@ fn limits_survive_a_restart_with_a_persistent_store() {
 /// The dialect file; `auth_extra` is appended inside the `auth` block.
 fn config_text(auth_extra: &str) -> String {
     format!(
-        r#"version: 0
+        r#"version: 1
 listen: 127.0.0.1:{listen}
 admin: 127.0.0.1:{admin}
 providers:
