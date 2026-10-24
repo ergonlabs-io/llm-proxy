@@ -54,6 +54,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 mod auth_limit;
+mod json_object;
 use auth_limit::{AuthFailureLimiter, Verdict};
 mod transport;
 use transport::{AdminTransport, TransportCache, HANDSHAKE_TIMEOUT};
@@ -1954,7 +1955,8 @@ fn unknown_endpoint(path: &str) -> Response<Full<Bytes>> {
 }
 
 /// Parses a JSON request body into `T`, rejecting unknown fields (`#[serde(deny_unknown_fields)]` on every
-/// request struct; AGENTS.md invariant 1 applies to security writes too), and maps any parse failure to 400.
+/// request struct; AGENTS.md invariant 1 applies to security writes too) and any body that is not a JSON object
+/// (see [`json_object`]), and maps any parse failure to 400.
 /// The `serde_json` message names only the shape problem, never a token or key: none of these bodies carries a
 /// plaintext key, since `POST /keys` only returns one.
 // See `read_limited_body`'s identical `#[allow]` -- same cold admin-write
@@ -1963,7 +1965,7 @@ fn unknown_endpoint(path: &str) -> Response<Full<Bytes>> {
 fn parse_json_body<T: serde::de::DeserializeOwned>(
     body: &[u8],
 ) -> Result<T, Response<Full<Bytes>>> {
-    serde_json::from_slice(body)
+    json_object::from_slice(body)
         .map_err(|err| bad_request(&format!("malformed request body: {err}")))
 }
 
@@ -2069,6 +2071,7 @@ struct SetBudgetRequest {
         deserialize_with = "read_api_schema_version"
     )]
     _schema_version: (),
+    #[serde(default, deserialize_with = "json_object::nullable_object")]
     budget: Option<BudgetSpec>,
 }
 
@@ -2100,7 +2103,7 @@ fn read_limits_api_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Re
 }
 
 fn nullable_limits<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<LimitSpec>, D::Error> {
-    <Option<LimitSpec> as serde::Deserialize>::deserialize(de)
+    json_object::nullable_object(de)
 }
 
 #[derive(serde::Deserialize)]
@@ -2539,7 +2542,7 @@ async fn put_tenant_credential_inner(
             "provider must not be empty",
         );
     }
-    let request: PutTenantCredentialRequest = match serde_json::from_slice(body) {
+    let request: PutTenantCredentialRequest = match json_object::from_slice(body) {
         Ok(request) => request,
         Err(err) => {
             let message = match err.classify() {

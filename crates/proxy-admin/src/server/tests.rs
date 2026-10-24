@@ -3521,6 +3521,7 @@ mod credentials;
 mod key_tags;
 mod ledger;
 mod limits;
+mod object_bodies;
 mod object_owners;
 mod policy_publish;
 mod pricing;
