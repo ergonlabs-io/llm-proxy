@@ -11,8 +11,6 @@ enforcement guidelines.
 
 ## Report a problem
 
-<!-- TODO(owner): put a real, monitored contact address here before the
-     repository is made public. It must not be a public issue tracker. -->
-
-To report unacceptable behaviour, write to **CONDUCT-CONTACT-PLACEHOLDER**.
+To report unacceptable behaviour, write to **support@ergonlabs.io** with
+`[conduct]` at the start of the subject line.
 The maintainers keep the identity of the reporter confidential.

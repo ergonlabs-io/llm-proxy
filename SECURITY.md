@@ -6,14 +6,8 @@ service. Please report suspected vulnerabilities privately.
 
 ## Reporting a vulnerability
 
-<!-- TODO(owner): name a real private reporting channel here, then link it from
-     README.md and the docs site. Do not publish this file with a placeholder.
-     If you use GitHub private vulnerability reporting (Security > Advisories >
-     "Report a vulnerability"), check that it is enabled on the repository first. -->
-
-**Contact: _not yet published_.** There is no private reporting channel yet.
-Do not report a suspected vulnerability in a public issue. Wait until this
-section names a private channel.
+Email **support@ergonlabs.io** with `[security]` at the start of the subject
+line. Do not report a suspected vulnerability in a public issue.
 
 Please include: what you observed, how to reproduce it, the version or commit,
 and the configuration involved (with secrets redacted). A proof of concept is
