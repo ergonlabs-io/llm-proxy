@@ -264,6 +264,14 @@ impl UpstreamEvidence {
         if raw.len() > MAX_UPSTREAM_USAGE_BYTES {
             self.usage_json = None;
             self.usage_oversized = true;
+        } else if serde_json::from_str::<Strict>(raw).is_err() {
+            // The callers only scanned the object (`RawValue`), which accepts
+            // numbers outside `f64` range and lone `\u` surrogates. A reader
+            // that parses the record as a `Value` (as `serde_json` callers do)
+            // would refuse such text, so it is not kept; the latest usage is
+            // unknown. This matches what usage extraction bills (`Strict`).
+            self.usage_json = None;
+            self.usage_oversized = false;
         } else {
             self.usage_json = Some(single_line_json(raw));
             self.usage_oversized = false;
@@ -1838,6 +1846,43 @@ mod tests {
         assert!(!text.contains(['\n', '\r']), "{text:?}");
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["b"], "x y");
+    }
+
+    /// A usage object that only scans as JSON (a number outside `f64` range,
+    /// a lone surrogate escape) is not recorded from a JSON body or its tail:
+    /// a `Value` parse of the record would refuse it. A stream frame like that
+    /// is skipped whole, as billing skips it, so earlier and later valid
+    /// usage is kept.
+    #[test]
+    fn usage_a_value_parse_would_refuse_is_not_recorded() {
+        for usage in [r#"{"d":1e2022}"#, r#"{"d":-1e400}"#, r#"{"s":"\ud800"}"#] {
+            let body = format!(r#"{{"id":"chatcmpl-1","usage":{usage}}}"#);
+            let e = extract_json_upstream(body.as_bytes());
+            assert_eq!(e.usage_json, None, "{usage} must not be kept as usage_json");
+            assert!(!e.usage_oversized, "{usage} is not oversized");
+            assert_eq!(
+                e.response_id.as_deref(),
+                Some("chatcmpl-1"),
+                "the id is unaffected"
+            );
+            let tail = extract_json_upstream_from_tail(body.as_bytes());
+            assert_eq!(tail.usage_json, None, "{usage} from the tail window");
+            let stream = format!(
+                "data: {{\"id\":\"chatcmpl-1\",\"usage\":{{\"prompt_tokens\":1}}}}\n\n\
+                 data: {{\"id\":\"chatcmpl-1\",\"usage\":{usage}}}\n\n"
+            );
+            let e = sse_upstream(Dialect::OpenAi, &stream);
+            assert_eq!(
+                e.usage_json.as_deref(),
+                Some(r#"{"prompt_tokens":1}"#),
+                "a stream frame with {usage} is skipped whole, so the earlier usage stays"
+            );
+        }
+        let e = sse_upstream(
+            Dialect::OpenAi,
+            "data: {\"usage\":{\"d\":1e2022}}\n\ndata: {\"usage\":{\"prompt_tokens\":2}}\n\n",
+        );
+        assert_eq!(e.usage_json.as_deref(), Some(r#"{"prompt_tokens":2}"#));
     }
 
     #[test]

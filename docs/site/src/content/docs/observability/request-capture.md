@@ -172,7 +172,7 @@ These are some of the fields of a record:
 | `usage.completeness`, `usage.provenance` | `complete` for a finished response. `partial` for a stream cut off before the provider's final usage: the counts are then the provider's figures where they arrived and estimates (4 bytes per token) for the rest. `provenance` is `provider`, or `estimate` when any count was estimated; `usage.input_estimated` and `usage.output_estimated` say which. |
 | `cost.kind` | `list` for a rate-card price of provider-reported usage, `estimate` when it prices estimated usage. A partial record is charged to spend and token limits at this estimate. |
 | `upstream_response_id` | The provider's own id for the response, bounded to 256 bytes. `null` when absent. |
-| `upstream_usage` | The provider's `usage` object exactly as sent, embedded as JSON (the last one, for a stream). Evidence only: cost never comes from it. `null` when absent or over 4096 bytes. |
+| `upstream_usage` | The provider's `usage` object exactly as sent, embedded as JSON (the last one, for a stream). Evidence only: cost never comes from it. `null` when absent, over 4096 bytes, or not valid for a strict JSON parser (a number outside the double range, or a lone `\u` surrogate). |
 | `attempts`, `attempts_truncated` | One summary for each provider attempt. Excess attempts are cut and flagged. |
 
 ## Checking that no record was lost
