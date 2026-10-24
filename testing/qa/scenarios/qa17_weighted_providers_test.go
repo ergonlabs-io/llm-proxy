@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
-	"github.com/vigneshaigal/llm-proxy/testing/qa/mocks"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/mocks"
 )
 
 // QA-17: a weighted `models` alias splits traffic by weight, keeps each

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
-	"github.com/vigneshaigal/llm-proxy/testing/qa/mocks"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/mocks"
 )
 
 // QA-6: an upstream dying mid-stream surfaces an error, and is never retried

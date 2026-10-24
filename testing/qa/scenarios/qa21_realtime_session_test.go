@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
 )
 
 // QA-21: a realtime (WebSocket) session under a tenant spend budget

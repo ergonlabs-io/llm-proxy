@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
-	"github.com/vigneshaigal/llm-proxy/testing/qa/mocks"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/mocks"
 )
 
 // QA-16: chargeback tags as an operator and a finance consumer see them,

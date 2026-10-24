@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
-	"github.com/vigneshaigal/llm-proxy/testing/qa/mocks"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/mocks"
 )
 
 // This drill deliberately kills only AFTER Redis acknowledges the charge.

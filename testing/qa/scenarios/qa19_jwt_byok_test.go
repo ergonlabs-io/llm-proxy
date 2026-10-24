@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
-	"github.com/vigneshaigal/llm-proxy/testing/qa/mocks"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/mocks"
 )
 
 // QA-19: a JWT caller whose tenant stored its own provider key (BYOK,

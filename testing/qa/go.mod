@@ -1,3 +1,3 @@
-module github.com/vigneshaigal/llm-proxy/testing/qa
+module github.com/ergonlabs-io/llm-proxy/testing/qa
 
 go 1.26.5

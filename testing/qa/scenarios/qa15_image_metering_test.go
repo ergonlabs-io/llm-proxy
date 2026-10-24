@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
 )
 
 // QA-15: image generation under a tenant spend budget (ADR-0010 phase 2), as

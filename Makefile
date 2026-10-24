@@ -47,6 +47,10 @@ redb-retention-check: ## Check production redb qualification reporting without w
 install-check: ## Run scripts/install.sh end to end against the local debug build
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_install.py
 
+.PHONY: public-check
+public-check: ## Anonymous git clone + docker pull of a release, no stored credentials: make public-check [TAG=v1.0.0] (default: latest v* tag)
+	scripts/public-check.sh $(TAG)
+
 .PHONY: helm-check
 helm-check: ## helm lint and helm template the chart (deploy/helm/llm-proxy) for each ci/ values file; set LLM_PROXY_BIN to also validate the rendered configs
 	testing/helm/check.sh

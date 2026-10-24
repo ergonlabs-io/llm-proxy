@@ -1,4 +1,4 @@
-module github.com/ergonlabs/llm-proxy/testing/xds-conformance/fixture
+module github.com/ergonlabs-io/llm-proxy/testing/xds-conformance/fixture
 
 go 1.22
 
