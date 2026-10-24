@@ -15,11 +15,14 @@
 //! - splicing a new model at that range yields a form whose model is the new
 //!   one and whose other facts are unchanged;
 //! - on a built form, each field of interest sent once as valid UTF-8 within
-//!   the bound is read back exactly, and a field sent twice is unproven.
+//!   the bound is read back exactly, and a field sent twice is unproven;
+//! - a built form of more than `MAX_PARTS` parts is refused whole.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use proxy_http::multipart::{replace_range, scan, Field, Outcome, MAX_FIELD_BYTES};
+use proxy_http::multipart::{
+    replace_range, scan, Field, MultipartFacts, Outcome, MAX_FIELD_BYTES, MAX_PARTS,
+};
 
 const NAMES: [&str; 6] = [
     "model",
@@ -102,6 +105,17 @@ fuzz_target!(|data: &[u8]| {
     body.extend_from_slice(b"--b--\r\n");
     check(&body);
     let facts = scan(&body, "b");
+    // Past the part cap the scanner refuses the form by design, proving no
+    // field at all.
+    if sent.len() > MAX_PARTS {
+        assert_eq!(
+            facts,
+            MultipartFacts::default(),
+            "a form of {} parts was not refused",
+            sent.len()
+        );
+        return;
+    }
     assert_eq!(
         facts.outcome,
         Outcome::Complete,

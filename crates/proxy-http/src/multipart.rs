@@ -604,15 +604,28 @@ mod tests {
         assert_eq!(replace_range(&body, 0..1, "a\r\nb"), None);
     }
 
-    #[test]
-    fn a_form_with_too_many_parts_proves_nothing() {
-        let fields: Vec<(String, String)> = (0..=MAX_PARTS)
+    /// `form` adds a file part, so `parts` parts is `parts - 1` fields.
+    fn form_of_parts(parts: usize) -> Vec<u8> {
+        let mut fields: Vec<(String, String)> = (1..parts)
             .map(|i| (format!("f{i}"), "v".to_string()))
             .collect();
+        fields[0] = ("model".to_string(), "m".to_string());
         let refs: Vec<(&str, &str)> = fields
             .iter()
             .map(|(n, v)| (n.as_str(), v.as_str()))
             .collect();
-        assert_eq!(scan(&form(&refs, b""), B).outcome, Outcome::Invalid);
+        form(&refs, b"")
+    }
+
+    #[test]
+    fn a_form_with_too_many_parts_proves_nothing() {
+        let at_cap = scan(&form_of_parts(MAX_PARTS), B);
+        assert_eq!(at_cap.outcome, Outcome::Complete);
+        assert_eq!(at_cap.model.value(), Some("m"));
+        // One part over the cap refuses the whole form, the model included.
+        assert_eq!(
+            scan(&form_of_parts(MAX_PARTS + 1), B),
+            MultipartFacts::default()
+        );
     }
 }
