@@ -10,6 +10,7 @@ related:
   - help/faq
   - help/troubleshooting
   - configuration/strict-config-mode
+  - reference/stability
 ---
 
 This page lists what the proxy does not do when you start it with `--config`.
@@ -150,3 +151,4 @@ If your plan depends on a gap above, check two things first:
 - [FAQ](/docs/llm-proxy/help/faq/)
 - [Troubleshooting](/docs/llm-proxy/help/troubleshooting/)
 - [Strict config mode](/docs/llm-proxy/configuration/strict-config-mode/)
+- [Stability and versioning](/docs/llm-proxy/reference/stability/)

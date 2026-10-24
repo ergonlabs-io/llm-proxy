@@ -11,6 +11,13 @@ project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dia
 
 ### Added
 
+- Docs: [Stability and versioning](docs/site/src/content/docs/reference/stability.md)
+  states what the 1.x releases keep stable for a `--config` deployment: the schema, CLI flags,
+  Prometheus metric names, types and label names, admin API paths, and JSON
+  access-log keys, each with the contract test that holds it fixed. It lists
+  the surfaces that are not covered yet, the semantic versioning and
+  deprecation rules, and how to check a config before an upgrade. Envoy mode
+  is outside the promise.
 - `--config`: `version: 1` is the current schema version, and the version that
   the 1.x releases keep. It has the same fields as `version: 0`, so the only
   change to an existing file is that one line. The examples, the Helm chart's

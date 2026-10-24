@@ -9,6 +9,7 @@ related:
   - getting-started/quickstart
   - providers/overview
   - operations/config-reload
+  - reference/stability
 ---
 
 The configuration file is a YAML file that you pass with `--config`. This page
@@ -146,6 +147,9 @@ expect. For example, an `auth` block with no keys is a warning.
 `validate` reads the same environment variables as `serve`. Set the same
 variables, and pass `--service-node` if the file needs it. See
 [Rules that span fields](#rules-that-span-fields).
+
+Before you upgrade, run `validate` with the new binary on your current file.
+See [Check a config before you upgrade](/docs/llm-proxy/reference/stability/#check-a-config-before-you-upgrade).
 
 ## Example: the smallest file
 
