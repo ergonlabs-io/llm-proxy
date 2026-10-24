@@ -187,7 +187,7 @@ your config there and pass secrets as environment variables:
 docker run --rm -p 8080:8080 \
   -v "$PWD/llmproxy.yaml:/etc/llm-proxy/llmproxy.yaml:ro" \
   -e OPENAI_API_KEY \
-  ghcr.io/ergonlabs-io/llm-proxy:0.7.0
+  ghcr.io/ergonlabs-io/llm-proxy:1.0.0
 ```
 
 Set `listen` in the config to an address on all interfaces, such as

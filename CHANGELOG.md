@@ -10,6 +10,8 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
+## [1.0.0] - (date set at tag)
+
 ### Added
 
 - Docs: [Stability and versioning](docs/site/src/content/docs/reference/stability.md)
@@ -118,6 +120,18 @@ surfaces that an upgrade within 1.x keeps stable.
   in Envoy mode) is refused, and the previous snapshot keeps serving. Before,
   the reload succeeded and the proxy kept the journal it opened at startup
   without a word. The refusal names the field.
+- A `SIGHUP` reload that changes, adds or removes the admin address (`admin`
+  or `admin.address`) is refused by name, and the previous snapshot keeps
+  serving. Before, the admin server stayed on its startup address and the
+  reload reported success. `admin.tls` is still read again on reload.
+- The admin API refuses a request body that is not a JSON object with `400`.
+  Before, a JSON array was read field by field in order, so `["all"]` was
+  accepted as the policy `{"access": "all"}`. Found by fuzzing.
+- A provider `usage` object that a strict JSON parser refuses (a number
+  outside the double range, or a lone `\u` surrogate) is no longer recorded
+  as `upstream_usage` from a JSON body. Before, it was embedded as written, so
+  the access-log or request-record line could not be read back by a strict
+  JSON reader. Found by fuzzing.
 
 ### Removed
 
@@ -141,6 +155,15 @@ surfaces that an upgrade within 1.x keeps stable.
   (`make deny-check`, policy in `deny.toml`). The two advisories it ignores,
   each with its reason in `deny.toml`: `rsa` (RUSTSEC-2023-0071, test code
   only) and the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449).
+- A request body that has serde_json's internal key
+  `$serde_json::private::RawValue` at any depth is refused with
+  `400 request body uses a reserved key` before any filter reads it. With the
+  `raw_value` feature on, the proxy read such a body differently from the
+  provider: `{"model":{"$serde_json::private::RawValue":"\"cheap\""}}` was
+  model `cheap` to routing and model authorization, and an object to the
+  provider. Found by fuzzing.
+- `SECURITY.md` names the private reporting channel: support@ergonlabs.io,
+  with `[security]` at the start of the subject line.
 - PEM certificates and keys are read with `rustls-pki-types` instead of the
   unmaintained `rustls-pemfile` (RUSTSEC-2025-0134). The accepted formats do
   not change: PKCS#8, PKCS#1 and SEC1 private keys, and certificate chains in

@@ -52,7 +52,7 @@ llm-proxy --version
 ```
 
 Expected output: one line that starts with `llm-proxy`, for example
-`llm-proxy 0.7.0`. For all installer options, upgrade, and source builds, see
+`llm-proxy 1.0.0`. For all installer options, upgrade, and source builds, see
 [Install llm-proxy](/docs/llm-proxy/getting-started/installation/).
 
 ## Step 2: Create a starter config

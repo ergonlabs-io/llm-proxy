@@ -67,11 +67,11 @@ config:
       provider: openai
 ```
 
-Install the chart. Replace `0.7.0` with the release that you want:
+Install the chart. Replace `1.0.0` with the release that you want:
 
 ```bash
 helm install llm-proxy oci://ghcr.io/ergonlabs-io/charts/llm-proxy \
-  --version 0.7.0 -f values.yaml --wait
+  --version 1.0.0 -f values.yaml --wait
 ```
 
 Send a request through the Service from inside the cluster:

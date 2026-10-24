@@ -122,7 +122,7 @@ the config names, such as `api_key_file` or `price_list_file`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROXY_VERSION` | latest release | Release tag to install, for example `v0.7.0`. The `--version` option does the same. |
+| `LLM_PROXY_VERSION` | latest release | Release tag to install, for example `v1.0.0`. The `--version` option does the same. |
 | `LLM_PROXY_INSTALL_DIR` | `$HOME/.local/bin`; `/usr/local/bin` as root on Linux | Where the script puts `llm-proxy`. |
 | `LLM_PROXY_DATA_DIR` | `$HOME/.config/llm-proxy`; `/var/lib/llm-proxy` as root on Linux | Where the script puts the config, the secrets, `service.env`, and `admin-ui-dist`. |
 | `LLM_PROXY_DOWNLOAD_URL` | GitHub release URL | Full archive URL. It replaces the computed URL. The script also fetches `<url>.sha256`. |

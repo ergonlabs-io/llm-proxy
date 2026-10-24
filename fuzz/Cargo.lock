@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-admin"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "http-body-util",
  "hyper",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-api"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "prost",
  "prost-reflect",
@@ -1319,7 +1319,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-capture-spool"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "redb",
  "ring",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-cluster"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-config"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-control"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-credentials"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "proxy-observability",
  "zeroize",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-filters"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-http"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-observability"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "base64",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-simple-config"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "http",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-xds"
-version = "0.7.0"
+version = "1.0.0"
 dependencies = [
  "futures",
  "prost",

@@ -4,8 +4,8 @@ description: High-performance proxy for LLM inference APIs, configured with the 
 type: application
 # The release workflow sets both from the git tag when it packages the chart
 # (`helm package --version --app-version`). Keep them equal to VERSION.
-version: 0.7.0
-appVersion: "0.7.0"
+version: 1.0.0
+appVersion: "1.0.0"
 # The preStop hook uses the `sleep` lifecycle action, so the image needs no
 # shell. Kubernetes enables it by default from 1.30.
 kubeVersion: ">=1.30.0-0"
