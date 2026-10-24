@@ -17,7 +17,10 @@
 //!   streaming JSON object;
 //! - an attempt body never carries a denied or stripped key, carries the
 //!   cluster's upstream model when a rewrite applies, and otherwise keeps the
-//!   client's fields; with nothing to do it is the client's bytes unchanged.
+//!   client's fields; with nothing to do it is the client's bytes unchanged;
+//! - a body whose rewritten object would carry serde_json's reserved
+//!   `RawValue` key is refused, since `Value` reads such an object as the
+//!   JSON text in that key once a sorted rewrite moves the key first.
 #![no_main]
 
 use bytes::Bytes;
@@ -27,7 +30,9 @@ use proxy_http::endpoint::Endpoint;
 use proxy_http::router::fuzzing::{
     prepare_attempt_body, provider_model_pattern_matches, reconcile_request_body, BodyRefusal,
 };
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 const KEYS: [&str; 8] = [
     "tools",
@@ -49,6 +54,26 @@ fn output_fields(endpoint: Endpoint) -> &'static [&'static str] {
         Endpoint::Messages => &["max_tokens"],
         _ => &["max_completion_tokens", "max_tokens"],
     }
+}
+
+const SERDE_RAW_VALUE_KEY: &str = "$serde_json::private::RawValue";
+const RESERVED_KEY_REFUSAL: &str = "request body uses a reserved key";
+
+/// Whether the top-level object, or its `stream_options` object when
+/// `stream_options_too`, has the reserved key. Keys are read unescaped, so
+/// `\u0024serde_json::...` counts; values are kept raw, so `Value`'s reading
+/// of the key does not hide it.
+fn carries_reserved_key(body: &[u8], stream_options_too: bool) -> bool {
+    type RawObject = BTreeMap<String, Box<RawValue>>;
+    let Ok(object) = serde_json::from_slice::<RawObject>(body) else {
+        return false;
+    };
+    object.contains_key(SERDE_RAW_VALUE_KEY)
+        || (stream_options_too
+            && object
+                .get("stream_options")
+                .and_then(|raw| serde_json::from_str::<RawObject>(raw.get()).ok())
+                .is_some_and(|options| options.contains_key(SERDE_RAW_VALUE_KEY)))
 }
 
 fn without(object: &Map<String, Value>, keys: &[&str]) -> Map<String, Value> {
@@ -75,6 +100,15 @@ fn check_reconcile(
             "nothing to check, yet the body was touched"
         );
         return;
+    }
+    if let Err(refusal) = &result {
+        if refusal.message == RESERVED_KEY_REFUSAL {
+            assert!(
+                force && carries_reserved_key(body, /* stream_options_too */ true),
+                "refused a reserved key the body does not carry"
+            );
+            return;
+        }
     }
     let Ok(replacement) = result else {
         assert!(
@@ -180,6 +214,15 @@ fn check_attempt(
             assert!(
                 matches!(&result, Err(BodyRefusal::FieldNotPermitted(_))),
                 "denied key `{denied}` was not refused: {result:?}"
+            );
+            return;
+        }
+    }
+    if let Err(BodyRefusal::Invalid(message)) = &result {
+        if message == RESERVED_KEY_REFUSAL {
+            assert!(
+                carries_reserved_key(body, /* stream_options_too */ false),
+                "refused a reserved key the body does not carry"
             );
             return;
         }
