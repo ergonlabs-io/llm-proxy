@@ -99,6 +99,7 @@ that start after a successful reload.
 | `${ENV}` values | Read again from the environment of the running process, which does not change. | Yes, to change the value |
 | `listen.tls` `cert_file` / `key_file` | Read again on the next accepted connection. New connections get the new certificate. A file that cannot be read makes the listener reset every new TLS connection until a later reload succeeds. | No |
 | Listener admission limits | Active from the next accepted connection. | No |
+| `admin` address (`admin` or `admin.address`; add, remove, change) | A change makes the proxy refuse the whole reload. The admin server stays on the address from startup. | Yes |
 | `admin.tls` (add, remove, `cert_file` / `key_file`) | Read again on the next accepted admin connection, the same as `listen.tls`. A file that cannot be read makes the admin port close every new connection until a later reload succeeds. Removing `admin.tls` serves plain HTTP. | No |
 | `pricing` | Installed if the chain has no auth store. With an `auth:` block, the stored card wins; use `PUT /pricing`. | No |
 | `auth.max_policy_staleness` | Active. | No |
@@ -122,8 +123,9 @@ auth and spend fields appear under their internal names, for example
 `typed_config.hmac_secret (the dialect's `auth.hmac_secret` /
 `auth.hmac_secret_file`)` or `typed_config.recovery_journal_path (the
 dialect's `auth.spend.recovery_journal_path`)`. For `ledger`, `observability.traces`,
-`observability.tracing`, and `observability.metrics`, the log line names the
-field in parentheses. The log never contains the secret.
+`observability.tracing`, `observability.metrics`, and the `admin` address, the
+log line names the field in parentheses. For the `admin` address, the `running`
+and `reloaded` fields show both addresses. The log never contains the secret.
 
 To rotate the HMAC secret, change it and restart. Configured keys must be
 digested again under the new secret, and keys minted through the admin API stop working, because their digests were
@@ -198,6 +200,7 @@ For maintainers. The `reload` function is in `crates/proxy/src/main.rs`.
   `sighup_with_a_broken_config_keeps_serving_and_logs_error` (the process
   stays alive and the listener keeps accepting),
   `sighup_with_an_unchanged_config_is_harmless`,
+  `sighup_that_moves_the_admin_listener_is_refused_by_name`,
   `snapshot_version_advances_across_reloads`,
   `sighup_reload_is_reflected_in_config_dump_and_clusters`, and
   `sigterm_after_a_reload_still_drains_and_exits_cleanly`.

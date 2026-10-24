@@ -732,6 +732,8 @@ async fn run_serve(
     // OTLP export starts once below and never restarts; `reload` refuses a
     // change to either block.
     let running_otlp = (snapshot.tracing.clone(), snapshot.metrics.clone());
+    // `start_admin` binds the admin listener once; `reload` refuses a change.
+    let running_admin = snapshot.admin;
     let (trace_admission, trace_gate, trace_exporter) = match &snapshot.traces {
         None => (None, None, None),
         Some(config) => match open_traces(config, &node.id, &stats_control) {
@@ -1194,6 +1196,7 @@ async fn run_serve(
                             running_ledger.as_ref(),
                             running_traces.as_ref(),
                             &running_otlp,
+                            running_admin,
                             &factory_state_for_reload,
                         )
                         .await
@@ -1752,7 +1755,7 @@ async fn apply_ads_snapshot(
 /// Returns the new [`SnapshotVersion`] on success so the caller can advance
 /// `current_version` for the *next* reload, or `None` on any failure (old
 /// snapshot, old version, old cluster set: all still serving).
-// The boot-scoped inputs (ledger, traces, OTLP, auth) are each checked against the
+// The boot-scoped inputs (ledger, traces, OTLP, admin, auth) are each checked against the
 // reloaded snapshot here, where it is loaded; bundling them only for the lint
 // would hide which one refused a reload.
 #[allow(clippy::too_many_arguments)]
@@ -1769,6 +1772,7 @@ async fn reload(
         Option<proxy_config::ir::TracingConfig>,
         Option<proxy_config::ir::MetricsExportConfig>,
     ),
+    running_admin: Option<SocketAddr>,
     factory_state: &proxy_http::filter::SharedFactoryState,
 ) -> Option<SnapshotVersion> {
     // The parse and lowering are blocking file I/O and CPU work. Run inline,
@@ -1840,6 +1844,18 @@ async fn reload(
             "SIGHUP: node.metadata[\"io.llmproxy.metrics\"] (the dialect's \
              `observability.metrics`) cannot change on reload; restart the process to apply it. \
              Continuing to serve the previous snapshot"
+        );
+        return None;
+    }
+    // The admin listener is bound once at boot (`start_admin`). A reload
+    // cannot move, add or remove it, and admin TLS is the only admin field
+    // the admin server re-reads.
+    if snapshot.admin != running_admin {
+        tracing::error!(
+            running = ?running_admin,
+            reloaded = ?snapshot.admin,
+            "SIGHUP: admin.address (the dialect's `admin` or `admin.address`) cannot change on \
+             reload; restart the process to apply it. Continuing to serve the previous snapshot"
         );
         return None;
     }
