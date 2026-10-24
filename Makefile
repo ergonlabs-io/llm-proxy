@@ -493,10 +493,16 @@ FUZZ_TARGETS := usage_extract body_prefix_scan dialect_config model_wildcard vho
 	multipart_scan
 FUZZ_SECONDS ?= 300
 FUZZ_TOOLCHAIN ?= nightly
+# cargo-fuzz defaults --target to the triple it was itself built for, so a
+# prebuilt musl cargo-fuzz (what cargo-binstall fetches on CI) builds the
+# targets for musl, where the address sanitizer cannot link. Set FUZZ_TRIPLE
+# to the host triple there; empty keeps cargo-fuzz's default.
+FUZZ_TRIPLE ?=
+FUZZ_TARGET_FLAG := $(if $(FUZZ_TRIPLE),--target $(FUZZ_TRIPLE))
 
 .PHONY: fuzz-build
 fuzz-build: ## Build every fuzz target (nightly + cargo-fuzz)
-	cargo +$(FUZZ_TOOLCHAIN) fuzz build
+	cargo +$(FUZZ_TOOLCHAIN) fuzz build $(FUZZ_TARGET_FLAG)
 
 # fuzz/ is outside the workspace, so `make ci` never compiles it and an API
 # change in a crate can break a target unnoticed until the scheduled run. This
@@ -511,11 +517,11 @@ fuzz: ## Run every fuzz target for FUZZ_SECONDS each (default 300)
 	@fuzz/seed.sh
 	@for t in $(FUZZ_TARGETS); do \
 	  echo "== $$t ($(FUZZ_SECONDS)s)"; \
-	  cargo +$(FUZZ_TOOLCHAIN) fuzz run $$t -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
+	  cargo +$(FUZZ_TOOLCHAIN) fuzz run $(FUZZ_TARGET_FLAG) $$t -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
 	done
 
 .PHONY: fuzz-one
 fuzz-one: ## Run one fuzz target, e.g. make fuzz-one TARGET=usage_extract FUZZ_SECONDS=600
 	@test -n "$(TARGET)" || { echo "set TARGET to one of: $(FUZZ_TARGETS)"; exit 1; }
 	@fuzz/seed.sh
-	cargo +$(FUZZ_TOOLCHAIN) fuzz run $(TARGET) -- -max_total_time=$(FUZZ_SECONDS)
+	cargo +$(FUZZ_TOOLCHAIN) fuzz run $(FUZZ_TARGET_FLAG) $(TARGET) -- -max_total_time=$(FUZZ_SECONDS)

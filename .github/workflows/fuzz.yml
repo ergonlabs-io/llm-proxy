@@ -78,7 +78,7 @@ jobs:
       - name: Toolchain versions
         run: cargo +"$FUZZ_TOOLCHAIN" --version && cargo +"$FUZZ_TOOLCHAIN" fuzz --version
       - name: Fuzz
-        run: make fuzz-one TARGET="$TARGET" FUZZ_SECONDS="$SECONDS_PER_TARGET" FUZZ_TOOLCHAIN="$FUZZ_TOOLCHAIN"
+        run: make fuzz-one TARGET="$TARGET" FUZZ_SECONDS="$SECONDS_PER_TARGET" FUZZ_TOOLCHAIN="$FUZZ_TOOLCHAIN" FUZZ_TRIPLE=x86_64-unknown-linux-gnu
         env:
           TARGET: ${{ matrix.target }}
           SECONDS_PER_TARGET: ${{ inputs.seconds || '300' }}
