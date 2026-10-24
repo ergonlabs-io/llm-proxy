@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
 )
 
 // QA-18: speech and transcription under a tenant spend budget (ADR-0010

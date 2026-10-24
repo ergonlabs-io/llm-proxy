@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vigneshaigal/llm-proxy/testing/qa/harness"
+	"github.com/ergonlabs-io/llm-proxy/testing/qa/harness"
 )
 
 // QA-2: a bad config fails at load, names the offending field, and exits

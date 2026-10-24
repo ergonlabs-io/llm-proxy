@@ -3,3 +3,5 @@
 # root .gitignore's `/target` entry is anchored to the repo root and does not
 # reach here.
 /target
+# `go build` in fixture/ writes the binary next to main.go.
+/fixture/fixture
