@@ -21,7 +21,9 @@ or a self-hosted OpenAI-compatible server (vLLM, Ollama, TGI). It is one binary
 that you configure with one YAML file. Use it to put token accounting, access
 control, limits, and failover in one place instead of in every service.
 
-The project is pre-1.0. Interfaces change between releases.
+The 1.x releases follow the [stability policy](/docs/llm-proxy/reference/stability/). An upgrade within
+1.x needs no change to a `--config` file for the surfaces that the policy
+lists.
 
 ## At a glance
 

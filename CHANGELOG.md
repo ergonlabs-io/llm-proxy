@@ -3,9 +3,10 @@
 All notable changes to this project are recorded here. This file records _what shipped_, not
 what is planned.
 
-The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This
-project is pre-1.0: the config surface is not yet stable, and the `llmproxy` dialect's
-`version: 0` schema is frozen only from its first release onward.
+The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
+1.x releases follow the
+[stability policy](docs/site/src/content/docs/reference/stability.md), which lists the
+surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 

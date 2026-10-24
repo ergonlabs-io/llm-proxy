@@ -96,5 +96,6 @@ spends time reporting them, and so operators can judge the risk themselves:
 
 ## Supported versions
 
-Pre-1.0 and moving quickly. Fixes land on `main` and ship in the next release;
+The 1.x releases follow the [stability policy](https://ergonlabs.io/docs/llm-proxy/reference/stability/).
+Fixes land on `main` and ship in the next release;
 there are no backports to earlier tags.

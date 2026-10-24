@@ -16,7 +16,7 @@ and cluster policy on top of it, not a parallel system.
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/ergonlabs-io/llm-proxy?sort=semver)](https://github.com/ergonlabs-io/llm-proxy/releases)
 [![Docs](https://img.shields.io/badge/docs-ergonlabs.io-blue.svg)](https://ergonlabs.io/docs/llm-proxy/)
-![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-yellow.svg)
+[![Stability: 1.x policy](https://img.shields.io/badge/stability-1.x_policy-green.svg)](https://ergonlabs.io/docs/llm-proxy/reference/stability/)
 
 </div>
 
@@ -32,8 +32,11 @@ and the [documentation](https://ergonlabs.io/docs/llm-proxy/) for everything
 else.
 
 > [!NOTE]
-> **Pre-1.0.** The data plane serves real traffic, but interfaces still change
-> between releases and there are no backports to earlier tags. Read
+> **Stability.** The 1.x releases follow the
+> [stability policy](https://ergonlabs.io/docs/llm-proxy/reference/stability/): an upgrade within 1.x
+> needs no change to a `--config` file, a dashboard, or a script, for the
+> surfaces that the policy lists. Envoy mode is outside the policy. There are
+> no backports to earlier tags. Read
 > [Limitations](https://ergonlabs.io/docs/llm-proxy/help/limitations/) before
 > you depend on it: it lists what is not built or only partly built.
 

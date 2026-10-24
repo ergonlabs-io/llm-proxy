@@ -14,7 +14,8 @@ related:
 ---
 
 This page lists what the proxy does not do when you start it with `--config`.
-The project is before 1.0, and the config surface can still change. The
+The 1.x releases follow the
+[stability policy](/docs/llm-proxy/reference/stability/). The
 entries describe the current code in the repository. The proxy is strict by design. A field that parses
 but does nothing produces a load warning, never silence.
 

@@ -3,9 +3,11 @@
 Thank you for your interest in llm-proxy. This file tells you how to report a
 problem, propose a change, and get a pull request merged.
 
-llm-proxy is pre-1.0 and has one maintainer. Interfaces change between
-releases. Reviews are a best effort, so a small, focused pull request is
-merged sooner than a large one.
+llm-proxy has one maintainer. The 1.x releases follow the
+[stability policy](https://ergonlabs.io/docs/llm-proxy/reference/stability/), so a change
+that removes or renames a stable surface waits for a major release. Reviews
+are a best effort, so a small, focused pull request is merged sooner than a
+large one.
 
 ## Report a problem
 
