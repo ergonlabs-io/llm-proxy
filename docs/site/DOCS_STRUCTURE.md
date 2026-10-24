@@ -145,6 +145,7 @@ Reference). It replaces the hand-written `reference/config-schema` page.
 | `reference/response-flags` | new |
 | `reference/metrics` | new |
 | `reference/environment-variables` | new |
+| `reference/stability` | new: what the 1.x releases keep stable, and the test that fixes each surface |
 | `reference/glossary` | new |
 
 ### Help

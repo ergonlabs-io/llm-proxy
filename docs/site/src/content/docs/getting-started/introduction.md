@@ -12,6 +12,7 @@ related:
   - getting-started/quickstart
   - getting-started/core-concepts
   - getting-started/coming-from-litellm-or-openrouter
+  - reference/stability
 ---
 
 llm-proxy is a self-hosted gateway for LLM inference APIs, written in Rust. It
@@ -32,6 +33,8 @@ The project is pre-1.0. Interfaces change between releases.
   a request without a recognized credential gets `401`.
 - **Reload:** the proxy re-reads its file on `SIGHUP`. It does not watch the
   file. See [Reload configuration](/docs/llm-proxy/operations/config-reload/).
+- **Versioning:** [Stability and versioning](/docs/llm-proxy/reference/stability/)
+  lists what the 1.x releases keep stable across an upgrade.
 
 ## What it does today
 

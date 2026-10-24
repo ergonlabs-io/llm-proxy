@@ -154,6 +154,7 @@ export default defineConfig({
 						{ label: 'Response flags', slug: 'reference/response-flags' },
 						{ label: 'Metrics', slug: 'reference/metrics' },
 						{ label: 'Environment variables', slug: 'reference/environment-variables' },
+						{ label: 'Stability and versioning', slug: 'reference/stability' },
 						{ label: 'Glossary', slug: 'reference/glossary' },
 					],
 				},
