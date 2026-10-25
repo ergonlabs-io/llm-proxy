@@ -2526,6 +2526,12 @@ impl RouterHandler {
                         let request_sent =
                             attempt_timing.points().get(TimePoint::UsTxEnd).is_some();
                         let outcome = AttemptOutcome::from_codec_error(&err, request_sent);
+                        if outcome == AttemptOutcome::ResetBeforeRequest {
+                            crate::stream_info::DispatchedAttempt::mark_unsent(
+                                &dcb.stream_info().dispatched,
+                                &attempt_timing,
+                            );
+                        }
                         report_outlier(attempt_entry, host.address, &outcome);
                         self.emit_client_span(
                             attempt_trace,

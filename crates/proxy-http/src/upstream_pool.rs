@@ -1014,7 +1014,7 @@ impl LeasedH1 {
         // same as a failed send below.
         if let Err(not_ready) = sender.ready().await {
             conn_task.abort();
-            return Err(UpstreamCodecError::Send(not_ready));
+            return Err(UpstreamCodecError::NotReady(not_ready));
         }
         let response = match sender.send_request(request).await {
             Ok(response) => response,

@@ -88,9 +88,13 @@ impl AttemptOutcome {
     /// never succeed.
     pub fn from_codec_error(err: &UpstreamCodecError, request_sent: bool) -> Self {
         match err {
-            UpstreamCodecError::Handshake(_) | UpstreamCodecError::MissingAuthority => {
-                Self::ResetBeforeRequest
-            }
+            // Nothing was written: a failed handshake, a pooled connection
+            // that failed before taking the request, or a request that could
+            // not be framed. `request_sent` can already be set for an empty
+            // body, which is marked sent when it is built.
+            UpstreamCodecError::Handshake(_)
+            | UpstreamCodecError::NotReady(_)
+            | UpstreamCodecError::MissingAuthority => Self::ResetBeforeRequest,
             UpstreamCodecError::Connection(_) | UpstreamCodecError::Send(_) => {
                 if request_sent {
                     Self::ResetAwaitingResponse

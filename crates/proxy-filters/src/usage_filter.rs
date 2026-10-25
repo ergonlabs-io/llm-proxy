@@ -2548,10 +2548,19 @@ impl UsageFilterInstance {
             let mut charges = earlier;
             charges.push(own);
             write_charges(&mut stream_info, charges, basis);
+            // The cut-stream path counted it already.
+            if completeness != UsageCompleteness::Partial {
+                self.stats.partial.incr();
+                self.stats.estimated.incr();
+            }
         } else {
             // The answering attempt reported nothing; the earlier attempts
             // are what this request is charged.
-            write_charges(&mut stream_info, earlier, None);
+            write_charges(&mut stream_info, earlier, Some(PriceBasis::Tokens));
+            if completeness != UsageCompleteness::Partial {
+                self.stats.partial.incr();
+                self.stats.estimated.incr();
+            }
         }
         stream_info.llm.served_model = served_model;
         // Evidence only. Nothing below reads a field of the provider's usage

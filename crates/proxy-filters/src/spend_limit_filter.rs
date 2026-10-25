@@ -828,13 +828,30 @@ impl SpendLimitFilterInstance {
             attempts
                 .iter()
                 .filter_map(|attempt| {
-                    PricingRegistry::price_served(
+                    let priced = PricingRegistry::price_served(
                         self.pricing_snapshot.as_ref(),
                         Some(&attempt.cluster),
                         attempt.model.as_deref(),
                         attempt.served_model.as_deref(),
                         &attempt.usage,
-                    )
+                    );
+                    // One unpriced attempt among priced ones leaves the sum
+                    // short; warn as for a wholly unpriced request.
+                    if priced.is_none() && self.budget_applies {
+                        self.unpriced_warner.note(
+                            attempt.model.as_deref(),
+                            Some(&attempt.cluster),
+                            || {
+                                PricingRegistry::explain_unpriced(
+                                    self.pricing_snapshot.as_ref(),
+                                    Some(&attempt.cluster),
+                                    attempt.model.as_deref(),
+                                    &attempt.usage,
+                                )
+                            },
+                        );
+                    }
+                    priced
                 })
                 .reduce(|sum, priced| crate::pricing::Priced {
                     nanodollars: sum.nanodollars + priced.nanodollars,
@@ -2138,6 +2155,57 @@ mod tests {
             lines[0]
         );
         assert!(lines[1].contains("second"));
+    }
+
+    /// A request charged across attempts (one got no response) sums each
+    /// attempt at its own cluster. An attempt no card prices adds nothing,
+    /// and where a budget applies that shortfall is warned about, as for a
+    /// wholly unpriced request (AGENTS.md "Fail-open controls").
+    #[test]
+    fn an_unpriced_attempt_among_priced_ones_is_charged_zero_and_warns() {
+        let cp = control_plane_with(&[("tenant-a", dollar_budget())]);
+        let mut card = Card::default();
+        card.insert("cluster-a", "priced", 1_000_000);
+        let harness = filter_with(&cp, card, Period::Monthly);
+
+        let (capture, guard) = crate::control::log_capture::Capture::start();
+        let mut filter = harness.new_instance();
+        let mut cb = TestCallbacks::new();
+        cb.set_tenant("tenant-a");
+        decode(&mut filter, &mut cb, &mut request_headers(), true);
+        cb.set_upstream("cluster-a", "priced");
+        let tokens = |input_tokens| LlmTokenUsage {
+            input_tokens,
+            ..Default::default()
+        };
+        cb.set_usage(tokens(20));
+        let attempt = |cluster: &str, model: &str| proxy_http::stream_info::AttemptCharge {
+            cluster: cluster.to_owned(),
+            model: Some(model.to_owned()),
+            served_model: None,
+            usage: proxy_http::LlmUsage::from_tokens(tokens(10)),
+            input_estimated: true,
+            output_estimated: false,
+            list_cost: None,
+            attempt_index: None,
+        };
+        cb.stream_info.borrow_mut().llm.attempt_charges = vec![
+            attempt("cluster-b", "mystery"),
+            attempt("cluster-a", "priced"),
+        ];
+        filter.encode_headers(&mut cb, &mut response_headers(), false);
+        filter.encode_data(&mut cb, &mut Bytes::new(), true);
+        drop(guard);
+
+        let charge = cb.stream_info.borrow().llm.spend_charge.clone();
+        assert_eq!(
+            charge.expect("charged").micro_usd,
+            10,
+            "the priced attempt only"
+        );
+        let lines = unpriced_warnings(&capture);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("mystery") && lines[0].contains("cluster-b"));
     }
 
     /// ADR-0010 decision 3: audio tokens under an entry with no audio rate

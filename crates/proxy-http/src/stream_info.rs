@@ -450,6 +450,9 @@ pub struct DispatchedAttempt {
     /// The attempt's index in [`StreamInfo::attempts`] when records are on.
     pub attempt_index: Option<u16>,
     timing: Rc<UpstreamTiming>,
+    /// Set by the router when the attempt failed before any of the request
+    /// was written, which `US_TX_END` alone cannot show for an empty body.
+    unsent: Cell<bool>,
 }
 
 impl DispatchedAttempt {
@@ -466,6 +469,14 @@ impl DispatchedAttempt {
             unanswered,
             attempt_index,
             timing,
+            unsent: Cell::new(false),
+        }
+    }
+
+    /// The attempt on `timing` failed before any of its request was written.
+    pub(crate) fn mark_unsent(dispatched: &[Self], timing: &Rc<UpstreamTiming>) {
+        if let Some(attempt) = dispatched.iter().find(|a| Rc::ptr_eq(&a.timing, timing)) {
+            attempt.unsent.set(true);
         }
     }
 
@@ -474,7 +485,9 @@ impl DispatchedAttempt {
     /// request nobody will read.
     pub fn unanswered(&self) -> bool {
         let points = self.timing.points();
-        points.get(TimePoint::UsTxEnd).is_some() && points.get(TimePoint::UsRxBeg).is_none()
+        !self.unsent.get()
+            && points.get(TimePoint::UsTxEnd).is_some()
+            && points.get(TimePoint::UsRxBeg).is_none()
     }
 }
 

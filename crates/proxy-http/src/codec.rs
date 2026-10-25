@@ -337,6 +337,10 @@ pub enum UpstreamCodecError {
     Connection(#[source] hyper::Error),
     #[error("http/1.1 send_request failed: {0}")]
     Send(#[source] hyper::Error),
+    /// A pooled connection failed while waiting to take the request, before
+    /// any of it was written: S3.2's `reset-before-request` case.
+    #[error("upstream connection closed before the request was sent: {0}")]
+    NotReady(#[source] hyper::Error),
     /// h2-only failure: the request had neither an absolute-form URI nor a
     /// `Host` header to derive `:authority` from. Not reachable by
     /// `send_upstream_http1` (h1 has no `:authority` pseudo-header).
@@ -401,12 +405,14 @@ fn h2_reason(err: &hyper::Error) -> Option<h2::Reason> {
 /// Flag-only: this does not change retry classification. A reset before
 /// headers is already retriable under S3.2's `reset`
 /// ([`AttemptOutcome::from_codec_error`](crate::retry::AttemptOutcome::from_codec_error)
-/// maps `Send`/`Connection` to `ResetBeforeHeaders` regardless); this only
+/// maps `Send`/`Connection`/`NotReady` to a reset regardless); this only
 /// decides whether the rendered response flag is `UR` or `UC`.
 pub fn is_remote_reset(err: &UpstreamCodecError) -> bool {
     match err {
         UpstreamCodecError::RefusedStream => true,
-        UpstreamCodecError::Send(e) | UpstreamCodecError::Connection(e) => h2_reason(e).is_some(),
+        UpstreamCodecError::Send(e)
+        | UpstreamCodecError::Connection(e)
+        | UpstreamCodecError::NotReady(e) => h2_reason(e).is_some(),
         UpstreamCodecError::Handshake(_) | UpstreamCodecError::MissingAuthority => false,
     }
 }
@@ -419,7 +425,9 @@ pub fn is_remote_reset(err: &UpstreamCodecError) -> bool {
 /// here, whatever its reason code: [`is_remote_reset`] is checked first.
 pub fn is_protocol_error(err: &UpstreamCodecError) -> bool {
     match err {
-        UpstreamCodecError::Send(e) | UpstreamCodecError::Connection(e) => e.is_parse(),
+        UpstreamCodecError::Send(e)
+        | UpstreamCodecError::Connection(e)
+        | UpstreamCodecError::NotReady(e) => e.is_parse(),
         UpstreamCodecError::Handshake(_)
         | UpstreamCodecError::MissingAuthority
         | UpstreamCodecError::RefusedStream => false,
