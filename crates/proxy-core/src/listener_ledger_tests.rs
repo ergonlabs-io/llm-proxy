@@ -19,7 +19,7 @@ use proxy_http::{
 use proxy_observability::ledger::testing::TempLedger;
 use proxy_observability::ledger::OnUnavailable;
 use proxy_observability::records::ChargeScope;
-use proxy_observability::records::Termination;
+use proxy_observability::records::{Termination, UsageCompleteness};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -39,7 +39,9 @@ const OUTPUT_NANO: u64 = 2_003;
 
 /// A provider that answers by the request's model: `priced-model` with a
 /// JSON reply reporting 3 input and 2 output tokens, `cut-model` with two
-/// SSE frames and then a reset, `silent-model` never.
+/// SSE frames and then a reset, `silent-model` never, and `retry-model` by
+/// closing the connection after reading the first request, then like
+/// `priced-model`.
 struct Provider {
     address: std::net::SocketAddr,
     /// Connections accepted: how a test sees whether anything was dialled.
@@ -59,10 +61,11 @@ impl Provider {
         let address = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::clone(&connections);
+        let retries = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 accepted.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(Self::serve(socket));
+                tokio::spawn(Self::serve(socket, Arc::clone(&retries)));
             }
         });
         Self {
@@ -72,10 +75,14 @@ impl Provider {
         }
     }
 
-    async fn serve(mut socket: TcpStream) {
+    async fn serve(mut socket: TcpStream, retries: Arc<AtomicUsize>) {
         let Some(request) = read_request(&mut socket).await else {
             return;
         };
+        if request.contains("retry-model") && retries.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The whole request was read; close with no response.
+            return;
+        }
         if request.contains("silent-model") {
             tokio::time::sleep(Duration::from_secs(30)).await;
         } else if request.contains("cut-model") {
@@ -148,6 +155,18 @@ struct Chain {
 /// chain; without it the ledger prices from the usage filter's list cost.
 /// `listen` is the dialect `listen:` value.
 async fn chain_with(spend: bool, listen: &str, ledger: TempLedger) -> Chain {
+    chain_with_bootstrap(spend, listen, ledger, |_| {}).await
+}
+
+/// [`chain_with`], with `patch` applied to the lowered Envoy bootstrap before
+/// the strict Envoy-mode loader reads it: a configuration only Envoy mode can
+/// express.
+async fn chain_with_bootstrap(
+    spend: bool,
+    listen: &str,
+    ledger: TempLedger,
+    patch: impl FnOnce(&mut serde_json::Value),
+) -> Chain {
     let provider = Provider::spawn().await;
     let text = format!(
         r#"version: 1
@@ -172,6 +191,14 @@ pricing:
         tier_mode: whole_request
         tiers: [{{ input_nanodollars_per_token: {INPUT_NANO}, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: {OUTPUT_NANO} }}]
       - provider_type: openai
+        model: silent-model
+        tier_mode: whole_request
+        tiers: [{{ input_nanodollars_per_token: {INPUT_NANO}, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: {OUTPUT_NANO} }}]
+      - provider_type: openai
+        model: retry-model
+        tier_mode: whole_request
+        tiers: [{{ input_nanodollars_per_token: {INPUT_NANO}, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: {OUTPUT_NANO} }}]
+      - provider_type: openai
         model: cut-model
         tier_mode: whole_request
         tiers: [{{ input_nanodollars_per_token: {INPUT_NANO}, cached_input_nanodollars_per_token: 0, cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: {OUTPUT_NANO} }}]
@@ -181,7 +208,14 @@ limits:
         upstream = provider.address,
     );
     let config = proxy_simple_config::parse_simple_config(&text).unwrap();
-    let loaded = proxy_simple_config::lower_to_loaded(&config).unwrap();
+    let mut bootstrap = proxy_simple_config::lower(&config).unwrap().bootstrap;
+    patch(&mut bootstrap);
+    let loaded = proxy_config::parse_bootstrap(
+        &serde_json::to_vec(&bootstrap).unwrap(),
+        proxy_config::ConfigFormat::Json,
+        proxy_config::StrictMode::Strict,
+    )
+    .unwrap();
     let snapshot = proxy_config::build_snapshot(&loaded).unwrap();
     let manager = Arc::new(ClusterManager::with_default_transport(Arc::new(
         proxy_cluster::resolver::TokioResolver,
@@ -400,6 +434,67 @@ fn a_charged_request_is_entered_at_the_accumulators_amount() {
     });
 }
 
+/// Adds `reset` to every route's `retry_on`, which the dialect never sets.
+fn retry_on_reset(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                match value {
+                    serde_json::Value::String(tokens) if key == "retry_on" => {
+                        tokens.push_str(",reset");
+                    }
+                    _ => retry_on_reset(value),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(retry_on_reset),
+        _ => {}
+    }
+}
+
+/// Envoy mode with `retry_on: reset`: the first attempt sends the provider
+/// the whole request and its connection closes with no response, and the
+/// retry is answered. The request is charged both: the first at its
+/// provider's default `unanswered_usage: input`, the second its reported
+/// usage. The spend charge and the ledger entry agree with the record's cost.
+#[test]
+fn an_unanswered_attempt_is_charged_with_the_answered_retry() {
+    run(async {
+        let mut chain = chain_with_bootstrap(
+            true,
+            LISTEN,
+            TempLedger::open(1024, OnUnavailable::Reject),
+            retry_on_reset,
+        )
+        .await;
+        let key = chain.mint("key-a");
+        assert_eq!(chain.send(&key, "retry-model", false).await, 200);
+        let entries = chain.ledger.entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        let usage = entry.record.usage.as_ref().expect("charged");
+        assert_eq!(
+            usage.input_tokens,
+            entry.record.bytes_request.div_ceil(4) + 3,
+            "the estimated input of the unanswered attempt plus the reported 3"
+        );
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.completeness, UsageCompleteness::Partial);
+        let cost = entry.record.cost.as_ref().expect("priced");
+        assert_eq!(cost.kind, "estimate");
+        assert_eq!(entry.charged_micro_usd, cost.amount.div_ceil(1000));
+        let key_scope = entry
+            .charged_scopes
+            .iter()
+            .find(|s| s.scope == ChargeScope::Key)
+            .expect("the key was charged");
+        assert_eq!(
+            entry.charged_micro_usd,
+            chain.key_spend("key-a", &key_scope.period)
+        );
+    });
+}
+
 /// Without a spend filter the entry is the list price rounded up to
 /// micro-USD: (3 * 1001 + 2 * 2003) nanodollars = 7009, charged as 8.
 #[test]
@@ -440,10 +535,12 @@ fn a_cut_stream_is_entered_at_its_estimate_charge() {
     });
 }
 
-/// A provider that never answers is still dialled: the entry exists and is
-/// charged nothing.
+/// A provider that read the whole request and never answers is still
+/// dialled, and can bill it: the entry exists and is charged the estimated
+/// input (the default `unanswered_usage: input`), the same amount the spend
+/// filter charged.
 #[test]
-fn a_timeout_before_response_headers_is_entered_at_zero() {
+fn a_timeout_before_response_headers_is_entered_at_its_input_estimate() {
     run(async {
         let mut chain = chain_on(
             true,
@@ -455,8 +552,21 @@ fn a_timeout_before_response_headers_is_entered_at_zero() {
         assert!(status >= 400, "status {status}");
         let entries = chain.ledger.entries();
         assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_eq!(entries[0].charged_micro_usd, 0);
-        assert!(entries[0].record.usage.is_none());
+        let entry = &entries[0];
+        let usage = entry.record.usage.as_ref().expect("an estimate");
+        assert_eq!(usage.input_tokens, entry.record.bytes_request.div_ceil(4));
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.completeness, UsageCompleteness::Partial);
+        assert!(entry.charged_micro_usd > 0, "{entry:?}");
+        let key_scope = entry
+            .charged_scopes
+            .iter()
+            .find(|s| s.scope == ChargeScope::Key)
+            .expect("the key was charged");
+        assert_eq!(
+            entry.charged_micro_usd,
+            chain.key_spend("key-a", &key_scope.period)
+        );
     });
 }
 

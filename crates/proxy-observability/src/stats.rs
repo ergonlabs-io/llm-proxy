@@ -1058,6 +1058,28 @@ pub mod instruments {
         attribute_keys: &["scope", "reason"],
         buckets: None,
     };
+    /// Attempts that sent the provider the whole request and got no response,
+    /// charged an estimate by the provider's `unanswered_usage` (`input` or
+    /// `output_cap`). `scope` is the operator-chosen HCM `stat_prefix`.
+    /// Prometheus surface only.
+    pub const USAGE_UNANSWERED: Instrument = Instrument {
+        name: "llmproxy_usage_unanswered_total",
+        kind: InstrumentKind::Counter,
+        unit: "{attempt}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
+    /// Attempts like `llmproxy_usage_unanswered_total` that were charged
+    /// nothing because the provider's `unanswered_usage` is `none`. The
+    /// provider can still bill them. `scope` as above. Prometheus surface
+    /// only.
+    pub const USAGE_UNANSWERED_UNCHARGED: Instrument = Instrument {
+        name: "llmproxy_usage_unanswered_uncharged_total",
+        kind: InstrumentKind::Counter,
+        unit: "{attempt}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// Partial records in which any token count (and so the cost) is the
     /// proxy's estimate rather than a provider figure. `scope` as above.
     pub const USAGE_ESTIMATED: Instrument = Instrument {

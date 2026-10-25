@@ -12,6 +12,14 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Added
 
+- Billing: the provider field `unanswered_usage` (`none`, `input`,
+  `output_cap`; default `input`) sets what a request is charged when the
+  provider got the whole request and sent no response: the client
+  disconnected, a timeout cut the wait for the response headers, or the
+  connection closed. Envoy mode reads it from
+  `filter_metadata["io.llmproxy.usage"].unanswered` on the cluster. The
+  counters `llmproxy_usage_unanswered_total` and
+  `llmproxy_usage_unanswered_uncharged_total` count such attempts.
 - Metrics: `llmproxy_metadata_instance_info{instance_id}` names the
   `instance_id` that this process writes in each request record, and
   `llmproxy_metadata_last_record_seq` reports the highest `record_seq` given
@@ -20,6 +28,14 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Changed
 
+- Billing: a request whose provider got the whole request and sent no response
+  is now charged its estimated input tokens (the request size divided by 4),
+  priced at that provider's rate card, and recorded `completeness: partial`
+  with `cost.kind: estimate`. Before, it was charged nothing. Set
+  `unanswered_usage: none` on a provider to keep the old charge. When a
+  request is charged for more than one attempt, `usage` and `cost` in the
+  request record are the sum, and each entry of `attempts` carries its own
+  share.
 - Routing: a dialect route no longer retries a request when the provider
   connection closes after the provider received the whole request and before
   any response byte. The provider can already be generating a response, so a
@@ -35,7 +51,6 @@ surfaces that an upgrade within 1.x keeps stable.
 - Envoy mode: the retry token `reset-before-request` fired on any reset before
   response headers. It now fires only when the request was not fully sent,
   as Envoy defines it; `reset` still fires in both cases.
-
 - Records: a request that the client abandons while the proxy waits for the
   provider's response headers now gets an access-log line (response code `0`,
   flag `DC`), a request record (`termination: downstream_disconnect`,

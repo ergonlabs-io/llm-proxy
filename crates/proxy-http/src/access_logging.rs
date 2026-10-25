@@ -1002,10 +1002,14 @@ impl LoggingBody {
                     .iter_mut()
                     .find(|a| a.attempt_index == index)
                 {
-                    attempt.usage = record.usage.clone();
-                    attempt.endpoint = record.endpoint.clone();
-                    attempt.price_basis = record.price_basis.clone();
-                    attempt.cost = record.cost.clone();
+                    // Charged across attempts, each attempt gets its own share
+                    // below instead of the request's total.
+                    if ctx.stream_info.borrow().llm.attempt_charges.is_empty() {
+                        attempt.usage = record.usage.clone();
+                        attempt.endpoint = record.endpoint.clone();
+                        attempt.price_basis = record.price_basis.clone();
+                        attempt.cost = record.cost.clone();
+                    }
                     if attempt.termination == proxy_observability::records::Termination::Unknown {
                         attempt.termination = termination;
                     }
@@ -1013,6 +1017,55 @@ impl LoggingBody {
                         attempt.termination = termination;
                     }
                 }
+            }
+            // Charged across attempts (one got no response): the record holds
+            // the sum, and each attempt only its own share.
+            for charge in &ctx.stream_info.borrow().llm.attempt_charges {
+                let Some(attempt) = record
+                    .attempts
+                    .iter_mut()
+                    .find(|a| Some(a.attempt_index) == charge.attempt_index)
+                else {
+                    continue;
+                };
+                let estimated = charge.input_estimated || charge.output_estimated;
+                let t = charge.usage.tokens_or_zero();
+                attempt.usage = Some(proxy_observability::records::Usage {
+                    input_tokens: t.input_tokens,
+                    cache_read_tokens: t.cached_tokens,
+                    cache_write_tokens: t.cache_creation_tokens,
+                    output_tokens: t.output_tokens,
+                    completeness: if estimated {
+                        proxy_observability::records::UsageCompleteness::Partial
+                    } else {
+                        proxy_observability::records::UsageCompleteness::Complete
+                    },
+                    provenance: if estimated { "estimate" } else { "provider" }.to_owned(),
+                    input_estimated: charge.input_estimated,
+                    output_estimated: charge.output_estimated,
+                    input_image_tokens: None,
+                    output_image_tokens: None,
+                    input_audio_tokens: None,
+                    output_audio_tokens: None,
+                    images: None,
+                    image_size: None,
+                    image_quality: None,
+                    input_characters: None,
+                    audio_milliseconds: None,
+                });
+                attempt.endpoint = record.endpoint.clone();
+                attempt.price_basis = charge.list_cost.as_ref().and(record.price_basis.clone());
+                attempt.cost =
+                    charge
+                        .list_cost
+                        .as_ref()
+                        .map(|cost| proxy_observability::records::Cost {
+                            amount: cost.nanodollars,
+                            unit: "nanodollars".to_owned(),
+                            currency: "USD".to_owned(),
+                            rate_card_version: cost.rate_card_version.clone(),
+                            kind: if estimated { "estimate" } else { "list" }.to_owned(),
+                        });
             }
             let mut record = Some(record);
             if let Some(tee) = trace_tee {
@@ -1062,13 +1115,32 @@ impl LoggingBody {
         // `GenAiTokenStats::record_usage`'s no-tenant sentinel; see that
         // method's doc for why unauthenticated usage is a naming decision,
         // not a skip.
-        if let (Some(tokens), Some(token_stats), Some(provider)) = (
+        let info = ctx.stream_info.borrow();
+        let charges = &info.llm.attempt_charges;
+        if let Some(token_stats) = ctx.token_stats.as_ref().filter(|_| !charges.is_empty()) {
+            // Charged across attempts: each attempt's tokens go to the
+            // cluster it dialled.
+            for charge in charges {
+                let t = charge.usage.tokens_or_zero();
+                token_stats.record_usage(
+                    &charge.cluster,
+                    tenant.as_deref(),
+                    LlmTokens {
+                        input: t.input_tokens,
+                        cached: t.cached_tokens,
+                        cache_creation: t.cache_creation_tokens,
+                        output: t.output_tokens,
+                    },
+                );
+            }
+        } else if let (Some(tokens), Some(token_stats), Some(provider)) = (
             llm_tokens,
             ctx.token_stats.as_ref(),
             upstream_cluster.as_deref(),
         ) {
             token_stats.record_usage(provider, tenant.as_deref(), tokens);
         }
+        drop(info);
 
         // The semconv GenAI histograms are labelled by operation, requested
         // model, and provider. Each comes from a trustworthy local source:

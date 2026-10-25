@@ -16,6 +16,7 @@ use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
 
+use proxy_config::ir::UnansweredUsage;
 use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
     DecoderCallbacks, EncoderCallbacks, FactoryContext, FilterDataStatus, FilterHeadersStatus,
@@ -23,6 +24,7 @@ use proxy_http::filter::{
     RequestHeaders, ResponseHeaders, ResponseTrailers,
 };
 use proxy_http::stream_info::GenAiSystem;
+use proxy_http::stream_info::{AttemptCharge, StreamInfo};
 use proxy_http::{LlmListCost, LlmTokenUsage, LlmUsage, PriceBasis};
 use proxy_observability::records::UsageCompleteness;
 use proxy_observability::stats::{instruments, Handle, Instrument, Registry, WorkerId};
@@ -791,6 +793,11 @@ pub struct UsageStats {
     /// their entry, so they were charged at the text rate (ADR-0010
     /// decision 3).
     underpriced_modality: ExportedCounter,
+    /// Attempts with no response charged an estimate.
+    unanswered: ExportedCounter,
+    /// Attempts with no response charged nothing (`unanswered_usage: none`).
+    unanswered_uncharged: ExportedCounter,
+    last_uncharged_warning: Mutex<Option<Instant>>,
 }
 
 /// One Prometheus-exported counter that also keeps an in-process total, so
@@ -884,6 +891,16 @@ impl UsageStats {
                 &instruments::USAGE_UNDERPRICED_MODALITY,
                 scope,
             ),
+            unanswered: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_UNANSWERED,
+                scope,
+            ),
+            unanswered_uncharged: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_UNANSWERED_UNCHARGED,
+                scope,
+            ),
             exported,
             repriced_handle,
             scope: scope.to_string(),
@@ -971,6 +988,34 @@ impl UsageStats {
         );
     }
 
+    /// An attempt with no response that its provider's
+    /// `unanswered_usage: none` leaves uncharged. The operator chose this, but
+    /// it is still a request the provider can bill that no budget counts, so
+    /// it is loud (AGENTS.md "Fail-open controls"): counted, and warned about
+    /// at most once per interval. Reached only by such an attempt.
+    fn note_unanswered_uncharged(&self, cluster: &str) {
+        self.unanswered_uncharged.incr();
+        let now = Instant::now();
+        let mut last = self
+            .last_uncharged_warning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|at| now.duration_since(at) < OVERSIZED_WARN_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        // Only the operator-chosen cluster name is logged.
+        tracing::warn!(
+            cluster = %cluster,
+            "usage: an attempt sent this provider the whole request and got no response, and \
+             the provider's `unanswered_usage` is `none`, so it was NOT charged (no cost, spend \
+             and token limits did not count it). The provider can still bill it. Exported as \
+             envoy_llmproxy_usage_unanswered_uncharged_total; this warning repeats at most once \
+             per minute."
+        );
+    }
+
     fn note_oversized_unrecoverable(&self, cluster: Option<&str>) {
         self.oversized_unrecoverable.fetch_add(1, Ordering::Relaxed);
         if let Some((registry, handle)) = &self.exported {
@@ -999,6 +1044,40 @@ impl UsageStats {
              this warning repeats at most once per minute."
         );
     }
+}
+
+/// Writes a request charged across `charges` (at least one an attempt that
+/// got no response): `usage` and `list_cost` are their sums, the record is
+/// `partial` and estimated, and the breakdown stays in `attempt_charges` for
+/// the spend filter and the per-attempt record. `list_cost` sums the entries
+/// a rate card priced, and is `None` when none was.
+fn write_charges(info: &mut StreamInfo, charges: Vec<AttemptCharge>, basis: Option<PriceBasis>) {
+    let mut tokens = LlmTokenUsage::default();
+    for charge in &charges {
+        let t = charge.usage.tokens_or_zero();
+        tokens.input_tokens += t.input_tokens;
+        tokens.cached_tokens += t.cached_tokens;
+        tokens.cache_creation_tokens += t.cache_creation_tokens;
+        tokens.output_tokens += t.output_tokens;
+    }
+    let priced: Vec<&LlmListCost> = charges
+        .iter()
+        .filter_map(|c| c.list_cost.as_ref())
+        .collect();
+    info.llm.list_cost = priced.first().map(|first| {
+        let nanodollars = priced.iter().map(|cost| cost.nanodollars).sum();
+        LlmListCost {
+            nanodollars,
+            micro_usd: PricingRegistry::charge_micro_usd(nanodollars),
+            rate_card_version: first.rate_card_version.clone(),
+        }
+    });
+    info.llm.price_basis = info.llm.list_cost.as_ref().and(basis);
+    info.llm.usage = Some(LlmUsage::from_tokens(tokens));
+    info.llm.completeness = Some(UsageCompleteness::Partial);
+    info.llm.input_estimated = charges.iter().any(|c| c.input_estimated);
+    info.llm.output_estimated = charges.iter().any(|c| c.output_estimated);
+    info.llm.attempt_charges = charges;
 }
 
 /// The provider's `usage` object as sent, from a media scanner's capture.
@@ -2282,6 +2361,127 @@ impl UsageFilterInstance {
 
     /// Write usage, cost, timing and the provider's own evidence into
     /// `StreamInfo::llm`.
+    /// The rate-card price of `usage` sent to `cluster` as `sent_model`, at
+    /// the model the provider says it served when the card lists it
+    /// (dated snapshots have no card entry). The spend filter prices with the
+    /// same function (`PricingRegistry::price_served`).
+    fn price(
+        &self,
+        cluster: &str,
+        sent_model: &str,
+        served_model: Option<&str>,
+        usage: &LlmUsage,
+    ) -> Option<(Priced, LlmListCost)> {
+        let pricing = self.pricing.as_ref()?;
+        let provider_type = pricing.list.provider_for(cluster)?;
+        let (model, repriced) =
+            pricing
+                .list
+                .model_to_price(cluster, sent_model, served_model, usage);
+        let priced = pricing.list.price(provider_type, model, usage)?;
+        if repriced {
+            self.stats.note_served_model_repriced();
+        }
+        if priced.underpriced_modality {
+            // Counted on every request; the spend filter warns where a
+            // budget applies.
+            self.stats.underpriced_modality.incr();
+        }
+        Some((
+            priced,
+            LlmListCost {
+                nanodollars: priced.nanodollars,
+                micro_usd: PricingRegistry::charge_micro_usd(priced.nanodollars),
+                rate_card_version: pricing.list.version().as_str().to_string(),
+            },
+        ))
+    }
+
+    /// One charge per attempt that sent its provider the whole request and got
+    /// no response, at that provider's `unanswered_usage` (AGENTS.md
+    /// invariant 6): `input` charges the request size over
+    /// [`BYTES_PER_TOKEN_ESTIMATE`], `output_cap` adds the output-token limit,
+    /// `none` charges nothing and is counted and warned about. Only
+    /// token-priced endpoints are charged.
+    fn unanswered_charges(&self, info: &StreamInfo) -> Vec<AttemptCharge> {
+        if !matches!(
+            self.endpoint,
+            Endpoint::ChatCompletions
+                | Endpoint::Completions
+                | Endpoint::Responses
+                | Endpoint::Messages
+                | Endpoint::Embeddings
+        ) {
+            return Vec::new();
+        }
+        let mut charges = Vec::new();
+        for attempt in info.dispatched.iter().filter(|a| a.unanswered()) {
+            let output_tokens = match attempt.unanswered {
+                UnansweredUsage::None => {
+                    self.stats.note_unanswered_uncharged(&attempt.cluster);
+                    continue;
+                }
+                UnansweredUsage::Input => 0,
+                // Embeddings produce no output tokens.
+                UnansweredUsage::OutputCap if self.endpoint == Endpoint::Embeddings => 0,
+                // The tighter of the request's own limit and the model's cap;
+                // with neither there is no bound, so only input is charged.
+                UnansweredUsage::OutputCap => {
+                    let model_cap = info.max_output_tokens.map(u64::from);
+                    match (info.requested_output_limit, model_cap) {
+                        (Some(requested), Some(cap)) => requested.min(cap),
+                        (Some(limit), None) | (None, Some(limit)) => limit,
+                        (None, None) => 0,
+                    }
+                }
+            };
+            self.stats.unanswered.incr();
+            let usage = LlmUsage::from_tokens(LlmTokenUsage {
+                input_tokens: info.bytes_received.div_ceil(BYTES_PER_TOKEN_ESTIMATE),
+                output_tokens,
+                ..Default::default()
+            });
+            let model = attempt
+                .model
+                .clone()
+                .or_else(|| info.routing_model().map(str::to_owned));
+            let list_cost = model
+                .as_deref()
+                .and_then(|model| self.price(&attempt.cluster, model, None, &usage))
+                .map(|(_, cost)| cost);
+            charges.push(AttemptCharge {
+                cluster: attempt.cluster.clone(),
+                model,
+                served_model: None,
+                usage,
+                input_estimated: true,
+                output_estimated: output_tokens > 0,
+                list_cost,
+                attempt_index: attempt.attempt_index,
+            });
+        }
+        charges
+    }
+
+    /// No upstream response was metered (none arrived, or an error answered):
+    /// charge the attempts that the provider received in full and never
+    /// answered, if any.
+    fn charge_unanswered(&mut self, cb: &mut dyn EncoderCallbacks) {
+        let charges = self.unanswered_charges(&cb.stream_info());
+        if charges.is_empty() {
+            return;
+        }
+        self.finalized = true;
+        self.stats.partial.incr();
+        self.stats.estimated.incr();
+        let mut info = cb.stream_info();
+        write_charges(&mut info, charges, Some(PriceBasis::Tokens));
+        info.llm.system = Some(match self.dialect {
+            Dialect::OpenAi | Dialect::OpenAiResponses => GenAiSystem::OpenAi,
+            Dialect::Anthropic => GenAiSystem::Anthropic,
+        });
+    }
+
     fn write_stats(
         &mut self,
         cb: &mut dyn EncoderCallbacks,
@@ -2307,45 +2507,53 @@ impl UsageFilterInstance {
         // The card is evaluated only after the terminal usage extractor has
         // seen the complete response. In particular, an SSE stream's partial
         // chunks cannot create a provisional price that later changes.
+        let sent_model = stream_info
+            .selected_model
+            .clone()
+            .or_else(|| stream_info.routing_model().map(str::to_owned));
         let priced = usage.as_ref().and_then(|usage| {
-            let pricing = self.pricing.as_ref()?;
-            let cluster = stream_info.upstream_cluster.as_deref()?;
-            let provider_type = pricing.list.provider_for(cluster)?;
-            let sent_model = stream_info
-                .selected_model
-                .as_deref()
-                .or(stream_info.routing_model())?;
-            // Price what the provider says it served when the card lists it;
-            // otherwise the sent model (dated snapshots have no card entry).
-            let (model, repriced) =
-                pricing
-                    .list
-                    .model_to_price(cluster, sent_model, served_model.as_deref(), usage);
-            let priced = pricing.list.price(provider_type, model, usage)?;
-            if repriced {
-                self.stats.note_served_model_repriced();
-            }
-            if priced.underpriced_modality {
-                // Counted on every request; the spend filter warns where a
-                // budget applies.
-                self.stats.underpriced_modality.incr();
-            }
-            Some((
-                priced,
-                LlmListCost {
-                    nanodollars: priced.nanodollars,
-                    micro_usd: PricingRegistry::charge_micro_usd(priced.nanodollars),
-                    rate_card_version: pricing.list.version().as_str().to_string(),
-                },
-            ))
+            self.price(
+                stream_info.upstream_cluster.as_deref()?,
+                sent_model.as_deref()?,
+                served_model.as_deref(),
+                usage,
+            )
         });
-        stream_info.llm.price_basis = priced.as_ref().map(|(priced, _)| priced.basis);
-        stream_info.llm.list_cost = priced.map(|(_, cost)| cost);
-        stream_info.llm.usage = usage;
+        // An earlier attempt that sent the provider the whole request and got
+        // no response is charged on top of this one, each at its own
+        // provider's policy and rate card (ADR-0009 addendum "Unanswered attempts").
+        let earlier = self.unanswered_charges(&stream_info);
+        if earlier.is_empty() {
+            stream_info.llm.price_basis = priced.as_ref().map(|(priced, _)| priced.basis);
+            stream_info.llm.list_cost = priced.map(|(_, cost)| cost);
+            stream_info.llm.usage = usage;
+            stream_info.llm.completeness = Some(completeness);
+            stream_info.llm.input_estimated = estimated.input;
+            stream_info.llm.output_estimated = estimated.output;
+        } else if let (Some(usage), Some(cluster)) = (usage, stream_info.upstream_cluster.clone()) {
+            let own = AttemptCharge {
+                cluster,
+                model: sent_model,
+                served_model: served_model.clone(),
+                usage,
+                input_estimated: estimated.input,
+                output_estimated: estimated.output,
+                list_cost: priced.as_ref().map(|(_, cost)| cost.clone()),
+                attempt_index: stream_info
+                    .selected_attempt
+                    .as_ref()
+                    .map(|attempt| attempt.borrow().attempt_index),
+            };
+            let basis = priced.map(|(priced, _)| priced.basis);
+            let mut charges = earlier;
+            charges.push(own);
+            write_charges(&mut stream_info, charges, basis);
+        } else {
+            // The answering attempt reported nothing; the earlier attempts
+            // are what this request is charged.
+            write_charges(&mut stream_info, earlier, None);
+        }
         stream_info.llm.served_model = served_model;
-        stream_info.llm.completeness = Some(completeness);
-        stream_info.llm.input_estimated = estimated.input;
-        stream_info.llm.output_estimated = estimated.output;
         // Evidence only. Nothing below reads a field of the provider's usage
         // object; the rate card is the only source of cost.
         if upstream.id_oversized {
@@ -2511,7 +2719,13 @@ impl HttpFilter for UsageFilterInstance {
     /// loud (`llmproxy_usage_partial_total`, `llmproxy_usage_estimated_total`,
     /// `completeness: partial`, `cost.kind: estimate`).
     fn on_stream_complete(&mut self, cb: &mut dyn EncoderCallbacks) {
-        if self.finalized || self.headers_at.is_none() || !self.response_ok {
+        if self.finalized {
+            return;
+        }
+        if self.headers_at.is_none() || !self.response_ok {
+            // No successful response was metered: the client left or a timer
+            // cut the wait before response headers, or an error answered.
+            self.charge_unanswered(cb);
             return;
         }
         // An unread body is not usage, except that a cut speech response

@@ -116,6 +116,7 @@ lists every field. Defaults come from `schema/llmproxy-v1.schema.json`
 | `connect_timeout` | duration | `5s` | Connection setup timeout, TCP and TLS. |
 | `protocol` | `http1` or `http2` | `http1` | HTTP version used toward the provider. |
 | `circuit_breakers` | object | see [Concurrency ceilings](#concurrency-ceilings) | Ceilings on requests and connections. |
+| `unanswered_usage` | `none`, `input`, `output_cap` | `input` | What a request is charged when this provider got the whole request and sent no response. See [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/#requests-that-get-no-response). |
 | `outlier_detection` | object | absent: never ejected | Passes over a provider after repeated failures. See [Failover](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/). |
 | `request_fields` | object | none | Lists of top-level body keys to refuse (`deny`) or remove (`strip`) for this provider. |
 | `tenant_credentials` | boolean | `false` | Let a tenant send its own key for this provider. See [Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/). |

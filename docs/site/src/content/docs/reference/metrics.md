@@ -96,6 +96,8 @@ listener scope.
 |---|---|---|---|---|
 | `llmproxy_usage_partial_total` | counter | responses | `scope` | Streams that ended before the provider's final usage (client abort, upstream death). Each is recorded with `completeness: partial` and metered from an estimate. |
 | `llmproxy_usage_estimated_total` | counter | responses | `scope` | Partial records whose token counts, and so cost, include an estimate. |
+| `llmproxy_usage_unanswered_total` | counter | attempts | `scope` | Attempts that sent the provider the whole request and got no response, charged an estimate by the provider's `unanswered_usage`. |
+| `llmproxy_usage_unanswered_uncharged_total` | counter | attempts | `scope` | The same attempts, charged nothing because the provider's `unanswered_usage` is `none`. |
 | `llmproxy_usage_oversized_body_unmetered_total` | counter | requests | `scope` | Oversized JSON responses whose `usage` the proxy could not recover. Such a request has no usage and no cost, and no spend budget or token limit counts it. |
 | `llmproxy_usage_served_model_repriced_total` | counter | requests | `scope` | Requests priced at the model the provider says it served, because the active rate card lists that model for the provider. |
 | `llmproxy_usage_underpriced_modality_requests_total` | counter | requests | `scope` | Priced requests whose image or audio tokens had no modality rate on their rate-card entry. The proxy charged them at the text rate. |

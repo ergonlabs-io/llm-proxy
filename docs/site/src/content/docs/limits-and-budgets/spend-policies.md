@@ -293,9 +293,41 @@ after the cut that the proxy never sees, so the charge can be too low. Real
 tokens are not exactly 4 bytes each, so the estimate can also be high or low
 for the text that the proxy did see.
 
-A client that disconnects before the provider sends response headers is not
-charged and gets no access log line. The provider can still bill the input
-tokens of that request.
+## Requests that get no response
+
+The provider can receive the whole request and send no response: the client
+disconnects, a timeout cuts the wait for the response headers, or the
+connection closes. The provider can still bill such a request. The provider
+field `unanswered_usage` sets what the proxy charges for it:
+
+| `unanswered_usage` | Charge |
+|---|---|
+| `input` (default) | The estimated input tokens: the request body size divided by 4. No output. |
+| `output_cap` | The estimated input tokens plus the output-token limit: the request's `max_tokens`, `max_completion_tokens` or `max_output_tokens`, or else the model's `max_output_tokens`, whichever is smaller. Without a limit, the input only. |
+| `none` | Nothing. The counter `llmproxy_usage_unanswered_uncharged_total` counts each such attempt, and the proxy logs a warning at most once a minute. |
+
+```yaml
+providers:
+  openrouter:
+    type: openrouter
+    api_key_file: /etc/llmproxy/openrouter.key
+    unanswered_usage: output_cap
+```
+
+The charge is priced at the rate card entry of the provider that got the
+request, and the record shows `completeness: partial` and `cost.kind:
+estimate`. It applies to the chat completions, completions, responses,
+messages and embeddings endpoints. The counter
+`llmproxy_usage_unanswered_total` counts each charged attempt.
+
+The setting is on the provider, not on the route. When a request fails over,
+each attempt that got no response is charged by the provider that it
+reached. When a request makes more than one charged attempt, the request is
+charged the sum, and each attempt in the record shows its own share.
+
+`output_cap` is an upper bound on the output that the provider can bill.
+`input` charges less, and can be lower than the provider's bill when the
+provider generates output for a request that nobody reads.
 
 ## Set a budget
 

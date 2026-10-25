@@ -1324,6 +1324,8 @@ impl RouterHandler {
                 return local_reply(StatusCode::BAD_REQUEST, &refusal.message);
             }
         };
+        // Read lazily, by the first attempt to an `output_cap` provider.
+        let mut output_limit_read = false;
         let trailers = self.captured_trailers.as_ref().map(|t| t.0.clone());
 
         let latency_sampled = matches!(
@@ -1662,11 +1664,31 @@ impl RouterHandler {
                     let attempt_info = info.begin_attempt(
                         attempt_cluster,
                         &host.address.to_string(),
-                        selected_model,
+                        selected_model.clone(),
                     );
                     if let Some(attempt) = &attempt_info {
                         attempt.borrow_mut().trace = attempt_trace;
                     }
+                    // Kept for every request, so an attempt that sends the
+                    // whole request and gets no response is charged by this
+                    // provider's own policy (ADR-0009 addendum "Unanswered attempts").
+                    let unanswered = attempt_entry.unanswered_usage();
+                    if unanswered == proxy_config::ir::UnansweredUsage::OutputCap
+                        && !output_limit_read
+                    {
+                        output_limit_read = true;
+                        info.requested_output_limit =
+                            requested_output_limit(&body_bytes, info.llm.endpoint);
+                    }
+                    let attempt_index = attempt_info.as_ref().map(|a| a.borrow().attempt_index);
+                    info.dispatched
+                        .push(crate::stream_info::DispatchedAttempt::new(
+                            attempt_cluster,
+                            selected_model,
+                            unanswered,
+                            attempt_index,
+                            attempt_timing.clone(),
+                        ));
                     (attempt_trace, SystemTime::now(), attempt_info)
                 };
                 let attempt_guard = crate::attempt_logging::AttemptGuard(attempt_info.clone());
@@ -3019,6 +3041,20 @@ struct BodyDecodeFacts {
     /// (see [`OUTPUT_TOKEN_KEYS`]). Kept as a list, not a map, so a repeated
     /// key is visible as a repeat.
     token_limits: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// The output-token limit `body` sets for `endpoint`, the first of its limit
+/// keys present (see [`output_token_fields`]). `None` when the body is not a
+/// JSON object or sets no limit. Only an `output_cap` charge reads it.
+fn requested_output_limit(body: &Bytes, endpoint: Endpoint) -> Option<u64> {
+    let facts: BodyDecodeFacts = serde_json::from_slice(body).ok()?;
+    output_token_fields(endpoint).iter().find_map(|field| {
+        facts
+            .token_limits
+            .iter()
+            .find(|(name, _)| name == field)
+            .and_then(|(_, value)| value.as_u64())
+    })
 }
 
 /// The top-level keys any supported wire format uses to bound output tokens.

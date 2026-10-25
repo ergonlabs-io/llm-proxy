@@ -66,7 +66,7 @@ fn an_abandoned_stream_is_recorded_partial_estimated_and_charged() {
     in_one_token_window("abort", || {
         let minute = token_window_minute();
         let dir = scratch_dir("abort");
-        let proxy = Proxy::start(&dir, NO_TIMERS);
+        let proxy = Proxy::start(&dir, NO_EXTRAS);
         let key = mint_key(&proxy);
 
         // Clean stream first: complete, provider counts, charged once.
@@ -188,7 +188,7 @@ fn an_upstream_reset_mid_stream_is_recorded_partial_and_charged_once() {
     in_one_token_window("reset", || {
         let minute = token_window_minute();
         let dir = scratch_dir("reset");
-        let proxy = Proxy::start(&dir, NO_TIMERS);
+        let proxy = Proxy::start(&dir, NO_EXTRAS);
         let key = mint_key(&proxy);
         let response = post_to_end(proxy.listen, &key, &chat_body("reset"));
         assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
@@ -210,26 +210,28 @@ fn a_timeout_mid_stream_is_recorded_partial_and_charged_once() {
     let cases = [
         (
             "route-idle",
-            Timers {
+            Extras {
                 route: ", idle_timeout: 1s",
                 listen: "",
+                ..NO_EXTRAS
             },
             "SI",
         ),
         (
             "duration",
-            Timers {
+            Extras {
                 route: "",
                 listen: ", max_stream_duration: 1s",
+                ..NO_EXTRAS
             },
             "UMSDR",
         ),
     ];
-    for (tag, timers, flag) in cases {
+    for (tag, extras, flag) in cases {
         in_one_token_window(tag, || {
             let minute = token_window_minute();
             let dir = scratch_dir(tag);
-            let proxy = Proxy::start(&dir, timers);
+            let proxy = Proxy::start(&dir, extras);
             let key = mint_key(&proxy);
             let response = post_to_end(proxy.listen, &key, &chat_body("stall"));
             assert!(
@@ -255,7 +257,7 @@ fn a_timeout_mid_stream_is_recorded_partial_and_charged_once() {
 #[test]
 fn a_stream_cut_at_the_drain_deadline_is_recorded_partial_before_exit() {
     let dir = scratch_dir("drain");
-    let mut proxy = Proxy::start_with_args(&dir, NO_TIMERS, &["--drain-time-s", "1"]);
+    let mut proxy = Proxy::start_with_args(&dir, NO_EXTRAS, &["--drain-time-s", "1"]);
     let key = mint_key(&proxy);
     let body = chat_body("abort");
     let mut stream = read_two_frames(proxy.listen, &key, &body);
@@ -325,11 +327,12 @@ fn a_stream_cut_at_the_drain_deadline_is_recorded_partial_before_exit() {
 
 /// A client that hangs up while the request still waits for response headers
 /// is logged and recorded, as Envoy logs it: response code 0, flag `DC`, and a
-/// record that names the attempt it dialled, with no status and no usage.
+/// record that names the attempt it dialled, with no status. The provider
+/// received the whole request, so it is charged its estimated input.
 #[test]
-fn a_client_disconnect_before_response_headers_is_logged_and_recorded() {
+fn a_client_disconnect_before_response_headers_is_logged_recorded_and_charged() {
     let dir = scratch_dir("preheaders");
-    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let proxy = Proxy::start(&dir, NO_EXTRAS);
     let key = mint_key(&proxy);
     let mut stream = TcpStream::connect(proxy.listen).expect("connect");
     stream
@@ -353,47 +356,110 @@ fn a_client_disconnect_before_response_headers_is_logged_and_recorded() {
     );
     assert_eq!(record["error_category"], "downstream_remote_disconnect");
     assert_eq!(record["record_seq"], 1, "{record}");
-    assert!(record["usage"].is_null(), "{record}");
+    // The provider holds the whole request, so the default
+    // `unanswered_usage: input` charges its estimated input.
+    let input = assert_input_estimate_charged(&proxy, &record, 0);
     let attempt = &record["attempts"][0];
     assert_eq!(attempt["cluster"], "provider:openai", "{record}");
     assert_eq!(attempt["upstream_model"], MODEL, "{record}");
     assert_eq!(attempt["termination"], "downstream_disconnect", "{record}");
+    assert_eq!(attempt["usage"]["input_tokens"], input, "{record}");
     let line = proxy.wait_for_chat_log_lines(1).remove(0);
     assert_eq!(line["response_code"], "0", "{line}");
     assert_eq!(line["response_flags"], "DC", "{line}");
+    assert_eq!(line["llm_usage_completeness"], "partial", "{line}");
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A non-streamed request the provider read in full but never answered, cut
 /// by the listener's `stream_idle_timeout` while the proxy waits for response
-/// headers. The attempt ends `timeout`, the same as the request: the router's
-/// drop must not leave it `unknown`.
+/// headers, is charged by the provider's `unanswered_usage`: `input` (the
+/// default) charges the estimated input, `output_cap` adds the request's
+/// `max_tokens`, and `none` charges nothing but is counted and logged. The
+/// attempt ends `timeout`, the same as the request, not `unknown`.
 #[test]
-fn a_timeout_before_response_headers_records_the_attempt_as_timed_out() {
-    let dir = scratch_dir("preheaders-timeout");
+fn a_timeout_before_response_headers_is_charged_by_the_providers_unanswered_usage() {
+    for (policy, provider, output) in [
+        ("default", "", Some(0)),
+        (
+            "output_cap",
+            "\n    unanswered_usage: output_cap",
+            Some(MAX_TOKENS),
+        ),
+        ("none", "\n    unanswered_usage: none", None),
+    ] {
+        let dir = scratch_dir(&format!("preheaders-timeout-{policy}"));
+        let proxy = Proxy::start(
+            &dir,
+            Extras {
+                listen: ", stream_idle_timeout: 1s",
+                provider,
+                ..NO_EXTRAS
+            },
+        );
+        let key = mint_key(&proxy);
+        let response = post_to_end(proxy.listen, &key, &quiet_body());
+        assert!(response.starts_with("HTTP/1.1 408"), "{policy}: {response}");
+        let record = proxy.wait_for_records(1).remove(0);
+        assert_eq!(record["termination"], "timeout", "{policy}: {record}");
+        assert_eq!(record["attempts"][0]["termination"], "timeout", "{record}");
+        match output {
+            Some(output) => {
+                assert_input_estimate_charged(&proxy, &record, output);
+            }
+            None => {
+                assert!(record["usage"].is_null(), "{policy}: {record}");
+                assert_eq!(proxy.spend_micros(), 0, "{policy}: {record}");
+                assert_eq!(
+                    proxy.counter("envoy_llmproxy_usage_unanswered_uncharged_total"),
+                    1
+                );
+                let stderr = std::fs::read_to_string(&proxy.stderr).unwrap_or_default();
+                assert!(
+                    stderr.contains("`unanswered_usage` is `none`"),
+                    "the uncharged attempt is logged:\n{stderr}"
+                );
+            }
+        }
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// AGENTS.md invariant 6: each attempt is charged by the provider it reached.
+/// The primary answers 503 (answered, so not charged) and fails over to a
+/// backup that reads the request and never answers. The backup's default
+/// `input` applies, not the primary's `output_cap`: no output is charged.
+#[test]
+fn a_fallback_that_never_answers_is_charged_by_its_own_unanswered_usage() {
+    let dir = scratch_dir("fallback-unanswered");
     let proxy = Proxy::start(
         &dir,
-        Timers {
-            route: "",
+        Extras {
             listen: ", stream_idle_timeout: 1s",
+            provider: "\n    unanswered_usage: output_cap",
+            providers: "  backup:\n    type: openai\n    base_url: http://{mock}\n    \
+                        api_key: sk-backup-provider-key\n",
+            route: ", fallbacks: [backup]",
+            primary: Some(spawn_503_upstream()),
         },
     );
     let key = mint_key(&proxy);
-    let body = format!(
-        r#"{{"model":"{MODEL}","stream":false,"messages":[{{"role":"user","content":"quiet"}}]}}"#
-    );
-    let response = post_to_end(proxy.listen, &key, &body);
+    let response = post_to_end(proxy.listen, &key, &quiet_body());
     assert!(response.starts_with("HTTP/1.1 408"), "got:\n{response}");
-    assert_eq!(UPSTREAM_QUIET.load(Ordering::SeqCst), 1);
     let record = proxy.wait_for_records(1).remove(0);
-    assert_eq!(record["termination"], "timeout", "{record}");
-    assert_eq!(
-        record["response_flags"],
-        serde_json::json!(["SI"]),
-        "{record}"
+    let attempts = record["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{record}");
+    assert_eq!(attempts[0]["cluster"], "provider:openai", "{record}");
+    assert_eq!(attempts[0]["status"], 503, "{record}");
+    assert!(
+        attempts[0]["cost"].is_null(),
+        "an answered 503 is not charged: {record}"
     );
-    assert_eq!(record["attempts"][0]["termination"], "timeout", "{record}");
+    assert_eq!(attempts[1]["cluster"], "provider:backup", "{record}");
+    assert_input_estimate_charged(&proxy, &record, 0);
+    assert_eq!(attempts[1]["cost"], record["cost"], "{record}");
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -405,7 +471,7 @@ fn a_timeout_before_response_headers_records_the_attempt_as_timed_out() {
 #[test]
 fn a_reset_after_the_provider_read_the_request_is_not_dispatched_again() {
     let dir = scratch_dir("reset-after-send");
-    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let proxy = Proxy::start(&dir, NO_EXTRAS);
     let key = mint_key(&proxy);
     let body = format!(
         r#"{{"model":"{MODEL}","stream":false,"messages":[{{"role":"user","content":"dropconn"}}]}}"#
@@ -421,6 +487,59 @@ fn a_reset_after_the_provider_read_the_request_is_not_dispatched_again() {
     );
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The output-token limit the `quiet` request sets.
+const MAX_TOKENS: u64 = 40;
+
+/// A non-streamed request the mock reads in full and never answers.
+fn quiet_body() -> String {
+    format!(
+        r#"{{"model":"{MODEL}","stream":false,"max_tokens":{MAX_TOKENS},"messages":[{{"role":"user","content":"quiet"}}]}}"#
+    )
+}
+
+/// The only request on `proxy` was charged an estimate for an attempt that
+/// got no response: its request size over four as input, `output` as output,
+/// priced at the test card, `partial` and estimated, and the tenant's spend
+/// moved by that amount. Returns the input token count.
+fn assert_input_estimate_charged(proxy: &Proxy, record: &serde_json::Value, output: u64) -> u64 {
+    let usage = &record["usage"];
+    let input = record["bytes_request"].as_u64().unwrap().div_ceil(4);
+    assert_eq!(usage["completeness"], "partial", "{record}");
+    assert_eq!(usage["provenance"], "estimate", "{record}");
+    assert_eq!(usage["input_tokens"], input, "{record}");
+    assert_eq!(usage["output_tokens"], output, "{record}");
+    let amount = input * INPUT_NANO + output * OUTPUT_NANO;
+    assert_eq!(record["cost"]["amount"], amount, "{record}");
+    assert_eq!(record["cost"]["kind"], "estimate", "{record}");
+    assert_eq!(
+        proxy.spend_micros(),
+        amount / 1000,
+        "charged once: {record}"
+    );
+    input
+}
+
+/// An upstream that answers every request `503` once it has read it.
+fn spawn_503_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 503 upstream");
+    let addr = listener.local_addr().expect("no local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    addr
 }
 
 fn wait_until(what: &str, done: impl Fn() -> bool) {
@@ -512,7 +631,7 @@ fn in_one_token_window(what: &str, mut case: impl FnMut() -> bool) {
 #[test]
 fn the_record_names_the_keys_user_not_the_bodys_user_field() {
     let dir = scratch_dir("identity");
-    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let proxy = Proxy::start(&dir, NO_EXTRAS);
     let key = mint_key(&proxy);
 
     let body = format!(
@@ -548,7 +667,7 @@ fn the_record_names_the_keys_user_not_the_bodys_user_field() {
 #[test]
 fn a_refused_credential_is_recorded_under_unauthenticated() {
     let dir = scratch_dir("unauthenticated");
-    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let proxy = Proxy::start(&dir, NO_EXTRAS);
     let key = mint_key(&proxy);
     let body = chat_body("clean");
 
@@ -584,18 +703,25 @@ fn chat_body(marker: &str) -> String {
 
 /// The dialect file: auth (so spend is charged to a tenant), a per-tenant
 /// token limit (so the token window is metered), a rate card, and a JSON
-/// access log. `timers` are appended to the listener and the catch-all route.
+/// access log. `extras` add to the listener, the `openai` provider and the
+/// catch-all route, and can add providers; the mock upstream serves
+/// `openai` unless `extras.primary` names another.
 fn config_text(
     listen: u16,
     admin: u16,
     upstream: SocketAddr,
     access_log: &Path,
-    timers: Timers,
+    extras: &Extras,
 ) -> String {
-    let Timers {
+    let Extras {
         route: route_extra,
         listen: listen_extra,
-    } = timers;
+        provider: provider_extra,
+        providers,
+        primary,
+    } = extras;
+    let primary = primary.unwrap_or(upstream);
+    let providers = providers.replace("{mock}", &upstream.to_string());
     format!(
         r#"version: 1
 listen: {{ address: "127.0.0.1:{listen}"{listen_extra} }}
@@ -603,9 +729,9 @@ admin: 127.0.0.1:{admin}
 providers:
   openai:
     type: openai
-    base_url: http://{upstream}
-    api_key: sk-upstream-provider-key
-routes:
+    base_url: http://{primary}
+    api_key: sk-upstream-provider-key{provider_extra}
+{providers}routes:
   - {{ model: "*", provider: openai{route_extra} }}
 auth:
   hmac_secret: "{HMAC_SECRET}"
@@ -633,17 +759,27 @@ observability:
     )
 }
 
-/// Extra YAML flow-map entries (each starting `, `) for the listener and the
-/// catch-all route, so a test can arm one stream timer.
+/// What a test adds to the dialect file. `listen` and `route` are YAML
+/// flow-map entries (each starting `, `), for example a stream timer;
+/// `provider` is block lines (each starting `\n    `) added to the `openai`
+/// provider; `providers` is more provider entries, where `{mock}` stands for
+/// the mock upstream's address; `primary` replaces the `openai` provider's
+/// upstream.
 #[derive(Clone, Copy)]
-struct Timers {
+struct Extras {
     route: &'static str,
     listen: &'static str,
+    provider: &'static str,
+    providers: &'static str,
+    primary: Option<SocketAddr>,
 }
 
-const NO_TIMERS: Timers = Timers {
+const NO_EXTRAS: Extras = Extras {
     route: "",
     listen: "",
+    provider: "",
+    providers: "",
+    primary: None,
 };
 
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -664,14 +800,15 @@ struct Proxy {
     admin: SocketAddr,
     records: PathBuf,
     access_log: PathBuf,
+    stderr: PathBuf,
 }
 
 impl Proxy {
-    fn start(dir: &Path, timers: Timers) -> Proxy {
-        Proxy::start_with_args(dir, timers, &[])
+    fn start(dir: &Path, extras: Extras) -> Proxy {
+        Proxy::start_with_args(dir, extras, &[])
     }
 
-    fn start_with_args(dir: &Path, timers: Timers, extra: &[&str]) -> Proxy {
+    fn start_with_args(dir: &Path, extras: Extras, extra: &[&str]) -> Proxy {
         let listen = free_port();
         let admin = free_port();
         let upstream = spawn_streaming_upstream();
@@ -680,7 +817,7 @@ impl Proxy {
         let access_log = dir.join("access.log");
         std::fs::write(
             &path,
-            config_text(listen, admin, upstream, &access_log, timers),
+            config_text(listen, admin, upstream, &access_log, &extras),
         )
         .expect("write temp config");
         let child = Command::new(BIN)
@@ -695,7 +832,7 @@ impl Proxy {
             .args(extra)
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("stderr.log")).expect("create stderr log"))
             .spawn()
             .expect("failed to spawn llm-proxy");
         let proxy = Proxy {
@@ -704,6 +841,7 @@ impl Proxy {
             admin: SocketAddr::from(([127, 0, 0, 1], admin)),
             records,
             access_log,
+            stderr: dir.join("stderr.log"),
         };
         for addr in [proxy.admin, proxy.listen] {
             assert!(
@@ -785,6 +923,16 @@ impl Proxy {
         // The proxy read its window before answering, so if the minute is
         // still `minute` now, it was `minute` then.
         (token_window_minute() == minute).then_some(used as u64)
+    }
+
+    /// The sum of every series of the counter `name` on `/stats/prometheus`.
+    fn counter(&self, name: &str) -> u64 {
+        let response = http_get(self.admin, "/stats/prometheus", None);
+        response
+            .lines()
+            .filter(|line| line.starts_with(name))
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum()
     }
 
     /// The tenant's charged spend, in micro-dollars, from the admin API.

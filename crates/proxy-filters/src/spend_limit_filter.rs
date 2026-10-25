@@ -786,7 +786,7 @@ impl SpendLimitFilterInstance {
         // before calling `self.accumulator.record` below -- `stream_info()`
         // must not be held across another call (see its doc), same pattern
         // as `token_limit_filter::record_if_present`.
-        let (usage, cluster, model, selected_model, served_model, credential_source) = {
+        let (usage, cluster, model, selected_model, served_model, credential_source, attempts) = {
             let info = cb.stream_info();
             (
                 info.llm.usage.clone(),
@@ -795,6 +795,7 @@ impl SpendLimitFilterInstance {
                 info.selected_model.clone(),
                 info.llm.served_model.clone(),
                 info.credential_source,
+                info.llm.attempt_charges.clone(),
             )
         };
 
@@ -813,13 +814,34 @@ impl SpendLimitFilterInstance {
         // so the spend charge and the record agree when a provider served a
         // different model than the one sent.
         let sent_model = selected_model.as_deref().or(model.as_deref());
-        let priced = PricingRegistry::price_served(
-            self.pricing_snapshot.as_ref(),
-            cluster.as_deref(),
-            sent_model,
-            served_model.as_deref(),
-            &usage,
-        );
+        let priced = if attempts.is_empty() {
+            PricingRegistry::price_served(
+                self.pricing_snapshot.as_ref(),
+                cluster.as_deref(),
+                sent_model,
+                served_model.as_deref(),
+                &usage,
+            )
+        } else {
+            // Charged across attempts (one got no response): each is priced
+            // at its own cluster, as the usage filter priced the record.
+            attempts
+                .iter()
+                .filter_map(|attempt| {
+                    PricingRegistry::price_served(
+                        self.pricing_snapshot.as_ref(),
+                        Some(&attempt.cluster),
+                        attempt.model.as_deref(),
+                        attempt.served_model.as_deref(),
+                        &attempt.usage,
+                    )
+                })
+                .reduce(|sum, priced| crate::pricing::Priced {
+                    nanodollars: sum.nanodollars + priced.nanodollars,
+                    basis: sum.basis,
+                    underpriced_modality: sum.underpriced_modality || priced.underpriced_modality,
+                })
+        };
         if self.budget_applies && priced.is_some_and(|priced| priced.underpriced_modality) {
             self.unpriced_warner
                 .note_underpriced(sent_model, cluster.as_deref());

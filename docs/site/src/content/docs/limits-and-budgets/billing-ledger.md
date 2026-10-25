@@ -72,7 +72,9 @@ An entry exists for each request that the proxy dialled to a provider. This
 includes a request that the proxy charged zero, because the provider can still
 bill it. It also includes a request that the client abandoned before the
 response headers arrived: its record has `termination: downstream_disconnect`,
-no `status`, and the flag `DC`. A request that the proxy refused before it
+no `status`, and the flag `DC`. When the provider got the whole request and
+sent no response, the entry is charged by the provider's `unanswered_usage`
+(see [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/#requests-that-get-no-response)). A request that the proxy refused before it
 dialled gets no entry. This
 covers a refusal for authentication, model access, budget, or rate limit, and
 a refusal by the ledger itself.

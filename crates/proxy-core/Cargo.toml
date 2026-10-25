@@ -64,6 +64,8 @@ tokio = { workspace = true, features = ["test-util", "io-util"] }
 tracing-subscriber = { workspace = true }
 # The ledger tests open a real ledger spool in a temporary directory.
 proxy-observability = { workspace = true, features = ["test-support"] }
+# The ledger tests patch a lowered bootstrap into an Envoy-mode-only config.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -168,6 +168,28 @@ pub struct LlmListCost {
     pub rate_card_version: String,
 }
 
+/// One attempt's share of a request charged across several attempts: an
+/// attempt that sent the provider the whole request and got no response is
+/// charged by its own provider's `unanswered_usage` (ADR-0009 addendum
+/// "Unanswered attempts"), on top of what the answered attempt used.
+/// Written by the usage filter; the spend filter prices each entry with the
+/// same function, so the record, the spend charge and the ledger agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptCharge {
+    /// The cluster the attempt dialled, whose rate card prices it.
+    pub cluster: String,
+    /// The model sent to that cluster.
+    pub model: Option<String>,
+    /// The model the provider said it served; only an answered attempt has one.
+    pub served_model: Option<String>,
+    pub usage: LlmUsage,
+    pub input_estimated: bool,
+    pub output_estimated: bool,
+    pub list_cost: Option<LlmListCost>,
+    /// The attempt's index in [`StreamInfo::attempts`] when records are on.
+    pub attempt_index: Option<u16>,
+}
+
 /// What the spend filter added to the spend counters for this request,
 /// published when it priced the request's usage so the ledger entry copies
 /// the charge instead of pricing it a second time (ADR-0009 decision 4).
@@ -283,6 +305,11 @@ pub struct LlmStats {
     /// coalesced into one chunk shows up here as `1` — which is exactly the
     /// streaming invariant failing, so it is worth counting.
     pub response_chunks: u64,
+    /// Each charged attempt, when the request was charged for an attempt that
+    /// got no response. Empty otherwise, and then `usage` and `list_cost`
+    /// belong to the one attempt that answered. When not empty, `usage` and
+    /// `list_cost` are the sums of these entries.
+    pub attempt_charges: Vec<AttemptCharge>,
 }
 
 /// Authenticated caller identifiers from the auth filter. Policy is not
@@ -410,6 +437,47 @@ impl UpstreamTiming {
     }
 }
 
+/// One attempt the router dialled, kept for every request (records on or
+/// not) so the usage filter can charge an attempt that sent the provider the
+/// whole request and got no response, at that attempt's own provider's
+/// `unanswered_usage` (AGENTS.md invariant 6).
+#[derive(Debug)]
+pub struct DispatchedAttempt {
+    pub cluster: String,
+    /// The model sent to `cluster`.
+    pub model: Option<String>,
+    pub unanswered: proxy_config::ir::UnansweredUsage,
+    /// The attempt's index in [`StreamInfo::attempts`] when records are on.
+    pub attempt_index: Option<u16>,
+    timing: Rc<UpstreamTiming>,
+}
+
+impl DispatchedAttempt {
+    pub(crate) fn new(
+        cluster: &str,
+        model: Option<String>,
+        unanswered: proxy_config::ir::UnansweredUsage,
+        attempt_index: Option<u16>,
+        timing: Rc<UpstreamTiming>,
+    ) -> Self {
+        Self {
+            cluster: cluster.to_owned(),
+            model,
+            unanswered,
+            attempt_index,
+            timing,
+        }
+    }
+
+    /// The provider was sent the whole request (`US_TX_END`) and sent back
+    /// nothing (`US_RX_BEG` unset): it can be working on, and billing, a
+    /// request nobody will read.
+    pub fn unanswered(&self) -> bool {
+        let points = self.timing.points();
+        points.get(TimePoint::UsTxEnd).is_some() && points.get(TimePoint::UsRxBeg).is_none()
+    }
+}
+
 /// A request's trace-export capture while it runs (ADR-0008), with the
 /// request facts the exporter needs. Lives on the stream so the filter
 /// manager can admit it after the decode chain and `LoggingBody` can feed and
@@ -508,6 +576,13 @@ pub struct StreamInfo {
     /// by the router, which clamps or injects the request's output-token
     /// limit in the whole buffered body. `None` means no cap.
     pub max_output_tokens: Option<u32>,
+    /// The output-token limit the request body itself sets (`max_tokens`,
+    /// `max_completion_tokens` or `max_output_tokens`, per endpoint). Read by
+    /// the router only when an attempt reaches a provider whose
+    /// `unanswered_usage` is `output_cap`; `None` otherwise or when absent.
+    pub requested_output_limit: Option<u64>,
+    /// Every attempt the router dialled, in order.
+    pub dispatched: Vec<DispatchedAttempt>,
     /// The model alias a resolver chose for a request whose `requested_model`
     /// is a resolver trigger such as `auto`, published by
     /// `proxy_filters::model_resolver_filter`. `None` when no resolver ran or
@@ -591,6 +666,8 @@ impl Default for StreamInfo {
             request_facts: RequestFacts::default(),
             force_include_usage: false,
             max_output_tokens: None,
+            requested_output_limit: None,
+            dispatched: Vec::new(),
             resolved_model: None,
             guardrail: None,
             selected_model: None,
