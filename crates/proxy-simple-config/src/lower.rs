@@ -2362,8 +2362,12 @@ fn lower_route(
         "host_rewrite_literal": up.host,
     });
 
-    // S3, LLM-safe: retry only what is certainly unserved. Envoy's router
-    // never retries once response bytes have streamed downstream.
+    // S3, LLM-safe: retry a connect failure, a refused stream, a reset before
+    // the request was fully sent, and a 429/500/502/503 answer. A reset after
+    // the provider read the whole request is not retried (`reset` is not
+    // set): the provider may already be generating, and a second dispatch
+    // could be billed twice. Envoy's router never retries once response bytes
+    // have streamed downstream.
     let attempts = rule.retries.as_ref().map_or(1, |r| r.attempts);
     // `LoadBalancerContext::attempted_clusters` makes
     // each retry against an aggregate pick the NEXT member, so reaching the
@@ -2374,7 +2378,7 @@ fn lower_route(
     let num_retries = attempts.max(min_retries_for_failover);
     if num_retries > 0 {
         action["retry_policy"] = json!({
-            "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
+            "retry_on": "connect-failure,refused-stream,reset-before-request,retriable-status-codes",
             "num_retries": num_retries,
             "retriable_status_codes": [429, 500, 502, 503],
         });
@@ -2775,7 +2779,7 @@ fn lower_model(
     }
     if member_count > 1 {
         action["retry_policy"] = json!({
-            "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
+            "retry_on": "connect-failure,refused-stream,reset-before-request,retriable-status-codes",
             "num_retries": member_count - 1,
             "retriable_status_codes": [429, 500, 502, 503],
         });

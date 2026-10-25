@@ -2499,7 +2499,11 @@ impl RouterHandler {
                         if matches!(proto, UpstreamProtocol::Http2) {
                             self.conn_cache.invalidate(&conn_key);
                         }
-                        let outcome = AttemptOutcome::from_codec_error(&err);
+                        // Whether the provider holds the whole request
+                        // decides `reset-before-request` (S3.2).
+                        let request_sent =
+                            attempt_timing.points().get(TimePoint::UsTxEnd).is_some();
+                        let outcome = AttemptOutcome::from_codec_error(&err, request_sent);
                         report_outlier(attempt_entry, host.address, &outcome);
                         self.emit_client_span(
                             attempt_trace,
@@ -2769,7 +2773,8 @@ fn outlier_result_for(outcome: &AttemptOutcome) -> Option<RequestResult> {
             _ => RequestResult::Success,
         },
         AttemptOutcome::ConnectFailure
-        | AttemptOutcome::ResetBeforeHeaders
+        | AttemptOutcome::ResetBeforeRequest
+        | AttemptOutcome::ResetAwaitingResponse
         | AttemptOutcome::ResetAfterHeaders
         | AttemptOutcome::RefusedStream
         | AttemptOutcome::PerTryTimeout => RequestResult::LocalOriginFailure,
@@ -4016,7 +4021,8 @@ mod tests {
         // Connection-level failures fold into the local-origin bucket.
         for o in [
             ConnectFailure,
-            ResetBeforeHeaders,
+            ResetBeforeRequest,
+            ResetAwaitingResponse,
             ResetAfterHeaders,
             RefusedStream,
             PerTryTimeout,

@@ -152,8 +152,9 @@ provider in the chain.
 - Failover needs retries. The proxy raises the retry count to at least the
   number of fallbacks. So `retries.attempts: 0` does not turn off failover on
   a route that has fallbacks.
-- The proxy retries on a connection failure, a refused stream, a reset, and
-  the status codes 429, 500, 502, and 503.
+- The proxy retries on a connection failure, a refused stream, a reset
+  before the provider received the whole request, and the status codes 429,
+  500, 502, and 503.
 
 See [Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/)
 for the runtime behavior.

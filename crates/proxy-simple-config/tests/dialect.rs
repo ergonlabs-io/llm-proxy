@@ -519,7 +519,7 @@ routes:
     assert_eq!(action["retry_policy"]["num_retries"], 1);
     assert_eq!(
         action["retry_policy"]["retry_on"],
-        "connect-failure,refused-stream,reset,retriable-status-codes"
+        "connect-failure,refused-stream,reset-before-request,retriable-status-codes"
     );
     assert_eq!(action["host_rewrite_literal"], "api.openai.com");
 }

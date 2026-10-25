@@ -157,7 +157,7 @@ static_resources:
                     - 500
                     - 502
                     - 503
-                    retry_on: connect-failure,refused-stream,reset,retriable-status-codes
+                    retry_on: connect-failure,refused-stream,reset-before-request,retriable-status-codes
                   timeout: 0s
                 typed_per_filter_config:
                   llmproxy.body_rewrite:

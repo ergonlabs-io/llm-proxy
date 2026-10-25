@@ -29,12 +29,14 @@ pub enum AttemptOutcome {
     /// so that distinction ("connect-failure excludes request timeout") is
     /// structural rather than something callers have to remember.
     ConnectFailure,
-    /// Connection reset/closed before any response headers arrived --
-    /// includes both "reset while waiting for a response" and "reset before
-    /// the request finished sending" (S3.2's `reset` and
-    /// `reset-before-request` respectively). See the module doc comment on
-    /// [`trigger_fires`] for why these two are folded together here.
-    ResetBeforeHeaders,
+    /// Connection reset/closed before the request was fully sent upstream:
+    /// the provider cannot have acted on it. Fires under S3.2's
+    /// `reset-before-request` as well as `reset`.
+    ResetBeforeRequest,
+    /// Connection reset/closed after the whole request was sent and before
+    /// any response headers arrived. The provider may have started work on
+    /// it, so only S3.2's `reset` (not `reset-before-request`) fires.
+    ResetAwaitingResponse,
     /// Connection reset/closed after response headers arrived (mid-body).
     /// Nothing produces this yet: the current codec (`send_upstream_http1`)
     /// returns the full head before the caller can observe a body-phase
@@ -66,26 +68,36 @@ impl AttemptOutcome {
             PoolError::ConnectFailure(_)
             | PoolError::ConnectTimeout
             | PoolError::TlsHandshake(_) => Self::ConnectFailure,
-            PoolError::ResetBeforeHeaders => Self::ResetBeforeHeaders,
+            // A reset while connecting: nothing of the request was sent.
+            PoolError::ResetBeforeHeaders => Self::ResetBeforeRequest,
         }
     }
 
     /// Project an upstream codec failure onto the S3.2 vocabulary.
+    /// `request_sent` is whether the attempt's request body was written in
+    /// full (`US_TX_END`), which separates S3.2's `reset-before-request`
+    /// from a reset while the provider holds the whole request.
     ///
     /// `UpstreamCodecError::MissingAuthority` is a local request-shape
     /// defect (no `Host`/absolute-form URI to derive `:authority` from), not
     /// a network failure -- retrying will reproduce it identically. There is
     /// no dedicated "not retriable, don't even ask" outcome yet, so it is
-    /// conservatively folded into `ResetBeforeHeaders` (the "no response at
-    /// all" bucket); this is flagged as a divergence rather than silently
-    /// assumed, since it will report as retriable under `5xx`/`reset` even
-    /// though a retry can never succeed.
-    pub fn from_codec_error(err: &UpstreamCodecError) -> Self {
+    /// conservatively folded into `ResetBeforeRequest` (nothing was sent);
+    /// this is flagged as a divergence rather than silently assumed, since it
+    /// will report as retriable under `5xx`/`reset` even though a retry can
+    /// never succeed.
+    pub fn from_codec_error(err: &UpstreamCodecError, request_sent: bool) -> Self {
         match err {
-            UpstreamCodecError::Handshake(_)
-            | UpstreamCodecError::Connection(_)
-            | UpstreamCodecError::Send(_)
-            | UpstreamCodecError::MissingAuthority => Self::ResetBeforeHeaders,
+            UpstreamCodecError::Handshake(_) | UpstreamCodecError::MissingAuthority => {
+                Self::ResetBeforeRequest
+            }
+            UpstreamCodecError::Connection(_) | UpstreamCodecError::Send(_) => {
+                if request_sent {
+                    Self::ResetAwaitingResponse
+                } else {
+                    Self::ResetBeforeRequest
+                }
+            }
             UpstreamCodecError::RefusedStream => Self::RefusedStream,
         }
     }
@@ -111,9 +123,10 @@ fn trigger_fires(policy: &RetryPolicyIR, outcome: &AttemptOutcome) -> bool {
         // counts as 5xx/gateway-error per S3.2's `5xx` row ("any 5xx
         // response or no response at all").
         AttemptOutcome::ConnectFailure => on.connect_failure || on.five_xx || on.gateway_error,
-        AttemptOutcome::ResetBeforeHeaders => {
+        AttemptOutcome::ResetBeforeRequest => {
             on.reset || on.reset_before_request || on.five_xx || on.gateway_error
         }
+        AttemptOutcome::ResetAwaitingResponse => on.reset || on.five_xx || on.gateway_error,
         AttemptOutcome::ResetAfterHeaders => on.reset || on.five_xx || on.gateway_error,
         AttemptOutcome::RefusedStream => on.refused_stream,
         // Per S3.2's `5xx` row annotation ("Envoy: timeout -> 504 counts
@@ -305,7 +318,8 @@ mod tests {
     fn five_xx_fires_on_no_response_at_all() {
         let p = policy("5xx", 1);
         assert!(should_retry(&p, &AttemptOutcome::ConnectFailure, 0));
-        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
+        assert!(should_retry(&p, &AttemptOutcome::ResetAwaitingResponse, 0));
         assert!(should_retry(&p, &AttemptOutcome::ResetAfterHeaders, 0));
         assert!(should_retry(&p, &AttemptOutcome::PoolOverflow, 0));
     }
@@ -349,7 +363,7 @@ mod tests {
     fn connect_failure_fires_only_on_connect_failure_outcome() {
         let p = policy("connect-failure", 1);
         assert!(should_retry(&p, &AttemptOutcome::ConnectFailure, 0));
-        assert!(!should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
         assert!(!should_retry(&p, &AttemptOutcome::PerTryTimeout, 0));
         assert!(!should_retry(&p, &AttemptOutcome::Response(500), 0));
     }
@@ -364,7 +378,7 @@ mod tests {
             assert!(!should_retry(&p, &AttemptOutcome::Response(status), 0));
         }
         assert!(should_retry(&p, &AttemptOutcome::ConnectFailure, 0));
-        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
         assert!(should_retry(&p, &AttemptOutcome::PoolOverflow, 0));
     }
 
@@ -380,7 +394,8 @@ mod tests {
     #[test]
     fn reset_fires_before_and_after_headers_and_on_per_try_timeout() {
         let p = policy("reset", 1);
-        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
+        assert!(should_retry(&p, &AttemptOutcome::ResetAwaitingResponse, 0));
         assert!(should_retry(&p, &AttemptOutcome::ResetAfterHeaders, 0));
         assert!(should_retry(&p, &AttemptOutcome::PerTryTimeout, 0));
         assert!(!should_retry(&p, &AttemptOutcome::ConnectFailure, 0));
@@ -388,9 +403,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_before_request_fires_on_reset_before_headers() {
+    fn reset_before_request_fires_only_while_the_request_is_unsent() {
         let p = policy("reset-before-request", 1);
-        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
+        // The provider holds the whole request: it may already be working.
+        assert!(!should_retry(&p, &AttemptOutcome::ResetAwaitingResponse, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::ResetAfterHeaders, 0));
         assert!(!should_retry(&p, &AttemptOutcome::ConnectFailure, 0));
     }
 
@@ -398,7 +416,7 @@ mod tests {
     fn refused_stream_fires_only_on_refused_stream_outcome() {
         let p = policy("refused-stream", 1);
         assert!(should_retry(&p, &AttemptOutcome::RefusedStream, 0));
-        assert!(!should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
         assert!(!should_retry(&p, &AttemptOutcome::Response(503), 0));
     }
 
@@ -425,7 +443,7 @@ mod tests {
         let p = policy("", 1);
         assert!(!should_retry(&p, &AttemptOutcome::Response(500), 0));
         assert!(!should_retry(&p, &AttemptOutcome::ConnectFailure, 0));
-        assert!(!should_retry(&p, &AttemptOutcome::ResetBeforeHeaders, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::ResetBeforeRequest, 0));
     }
 
     // ------------------------------------------------------ PoolError map --
@@ -454,15 +472,15 @@ mod tests {
         );
         assert_eq!(
             AttemptOutcome::from_pool_error(&PoolError::ResetBeforeHeaders),
-            AttemptOutcome::ResetBeforeHeaders
+            AttemptOutcome::ResetBeforeRequest
         );
     }
 
     #[test]
     fn codec_error_projection() {
         assert_eq!(
-            AttemptOutcome::from_codec_error(&UpstreamCodecError::MissingAuthority),
-            AttemptOutcome::ResetBeforeHeaders
+            AttemptOutcome::from_codec_error(&UpstreamCodecError::MissingAuthority, false),
+            AttemptOutcome::ResetBeforeRequest
         );
     }
 

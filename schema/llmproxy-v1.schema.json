@@ -1038,7 +1038,7 @@
         "providers": {
           "type": "array",
           "minItems": 1,
-          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. `providers[0]` serves the request; each later entry is a fallback, tried in order on a connection failure or a 429, 500, 502 or 503 response, never after the first response byte of a stream. With `weight` on every entry, each request picks its first provider in proportion to weight, and the other entries are its fallbacks in list order. A provider ejected by its `outlier_detection` is passed over while another entry has a provider that is not ejected. Every entry must speak the same dialect as `providers[0]`; a mismatch is a load error.",
+          "description": "Providers tried for this model, in priority order. Each entry is either the shorthand string form (`provider` or `provider/model`, reusing the same `ProviderModelRef` shape `routes` uses) or the object form, needed whenever `dialect` must be set explicitly. `providers[0]` serves the request; each later entry is a fallback, tried in order on a connection failure, a connection reset before the request was fully sent, or a 429, 500, 502 or 503 response, never after the provider received the whole request and then closed the connection, and never after the first response byte of a stream. With `weight` on every entry, each request picks its first provider in proportion to weight, and the other entries are its fallbacks in list order. A provider ejected by its `outlier_detection` is passed over while another entry has a provider that is not ejected. Every entry must speak the same dialect as `providers[0]`; a mismatch is a load error.",
           "items": {
             "oneOf": [
               { "$ref": "#/$defs/ProviderModelRef" },
@@ -1126,13 +1126,13 @@
           "description": "Where matching requests go. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`."
         },
         "fallbacks": {
-          "description": "Tried in order when the primary provider fails (connection failure, or a 429, 500, 502 or 503 response — and never after the first response byte of a stream has been sent to the client), or when the primary's credential cannot be applied (no unexpired minted token, a failed Bedrock signature). A credential failure moves to the next provider without using a retry. Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
+          "description": "Tried in order when the primary provider fails (connection failure, a connection reset before the request was fully sent, or a 429, 500, 502 or 503 response — never after the provider received the whole request and then closed the connection, and never after the first response byte of a stream has been sent to the client), or when the primary's credential cannot be applied (no unexpired minted token, a failed Bedrock signature). A credential failure moves to the next provider without using a retry. Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
           "type": "array",
           "items": { "$ref": "#/$defs/ProviderModelRef" }
         },
         "retries": {
           "type": "object",
-          "description": "Retry policy for this route. Defaults are LLM-safe: retry only what is certainly unserved (connection failures, 429s, and 5xx received before any response byte); a request is never replayed once streaming to the client has begun. NOT a separate budget from `fallbacks` -- both draw on one retry count, and each retry against a fallback chain moves to the NEXT member rather than repeating the primary.",
+          "description": "Retry policy for this route. A retry fires on a connection failure, a refused HTTP/2 stream, a connection reset before the request was fully sent, or a 429, 500, 502 or 503 response. A connection that closes after the provider received the whole request is not retried, because the provider can already be generating a response and a second attempt can be billed again. A request is never replayed once streaming to the client has begun. NOT a separate budget from `fallbacks` -- both draw on one retry count, and each retry against a fallback chain moves to the NEXT member rather than repeating the primary.",
           "additionalProperties": false,
           "properties": {
             "attempts": {

@@ -93,7 +93,7 @@ fn an_alias_without_weights_lowers_exactly_as_before() {
             "idle_timeout": "90s",
             "host_rewrite_literal": "a.internal",
             "retry_policy": {
-                "retry_on": "connect-failure,refused-stream,reset,retriable-status-codes",
+                "retry_on": "connect-failure,refused-stream,reset-before-request,retriable-status-codes",
                 "num_retries": 1,
                 "retriable_status_codes": [429, 500, 502, 503],
             },

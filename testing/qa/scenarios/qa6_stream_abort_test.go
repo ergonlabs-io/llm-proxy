@@ -19,8 +19,8 @@ import (
 // byte of a stream").
 //
 // The route carries an explicit retry policy (retries.attempts, lowered to
-// Envoy's retry_on: connect-failure,refused-stream,reset,retriable-status-
-// codes, which subsumes "5xx"). The mock sends 2 of 5 SSE chunks and then
+// Envoy's retry_on: connect-failure,refused-stream,reset-before-request,
+// retriable-status-codes). The mock sends 2 of 5 SSE chunks and then
 // hijacks and closes the raw TCP connection -- no finish-reason chunk, no
 // usage chunk, no `[DONE]`, no clean FIN. A plain early `return` from the
 // mock handler would instead produce an ordinary chunked-transfer EOF that a

@@ -88,7 +88,8 @@ uses the same fixed trigger set. You cannot widen or narrow it:
 |---|---|
 | Connection failure (TCP or TLS) | Yes |
 | h2 `REFUSED_STREAM` | Yes |
-| Reset before any response byte | Yes |
+| Connection reset before the provider received the whole request | Yes |
+| Connection reset after the provider received the whole request, before any response byte | **No** |
 | Response status `429` | Yes |
 | Response status `500`, `502`, `503` | Yes |
 | Response status `501`, `504`, or any other status | **No** |
@@ -96,9 +97,16 @@ uses the same fixed trigger set. You cannot widen or narrow it:
 | Anything after the client has started receiving the stream | Never |
 
 The dialect uses the retry tokens `connect-failure`, `refused-stream`,
-`reset`, and `retriable-status-codes`, with the status list `429, 500, 502,
-503`. It does not use the broad `5xx` or `gateway-error` tokens. A `501` or a
-`504` that a provider returns passes straight through and is not retried.
+`reset-before-request`, and `retriable-status-codes`, with the status list
+`429, 500, 502, 503`. It does not use the broad `5xx`, `gateway-error`, or
+`reset` tokens. A `501` or a `504` that a provider returns passes straight
+through and is not retried.
+
+A connection that closes after the provider received the whole request is not
+retried. The provider can already be generating a response, and a second
+attempt can be billed a second time. The client gets `503` with the flag `UC`
+or `UR`. The request record lists the attempt with `termination:
+upstream_error`.
 
 Every request that the listener accepts can be retried. A request body larger than the
 listener's request body limit is rejected with `413` before it reaches the router, so the

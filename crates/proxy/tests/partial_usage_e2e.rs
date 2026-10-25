@@ -43,6 +43,9 @@ const RECORD_TIMEOUT: Duration = Duration::from_secs(20);
 static UPSTREAM_SILENT: AtomicUsize = AtomicUsize::new(0);
 /// Requests with the `quiet` marker: read in full, never answered.
 static UPSTREAM_QUIET: AtomicUsize = AtomicUsize::new(0);
+/// Requests with the `dropconn` marker: read in full, then the connection is
+/// closed with no response.
+static UPSTREAM_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
 const HMAC_SECRET: &str = "partial-usage-e2e-secret";
 const ADMIN_TOKEN: &str = "partial-usage-e2e-admin-token";
@@ -391,6 +394,31 @@ fn a_timeout_before_response_headers_records_the_attempt_as_timed_out() {
         "{record}"
     );
     assert_eq!(record["attempts"][0]["termination"], "timeout", "{record}");
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The dialect's default retry does not send a request again after the
+/// provider read the whole of it and closed the connection without a response:
+/// the provider may already be generating, so a second dispatch could be
+/// billed twice. The client gets the `503`, and the record shows one attempt.
+#[test]
+fn a_reset_after_the_provider_read_the_request_is_not_dispatched_again() {
+    let dir = scratch_dir("reset-after-send");
+    let proxy = Proxy::start(&dir, NO_TIMERS);
+    let key = mint_key(&proxy);
+    let body = format!(
+        r#"{{"model":"{MODEL}","stream":false,"messages":[{{"role":"user","content":"dropconn"}}]}}"#
+    );
+    let response = post_to_end(proxy.listen, &key, &body);
+    assert!(response.starts_with("HTTP/1.1 503"), "got:\n{response}");
+    let record = proxy.wait_for_records(1).remove(0);
+    assert_eq!(record["attempt_count"], 1, "{record}");
+    assert_eq!(
+        UPSTREAM_DROPPED.load(Ordering::SeqCst),
+        1,
+        "requests the provider read in full: {record}"
+    );
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -958,6 +986,11 @@ fn serve_stream(stream: &mut TcpStream) {
         // timeout) for the proxy to hang up.
         UPSTREAM_SILENT.fetch_add(1, Ordering::SeqCst);
         let _ = stream.read(&mut buf);
+        return;
+    }
+    if body.contains("dropconn") {
+        UPSTREAM_DROPPED.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         return;
     }
     if body.contains("quiet") {

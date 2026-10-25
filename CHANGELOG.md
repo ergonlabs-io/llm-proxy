@@ -18,7 +18,23 @@ surfaces that an upgrade within 1.x keeps stable.
   out. A consumer can now match the `llmproxy_metadata_*` counters of a scrape
   to the records of the same process.
 
+### Changed
+
+- Routing: a dialect route no longer retries a request when the provider
+  connection closes after the provider received the whole request and before
+  any response byte. The provider can already be generating a response, so a
+  second attempt can be billed again. The dialect now lowers to the retry token
+  `reset-before-request` instead of `reset`. A connection failure, a refused
+  stream, a reset before the request was fully sent, and a 429, 500, 502 or
+  503 response are retried as before. The schema descriptions of
+  `routes[].retries`, `routes[].fallbacks` and `models.<name>.providers` say
+  this.
+
 ### Fixed
+
+- Envoy mode: the retry token `reset-before-request` fired on any reset before
+  response headers. It now fires only when the request was not fully sent,
+  as Envoy defines it; `reset` still fires in both cases.
 
 - Records: a request that the client abandons while the proxy waits for the
   provider's response headers now gets an access-log line (response code `0`,

@@ -917,6 +917,52 @@ async fn no_retry_policy_issues_exactly_one_attempt() {
         .await;
 }
 
+/// An upstream that reads each request in full, then closes the connection
+/// without a response: the provider held the whole request.
+async fn spawn_upstream_reads_then_closes() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_task = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_one_request(&mut stream).await;
+            count_task.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (addr, count)
+}
+
+/// S3.2: `reset-before-request` retries only a reset before the request was
+/// fully sent. A reset after the provider read the whole request is retried
+/// under `reset`, never under `reset-before-request`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reset_after_the_whole_request_was_sent_is_not_a_reset_before_request() {
+    for (retry_on, attempts) in [("reset-before-request", 1), ("reset", 2)] {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, count) = spawn_upstream_reads_then_closes().await;
+                let router =
+                    build_router(addr, forward_to_up(Some(retry_policy(retry_on, 1)))).await;
+                let resp = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    router.handle(request_with_body("/v1/chat", b"{\"model\":\"m\"}")),
+                )
+                .await
+                .expect("the request ends");
+                assert!(resp.head.status.is_server_error(), "{retry_on}");
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    attempts,
+                    "requests the upstream read in full under `{retry_on}`"
+                );
+            })
+            .await;
+    }
+}
+
 // ------------------------------------------------------------ S4.2 --
 
 /// An upstream that accepts connections in a loop; each connection either

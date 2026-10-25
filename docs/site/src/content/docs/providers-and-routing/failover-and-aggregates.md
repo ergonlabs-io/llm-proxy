@@ -336,8 +336,9 @@ This section is for maintainers.
   in `testing/diffrig/tests/weighted_e2e.rs`. QA scenario:
   `TestQA15_WeightedAliasSplitsAndSkipsAnEjectedProvider` in
   `testing/qa/scenarios/qa15_weighted_providers_test.go`.
-- Lowering sets `retry_on` to `connect-failure,refused-stream,reset,
-  retriable-status-codes` with the status list 429, 500, 502, 503.
+- Lowering sets `retry_on` to `connect-failure,refused-stream,
+  reset-before-request,retriable-status-codes` with the status list 429, 500,
+  502, 503.
 - Lowering raises `num_retries` to reach every member. Test:
   `num_retries_is_raised_to_reach_every_member`.
 - Strict member order: `ClusterHandle::select_aggregate_member` in
