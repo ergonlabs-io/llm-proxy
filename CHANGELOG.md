@@ -10,7 +10,7 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
-## [1.0.0] - (date set at tag)
+## [1.0.0] - 2026-10-24
 
 ### Added
 
