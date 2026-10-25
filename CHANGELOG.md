@@ -10,6 +10,14 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
+### Added
+
+- Metrics: `llmproxy_metadata_instance_info{instance_id}` names the
+  `instance_id` that this process writes in each request record, and
+  `llmproxy_metadata_last_record_seq` reports the highest `record_seq` given
+  out. A consumer can now match the `llmproxy_metadata_*` counters of a scrape
+  to the records of the same process.
+
 ## [1.0.0] - 2026-10-24
 
 ### Added

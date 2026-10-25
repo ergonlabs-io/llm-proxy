@@ -208,6 +208,12 @@ so an idle proxy shows `0` and not a missing series.
 | `llmproxy_metadata_queue_capacity` | none | Queue size. `0` means capture is not configured. |
 | `llmproxy_metadata_written` | none | Records delivered. An append to the file. |
 | `llmproxy_metadata_write_failures` | none | Write failures, or deliveries with an unknown result. |
+| `llmproxy_metadata_instance_info` | `instance_id` | Always `1`. The `instance_id` that this process writes in each record. The proxy creates this series when it opens the records file, so it is missing when no file is set. |
+| `llmproxy_metadata_last_record_seq` | none | The highest `record_seq` that the proxy gave to a record. A record that failed to write counts too. |
+
+Use `llmproxy_metadata_instance_info` to match the counters of one scrape to
+the records of the same process. The `instance_id` changes at each start, so
+the label also separates two processes that run one after the other.
 
 Alert on a rising `llmproxy_metadata_write_failures` and on
 `llmproxy_metadata_admission{outcome="capacity_exceeded"}`.

@@ -1328,6 +1328,28 @@ pub mod instruments {
         buckets: None,
     };
 
+    /// The `instance_id` this process stamps on every request record: one
+    /// series, value 1, present once the records file is open. It changes on
+    /// every start, so a consumer pairs this process's `llmproxy_metadata_*`
+    /// counters with its records by this label (ADR-0011 decision 2).
+    pub const METADATA_INSTANCE_INFO: Instrument = Instrument {
+        name: "llmproxy_metadata_instance_info",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{instance}",
+        attribute_keys: &["instance_id"],
+        buckets: None,
+    };
+
+    /// The highest `record_seq` the writer thread has stamped, written or
+    /// not; the same value as the exit summary's `last_record_seq`.
+    pub const METADATA_LAST_RECORD_SEQ: Instrument = Instrument {
+        name: "llmproxy_metadata_last_record_seq",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "{record}",
+        attribute_keys: &[],
+        buckets: None,
+    };
+
     /// Records successfully appended by the file sink's writer thread.
     pub const METADATA_WRITTEN: Instrument = Instrument {
         name: "llmproxy_metadata_written",
@@ -1429,6 +1451,7 @@ pub struct MetadataDeliveryStats {
     queue_capacity: Handle,
     written: Handle,
     write_failures: Handle,
+    last_record_seq: Handle,
 }
 
 impl MetadataDeliveryStats {
@@ -1462,6 +1485,7 @@ impl MetadataDeliveryStats {
             queue_capacity: control.resolve(&instruments::METADATA_QUEUE_CAPACITY, &[]),
             written: control.resolve(&instruments::METADATA_WRITTEN, &[]),
             write_failures: control.resolve(&instruments::METADATA_WRITE_FAILURES, &[]),
+            last_record_seq: control.resolve(&instruments::METADATA_LAST_RECORD_SEQ, &[]),
         }
     }
 
@@ -1510,6 +1534,22 @@ impl MetadataDeliveryStats {
     /// the bounded channel.
     pub fn record_dequeued(&self) {
         self.registry.add(WorkerId(0), self.queue_depth, -1);
+    }
+
+    /// Lifecycle point: once, when the collector starts, with the
+    /// `instance_id` it stamps on every record. One series per process.
+    pub fn publish_instance(&self, instance_id: &str) {
+        let handle = self.registry.resolve(
+            &instruments::METADATA_INSTANCE_INFO,
+            &[("instance_id", instance_id)],
+        );
+        self.registry.incr(WorkerId(0), handle, 1);
+    }
+
+    /// Lifecycle point: the writer stamped the next `record_seq`. Sequence
+    /// numbers rise by one, so the gauge follows the last one stamped.
+    pub fn record_stamped(&self) {
+        self.registry.incr(WorkerId(0), self.last_record_seq, 1);
     }
 
     /// Lifecycle point: successful JSON serialization plus append write.

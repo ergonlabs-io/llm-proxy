@@ -5,7 +5,7 @@
 #
 # Produced by contract_golden_e2e.rs from the --config dialect after served
 # traffic (auth, tenant and key budgets, token limit, pricing, fallback, ledger,
-# trace export, non-streamed and streamed chat, one 401).
+# request records, trace export, non-streamed and streamed chat, one 401).
 #
 # NOT COVERED: a family renders only once something records into it, so the
 # families below exist in the code but this scenario never reaches them. They
@@ -45,6 +45,8 @@ envoy_llmproxy_ledger_spend_written_micro_usd_total counter
 envoy_llmproxy_ledger_unclean_epochs_total counter
 envoy_llmproxy_ledger_unledgered_total counter reason
 envoy_llmproxy_metadata_admission counter outcome
+envoy_llmproxy_metadata_instance_info gauge instance_id
+envoy_llmproxy_metadata_last_record_seq gauge
 envoy_llmproxy_metadata_queue_capacity gauge
 envoy_llmproxy_metadata_queue_depth gauge
 envoy_llmproxy_metadata_write_failures counter

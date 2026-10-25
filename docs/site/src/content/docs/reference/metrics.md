@@ -167,6 +167,8 @@ means the file is not set. See
 | `llmproxy_metadata_queue_capacity` | gauge | records | none | Queue size. |
 | `llmproxy_metadata_written` | counter | records | none | Records appended to the file. |
 | `llmproxy_metadata_write_failures` | counter | failures | none | Serialization or write failures. A write failure closes admission. |
+| `llmproxy_metadata_instance_info` | gauge | instances | `instance_id` | Always `1`. The `instance_id` in this process's request records. Present only when `--request-records-file` is set. |
+| `llmproxy_metadata_last_record_seq` | gauge | records | none | The highest `record_seq` given to a record, written or not. |
 
 ## Billing ledger
 

@@ -11,7 +11,7 @@
 //! The scenario switches on what a dialect deployment commonly runs: auth with
 //! a minted key, a tenant with policy and budgets, a key budget, a token limit,
 //! pricing, a fallback model (the primary answers 503), the billing ledger,
-//! trace export for an opted-in tenant, a non-streamed and a streamed chat
+//! request records, trace export for an opted-in tenant, a non-streamed and a streamed chat
 //! completion, and one unauthenticated request. Families that appear only
 //! under other conditions are named in each golden file's header as not
 //! covered.
@@ -51,7 +51,7 @@ family name, without `le`.
 
 Produced by contract_golden_e2e.rs from the --config dialect after served
 traffic (auth, tenant and key budgets, token limit, pricing, fallback, ledger,
-trace export, non-streamed and streamed chat, one 401).
+request records, trace export, non-streamed and streamed chat, one 401).
 
 NOT COVERED: a family renders only once something records into it, so the
 families below exist in the code but this scenario never reaches them. They
@@ -439,6 +439,7 @@ impl Proxy {
         let path = dir.join("llmproxy.yaml");
         std::fs::write(&path, config).expect("write temp config");
         let stderr = std::fs::File::create(dir.join("stderr.log")).expect("create stderr log");
+        let records = dir.join("records.jsonl");
         let mut command = Command::new(BIN);
         command
             .args([
@@ -448,6 +449,8 @@ impl Proxy {
                 "1",
                 "--service-node",
                 "contract-node",
+                "--request-records-file",
+                records.to_str().expect("utf-8 path"),
             ])
             .env_remove("LLMPROXY_ADMIN_TOKEN")
             .env_remove("LLMPROXY_ADMIN_UI_DIR")

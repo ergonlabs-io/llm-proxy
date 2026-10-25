@@ -229,6 +229,7 @@ impl MetadataDelivery {
         let sink = match stats.as_ref() {
             Some(stats) => {
                 stats.configure_queue(capacity);
+                stats.publish_instance(&instance_id);
                 sink.with_delivery_stats(stats.clone())
             }
             None => sink,
@@ -267,6 +268,9 @@ impl MetadataDelivery {
                         seq += 1;
                         record.record_seq = Some(seq);
                         thread_last_seq.store(seq, Ordering::Relaxed);
+                        if let Some(stats) = &stats {
+                            stats.record_stamped();
+                        }
                         if thread_reopen.swap(false, Ordering::AcqRel) {
                             file = None;
                         }
@@ -638,6 +642,23 @@ mod tests {
         assert!(
             rendered.contains("envoy_llmproxy_metadata_written 2"),
             "{rendered}"
+        );
+        // The scrape names the instance its counters belong to, and the last
+        // stamped number counts the failed record too, as the summary does.
+        assert!(
+            rendered.contains(&format!(
+                "envoy_llmproxy_metadata_instance_info{{instance_id=\"{}\"}} 1",
+                summary.instance_id
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "envoy_llmproxy_metadata_last_record_seq {}",
+                summary.last_record_seq
+            )) && summary.last_record_seq == 3,
+            "last_record_seq {} must render:\n{rendered}",
+            summary.last_record_seq
         );
     }
 
