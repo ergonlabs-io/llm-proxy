@@ -75,6 +75,9 @@ impl Provider {
         }
     }
 
+    /// Serves one request per connection. Each answer says `Connection: close`,
+    /// or the proxy could reuse the pooled connection as it closes and answer
+    /// 503, since a request the provider may have received is not resent.
     async fn serve(mut socket: TcpStream, retries: Arc<AtomicUsize>) {
         let Some(request) = read_request(&mut socket).await else {
             return;
@@ -89,7 +92,7 @@ impl Provider {
             let frame = r#"data: {"id":"chatcmpl-cut","model":"cut-model","choices":[{"index":0,"delta":{"content":"abcd"}}]}"#;
             let chunk = format!("{frame}\n\n");
             let mut out = String::from(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
             );
             for _ in 0..2 {
                 out.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
@@ -103,7 +106,7 @@ impl Provider {
             let _ = socket
                 .write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
                     )
                     .as_bytes(),
