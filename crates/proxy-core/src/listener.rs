@@ -2294,6 +2294,7 @@ mod tests {
             upstream_protocol: proxy_config::ir::UpstreamProtocol::Http1,
             request_headers_to_add: Vec::new(),
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             request_path_rewrite: None,
             provider_runtime: None,
             health_check: None,

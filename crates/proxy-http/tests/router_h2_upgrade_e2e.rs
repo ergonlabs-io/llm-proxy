@@ -101,6 +101,7 @@ async fn build_router(
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: None,
             outlier_detection: None,
         }),

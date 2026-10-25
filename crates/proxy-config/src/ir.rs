@@ -988,6 +988,10 @@ pub struct ClusterConfig {
     /// `convert_cluster`), so the member that actually serves a request is
     /// the one that must carry it.
     pub usage_dialect: Option<UsageDialect>,
+    /// What an attempt to this cluster that got no response is charged. Set
+    /// by `unanswered` under the same `io.llmproxy.usage` metadata as
+    /// `usage_dialect`; [`UnansweredUsage::Input`] otherwise.
+    pub unanswered_usage: UnansweredUsage,
     /// S6 active health checking; `None` when the config configures
     /// none, which is Envoy's own default (no probing, every host healthy).
     /// Singular though the proto field is repeated — see [`HealthCheckIR`].
@@ -1227,6 +1231,26 @@ pub enum UsageDialect {
     OpenAi,
     /// Anthropic's Messages API request/response and SSE shapes.
     Anthropic,
+}
+
+/// What the usage filter charges for an attempt that sent this cluster's
+/// provider the whole request and got no response back: the client left, a
+/// timer cut the wait, or the connection closed. The provider can still bill
+/// such a request, so a provider-specific choice lives on the cluster
+/// (AGENTS.md invariant 6), and unset is never free (AGENTS.md "Fail-open
+/// controls").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnansweredUsage {
+    /// Charge nothing. The operator's choice, counted and warned about.
+    None,
+    /// Charge the estimated input tokens (the request size over four), and
+    /// no output. The default.
+    #[default]
+    Input,
+    /// Charge the estimated input tokens plus the output cap: the request's
+    /// own output-token limit, else the model's `max_output_tokens`. An upper
+    /// bound; without either limit it charges as [`Self::Input`].
+    OutputCap,
 }
 
 /// Which HTTP protocol version the proxy speaks to a cluster's upstreams.

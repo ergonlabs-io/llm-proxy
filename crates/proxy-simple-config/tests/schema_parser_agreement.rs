@@ -271,6 +271,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_variants::<UpstreamProtocol>,
         ),
         (
+            "#/$defs/Provider/properties/unanswered_usage",
+            "UnansweredUsageDef",
+            parser_variants::<UnansweredUsageDef>,
+        ),
+        (
             "#/$defs/ModelProvider/properties/dialect",
             "Dialect",
             parser_variants::<Dialect>,

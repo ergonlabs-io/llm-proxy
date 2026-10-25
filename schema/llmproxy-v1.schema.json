@@ -858,6 +858,12 @@
             }
           }
         },
+        "unanswered_usage": {
+          "type": "string",
+          "enum": ["none", "input", "output_cap"],
+          "default": "input",
+          "description": "What a request is charged when this provider received the whole request and sent no response: the client left, a timeout cut the wait for the response, or the connection closed. `input` charges the estimated input tokens (the request size in bytes divided by 4) and no output. `output_cap` charges the estimated input tokens plus the output-token limit: the request's own `max_tokens`, `max_completion_tokens` or `max_output_tokens`, else the model's `max_output_tokens`; without a limit it charges as `input`. `none` charges nothing, and the proxy counts and logs each such request. The charge is an estimate (`completeness: partial`, `cost.kind: estimate`) priced at this provider's rate card. It applies to the chat completions, completions, responses, messages and embeddings endpoints. Each attempt of a fallback chain is charged by the provider it reached."
+        },
         "circuit_breakers": {
           "type": "object",
           "additionalProperties": false,

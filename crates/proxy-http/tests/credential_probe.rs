@@ -142,6 +142,7 @@ fn cluster(name: &str, addr: SocketAddr) -> ClusterConfig {
             tenant_credential: Some(slot()),
         }),
         usage_dialect: None,
+        unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
         health_check: None,
         outlier_detection: None,
     }

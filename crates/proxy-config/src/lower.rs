@@ -4301,7 +4301,8 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
     // A known instance of AGENTS.md invariant 6: the usage-filter dialect
     // is per-provider, so it rides the same `Cluster.metadata.filter_metadata`
     // smuggling channel as credentials above, under its own namespace.
-    let usage_dialect = convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
+    let (usage_dialect, unanswered_usage) =
+        convert_usage_dialect_metadata(c.metadata.as_ref(), path)?;
     let request_path_rewrite = convert_request_path_rewrite_metadata(c.metadata.as_ref(), path)?;
     // S6 active health checking: meaningful on an aggregate too, in
     // principle, but Envoy runs health checks against a cluster's own hosts
@@ -4345,6 +4346,7 @@ fn convert_cluster(c: &cluster_v3::Cluster, path: &str) -> Result<ClusterConfig,
         request_path_rewrite,
         provider_runtime,
         usage_dialect,
+        unanswered_usage,
         health_check,
         outlier_detection,
         eds,
@@ -5609,23 +5611,24 @@ fn convert_streaming_strict_metadata(
 }
 
 /// Lower `Cluster.metadata.filter_metadata["io.llmproxy.usage"]` into
-/// [`ClusterConfig::usage_dialect`]. The expected shape is
-/// `{ dialect: "openai" | "anthropic" }`.
+/// [`ClusterConfig::usage_dialect`] and [`ClusterConfig::unanswered_usage`].
+/// The expected shape is `{ dialect: "openai" | "anthropic", unanswered:
+/// "none" | "input" | "output_cap" }`, with `unanswered` optional.
 ///
 /// Same re-implementation-by-hand rationale as
 /// [`convert_provider_auth_metadata`]: `google.protobuf.Struct` is opaque to
 /// the reflective surface walk, so AGENTS.md invariant 1 has to be enforced here
-/// directly -- an unrecognized `dialect` value, a missing `dialect` key, or
-/// any unexpected key in the namespace is a hard error with its full dotted
+/// directly -- an unrecognized value, a missing `dialect` key, or any
+/// unexpected key in the namespace is a hard error with its full dotted
 /// path, never a silent skip. Any *other* `filter_metadata` namespace
 /// (including [`PROVIDER_AUTH_METADATA_KEY`]) is left alone.
 fn convert_usage_dialect_metadata(
     metadata: Option<&core_v3::Metadata>,
     path: &str,
-) -> Result<Option<UsageDialect>, ConfigError> {
+) -> Result<(Option<UsageDialect>, UnansweredUsage), ConfigError> {
     let Some(usage) = metadata.and_then(|m| m.filter_metadata.get(USAGE_DIALECT_METADATA_KEY))
     else {
-        return Ok(None);
+        return Ok((None, UnansweredUsage::default()));
     };
     let usage_path = format!("{path}.metadata.filter_metadata[\"{USAGE_DIALECT_METADATA_KEY}\"]");
 
@@ -5634,13 +5637,16 @@ fn convert_usage_dialect_metadata(
     let mut unknown: Vec<&String> = usage
         .fields
         .keys()
-        .filter(|k| k.as_str() != "dialect")
+        .filter(|k| !matches!(k.as_str(), "dialect" | "unanswered"))
         .collect();
     unknown.sort();
     if let Some(key) = unknown.first() {
         return Err(unsupported(
             format!("{usage_path}.{key}"),
-            format!("`{USAGE_DIALECT_METADATA_KEY}` only supports a `dialect` string"),
+            format!(
+                "`{USAGE_DIALECT_METADATA_KEY}` only supports a `dialect` string and an \
+                 `unanswered` string"
+            ),
         ));
     }
 
@@ -5650,14 +5656,36 @@ fn convert_usage_dialect_metadata(
         Some(_) => return Err(invalid(&dialect_path, "must be a string")),
         None => return Err(invalid(&dialect_path, "is required")),
     };
-    match dialect {
-        "openai" => Ok(Some(UsageDialect::OpenAi)),
-        "anthropic" => Ok(Some(UsageDialect::Anthropic)),
-        other => Err(invalid(
-            &dialect_path,
-            format!("unrecognized dialect `{other}`; expected `openai` or `anthropic`"),
-        )),
-    }
+    let dialect = match dialect {
+        "openai" => UsageDialect::OpenAi,
+        "anthropic" => UsageDialect::Anthropic,
+        other => {
+            return Err(invalid(
+                &dialect_path,
+                format!("unrecognized dialect `{other}`; expected `openai` or `anthropic`"),
+            ))
+        }
+    };
+
+    let unanswered_path = format!("{usage_path}.unanswered");
+    let unanswered = match usage.fields.get("unanswered").and_then(|v| v.kind.as_ref()) {
+        None => UnansweredUsage::default(),
+        Some(prost_types::value::Kind::StringValue(v)) => match v.as_str() {
+            "none" => UnansweredUsage::None,
+            "input" => UnansweredUsage::Input,
+            "output_cap" => UnansweredUsage::OutputCap,
+            other => {
+                return Err(invalid(
+                    &unanswered_path,
+                    format!(
+                        "unrecognized value `{other}`; expected `none`, `input` or `output_cap`"
+                    ),
+                ))
+            }
+        },
+        Some(_) => return Err(invalid(&unanswered_path, "must be a string")),
+    };
+    Ok((Some(dialect), unanswered))
 }
 
 // ------------------------------------------------------------------ tracing --

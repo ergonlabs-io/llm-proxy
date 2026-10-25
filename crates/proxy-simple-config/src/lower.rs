@@ -1439,10 +1439,14 @@ fn lower_provider(
         }
         _ => {}
     }
+    let mut usage = json!({ "dialect": dialect });
+    if let Some(unanswered) = provider.unanswered_usage {
+        usage["unanswered"] = json!(unanswered.as_str());
+    }
     cluster["metadata"] = json!({
         "filter_metadata": {
             PROVIDER_AUTH_METADATA_KEY: provider_auth,
-            USAGE_DIALECT_METADATA_KEY: { "dialect": dialect },
+            USAGE_DIALECT_METADATA_KEY: usage,
         }
     });
     if let Some(template) = path_template {

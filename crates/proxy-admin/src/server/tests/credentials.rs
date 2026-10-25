@@ -39,6 +39,7 @@ fn provider_cluster(name: &str, verify_path: Option<&str>) -> ClusterConfig {
         upstream_protocol: UpstreamProtocol::Http1,
         request_headers_to_add: Vec::new(),
         usage_dialect: None,
+        unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
         request_path_rewrite: None,
         provider_runtime: Some(proxy_config::ir::ProviderRuntimeConfig {
             credential: None,

@@ -82,6 +82,7 @@ fn cluster(name: &str, addr: SocketAddr, runtime: Option<ProviderRuntimeConfig>)
         request_path_rewrite: None,
         provider_runtime: runtime,
         usage_dialect: None,
+        unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
         health_check: None,
         outlier_detection: None,
     }

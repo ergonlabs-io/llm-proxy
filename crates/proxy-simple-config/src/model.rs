@@ -552,6 +552,37 @@ pub struct Provider {
     /// left unset keeps the Envoy default of 1024.
     #[serde(default)]
     pub circuit_breakers: Option<CircuitBreakersDef>,
+    /// What a request is charged when this provider received the whole of it
+    /// and sent no response: the client left, a timer cut the wait, or the
+    /// connection closed. It sits on the provider, never the route (AGENTS.md
+    /// invariant 6), so each attempt of a fallback chain is charged by the
+    /// provider it reached. Lowers to `unanswered` in the provider cluster's
+    /// `io.llmproxy.usage` metadata. Absent means `input`.
+    #[serde(default)]
+    pub unanswered_usage: Option<UnansweredUsageDef>,
+}
+
+/// `providers.<name>.unanswered_usage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnansweredUsageDef {
+    /// Charge nothing; counted and warned about.
+    None,
+    /// The estimated input tokens, no output.
+    Input,
+    /// The estimated input tokens plus the output-token limit.
+    OutputCap,
+}
+
+impl UnansweredUsageDef {
+    /// The value `io.llmproxy.usage.unanswered` carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Input => "input",
+            Self::OutputCap => "output_cap",
+        }
+    }
 }
 
 /// `providers.<name>.circuit_breakers`: the S5 budgets of one provider

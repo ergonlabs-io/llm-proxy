@@ -282,6 +282,59 @@ routes:
     assert_eq!(field_path, "providers.openai.protocol");
 }
 
+/// `providers.<name>.unanswered_usage` reaches each provider's own cluster,
+/// so a fallback chain charges each attempt by the provider it reached
+/// (AGENTS.md invariant 6). A provider that does not set it is `input`.
+#[test]
+fn unanswered_usage_lowers_to_each_providers_cluster() {
+    let config = parse(
+        r#"
+version: 1
+providers:
+  openai: { api_key: ${OPENAI_API_KEY}, unanswered_usage: output_cap }
+  anthropic: { type: anthropic, api_key: ${ANTHROPIC_API_KEY}, unanswered_usage: none }
+  backup: { type: openai-compatible, base_url: "http://127.0.0.1:9" }
+routes:
+  - { model: "gpt-*", provider: openai, fallbacks: [backup] }
+  - { model: "*", provider: anthropic }
+"#,
+    )
+    .expect("must parse");
+    let loaded = lower_to_loaded(&config).expect("must lower");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("must build IR");
+    use proxy_config::ir::UnansweredUsage;
+    for (cluster, expected) in [
+        ("provider:openai", UnansweredUsage::OutputCap),
+        ("provider:anthropic", UnansweredUsage::None),
+        ("provider:backup", UnansweredUsage::Input),
+    ] {
+        assert_eq!(
+            snapshot.clusters[cluster].unanswered_usage, expected,
+            "{cluster}"
+        );
+    }
+}
+
+/// An unknown `unanswered_usage` value is a load error naming the full dotted
+/// path (AGENTS.md invariant 1), never a fallback to some charge.
+#[test]
+fn unanswered_usage_bad_value_errors_with_path() {
+    let err = parse(
+        r#"
+version: 1
+providers:
+  openai: { api_key: ${OPENAI_API_KEY}, unanswered_usage: free }
+routes:
+  - { model: "*", provider: openai }
+"#,
+    )
+    .expect_err("an unknown value must fail");
+    let ConfigError::InvalidValue { field_path, .. } = &err else {
+        panic!("expected InvalidValue, got: {err}");
+    };
+    assert_eq!(field_path, "providers.openai.unanswered_usage");
+}
+
 /// Model globs lower to the right header matchers on the model header.
 #[test]
 fn model_globs_lower_to_header_matchers() {

@@ -129,6 +129,7 @@ fn member_cluster(name: &str, addr: SocketAddr, mutations: Vec<HeaderMutation>) 
         request_path_rewrite: None,
         provider_runtime: None,
         usage_dialect: None,
+        unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
         health_check: None,
         outlier_detection: None,
     }
@@ -158,6 +159,7 @@ fn aggregate_cluster() -> ClusterConfig {
         request_path_rewrite: None,
         provider_runtime: None,
         usage_dialect: None,
+        unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
         health_check: None,
         outlier_detection: None,
     }

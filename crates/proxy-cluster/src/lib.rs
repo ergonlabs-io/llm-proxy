@@ -577,6 +577,10 @@ pub trait ClusterEntry: Send + Sync {
     /// `None` for ordinary clusters that never set the llmproxy usage metadata.
     fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect>;
 
+    /// What an attempt to this cluster that sent the whole request and got
+    /// no response is charged (`ClusterConfig::unanswered_usage`).
+    fn unanswered_usage(&self) -> proxy_config::ir::UnansweredUsage;
+
     /// Feeds one upstream attempt's outcome to this cluster's S6 outlier detector. `addr` is the host the attempt
     /// dialed. A no-op without outlier detection, so the router can call it after every attempt. Takes `&self`
     /// because the detector does its own interior locking.

@@ -39,6 +39,11 @@ static_resources:
 "#;
     let snapshot = snapshot_from(yaml).expect("must lower");
     assert_eq!(snapshot.clusters["c1"].usage_dialect, None);
+    // Unset is never free (AGENTS.md "Fail-open controls").
+    assert_eq!(
+        snapshot.clusters["c1"].unanswered_usage,
+        UnansweredUsage::Input
+    );
 }
 
 /// A namespace belonging to some other consumer (including the credentials
@@ -209,4 +214,54 @@ static_resources:
 "#;
     let err = snapshot_from(yaml).expect_err("metadata on an aggregate must not load");
     assert_eq!(err_path(&err), "static_resources.clusters[0].metadata");
+}
+
+/// `unanswered` sets what an attempt that got no response is charged; each
+/// documented value lowers, and omitting it means `input`.
+#[test]
+fn each_unanswered_value_lowers_to_the_cluster() {
+    for (value, expected) in [
+        ("none", UnansweredUsage::None),
+        ("input", UnansweredUsage::Input),
+        ("output_cap", UnansweredUsage::OutputCap),
+    ] {
+        let yaml = format!(
+            r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.usage:
+            dialect: openai
+            unanswered: {value}
+"#
+        );
+        let snapshot = snapshot_from(&yaml).expect("must lower");
+        assert_eq!(
+            snapshot.clusters["c1"].unanswered_usage, expected,
+            "{value}"
+        );
+    }
+}
+
+/// AGENTS.md invariant 1: an unrecognized `unanswered` value names its field
+/// rather than falling back to a default charge.
+#[test]
+fn an_unrecognized_unanswered_value_is_a_hard_error() {
+    let yaml = r#"
+static_resources:
+  clusters:
+    - name: c1
+      metadata:
+        filter_metadata:
+          io.llmproxy.usage:
+            dialect: openai
+            unanswered: free
+"#;
+    let err = snapshot_from(yaml).expect_err("an unknown value must not load");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[0].metadata.filter_metadata[\"io.llmproxy.usage\"].unanswered"
+    );
 }

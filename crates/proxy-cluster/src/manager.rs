@@ -1210,6 +1210,10 @@ impl ClusterEntry for ClusterHandle {
         self.managed.config.usage_dialect
     }
 
+    fn unanswered_usage(&self) -> proxy_config::ir::UnansweredUsage {
+        self.managed.config.unanswered_usage
+    }
+
     fn report_outlier_result(&self, addr: SocketAddr, result: RequestResult) {
         // No-op unless this cluster configures outlier detection. For an aggregate, the router calls this on the
         // member's entry (the one owning the dialled host), which is why it reaches the member's detector.
@@ -1252,6 +1256,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: None,
             outlier_detection: None,
         })
@@ -1288,6 +1293,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: None,
             outlier_detection: None,
         })
@@ -1314,6 +1320,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: None,
             outlier_detection: None,
         })
@@ -1350,6 +1357,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: None,
             outlier_detection: Some(od),
         })
@@ -1377,6 +1385,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: None,
             outlier_detection: None,
         })
@@ -1419,6 +1428,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: Some(health_check),
             outlier_detection: None,
         })
@@ -1478,6 +1488,7 @@ mod tests {
             request_path_rewrite: None,
             provider_runtime: None,
             usage_dialect: None,
+            unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
             health_check: Some(health_check),
             outlier_detection: Some(od),
         })
@@ -2670,6 +2681,7 @@ mod tests {
                 request_path_rewrite: None,
                 provider_runtime: None,
                 usage_dialect: None,
+                unanswered_usage: proxy_config::ir::UnansweredUsage::default(),
                 health_check: None,
                 outlier_detection: None,
             }),
