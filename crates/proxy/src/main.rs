@@ -228,9 +228,12 @@ impl LogLevel {
 /// visible; logs always go to stderr so stdout's validate/translate contract
 /// is untouched.
 fn init_tracing(level: LogLevel) {
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(level.filter_directive()))
         .with_writer(std::io::stderr)
+        // Colour codes only for a terminal; a redirected log file stays plain text.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 }
 
@@ -543,12 +546,17 @@ const ADMIN_TOKEN_ENV_VAR: &str = "LLMPROXY_ADMIN_TOKEN";
 /// Env var pointing at the `make ui-build` output directory
 /// (`admin-ui/dist/`). When set, the admin server loads the single-page admin
 /// UI into memory once at startup and serves it same-origin under `/ui` --
-/// no CORS, no extra port. Unset (or pointing at a dir without an
+/// no CORS, no extra port. Unset, the `admin-ui-dist` directory next to the
+/// binary is used if it exists. Unset with no such directory (or pointing at a dir without an
 /// `index.html`) keeps the API-only behavior: `/ui` 404s with a hint. A
 /// broken dir is a warning, not a startup error -- the API surface is the
 /// contract, the UI is convenience, and refusing to serve traffic over a
 /// missing bundle would invert that priority.
 const ADMIN_UI_DIR_ENV_VAR: &str = "LLMPROXY_ADMIN_UI_DIR";
+
+/// The UI bundle's directory name in the release archive, next to the binary. Used when
+/// `LLMPROXY_ADMIN_UI_DIR` is unset (see [`admin_ui_dir`]).
+const ADMIN_UI_DIR_BESIDE_BINARY: &str = "admin-ui-dist";
 
 #[allow(clippy::too_many_arguments)]
 async fn run_serve(
@@ -2828,25 +2836,24 @@ async fn start_admin(
     let token_set = admin_token
         .as_deref()
         .is_some_and(|token| !token.trim().is_empty());
-    let ui = std::env::var(ADMIN_UI_DIR_ENV_VAR)
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-        .and_then(
-            |dir| match proxy_admin::UiAssets::load_from_dir(std::path::Path::new(&dir)) {
-                Ok(assets) => {
-                    tracing::info!(dir = %dir, "admin UI loaded, serving under /ui");
-                    Some(Arc::new(assets))
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        dir = %dir,
-                        error = %err,
-                        "admin UI not loaded, /ui will 404; API surface unaffected"
-                    );
-                    None
-                }
-            },
-        );
+    let ui = admin_ui_dir(
+        std::env::var(ADMIN_UI_DIR_ENV_VAR).ok(),
+        std::env::current_exe().ok(),
+    )
+    .and_then(|dir| match proxy_admin::UiAssets::load_from_dir(&dir) {
+        Ok(assets) => {
+            tracing::info!(dir = %dir.display(), "admin UI loaded, serving under /ui");
+            Some(Arc::new(assets))
+        }
+        Err(err) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %err,
+                "admin UI not loaded, /ui will 404; API surface unaffected"
+            );
+            None
+        }
+    });
     let ui_loaded = ui.is_some();
     let server = proxy_admin::serve(
         addr,
@@ -2877,6 +2884,20 @@ async fn start_admin(
     Ok(Some(server))
 }
 
+/// The directory to load the admin UI from: `LLMPROXY_ADMIN_UI_DIR` when set, otherwise the
+/// `admin-ui-dist` directory next to the binary, which is where the release archive puts it. The
+/// fallback applies only when that directory exists, so a binary without it stays API-only and quiet.
+fn admin_ui_dir(
+    env: Option<String>,
+    exe: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = env.filter(|dir| !dir.trim().is_empty()) {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    let bundled = exe?.parent()?.join(ADMIN_UI_DIR_BESIDE_BINARY);
+    bundled.is_dir().then_some(bundled)
+}
+
 /// What the operator needs to hear about the admin server at startup: where the UI is, and whether its writes can
 /// work. The admin gate already refuses every write with 403 when the token is unset; without this line a new user
 /// first learns that from a failed click.
@@ -2896,8 +2917,8 @@ fn admin_startup_notes(
         Some(format!("admin UI: {scheme}://{addr}/ui/"))
     } else {
         Some(format!(
-            "admin UI not loaded: set {ADMIN_UI_DIR_ENV_VAR} to the UI bundle (the release archive's admin-ui-dist) \
-             to serve it at {scheme}://{addr}/ui/"
+            "admin UI not loaded: set {ADMIN_UI_DIR_ENV_VAR} to the UI bundle (the release archive's admin-ui-dist, \
+             found automatically next to the binary) to serve it at {scheme}://{addr}/ui/"
         ))
     };
     let token = (!token_set).then(|| {
@@ -3221,6 +3242,35 @@ impl ControlSignals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The release archive unpacks `llm-proxy` and `admin-ui-dist` side by side; the UI must load
+    /// from there with no env var, the env var must win when set, and a binary without the
+    /// directory must stay API-only.
+    #[test]
+    fn admin_ui_dir_prefers_the_env_var_then_the_bundle_beside_the_binary() {
+        let unpacked = tempfile::tempdir().unwrap();
+        let exe = unpacked.path().join("llm-proxy");
+        let bundled = unpacked.path().join("admin-ui-dist");
+
+        assert_eq!(
+            admin_ui_dir(None, Some(exe.clone())),
+            None,
+            "no bundle beside the binary means no UI"
+        );
+
+        std::fs::create_dir(&bundled).unwrap();
+        assert_eq!(admin_ui_dir(None, Some(exe.clone())), Some(bundled.clone()));
+        assert_eq!(
+            admin_ui_dir(Some("  ".to_owned()), Some(exe.clone())),
+            Some(bundled),
+            "a blank env var counts as unset"
+        );
+        assert_eq!(
+            admin_ui_dir(Some("/srv/ui".to_owned()), Some(exe)),
+            Some(std::path::PathBuf::from("/srv/ui")),
+            "the env var overrides the bundled copy"
+        );
+    }
 
     #[test]
     fn admin_startup_notes_name_the_ui_and_warn_only_without_a_token() {

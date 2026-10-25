@@ -4,7 +4,7 @@ description: Route to OpenRouter with one key, import its model catalog and toke
 summary: The OpenRouter provider block, the /v1 to /api/v1 path rewrite, the
   generated catalog example, the denied request fields, and the pricing
   snapshot.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-25
 related:
   - providers/overview
   - limits-and-budgets/pricing-and-cost-tracking
@@ -39,6 +39,12 @@ providers:
 routes:
   - model: "*"
     provider: openrouter
+
+# One JSON line per request on stdout, with the token counts.
+observability:
+  access_logs:
+    output: stdout
+    format: json
 ```
 
 1. Set the key and check the file.
@@ -59,12 +65,18 @@ routes:
    ```bash
    curl --max-time 30 http://127.0.0.1:53421/v1/chat/completions \
      -H 'content-type: application/json' \
-     -d '{"model":"anthropic/claude-sonnet-4.5","messages":[{"role":"user","content":"hi"}]}'
+     -d '{"model":"google/gemini-2.5-flash-lite","messages":[{"role":"user","content":"hi"}]}'
    ```
 
 The request reaches `https://openrouter.ai/api/v1/chat/completions`. The
 proxy forwards the client model name unchanged, so use the OpenRouter model
-IDs.
+IDs. Free models (IDs that end in `:free`) are often rate limited by
+OpenRouter; the proxy passes their `429` through to the client.
+
+Do not use the quick-start file with `UPSTREAM_BASE_URL=https://openrouter.ai`.
+A provider with a generic name does not get the `/api/v1` path rewrite, so
+every request reaches the OpenRouter website and gets an HTML `404`. Name the
+provider `openrouter`, or set `type: openrouter`.
 
 ## Fields
 

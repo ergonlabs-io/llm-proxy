@@ -11,6 +11,10 @@
 # For a local Ollama, set UPSTREAM_BASE_URL=http://127.0.0.1:11434 and set
 # UPSTREAM_API_KEY to any value; Ollama ignores it.
 #
+# Not for OpenRouter: it serves its API under /api/v1, and only a provider
+# named `openrouter` (or with `type: openrouter`) rewrites the path. See the
+# README's Quick start, step 1.
+#
 # The proxy listens on loopback only and has no `auth` section, so it does not
 # check callers. Anyone who can reach the port uses your provider key. Add
 # virtual keys before you expose it (docs: Authentication > Virtual keys).

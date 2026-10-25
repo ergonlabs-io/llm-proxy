@@ -3,7 +3,7 @@ title: Admin UI
 description: "Serve the single-page admin console at /ui/, sign in with the admin token, and use its pages to check setup, create keys, and set prices."
 summary: How to load the admin UI with LLMPROXY_ADMIN_UI_DIR, how to sign in
   with the admin token, and what each page does.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-10-25
 related:
   - administration/admin-api
   - getting-started/quickstart
@@ -20,9 +20,11 @@ no CORS setup is needed.
 
 ## At a glance
 
-- **Default when unset:** off. `GET /ui` answers `404` with a hint.
-- **How to turn on:** set the `admin` address in the config and set
-  `LLMPROXY_ADMIN_UI_DIR`.
+- **Default when unset:** the proxy loads the `admin-ui-dist` directory next
+  to the binary, as the release archive unpacks it. With no such directory,
+  `GET /ui` answers `404` with a hint.
+- **How to turn on:** set the `admin` address in the config. Run the binary
+  from the unpacked release archive, or set `LLMPROXY_ADMIN_UI_DIR`.
 - **Failure mode:** a missing or broken UI directory logs a warning. The API
   keeps running.
 - **Changes need a token:** the page loads without a token. Every change needs
@@ -35,7 +37,12 @@ installer copies that directory to `~/.config/llm-proxy/admin-ui-dist`
 (`/var/lib/llm-proxy/admin-ui-dist` when it runs as root). It also sets
 `LLMPROXY_ADMIN_UI_DIR` in the service runner it writes.
 
-To run the proxy yourself, set both variables and start the proxy:
+If you run the binary from the directory where you unpacked the release
+archive, the proxy finds `admin-ui-dist` next to it and you do not need
+`LLMPROXY_ADMIN_UI_DIR`. Set the variable when the UI files are somewhere
+else. It overrides the directory next to the binary.
+
+To run the proxy with the installed copy, set both variables and start the proxy:
 
 ```sh
 export LLMPROXY_ADMIN_TOKEN="$(cat admin-token)"

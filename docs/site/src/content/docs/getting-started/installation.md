@@ -1,7 +1,7 @@
 ---
 title: Install llm-proxy
 description: "Install llm-proxy from a release archive, a container image, or source. Send a first request in about five minutes, then run it as a service."
-lastUpdated: 2026-10-22
+lastUpdated: 2026-10-25
 related:
   - getting-started/quickstart
   - reference/cli
@@ -154,8 +154,8 @@ The proxy listens on `127.0.0.1:8080`. The admin address is
 
 The start-up log has some lines that you can ignore in the quick start:
 
-- On macOS, one `failed to pin worker to core, continuing unpinned` warning
-  for each worker.
+- On macOS, one `failed to pin workers to cores` warning. macOS does not
+  let a process pin threads to cores, so the workers run unpinned.
 - A warning that `LLMPROXY_ADMIN_TOKEN` is not set. The admin API then
   refuses writes.
 - An info line `admin UI not loaded`. The admin UI is off.

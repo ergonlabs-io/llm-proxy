@@ -577,7 +577,9 @@ fn spawn_bound(
         source,
     })?;
     let addr = listener_ir.address;
-    tracing::info!(listener = %name, %addr, "listener bound");
+    // Debug, not info: every worker binds its own socket, so info would print the same line once per
+    // worker. The `llm-proxy started` line names each listener once.
+    tracing::debug!(listener = %name, %addr, "listener bound");
     let task = spawn_accept_loop(
         name.clone(),
         tcp_listener,

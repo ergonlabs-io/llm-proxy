@@ -6,6 +6,7 @@
 //! its handle in the same [`SnapshotHandles`] registry, so [`ConfigPublisher::publish`] cannot leave it behind.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -154,6 +155,16 @@ impl WorkerPool {
         let (drain_coordinator, drain_rx) = DrainCoordinator::new(config.concurrency);
         let drain_done_tx = drain_coordinator.done_sender();
 
+        let available_cores = core_ids.as_ref().map_or(0, Vec::len);
+        if config.pin_cores && available_cores < config.concurrency {
+            tracing::warn!(
+                workers = config.concurrency,
+                cores = available_cores,
+                "fewer CPU cores to pin to than workers (pin_cores requested); the rest run unpinned"
+            );
+        }
+        let pin_failure_reported = Arc::new(AtomicBool::new(false));
+
         let connection_limiter = crate::admission::ConnectionLimiter::default();
         for i in 0..config.concurrency {
             let id = WorkerId(i);
@@ -168,21 +179,19 @@ impl WorkerPool {
             let worker_main = worker_main.clone();
 
             let core_id = core_ids.as_ref().and_then(|ids| ids.get(i).copied());
-            if config.pin_cores && core_id.is_none() {
-                tracing::warn!(
-                    worker = i,
-                    "no CPU core available to pin to (pin_cores requested); running unpinned"
-                );
-            }
+            let pin_failure_reported = pin_failure_reported.clone();
 
             let thread = std::thread::Builder::new()
                 .name(format!("worker-{i}"))
                 .spawn(move || {
                     if let Some(core_id) = core_id {
-                        if !core_affinity::set_for_current(core_id) {
+                        // One warning per process, not per worker: the cause (macOS on Apple
+                        // silicon refuses affinity, a cgroup cpuset) is the same for every worker.
+                        if !core_affinity::set_for_current(core_id)
+                            && !pin_failure_reported.swap(true, Ordering::Relaxed)
+                        {
                             tracing::warn!(
-                                worker = i,
-                                "failed to pin worker to core, continuing unpinned"
+                                "failed to pin workers to cores (unsupported on this platform), continuing unpinned"
                             );
                         }
                     }

@@ -107,7 +107,10 @@ provider on failover. That has been a real key-disclosure bug here twice.
 - **Meters tokens.** Input, output, and separately-priced buckets are read from
   provider responses, for streaming and non-streaming requests alike, and land in
   the access log. `/v1/embeddings` requests are metered and charged the same way.
-  The proxy answers `GET /v1/models` itself, with the models the caller may use.
+  When `routes` or `models` name individual models, the proxy answers
+  `GET /v1/models` itself, with the models the caller may use. Patterns with
+  `*` are not listed, so a config with only a `"*"` route passes the request
+  to the provider.
 
 - **Enforces token budgets.** A tenant over its limit gets a 429 with
   `x-ratelimit-*` headers before the request reaches a provider. A request already
@@ -201,6 +204,8 @@ get the proxy; the run steps after it are the same for all three.
 ```sh
 os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 curl -fsSLO "https://github.com/ergonlabs-io/llm-proxy/releases/latest/download/llm-proxy-$os-$arch.tar.gz"
+curl -fsSLO "https://github.com/ergonlabs-io/llm-proxy/releases/latest/download/llm-proxy-$os-$arch.tar.gz.sha256"
+shasum -a 256 -c "llm-proxy-$os-$arch.tar.gz.sha256"     # prints: llm-proxy-...tar.gz: OK
 tar -xzf "llm-proxy-$os-$arch.tar.gz"
 curl -fsSLO https://raw.githubusercontent.com/ergonlabs-io/llm-proxy/main/examples/llmproxy-quickstart.yaml
 ```
@@ -248,6 +253,28 @@ export UPSTREAM_API_KEY=sk-...                     # your provider key
 For a local Ollama, use `UPSTREAM_BASE_URL=http://127.0.0.1:11434` and any
 value for the key.
 
+For OpenRouter, do not use this file: OpenRouter serves its API under
+`/api/v1`, and only a provider named `openrouter` (or with
+`type: openrouter`) rewrites the path. Save this as `llmproxy.yaml` instead,
+and use it in place of `llmproxy-quickstart.yaml` in the next steps:
+
+```yaml
+version: 1
+listen: 127.0.0.1:8080
+admin: 127.0.0.1:9901
+providers:
+  openrouter:                        # type and base_url inferred from the name
+    api_key: ${OPENROUTER_API_KEY}
+routes:
+  - model: "*"
+    provider: openrouter
+observability:
+  access_logs: { output: stdout, format: json }
+```
+
+Send OpenRouter model IDs, for example `google/gemini-2.5-flash-lite`. Free
+models (`:free`) are often rate limited upstream and return `429`.
+
 **2. Start it.** It listens on `127.0.0.1:8080`, with the admin endpoint on
 `127.0.0.1:9901`.
 
@@ -265,7 +292,9 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 The proxy replaces the caller's `Authorization` header with the provider key
 and prints one JSON access-log line per request, with `llm_input_tokens` and
 `llm_output_tokens`. The quick-start config has no `auth` section, so it does
-not check callers; keep it on loopback. Next:
+not check callers; keep it on loopback. The release archive's admin UI loads
+automatically at `http://127.0.0.1:9901/ui/` (read-only until you set
+`LLMPROXY_ADMIN_TOKEN`). Next:
 [virtual keys](https://ergonlabs.io/docs/llm-proxy/authentication/virtual-keys/),
 budgets, and [`llm-proxy init`](https://ergonlabs.io/docs/llm-proxy/getting-started/quickstart/),
 which writes a starter config with authentication turned on.
@@ -291,8 +320,10 @@ and [Kubernetes and Helm](https://ergonlabs.io/docs/llm-proxy/operations/kuberne
 
 OpenAI, Anthropic, OpenRouter, Azure OpenAI, Vertex AI, Amazon Bedrock, and any
 OpenAI-compatible server (vLLM, Ollama, TGI). `examples/` has a runnable file
-for several of them; `examples/llmproxy-openrouter.yaml` carries OpenRouter's
-model catalog and token rates. See
+for several of them. For OpenRouter, start from the short file in
+[Quick start](#quick-start) step 1; `examples/llmproxy-openrouter.yaml` is a
+generated file with OpenRouter's whole model catalog and token rates, for
+cost tracking, not a first config. See
 [Providers](https://ergonlabs.io/docs/llm-proxy/providers/overview/).
 
 ### A fuller configuration

@@ -1,7 +1,7 @@
 ---
 title: Quickstart
 description: "Install llm-proxy, create a starter config, send one request to OpenAI through the proxy, and read the token counts in the access log."
-lastUpdated: 2026-10-22
+lastUpdated: 2026-10-25
 related:
   - getting-started/introduction
   - getting-started/installation
@@ -149,7 +149,7 @@ make changes. `LLMPROXY_ADMIN_UI_DIR` names the UI files, which the installer
 copies to `~/.config/llm-proxy/admin-ui-dist` (`/var/lib/llm-proxy/admin-ui-dist`
 when it runs as root). Without them, the proxy still serves requests.
 
-Expected outcome: log lines that end with a `listener bound` line, and an
+Expected outcome: an `llm-proxy started` line that names the listeners, and an
 `admin UI: http://127.0.0.1:53422/ui/` line. Leave the proxy running. To stop
 it, press Ctrl+C.
 

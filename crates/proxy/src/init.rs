@@ -81,7 +81,7 @@ fn run_command() -> String {
 
 fn admin_ui_hint() -> String {
     format!(
-        "Admin UI: http://{ADMIN_ADDRESS}/ui/\n  Paste the token from {ADMIN_TOKEN_FILE} to manage keys, tenants, budgets and pricing.\n  The UI needs LLMPROXY_ADMIN_UI_DIR set to the admin-ui-dist directory of the release archive."
+        "Admin UI: http://{ADMIN_ADDRESS}/ui/\n  Paste the token from {ADMIN_TOKEN_FILE} to manage keys, tenants, budgets and pricing.\n  The UI loads from the admin-ui-dist directory next to the binary, or from LLMPROXY_ADMIN_UI_DIR."
     )
 }
 
