@@ -357,10 +357,15 @@ pub struct AttemptInfo {
 }
 
 impl AttemptInfo {
+    /// The first call fixes when the attempt ended. `Unknown` (an attempt
+    /// dropped with no reason given, e.g. its router future cut short) is a
+    /// placeholder: a later call that knows the reason replaces it.
     pub fn finish(&mut self, termination: Termination) {
         if self.finished_at.is_none() {
             self.finished_at = Some(SystemTime::now());
             self.duration = self.started_instant.elapsed();
+            self.termination = termination;
+        } else if self.termination == Termination::Unknown {
             self.termination = termination;
         }
     }

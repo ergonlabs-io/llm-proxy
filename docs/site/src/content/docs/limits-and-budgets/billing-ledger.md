@@ -70,7 +70,10 @@ Two further rules:
 
 An entry exists for each request that the proxy dialled to a provider. This
 includes a request that the proxy charged zero, because the provider can still
-bill it. A request that the proxy refused before it dialled gets no entry. This
+bill it. It also includes a request that the client abandoned before the
+response headers arrived: its record has `termination: downstream_disconnect`,
+no `status`, and the flag `DC`. A request that the proxy refused before it
+dialled gets no entry. This
 covers a refusal for authentication, model access, budget, or rate limit, and
 a refusal by the ledger itself.
 
@@ -531,5 +534,7 @@ This section is for maintainers.
 - Refusal while every slot is held:
   `with_every_slot_held_a_request_is_refused_503_and_never_dialled` in
   `crates/proxy-core/src/listener_ledger_tests.rs`.
+- A request abandoned before response headers:
+  `a_request_dropped_before_response_headers_is_entered` in the same file.
 - Crash drill: `TestQA13_LedgerSurvivesSigkillAndRedeliversUntilAcked` in
   `testing/qa/scenarios/qa13_billing_ledger_test.go`.

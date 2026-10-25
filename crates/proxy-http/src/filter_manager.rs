@@ -48,7 +48,7 @@ use proxy_config::ir::{AccessLogIR, PerFilterConfig, RouteActionIR, RouteEntry, 
 use proxy_config::ConfigError;
 
 use crate::access_logging::{
-    snapshot_request, AccessLogContext, AccessLoggerRuntime, LoggingBody, RequestSnapshot,
+    snapshot_request, AccessLoggerRuntime, LoggingBody, PendingLog, RequestSnapshot,
 };
 use crate::filter::{
     BufferedBody, DecodeContinueHandle, DecoderCallbacks, EncoderCallbacks, FilterDataStatus,
@@ -867,99 +867,69 @@ impl StreamHandler for FilterChainHandler {
                 };
                 stream_info.borrow_mut().trace = Some(ctx);
             }
-            let (resp, request_headers_snapshot) = {
-                // Rust note: a fresh, `!Send` instance vector per request — filters
-                // may freely hold `Rc`/`RefCell` (ADR-0003).
-                let filters: Vec<Box<dyn HttpFilter>> =
-                    self.factories.iter().map(|f| f.create_filter()).collect();
-                // ADR-0004 step 3: the terminal instance is minted LAST, after
-                // every configured filter -- it's created and destroyed exactly
-                // like any other filter instance (S2.1: reverse creation order),
-                // just via its own factory type since `TerminalHttpFilter` isn't
-                // `HttpFilter`-uniform (it also exposes `respond`).
-                let terminal = self.terminal_factory.create_terminal_filter();
-                let mgr = FilterManager {
-                    filters,
-                    ctx: ChainCtx::new(stream_info.clone())
-                        .with_route_table(self.route_table.clone())
-                        .with_per_route(self.per_route.clone())
-                        .with_stream_limits(StreamLimits {
-                            idle: self.stream_idle_timeout,
-                            deadline: self.max_stream_duration.map(|d| start_instant + d),
-                        })
-                        .with_traces(self.traces.clone()),
-                    terminal,
-                    buffer_limit: self.buffer_limit,
-                    request_deadline: self.request_timeout.map(|t| start_instant + t),
-                };
-                // Rust note: `mgr` is still a plain local value here (not yet
-                // moved into `run()`), so its `ctx.request_headers_snapshot` --
-                // an `Rc<RefCell<Option<HeaderMap>>>` `ChainCtx::new` mints
-                // internally -- can be cloned out now and read back after `run()`
-                // returns, without changing `run()`'s own return type (which
-                // every direct `FilterManager` test below also relies on).
-                let request_headers_snapshot = mgr.ctx.request_headers_snapshot.clone();
-                (mgr.run(req).await, request_headers_snapshot)
+            // Rust note: a fresh, `!Send` instance vector per request — filters
+            // may freely hold `Rc`/`RefCell` (ADR-0003).
+            let filters: Vec<Box<dyn HttpFilter>> =
+                self.factories.iter().map(|f| f.create_filter()).collect();
+            // ADR-0004 step 3: the terminal instance is minted LAST, after
+            // every configured filter -- it's created and destroyed exactly
+            // like any other filter instance (S2.1: reverse creation order),
+            // just via its own factory type since `TerminalHttpFilter` isn't
+            // `HttpFilter`-uniform (it also exposes `respond`).
+            let terminal = self.terminal_factory.create_terminal_filter();
+            let mgr = FilterManager {
+                filters,
+                ctx: ChainCtx::new(stream_info.clone())
+                    .with_route_table(self.route_table.clone())
+                    .with_per_route(self.per_route.clone())
+                    .with_stream_limits(StreamLimits {
+                        idle: self.stream_idle_timeout,
+                        deadline: self.max_stream_duration.map(|d| start_instant + d),
+                    })
+                    .with_traces(self.traces.clone()),
+                terminal,
+                buffer_limit: self.buffer_limit,
+                request_deadline: self.request_timeout.map(|t| start_instant + t),
             };
+            // Built before the chain runs, so a stream dropped while it waits
+            // for response headers can still log and record itself. The
+            // request-header snapshot is the chain's own cell, read when the
+            // stream ends (see `ChainCtx::request_headers_snapshot`).
+            let pending = PendingLog {
+                loggers: self.access_loggers.clone(),
+                stream_info: stream_info.clone(),
+                start_time,
+                start_instant,
+                request: mgr.ctx.request_headers_snapshot.clone(),
+                downstream_remote_address,
+                token_stats: self.token_stats.clone(),
+                latency_stats: self.latency_stats.clone(),
+                span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
+                request_record_sink: self.request_record_sink.clone(),
+                ledger_wired: self.ledger.is_some(),
+                ledger: ledger_ticket,
+            };
+            let (resp, pending) = AbandonGuard::new(mgr.run(req), pending).await;
 
             // The wrap is what runs `finish()` at end-of-stream, and `finish()`
             // does TWO jobs: it renders the access log AND it records the
-            // LLM_CLIENT_TOKEN_USAGE instrument. Gating
-            // it on access loggers alone meant a listener that configured
-            // `llmproxy.usage` for token metrics but no `access_log` recorded no
-            // tokens at all -- the stat was wired end to end and then skipped by
-            // the one branch that decides whether anything runs. Neither reason
-            // implies the other, so this is an OR.
-            //
-            // `self.tracing.is_some()` joins the OR for
-            // the identical reason -- the SERVER span (if this stream is
-            // sampled) is also only known complete at end-of-stream, and
-            // `LoggingBody::finish` is that one place, same as the other two
-            // instruments.
-            if self.access_loggers.is_empty()
-                && self.token_stats.is_none()
-                && self.latency_stats.is_none()
-                && self.tracing.is_none()
-                && !stream_info.borrow().metadata_enabled
-                && self.ledger.is_none()
-                && stream_info.borrow().trace_tee.is_none()
-            {
+            // LLM_CLIENT_TOKEN_USAGE instrument. Gating it on access loggers
+            // alone meant a listener that configured `llmproxy.usage` for
+            // token metrics but no `access_log` recorded no tokens at all, so
+            // `PendingLog::wanted` is an OR of every consumer: the SERVER span,
+            // request records, the ledger and trace capture are also only
+            // known complete at end-of-stream.
+            if !pending.wanted() {
                 return resp;
             }
 
-            // Rust note: `.take()` both reads the snapshot out and leaves
-            // `None` behind -- there's nothing else left to read it after
-            // this. `unwrap_or_default()` only matters if every path inside
-            // `run()` somehow skipped setting it, which none do (module doc
-            // on `ChainCtx::request_headers_snapshot`'s field).
-            let request = request_headers_snapshot
-                .borrow_mut()
-                .take()
-                .unwrap_or_default();
-            let request_record_sink = self
-                .request_record_sink
-                .clone()
-                .filter(|_| stream_info.borrow().metadata_enabled);
             // The response head leaves the filter chain for the downstream
             // codec here, Envoy's first downstream TX byte.
             stream_info
                 .borrow_mut()
                 .mark_downstream(proxy_observability::access_log::TimePoint::DsTxBeg);
-            let log_ctx = AccessLogContext {
-                loggers: self.access_loggers.clone(),
-                stream_info,
-                start_time,
-                start_instant,
-                request,
-                response_headers: resp.head.headers.clone(),
-                response_code: resp.head.status.as_u16(),
-                downstream_remote_address,
-                token_stats: self.token_stats.clone(),
-                latency_stats: self.latency_stats.clone(),
-                span_sink: self.tracing.as_ref().map(|w| w.sink.clone()),
-                request_record_sink,
-                ledger: ledger_ticket,
-            };
+            let log_ctx =
+                pending.into_context(resp.head.headers.clone(), resp.head.status.as_u16());
             HttpResponseParts {
                 head: resp.head,
                 body: local_boxed(LoggingBody::new(resp.body, log_ctx)),
@@ -1340,6 +1310,57 @@ impl StreamLimits {
     }
 }
 
+/// Drives a stream's `FilterManager::run` and hands back its [`PendingLog`]
+/// with the response. Dropped before `run` finishes (the client went away
+/// while the request waited for response headers), it drops the run first,
+/// which tears the filter chain down ([`Chain`]), and then logs and records
+/// the stream as abandoned. That order is fixed here rather than left to the
+/// drop order of the enclosing future's locals.
+struct AbandonGuard<F: Future> {
+    run: Option<Pin<Box<F>>>,
+    pending: Option<PendingLog>,
+}
+
+impl<F: Future> AbandonGuard<F> {
+    fn new(run: F, pending: PendingLog) -> Self {
+        Self {
+            run: Some(Box::pin(run)),
+            pending: Some(pending),
+        }
+    }
+}
+
+impl<F: Future> Future for AbandonGuard<F> {
+    type Output = (F::Output, PendingLog);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Rust note: `Pin<Box<F>>` is `Unpin`, so this guard is too, and
+        // `get_mut` needs no pin projection.
+        let this = self.get_mut();
+        let Some(run) = this.run.as_mut() else {
+            return Poll::Pending;
+        };
+        let out = std::task::ready!(run.as_mut().poll(cx));
+        this.run = None;
+        let pending = this
+            .pending
+            .take()
+            .expect("the pending log is taken only here, once the run completes");
+        Poll::Ready((out, pending))
+    }
+}
+
+impl<F: Future> Drop for AbandonGuard<F> {
+    fn drop(&mut self) {
+        if let Some(run) = self.run.take() {
+            drop(run);
+            if let Some(pending) = self.pending.take() {
+                pending.abandon();
+            }
+        }
+    }
+}
+
 /// S2.8: refresh `ctx`'s route-resolution snapshot (`:authority`, `:path`,
 /// headers) from the LIVE request head. Called immediately before every
 /// decode filter callback (see the call sites in `drive_decode` /
@@ -1475,12 +1496,18 @@ struct FilterManager {
 impl FilterManager {
     async fn run(self, req: HttpRequestParts) -> HttpResponseParts {
         let FilterManager {
-            mut filters,
-            mut ctx,
-            mut terminal,
+            filters,
+            ctx,
+            terminal,
             buffer_limit,
             request_deadline,
         } = self;
+        // Owns the chain until a response path takes it, so a stream dropped
+        // before its response headers (a client gone while the request waits
+        // on the provider) still completes and destroys every filter.
+        let mut chain = Chain::new(terminal, filters, ctx);
+        let parts = chain.parts_mut();
+        let (terminal, filters, ctx) = (&mut parts.terminal, &mut parts.filters, &mut parts.ctx);
         ctx.buffer_limit = buffer_limit;
 
         // Access-log request-header snapshot (fallback): taken here, before
@@ -1506,7 +1533,7 @@ impl FilterManager {
             let mut empty_body = Bytes::new();
             if let Err(status) = drive_decode(
                 &mut filters[..early],
-                &mut ctx,
+                ctx,
                 buffer_limit,
                 &mut req.head,
                 &mut empty_body,
@@ -1523,10 +1550,10 @@ impl FilterManager {
                     "request rejected by filter chain",
                     "decode_buffer_overflow",
                 );
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
             if let Some(reply) = ctx.local_reply.take() {
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
         }
         // --- collect the request body (buffered model) ---
@@ -1565,7 +1592,7 @@ impl FilterManager {
                     "request timeout",
                     "request_overall_timeout",
                 );
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
             // A downstream body read error is a client problem: 400.
             // S2.5: routed through the encoder chain like any other response —
@@ -1577,7 +1604,7 @@ impl FilterManager {
                     "request body exceeds buffer limit",
                     "decode_buffer_overflow",
                 );
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
             Err(RequestCollectionError::Body(err)) => {
                 // `DC`: a `BodyError::Downstream` means the CLIENT's
@@ -1602,7 +1629,7 @@ impl FilterManager {
                     "invalid request body",
                     "request_body_read_error",
                 );
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
         };
 
@@ -1616,7 +1643,7 @@ impl FilterManager {
                 "request body uses a reserved key",
                 "request_body_reserved_json_key",
             );
-            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(chain, buffer_limit, reply).await;
         }
 
         // Trace export (ADR-0008): keep the body as received across the
@@ -1631,8 +1658,8 @@ impl FilterManager {
 
         // --- decode chain (config order) ---
         let decoded = drive_decode(
-            &mut filters,
-            &mut ctx,
+            filters,
+            ctx,
             buffer_limit,
             &mut head,
             &mut body,
@@ -1645,14 +1672,14 @@ impl FilterManager {
         .await;
         // On every outcome, before any local reply below: a refusal sent by a
         // filter after auth is the response the tenant's agent received.
-        admit_trace(&ctx, trace_original, &head);
+        admit_trace(ctx, trace_original, &head);
         if let Err(status) = decoded {
             let reply = LocalReply::new(
                 status,
                 "request rejected by filter chain",
                 "decode_buffer_overflow",
             );
-            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(chain, buffer_limit, reply).await;
         }
 
         // Configured decoder filters have now had their
@@ -1682,7 +1709,7 @@ impl FilterManager {
         // to move into `respond_with_local_reply` below; we can't hold a
         // borrow of it across that move.
         if let Some(reply) = ctx.local_reply.take() {
-            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(chain, buffer_limit, reply).await;
         }
 
         // --- terminal (ADR-0004 step 3): an ordinary filter for decode
@@ -1701,32 +1728,32 @@ impl FilterManager {
         let end_stream_on_headers =
             decoded_body.is_empty() && req_trailers.is_none() && !ctx.decode.dont_end_stream;
         ctx.decode.current_idx = filters.len();
-        sync_route_head(&mut ctx, &head);
+        sync_route_head(ctx, &head);
         {
-            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
+            let mut cb = DecoderCallbacksAdapter::new(ctx);
             let _ = terminal.decode_headers(&mut cb, &mut head, end_stream_on_headers);
         }
         if let Some(reply) = ctx.local_reply.take() {
-            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(chain, buffer_limit, reply).await;
         }
 
         let end_stream = req_trailers.is_none();
         {
-            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
+            let mut cb = DecoderCallbacksAdapter::new(ctx);
             let _ = terminal.decode_data(&mut cb, &mut decoded_body, end_stream);
         }
         if let Some(reply) = ctx.local_reply.take() {
-            return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+            return respond_with_local_reply(chain, buffer_limit, reply).await;
         }
 
         if let Some(t) = &req_trailers {
             let mut owned = RequestTrailers(t.0.clone());
             {
-                let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
+                let mut cb = DecoderCallbacksAdapter::new(ctx);
                 let _ = terminal.decode_trailers(&mut cb, &mut owned);
             }
             if let Some(reply) = ctx.local_reply.take() {
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
         }
 
@@ -1739,7 +1766,7 @@ impl FilterManager {
         // them.
         let stream_limits = ctx.stream_limits;
         let responded = {
-            let mut cb = DecoderCallbacksAdapter::new(&mut ctx);
+            let mut cb = DecoderCallbacksAdapter::new(ctx);
             stream_limits.bound(terminal.respond(&mut cb)).await
         };
         let resp = match responded {
@@ -1768,7 +1795,7 @@ impl FilterManager {
                     }
                 }
                 let reply = LocalReply::new(status, text, details);
-                return respond_with_local_reply(terminal, filters, ctx, buffer_limit, reply).await;
+                return respond_with_local_reply(chain, buffer_limit, reply).await;
             }
         };
         // S10: `upgrade` is carried straight through
@@ -1806,37 +1833,36 @@ impl FilterManager {
 
         // --- encode header phase (async: a header hold may need to consume
         // upstream frames to resolve it, S2.2) ---
-        let hold =
-            match encode_headers_phase(&mut filters, &mut ctx, buffer_limit, &mut head, &mut body)
-                .await
-            {
-                Ok(hold) => hold,
-                Err(status) => {
-                    // The encoder chain has ALREADY begun traversing this
-                    // response — at least one filter has seen `encode_headers`.
-                    // Substituting a local reply and restarting the chain from
-                    // position 0 would call `encode_headers` on those filters a
-                    // *second* time within one stream. That re-entrancy is
-                    // precisely the bug class that hurts most here: a metering
-                    // or access-logging filter would count the same response
-                    // twice. Envoy draws the same line — a local reply raised
-                    // once encoding is under way is sent directly rather than
-                    // back through the filters.
-                    //
-                    // The trade-off, stated plainly: filters do NOT observe
-                    // this particular 500. That is the lesser evil against
-                    // double-invocation, and this path only fires when the
-                    // filter chain itself blew the encode buffer limit.
-                    {
-                        let mut info = ctx.stream_info.borrow_mut();
-                        info.is_local_reply = true;
-                        info.response_code_details =
-                            Some("encode_header_phase_overflow".to_string());
-                    }
-                    destroy_filters(terminal.as_mut(), &mut filters, &mut ctx);
-                    return synth_response(status, "response rejected by filter chain");
+        let hold = match encode_headers_phase(filters, ctx, buffer_limit, &mut head, &mut body)
+            .await
+        {
+            Ok(hold) => hold,
+            Err(status) => {
+                // The encoder chain has ALREADY begun traversing this
+                // response — at least one filter has seen `encode_headers`.
+                // Substituting a local reply and restarting the chain from
+                // position 0 would call `encode_headers` on those filters a
+                // *second* time within one stream. That re-entrancy is
+                // precisely the bug class that hurts most here: a metering
+                // or access-logging filter would count the same response
+                // twice. Envoy draws the same line — a local reply raised
+                // once encoding is under way is sent directly rather than
+                // back through the filters.
+                //
+                // The trade-off, stated plainly: filters do NOT observe
+                // this particular 500. That is the lesser evil against
+                // double-invocation, and this path only fires when the
+                // filter chain itself blew the encode buffer limit.
+                {
+                    let mut info = ctx.stream_info.borrow_mut();
+                    info.is_local_reply = true;
+                    info.response_code_details = Some("encode_header_phase_overflow".to_string());
                 }
-            };
+                // Dropping the chain completes and destroys the filters.
+                drop(chain);
+                return synth_response(status, "response rejected by filter chain");
+            }
+        };
 
         // Response headers are about to be handed back across the seam —
         // from this point on, `send_local_reply` can no longer synthesize a
@@ -1851,6 +1877,11 @@ impl FilterManager {
         // end when `run()` returns. `terminal` rides along too (S2.1: created
         // last, so destroyed first).
         let remaining_content_length = parse_content_length(&head.headers);
+        let ChainParts {
+            terminal,
+            filters,
+            ctx,
+        } = chain.into_parts();
         let encoder = StreamingEncoder {
             terminal,
             filters,
@@ -1880,28 +1911,66 @@ impl FilterManager {
 /// encoder filters (token metering, access logging, ...) observe a local
 /// reply exactly like any other response. Used both for an explicit
 /// `send_local_reply()` call and for the failure paths `run()` itself raises.
-/// Per-stream teardown (S2.1: reverse creation order).
+/// A stream's filter chain while no response body owns it: from the start of
+/// `run()` until a [`StreamingEncoder`] takes it.
 ///
-/// Normally this rides on [`StreamingEncoder`]'s `Drop`, since a streaming
-/// response means the filters outlive `run()`. Any path that returns a bare
-/// [`synth_response`] never constructs a `StreamingEncoder`, so it must call
-/// this explicitly — otherwise the filter instances are simply dropped and
-/// `on_destroy` never fires. Filters that emit their stats/usage record on
-/// teardown (exactly what an LLM token-metering filter does) would silently
-/// report nothing for those requests. `terminal` is destroyed FIRST -- it's
-/// created last (S2.1: reverse creation order), just like every other filter,
-/// whether or not it ever actually ran (a local reply short-circuits before
-/// the terminal's own callbacks fire, but the instance still exists and still
-/// needs tearing down).
-fn destroy_filters(
-    terminal: &mut dyn TerminalHttpFilter,
-    filters: &mut [Box<dyn HttpFilter>],
-    ctx: &mut ChainCtx,
-) {
-    complete_filters(filters, ctx);
-    terminal.on_destroy();
-    for filter in filters.iter_mut().rev() {
-        filter.on_destroy();
+/// Per-stream teardown (S2.1: reverse creation order) rides on `Drop`: a path
+/// that ends without a `StreamingEncoder` (a bare [`synth_response`], or the
+/// stream's future dropped while it waits for response headers) still runs
+/// every filter's `on_stream_complete` and `on_destroy`. Filters that charge
+/// or record at stream end (token metering, spend) would otherwise report
+/// nothing for those requests. `terminal` is destroyed FIRST: it is created
+/// last (S2.1), whether or not it ever ran.
+struct Chain(Option<ChainParts>);
+
+struct ChainParts {
+    terminal: Box<dyn TerminalHttpFilter>,
+    filters: Vec<Box<dyn HttpFilter>>,
+    ctx: ChainCtx,
+}
+
+impl Chain {
+    fn new(
+        terminal: Box<dyn TerminalHttpFilter>,
+        filters: Vec<Box<dyn HttpFilter>>,
+        ctx: ChainCtx,
+    ) -> Self {
+        Self(Some(ChainParts {
+            terminal,
+            filters,
+            ctx,
+        }))
+    }
+
+    fn parts_mut(&mut self) -> &mut ChainParts {
+        self.0
+            .as_mut()
+            .expect("a chain's parts are taken only by into_parts, which consumes it")
+    }
+
+    /// Hands the chain to a [`StreamingEncoder`], whose own `Drop` tears it
+    /// down when the response body ends.
+    fn into_parts(mut self) -> ChainParts {
+        self.0
+            .take()
+            .expect("a chain's parts are taken only by into_parts, which consumes it")
+    }
+}
+
+impl Drop for Chain {
+    fn drop(&mut self) {
+        if let Some(ChainParts {
+            terminal,
+            filters,
+            ctx,
+        }) = self.0.as_mut()
+        {
+            complete_filters(filters, ctx);
+            terminal.on_destroy();
+            for filter in filters.iter_mut().rev() {
+                filter.on_destroy();
+            }
+        }
     }
 }
 
@@ -1922,12 +1991,12 @@ fn complete_filters(filters: &mut [Box<dyn HttpFilter>], ctx: &mut ChainCtx) {
 }
 
 async fn respond_with_local_reply(
-    mut terminal: Box<dyn TerminalHttpFilter>,
-    mut filters: Vec<Box<dyn HttpFilter>>,
-    mut ctx: ChainCtx,
+    mut chain: Chain,
     buffer_limit: usize,
     reply: LocalReply,
 ) -> HttpResponseParts {
+    let parts = chain.parts_mut();
+    let (filters, ctx) = (&mut parts.filters, &mut parts.ctx);
     // A local reply always starts the encoder chain fresh, as if this were a
     // brand-new response substituted at the very top of the chain — discard
     // any encode-side state a prior, now-abandoned attempt left behind (e.g.
@@ -1966,10 +2035,15 @@ async fn respond_with_local_reply(
     };
     let mut body = bytes_to_seam_body(Bytes::from(body_bytes), None);
 
-    match encode_headers_phase(&mut filters, &mut ctx, buffer_limit, &mut head, &mut body).await {
+    match encode_headers_phase(filters, ctx, buffer_limit, &mut head, &mut body).await {
         Ok(hold) => {
             ctx.response_headers_forwarded = true;
             let remaining_content_length = parse_content_length(&head.headers);
+            let ChainParts {
+                terminal,
+                filters,
+                ctx,
+            } = chain.into_parts();
             let encoder = StreamingEncoder {
                 terminal,
                 filters,
@@ -2000,9 +2074,9 @@ async fn respond_with_local_reply(
             // The local reply itself overflowed the encode buffer — there's
             // nowhere left to route it, so fall back to a bare synthesized
             // response (bypassing the chain), same as the pre-S2.5 behavior.
-            // Teardown still has to happen: `on_destroy` normally rides on
-            // `StreamingEncoder`'s `Drop`, and this path never builds one.
-            destroy_filters(terminal.as_mut(), &mut filters, &mut ctx);
+            // Teardown still has to happen, and dropping the chain does it:
+            // this path never builds a `StreamingEncoder`.
+            drop(chain);
             synth_response(status, "response rejected by filter chain")
         }
     }

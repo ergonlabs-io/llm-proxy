@@ -18,6 +18,16 @@ surfaces that an upgrade within 1.x keeps stable.
   out. A consumer can now match the `llmproxy_metadata_*` counters of a scrape
   to the records of the same process.
 
+### Fixed
+
+- Records: a request that the client abandons while the proxy waits for the
+  provider's response headers now gets an access-log line (response code `0`,
+  flag `DC`), a request record (`termination: downstream_disconnect`,
+  `status: null`), and a billing-ledger entry, and each filter completes as
+  for any other stream end. Before, such a request left no trace.
+- Records: an attempt cut while it waits for response headers now ends with
+  the request's reason, for example `timeout`, instead of `unknown`.
+
 ## [1.0.0] - 2026-10-24
 
 ### Added

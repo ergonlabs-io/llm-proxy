@@ -442,7 +442,7 @@ impl HttpFilter for RecordingTerminal {
     }
 
     /// ADR-0004 step 3: the terminal is now an ordinary filter instance
-    /// (`filter_manager::destroy_filters` calls `terminal.on_destroy()`
+    /// (the filter manager's chain teardown calls `terminal.on_destroy()`
     /// before walking the rest of the chain in reverse creation order) --
     /// before this step the router lived behind a `StreamHandler` seam and
     /// never received `on_destroy` at all. Recorded onto the same shared
@@ -3888,6 +3888,29 @@ impl FilterInstanceFactory for StampsUsageOnStreamCompleteFilterFactory {
     }
 }
 
+/// A terminal whose response never arrives: a provider that accepted the
+/// request and has not answered yet.
+struct NeverRespondsTerminal;
+
+impl HttpFilter for NeverRespondsTerminal {}
+
+impl TerminalHttpFilter for NeverRespondsTerminal {
+    fn respond<'a>(
+        &'a mut self,
+        _cb: &'a mut dyn DecoderCallbacks,
+    ) -> Pin<Box<dyn Future<Output = HttpResponseParts> + 'a>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+struct NeverRespondsTerminalFactory;
+
+impl TerminalFilterInstanceFactory for NeverRespondsTerminalFactory {
+    fn create_terminal_filter(&self) -> Box<dyn TerminalHttpFilter> {
+        Box::new(NeverRespondsTerminal)
+    }
+}
+
 /// Which way the stream under test ends.
 #[derive(Clone, Copy, Debug)]
 enum StreamEnd {
@@ -3897,6 +3920,9 @@ enum StreamEnd {
     Abandoned,
     /// A decode filter replies locally, so the router terminal never runs.
     LocalReply,
+    /// The client goes away while the request waits for response headers:
+    /// the stream's future is dropped before it returns a response.
+    AbandonedBeforeHeaders,
 }
 
 /// A value written in `on_stream_complete` must be in the rendered access-log
@@ -3909,15 +3935,20 @@ fn on_stream_complete_write_reaches_the_access_log_however_the_stream_ends() {
         StreamEnd::Clean,
         StreamEnd::Abandoned,
         StreamEnd::LocalReply,
+        StreamEnd::AbandonedBeforeHeaders,
     ] {
         block_on(async {
             let terminal_factory: Arc<dyn TerminalFilterInstanceFactory> =
-                Arc::new(RecordingTerminalFactory {
-                    seen_body: Arc::new(Mutex::new(Bytes::new())),
-                    seen_request_id: Arc::new(Mutex::new(None)),
-                    seen_headers: None,
-                    term_log: None,
-                });
+                if matches!(end, StreamEnd::AbandonedBeforeHeaders) {
+                    Arc::new(NeverRespondsTerminalFactory)
+                } else {
+                    Arc::new(RecordingTerminalFactory {
+                        seen_body: Arc::new(Mutex::new(Bytes::new())),
+                        seen_request_id: Arc::new(Mutex::new(None)),
+                        seen_headers: None,
+                        term_log: None,
+                    })
+                };
             let path = temp_log_path("on-stream-complete");
             let mut factories: Vec<Arc<dyn FilterInstanceFactory>> =
                 vec![Arc::new(StampsUsageOnStreamCompleteFilterFactory)];
@@ -3933,16 +3964,25 @@ fn on_stream_complete_write_reaches_the_access_log_however_the_stream_ends() {
                 0,
                 &[text_access_log(
                     &path,
-                    "%LLM_INPUT_TOKENS% %RESPONSE_FLAGS%\n",
+                    "%LLM_INPUT_TOKENS% %RESPONSE_FLAGS% %RESPONSE_CODE%\n",
                 )],
             )
             .expect("temp file sink always opens cleanly");
 
-            let resp = handler.handle(request(b"hi")).await;
-            match end {
-                StreamEnd::Abandoned => drop(resp.body),
-                StreamEnd::Clean | StreamEnd::LocalReply => {
-                    resp.body.collect().await.expect("resp body must collect");
+            if matches!(end, StreamEnd::AbandonedBeforeHeaders) {
+                let mut stream = handler.handle(request(b"hi"));
+                assert!(
+                    futures::poll!(stream.as_mut()).is_pending(),
+                    "the terminal never responds"
+                );
+                drop(stream);
+            } else {
+                let resp = handler.handle(request(b"hi")).await;
+                match end {
+                    StreamEnd::Abandoned => drop(resp.body),
+                    _ => {
+                        resp.body.collect().await.expect("resp body must collect");
+                    }
                 }
             }
 
@@ -3951,8 +3991,15 @@ fn on_stream_complete_write_reaches_the_access_log_however_the_stream_ends() {
                 line.starts_with("7 "),
                 "{end:?}: on_stream_complete's write must be in the log line, got {line:?}"
             );
-            if matches!(end, StreamEnd::Abandoned) {
+            if matches!(
+                end,
+                StreamEnd::Abandoned | StreamEnd::AbandonedBeforeHeaders
+            ) {
                 assert!(line.contains("DC"), "{end:?}: {line:?}");
+            }
+            if matches!(end, StreamEnd::AbandonedBeforeHeaders) {
+                // Envoy logs a stream that never sent a response head as 0.
+                assert_eq!(line.trim_end(), "7 DC 0", "{end:?}");
             }
             std::fs::remove_file(&path).ok();
         });

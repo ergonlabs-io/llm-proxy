@@ -3,7 +3,7 @@
 //! the stream after response headers (review C3): the client drops the
 //! connection, the provider resets it, and a stream timer fires. A fourth cut,
 //! the drain deadline at shutdown, must still be recorded before exit. A client
-//! that leaves before response headers is pinned as a known divergence.
+//! that leaves before response headers is logged and recorded too.
 //!
 //! The request record (`--request-records-file`) must say `completeness:
 //! partial`, carry the upstream response id, mark the token counts and cost as
@@ -38,10 +38,11 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const RECORD_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Requests the mock provider received with the `silent` marker, and how many
-/// of those the proxy then hung up. Only the pre-headers test sends `silent`.
+/// Requests the mock provider received with the `silent` marker. Only the
+/// pre-headers test sends `silent`.
 static UPSTREAM_SILENT: AtomicUsize = AtomicUsize::new(0);
-static UPSTREAM_HUNG_UP: AtomicUsize = AtomicUsize::new(0);
+/// Requests with the `quiet` marker: read in full, never answered.
+static UPSTREAM_QUIET: AtomicUsize = AtomicUsize::new(0);
 
 const HMAC_SECRET: &str = "partial-usage-e2e-secret";
 const ADMIN_TOKEN: &str = "partial-usage-e2e-admin-token";
@@ -319,13 +320,11 @@ fn a_stream_cut_at_the_drain_deadline_is_recorded_partial_before_exit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Pins `envoy-divergences.md` row 34: a client that hangs up while the
-/// request still waits for response headers drops the filter chain's future,
-/// so no `on_stream_complete`, no access log line, no record and no charge.
-/// Envoy logs this stream (code 0, flag `DC`). When the divergence is fixed,
-/// this test fails and should assert the logged line instead.
+/// A client that hangs up while the request still waits for response headers
+/// is logged and recorded, as Envoy logs it: response code 0, flag `DC`, and a
+/// record that names the attempt it dialled, with no status and no usage.
 #[test]
-fn a_client_disconnect_before_response_headers_is_not_logged_or_charged() {
+fn a_client_disconnect_before_response_headers_is_logged_and_recorded() {
     let dir = scratch_dir("preheaders");
     let proxy = Proxy::start(&dir, NO_TIMERS);
     let key = mint_key(&proxy);
@@ -337,26 +336,61 @@ fn a_client_disconnect_before_response_headers_is_not_logged_or_charged() {
         UPSTREAM_SILENT.load(Ordering::SeqCst) == 1
     });
     drop(stream);
-    // The proxy closing its upstream connection means the stream is gone:
-    // anything it would log or record has been written by now.
-    wait_until("the proxy hangs up on the provider", || {
-        UPSTREAM_HUNG_UP.load(Ordering::SeqCst) == 1
-    });
 
-    // A clean request afterwards proves the sinks are live.
-    let response = post_to_end(proxy.listen, &key, &chat_body("clean"));
-    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
-    let records = proxy.wait_for_records(1);
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0]["upstream_response_id"], "chatcmpl-clean");
-    let lines = proxy.wait_for_chat_log_lines(1);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0]["response_flags"], "-", "{lines:?}");
-    assert_eq!(
-        proxy.spend_micros(),
-        (11 * INPUT_NANO + 5 * OUTPUT_NANO) / 1000,
-        "only the clean request is charged"
+    let record = proxy.wait_for_records(1).remove(0);
+    assert_eq!(record["termination"], "downstream_disconnect", "{record}");
+    assert!(
+        record["status"].is_null(),
+        "no response head was sent: {record}"
     );
+    assert_eq!(
+        record["response_flags"],
+        serde_json::json!(["DC"]),
+        "{record}"
+    );
+    assert_eq!(record["error_category"], "downstream_remote_disconnect");
+    assert_eq!(record["record_seq"], 1, "{record}");
+    assert!(record["usage"].is_null(), "{record}");
+    let attempt = &record["attempts"][0];
+    assert_eq!(attempt["cluster"], "provider:openai", "{record}");
+    assert_eq!(attempt["upstream_model"], MODEL, "{record}");
+    assert_eq!(attempt["termination"], "downstream_disconnect", "{record}");
+    let line = proxy.wait_for_chat_log_lines(1).remove(0);
+    assert_eq!(line["response_code"], "0", "{line}");
+    assert_eq!(line["response_flags"], "DC", "{line}");
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A non-streamed request the provider read in full but never answered, cut
+/// by the listener's `stream_idle_timeout` while the proxy waits for response
+/// headers. The attempt ends `timeout`, the same as the request: the router's
+/// drop must not leave it `unknown`.
+#[test]
+fn a_timeout_before_response_headers_records_the_attempt_as_timed_out() {
+    let dir = scratch_dir("preheaders-timeout");
+    let proxy = Proxy::start(
+        &dir,
+        Timers {
+            route: "",
+            listen: ", stream_idle_timeout: 1s",
+        },
+    );
+    let key = mint_key(&proxy);
+    let body = format!(
+        r#"{{"model":"{MODEL}","stream":false,"messages":[{{"role":"user","content":"quiet"}}]}}"#
+    );
+    let response = post_to_end(proxy.listen, &key, &body);
+    assert!(response.starts_with("HTTP/1.1 408"), "got:\n{response}");
+    assert_eq!(UPSTREAM_QUIET.load(Ordering::SeqCst), 1);
+    let record = proxy.wait_for_records(1).remove(0);
+    assert_eq!(record["termination"], "timeout", "{record}");
+    assert_eq!(
+        record["response_flags"],
+        serde_json::json!(["SI"]),
+        "{record}"
+    );
+    assert_eq!(record["attempts"][0]["termination"], "timeout", "{record}");
     drop(proxy);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -921,11 +955,14 @@ fn serve_stream(stream: &mut TcpStream) {
     let id = if abort { "abort" } else { "clean" };
     if body.contains("silent") {
         // Never answer; count the request, then wait (bounded by the read
-        // timeout) for the proxy to hang up and count that.
+        // timeout) for the proxy to hang up.
         UPSTREAM_SILENT.fetch_add(1, Ordering::SeqCst);
-        if matches!(stream.read(&mut buf), Ok(0)) {
-            UPSTREAM_HUNG_UP.fetch_add(1, Ordering::SeqCst);
-        }
+        let _ = stream.read(&mut buf);
+        return;
+    }
+    if body.contains("quiet") {
+        UPSTREAM_QUIET.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.read(&mut buf);
         return;
     }
     let send = |stream: &mut TcpStream, bytes: &[u8]| stream.write_all(bytes).is_ok();

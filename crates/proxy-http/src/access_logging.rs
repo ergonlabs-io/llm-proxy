@@ -304,6 +304,94 @@ pub(crate) struct AccessLogContext {
     pub(crate) ledger: Option<LedgerTicket>,
 }
 
+/// Everything a stream's access-log context needs except the response head,
+/// held from before the filter chain runs. A normal response turns it into an
+/// [`AccessLogContext`] for [`LoggingBody`]; a stream dropped before its
+/// response headers (the client went away while the request waited on the
+/// provider) logs and records itself through [`Self::abandon`], so it still
+/// gets its access-log line, request record and ledger entry.
+pub(crate) struct PendingLog {
+    pub(crate) loggers: Rc<Vec<AccessLoggerRuntime>>,
+    pub(crate) stream_info: Rc<RefCell<StreamInfo>>,
+    pub(crate) start_time: SystemTime,
+    pub(crate) start_instant: Instant,
+    /// The chain's request-header snapshot, read when the stream ends.
+    pub(crate) request: Rc<RefCell<Option<RequestSnapshot>>>,
+    pub(crate) downstream_remote_address: String,
+    pub(crate) token_stats: Option<Arc<GenAiTokenStats>>,
+    pub(crate) latency_stats: Option<Arc<GenAiLatencyStats>>,
+    pub(crate) span_sink: Option<SpanSink>,
+    pub(crate) request_record_sink: Option<Arc<dyn RequestRecordSink>>,
+    /// Whether this handler has a ledger at all. `ledger` is `None` both
+    /// without one and when admission refused this request.
+    pub(crate) ledger_wired: bool,
+    pub(crate) ledger: Option<LedgerTicket>,
+}
+
+impl PendingLog {
+    /// Whether anything consumes this stream's end. A handler with no access
+    /// log, stats, tracing, records, ledger or trace capture skips the wrap.
+    pub(crate) fn wanted(&self) -> bool {
+        let info = self.stream_info.borrow();
+        !self.loggers.is_empty()
+            || self.token_stats.is_some()
+            || self.latency_stats.is_some()
+            || self.span_sink.is_some()
+            || info.metadata_enabled
+            || self.ledger_wired
+            || info.trace_tee.is_some()
+    }
+
+    pub(crate) fn into_context(
+        self,
+        response_headers: HeaderMap,
+        response_code: u16,
+    ) -> AccessLogContext {
+        // `unwrap_or_default` only matters if a path inside the chain skipped
+        // the snapshot, which none does (`ChainCtx::request_headers_snapshot`).
+        let request = self.request.borrow_mut().take().unwrap_or_default();
+        let request_record_sink = self
+            .request_record_sink
+            .filter(|_| self.stream_info.borrow().metadata_enabled);
+        AccessLogContext {
+            loggers: self.loggers,
+            stream_info: self.stream_info,
+            start_time: self.start_time,
+            start_instant: self.start_instant,
+            request,
+            response_headers,
+            response_code,
+            downstream_remote_address: self.downstream_remote_address,
+            token_stats: self.token_stats,
+            latency_stats: self.latency_stats,
+            span_sink: self.span_sink,
+            request_record_sink,
+            ledger: self.ledger,
+        }
+    }
+
+    /// The stream was dropped before response headers. Call it only after
+    /// the filter chain is torn down, so what filters write in
+    /// `on_stream_complete` is in the line and the record. Logged like a
+    /// response body the client abandoned: response code 0 and flag `DC`, as
+    /// Envoy does, with details per ADR-0011 decision 1. An attempt still
+    /// open when the router was dropped ends `downstream_disconnect`.
+    pub(crate) fn abandon(self) {
+        if !self.wanted() {
+            return;
+        }
+        for attempt in &self.stream_info.borrow().attempts {
+            attempt
+                .borrow_mut()
+                .finish(proxy_observability::records::Termination::DownstreamDisconnect);
+        }
+        drop(LoggingBody::new(
+            empty_body(),
+            self.into_context(HeaderMap::new(), 0),
+        ));
+    }
+}
+
 /// Wraps a response [`StreamBody`] so that -- regardless of whether the
 /// stream completes normally, errors, or is simply dropped mid-flight (a
 /// disconnecting client, or an outer combinator like `GuardedBody`/
@@ -434,9 +522,11 @@ impl LoggingBody {
         let Some(ctx) = &self.ctx else {
             return false;
         };
-        self.remaining_content_length == Some(0)
-            || matches!(ctx.response_code, 100..=199 | 204 | 304)
-            || ctx.request.method == "HEAD"
+        // No response head was sent (code 0), so no framing is complete.
+        ctx.response_code != 0
+            && (self.remaining_content_length == Some(0)
+                || matches!(ctx.response_code, 100..=199 | 204 | 304)
+                || ctx.request.method == "HEAD")
     }
 
     /// `DS_TX_END`: the last response byte went to the downstream codec. Only
@@ -766,7 +856,8 @@ impl LoggingBody {
                     .map(proxy_observability::records::bounded_field),
                 upstream_response_id: llm_upstream.0.clone(),
                 upstream_usage: llm_upstream.1.clone(),
-                status: Some(ctx.response_code),
+                // Code 0: the client left before any response head.
+                status: (ctx.response_code != 0).then_some(ctx.response_code),
                 termination,
                 error_category: response_code_details
                     .as_deref()
@@ -1076,7 +1167,7 @@ impl LoggingBody {
                     end: SystemTime::now(),
                     attributes,
                     int_attributes,
-                    status: if ctx.response_code >= 500 {
+                    status: if ctx.response_code >= 500 || ctx.response_code == 0 {
                         SpanStatus::Error
                     } else {
                         SpanStatus::Ok
@@ -1258,7 +1349,7 @@ fn trace_meta(
     };
     TraceMeta {
         path: tee.path.clone(),
-        status: Some(ctx.response_code),
+        status: (ctx.response_code != 0).then_some(ctx.response_code),
         request_content_type: tee.request_content_type.clone(),
         request_content_encoding: tee.request_content_encoding.clone(),
         response_content_type: header(http::header::CONTENT_TYPE),

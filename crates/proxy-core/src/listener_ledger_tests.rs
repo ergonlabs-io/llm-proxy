@@ -19,6 +19,7 @@ use proxy_http::{
 use proxy_observability::ledger::testing::TempLedger;
 use proxy_observability::ledger::OnUnavailable;
 use proxy_observability::records::ChargeScope;
+use proxy_observability::records::Termination;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -459,6 +460,26 @@ fn a_timeout_before_response_headers_is_entered_at_zero() {
     });
 }
 
+/// ADR-0009 decision 2: a request dropped while it waits for the provider's
+/// response headers (the client went away) was dialled, so it is entered.
+/// It has no usage and no status, and the downstream ended it.
+#[test]
+fn a_request_dropped_before_response_headers_is_entered() {
+    run(async {
+        let mut chain = chain(true).await;
+        let key = chain.mint("key-a");
+        let held = chain.hold_a_slot(&key).await;
+        held.abort();
+        let _ = held.await;
+        let entries = chain.ledger.entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let record = &entries[0].record;
+        assert_eq!(record.termination, Termination::DownstreamDisconnect);
+        assert_eq!(record.status, None, "no response head was sent");
+        assert_eq!(record.response_flags, ["DC"]);
+    });
+}
+
 /// Refusals before dialling (unknown key, exhausted budget, rate limit) get
 /// no entry,
 /// and the entries around them still number without a gap.
@@ -537,7 +558,7 @@ fn counter(scrape: &str, series: &str) -> u64 {
 /// The refusal is answered where the request would be dialled, so a request
 /// the filters refuse gets their answer: a wrong key is 401, a request over
 /// its rate limit is 429, and neither counts as a ledger rejection. A
-/// request dropped mid-flight gives its slot back.
+/// request dropped mid-flight gives its slot back once its entry commits.
 #[test]
 fn with_every_slot_held_a_request_is_refused_503_and_never_dialled() {
     run(async {
@@ -574,7 +595,15 @@ fn with_every_slot_held_a_request_is_refused_503_and_never_dialled() {
 
         held.abort();
         let _ = held.await;
-        assert_eq!(chain.ledger.ledger.reserved(), 0);
+        // The dropped request was dialled, so it is entered; its slot is
+        // held until that entry commits.
+        tokio::time::timeout(IO_TIMEOUT, async {
+            while chain.ledger.ledger.reserved() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dropped request's slot comes back");
         assert_eq!(chain.send(&key, "priced-model", false).await, 200);
     });
 }
@@ -609,7 +638,13 @@ fn under_admit_a_request_without_a_slot_is_served_counted_and_warned_once() {
         );
         held.abort();
         let _ = held.await;
-        assert!(chain.ledger.entries().is_empty());
+        // Only the held request, which had the slot, is entered.
+        let entries = chain.ledger.entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(
+            entries[0].record.termination,
+            Termination::DownstreamDisconnect
+        );
 
         let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert_eq!(
