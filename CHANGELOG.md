@@ -10,55 +10,6 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
-### Added
-
-- Billing: the provider field `unanswered_usage` (`none`, `input`,
-  `output_cap`; default `input`) sets what a request is charged when the
-  provider got the whole request and sent no response: the client
-  disconnected, a timeout cut the wait for the response headers, or the
-  connection closed. Envoy mode reads it from
-  `filter_metadata["io.llmproxy.usage"].unanswered` on the cluster. The
-  counters `llmproxy_usage_unanswered_total` and
-  `llmproxy_usage_unanswered_uncharged_total` count such attempts.
-- Metrics: `llmproxy_metadata_instance_info{instance_id}` names the
-  `instance_id` that this process writes in each request record, and
-  `llmproxy_metadata_last_record_seq` reports the highest `record_seq` given
-  out. A consumer can now match the `llmproxy_metadata_*` counters of a scrape
-  to the records of the same process.
-
-### Changed
-
-- Billing: a request whose provider got the whole request and sent no response
-  is now charged its estimated input tokens (the request size divided by 4),
-  priced at that provider's rate card, and recorded `completeness: partial`
-  with `cost.kind: estimate`. Before, it was charged nothing. Set
-  `unanswered_usage: none` on a provider to keep the old charge. When a
-  request is charged for more than one attempt, `usage` and `cost` in the
-  request record are the sum, and each entry of `attempts` carries its own
-  share.
-- Routing: a dialect route no longer retries a request when the provider
-  connection closes after the provider received the whole request and before
-  any response byte. The provider can already be generating a response, so a
-  second attempt can be billed again. The dialect now lowers to the retry token
-  `reset-before-request` instead of `reset`. A connection failure, a refused
-  stream, a reset before the request was fully sent, and a 429, 500, 502 or
-  503 response are retried as before. The schema descriptions of
-  `routes[].retries`, `routes[].fallbacks` and `models.<name>.providers` say
-  this.
-
-### Fixed
-
-- Envoy mode: the retry token `reset-before-request` fired on any reset before
-  response headers. It now fires only when the request was not fully sent,
-  as Envoy defines it; `reset` still fires in both cases.
-- Records: a request that the client abandons while the proxy waits for the
-  provider's response headers now gets an access-log line (response code `0`,
-  flag `DC`), a request record (`termination: downstream_disconnect`,
-  `status: null`), and a billing-ledger entry, and each filter completes as
-  for any other stream end. Before, such a request left no trace.
-- Records: an attempt cut while it waits for response headers now ends with
-  the request's reason, for example `timeout`, instead of `unknown`.
-
 ## [1.0.0] - 2026-10-24
 
 ### Added
@@ -97,6 +48,29 @@ surfaces that an upgrade within 1.x keeps stable.
   `--service-node` and a `persistent` or `shared` store, and is a load error
   with `auth.enforce.spend: false`; each refusal names
   `auth.spend.recovery_journal_path`.
+- Billing: the provider field `unanswered_usage` (`none`, `input`,
+  `output_cap`; default `input`) sets what a request is charged when the
+  provider got the whole request and sent no response: the client
+  disconnected, a timeout cut the wait for the response headers, or the
+  connection closed. `input` charges the estimated input tokens (the request
+  size divided by 4) at that provider's rate card; `output_cap` adds the
+  output cap. The request is recorded `completeness: partial` with
+  `cost.kind: estimate`. When a request is charged for more than one attempt,
+  `usage` and `cost` in the request record are the sum, and each entry of
+  `attempts` carries its own share. Envoy mode reads the setting from
+  `filter_metadata["io.llmproxy.usage"].unanswered` on the cluster. The
+  counters `llmproxy_usage_unanswered_total` and
+  `llmproxy_usage_unanswered_uncharged_total` count such attempts.
+- Records: a request that the client abandons while the proxy waits for the
+  provider's response headers gets an access-log line (response code `0`,
+  flag `DC`), a request record (`termination: downstream_disconnect`,
+  `status: null`), and a billing-ledger entry. An attempt cut while it waits
+  for response headers ends with the request's reason, for example `timeout`.
+- Metrics: `llmproxy_metadata_instance_info{instance_id}` names the
+  `instance_id` that this process writes in each request record, and
+  `llmproxy_metadata_last_record_seq` reports the highest `record_seq` given
+  out, so a consumer can match the `llmproxy_metadata_*` counters of a scrape
+  to the records of the same process.
 
 ### Changed
 
@@ -130,6 +104,11 @@ surfaces that an upgrade within 1.x keeps stable.
   unauthenticated-credential buckets at 10000 distinct values per filter chain.
   Past the cap, new values for one entry share one bucket. Before, each
   distinct value got its own window with no limit.
+- Routing: a dialect route retries a reset only when the provider did not
+  receive the whole request (retry token `reset-before-request`, not `reset`),
+  so a request the provider may already be generating is not sent twice. A
+  connection failure, a refused stream, and a 429, 500, 502 or 503 response
+  are retried as before.
 
 ### Deprecated
 
@@ -181,6 +160,9 @@ surfaces that an upgrade within 1.x keeps stable.
   as `upstream_usage` from a JSON body. Before, it was embedded as written, so
   the access-log or request-record line could not be read back by a strict
   JSON reader. Found by fuzzing.
+- Envoy mode: the retry token `reset-before-request` fires only when the
+  request was not fully sent, as Envoy defines it; `reset` fires in both
+  cases.
 
 ### Removed
 
