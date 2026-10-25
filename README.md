@@ -292,9 +292,16 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 The proxy replaces the caller's `Authorization` header with the provider key
 and prints one JSON access-log line per request, with `llm_input_tokens` and
 `llm_output_tokens`. The quick-start config has no `auth` section, so it does
-not check callers; keep it on loopback. The release archive's admin UI loads
-automatically at `http://127.0.0.1:9901/ui/` (read-only until you set
-`LLMPROXY_ADMIN_TOKEN`). Next:
+not check callers; keep it on loopback.
+
+The admin UI is at `http://127.0.0.1:9901/ui/`. The release binary finds it in
+the `admin-ui-dist` directory next to it, and the container image has it built
+in. A source build has no UI until you run `make ui-build` (needs Node.js) and
+set `LLMPROXY_ADMIN_UI_DIR=admin-ui/dist`.
+
+Two start-up warnings are expected in the quick start: `LLMPROXY_ADMIN_TOKEN
+is not set` (the admin API and UI refuse changes until you set it), and, on
+macOS, `failed to pin workers to cores`. Next:
 [virtual keys](https://ergonlabs.io/docs/llm-proxy/authentication/virtual-keys/),
 budgets, and [`llm-proxy init`](https://ergonlabs.io/docs/llm-proxy/getting-started/quickstart/),
 which writes a starter config with authentication turned on.
