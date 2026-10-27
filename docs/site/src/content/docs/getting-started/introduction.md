@@ -11,7 +11,6 @@ related:
   - getting-started/installation
   - getting-started/quickstart
   - getting-started/core-concepts
-  - getting-started/coming-from-litellm-or-openrouter
   - reference/stability
 ---
 
@@ -80,9 +79,6 @@ The full list is on [Limitations](/docs/llm-proxy/help/limitations/).
 | Dialect handling | Passthrough, no conversion | One API for many providers | Converts between provider formats |
 | Provider credentials | Yours, held on each provider | The vendor's, or yours | Yours |
 | Configuration | One strict YAML file | Dashboard and API | YAML file and a database |
-
-For a term-by-term map, read
-[Coming from LiteLLM or OpenRouter](/docs/llm-proxy/getting-started/coming-from-litellm-or-openrouter/).
 
 ## Security defaults
 

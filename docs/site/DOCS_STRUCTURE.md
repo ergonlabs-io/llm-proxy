@@ -43,7 +43,7 @@ than a neat URL.
 | `getting-started/installation` | existing | `scripts/install.sh`, release archives, build from source, verify the install. |
 | `getting-started/core-concepts` | new | Providers, models, routes, fallbacks, wire dialects, virtual keys, tenants, the request lifecycle. |
 | `getting-started/connect-your-application` | existing | Point the OpenAI and Anthropic SDKs, curl, and agents at the proxy. |
-| `getting-started/coming-from-litellm-or-openrouter` | new | Concept map from LiteLLM proxy and OpenRouter terms to llm-proxy terms; what has no equivalent. |
+| `getting-started/coming-from-litellm-or-openrouter` | moved → `getting-started/introduction` | Removed from the docs: the LiteLLM and OpenRouter comparison will live on a marketing page on ergonlabs.io. |
 
 ### Providers
 | Slug | Status | Purpose |

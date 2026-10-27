@@ -20,6 +20,8 @@ export default defineConfig({
 		'/observability/admin-endpoints': '/docs/llm-proxy/administration/admin-api/',
 		'/authentication/external-authorization': '/docs/llm-proxy/help/limitations/',
 		'/operations/xds-conformance': '/docs/llm-proxy/help/limitations/',
+		// Removed: the comparison moves to a marketing page on ergonlabs.io.
+		'/getting-started/coming-from-litellm-or-openrouter': '/docs/llm-proxy/getting-started/introduction/',
 	},
 	integrations: [
 		starlight({
@@ -53,7 +55,6 @@ export default defineConfig({
 						{ label: 'Install llm-proxy', slug: 'getting-started/installation' },
 						{ label: 'Core concepts', slug: 'getting-started/core-concepts' },
 						{ label: 'Connect your application', slug: 'getting-started/connect-your-application' },
-						{ label: 'Coming from LiteLLM or OpenRouter', slug: 'getting-started/coming-from-litellm-or-openrouter' },
 					],
 				},
 				{

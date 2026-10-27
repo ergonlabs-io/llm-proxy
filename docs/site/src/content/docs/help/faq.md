@@ -7,7 +7,6 @@ summary: Questions an evaluator asks, answered in a few sentences each. Every
 lastUpdated: 2026-10-22
 related:
   - getting-started/introduction
-  - getting-started/coming-from-litellm-or-openrouter
   - help/limitations
   - help/troubleshooting
 ---
@@ -36,8 +35,7 @@ of its providers. See [OpenRouter](/docs/llm-proxy/providers/openrouter/).
 
 Both are self-hosted gateways. llm-proxy is a single Rust binary that passes
 requests through in the client's own API format. It does not translate between
-provider formats. See
-[Coming from LiteLLM or OpenRouter](/docs/llm-proxy/getting-started/coming-from-litellm-or-openrouter/).
+provider formats.
 
 ## Compatibility
 
