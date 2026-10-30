@@ -101,7 +101,7 @@ base64 = "0.22"
 flate2 = "1.1"
 # The long-window codec for agent traffic, which resends the whole
 # conversation each turn. Vendored C built by `cc`: no cmake or NASM.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 # Optional global allocator for the `llm-proxy` binary (`--features mimalloc`
 # on `proxy`). mimalloc over tikv-jemallocator: its C sources build with `cc`
 # alone, the same no-cmake/no-autotools property as zstd above, while
