@@ -96,6 +96,7 @@ listener scope.
 |---|---|---|---|---|
 | `llmproxy_usage_partial_total` | counter | responses | `scope` | Streams that ended before the provider's final usage (client abort, upstream death). Each is recorded with `completeness: partial` and metered from an estimate. |
 | `llmproxy_usage_estimated_total` | counter | responses | `scope` | Partial records whose token counts, and so cost, include an estimate. |
+| `llmproxy_usage_encoded_body_total` | counter | responses | `scope` | Responses a provider sent compressed although the proxy asked for `identity`. Each one is charged an estimate. |
 | `llmproxy_usage_unanswered_total` | counter | attempts | `scope` | Attempts that sent the provider the whole request and got no response, charged an estimate by the provider's `unanswered_usage`. |
 | `llmproxy_usage_unanswered_uncharged_total` | counter | attempts | `scope` | The same attempts, charged nothing because the provider's `unanswered_usage` is `none`. |
 | `llmproxy_usage_oversized_body_unmetered_total` | counter | requests | `scope` | Oversized JSON responses whose `usage` the proxy could not recover. Such a request has no usage and no cost, and no spend budget or token limit counts it. |

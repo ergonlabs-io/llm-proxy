@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::{Bytes, BytesMut};
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
 use prost_reflect::DynamicMessage;
 
 use proxy_config::ConfigError;
@@ -798,6 +798,9 @@ pub struct UsageStats {
     /// Attempts with no response charged nothing (`unanswered_usage: none`).
     unanswered_uncharged: ExportedCounter,
     last_uncharged_warning: Mutex<Option<Instant>>,
+    /// Readable responses that arrived content-encoded, charged an estimate.
+    encoded_body: ExportedCounter,
+    last_encoded_warning: Mutex<Option<Instant>>,
 }
 
 /// One Prometheus-exported counter that also keeps an in-process total, so
@@ -901,6 +904,11 @@ impl UsageStats {
                 &instruments::USAGE_UNANSWERED_UNCHARGED,
                 scope,
             ),
+            encoded_body: ExportedCounter::new(
+                exported.as_ref().map(|(registry, _)| registry),
+                &instruments::USAGE_ENCODED_BODY,
+                scope,
+            ),
             exported,
             repriced_handle,
             scope: scope.to_string(),
@@ -922,6 +930,10 @@ impl UsageStats {
 
     pub fn partial(&self) -> u64 {
         self.partial.get()
+    }
+
+    pub fn encoded_body(&self) -> u64 {
+        self.encoded_body.get()
     }
 
     pub fn estimated(&self) -> u64 {
@@ -1013,6 +1025,30 @@ impl UsageStats {
              and token limits did not count it). The provider can still bill it. Exported as \
              envoy_llmproxy_usage_unanswered_uncharged_total; this warning repeats at most once \
              per minute."
+        );
+    }
+
+    fn note_encoded_body(&self, cluster: Option<&str>) {
+        self.encoded_body.incr();
+        let now = Instant::now();
+        let mut last = self
+            .last_encoded_warning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|at| now.duration_since(at) < OVERSIZED_WARN_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        // The response is delivered and charged an estimate rather than
+        // nothing: a body the filter cannot read must not be free. Only the
+        // operator-chosen cluster name is logged.
+        tracing::warn!(
+            cluster = ?cluster,
+            "usage: a provider sent a compressed response although the proxy asked for \
+             `accept-encoding: identity`, so its usage could not be read and the request was \
+             charged an estimate (request and response size over four). Exported as \
+             envoy_llmproxy_usage_encoded_body_total; this warning repeats at most once per minute."
         );
     }
 
@@ -1902,6 +1938,13 @@ enum BodyMode {
     /// An accepted realtime session: the tunnel's server frames, read for
     /// `response.done` usage (ADR-0015).
     Realtime(RealtimeScanner),
+    /// A JSON or event-stream body sent with a `content-encoding` other than
+    /// `identity`: its usage cannot be read, so only its size is counted, and
+    /// the request is charged an estimate from it.
+    Encoded {
+        /// Body bytes seen, as sent (still encoded).
+        seen: u64,
+    },
     /// Anything else (including "haven't seen headers yet"): do nothing.
     Inert,
 }
@@ -2015,6 +2058,11 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect, endpoint: Endpoint) -> B
     };
     let media_type = value.split(';').next().unwrap_or("").trim();
 
+    let readable = media_type.eq_ignore_ascii_case("text/event-stream")
+        || media_type.eq_ignore_ascii_case("application/json");
+    if readable && is_encoded(headers) {
+        return BodyMode::Encoded { seen: 0 };
+    }
     let media = is_media(endpoint);
     if media_type.eq_ignore_ascii_case("text/event-stream") {
         if media {
@@ -2031,6 +2079,23 @@ fn classify_body(headers: &HeaderMap, dialect: Dialect, endpoint: Endpoint) -> B
     } else {
         BodyMode::Inert
     }
+}
+
+/// Whether the body is sent with a content coding other than `identity`
+/// (RFC 9110 section 8.4). An unparseable value counts as encoded: it is
+/// not known to be readable.
+fn is_encoded(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+            })
+        })
 }
 
 /// Pick the response parser from the downstream request. Only POST creates a
@@ -2172,7 +2237,7 @@ impl UsageFilterInstance {
                 )
             }
             BodyMode::Realtime(scanner) => (scanner.usage(), LlmMeters::default()),
-            BodyMode::Inert => (None, LlmMeters::default()),
+            BodyMode::Encoded { .. } | BodyMode::Inert => (None, LlmMeters::default()),
         };
         meters.audio_milliseconds = match &self.mode {
             BodyMode::MediaJson(scanner) => {
@@ -2180,7 +2245,11 @@ impl UsageFilterInstance {
                 self.audio_meter(facts.usage.as_deref(), facts.duration_ms)
             }
             BodyMode::MediaSse(scanner) => self.audio_meter(scanner.facts().usage.as_deref(), None),
-            BodyMode::Sse(_) | BodyMode::Json(_) | BodyMode::Realtime(_) | BodyMode::Inert => None,
+            BodyMode::Sse(_)
+            | BodyMode::Json(_)
+            | BodyMode::Realtime(_)
+            | BodyMode::Encoded { .. }
+            | BodyMode::Inert => None,
         };
         // A request-side meter: charged only when the response the client got
         // was 2xx, once, at the entry of the cluster dialled last. Speech's
@@ -2246,7 +2315,7 @@ impl UsageFilterInstance {
             BodyMode::Json(body) => body.facts().served_model.clone(),
             BodyMode::MediaJson(scanner) => scanner.facts().model.clone(),
             BodyMode::MediaSse(scanner) => scanner.facts().model.clone(),
-            BodyMode::Realtime(_) | BodyMode::Inert => None,
+            BodyMode::Realtime(_) | BodyMode::Encoded { .. } | BodyMode::Inert => None,
         }
     }
 
@@ -2266,7 +2335,7 @@ impl UsageFilterInstance {
                 media_upstream(facts.usage.as_deref(), facts.usage_oversized)
             }
             BodyMode::Realtime(scanner) => media_upstream(scanner.last_usage_json(), false),
-            BodyMode::Inert => UpstreamEvidence::default(),
+            BodyMode::Encoded { .. } | BodyMode::Inert => UpstreamEvidence::default(),
         }
     }
 
@@ -2279,6 +2348,12 @@ impl UsageFilterInstance {
         }
         self.finalized = true;
 
+        if matches!(self.mode, BodyMode::Encoded { .. }) {
+            // A complete body that could not be read is charged like a cut
+            // one: from an estimate, never as free.
+            self.write_estimate(cb);
+            return;
+        }
         let usage = self.compute_usage();
         if usage.is_none() && matches!(&self.mode, BodyMode::Json(body) if body.overflowed) {
             let cluster = cb.stream_info().upstream_cluster.clone();
@@ -2320,6 +2395,9 @@ impl UsageFilterInstance {
             // A cut-off JSON body cannot be parsed, so its size stands in for
             // the generated text.
             BodyMode::Json(body) => body.seen,
+            // An encoded body's size understates the text it carries, so
+            // the estimate is a floor.
+            BodyMode::Encoded { seen } => *seen,
             BodyMode::MediaJson(_)
             | BodyMode::MediaSse(_)
             | BodyMode::Realtime(_)
@@ -2342,6 +2420,24 @@ impl UsageFilterInstance {
         }
         let nothing = usage == LlmTokenUsage::default();
         ((!nothing).then(|| LlmUsage::from_tokens(usage)), estimated)
+    }
+
+    /// Record the request as partial and charge it an estimate (see
+    /// [`Self::estimate_partial_usage`]): a stream cut before its final
+    /// usage, or a body sent encoded, so unreadable.
+    fn write_estimate(&mut self, cb: &mut dyn EncoderCallbacks) {
+        if matches!(self.mode, BodyMode::Encoded { .. }) {
+            let cluster = cb.stream_info().upstream_cluster.clone();
+            self.stats.note_encoded_body(cluster.as_deref());
+        }
+        self.report_realtime_missing(cb);
+        let request_bytes = cb.stream_info().bytes_received;
+        let (usage, estimated) = self.estimate_partial_usage(request_bytes);
+        self.stats.partial.incr();
+        if estimated.input || estimated.output {
+            self.stats.estimated.incr();
+        }
+        self.write_stats(cb, usage, UsageCompleteness::Partial, estimated);
     }
 
     /// Count and warn about each realtime response the session did not pay
@@ -2598,6 +2694,14 @@ impl HttpFilter for UsageFilterInstance {
     ) -> FilterHeadersStatus {
         self.endpoint = cb.stream_info().llm.endpoint;
         self.request_dialect = dialect_for_request(self.endpoint);
+        // A compressed response body cannot be read for usage, and the client
+        // chooses whether to ask for one. Asking every provider for the body
+        // as sent keeps that choice away from the meter; a provider that
+        // compresses anyway is charged an estimate (`BodyMode::Encoded`).
+        headers.headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
         if self.endpoint == Endpoint::Realtime {
             // `permessage-deflate` would compress the event frames this filter
             // reads for usage. Without the client's offer the server cannot
@@ -2686,6 +2790,7 @@ impl HttpFilter for UsageFilterInstance {
             BodyMode::MediaJson(scanner) => scanner.push(data),
             BodyMode::MediaSse(scanner) => scanner.push(data),
             BodyMode::Realtime(scanner) => scanner.push(data),
+            BodyMode::Encoded { seen } => *seen += data.len() as u64,
             BodyMode::Inert => {}
         }
 
@@ -2742,21 +2847,11 @@ impl HttpFilter for UsageFilterInstance {
         if matches!(self.mode, BodyMode::Inert) && self.endpoint != Endpoint::Speech {
             return;
         }
-        let (dialled, request_bytes) = {
-            let info = cb.stream_info();
-            (info.upstream_cluster.is_some(), info.bytes_received)
-        };
-        if !dialled {
+        if cb.stream_info().upstream_cluster.is_none() {
             return;
         }
         self.finalized = true;
-        self.report_realtime_missing(cb);
-        let (usage, estimated) = self.estimate_partial_usage(request_bytes);
-        self.stats.partial.incr();
-        if estimated.input || estimated.output {
-            self.stats.estimated.incr();
-        }
-        self.write_stats(cb, usage, UsageCompleteness::Partial, estimated);
+        self.write_estimate(cb);
     }
 }
 
@@ -3779,6 +3874,111 @@ mod tests {
         assert_eq!((stats.partial(), stats.estimated()), (0, 0));
     }
 
+    // ---- compressed responses ------------------------------------------
+
+    /// The client decides whether to offer compression, and a compressed body
+    /// cannot be read for usage, so the offer never reaches the provider.
+    #[test]
+    fn the_clients_accept_encoding_is_replaced_with_identity() {
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        let mut request = RequestHeaders {
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse().unwrap(),
+            headers: HeaderMap::new(),
+        };
+        request.headers.insert(
+            http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        decode(&mut filter, &mut cb, &mut request, false);
+        let sent: Vec<_> = request
+            .headers
+            .get_all(http::header::ACCEPT_ENCODING)
+            .iter()
+            .collect();
+        assert_eq!(
+            sent,
+            [HeaderValue::from_static("identity")],
+            "the provider must be asked for an uncompressed body, got {sent:?}"
+        );
+    }
+
+    /// A provider that compresses anyway: the body is unreadable, so the
+    /// request is charged from its sizes, exactly as a cut stream is, never
+    /// as free. `identity` is not a compression and is still read.
+    #[test]
+    fn a_compressed_response_is_charged_an_estimate_not_free() {
+        // Twelve bytes of a gzip member: unreadable without inflating.
+        const GZIP: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xab\xae";
+        for content_type in ["application/json", "text/event-stream"] {
+            let mut filter = priced_filter();
+            let stats = Arc::clone(&filter.stats);
+            let mut cb = TestCallbacks::new();
+            {
+                let mut info = cb.stream_info.borrow_mut();
+                info.upstream_cluster = Some("provider:openai".into());
+                info.requested_model = Some("gpt-5".into());
+                info.bytes_received = 40;
+            }
+            let mut headers = response_headers(content_type);
+            headers.headers.insert(
+                http::header::CONTENT_ENCODING,
+                HeaderValue::from_static("gzip"),
+            );
+            filter.encode_headers(&mut cb, &mut headers, false);
+            filter.encode_data(&mut cb, &mut Bytes::from_static(GZIP), true);
+
+            let llm = cb.llm();
+            assert_eq!(
+                llm.completeness,
+                Some(UsageCompleteness::Partial),
+                "{content_type}"
+            );
+            // 40 request bytes -> 10 input tokens; 12 body bytes -> 3 output.
+            let usage = llm.usage.and_then(|u| u.tokens).expect("estimated usage");
+            assert_eq!(
+                (usage.input_tokens, usage.output_tokens),
+                (10, 3),
+                "{content_type}"
+            );
+            assert!(
+                llm.input_estimated && llm.output_estimated,
+                "{content_type}"
+            );
+            assert_eq!(
+                llm.list_cost.expect("priced").nanodollars,
+                400,
+                "{content_type}"
+            );
+            assert_eq!(
+                (stats.encoded_body(), stats.partial(), stats.estimated()),
+                (1, 1, 1),
+                "{content_type}"
+            );
+        }
+
+        let mut filter = priced_filter();
+        let mut cb = TestCallbacks::new();
+        {
+            let mut info = cb.stream_info.borrow_mut();
+            info.upstream_cluster = Some("provider:openai".into());
+            info.requested_model = Some("gpt-5".into());
+        }
+        let mut headers = response_headers("application/json");
+        headers.headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        filter.encode_headers(&mut cb, &mut headers, false);
+        let body = r#"{"usage":{"prompt_tokens":2,"completion_tokens":3}}"#;
+        filter.encode_data(&mut cb, &mut Bytes::from_static(body.as_bytes()), true);
+        let llm = cb.llm();
+        assert_eq!(llm.completeness, Some(UsageCompleteness::Complete));
+        assert_eq!(llm.list_cost.expect("priced").nanodollars, 320);
+        assert_eq!(filter.stats.encoded_body(), 0);
+    }
+
     #[test]
     fn error_bodies_and_unrecognised_content_are_never_recorded_as_partial() {
         // A non-2xx response that is cut off carries no usage to estimate.
@@ -3813,10 +4013,12 @@ mod tests {
         let stats = UsageStats::new(Some(registry.clone()), "ingress");
         stats.partial.incr();
         stats.estimated.incr();
+        stats.encoded_body.incr();
         let rendered = proxy_observability::stats::prometheus_render::render(&registry);
         for name in [
             "envoy_llmproxy_usage_partial_total{",
             "envoy_llmproxy_usage_estimated_total{",
+            "envoy_llmproxy_usage_encoded_body_total{",
         ] {
             let line = rendered
                 .lines()

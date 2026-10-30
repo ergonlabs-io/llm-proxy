@@ -1089,6 +1089,18 @@ pub mod instruments {
         attribute_keys: &["scope"],
         buckets: None,
     };
+    /// Readable responses (JSON or an event stream) that arrived with a
+    /// `content-encoding`, so their usage could not be read. Each one is
+    /// charged an estimate instead. The usage filter asks every provider for
+    /// `identity`, so any increase means a provider ignored that.
+    /// `scope` as above. Prometheus surface only.
+    pub const USAGE_ENCODED_BODY: Instrument = Instrument {
+        name: "llmproxy_usage_encoded_body_total",
+        kind: InstrumentKind::Counter,
+        unit: "{response}",
+        attribute_keys: &["scope"],
+        buckets: None,
+    };
     /// Priced requests whose image or audio tokens had no modality rate on
     /// their rate-card entry, so they were charged at the text rate: never
     /// less than before modality rates existed, but under the provider's
