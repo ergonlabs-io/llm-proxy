@@ -2300,6 +2300,51 @@ async fn put_budget_and_put_policy_do_not_clobber_each_other() {
     assert!(policy.budget.is_some());
 }
 
+/// `weekly` is accepted on the wire and reaches enforcement as [`Period::Weekly`].
+#[tokio::test]
+async fn put_budget_accepts_a_weekly_period() {
+    let (factory_state, handle, _spend) = factory_state_with_control_plane_and_spend(Period::Daily);
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+
+    let (status, _headers, body) = request(
+        addr,
+        "PUT",
+        "/tenants/tenant-a/budget",
+        Some(ADMIN_TOKEN),
+        r#"{"budget":{"max_usd":"25.00","period":"weekly"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let budget = handle
+        .load()
+        .policies
+        .get("tenant-a")
+        .and_then(|p| p.budget)
+        .expect("the budget PUT must be visible in the republished snapshot");
+    assert_eq!(budget.period, Period::Weekly);
+
+    let (status, _headers, body) = request(
+        addr,
+        "GET",
+        "/tenants/tenant-a/spend",
+        Some(ADMIN_TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(Period::Weekly.key_for_now().as_str()),
+        "the spend read must report the current week: {body}"
+    );
+}
+
 /// A malformed `max_usd` (not a valid decimal `parse_micro_usd` accepts) is a
 /// 400 naming the problem, never a silently-truncated or silently-zeroed
 /// budget.

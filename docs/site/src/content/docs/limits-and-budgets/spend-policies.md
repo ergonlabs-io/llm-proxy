@@ -24,7 +24,7 @@ card to the config file. Then set a ceiling with `PUT /keys/{id}/budget` or
 Spend enforcement uses two kinds of ceiling, and either one can refuse a
 request. A key budget counts the spend of one stable `key_id`. A tenant budget
 counts the spend of every key of one tenant. Each ceiling uses its own UTC
-budget period (`daily` or `monthly`) and counts spend across every model and
+budget period (`daily`, `weekly`, or `monthly`) and counts spend across every model and
 selected provider. A key budget never grants model access.
 
 A JWT caller counts against the budget of its tenant. For a ceiling on one JWT
@@ -347,7 +347,8 @@ to also count spend on the tenant's own provider key. The default is `false`.
 takes `credential_source` instead of `include_byok_in_limit`. See
 [Budgets](/docs/llm-proxy/authentication/tenant-provider-credentials/#budgets).
 
-- `period` is `daily` or `monthly`. Both use UTC.
+- `period` is `daily`, `weekly`, or `monthly`. All use UTC. A `weekly` period
+  is an ISO week: it starts on Monday at 00:00 UTC.
 - `{"budget":null}` clears the ceiling.
 - `GET /keys/{id}/spend` returns the ledger of a key. `GET /tenants/{id}/spend`
   returns the ledger of a tenant. `GET /keys` lists the policies without
@@ -494,7 +495,8 @@ metric labels.
 - A `SIGKILL` loses the charges since the last flush. Without
   `auth.spend.recovery_journal_path` it also loses the backlog of a store
   outage.
-- A budget has a period of `daily` or `monthly`. There is no other period.
+- A budget has a period of `daily`, `weekly`, or `monthly`. There is no other
+  period, and a key or tenant has one budget at a time.
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 

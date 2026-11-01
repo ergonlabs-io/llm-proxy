@@ -3,13 +3,15 @@ import { apiFetch, scopedWritePath, type AdminConn, type ApiResult } from './api
 import { parseRouting, parseTokenUsage, type Routing, type UsageRow } from './onboarding'
 import { featureState, type FeatureState } from './observability'
 
+export type BudgetPeriod = 'daily' | 'weekly' | 'monthly'
+
 /** One row of `GET /keys`. */
 export interface KeyRow {
   key_id: string
   tenant: string
   revoked: boolean
   /** `null` is "no ceiling configured"; a zero ceiling is a real number. */
-  budget: { max_micro_usd: number; max_usd: string; period: string } | null
+  budget: { max_micro_usd: number; max_usd: string; period: BudgetPeriod } | null
   policy: { access: 'all' | { only: string[] }; deny?: string[] } | null
 }
 

@@ -258,6 +258,8 @@ const MAX_UNPRICED_PAIRS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period {
     Daily,
+    /// An ISO 8601 week, Monday 00:00 UTC to the next Monday.
+    Weekly,
     Monthly,
 }
 
@@ -268,17 +270,19 @@ impl Period {
     /// happens on RECORD" note for why that split matters.
     pub fn key_for(&self, now: DateTime<Utc>) -> PeriodKey {
         // `%Y-%m-%d`/`%Y-%m` are `chrono`'s strftime-style specifiers, both
-        // zero-padded; `now` being a `DateTime<Utc>` (never naive or
+        // zero-padded. `%G` is the ISO week-based year, not `%Y`: 2027-01-01
+        // falls in 2026-W53, and `%Y` would split that week in two. `now` being a `DateTime<Utc>` (never naive or
         // local) is what makes the rendering UTC-safe by construction
         // rather than by convention.
         match self {
             Period::Daily => PeriodKey(now.format("%Y-%m-%d").to_string()),
+            Period::Weekly => PeriodKey(now.format("%G-W%V").to_string()),
             Period::Monthly => PeriodKey(now.format("%Y-%m").to_string()),
         }
     }
 
     /// The UTC instant this period's CURRENT window ends (exclusive) -- the
-    /// next daily or monthly calendar boundary strictly after `now`. The
+    /// next daily, weekly or monthly calendar boundary strictly after `now`. The
     /// spend enforcement filter uses this (never the
     /// accumulator itself, which has no notion of a ceiling) to compute
     /// `x-ratelimit-reset`/`retry-after` on a 429: "how many seconds until
@@ -288,6 +292,10 @@ impl Period {
     pub fn next_boundary(&self, now: DateTime<Utc>) -> DateTime<Utc> {
         let next_date = match self {
             Period::Daily => now.date_naive() + chrono::Duration::days(1),
+            Period::Weekly => {
+                let days_into_week = i64::from(now.weekday().num_days_from_monday());
+                now.date_naive() + chrono::Duration::days(7 - days_into_week)
+            }
             Period::Monthly => {
                 let (year, month) = (now.year(), now.month());
                 let (next_year, next_month) = if month == 12 {
@@ -327,6 +335,10 @@ impl Period {
     fn current_boundary(&self, now: DateTime<Utc>) -> DateTime<Utc> {
         let start_date = match self {
             Period::Daily => now.date_naive(),
+            Period::Weekly => {
+                let days_into_week = i64::from(now.weekday().num_days_from_monday());
+                now.date_naive() - chrono::Duration::days(days_into_week)
+            }
             Period::Monthly => NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
                 .expect("the first day of a valid year/month is always a valid date"),
         };
@@ -361,7 +373,8 @@ impl Period {
 }
 
 /// A rendered [`Period`] -- `"2026-08-31"` for [`Period::Daily`],
-/// `"2026-08"` for [`Period::Monthly`]. A newtype around `String`, same
+/// `"2026-W36"` for [`Period::Weekly`], `"2026-08"` for [`Period::Monthly`].
+/// A newtype around `String`, same
 /// reasoning as [`MicroUsd`]'s doc above: a raw period string and a raw
 /// tenant id are both "just a `String`" at the type level, and this keeps a
 /// call site from passing one where the other belongs.
@@ -393,6 +406,15 @@ impl PeriodKey {
                 Period::Daily,
                 NaiveDate::parse_from_str(&self.0, "%Y-%m-%d").ok()?,
             ),
+            8 => {
+                let (year, week) = self.0.split_once("-W")?;
+                let monday = NaiveDate::from_isoywd_opt(
+                    year.parse().ok()?,
+                    week.parse().ok()?,
+                    chrono::Weekday::Mon,
+                )?;
+                (Period::Weekly, monday)
+            }
             7 => (
                 Period::Monthly,
                 NaiveDate::parse_from_str(&format!("{}-01", self.0), "%Y-%m-%d").ok()?,
@@ -2679,6 +2701,40 @@ pub(crate) mod tests {
             Period::Daily.key_for(dt(2026, 8, 31, 12, 0, 0)),
             PeriodKey::for_test("2026-08-31")
         );
+    }
+
+    #[test]
+    fn weekly_period_runs_monday_to_monday_utc() {
+        let monday = dt(2026, 8, 31, 0, 0, 0);
+        let sunday_night = dt(2026, 9, 6, 23, 59, 59);
+        let key = Period::Weekly.key_for(monday);
+        assert_eq!(key, PeriodKey::for_test("2026-W36"));
+        assert_eq!(Period::Weekly.key_for(sunday_night), key);
+        assert_ne!(Period::Weekly.key_for(dt(2026, 9, 7, 0, 0, 0)), key);
+        assert_eq!(
+            Period::Weekly.next_boundary(monday),
+            dt(2026, 9, 7, 0, 0, 0)
+        );
+        assert_eq!(
+            Period::Weekly.next_boundary(sunday_night),
+            dt(2026, 9, 7, 0, 0, 0)
+        );
+        assert_eq!(Period::Weekly.current_boundary(sunday_night), monday);
+    }
+
+    /// A store row outlives the process, so a stored key must parse back to the window that wrote it, or
+    /// reporting and Redis expiry lose the window. The new year is the case `%Y` would get wrong.
+    #[test]
+    fn weekly_period_key_survives_the_new_year_and_parses_back() {
+        let key = Period::Weekly.key_for(dt(2027, 1, 1, 12, 0, 0));
+        assert_eq!(key, PeriodKey::for_test("2026-W53"));
+        assert_eq!(key, Period::Weekly.key_for(dt(2026, 12, 28, 0, 0, 0)));
+        assert_eq!(key.starts_at(), Some(dt(2026, 12, 28, 0, 0, 0)));
+        assert_eq!(key.ends_at(), Some(dt(2027, 1, 4, 0, 0, 0)));
+
+        // 2027 has 52 ISO weeks, and a bare `2026-W5` is not what `key_for` renders.
+        assert_eq!(PeriodKey::for_test("2027-W53").ends_at(), None);
+        assert_eq!(PeriodKey::for_test("2026-W5").ends_at(), None);
     }
 
     #[test]

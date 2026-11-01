@@ -2152,12 +2152,13 @@ struct BudgetSpec {
     include_byok_in_limit: Option<bool>,
 }
 
-/// Wire form of [`Period`]: `"daily"` or `"monthly"`. The same spelling is used for requests and responses, so
+/// Wire form of [`Period`]: `"daily"`, `"weekly"` or `"monthly"`. The same spelling is used for requests and responses, so
 /// a `PUT` and a `GET` agree.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PeriodSpec {
     Daily,
+    Weekly,
     Monthly,
 }
 
@@ -2165,6 +2166,7 @@ impl From<PeriodSpec> for Period {
     fn from(spec: PeriodSpec) -> Self {
         match spec {
             PeriodSpec::Daily => Period::Daily,
+            PeriodSpec::Weekly => Period::Weekly,
             PeriodSpec::Monthly => Period::Monthly,
         }
     }
@@ -2174,6 +2176,7 @@ impl From<Period> for PeriodSpec {
     fn from(period: Period) -> Self {
         match period {
             Period::Daily => PeriodSpec::Daily,
+            Period::Weekly => PeriodSpec::Weekly,
             Period::Monthly => PeriodSpec::Monthly,
         }
     }

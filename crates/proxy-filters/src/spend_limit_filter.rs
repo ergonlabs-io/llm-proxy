@@ -1988,6 +1988,49 @@ mod tests {
             .current_total_key(&test_key_id("tenant-a"), &Period::Daily.key_for_now())
     }
 
+    /// A weekly budget charges the week's bucket, reads the same bucket at admission, and its 429 uses the week's
+    /// reset rather than a daily or monthly one. `weekly_period_runs_monday_to_monday_utc` owns the boundary itself.
+    #[test]
+    fn a_weekly_budget_charges_the_week_and_resets_on_monday() {
+        use proxy_observability::records::UsageCompleteness::Complete;
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            KeyBudget {
+                max_micros: MicroUsd::from_micros(5),
+                period: Period::Weekly,
+                include_byok_in_limit: false,
+            },
+        )]);
+        let mut table = Card::default();
+        table.insert("cluster-a", "first", 1_000_000);
+        let harness = filter_with(&cp, table, Period::Monthly);
+
+        assert_eq!(run_stream(&harness, 7, Some(Complete), false), None);
+        assert_eq!(
+            harness
+                .accumulator
+                .current_total_key(&test_key_id("tenant-a"), &Period::Weekly.key_for_now()),
+            7
+        );
+
+        let latest_reset = Period::Weekly.seconds_until_reset(Utc::now());
+        let (reply, _cb) = run_request(&harness, "tenant-a", Some(("cluster-a", "first")), Some(1));
+        let (status, headers) = reply.expect("7 micros is over the weekly ceiling of 5");
+        let earliest_reset = Period::Weekly.seconds_until_reset(Utc::now());
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let reset: u64 = headers
+            .get("x-ratelimit-reset")
+            .expect("a 429 names its reset")
+            .to_str()
+            .expect("the header is ascii digits")
+            .parse()
+            .expect("the header is a number of seconds");
+        assert!(
+            (earliest_reset..=latest_reset).contains(&reset),
+            "reset {reset} must be the weekly reset: {earliest_reset}..={latest_reset}"
+        );
+    }
+
     #[test]
     fn an_aborted_stream_is_charged_its_partial_estimate_exactly_once() {
         use proxy_observability::records::UsageCompleteness::Partial;

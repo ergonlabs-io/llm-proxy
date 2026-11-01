@@ -10,6 +10,12 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
+### Added
+
+- Spend budgets: `period` can be `weekly`, an ISO week that starts on Monday at
+  00:00 UTC. A store that holds a weekly budget cannot be read by 1.0.0, so
+  change or clear weekly budgets before a downgrade.
+
 ### Fixed
 
 - Outlier detection: the ejection-time multiplier now decays. It decreases by 1

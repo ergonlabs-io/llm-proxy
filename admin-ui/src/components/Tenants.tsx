@@ -4,8 +4,8 @@ import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Input } from './ui/input'
 import { Field, ResultPanel } from './forms'
 import { apiFetch, type AdminConn, type ApiResult } from '../lib/api'
+import type { BudgetPeriod } from '../lib/useAdminState'
 
-type BudgetPeriod = 'daily' | 'monthly'
 
 function budgetBody(maxUsd: string, period: BudgetPeriod, clear: boolean): unknown {
   if (clear) return { budget: null }
@@ -198,6 +198,7 @@ export function Tenants({ conn }: { conn: AdminConn }) {
                   disabled={budgetClear}
                 >
                   <option value="daily">daily</option>
+                  <option value="weekly">weekly</option>
                   <option value="monthly">monthly</option>
                 </select>
               </Field>

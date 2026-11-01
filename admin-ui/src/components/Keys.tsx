@@ -8,7 +8,7 @@ import { Dialog } from './ui/tabs'
 import { Table, THead, TRow, TH, TD } from './ui/table'
 import { Field, ResultPanel } from './forms'
 import { apiFetch, type AdminConn, type ApiResult } from '../lib/api'
-import type { AdminState, KeyRow } from '../lib/useAdminState'
+import type { AdminState, BudgetPeriod, KeyRow } from '../lib/useAdminState'
 import { firstRequestSnippet, proxyBaseUrls, sampleModel, type SnippetKind } from '../lib/onboarding'
 
 /**
@@ -41,9 +41,11 @@ function policyLabel(policy: KeyRow['policy']): string {
   return policy.access.only.join(', ')
 }
 
+const periodUnit: Record<BudgetPeriod, string> = { daily: 'day', weekly: 'week', monthly: 'month' }
+
 function budgetLabel(budget: KeyRow['budget']): string {
   if (!budget) return 'no limit'
-  return `$${budget.max_usd} / ${budget.period === 'daily' ? 'day' : 'month'}`
+  return `$${budget.max_usd} / ${periodUnit[budget.period]}`
 }
 
 function browserHost(conn: AdminConn): string {
@@ -58,7 +60,7 @@ function browserHost(conn: AdminConn): string {
 async function applyLimits(
   conn: AdminConn,
   keyId: string,
-  limits: { budgetUsd: string; period: 'daily' | 'monthly'; models: string },
+  limits: { budgetUsd: string; period: BudgetPeriod; models: string },
 ): Promise<ApiResult[]> {
   const id = encodeURIComponent(keyId)
   const results: ApiResult[] = []
@@ -90,9 +92,9 @@ function LimitFields({
   onChange,
 }: {
   budgetUsd: string
-  period: 'daily' | 'monthly'
+  period: BudgetPeriod
   models: string
-  onChange: (v: { budgetUsd: string; period: 'daily' | 'monthly'; models: string }) => void
+  onChange: (v: { budgetUsd: string; period: BudgetPeriod; models: string }) => void
 }) {
   return (
     <div className="grid gap-2 sm:grid-cols-3">
@@ -107,10 +109,11 @@ function LimitFields({
       <Field label="per">
         <select
           value={period}
-          onChange={(e) => onChange({ budgetUsd, period: e.target.value as 'daily' | 'monthly', models })}
+          onChange={(e) => onChange({ budgetUsd, period: e.target.value as BudgetPeriod, models })}
           className="h-9 w-full rounded-md border border-zinc-300 bg-white px-2 text-sm"
         >
           <option value="daily">day</option>
+          <option value="weekly">week</option>
           <option value="monthly">month</option>
         </select>
       </Field>
@@ -134,7 +137,7 @@ export function Keys({ conn, state }: { conn: AdminConn; state: AdminState }) {
   const [name, setName] = useState('')
   const [tenant, setTenant] = useState(TEAM_TENANT)
   const [showAdvanced, setShowAdvanced] = useState(false)
-  const [limits, setLimits] = useState({ budgetUsd: '', period: 'monthly' as 'daily' | 'monthly', models: '' })
+  const [limits, setLimits] = useState({ budgetUsd: '', period: 'monthly' as BudgetPeriod, models: '' })
   const [mintError, setMintError] = useState<ApiResult | null>(null)
   const [minted, setMinted] = useState<Minted | null>(null)
   const [busy, setBusy] = useState(false)
@@ -213,7 +216,7 @@ export function Keys({ conn, state }: { conn: AdminConn; state: AdminState }) {
 
   // ---- edit / revoke ----
   const [editing, setEditing] = useState<string | null>(null)
-  const [editLimits, setEditLimits] = useState({ budgetUsd: '', period: 'monthly' as 'daily' | 'monthly', models: '' })
+  const [editLimits, setEditLimits] = useState({ budgetUsd: '', period: 'monthly' as BudgetPeriod, models: '' })
   const [rowResult, setRowResult] = useState<ApiResult | null>(null)
 
   function startEdit(k: KeyRow) {
@@ -221,7 +224,7 @@ export function Keys({ conn, state }: { conn: AdminConn; state: AdminState }) {
     setEditing(k.key_id)
     setEditLimits({
       budgetUsd: k.budget?.max_usd ?? '',
-      period: k.budget?.period === 'daily' ? 'daily' : 'monthly',
+      period: k.budget?.period ?? 'monthly',
       models: k.policy && k.policy.access !== 'all' ? k.policy.access.only.join(', ') : '',
     })
   }

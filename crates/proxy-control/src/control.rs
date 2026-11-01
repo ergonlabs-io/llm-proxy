@@ -1825,6 +1825,7 @@ impl From<EncodedModelAccess> for ModelAccess {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) enum EncodedPeriod {
     Daily,
+    Weekly,
     Monthly,
 }
 
@@ -1832,6 +1833,7 @@ impl From<crate::spend::Period> for EncodedPeriod {
     fn from(period: crate::spend::Period) -> Self {
         match period {
             crate::spend::Period::Daily => EncodedPeriod::Daily,
+            crate::spend::Period::Weekly => EncodedPeriod::Weekly,
             crate::spend::Period::Monthly => EncodedPeriod::Monthly,
         }
     }
@@ -1841,6 +1843,7 @@ impl From<EncodedPeriod> for crate::spend::Period {
     fn from(encoded: EncodedPeriod) -> Self {
         match encoded {
             EncodedPeriod::Daily => crate::spend::Period::Daily,
+            EncodedPeriod::Weekly => crate::spend::Period::Weekly,
             EncodedPeriod::Monthly => crate::spend::Period::Monthly,
         }
     }
@@ -7579,6 +7582,21 @@ mod tests {
              published handle right away -- a set_budget that skipped rebuild() would leave \
              this None"
         );
+    }
+
+    /// A store row must decode to the period it was written with. The spelling is pinned too: a stored budget
+    /// outlives the binary that wrote it.
+    #[test]
+    fn a_weekly_budget_survives_the_stored_encoding() {
+        let budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(25_000_000),
+            period: Period::Weekly,
+            credential_source: CredentialSource::Platform,
+        };
+        let row = serde_json::to_string(&EncodedTenantBudget::from(&budget)).unwrap();
+        assert!(row.contains(r#""period":"Weekly""#), "stored as: {row}");
+        let decoded: EncodedTenantBudget = serde_json::from_str(&row).unwrap();
+        assert_eq!(TenantBudget::from(decoded), budget);
     }
 
     /// Clearing a budget (`set_budget(.., None)`) removes it from the
