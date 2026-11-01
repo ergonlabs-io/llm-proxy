@@ -42,6 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -219,6 +220,9 @@ struct HostState {
     /// True from an ejection until the first sweep that finds the host out of ejection. Decay waits for the sweep
     /// after that, so the host has been healthy for a full interval: Envoy's `now - lastUnejectionTime >= interval`.
     ejected_since_last_sweep: bool,
+    /// The latest ejection, from [`OutlierDetector::next_ejection_id`]. An un-eject timer ends only the ejection it
+    /// was scheduled for, or a host un-ejected early and ejected again would be released at the old deadline.
+    ejection_id: u64,
     /// Successes/failures accumulated since the last interval tick, for the
     /// success-rate/failure-percentage detectors.
     interval_success: u32,
@@ -336,7 +340,9 @@ pub struct OutlierDetector {
     config: OutlierDetectionConfig,
     cluster_name: String,
     host_set: Arc<ArcSwap<HostSet>>,
-    states: Mutex<HashMap<SocketAddr, HostState>>,
+    states: Arc<Mutex<HashMap<SocketAddr, HostState>>>,
+    /// Detector-wide, so a host pruned from `states` and ejected again cannot reuse the id of a pending timer.
+    next_ejection_id: AtomicU64,
     rng: Mutex<StdRng>,
     sink: Arc<dyn OutlierEventSink>,
     /// Pending un-eject timers. Owned here, so a removed cluster's timers stop with it:
@@ -371,7 +377,8 @@ impl OutlierDetector {
             config,
             cluster_name: cluster_name.into(),
             host_set,
-            states: Mutex::new(HashMap::new()),
+            states: Arc::new(Mutex::new(HashMap::new())),
+            next_ejection_id: AtomicU64::new(0),
             rng: Mutex::new(StdRng::seed_from_u64(seed)),
             sink,
             unejects: Mutex::new(JoinSet::new()),
@@ -642,6 +649,12 @@ impl OutlierDetector {
     fn eject(&self, addr: SocketAddr, cause: EjectionCause) {
         // Rust note: the decision sits inside `rcu` so it re-runs on the newest set after a lost compare-and-swap.
         // Decided outside, two workers could both pass the cap check on the same snapshot, then both publish.
+        // `states` stays locked until the new id is stored, so an expiring timer cannot match the old id and clear
+        // this ejection's flag.
+        let mut states = self
+            .states
+            .lock()
+            .expect("lock poisoned: a holder panicked");
         let mut decision = EjectDecision::Skip;
         self.host_set.rcu(|current| {
             decision = self.decide_ejection(current, addr);
@@ -656,13 +669,17 @@ impl OutlierDetector {
             EjectDecision::Capped => {
                 // The counter was already reset in `report_result` (or, for the statistical detectors, there is
                 // none); see the module doc.
+                drop(states);
                 self.emit_eject_event(addr, cause, false, None, 0);
             }
             EjectDecision::Eject => {
-                let (ejection_count, backoff) = self.record_ejection(addr);
+                let ejection_id = self.next_ejection_id.fetch_add(1, Ordering::Relaxed) + 1;
+                let (ejection_count, backoff) =
+                    self.record_ejection(&mut states, addr, ejection_id);
+                drop(states);
                 let duration = self.ejection_duration(backoff);
                 self.emit_eject_event(addr, cause, true, Some(duration), ejection_count);
-                self.schedule_uneject(addr, duration);
+                self.schedule_uneject(addr, duration, ejection_id);
             }
         }
     }
@@ -699,16 +716,18 @@ impl OutlierDetector {
     /// Counts one enforced ejection and returns the new `(lifetime count, backoff)`. The backoff stops one step past
     /// the cap, the same bound as Envoy's `ejectHost`, so a recovered host decays from there rather than from however
     /// many ejections it has ever had.
-    fn record_ejection(&self, addr: SocketAddr) -> (u32, u32) {
+    fn record_ejection(
+        &self,
+        states: &mut HashMap<SocketAddr, HostState>,
+        addr: SocketAddr,
+        ejection_id: u64,
+    ) -> (u32, u32) {
         let base = self.config.base_ejection_time;
         let limit = self.ejection_time_cap().saturating_add(base);
-        let mut states = self
-            .states
-            .lock()
-            .expect("lock poisoned: a holder panicked");
         let state = states.entry(addr).or_default();
         state.ejection_count += 1;
         state.ejected_since_last_sweep = true;
+        state.ejection_id = ejection_id;
         if base.saturating_mul(state.ejection_backoff) < limit {
             state.ejection_backoff += 1;
         }
@@ -729,15 +748,25 @@ impl OutlierDetector {
             .max(self.config.base_ejection_time)
     }
 
-    /// Un-eject timer, owned by the detector. Only clones of `host_set`, `sink`, and `cluster_name` cross into
-    /// the spawned task, so `report_result` and `eject` can stay plain `&self` methods.
-    fn schedule_uneject(&self, addr: SocketAddr, duration: Duration) {
+    /// Un-eject timer, owned by the detector. Only clones of `host_set`, `states`, `sink`, and `cluster_name` cross
+    /// into the spawned task, so `report_result` and `eject` can stay plain `&self` methods.
+    fn schedule_uneject(&self, addr: SocketAddr, duration: Duration, ejection_id: u64) {
         let host_set = Arc::clone(&self.host_set);
+        let states = Arc::clone(&self.states);
         let sink = Arc::clone(&self.sink);
         let cluster_name = self.cluster_name.clone();
         let timer = async move {
             tokio::time::sleep(duration).await;
-            if Self::set_outlier_flag(&host_set, addr, false) {
+            // No state means the sweep pruned the host, so no later ejection can be running. Clearing is the safe
+            // side: a timer that gave up here could leave a host ejected with nothing left to end it.
+            let unejected = {
+                let states = states.lock().expect("lock poisoned: a holder panicked");
+                states
+                    .get(&addr)
+                    .is_none_or(|state| state.ejection_id == ejection_id)
+                    && Self::set_outlier_flag(&host_set, addr, false)
+            };
+            if unejected {
                 Self::emit_uneject_event_static(
                     &cluster_name,
                     sink.as_ref(),
@@ -1188,6 +1217,30 @@ mod tests {
 
     /// Past the cap, more ejections must not bank extra steps: Envoy's bound means a host decays to base in about
     /// `max_ejection_time / base_ejection_time` intervals, however long the incident ran.
+    /// The first ejection's timer is still pending when a health check ends that ejection early. It must not end the
+    /// next one at the old deadline. Failing here means a re-ejected host takes traffic too soon.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_timer_does_not_end_a_later_ejection() {
+        let a = addr(1);
+        let (engine, host_set, _sink) =
+            detector(vec![host(1), host(2)], config_without_ejection_cap());
+        eject_with_5xx(&engine, a);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        engine.on_active_health_check_pass(a);
+        assert!(!is_ejected(&host_set, a), "the health check un-ejects");
+
+        eject_with_5xx(&engine, a);
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert!(
+            is_ejected(&host_set, a),
+            "35s in, the first timer has fired; the second ejection lasts 60s from 10s"
+        );
+
+        tokio::time::sleep(Duration::from_secs(36)).await;
+        engine.await_pending_unejects().await;
+        assert!(!is_ejected(&host_set, a), "the second timer ends it at 70s");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_long_incident_does_not_bank_backoff_past_the_cap() {
         let a = addr(1);

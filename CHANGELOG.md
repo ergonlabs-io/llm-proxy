@@ -25,6 +25,8 @@ surfaces that an upgrade within 1.x keeps stable.
   `max_ejection_percent` allows, or eject one host twice.
 - EDS: an update that races a health check or an outlier ejection no longer
   loses the health flag.
+- Outlier detection: the timer of an ejection that a health check ended early no
+  longer ends a later ejection of the same provider at the old deadline.
 
 ## [1.0.0] - 2026-10-24
 
