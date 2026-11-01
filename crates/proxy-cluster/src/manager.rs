@@ -829,14 +829,16 @@ impl ClusterManager {
             .ok_or_else(|| not_found(name))?;
         // Rust note: `static_hosts` turns literal-IP `EndpointIR`s into `Host`s. It does no I/O, whatever the source.
         let hosts = discovery::static_hosts(endpoints)?;
-        let new_set = HostSet::from_hosts(hosts);
-        let old_set = managed.host_set.load();
-        let diff = diff_host_sets(&old_set, &new_set);
-        // Carry `health_flags` over for every address still present. Otherwise the next EDS push would erase an
-        // active-check result. See `host_set::carry_over_health_flags`.
-        let new_set = carry_over_health_flags(&old_set, new_set, &diff);
-        drop(old_set);
-        managed.host_set.store(Arc::new(new_set));
+        let mut diff = HostSetDiff::default();
+        // Rust note: `rcu`, for the reason in `ManagedCluster::resolve_and_publish`: a health or outlier flag set
+        // between a load and a store would be lost, and those transitions are edge-triggered, so nothing sets it again.
+        managed.host_set.rcu(|live| {
+            let candidate = HostSet::from_hosts(hosts.clone());
+            diff = diff_host_sets(live, &candidate);
+            // Carry `health_flags` over for every address still present. Otherwise the next EDS push would erase an
+            // active-check result. See `host_set::carry_over_health_flags`.
+            Arc::new(carry_over_health_flags(live, candidate, &diff))
+        });
         managed.initialized.store(true, Ordering::Release);
         managed.reconcile_probes(&diff);
         Ok(diff)
@@ -2333,6 +2335,58 @@ mod tests {
              single-generation baseline ({baseline} hits/250ms) -- earlier \
              generations' probes were never aborted and are still running"
         );
+    }
+
+    /// An EDS push racing an ejection must keep the flag: ejections are edge-triggered, so a lost flag is never set
+    /// again. Every host gets one ejection while pushes run, and a large set keeps each push's window wide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eds_update_keeps_a_flag_set_while_it_runs() {
+        let resolver = Arc::new(FakeResolver::new());
+        let manager = ClusterManager::with_default_transport(resolver);
+        let eds = Arc::into_inner(cluster_config_eds("eds-svc")).expect("the only reference");
+        let config = ClusterConfig {
+            outlier_detection: Some(proxy_config::ir::OutlierDetectionIR {
+                consecutive_5xx: 1,
+                enforcing_consecutive_5xx: 100,
+                max_ejection_percent: 100,
+                ..proxy_config::ir::OutlierDetectionIR::ENVOY_DEFAULT
+            }),
+            ..eds
+        };
+        let snapshot = HashMap::from([("eds-svc".to_string(), Arc::new(config))]);
+        manager.update_from_snapshot(&snapshot).await;
+        let endpoints: Vec<EndpointIR> = (1..=250)
+            .map(|last| endpoint(&format!("10.0.0.{last}"), 80))
+            .collect();
+        manager
+            .accept_eds_update("eds-svc", &endpoints)
+            .expect("EDS update");
+        let entry = manager.cluster("eds-svc").expect("cluster exists");
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    manager
+                        .accept_eds_update("eds-svc", &endpoints)
+                        .expect("EDS update");
+                }
+            });
+            for last in 1..=250u8 {
+                let target = SocketAddr::from(([10, 0, 0, last], 80));
+                entry.report_outlier_result(target, RequestResult::Http5xx);
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+
+        let lost = manager.clusters.load()["eds-svc"]
+            .host_set
+            .load()
+            .all_hosts()
+            .iter()
+            .filter(|h| !h.health_flags.failed_outlier_check)
+            .count();
+        assert_eq!(lost, 0, "{lost} of 250 ejections lost to a racing EDS push");
     }
 
     /// Acceptance test: a cluster configured with outlier detection

@@ -850,7 +850,7 @@
             "base_ejection_time": {
               "$ref": "#/$defs/Duration",
               "default": "30s",
-              "description": "Length of the first ejection. Each later ejection of the provider lasts this value times the number of ejections so far, up to `max_ejection_time`. Must be greater than 0."
+              "description": "Length of the first ejection. Each later ejection of the provider lasts this value times the ejection multiplier, up to `max_ejection_time`. The multiplier increases by 1 at each ejection and decreases by 1 for each 10 seconds that the provider stays out of ejection. Must be greater than 0."
             },
             "max_ejection_time": {
               "$ref": "#/$defs/Duration",

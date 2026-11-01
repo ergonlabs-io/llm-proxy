@@ -178,7 +178,7 @@ provider. It is off when you omit it.
 | Field | Type | Default | What it does |
 |---|---|---|---|
 | `consecutive_5xx` | integer, 1 or more | `5` | Consecutive failed attempts that eject the provider. A 5xx response and a local failure count. A 429 does not count and ends the run. |
-| `base_ejection_time` | duration | `30s` | Length of the first ejection. Each later ejection lasts this value times the number of ejections so far. Must be greater than 0. |
+| `base_ejection_time` | duration | `30s` | Length of the first ejection. Each later ejection lasts this value times the ejection multiplier. The multiplier increases by 1 at each ejection and decreases by 1 for each 10 seconds that the provider stays out of ejection. Must be greater than 0. |
 | `max_ejection_time` | duration | the larger of `300s` and `base_ejection_time` | Upper bound on one ejection. Must not be less than `base_ejection_time`. |
 
 Ejection is per proxy process. Replicas do not share it. A provider cluster

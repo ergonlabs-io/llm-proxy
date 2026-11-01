@@ -34,8 +34,13 @@
 //! **A threshold crossing always resets its counter**, whether or not the ejection was enforced (the
 //! enforcement dice roll or `max_ejection_percent` may block it). This matches Envoy's edge-triggered
 //! counters: detection fired, so the run restarts from zero rather than re-firing on every later request.
+//!
+//! **The ejection-time multiplier decays; the ejection count does not.** Envoy keeps two numbers per host, and so
+//! does [`HostState`]: the lifetime `num_ejections` for the event log, and `ejectTimeBackoff`, which sets the
+//! duration. An ejection adds one to the backoff, unless the duration has already reached the cap. Each interval sweep
+//! takes one off, provided the host has been out of ejection for a full interval (`DetectorImpl::onIntervalTimer`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,10 +74,12 @@ pub enum RequestResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutlierDetectionConfig {
     /// How often the success-rate and failure-percentage detectors re-run
-    /// over the whole host set. S6 default: 10s.
+    /// over the whole host set, and how often a healthy host's ejection-time
+    /// multiplier drops by one. S6 default: 10s.
     pub interval: Duration,
     /// First ejection's duration; later ejections grow by this amount per
-    /// consecutive ejection (see [`OutlierDetectionConfig::max_ejection_time`]).
+    /// step of the ejection-time multiplier, which decays while the host stays
+    /// healthy (see [`OutlierDetectionConfig::max_ejection_time`]).
     /// S6 default: 30s.
     pub base_ejection_time: Duration,
     /// Ceiling on ejection duration regardless of growth, clamped to be at
@@ -205,8 +212,13 @@ impl From<&proxy_config::ir::OutlierDetectionIR> for OutlierDetectionConfig {
 struct HostState {
     consecutive_5xx: u32,
     consecutive_gateway_failure: u32,
-    /// Lifetime ejection count. Drives ejection-time growth (S6: `base_ejection_time * consecutive ejection count`).
+    /// Lifetime ejection count, reported as the event log's `num_ejections`. Only ever grows.
     ejection_count: u32,
+    /// Ejection-time multiplier, Envoy's `ejectTimeBackoff` (S6: `base_ejection_time * consecutive ejection count`).
+    ejection_backoff: u32,
+    /// True from an ejection until the first sweep that finds the host out of ejection. Decay waits for the sweep
+    /// after that, so the host has been healthy for a full interval: Envoy's `now - lastUnejectionTime >= interval`.
+    ejected_since_last_sweep: bool,
     /// Successes/failures accumulated since the last interval tick, for the
     /// success-rate/failure-percentage detectors.
     interval_success: u32,
@@ -232,6 +244,16 @@ impl EjectionCause {
             EjectionCause::FailurePercentage => "FAILURE_PERCENTAGE",
         }
     }
+}
+
+/// What [`OutlierDetector::eject`] decided against one host-set snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EjectDecision {
+    /// Not a member, or already ejected: not a new event.
+    Skip,
+    /// Detection fired, but `max_ejection_percent` blocks enforcement.
+    Capped,
+    Eject,
 }
 
 /// Why a host was un-ejected, for the event log.
@@ -475,15 +497,26 @@ impl OutlierDetector {
         }
     }
 
-    /// Interval sweep: snapshot + reset every host's interval counters, then
-    /// run the success-rate and failure-percentage detectors over the
-    /// snapshot.
+    /// Interval sweep: drop the state of hosts that left the set, snapshot + reset every remaining host's interval
+    /// counters, run the success-rate and failure-percentage detectors over the snapshot, then decay the backoff of
+    /// the hosts they left alone.
     fn run_interval_tick(&self) {
+        let members: HashSet<SocketAddr> = self
+            .host_set
+            .load()
+            .all_hosts()
+            .iter()
+            .map(|h| h.address)
+            .collect();
         let snapshot: Vec<(SocketAddr, u32, u32)> = {
             let mut states = self
                 .states
                 .lock()
                 .expect("lock poisoned: a holder panicked");
+            // A later host at the same address is a new host, and must not inherit this one's backoff. Envoy drops
+            // the monitor on the membership update; here the sweep does, so an address that returns within one
+            // interval keeps its state.
+            states.retain(|addr, _| members.contains(addr));
             states
                 .iter_mut()
                 .map(|(addr, state)| {
@@ -496,6 +529,32 @@ impl OutlierDetector {
         };
         self.run_success_rate_detection(&snapshot);
         self.run_failure_percentage_detection(&snapshot);
+        self.decay_ejection_backoff();
+    }
+
+    /// Takes one step off the backoff of every host that spent the whole last interval out of ejection. Runs after
+    /// the detectors, as in `DetectorImpl::onIntervalTimer`, so an ejection in this sweep holds its backoff.
+    fn decay_ejection_backoff(&self) {
+        let ejected: HashSet<SocketAddr> = self
+            .host_set
+            .load()
+            .all_hosts()
+            .iter()
+            .filter(|h| h.health_flags.failed_outlier_check)
+            .map(|h| h.address)
+            .collect();
+        let mut states = self
+            .states
+            .lock()
+            .expect("lock poisoned: a holder panicked");
+        for (addr, state) in states.iter_mut() {
+            let is_ejected = ejected.contains(addr);
+            if is_ejected || state.ejected_since_last_sweep {
+                state.ejected_since_last_sweep = is_ejected;
+            } else {
+                state.ejection_backoff = state.ejection_backoff.saturating_sub(1);
+            }
+        }
     }
 
     /// S6 success-rate detection: eject hosts whose success rate falls more
@@ -581,26 +640,49 @@ impl OutlierDetector {
     /// Ejects `addr`, subject to `max_ejection_percent` and "already ejected" short-circuits. Schedules the
     /// automatic un-eject timer on success.
     fn eject(&self, addr: SocketAddr, cause: EjectionCause) {
-        let snapshot = self.host_set.load();
-        let all_hosts = snapshot.all_hosts();
-        let total = all_hosts.len() as u64;
-        if total == 0 {
-            return;
+        // Rust note: the decision sits inside `rcu` so it re-runs on the newest set after a lost compare-and-swap.
+        // Decided outside, two workers could both pass the cap check on the same snapshot, then both publish.
+        let mut decision = EjectDecision::Skip;
+        self.host_set.rcu(|current| {
+            decision = self.decide_ejection(current, addr);
+            if decision == EjectDecision::Eject {
+                Arc::new(with_outlier_flag(current, addr, true))
+            } else {
+                Arc::clone(current)
+            }
+        });
+        match decision {
+            EjectDecision::Skip => {}
+            EjectDecision::Capped => {
+                // The counter was already reset in `report_result` (or, for the statistical detectors, there is
+                // none); see the module doc.
+                self.emit_eject_event(addr, cause, false, None, 0);
+            }
+            EjectDecision::Eject => {
+                let (ejection_count, backoff) = self.record_ejection(addr);
+                let duration = self.ejection_duration(backoff);
+                self.emit_eject_event(addr, cause, true, Some(duration), ejection_count);
+                self.schedule_uneject(addr, duration);
+            }
         }
+    }
+
+    fn decide_ejection(&self, hosts: &HostSet, addr: SocketAddr) -> EjectDecision {
+        let all_hosts = hosts.all_hosts();
         let Some(target) = all_hosts.iter().find(|h| h.address == addr) else {
             // Host isn't part of the set (removed by discovery, or never
             // was) -- nothing to eject.
-            return;
+            return EjectDecision::Skip;
         };
         if target.health_flags.failed_outlier_check {
-            // Already ejected; not a new event.
-            return;
+            return EjectDecision::Skip;
         }
 
         let currently_ejected = all_hosts
             .iter()
             .filter(|h| h.health_flags.failed_outlier_check)
             .count() as u64;
+        let total = all_hosts.len() as u64;
         let allowed = (total * u64::from(self.config.max_ejection_percent)) / 100;
         let allowed = if self.config.always_eject_one_host {
             allowed.max(1)
@@ -608,32 +690,43 @@ impl OutlierDetector {
             allowed
         };
         if currently_ejected >= allowed {
-            // Detection fired, but the cluster-wide cap blocks enforcement. The counter was already reset in
-            // `report_result` (or, for the statistical detectors, there is none); see the module doc.
-            self.emit_eject_event(addr, cause, false, None, 0);
-            return;
+            EjectDecision::Capped
+        } else {
+            EjectDecision::Eject
         }
-
-        let ejection_count = {
-            let mut states = self
-                .states
-                .lock()
-                .expect("lock poisoned: a holder panicked");
-            let state = states.entry(addr).or_default();
-            state.ejection_count += 1;
-            state.ejection_count
-        };
-        let duration = self.ejection_duration(ejection_count);
-        Self::set_outlier_flag(&self.host_set, addr, true);
-        self.emit_eject_event(addr, cause, true, Some(duration), ejection_count);
-        self.schedule_uneject(addr, duration);
     }
 
-    /// `base_ejection_time * ejection_count`, capped at `max(max_ejection_time, base_ejection_time)`.
-    fn ejection_duration(&self, ejection_count: u32) -> Duration {
+    /// Counts one enforced ejection and returns the new `(lifetime count, backoff)`. The backoff stops one step past
+    /// the cap, the same bound as Envoy's `ejectHost`, so a recovered host decays from there rather than from however
+    /// many ejections it has ever had.
+    fn record_ejection(&self, addr: SocketAddr) -> (u32, u32) {
         let base = self.config.base_ejection_time;
-        let cap = self.config.max_ejection_time.max(base);
-        base.saturating_mul(ejection_count.max(1)).min(cap)
+        let limit = self.ejection_time_cap().saturating_add(base);
+        let mut states = self
+            .states
+            .lock()
+            .expect("lock poisoned: a holder panicked");
+        let state = states.entry(addr).or_default();
+        state.ejection_count += 1;
+        state.ejected_since_last_sweep = true;
+        if base.saturating_mul(state.ejection_backoff) < limit {
+            state.ejection_backoff += 1;
+        }
+        (state.ejection_count, state.ejection_backoff)
+    }
+
+    /// `base_ejection_time * ejection_backoff`, capped at `max(max_ejection_time, base_ejection_time)`.
+    fn ejection_duration(&self, ejection_backoff: u32) -> Duration {
+        self.config
+            .base_ejection_time
+            .saturating_mul(ejection_backoff.max(1))
+            .min(self.ejection_time_cap())
+    }
+
+    fn ejection_time_cap(&self) -> Duration {
+        self.config
+            .max_ejection_time
+            .max(self.config.base_ejection_time)
     }
 
     /// Un-eject timer, owned by the detector. Only clones of `host_set`, `sink`, and `cluster_name` cross into
@@ -670,44 +763,24 @@ impl OutlierDetector {
         }
     }
 
-    /// Toggles one host's `failed_outlier_check` bit, leaving `failed_active_hc` and `active_requests` alone. Same
-    /// discipline as `health_check::apply_health_transition`. A free function, so the detached `schedule_uneject`
-    /// task can share it. Returns whether the flag changed, so callers do not emit a redundant event.
+    /// Sets one host's `failed_outlier_check` bit. A free function, so the detached `schedule_uneject` task can share
+    /// it. Returns whether the flag changed, so callers do not emit a redundant event.
     fn set_outlier_flag(host_set: &ArcSwap<HostSet>, addr: SocketAddr, ejected: bool) -> bool {
         // Rust note: `rcu`, not `load()` then `store()`, so concurrent transitions on other hosts are not lost
-        // (see `health_check::apply_health_transition`). `changed` is an `AtomicBool` because `rcu` may run the
-        // closure more than once on a lost compare-and-swap, and an `Fn` closure cannot capture a plain `&mut bool`.
-        let changed = std::sync::atomic::AtomicBool::new(false);
+        // (see `health_check::apply_health_transition`).
+        let mut changed = false;
         host_set.rcu(|current| {
-            let updated: Vec<Arc<Host>> = current
+            changed = current
                 .all_hosts()
-                .into_iter()
-                .map(|h| {
-                    if h.address != addr {
-                        return h;
-                    }
-                    if h.health_flags.failed_outlier_check == ejected {
-                        changed.store(false, std::sync::atomic::Ordering::Relaxed);
-                        return h;
-                    }
-                    changed.store(true, std::sync::atomic::Ordering::Relaxed);
-                    Arc::new(Host {
-                        address: h.address,
-                        hostname: h.hostname.clone(),
-                        metadata: h.metadata.clone(),
-                        weight: h.weight,
-                        priority: h.priority,
-                        health_flags: HealthFlags {
-                            failed_active_hc: h.health_flags.failed_active_hc,
-                            failed_outlier_check: ejected,
-                        },
-                        active_requests: Arc::clone(&h.active_requests),
-                    })
-                })
-                .collect();
-            Arc::new(HostSet::from_hosts(updated))
+                .iter()
+                .any(|h| h.address == addr && h.health_flags.failed_outlier_check != ejected);
+            if changed {
+                Arc::new(with_outlier_flag(current, addr, ejected))
+            } else {
+                Arc::clone(current)
+            }
         });
-        changed.load(std::sync::atomic::Ordering::Relaxed)
+        changed
     }
 
     fn emit_eject_event(
@@ -751,6 +824,33 @@ impl OutlierDetector {
             eject_duration_ms: None,
         });
     }
+}
+
+/// `hosts` with `addr`'s `failed_outlier_check` bit set to `ejected`, leaving `failed_active_hc` and `active_requests`
+/// alone. Same discipline as `health_check::apply_health_transition`.
+fn with_outlier_flag(hosts: &HostSet, addr: SocketAddr, ejected: bool) -> HostSet {
+    let updated: Vec<Arc<Host>> = hosts
+        .all_hosts()
+        .into_iter()
+        .map(|h| {
+            if h.address != addr {
+                return h;
+            }
+            Arc::new(Host {
+                address: h.address,
+                hostname: h.hostname.clone(),
+                metadata: h.metadata.clone(),
+                weight: h.weight,
+                priority: h.priority,
+                health_flags: HealthFlags {
+                    failed_active_hc: h.health_flags.failed_active_hc,
+                    failed_outlier_check: ejected,
+                },
+                active_requests: Arc::clone(&h.active_requests),
+            })
+        })
+        .collect();
+    HostSet::from_hosts(updated)
 }
 
 fn now_rfc3339() -> String {
@@ -1019,6 +1119,119 @@ mod tests {
         );
     }
 
+    /// The enforced duration the detector just recorded, in the event the operator reads.
+    fn last_ejection_ms(sink: &CapturingSink) -> Option<u64> {
+        sink.events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| matches!(e.action, EjectAction::Eject) && e.enforced)
+            .and_then(|e| e.eject_duration_ms)
+    }
+
+    fn eject_with_5xx(engine: &OutlierDetector, target: SocketAddr) {
+        for _ in 0..5 {
+            engine.report_result(target, RequestResult::Http5xx);
+        }
+    }
+
+    /// Drives the real sweep task. Sweeps fall on multiples of 10s; the sleeps below land between them.
+    #[tokio::test(start_paused = true)]
+    async fn ejection_backoff_decays_one_step_per_healthy_interval() {
+        let a = addr(1);
+        let (engine, host_set, sink) =
+            detector(vec![host(1), host(2)], config_without_ejection_cap());
+        let sweep = engine.spawn();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // t=1, out at t=31. Sweeps during the ejection decay nothing, and the host is back for less than an
+        // interval when it fails again at t=32, so the backoff holds.
+        eject_with_5xx(&engine, a);
+        assert_eq!(last_ejection_ms(&sink), Some(30_000));
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert!(!is_ejected(&host_set, a));
+        eject_with_5xx(&engine, a);
+        assert_eq!(last_ejection_ms(&sink), Some(60_000));
+
+        // Out at t=92, sweep at t=100 ends the ejected interval, and only t=110 decays. Backoff 2 -> 1 -> 2.
+        tokio::time::sleep(Duration::from_secs(83)).await;
+        assert!(!is_ejected(&host_set, a));
+        eject_with_5xx(&engine, a);
+        assert_eq!(
+            last_ejection_ms(&sink),
+            Some(60_000),
+            "one healthy interval takes one step off, not the whole multiplier"
+        );
+
+        // Out at t=175, then t=190 and t=200 decay all of it.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        assert!(!is_ejected(&host_set, a));
+        eject_with_5xx(&engine, a);
+        assert_eq!(
+            last_ejection_ms(&sink),
+            Some(30_000),
+            "a recovered host must be back at base_ejection_time"
+        );
+
+        let events = sink.events.lock().unwrap();
+        let last_eject = events
+            .iter()
+            .rfind(|e| matches!(e.action, EjectAction::Eject))
+            .expect("the host was ejected");
+        assert_eq!(
+            last_eject.num_ejections, 4,
+            "num_ejections is the lifetime count and must not decay with the multiplier"
+        );
+        sweep.abort();
+    }
+
+    /// Past the cap, more ejections must not bank extra steps: Envoy's bound means a host decays to base in about
+    /// `max_ejection_time / base_ejection_time` intervals, however long the incident ran.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_incident_does_not_bank_backoff_past_the_cap() {
+        let a = addr(1);
+        let config = OutlierDetectionConfig {
+            base_ejection_time: Duration::from_secs(10),
+            max_ejection_time: Duration::from_secs(20),
+            ..config_without_ejection_cap()
+        };
+        let (engine, host_set, sink) = detector(vec![host(1), host(2)], config);
+
+        for _ in 0..10 {
+            eject_with_5xx(&engine, a);
+            tokio::time::sleep(Duration::from_secs(21)).await;
+            assert!(!is_ejected(&host_set, a));
+        }
+        assert_eq!(last_ejection_ms(&sink), Some(20_000));
+
+        // The limit is 30s, so the backoff stopped at 3: one sweep closes the ejected interval, three decay it.
+        for _ in 0..4 {
+            engine.run_interval_tick();
+        }
+        eject_with_5xx(&engine, a);
+        assert_eq!(last_ejection_ms(&sink), Some(10_000));
+    }
+
+    /// A recycled address is a new host, so it starts at the base time. Without the prune it inherits the backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_left_the_set_does_not_pass_its_backoff_to_a_later_host() {
+        let a = addr(1);
+        let (engine, host_set, sink) =
+            detector(vec![host(1), host(2)], config_without_ejection_cap());
+        eject_with_5xx(&engine, a);
+        assert_eq!(last_ejection_ms(&sink), Some(30_000));
+
+        host_set.store(Arc::new(HostSet::from_hosts(vec![host(2)])));
+        engine.run_interval_tick();
+        host_set.store(Arc::new(HostSet::from_hosts(vec![host(1), host(2)])));
+
+        eject_with_5xx(&engine, a);
+        assert_eq!(last_ejection_ms(&sink), Some(30_000));
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.last().map(|e| e.num_ejections), Some(1));
+    }
+
     /// A removed cluster's un-eject timers must stop: after `shutdown` (or dropping the detector), the pending
     /// timer never fires, so no stale event is emitted and the orphaned host set is untouched.
     #[tokio::test(start_paused = true)]
@@ -1135,6 +1348,45 @@ mod tests {
             !is_ejected(&host_set, addr(2)),
             "a 2nd simultaneous ejection must be blocked by max_ejection_percent=10% over 10 hosts"
         );
+    }
+
+    /// Workers report concurrently, so the cap has to hold when several hosts trip in the same instant. The race is
+    /// narrow, so this runs many rounds with the workers released together; it cannot fail on correct code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_ejections_stay_within_max_ejection_percent() {
+        const HOSTS: u8 = 8;
+        for round in 0..200 {
+            let hosts: Vec<Arc<Host>> = (1..=HOSTS).map(host).collect();
+            let config = OutlierDetectionConfig {
+                consecutive_5xx: 1,
+                max_ejection_percent: 25,
+                ..OutlierDetectionConfig::default()
+            };
+            let (engine, host_set, _sink) = detector(hosts, config);
+            let ready = std::sync::atomic::AtomicU8::new(0);
+            std::thread::scope(|scope| {
+                for last in 1..=HOSTS {
+                    let (engine, ready) = (&engine, &ready);
+                    scope.spawn(move || {
+                        ready.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        while ready.load(std::sync::atomic::Ordering::SeqCst) < HOSTS {
+                            std::hint::spin_loop();
+                        }
+                        engine.report_result(addr(last), RequestResult::Http5xx);
+                    });
+                }
+            });
+            let ejected = host_set
+                .load()
+                .all_hosts()
+                .iter()
+                .filter(|h| h.health_flags.failed_outlier_check)
+                .count();
+            assert_eq!(
+                ejected, 2,
+                "25% of {HOSTS} hosts allows exactly 2 ejections; round {round} ejected {ejected}"
+            );
+        }
     }
 
     // --------------------------------------- success-rate volume gating --

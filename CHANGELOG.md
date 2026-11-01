@@ -10,6 +10,22 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
+### Fixed
+
+- Outlier detection: the ejection-time multiplier now decays. It decreases by 1
+  for each interval (10 seconds in `--config` mode) that a provider stays out
+  of ejection, as in Envoy, so a provider that recovers goes back to
+  `base_ejection_time`. Before, every later ejection of a provider lasted
+  longer, even after a long healthy period. The `num_ejections` value in the
+  event log stays a lifetime count.
+- Outlier detection: a host that leaves the host set loses its detector state,
+  so a later host at the same address starts with no backoff. The state goes at
+  the next interval sweep.
+- Outlier detection: concurrent workers can no longer eject more hosts than
+  `max_ejection_percent` allows, or eject one host twice.
+- EDS: an update that races a health check or an outlier ejection no longer
+  loses the health flag.
+
 ## [1.0.0] - 2026-10-24
 
 ### Added

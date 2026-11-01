@@ -442,7 +442,7 @@ Passive health checking. After `consecutive_5xx` consecutive failed attempts, th
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `consecutive_5xx` | integer; minimum 1, maximum 4294967295 | no | `5` | Consecutive failed attempts that eject the provider. A failure is a 5xx response or a local failure (connection refused, reset, or timeout). A 429 or any other response ends the run. |
-| `base_ejection_time` | [Duration](#duration) | no | `30s` | Length of the first ejection. Each later ejection of the provider lasts this value times the number of ejections so far, up to `max_ejection_time`. Must be greater than 0. |
+| `base_ejection_time` | [Duration](#duration) | no | `30s` | Length of the first ejection. Each later ejection of the provider lasts this value times the ejection multiplier, up to `max_ejection_time`. The multiplier increases by 1 at each ejection and decreases by 1 for each 10 seconds that the provider stays out of ejection. Must be greater than 0. |
 | `max_ejection_time` | [Duration](#duration) | no | none | Upper bound on one ejection. Default: the larger of `300s` and `base_ejection_time`. Must not be less than `base_ejection_time`. |
 
 Any other field is a load error.

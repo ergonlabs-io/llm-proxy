@@ -613,7 +613,8 @@ pub struct OutlierDetectionDef {
     #[serde(default)]
     pub consecutive_5xx: Option<u32>,
     /// Ejection length for the first ejection; each later ejection of the
-    /// same provider lasts this times the ejection count. Default 30s.
+    /// same provider lasts this times the ejection multiplier, which decays
+    /// while the provider stays out of ejection. Default 30s.
     #[serde(default)]
     pub base_ejection_time: Option<SimpleDuration>,
     /// Upper bound on one ejection. Default the larger of 300s and
