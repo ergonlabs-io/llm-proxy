@@ -2208,6 +2208,42 @@ fn requests_per_minute_lowers_to_a_rule_without_warning() {
     assert_no_limits_warnings(&lowered);
 }
 
+/// Daily limits lower beside the per-minute ones, and the strict loader
+/// (which rejects any rule field it has no reader for) accepts them.
+#[test]
+fn daily_limits_lower_beside_per_minute_limits_and_load() {
+    let limits = "  - key: global\n    requests_per_minute: 5\n    requests_per_day: 3\n    tokens_per_day: 40k\n";
+    let (lowered, rules) = lowered_rules(limits);
+    assert_eq!(
+        rules,
+        serde_json::json!([
+            {
+                "key": "GLOBAL",
+                "requests_per_minute": 5,
+                "tokens_per_day": 40_000,
+                "requests_per_day": 3
+            }
+        ])
+    );
+    assert_no_limits_warnings(&lowered);
+    let config = parse(&format!("{BASIC_CONFIG}limits:\n{limits}")).expect("must parse");
+    lower_to_loaded(&config).expect("strict loader must accept the daily fields");
+}
+
+/// A limit field the dialect does not define, such as an hourly window, is
+/// refused with its dotted path rather than ignored (AGENTS.md invariant 1).
+#[test]
+fn an_unknown_limit_field_errors_with_its_dotted_path() {
+    let err = parse(&format!(
+        "{BASIC_CONFIG}limits:\n  - key: global\n    requests_per_hour: 3\n"
+    ))
+    .expect_err("an hourly window is not a dialect field");
+    let ConfigError::UnknownField { field_path, .. } = &err else {
+        panic!("expected UnknownField, got: {err}");
+    };
+    assert_eq!(field_path, "limits[0].requests_per_hour");
+}
+
 #[test]
 fn concurrent_sessions_lowers_to_concurrent_streams_without_warning() {
     let (lowered, rules) =

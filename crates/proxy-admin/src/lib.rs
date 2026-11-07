@@ -20,7 +20,7 @@
 //! Budget bodies are `{"budget": {"max_usd": "500.00", "period": "monthly"}}` to set, or `{"budget": null}` to
 //! clear. `max_usd` goes through `proxy_control::spend::parse_micro_usd`, the same parser a configured price
 //! uses. Limit bodies are `{"limits": null}` or an object with optional `tokens_per_minute`,
-//! `requests_per_minute`, and `concurrent_streams`. An omitted field sets no limit, and zero is an explicit
+//! `requests_per_minute`, `tokens_per_day`, `requests_per_day` (a UTC calendar day), and `concurrent_streams`. An omitted field sets no limit, and zero is an explicit
 //! refusal. With a shared store, counters and concurrent-stream leases are shared across replicas (ADR-0006).
 //! Otherwise N replicas can admit up to N times a configured limit.
 //!

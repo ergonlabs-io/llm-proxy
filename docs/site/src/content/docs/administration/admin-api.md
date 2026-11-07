@@ -416,6 +416,8 @@ curl --max-time 5 -X PUT http://127.0.0.1:53422/tenants/acme/limits \
 |---|---|---|---|
 | `tokens_per_minute` | integer, 0 or more | no limit | Tokens in one minute. |
 | `requests_per_minute` | integer, 0 or more | no limit | Requests in one minute. |
+| `tokens_per_day` | integer, 0 or more | no limit | Tokens in one UTC calendar day. Counts beside `tokens_per_minute`. |
+| `requests_per_day` | integer, 0 or more | no limit | Requests in one UTC calendar day. Counts beside `requests_per_minute`. |
 | `concurrent_streams` | integer, 0 or more | no limit | Requests in flight at the same time. |
 
 A field that you omit sets no limit of that kind. A value of `0` refuses
@@ -454,6 +456,8 @@ and the `x-ratelimit-*-requests` or `x-ratelimit-*-tokens` set (see
 |---|---|
 | `tokens_per_minute` | `token budget exceeded` |
 | `requests_per_minute` | `request rate exceeded` |
+| `tokens_per_day` | `token budget exceeded (daily limit)` |
+| `requests_per_day` | `request rate exceeded (daily limit)` |
 | `concurrent_streams` | `too many concurrent streams` |
 
 The dialect adds `llmproxy.token_limit` for you when `auth` is set. See

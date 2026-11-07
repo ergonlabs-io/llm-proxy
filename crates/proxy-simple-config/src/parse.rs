@@ -475,12 +475,15 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
     for (i, limit) in config.limits.iter().enumerate() {
         if limit.tokens_per_minute.is_none()
             && limit.requests_per_minute.is_none()
+            && limit.tokens_per_day.is_none()
+            && limit.requests_per_day.is_none()
             && limit.concurrent_sessions.is_none()
         {
             return Err(ConfigError::InvalidValue {
                 field_path: format!("limits[{i}]"),
                 reason: "a limit needs at least one of tokens_per_minute, \
-                         requests_per_minute, concurrent_sessions"
+                         requests_per_minute, tokens_per_day, requests_per_day, \
+                         concurrent_sessions"
                     .to_string(),
             });
         }

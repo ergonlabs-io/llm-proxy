@@ -238,7 +238,7 @@ fn a_failover_chain_that_all_answers_429_passes_the_last_providers_headers_throu
     let dir = scratch_dir("failover");
     let first = Mock::rate_limited("111");
     let second = Mock::rate_limited("222");
-    let proxy = Proxy::start(&dir, &failover_config(first.addr, second.addr));
+    let proxy = Proxy::start(&dir, &failover_config(first.addr, second.addr, ""));
 
     let response = send_model(proxy.listen, "/v1/chat/completions", "chain", &[]);
     assert_eq!(response.status, 429, "{response:?}");
@@ -259,6 +259,144 @@ fn a_failover_chain_that_all_answers_429_passes_the_last_providers_headers_throu
             r#"{"error":"provider-rate-limited"}"#.to_string()
         ),
         "every member was tried, and the client got the last member's 429 verbatim"
+    );
+    finish(proxy, &dir);
+}
+
+#[test]
+fn a_key_with_requests_per_day_3_admits_three_and_refuses_the_fourth() {
+    start_away_from_a_day_edge();
+    let dir = scratch_dir("daily-requests");
+    let mock = Mock::ok(Duration::ZERO);
+    let proxy = Proxy::start(&dir, &auth_config(mock.addr, "", ""));
+    let key = setup_tenant(&proxy);
+    let put = admin(
+        &proxy,
+        "PUT",
+        "/keys/k1/limits",
+        r#"{"limits":{"requests_per_day":3}}"#,
+    );
+    assert_eq!(put.status, 204, "{put:?}");
+    let auth = format!("Bearer {key}");
+
+    for n in 1..=3 {
+        assert_eq!(
+            chat(&proxy, &[("authorization", &auth)]).status,
+            200,
+            "request {n}"
+        );
+    }
+    let refused = chat(&proxy, &[("authorization", &auth)]);
+    assert_eq!(refused.status, 429, "{refused:?}");
+    assert_openai_error(
+        &refused,
+        "request_limit_exceeded",
+        "request rate exceeded (daily limit)",
+    );
+    // The wait is to the next UTC midnight: over a minute away, since the
+    // test started away from the day's edge.
+    let wait = refused.retry_after();
+    assert!((61..=86_400).contains(&wait), "{wait}");
+    assert_eq!(refused.header("x-should-retry"), "false");
+    assert_eq!(refused.header("x-ratelimit-limit-requests"), "3");
+    assert_eq!(refused.header("x-ratelimit-remaining-requests"), "0");
+    assert_eq!(mock.count(), 3, "the refused request reached the upstream");
+    finish(proxy, &dir);
+}
+
+/// `tokens_per_day` charges the usage the provider that answered reported,
+/// here the second member of a chain whose first member is down.
+#[test]
+fn a_daily_token_limit_charges_the_provider_that_answered_after_failover() {
+    start_away_from_a_day_edge();
+    let dir = scratch_dir("daily-tokens-failover");
+    let first = Mock::unavailable();
+    let second = Mock::ok(Duration::ZERO);
+    let extra = format!(
+        "admin: 127.0.0.1:{}\nauth:\n  hmac_secret: \"{HMAC_SECRET}\"\n\
+         limits:\n  - {{ key: tenant, tokens_per_day: 15 }}\n",
+        free_port()
+    );
+    let proxy = Proxy::start(&dir, &failover_config(first.addr, second.addr, &extra));
+    let key = setup_tenant(&proxy);
+    let auth = format!("Bearer {key}");
+
+    // Each answer reports 10 tokens: 10 is under 15, 20 is over.
+    for n in 1..=2 {
+        let r = send_model(
+            proxy.listen,
+            "/v1/chat/completions",
+            "chain",
+            &[("authorization", &auth)],
+        );
+        assert_eq!(r.status, 200, "request {n}: {r:?}");
+    }
+    assert_eq!(second.count(), 2, "the second member answered both");
+    let refused = send_model(
+        proxy.listen,
+        "/v1/chat/completions",
+        "chain",
+        &[("authorization", &auth)],
+    );
+    assert_eq!(refused.status, 429, "{refused:?}");
+    assert_openai_error(
+        &refused,
+        "token_limit_exceeded",
+        "token budget exceeded (daily limit)",
+    );
+    assert_eq!(refused.header("x-ratelimit-limit-tokens"), "15");
+    assert_eq!(refused.header("x-should-retry"), "false");
+    finish(proxy, &dir);
+}
+
+/// With a persistent store the day's count is written beside the keys, so a
+/// restarted proxy still refuses. (With `in_memory` the keys and counts are
+/// gone after a restart, which the docs state.)
+#[test]
+fn a_daily_count_survives_a_restart_with_a_persistent_store() {
+    start_away_from_a_day_edge();
+    let dir = scratch_dir("daily-restart");
+    let mock = Mock::ok(Duration::ZERO);
+    let store = format!(
+        "  store:\n    persistent: {{ path: \"{}\" }}\n",
+        dir.join("control.redb").display()
+    );
+    let config = auth_config_with_store(mock.addr, "", "", &store);
+    let proxy = Proxy::start(&dir, &config);
+    let key = setup_tenant(&proxy);
+    let put = admin(
+        &proxy,
+        "PUT",
+        "/keys/k1/limits",
+        r#"{"limits":{"requests_per_day":2}}"#,
+    );
+    assert_eq!(put.status, 204, "{put:?}");
+    let auth = format!("Bearer {key}");
+    for n in 1..=2 {
+        assert_eq!(
+            chat(&proxy, &[("authorization", &auth)]).status,
+            200,
+            "request {n}"
+        );
+    }
+    // Counts reach the store on the flush interval (one second by default).
+    std::thread::sleep(Duration::from_secs(3));
+    drop(proxy);
+
+    let proxy = Proxy::start(&dir, &config);
+    let deadline = Instant::now() + WAIT;
+    let refused = loop {
+        let r = chat(&proxy, &[("authorization", &auth)]);
+        if r.status == 429 {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the day's count was lost: {r:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_openai_error(
+        &refused,
+        "request_limit_exceeded",
+        "request rate exceeded (daily limit)",
     );
     finish(proxy, &dir);
 }
@@ -300,6 +438,11 @@ limits:
 /// A config with `auth` (so keys can be minted) and, optionally, `limits` and
 /// extra top-level blocks such as [`PRICING`].
 fn auth_config(upstream: SocketAddr, limits: &str, extra: &str) -> String {
+    auth_config_with_store(upstream, limits, extra, "")
+}
+
+/// [`auth_config`] with `store` (indented `auth` members) after `hmac_secret`.
+fn auth_config_with_store(upstream: SocketAddr, limits: &str, extra: &str, store: &str) -> String {
     let limits = if limits.is_empty() {
         String::new()
     } else {
@@ -318,13 +461,13 @@ routes:
   - {{ model: "*", provider: openai }}
 auth:
   hmac_secret: "{HMAC_SECRET}"
-{limits}{extra}"#,
+{store}{limits}{extra}"#,
         listen = free_port(),
         admin = free_port(),
     )
 }
 
-fn failover_config(first: SocketAddr, second: SocketAddr) -> String {
+fn failover_config(first: SocketAddr, second: SocketAddr, extra: &str) -> String {
     format!(
         r#"version: 1
 listen: 127.0.0.1:{listen}
@@ -335,7 +478,7 @@ routes:
   - {{ model: "unused", provider: first }}
 models:
   chain: {{ providers: [first, second] }}
-"#,
+{extra}"#,
         listen = free_port(),
     )
 }
@@ -614,6 +757,16 @@ impl Mock {
         Mock::start(delay, response)
     }
 
+    /// Answers `503`, which a failover chain retries on its next member.
+    fn unavailable() -> Mock {
+        Mock::start(
+            Duration::ZERO,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+                .to_string(),
+        )
+    }
+
     fn rate_limited(limit: &str) -> Mock {
         let body = r#"{"error":"provider-rate-limited"}"#;
         let response = format!(
@@ -693,5 +846,18 @@ fn start_away_from_a_window_edge() {
     let into_minute = secs % 60;
     if into_minute >= 50 {
         std::thread::sleep(Duration::from_secs(61 - into_minute));
+    }
+}
+
+/// Daily windows end at UTC midnight. A test that expects a wait of more than
+/// a minute must not start in the last minutes of the UTC day.
+fn start_away_from_a_day_edge() {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs();
+    let into_day = secs % 86_400;
+    if into_day >= 86_400 - 120 {
+        std::thread::sleep(Duration::from_secs(86_400 - into_day + 1));
     }
 }

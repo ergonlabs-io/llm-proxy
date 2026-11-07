@@ -1174,6 +1174,12 @@ pub struct Limit {
     pub tokens_per_minute: Option<TokenAmount>,
     #[serde(default)]
     pub requests_per_minute: Option<TokenAmount>,
+    /// Total tokens per UTC calendar day, counted beside `tokens_per_minute`.
+    #[serde(default)]
+    pub tokens_per_day: Option<TokenAmount>,
+    /// Requests per UTC calendar day, counted beside `requests_per_minute`.
+    #[serde(default)]
+    pub requests_per_day: Option<TokenAmount>,
     #[serde(default)]
     pub concurrent_sessions: Option<u64>,
     #[serde(default)]

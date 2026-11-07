@@ -1380,11 +1380,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     ) -> Result<(), StoreError> {
         let limits_key = self.limits_key();
         let generation_key = self.generation_key();
-        match limits.filter(|policy| {
-            policy.tokens_per_minute.is_some()
-                || policy.requests_per_minute.is_some()
-                || policy.concurrent_streams.is_some()
-        }) {
+        match limits.filter(|policy| **policy != LimitPolicy::default()) {
             Some(limits) => {
                 let encoded: EncodedLimitPolicy = limits.into();
                 let bytes = encode_json(&encoded);
@@ -2562,6 +2558,8 @@ mod tests {
         let limits = LimitPolicy {
             tokens_per_minute: Some(1_000),
             requests_per_minute: Some(0),
+            tokens_per_day: Some(20_000),
+            requests_per_day: Some(7),
             concurrent_streams: None,
         };
         store.set_limits(&tenant, Some(&limits)).unwrap();
@@ -2739,8 +2737,7 @@ mod tests {
         store.create_tenant(&TenantId::new("a")).unwrap();
         let limits = LimitPolicy {
             tokens_per_minute: Some(10),
-            requests_per_minute: None,
-            concurrent_streams: None,
+            ..Default::default()
         };
         store
             .set_limits(&TenantId::new("a"), Some(&limits))

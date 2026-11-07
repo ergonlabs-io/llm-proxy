@@ -2111,6 +2111,12 @@ fn nullable_limits<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Lim
 struct LimitSpec {
     tokens_per_minute: Option<u64>,
     requests_per_minute: Option<u64>,
+    // Absent means no daily limit. Counted in a UTC calendar day beside the
+    // per-minute limit of the same name.
+    #[serde(default)]
+    tokens_per_day: Option<u64>,
+    #[serde(default)]
+    requests_per_day: Option<u64>,
     concurrent_streams: Option<u32>,
 }
 
@@ -2119,6 +2125,8 @@ impl LimitSpec {
         let policy = LimitPolicy {
             tokens_per_minute: self.tokens_per_minute,
             requests_per_minute: self.requests_per_minute,
+            tokens_per_day: self.tokens_per_day,
+            requests_per_day: self.requests_per_day,
             concurrent_streams: self.concurrent_streams,
         };
         (policy != LimitPolicy::default()).then_some(policy)
@@ -2233,6 +2241,12 @@ fn render_limits(limits: LimitPolicy) -> serde_json::Value {
     }
     if let Some(value) = limits.requests_per_minute {
         fields.insert("requests_per_minute".into(), serde_json::json!(value));
+    }
+    if let Some(value) = limits.tokens_per_day {
+        fields.insert("tokens_per_day".into(), serde_json::json!(value));
+    }
+    if let Some(value) = limits.requests_per_day {
+        fields.insert("requests_per_day".into(), serde_json::json!(value));
     }
     if let Some(value) = limits.concurrent_streams {
         fields.insert("concurrent_streams".into(), serde_json::json!(value));

@@ -409,6 +409,8 @@ fn parse_rules(config: &DynamicMessage) -> Result<Vec<KeyedRule>, ConfigError> {
         let limits = LimitPolicy {
             tokens_per_minute: optional_u64("tokens_per_minute"),
             requests_per_minute: optional_u64("requests_per_minute"),
+            tokens_per_day: optional_u64("tokens_per_day"),
+            requests_per_day: optional_u64("requests_per_day"),
             concurrent_streams: msg
                 .has_field_by_name("concurrent_streams")
                 .then(|| {
@@ -420,7 +422,8 @@ fn parse_rules(config: &DynamicMessage) -> Result<Vec<KeyedRule>, ConfigError> {
         if limits == LimitPolicy::default() {
             return Err(invalid(
                 path,
-                "sets no limit; set tokens_per_minute, requests_per_minute or concurrent_streams",
+                "sets no limit; set tokens_per_minute, requests_per_minute, tokens_per_day, \
+                 requests_per_day or concurrent_streams",
             ));
         }
         let mut models = Vec::new();
@@ -471,6 +474,9 @@ fn merge_buckets(buckets: Vec<PolicyBucket>) -> Vec<PolicyBucket> {
                     min_opt(existing.tokens_per_minute, limits.tokens_per_minute);
                 existing.requests_per_minute =
                     min_opt(existing.requests_per_minute, limits.requests_per_minute);
+                existing.tokens_per_day = min_opt(existing.tokens_per_day, limits.tokens_per_day);
+                existing.requests_per_day =
+                    min_opt(existing.requests_per_day, limits.requests_per_day);
                 existing.concurrent_streams =
                     min_opt(existing.concurrent_streams, limits.concurrent_streams);
             }
@@ -810,9 +816,46 @@ fn can_count(endpoint: Endpoint) -> bool {
     endpoint == Endpoint::Free || unmetered::metered_under_token_limit(endpoint)
 }
 
-/// Control-plane limits are per minute, matching the dialect's
-/// `tokens_per_minute` and `requests_per_minute`.
+/// Control-plane limits count in two windows: a minute and a UTC calendar
+/// day, matching the dialect's `*_per_minute` and `*_per_day`.
 const POLICY_WINDOW: Duration = Duration::from_secs(60);
+const DAY_WINDOW: Duration = Duration::from_secs(86_400);
+
+/// Which window a control-plane limit counts in. Counters stay keyed by
+/// subject, dimension and window length (ADR-0006 amendment C), so a minute
+/// limit and a day limit on one subject are two rows, and both apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Period {
+    Minute,
+    Day,
+}
+
+impl Period {
+    fn window(self, now_secs: u64) -> WindowKey {
+        let length = match self {
+            Period::Minute => POLICY_WINDOW,
+            Period::Day => DAY_WINDOW,
+        };
+        WindowKey::containing(now_secs, length.as_secs())
+    }
+
+    fn of(window: WindowKey) -> Self {
+        if window.length_secs == DAY_WINDOW.as_secs() {
+            Period::Day
+        } else {
+            Period::Minute
+        }
+    }
+
+    /// The 429 message: the per-minute text is the original, and a daily
+    /// refusal says so, so a client can tell which limit refused.
+    fn message(self, cause: Cause) -> String {
+        match self {
+            Period::Minute => cause.message().to_string(),
+            Period::Day => format!("{} (daily limit)", cause.message()),
+        }
+    }
+}
 
 /// A control-plane limits row and the counter key it is enforced under.
 type PolicyBucket = (LimitKey, LimitPolicy);
@@ -827,7 +870,7 @@ struct Deferred {
 }
 
 fn policy_window(now_secs: u64) -> WindowKey {
-    WindowKey::containing(now_secs, POLICY_WINDOW.as_secs())
+    Period::Minute.window(now_secs)
 }
 
 fn unix_secs(now: SystemTime) -> u64 {
@@ -989,7 +1032,9 @@ struct TokenLimitFilterInstance {
     key: Option<LimitKey>,
     /// Tenant and key token buckets this admitted request is charged to at
     /// stream end, with the tokens-per-minute limit each was checked against.
-    policy_charges: Vec<(LimitKey, u64)>,
+    /// Each token limit this request was admitted under: the row, its limit
+    /// and its window, charged with the reported usage at stream end.
+    policy_charges: Vec<(LimitKey, u64, Period)>,
     /// Concurrent-stream slots held for the life of this stream. Dropping a
     /// lease frees its slot, so they are cleared when the stream completes.
     leases: Vec<StreamLease>,
@@ -1046,7 +1091,7 @@ impl TokenLimitFilterInstance {
         key: Option<PolicyBucket>,
         rules: &[PolicyBucket],
         now_secs: u64,
-    ) -> Option<(LimitDecision, Cause)> {
+    ) -> Option<(LimitDecision, Cause, Period)> {
         let tenant_first: Vec<&PolicyBucket> =
             tenant.iter().chain(key.iter()).chain(rules).collect();
         let key_first: Vec<&PolicyBucket> = key.iter().chain(tenant.iter()).chain(rules).collect();
@@ -1063,17 +1108,20 @@ impl TokenLimitFilterInstance {
         streams_order: &[&PolicyBucket],
         requests_order: &[&PolicyBucket],
         now_secs: u64,
-    ) -> Option<(LimitDecision, Cause)> {
-        let window = policy_window(now_secs);
-
+    ) -> Option<(LimitDecision, Cause, Period)> {
         for (key, limits) in streams_order {
-            if let Some(tokens) = limits.tokens_per_minute {
+            for (period, tokens) in [
+                (Period::Minute, limits.tokens_per_minute),
+                (Period::Day, limits.tokens_per_day),
+            ] {
+                let Some(tokens) = tokens else { continue };
+                let window = period.window(now_secs);
                 let used = self
                     .counters
                     .used(key, WindowDimension::TotalTokens, window);
                 let decision = LimitDecision::for_window(used, tokens, window, now_secs);
                 if matches!(decision, LimitDecision::Deny { .. }) {
-                    return Some((decision, Cause::Tokens));
+                    return Some((decision, Cause::Tokens, period));
                 }
             }
         }
@@ -1084,28 +1132,46 @@ impl TokenLimitFilterInstance {
                 match self.streams.try_acquire(key, max_streams) {
                     Ok(lease) => leases.push(lease),
                     // Permits taken so far drop with `leases` here.
-                    Err(deny) => return Some((deny, Cause::Streams)),
+                    Err(deny) => return Some((deny, Cause::Streams, Period::Minute)),
                 }
             }
         }
 
-        let requests: Vec<(&LimitKey, u64)> = requests_order
+        // Every request count of both windows in one all-or-nothing step, so
+        // a daily refusal spends nothing from a minute row, and the reverse.
+        let requests: Vec<(&LimitKey, WindowKey, u64)> = requests_order
             .iter()
-            .filter_map(|(key, limits)| limits.requests_per_minute.map(|max| (key, max)))
+            .flat_map(|(key, limits)| {
+                [
+                    (Period::Minute, limits.requests_per_minute),
+                    (Period::Day, limits.requests_per_day),
+                ]
+                .into_iter()
+                .filter_map(move |(period, max)| max.map(|max| (key, period.window(now_secs), max)))
+            })
             .collect();
-        if let Err(RowRefused { index, used }) =
-            self.counters
-                .admit_all(WindowDimension::Requests, window, &requests)
+        if let Err(RowRefused { index, used }) = self
+            .counters
+            .admit_all(WindowDimension::Requests, &requests)
         {
-            let max_requests = requests.get(index).map_or(0, |(_, max)| *max);
+            let (window, max_requests) = requests
+                .get(index)
+                .map_or((policy_window(now_secs), 0), |(_, w, max)| (*w, *max));
             let decision = LimitDecision::for_window(used, max_requests, window, now_secs);
-            return Some((decision, Cause::Requests));
+            return Some((decision, Cause::Requests, Period::of(window)));
         }
 
         self.leases.extend(leases);
         self.policy_charges
-            .extend(streams_order.iter().filter_map(|(key, limits)| {
-                limits.tokens_per_minute.map(|tokens| (key.clone(), tokens))
+            .extend(streams_order.iter().flat_map(|(key, limits)| {
+                [
+                    (Period::Minute, limits.tokens_per_minute),
+                    (Period::Day, limits.tokens_per_day),
+                ]
+                .into_iter()
+                .filter_map(move |(period, tokens)| {
+                    tokens.map(|tokens| (key.clone(), tokens, period))
+                })
             }));
         None
     }
@@ -1176,17 +1242,17 @@ impl TokenLimitFilterInstance {
             let tenant_tokens = snapshot
                 .tenant_limits
                 .get(&TenantId::new(tenant))
-                .is_some_and(|limits| limits.tokens_per_minute.is_some());
+                .is_some_and(|limits| limits.has_token_limit());
             let key_tokens = key_id
                 .and_then(|id| snapshot.key_limits.get(&KeyId::new(id)))
-                .is_some_and(|limits| limits.tokens_per_minute.is_some());
+                .is_some_and(|limits| limits.has_token_limit());
             if tenant_tokens || key_tokens {
                 return true;
             }
         }
         self.rules.iter().any(|rule| {
             rule.models.is_empty()
-                && rule.limits.tokens_per_minute.is_some()
+                && rule.limits.has_token_limit()
                 && Self::rule_key(rule, tenant, key_id, client, headers).is_some()
         })
     }
@@ -1234,11 +1300,7 @@ impl TokenLimitFilterInstance {
             }
             None => Vec::new(),
         };
-        if !can_count(self.endpoint)
-            && scoped
-                .iter()
-                .any(|(_, limits)| limits.tokens_per_minute.is_some())
-        {
+        if !can_count(self.endpoint) && scoped.iter().any(|(_, limits)| limits.has_token_limit()) {
             self.refuse_unmetered(cb);
             return;
         }
@@ -1261,7 +1323,7 @@ impl TokenLimitFilterInstance {
     ) {
         let limited = self.key.is_some() || tenant.is_some() || key.is_some() || !rules.is_empty();
         match self.admit_set(tenant, key, rules, unix_secs(now)) {
-            Some((deny, refusal)) => self.refuse(cb, deny, refusal),
+            Some((deny, refusal, period)) => self.refuse(cb, deny, refusal, period),
             // Counted (and warned about) only while the counters are past
             // their reconciliation bound; see `window_counter`'s "Store
             // outage".
@@ -1292,7 +1354,7 @@ impl TokenLimitFilterInstance {
         let Some(warn_key) = self
             .key
             .as_ref()
-            .or(self.policy_charges.first().map(|(key, _)| key))
+            .or(self.policy_charges.first().map(|(key, _, _)| key))
         else {
             return;
         };
@@ -1340,21 +1402,26 @@ impl TokenLimitFilterInstance {
                 rule.max_tokens,
             );
         }
-        let window = policy_window(now_secs);
-        for (key, tokens_per_minute) in &self.policy_charges {
+        for (key, limit, period) in &self.policy_charges {
             self.counters.add(
                 key,
                 WindowDimension::TotalTokens,
-                window,
+                period.window(now_secs),
                 usage.total(),
-                *tokens_per_minute,
+                *limit,
             );
         }
     }
 
     /// Refuse with 429 and the decision's rate-limit headers. The one place
     /// this filter refuses a request, so the one place `RL` is set.
-    fn refuse(&self, cb: &mut dyn DecoderCallbacks, decision: LimitDecision, refusal: Cause) {
+    fn refuse(
+        &self,
+        cb: &mut dyn DecoderCallbacks,
+        decision: LimitDecision,
+        refusal: Cause,
+        period: Period,
+    ) {
         let LimitDecision::Deny {
             limit,
             remaining,
@@ -1377,7 +1444,7 @@ impl TokenLimitFilterInstance {
             reset_after.as_secs(),
             retry_after.as_secs(),
         )
-        .send(cb, None);
+        .send(cb, Some(&period.message(refusal)));
     }
 
     /// Terminates a `GET /v1/usage` request with the
@@ -1758,7 +1825,7 @@ impl HttpFilter for TokenLimitFilterInstance {
             let decision = LimitDecision::for_window(used, rule.max_tokens, window, now_secs);
             self.key = Some(key);
             if let deny @ LimitDecision::Deny { .. } = decision {
-                self.refuse(cb, deny, Cause::Tokens);
+                self.refuse(cb, deny, Cause::Tokens, Period::Minute);
                 // Rust note: the returned status is irrelevant here --
                 // `drive_decode` checks `ctx.local_reply.is_some()` right
                 // after this callback returns and stops the chain
@@ -1915,7 +1982,7 @@ impl HttpFilter for TokenLimitFilterInstance {
 mod tests {
     use super::*;
 
-    use std::cell::{RefCell, RefMut};
+    use std::cell::{Cell, RefCell, RefMut};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
 
@@ -2257,8 +2324,22 @@ mod tests {
     /// 20 seconds into a minute, so a test's requests never straddle a
     /// window boundary.
     fn fixed_clock() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + 20)
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + 20 + CLOCK_SKEW_SECS.with(Cell::get))
     }
+
+    thread_local! {
+        /// Seconds a test has moved [`fixed_clock`] forward. Thread-local, so
+        /// tests that run on one thread each never see another's skew.
+        static CLOCK_SKEW_SECS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Move [`fixed_clock`] forward, as time passing between two requests.
+    fn advance_clock(secs: u64) {
+        CLOCK_SKEW_SECS.with(|skew| skew.set(skew.get() + secs));
+    }
+
+    /// Seconds from [`fixed_clock`] (08:00:20 UTC) to the next UTC midnight.
+    const SECS_TO_MIDNIGHT: u64 = 86_400 - (8 * 3_600 + 20);
 
     /// One minute after [`fixed_clock`]: the next window.
     fn next_minute_clock() -> SystemTime {
@@ -3694,6 +3775,7 @@ mod tests {
             tokens_per_minute,
             requests_per_minute,
             concurrent_streams,
+            ..Default::default()
         }
     }
 
@@ -3720,6 +3802,30 @@ mod tests {
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
             error_message(&body)
         })
+    }
+
+    /// The whole 429 when refused: its headers and decoded JSON body.
+    fn refusal_reply(
+        factory: &dyn FilterInstanceFactory,
+        tenant: &str,
+        key: &str,
+    ) -> Option<(HeaderMap, serde_json::Value)> {
+        let (_filter, cb) = admit(factory, tenant, key);
+        cb.local_reply.map(|(status, headers, body)| {
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            (
+                headers,
+                serde_json::from_str(&body).expect("a 429 body is JSON"),
+            )
+        })
+    }
+
+    fn daily(tokens: Option<u64>, requests: Option<u64>) -> LimitPolicy {
+        LimitPolicy {
+            tokens_per_day: tokens,
+            requests_per_day: requests,
+            ..Default::default()
+        }
     }
 
     /// Admit, then end the stream having used `tokens`.
@@ -3787,6 +3893,117 @@ mod tests {
             refusal(&*factory, "tenant-a", "key-b").as_deref(),
             Some("request rate exceeded")
         );
+    }
+
+    /// A key with `requests_per_day: 3` admits three requests and refuses the
+    /// fourth, naming the daily limit and waiting until the next UTC midnight;
+    /// the first request of the next day is admitted.
+    #[test]
+    fn a_daily_request_limit_refuses_the_fourth_request_until_utc_midnight() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_key_limits(&KeyId::new("key-a"), Some(&daily(None, Some(3))))
+            .unwrap();
+        let factory = policy_factory(&cp);
+
+        for n in 1..=3 {
+            assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None, "request {n}");
+        }
+        let (headers, body) =
+            refusal_reply(&*factory, "tenant-a", "key-a").expect("the fourth is refused");
+        assert_eq!(
+            body["error"]["message"],
+            "request rate exceeded (daily limit)"
+        );
+        assert_eq!(body["error"]["code"], "request_limit_exceeded");
+        assert_eq!(
+            headers["retry-after"],
+            SECS_TO_MIDNIGHT.to_string().as_str()
+        );
+        assert_eq!(headers["x-should-retry"], "false");
+        assert_eq!(headers["x-ratelimit-limit-requests"], "3");
+        assert_eq!(headers["x-ratelimit-remaining-requests"], "0");
+
+        advance_clock(SECS_TO_MIDNIGHT - 1);
+        assert!(
+            refusal(&*factory, "tenant-a", "key-a").is_some(),
+            "still the same UTC day"
+        );
+        advance_clock(1);
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a"),
+            None,
+            "a new UTC day"
+        );
+    }
+
+    /// Per-minute and per-day limits on one subject both apply, and the
+    /// refusal names whichever is spent.
+    #[test]
+    fn minute_and_day_request_limits_both_apply_and_the_refusal_names_the_spent_one() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_key_limits(
+            &KeyId::new("key-a"),
+            Some(&LimitPolicy {
+                requests_per_minute: Some(2),
+                requests_per_day: Some(3),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let factory = policy_factory(&cp);
+
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("request rate exceeded"),
+            "the minute limit is spent first"
+        );
+        // The minute rolls over; the day has one request left.
+        advance_clock(60);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
+        assert_eq!(
+            refusal(&*factory, "tenant-a", "key-a").as_deref(),
+            Some("request rate exceeded (daily limit)"),
+            "the minute row is fresh, so only the day limit can refuse"
+        );
+    }
+
+    /// `tokens_per_day` charges the usage reported at stream end, beside a
+    /// per-minute token limit that is far from spent.
+    #[test]
+    fn a_daily_token_limit_charges_reported_usage_and_resets_at_utc_midnight() {
+        let cp = control_plane();
+        mint(&cp, "tenant-a", "key-a");
+        cp.set_key_limits(
+            &KeyId::new("key-a"),
+            Some(&LimitPolicy {
+                tokens_per_minute: Some(1_000),
+                tokens_per_day: Some(10),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let factory = policy_factory(&cp);
+
+        complete_with_usage(&*factory, "tenant-a", "key-a", 10);
+        let (headers, body) =
+            refusal_reply(&*factory, "tenant-a", "key-a").expect("10 tokens spend the daily limit");
+        assert_eq!(
+            body["error"]["message"],
+            "token budget exceeded (daily limit)"
+        );
+        assert_eq!(body["error"]["code"], "token_limit_exceeded");
+        assert_eq!(headers["x-ratelimit-limit-tokens"], "10");
+        assert_eq!(
+            headers["retry-after"],
+            SECS_TO_MIDNIGHT.to_string().as_str()
+        );
+
+        advance_clock(SECS_TO_MIDNIGHT);
+        assert_eq!(refusal(&*factory, "tenant-a", "key-a"), None);
     }
 
     #[test]

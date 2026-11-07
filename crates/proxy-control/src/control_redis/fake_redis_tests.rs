@@ -142,6 +142,8 @@ fn sample_limits() -> LimitPolicy {
     LimitPolicy {
         tokens_per_minute: Some(1200),
         requests_per_minute: Some(0),
+        tokens_per_day: Some(50_000),
+        requests_per_day: Some(900),
         concurrent_streams: None,
     }
 }

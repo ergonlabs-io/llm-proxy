@@ -3393,6 +3393,12 @@ fn lower_limits(config: &SimpleConfig) -> Result<Option<Value>, ConfigError> {
         if let Some(requests) = limit.requests_per_minute {
             rule.insert("requests_per_minute".into(), json!(requests.0));
         }
+        if let Some(tokens) = limit.tokens_per_day {
+            rule.insert("tokens_per_day".into(), json!(tokens.0));
+        }
+        if let Some(requests) = limit.requests_per_day {
+            rule.insert("requests_per_day".into(), json!(requests.0));
+        }
         if let Some(sessions) = limit.concurrent_sessions {
             // `concurrent_sessions` counts streams in flight.
             let streams = u32::try_from(sessions).map_err(|_| ConfigError::InvalidValue {

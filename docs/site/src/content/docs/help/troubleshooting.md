@@ -303,6 +303,7 @@ served the request. See
 |---|---|---|
 | `token budget exceeded` | The caller used its `tokens_per_minute` allowance. | Wait `retry-after` seconds, or raise the limit. |
 | `request rate exceeded` | The caller used its `requests_per_minute` allowance. | Wait `retry-after` seconds, or raise the limit. |
+| `request rate exceeded (daily limit)`, `token budget exceeded (daily limit)` | The caller used its `requests_per_day` or `tokens_per_day` allowance for the UTC day. | Wait until 00:00 UTC (`retry-after` counts the seconds), or raise the limit. |
 | `too many concurrent streams` | The caller reached `concurrent_sessions`. | Wait for a stream to end, or raise the limit. |
 | `spend budget exceeded` | A key or tenant reached its budget for the period. | Raise the budget, or wait for the period to reset. |
 

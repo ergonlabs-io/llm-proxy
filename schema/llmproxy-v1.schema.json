@@ -1181,6 +1181,14 @@
           "$ref": "#/$defs/TokenAmount",
           "description": "Requests allowed per one-minute epoch-aligned window per bucket. Counted at admission, for every key."
         },
+        "tokens_per_day": {
+          "$ref": "#/$defs/TokenAmount",
+          "description": "Total (input + output) tokens allowed per UTC calendar day per bucket, counted beside `tokens_per_minute`. Both apply, and the first one that is spent refuses. A refusal waits until the next UTC midnight. With `auth.store` `in_memory` the count is lost on restart; with `persistent` it survives."
+        },
+        "requests_per_day": {
+          "$ref": "#/$defs/TokenAmount",
+          "description": "Requests allowed per UTC calendar day per bucket, counted at admission beside `requests_per_minute`. Both apply, and the first one that is spent refuses. A refusal waits until the next UTC midnight. With `auth.store` `in_memory` the count is lost on restart; with `persistent` it survives."
+        },
         "concurrent_sessions": {
           "type": "integer",
           "minimum": 1,

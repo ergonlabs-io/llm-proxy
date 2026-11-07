@@ -33,6 +33,19 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Added
 
+- Daily request and token limits: `requests_per_day` and `tokens_per_day` on a
+  `limits` entry, and on the admin `PUT /tenants/{id}/limits` and
+  `PUT /keys/{id}/limits` bodies (and in `GET /keys`). A day is a UTC calendar
+  day, the same as a daily spend budget. The daily limit counts beside the
+  per-minute limit of the same kind: both apply, and the first one that is
+  spent refuses, with the message `request rate exceeded (daily limit)` or
+  `token budget exceeded (daily limit)`, a `retry-after` to the next UTC
+  midnight and `x-should-retry: false`. With a `persistent` or `shared` auth
+  store the count survives a restart; with `in_memory` it does not. A store
+  that holds a daily limit cannot be read by 1.0.0: its limits row is stored as
+  version 2, and 1.0.0 refuses to load a version it does not know instead of
+  dropping the limit. Clear daily limits before a downgrade. A store with no
+  daily limit stays readable by 1.0.0.
 - Spend budgets: `period` can be `weekly`, an ISO week that starts on Monday at
   00:00 UTC. A store that holds a weekly budget cannot be read by 1.0.0, so
   change or clear weekly budgets before a downgrade.

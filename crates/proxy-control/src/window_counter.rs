@@ -381,22 +381,22 @@ impl WindowAccumulator {
     /// Check every row, then count one unit on each, under one lock: either
     /// every row is below its limit and all are counted, or none is. A
     /// request that one limit refuses therefore spends nothing against the
-    /// others it was checked against. Returns the first refusing row's index
-    /// in `rows` and its total.
+    /// others it was checked against, including a limit of another window
+    /// length on the same subject. Returns the first refusing row's index in
+    /// `rows` and its total.
     pub fn admit_all(
         &self,
         dimension: WindowDimension,
-        window: WindowKey,
-        rows: &[(&LimitKey, u64)],
+        rows: &[(&LimitKey, WindowKey, u64)],
     ) -> Result<(), RowRefused> {
         let (wake, first_fold) = {
             let mut buckets = self.inner.lock_buckets();
             let mut first_fold = false;
             let mut bounded = Vec::with_capacity(rows.len());
-            for (index, (key, limit)) in rows.iter().enumerate() {
+            for (index, (key, window, limit)) in rows.iter().enumerate() {
                 let (key, fold) = buckets.bounded(key);
                 first_fold |= fold;
-                let row = (key, dimension, window);
+                let row = (key, dimension, *window);
                 let used = buckets.by_key.get(&row).map_or(0, Bucket::used);
                 if used >= *limit {
                     drop(buckets);
@@ -1483,13 +1483,13 @@ mod tests {
             LimitKey::for_client_rule(format!("header=x-u:{v}"), "header=x-u:overflow".to_string())
         };
         for i in 0..MAX_CLIENT_KEYED_WINDOWS {
-            assert_eq!(acc.admit_all(REQUESTS, w, &[(&ip(i), 100)]), Ok(()));
+            assert_eq!(acc.admit_all(REQUESTS, &[(&ip(i), w, 100)]), Ok(()));
         }
         let (late_1, late_2) = (
             ip(MAX_CLIENT_KEYED_WINDOWS),
             ip(MAX_CLIENT_KEYED_WINDOWS + 1),
         );
-        assert_eq!(acc.admit_all(REQUESTS, w, &[(&late_1, 100)]), Ok(()));
+        assert_eq!(acc.admit_all(REQUESTS, &[(&late_1, w, 100)]), Ok(()));
         assert_eq!(
             acc.used(&late_2, REQUESTS, w),
             1,
@@ -1516,11 +1516,11 @@ mod tests {
         let tenant = LimitKey::for_tenant_policy("acme");
         let key = LimitKey::for_key_policy("k1");
         assert_eq!(
-            acc.admit_all(REQUESTS, w, &[(&tenant, 5), (&key, 1)]),
+            acc.admit_all(REQUESTS, &[(&tenant, w, 5), (&key, w, 1)]),
             Ok(())
         );
         assert_eq!(
-            acc.admit_all(REQUESTS, w, &[(&tenant, 5), (&key, 1)]),
+            acc.admit_all(REQUESTS, &[(&tenant, w, 5), (&key, w, 1)]),
             Err(RowRefused { index: 1, used: 1 })
         );
         assert_eq!(
@@ -1528,6 +1528,29 @@ mod tests {
             1,
             "the key's refusal must not count against the tenant checked before it"
         );
+    }
+
+    /// One subject with a minute row and a day row (two window lengths, one
+    /// dimension): a refusal by either spends nothing from the other.
+    #[test]
+    fn admit_all_counts_nothing_when_the_other_window_length_refuses() {
+        let store = Arc::new(InMemoryControlPlaneStore::default());
+        let acc = accumulator(&store, "a");
+        let minute = window_at(t0());
+        let day = WindowKey::containing(unix_secs(t0()), 86_400);
+        let key = LimitKey::for_key_policy("k1");
+        let rows = [(&key, minute, 5), (&key, day, 1)];
+        assert_eq!(acc.admit_all(REQUESTS, &rows), Ok(()));
+        assert_eq!(
+            acc.admit_all(REQUESTS, &rows),
+            Err(RowRefused { index: 1, used: 1 })
+        );
+        assert_eq!(
+            acc.used(&key, REQUESTS, minute),
+            1,
+            "the day row's refusal must not count against the minute row"
+        );
+        assert_eq!(acc.used(&key, REQUESTS, day), 1);
     }
 
     #[test]

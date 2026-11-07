@@ -34,13 +34,15 @@ async fn put_tenant_limits_sets_and_clears_snapshot() {
         "PUT",
         "/tenants/tenant-a/limits",
         Some(ADMIN_TOKEN),
-        r#"{"schema_version":1,"limits":{"tokens_per_minute":0,"requests_per_minute":60}}"#,
+        r#"{"schema_version":1,"limits":{"tokens_per_minute":0,"requests_per_minute":60,"tokens_per_day":5000,"requests_per_day":300}}"#,
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let limits = handle.load().tenant_limits[&TenantId::new("tenant-a")];
     assert_eq!(limits.tokens_per_minute, Some(0));
     assert_eq!(limits.requests_per_minute, Some(60));
+    assert_eq!(limits.tokens_per_day, Some(5000));
+    assert_eq!(limits.requests_per_day, Some(300));
     assert_eq!(limits.concurrent_streams, None);
 
     let (status, _, body) = request(
@@ -77,7 +79,7 @@ async fn put_key_limits_updates_listing_and_all_absent_clears() {
         "PUT",
         "/keys/key-a/limits",
         Some(ADMIN_TOKEN),
-        r#"{"limits":{"concurrent_streams":3}}"#,
+        r#"{"limits":{"concurrent_streams":3,"requests_per_day":9}}"#,
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
@@ -90,7 +92,7 @@ async fn put_key_limits_updates_listing_and_all_absent_clears() {
     let listing: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
         listing["keys"][0]["limits"],
-        serde_json::json!({"concurrent_streams": 3})
+        serde_json::json!({"concurrent_streams": 3, "requests_per_day": 9})
     );
 
     let (status, _, body) = request(

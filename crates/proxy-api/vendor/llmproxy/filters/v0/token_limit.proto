@@ -38,8 +38,8 @@ message TokenLimit {
   repeated LimitRule rules = 3;
 }
 
-// One keyed limit. At least one of tokens_per_minute, requests_per_minute and
-// concurrent_streams must be set.
+// One keyed limit. At least one of tokens_per_minute, requests_per_minute,
+// tokens_per_day, requests_per_day and concurrent_streams must be set.
 message LimitRule {
   // Who the limit is counted against.
   enum Key {
@@ -69,4 +69,9 @@ message LimitRule {
   // (an exact name or a single trailing `*`). Empty applies to every request.
   // A scoped rule is checked once the request body has named the model.
   repeated string models = 6;
+  // Total tokens per UTC calendar day, counted beside tokens_per_minute: both
+  // apply and the first one that is spent refuses.
+  optional uint64 tokens_per_day = 7;
+  // Requests per UTC calendar day, counted beside requests_per_minute.
+  optional uint64 requests_per_day = 8;
 }

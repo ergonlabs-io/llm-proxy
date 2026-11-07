@@ -70,6 +70,8 @@ from the schema.
 | `key` | string | none (required) | What the limit counts against. See the next table. |
 | `tokens_per_minute` | integer, or a string with `k` or `m` | none | Input plus output tokens in one window for each bucket. The proxy reads usage from the provider response, also for streams. |
 | `requests_per_minute` | integer, or a string with `k` or `m` | none | Requests in one window for each bucket. The proxy counts a request when it admits it. |
+| `tokens_per_day` | integer, or a string with `k` or `m` | none | Input plus output tokens in one UTC calendar day for each bucket. It counts beside `tokens_per_minute`. See [Daily limits](#daily-limits). |
+| `requests_per_day` | integer, or a string with `k` or `m` | none | Requests in one UTC calendar day for each bucket. It counts beside `requests_per_minute`. See [Daily limits](#daily-limits). |
 | `concurrent_sessions` | integer, 1 or more | none | Streams in flight for each bucket. This includes SSE streams and `realtime` sessions. The proxy frees the slot when the stream or session ends. |
 | `models` | list of model patterns | all models | Apply the entry only to requests for a matching model. A pattern is an exact name or a name with one trailing `*`. Other models neither count against the limit nor get refused by it. |
 
@@ -143,6 +145,8 @@ names the limit, and the detail in `%RESPONSE_CODE_DETAILS%` names it too:
 |---|---|---|
 | `tokens_per_minute` | `token budget exceeded` | `token_limit_exceeded` |
 | `requests_per_minute` | `request rate exceeded` | `request_limit_exceeded` |
+| `tokens_per_day` | `token budget exceeded (daily limit)` | `token_limit_exceeded` |
+| `requests_per_day` | `request rate exceeded (daily limit)` | `request_limit_exceeded` |
 | `concurrent_sessions` | `too many concurrent streams` | `concurrency_limit_exceeded` |
 
 Each `429` has a JSON body in the shape of the endpoint called (see
@@ -240,6 +244,31 @@ the same name. As a result, the first window that a caller sees can be shorter
 than 60 seconds. A caller whose first request arrives 50 seconds into a minute
 has 10 seconds before the window resets. `x-ratelimit-reset-*` and `retry-after`
 count down to the end of the current window.
+
+## Daily limits
+
+`tokens_per_day` and `requests_per_day` count in a UTC calendar day, the same
+day as a `daily` spend budget. A day starts at 00:00 UTC and ends at the next
+00:00 UTC. A limit that you set per minute and per day on one bucket applies
+twice: the first limit that is spent refuses the request, and the message tells
+you which one. A refused request counts against neither window.
+
+A daily refusal sets `retry-after` to the seconds until the next UTC midnight
+and `x-should-retry: false` (`true` only in the last minute of the day). The
+daily token limit counts the usage that the provider reports, also after a
+failover to another provider.
+
+The counts live in the store that `auth.store` selects. With `persistent` the
+count of a day survives a restart, because the proxy writes it to the store
+about once a second. With `in_memory`, and for a `limits` entry on a proxy with
+no `auth:` block, the count starts again at zero after a restart. A restart
+therefore gives a caller a fresh day.
+
+A daily `client-ip` or `header` limit keeps one row for each distinct client
+for the whole day, and the row stays in the store for five minutes after the
+day ends. One limit tracks at most 10000 distinct clients at once. A client
+beyond that shares one overflow bucket, so the limit still holds and the
+number of rows stays bounded.
 
 ## Sharing counts across replicas
 

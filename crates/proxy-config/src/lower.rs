@@ -635,6 +635,8 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "requests_per_minute",
             "concurrent_streams",
             "models",
+            "tokens_per_day",
+            "requests_per_day",
         ],
         // One-release compatibility for the old borrowed token-limit type.
         // RateLimitSettings has unrelated xDS fields; accepting any of them

@@ -99,6 +99,8 @@ Available when you set `limits`. See
 | 429 | `token budget exceeded` | `token_limit_exceeded` | `RL` | A token limit is spent. |
 | 429 | `request rate exceeded` | `request_limit_exceeded` | `RL` | A `requests_per_minute` limit is spent. |
 | 429 | `too many concurrent streams` | `concurrency_limit_exceeded` | `RL` | A `concurrent_sessions` limit is full. |
+| 429 | `request rate exceeded (daily limit)` | `request_limit_exceeded` | `RL` | A `requests_per_day` limit is spent. `retry-after` counts to 00:00 UTC. |
+| 429 | `token budget exceeded (daily limit)` | `token_limit_exceeded` | `RL` | A `tokens_per_day` limit is spent. `retry-after` counts to 00:00 UTC. |
 
 Every proxy-made 429 has a JSON body and `content-type: application/json`.
 The shape follows the endpoint the client called. A request to

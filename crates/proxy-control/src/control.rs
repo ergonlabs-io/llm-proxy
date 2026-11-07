@@ -229,14 +229,22 @@ pub struct StoredControlPlane {
 pub struct LimitPolicy {
     pub tokens_per_minute: Option<u64>,
     pub requests_per_minute: Option<u64>,
+    /// Tokens per UTC calendar day. Counted beside `tokens_per_minute`: both
+    /// apply, and the first one that is spent refuses.
+    pub tokens_per_day: Option<u64>,
+    /// Requests per UTC calendar day, counted beside `requests_per_minute`.
+    pub requests_per_day: Option<u64>,
     pub concurrent_streams: Option<u32>,
 }
 
 impl LimitPolicy {
     fn is_empty(self) -> bool {
-        self.tokens_per_minute.is_none()
-            && self.requests_per_minute.is_none()
-            && self.concurrent_streams.is_none()
+        self == LimitPolicy::default()
+    }
+
+    /// Whether any token limit (per minute or per day) is set.
+    pub fn has_token_limit(self) -> bool {
+        self.tokens_per_minute.is_some() || self.tokens_per_day.is_some()
     }
 }
 
@@ -1997,8 +2005,22 @@ pub(crate) struct EncodedLimitPolicy {
     schema_version: u32,
     tokens_per_minute: Option<u64>,
     requests_per_minute: Option<u64>,
+    // Absent in a version 1 row. Written only when set, and only in a
+    // version 2 row, so a store that holds no daily limit stays readable by
+    // a build that knows version 1 alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tokens_per_day: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requests_per_day: Option<u64>,
     concurrent_streams: Option<u32>,
 }
+
+/// The limits row version a row without daily limits is written with.
+const LIMITS_SCHEMA_V1: u32 = 1;
+/// The limits row version that may carry `tokens_per_day` and
+/// `requests_per_day`. A build that reads only version 1 refuses to load it,
+/// rather than reading the row and silently dropping the daily limits.
+const LIMITS_SCHEMA_V2: u32 = 2;
 
 pub(crate) const TRACE_EXPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -2125,7 +2147,7 @@ pub(crate) fn decode_object_owner_row(value: &[u8]) -> Result<ObjectOwner, Store
 
 fn read_limits_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
     let version = <u32 as serde::Deserialize>::deserialize(de)?;
-    if version == 1 {
+    if matches!(version, LIMITS_SCHEMA_V1 | LIMITS_SCHEMA_V2) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(format!(
@@ -2136,10 +2158,17 @@ fn read_limits_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result
 
 impl From<&LimitPolicy> for EncodedLimitPolicy {
     fn from(limits: &LimitPolicy) -> Self {
+        let has_daily = limits.tokens_per_day.is_some() || limits.requests_per_day.is_some();
         Self {
-            schema_version: 1,
+            schema_version: if has_daily {
+                LIMITS_SCHEMA_V2
+            } else {
+                LIMITS_SCHEMA_V1
+            },
             tokens_per_minute: limits.tokens_per_minute,
             requests_per_minute: limits.requests_per_minute,
+            tokens_per_day: limits.tokens_per_day,
+            requests_per_day: limits.requests_per_day,
             concurrent_streams: limits.concurrent_streams,
         }
     }
@@ -2150,6 +2179,8 @@ impl From<EncodedLimitPolicy> for LimitPolicy {
         Self {
             tokens_per_minute: encoded.tokens_per_minute,
             requests_per_minute: encoded.requests_per_minute,
+            tokens_per_day: encoded.tokens_per_day,
+            requests_per_day: encoded.requests_per_day,
             concurrent_streams: encoded.concurrent_streams,
         }
     }
@@ -8330,6 +8361,8 @@ mod tests {
         let limits = LimitPolicy {
             tokens_per_minute: Some(0),
             requests_per_minute: Some(8),
+            tokens_per_day: Some(5_000),
+            requests_per_day: Some(300),
             concurrent_streams: None,
         };
         {
@@ -8603,6 +8636,48 @@ mod tests {
         assert!(!cp.trace_export(&tenant));
     }
 
+    /// The stored row is the downgrade contract. A row with no daily limit is
+    /// byte-compatible with 1.0.0 (version 1, no daily keys); a row with one is
+    /// version 2, which 1.0.0 refuses to load instead of dropping the limit.
+    #[test]
+    fn a_limits_row_is_version_2_only_when_it_carries_a_daily_limit() {
+        let json = |limits: &LimitPolicy| -> serde_json::Value {
+            serde_json::from_slice(&encode_json(&EncodedLimitPolicy::from(limits))).unwrap()
+        };
+        let minute_only = json(&LimitPolicy {
+            tokens_per_minute: Some(5),
+            ..Default::default()
+        });
+        assert_eq!(minute_only["schema_version"], 1);
+        assert!(minute_only.get("tokens_per_day").is_none(), "{minute_only}");
+        assert!(
+            minute_only.get("requests_per_day").is_none(),
+            "{minute_only}"
+        );
+
+        let daily = LimitPolicy {
+            requests_per_day: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(json(&daily)["schema_version"], 2);
+        let back: EncodedLimitPolicy =
+            decode_json(&encode_json(&EncodedLimitPolicy::from(&daily))).unwrap();
+        assert_eq!(LimitPolicy::from(back), daily);
+
+        // A row 1.0.0 wrote has no daily keys and still loads.
+        let old: EncodedLimitPolicy = decode_json(
+            br#"{"schema_version":1,"tokens_per_minute":5,"requests_per_minute":null,"concurrent_streams":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            LimitPolicy::from(old),
+            LimitPolicy {
+                tokens_per_minute: Some(5),
+                ..Default::default()
+            }
+        );
+    }
+
     #[test]
     fn redb_rejects_future_limits_schema_on_load() {
         let store = RedbControlPlaneStore::in_memory();
@@ -8610,7 +8685,7 @@ mod tests {
             let txn = store.db.begin_write().unwrap();
             {
                 let mut table = txn.open_table(LIMITS_TABLE).unwrap();
-                table.insert("tenant-a", br#"{"schema_version":2,"tokens_per_minute":5,"requests_per_minute":null,"concurrent_streams":null}"#.as_slice()).unwrap();
+                table.insert("tenant-a", br#"{"schema_version":3,"tokens_per_minute":5,"requests_per_minute":null,"concurrent_streams":null}"#.as_slice()).unwrap();
             }
             txn.commit().unwrap();
         }
