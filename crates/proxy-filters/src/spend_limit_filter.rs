@@ -30,6 +30,7 @@ use chrono::Utc;
 use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
+use crate::limit_reply::Reply;
 use proxy_config::ConfigError;
 use proxy_credentials::CredentialSource;
 use proxy_http::endpoint::Endpoint;
@@ -103,13 +104,6 @@ pub fn check_reload(
     };
     journal_path_refusal(&journal_path(config), &running).map_or(Ok(()), Err)
 }
-
-/// The `%RESPONSE_CODE_DETAILS%`/body value for this filter's one refusal
-/// reason -- unlike `model_authz_filter`'s deliberately generic denial, this
-/// one names spend specifically: nothing about a spend ceiling is sensitive
-/// the way a tenant's model allow-list contents might be, so there is no
-/// analogous reason to keep it vague.
-const DENY_DETAILS: &str = "spend_budget_exceeded";
 
 fn invalid(field_path: impl Into<String>, reason: impl Into<String>) -> ConfigError {
     ConfigError::InvalidValue {
@@ -1155,33 +1149,12 @@ impl HttpFilter for SpendLimitFilterInstance {
                 // period boundary -- for this filter to name).
                 let retry_secs = reset_secs;
 
-                cb.send_local_reply(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "spend budget exceeded",
-                    Some(Box::new(move |headers: &mut http::HeaderMap| {
-                        // Rust note: `HeaderValue::from_str` on formatted decimal
-                        // strings never fails (ASCII digits are always a valid
-                        // header value), so these unwraps are total -- same as
-                        // `token_limit_filter`'s identical headers.
-                        //
-                        // VALUES ARE IN MICRO-DOLLARS (1e-6 USD), NOT REQUEST
-                        // COUNTS -- unlike `token_limit_filter`'s identically
-                        // named headers, which count tokens. These header names
-                        // are a convention borrowed from request-count rate
-                        // limiting; nothing about the name says "money", so an
-                        // integrator reading a raw `x-ratelimit-remaining` value
-                        // here without reading this filter's docs would
-                        // reasonably misinterpret it as a request or token count.
-                        headers.insert("x-ratelimit-limit", http::HeaderValue::from(limit_micros));
-                        headers.insert(
-                            "x-ratelimit-remaining",
-                            http::HeaderValue::from(remaining_micros),
-                        );
-                        headers.insert("x-ratelimit-reset", http::HeaderValue::from(reset_secs));
-                        headers.insert("retry-after", http::HeaderValue::from(retry_secs));
-                    })),
-                    DENY_DETAILS,
-                );
+                // The body and headers are shared with `token_limit`
+                // (`limit_reply`). Values are micro-dollars inside; the wire
+                // carries USD in `x-llmproxy-budget-*`, not the request- and
+                // token-count `x-ratelimit-*` names.
+                Reply::budget(limit_micros, remaining_micros, reset_secs, retry_secs)
+                    .send(cb, None);
                 // Rust note: the returned status is irrelevant here --
                 // `drive_decode` checks `ctx.local_reply.is_some()` right after
                 // this callback returns and stops the chain unconditionally when
@@ -2019,7 +1992,7 @@ mod tests {
         let earliest_reset = Period::Weekly.seconds_until_reset(Utc::now());
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         let reset: u64 = headers
-            .get("x-ratelimit-reset")
+            .get("x-llmproxy-budget-reset")
             .expect("a 429 names its reset")
             .to_str()
             .expect("the header is ascii digits")
@@ -2687,7 +2660,7 @@ mod tests {
         let (reply, _) = run_request(&harness, "tenant-a", None, None);
         let (status, headers) = reply.unwrap();
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(headers["x-ratelimit-limit"], "3");
+        assert_eq!(headers["x-llmproxy-budget-limit-usd"], "0.000003");
         // Clearing the tenant ceiling must leave the independent key ledger intact.
         cp.set_budget(&tenant, None).unwrap();
         cp.set_key_budget(
@@ -2700,7 +2673,7 @@ mod tests {
         )
         .unwrap();
         let (reply, _) = run_request(&harness, "tenant-a", None, None);
-        assert_eq!(reply.unwrap().1["x-ratelimit-limit"], "2");
+        assert_eq!(reply.unwrap().1["x-llmproxy-budget-limit-usd"], "0.000002");
     }
 
     #[test]
@@ -3065,18 +3038,31 @@ mod tests {
             reply.expect("must be denied once the recorded total is over budget");
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         for name in [
-            "x-ratelimit-limit",
-            "x-ratelimit-remaining",
-            "x-ratelimit-reset",
+            "x-llmproxy-budget-limit-usd",
+            "x-llmproxy-budget-remaining-usd",
+            "x-llmproxy-budget-reset",
             "retry-after",
+            "x-should-retry",
         ] {
             assert!(
                 headers.get(name).is_some(),
                 "expected header `{name}` on a 429, got: {headers:?}"
             );
         }
-        assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "10000000");
-        assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "0");
+        assert_eq!(
+            headers.get("x-llmproxy-budget-limit-usd").unwrap(),
+            "10.000000"
+        );
+        assert_eq!(
+            headers.get("x-llmproxy-budget-remaining-usd").unwrap(),
+            "0.000000"
+        );
+        assert!(
+            headers
+                .keys()
+                .all(|n| !n.as_str().starts_with("x-ratelimit")),
+            "a spend 429 must not borrow the request/token-count names: {headers:?}"
+        );
     }
 
     #[test]

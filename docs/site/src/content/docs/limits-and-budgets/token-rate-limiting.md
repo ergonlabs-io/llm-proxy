@@ -145,14 +145,17 @@ names the limit, and the detail in `%RESPONSE_CODE_DETAILS%` names it too:
 | `requests_per_minute` | `request rate exceeded` | `request_limit_exceeded` |
 | `concurrent_sessions` | `too many concurrent streams` | `concurrency_limit_exceeded` |
 
-Each `429` carries four headers:
+Each `429` has a JSON body in the shape of the endpoint called (see
+[Errors](/docs/llm-proxy/api-compatibility/errors/#token-limits)), with the
+response code detail above as its `code`. It carries these headers:
 
 | Header | Value |
 |---|---|
-| `x-ratelimit-limit` | The configured limit. |
-| `x-ratelimit-remaining` | What remains in the window. |
-| `x-ratelimit-reset` | Seconds until the window ends. |
+| `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests` | The limit, what remains, and the seconds until the window ends. Sent when `requests_per_minute` refused. |
+| `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-tokens` | The same three values. Sent when `tokens_per_minute` refused. |
 | `retry-after` | Seconds until the client should retry. |
+| `x-should-retry` | `false` when `retry-after` is more than 60 seconds, else `true`. |
+| `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset` | Deprecated. The same values without a dimension. Removed after one more minor release. |
 
 The access log shows the response flag `RL`. The proxy checks token usage
 before the request and records it after the response. A stream already in
@@ -235,7 +238,7 @@ A window is a fixed period aligned to the Unix epoch. A 60-second window always
 starts on a whole minute. Every replica therefore counts the same minute under
 the same name. As a result, the first window that a caller sees can be shorter
 than 60 seconds. A caller whose first request arrives 50 seconds into a minute
-has 10 seconds before the window resets. `x-ratelimit-reset` and `retry-after`
+has 10 seconds before the window resets. `x-ratelimit-reset-*` and `retry-after`
 count down to the end of the current window.
 
 ## Sharing counts across replicas

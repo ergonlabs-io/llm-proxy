@@ -94,20 +94,42 @@ with no policy writes a warning in the proxy log.
 Available when you set `limits`. See
 [Token rate limiting](/docs/llm-proxy/limits-and-budgets/token-rate-limiting/).
 
-| Status | Body | Flag | Cause |
-| --- | --- | --- | --- |
-| 429 | `token budget exceeded` | `RL` | A token limit is spent. |
-| 429 | `request rate exceeded` | `RL` | A `requests_per_minute` limit is spent. |
-| 429 | `too many concurrent streams` | `RL` | A `concurrent_sessions` limit is full. |
+| Status | Message | Code | Flag | Cause |
+| --- | --- | --- | --- | --- |
+| 429 | `token budget exceeded` | `token_limit_exceeded` | `RL` | A token limit is spent. |
+| 429 | `request rate exceeded` | `request_limit_exceeded` | `RL` | A `requests_per_minute` limit is spent. |
+| 429 | `too many concurrent streams` | `concurrency_limit_exceeded` | `RL` | A `concurrent_sessions` limit is full. |
+
+Every proxy-made 429 has a JSON body and `content-type: application/json`.
+The shape follows the endpoint the client called. A request to
+`/v1/messages` gets the Anthropic shape. Every other request gets the OpenAI
+shape:
+
+```json
+{"error":{"message":"request rate exceeded","type":"rate_limit_error","code":"request_limit_exceeded"}}
+```
+
+```json
+{"type":"error","error":{"type":"rate_limit_error","message":"request rate exceeded","code":"request_limit_exceeded"}}
+```
+
+The `code` is stable. The Anthropic shape has no `code` in its public
+definition. The proxy adds it inside `error`. The same code is the
+`response_code_details` value in the access log.
 
 Each 429 carries these headers:
 
 | Header | Value |
 | --- | --- |
-| `x-ratelimit-limit` | The limit of the bucket. |
-| `x-ratelimit-remaining` | What is left in the bucket. |
-| `x-ratelimit-reset` | Seconds until the window resets. |
+| `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests` | The limit, what is left, and the seconds until the window resets. Sent when a request limit refused. |
+| `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-tokens` | The same three values. Sent when a token limit refused. |
 | `retry-after` | Seconds to wait before a retry. |
+| `x-should-retry` | `true`, or `false` when `retry-after` is more than 60 seconds. |
+| `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset` | Deprecated. The same values without a dimension. Sent for one more minor release, then removed. Use the suffixed headers. |
+
+A `concurrent_sessions` refusal has no suffixed headers, because it counts
+streams, not requests or tokens. The official OpenAI and Anthropic SDKs ignore
+a `retry-after` of more than 60 seconds and read `x-should-retry` instead.
 
 Fix: wait for `retry-after` seconds, or ask the operator to raise the limit.
 The proxy checks the limit before it forwards the request. It adds the tokens
@@ -132,15 +154,32 @@ and never forwards it.
 Available when you set a spend budget. See
 [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/).
 
-| Status | Body | Cause | Fix |
+| Status | Message | Cause | Fix |
 | --- | --- | --- | --- |
-| 429 | `spend budget exceeded` | The budget for the period is used. Flag `RL`. | Wait for `retry-after` seconds, or ask the operator to raise the budget. |
+| 429 | `spend budget exceeded` (code `spend_budget_exceeded`) | The budget for the period is used. Flag `RL`. | Wait for `retry-after` seconds, or ask the operator to raise the budget. |
 | 403 | `authenticated key identity required for spend policy` | A key budget applies and the request has no authenticated key. | Send a valid virtual key. |
 | 403 | `authenticated tenant identity required for spend policy` | A tenant budget applies and the request has no authenticated tenant. | Send a valid virtual key. |
 
-The spend 429 uses the same four headers as the token 429. For a spend
-budget, the values are in micro-dollars (1e-6 USD), not tokens or requests.
-`x-ratelimit-reset` and `retry-after` hold the same number of seconds.
+The spend 429 has the same JSON body shapes and the same `retry-after` and
+`x-should-retry` headers as the token 429. It does not send `x-ratelimit-*`
+headers, whose names mean requests or tokens. It sends:
+
+| Header | Value |
+| --- | --- |
+| `x-llmproxy-budget-limit-usd` | The ceiling, in USD, for example `10.000000`. |
+| `x-llmproxy-budget-remaining-usd` | What is left, in USD. `0.000000` when the budget is used. |
+| `x-llmproxy-budget-reset` | Seconds until the period resets. Equal to `retry-after`. |
+
+Before this change a spend 429 sent `x-ratelimit-*` headers with values in
+micro-dollars. Clients that read them must move to the headers above.
+
+### When every provider answers 429
+
+A failover chain tries the next provider on a provider `429`. When every
+provider answers `429`, the client gets the last provider's response
+unchanged. This includes the provider's own `x-ratelimit-*` and `retry-after`
+headers and its body. Those headers describe the operator's account with that
+provider, not a limit of the tenant.
 
 ## Refusals for paths that cannot be metered
 

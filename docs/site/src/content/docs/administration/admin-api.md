@@ -446,8 +446,9 @@ These rules apply:
   actual usage when the stream ends. A stream in flight is never cut.
 
 When a limit refuses a request, the proxy answers `429`. The body names the
-limit, and the response has the headers `x-ratelimit-limit`,
-`x-ratelimit-remaining`, `x-ratelimit-reset`, and `retry-after`:
+limit, and the response has the headers `retry-after`, `x-should-retry`,
+and the `x-ratelimit-*-requests` or `x-ratelimit-*-tokens` set (see
+[Errors](/docs/llm-proxy/api-compatibility/errors/#token-limits)):
 
 | Limit | `429` body |
 |---|---|

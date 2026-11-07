@@ -144,8 +144,8 @@ fn a_key_budget_counts_byok_spend_only_with_include_byok_in_limit() {
 // ------------------------------------------------------------------ helpers --
 
 /// The spend filter's refusal (`spend_budget_exceeded` in the access log):
-/// its body, and the key's ceiling in micro-dollars, which no token limit in
-/// this config could report.
+/// its body, and the key's ceiling in USD, which no token limit in this
+/// config could report.
 fn assert_spend_refusal(response: &str) {
     assert_eq!(status(response), 429, "{response}");
     assert!(
@@ -153,7 +153,7 @@ fn assert_spend_refusal(response: &str) {
         "the refusal names the spend budget: {response}"
     );
     assert!(
-        response.contains("x-ratelimit-limit: 28\r\n"),
+        response.contains("x-llmproxy-budget-limit-usd: 0.000028\r\n"),
         "the ceiling is the key's budget: {response}"
     );
 }

@@ -177,6 +177,7 @@ use http::header::AUTHORIZATION;
 use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
+use crate::limit_reply::{Cause, Reply};
 use proxy_config::ConfigError;
 use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::{
@@ -835,33 +836,6 @@ fn unix_secs(now: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-/// Which control-plane limit refused a request; selects the 429's body and
-/// local-reply details so an operator can tell the three apart in logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refusal {
-    Tokens,
-    Requests,
-    Streams,
-}
-
-impl Refusal {
-    fn body(self) -> &'static str {
-        match self {
-            Refusal::Tokens => "token budget exceeded",
-            Refusal::Requests => "request rate exceeded",
-            Refusal::Streams => "too many concurrent streams",
-        }
-    }
-
-    fn details(self) -> &'static str {
-        match self {
-            Refusal::Tokens => "token_limit_exceeded",
-            Refusal::Requests => "request_limit_exceeded",
-            Refusal::Streams => "concurrency_limit_exceeded",
-        }
-    }
-}
-
 /// Warns, at most once per [`LimitKey`] per [`crate::repeat_warner::REPEAT_INTERVAL`],
 /// when a budget applied to a request but its usage could not be read. The
 /// one call site is [`TokenLimitFilterInstance::record_if_present`]; see the
@@ -1072,7 +1046,7 @@ impl TokenLimitFilterInstance {
         key: Option<PolicyBucket>,
         rules: &[PolicyBucket],
         now_secs: u64,
-    ) -> Option<(LimitDecision, Refusal)> {
+    ) -> Option<(LimitDecision, Cause)> {
         let tenant_first: Vec<&PolicyBucket> =
             tenant.iter().chain(key.iter()).chain(rules).collect();
         let key_first: Vec<&PolicyBucket> = key.iter().chain(tenant.iter()).chain(rules).collect();
@@ -1089,7 +1063,7 @@ impl TokenLimitFilterInstance {
         streams_order: &[&PolicyBucket],
         requests_order: &[&PolicyBucket],
         now_secs: u64,
-    ) -> Option<(LimitDecision, Refusal)> {
+    ) -> Option<(LimitDecision, Cause)> {
         let window = policy_window(now_secs);
 
         for (key, limits) in streams_order {
@@ -1099,7 +1073,7 @@ impl TokenLimitFilterInstance {
                     .used(key, WindowDimension::TotalTokens, window);
                 let decision = LimitDecision::for_window(used, tokens, window, now_secs);
                 if matches!(decision, LimitDecision::Deny { .. }) {
-                    return Some((decision, Refusal::Tokens));
+                    return Some((decision, Cause::Tokens));
                 }
             }
         }
@@ -1110,7 +1084,7 @@ impl TokenLimitFilterInstance {
                 match self.streams.try_acquire(key, max_streams) {
                     Ok(lease) => leases.push(lease),
                     // Permits taken so far drop with `leases` here.
-                    Err(deny) => return Some((deny, Refusal::Streams)),
+                    Err(deny) => return Some((deny, Cause::Streams)),
                 }
             }
         }
@@ -1125,7 +1099,7 @@ impl TokenLimitFilterInstance {
         {
             let max_requests = requests.get(index).map_or(0, |(_, max)| *max);
             let decision = LimitDecision::for_window(used, max_requests, window, now_secs);
-            return Some((decision, Refusal::Requests));
+            return Some((decision, Cause::Requests));
         }
 
         self.leases.extend(leases);
@@ -1380,7 +1354,7 @@ impl TokenLimitFilterInstance {
 
     /// Refuse with 429 and the decision's rate-limit headers. The one place
     /// this filter refuses a request, so the one place `RL` is set.
-    fn refuse(&self, cb: &mut dyn DecoderCallbacks, decision: LimitDecision, refusal: Refusal) {
+    fn refuse(&self, cb: &mut dyn DecoderCallbacks, decision: LimitDecision, refusal: Cause) {
         let LimitDecision::Deny {
             limit,
             remaining,
@@ -1396,22 +1370,14 @@ impl TokenLimitFilterInstance {
         // Never set on a fail-open path: that request was admitted.
         cb.stream_info()
             .set_response_flag(ResponseFlag::RateLimited);
-        let reset_secs = reset_after.as_secs();
-        let retry_secs = retry_after.as_secs();
-        cb.send_local_reply(
-            StatusCode::TOO_MANY_REQUESTS,
-            refusal.body(),
-            Some(Box::new(move |headers: &mut http::HeaderMap| {
-                // Rust note: `HeaderValue::from` on formatted decimal
-                // strings never fails (ASCII digits are always a valid
-                // header value), so these unwraps are total.
-                headers.insert("x-ratelimit-limit", http::HeaderValue::from(limit));
-                headers.insert("x-ratelimit-remaining", http::HeaderValue::from(remaining));
-                headers.insert("x-ratelimit-reset", http::HeaderValue::from(reset_secs));
-                headers.insert("retry-after", http::HeaderValue::from(retry_secs));
-            })),
-            refusal.details(),
-        );
+        Reply::window(
+            refusal,
+            limit,
+            remaining,
+            reset_after.as_secs(),
+            retry_after.as_secs(),
+        )
+        .send(cb, None);
     }
 
     /// Terminates a `GET /v1/usage` request with the
@@ -1792,7 +1758,7 @@ impl HttpFilter for TokenLimitFilterInstance {
             let decision = LimitDecision::for_window(used, rule.max_tokens, window, now_secs);
             self.key = Some(key);
             if let deny @ LimitDecision::Deny { .. } = decision {
-                self.refuse(cb, deny, Refusal::Tokens);
+                self.refuse(cb, deny, Cause::Tokens);
                 // Rust note: the returned status is irrelevant here --
                 // `drive_decode` checks `ctx.local_reply.is_some()` right
                 // after this callback returns and stops the chain
@@ -2151,6 +2117,16 @@ mod tests {
         cb.stream_info.borrow_mut().llm.endpoint =
             proxy_http::endpoint::Endpoint::classify(&headers.method, headers.uri.path());
         filter.decode_headers(cb, headers, end_stream)
+    }
+
+    /// The message inside a 429's JSON error body. The shape and codes have
+    /// their own tests; most tests only need to know which limit refused.
+    fn error_message(body: &str) -> String {
+        let json: serde_json::Value = serde_json::from_str(body).expect("a 429 body is JSON");
+        json["error"]["message"]
+            .as_str()
+            .expect("an OpenAI-shaped error has a message")
+            .to_string()
     }
 
     struct TestCallbacks {
@@ -3742,7 +3718,7 @@ mod tests {
         let (_filter, cb) = admit(factory, tenant, key);
         cb.local_reply.map(|(status, _, body)| {
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-            body
+            error_message(&body)
         })
     }
 
@@ -4374,7 +4350,7 @@ mod tests {
         }
         let refused = cb.local_reply.as_ref().map(|(status, _, body)| {
             assert_eq!(*status, StatusCode::TOO_MANY_REQUESTS);
-            body.clone()
+            error_message(body)
         });
         (filter, cb, refused)
     }
@@ -4872,7 +4848,7 @@ mod tests {
             head.headers
                 .insert("x-user", HeaderValue::from_str(value).unwrap());
             decode(&mut *filter, &mut cb, &mut head, true);
-            cb.local_reply.map(|(_, _, body)| body)
+            cb.local_reply.map(|(_, _, body)| error_message(&body))
         };
         for i in 0..MAX_CLIENT_KEYED_WINDOWS {
             assert_eq!(user(&format!("u-{i}")), None, "value {i} is under the cap");

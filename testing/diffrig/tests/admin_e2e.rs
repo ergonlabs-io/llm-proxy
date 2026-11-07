@@ -1131,15 +1131,15 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
             })
     };
     assert_eq!(
-        header_value("x-ratelimit-limit"),
-        "1500000",
-        "x-ratelimit-limit must report the configured ceiling in MICRO-DOLLARS, not dollars \
+        header_value("x-llmproxy-budget-limit-usd"),
+        "1.500000",
+        "the budget limit header must report the configured ceiling in USD, not micro-dollars \
          or a request count"
     );
     assert_eq!(
-        header_value("x-ratelimit-remaining"),
-        "0",
-        "x-ratelimit-remaining must saturate at 0 once spend has crossed the ceiling, never \
+        header_value("x-llmproxy-budget-remaining-usd"),
+        "0.000000",
+        "the budget remaining header must saturate at 0 once spend has crossed the ceiling, never \
          wrap around to a huge positive number"
     );
 
@@ -1169,7 +1169,7 @@ async fn a_budget_write_is_enforced_live_and_reported_via_admin_spend() {
     );
     assert_eq!(
         spend_json["remaining_micro_usd"], 0,
-        "remaining must saturate at 0, matching the 429's own x-ratelimit-remaining, got: \
+        "remaining must saturate at 0, matching the 429's own x-llmproxy-budget-remaining-usd, got: \
          {spend_json}"
     );
 

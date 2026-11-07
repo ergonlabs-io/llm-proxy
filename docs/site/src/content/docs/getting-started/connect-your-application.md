@@ -231,7 +231,9 @@ to fix this.
 
 An SDK usually retries a `429`. A token limit or spend budget stays spent
 until its window resets, so a quick retry does not help. Read the `retry-after`
-header and the `x-ratelimit-*` headers instead.
+header, or `x-should-retry`, instead. The proxy sets `x-should-retry: false`
+when the wait is more than 60 seconds, which the official OpenAI and Anthropic
+SDKs follow.
 
 ## Common errors
 

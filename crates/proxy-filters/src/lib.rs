@@ -41,6 +41,7 @@ pub mod cors;
 pub mod ext_authz;
 pub mod guardrail_filter;
 pub mod jwks_refresh;
+mod limit_reply;
 pub mod jwt_auth;
 pub mod local_ratelimit;
 pub mod media_scan;

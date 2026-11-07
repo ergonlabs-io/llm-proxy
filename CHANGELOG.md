@@ -10,6 +10,27 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
+### Changed
+
+- Rate-limit and spend 429s (`llmproxy.token_limit`, `llmproxy.spend_limit`):
+  - Every such 429 has a JSON body (`application/json`). A `/v1/messages`
+    request gets Anthropic's `{"type":"error","error":{...}}` shape; other
+    requests get OpenAI's `{"error":{...}}` shape. The `error.message` text is
+    the old plain-text body. Clients that matched the whole plain-text body
+    must read `error.message` or `error.code`.
+  - A stable `code` per cause: `request_limit_exceeded`,
+    `token_limit_exceeded`, `concurrency_limit_exceeded`,
+    `spend_budget_exceeded`.
+  - New headers `x-ratelimit-{limit,remaining,reset}-requests` and
+    `-tokens` for the dimension that refused, and `x-should-retry` (`false`
+    when `retry-after` is above 60 seconds, which the official SDKs follow).
+  - Spend 429s send `x-llmproxy-budget-limit-usd`,
+    `x-llmproxy-budget-remaining-usd` and `x-llmproxy-budget-reset`, and no
+    longer send `x-ratelimit-*` (their values were micro-dollars).
+  - Deprecated: the unsuffixed `x-ratelimit-limit`, `x-ratelimit-remaining`
+    and `x-ratelimit-reset` on token and request 429s. They stay for one more
+    minor release.
+
 ### Added
 
 - Spend budgets: `period` can be `weekly`, an ISO week that starts on Monday at

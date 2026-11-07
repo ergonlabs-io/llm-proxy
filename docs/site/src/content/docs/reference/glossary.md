@@ -158,8 +158,9 @@ serves a request: `providers` and `models`. The docs do not use the word
 ## M
 
 **Micro-dollar**
-: One millionth of a US dollar. Budgets and the `x-ratelimit-*` headers of a
-  spend refusal use micro-dollars.
+: One millionth of a US dollar. Budgets and spend amounts use micro-dollars
+  inside the proxy. The `x-llmproxy-budget-*-usd` headers of a spend refusal
+  use USD.
 
 **Model**
 : A client-facing model name in the `models` catalog. It maps to an ordered
