@@ -237,4 +237,10 @@ writing, changing, reviewing, or sweeping tests.
 3. Fix local failures before widening scope.
 4. Run `make tq-changed` for touched crates.
 5. Run `make tq` and `make tq-doc` before landing; run `make ci` when required.
-6. Report changed files, validation run, and any unrelated pre-existing failure.
+   Before any push, run `cargo fmt --all -- --check` and
+   `cargo clippy --workspace --all-targets -- -D warnings` too: CI's `make ci`
+   stops at the first failing stage, so a format diff (for example a new
+   `mod` line out of order in a `lib.rs`) hides every later stage.
+6. After the last fix, re-run the full suite, not only the test that failed.
+   A green run from before the fix does not cover the fix.
+7. Report changed files, validation run, and any unrelated pre-existing failure.
