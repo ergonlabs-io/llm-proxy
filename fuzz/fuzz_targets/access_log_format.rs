@@ -11,7 +11,7 @@
 //! - rendering is compositional: the whole line is the concatenation of each
 //!   operator rendered alone;
 //! - a `%REQ%`/`%RESP%`/`%TRAILER%` with `:Z` renders at most `Z` characters;
-//! - a credential header's value never reaches the line, whatever the format
+//! - a credential header's value never changes the line, whatever the format
 //!   names (the `%REQ%` redaction, `internal-docs/envoy-divergences.md`);
 //! - a `%START_TIME(...)%` pattern the parser accepts renders in full: chrono
 //!   stops writing at the first specifier it cannot format, and a field that
@@ -27,8 +27,10 @@ use proxy_observability::access_log::{
     LlmTokens, LogContext, TimePoint, TimePoints,
 };
 
-/// A value no format can name: the target skips inputs that contain it.
+/// Two values for the credential headers; the line must not depend on which
+/// one is sent.
 const SECRET: &str = "sk-fuzz-secret-7f3a";
+const OTHER_SECRET: &str = "sk-fuzz-other-0c9e";
 
 const CREDENTIAL_HEADERS: [&str; 6] = [
     "authorization",
@@ -279,10 +281,16 @@ fuzz_target!(|data: &[u8]| {
         pieces.push_str(&piece);
     }
     assert_eq!(line, pieces, "rendering is not compositional");
-    if !input.contains(SECRET) {
-        assert!(
-            !line.contains(SECRET),
-            "credential reached the log line: {line:?}"
-        );
+    // The format's own literal text can spell the secret across operators
+    // (`...sk-fuzz-secret)%-7f3a`), so a substring check is not proof. The
+    // credential value must not change the line at all.
+    let mut other = request.clone();
+    for name in CREDENTIAL_HEADERS {
+        other.insert(name, http::HeaderValue::from_static(OTHER_SECRET));
     }
+    let other_line = render(&format, &context(&other, &response, &trailers));
+    assert_eq!(
+        line, other_line,
+        "a credential header's value reached the log line"
+    );
 });

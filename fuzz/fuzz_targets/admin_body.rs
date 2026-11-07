@@ -129,8 +129,12 @@ fn check_policy(body: &[u8]) {
         .unwrap_or_else(|status| panic!("rendered policy {rendered} refused with {status}"));
     assert_eq!(again, rendered, "policy changed on a round trip");
     let request: serde_json::Value = serde_json::from_slice(body).expect("accepted body is JSON");
+    // serde also reads a unit variant in map form, so `{"all": null}` is
+    // `"all"`: the same meaning, not an ignored field.
+    let grants_all =
+        request["access"] == "all" || request["access"] == serde_json::json!({"all": null});
     assert_eq!(
-        request["access"] == "all",
+        grants_all,
         rendered["access"] == "all",
         "{request} rendered as {rendered}"
     );
