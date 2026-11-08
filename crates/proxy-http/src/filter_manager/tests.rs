@@ -4866,3 +4866,53 @@ fn decoder_buffer_limit_reports_the_configured_limit() {
         assert_eq!(*seen.lock().unwrap(), Some(limit));
     });
 }
+
+// --- route snapshot refresh ---------------------------------------------------
+
+fn head_with(path: &str, headers: &[(&'static str, &str)]) -> RequestHeaders {
+    let mut map = HeaderMap::new();
+    for (k, v) in headers {
+        map.append(
+            HeaderName::from_static(k),
+            HeaderValue::from_str(v).expect("test header value is valid"),
+        );
+    }
+    RequestHeaders {
+        method: Method::POST,
+        uri: path.parse::<Uri>().expect("test path is a valid URI"),
+        headers: map,
+    }
+}
+
+/// The snapshot must follow the live head across repeated syncs, including a sync that changes nothing, then an
+/// edit to the path, a header value, and a header's presence.
+#[test]
+fn route_snapshot_follows_head_edits_between_syncs() {
+    let mut ctx = ChainCtx::new(Rc::new(RefCell::new(StreamInfo::default())));
+    let mut head = head_with("/a", &[("host", "one.example"), ("x-model", "m1")]);
+
+    sync_route_head(&mut ctx, &head);
+    sync_route_head(&mut ctx, &head);
+    assert_eq!(ctx.route_path, "/a");
+    assert_eq!(ctx.route_authority, "one.example");
+    assert_eq!(ctx.route_headers.get("x-model").unwrap(), "m1");
+
+    head.uri = "/b?q=1".parse().unwrap();
+    sync_route_head(&mut ctx, &head);
+    assert_eq!(
+        ctx.route_path, "/b?q=1",
+        "a path edit must reach the snapshot"
+    );
+
+    head.headers
+        .insert("x-model", HeaderValue::from_static("m2"));
+    sync_route_head(&mut ctx, &head);
+    assert_eq!(ctx.route_headers.get("x-model").unwrap(), "m2");
+
+    head.headers.remove("x-model");
+    head.headers
+        .insert("host", HeaderValue::from_static("two.example"));
+    sync_route_head(&mut ctx, &head);
+    assert!(ctx.route_headers.get("x-model").is_none());
+    assert_eq!(ctx.route_authority, "two.example");
+}

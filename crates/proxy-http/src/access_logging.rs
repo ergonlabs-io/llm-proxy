@@ -252,6 +252,22 @@ pub(crate) fn snapshot_request(head: &crate::filter::RequestHeaders) -> RequestS
     }
 }
 
+impl RequestSnapshot {
+    /// Whether [`snapshot_request`] of `head` would produce exactly this snapshot, decided without allocating.
+    pub(crate) fn matches(&self, head: &crate::filter::RequestHeaders) -> bool {
+        let authority = head.uri.authority().map(|a| a.as_str()).or_else(|| {
+            head.headers
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+        });
+        self.method == head.method.as_str()
+            && self.path == head.uri.path()
+            && self.authority.as_deref() == authority
+            && self.scheme.as_deref() == head.uri.scheme_str()
+            && crate::filter_manager::same_headers(&self.headers, &head.headers)
+    }
+}
+
 /// Maps the GenAI request targets this proxy understands to OTel's
 /// operation label. `responses` is deliberately the documented custom value
 /// for OpenAI's Responses API: semconv 1.41 has no well-known value for it,
@@ -1394,7 +1410,13 @@ fn metadata_termination(
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
+    out
 }
 
 /// A body that is already at its end, left in place of a torn-down inner body.
@@ -1572,6 +1594,57 @@ mod tests {
     use super::*;
     use crate::handler::local_boxed;
     use crate::stream_info::{LlmTokenUsage, LlmUsage};
+
+    #[test]
+    fn hex_bytes_is_lowercase_zero_padded() {
+        assert_eq!(hex_bytes(&[]), "");
+        assert_eq!(hex_bytes(&[0x00, 0x0a, 0xff, 0x7e, 0x10]), "000aff7e10");
+    }
+
+    fn head_for_snapshot() -> crate::filter::RequestHeaders {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", http::HeaderValue::from_static("api.example"));
+        headers.append("x-a", http::HeaderValue::from_static("1"));
+        crate::filter::RequestHeaders {
+            method: http::Method::POST,
+            uri: "/v1/chat?x=1".parse().unwrap(),
+            headers,
+        }
+    }
+
+    /// `matches` stands in for rebuilding the snapshot, so it must say "different" for every field a rebuild
+    /// would change.
+    #[test]
+    fn snapshot_matches_only_an_unchanged_head() {
+        let head = head_for_snapshot();
+        let snap = snapshot_request(&head);
+        assert!(snap.matches(&head));
+
+        let mut edited = head_for_snapshot();
+        edited
+            .headers
+            .append("x-a", http::HeaderValue::from_static("2"));
+        assert!(!snap.matches(&edited), "an added header value");
+
+        let mut edited = head_for_snapshot();
+        edited
+            .headers
+            .insert("host", http::HeaderValue::from_static("other.example"));
+        assert!(!snap.matches(&edited), "the Host header is the authority");
+
+        let mut edited = head_for_snapshot();
+        edited.uri = "/v1/other".parse().unwrap();
+        assert!(!snap.matches(&edited), "the path");
+
+        let mut edited = head_for_snapshot();
+        edited.method = http::Method::GET;
+        assert!(!snap.matches(&edited), "the method");
+
+        assert!(
+            !RequestSnapshot::default().matches(&head),
+            "an empty snapshot is not this head"
+        );
+    }
 
     /// An in-memory sink for asserting on rendered lines, standing in for
     /// `FileSink`/`StdoutSink` -- same trait, no I/O.

@@ -1372,24 +1372,39 @@ fn sync_route_head(ctx: &mut ChainCtx, head: &RequestHeaders) {
         .headers
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok());
-    ctx.route_authority = head
-        .uri
-        .authority()
-        .map(|a| a.as_str())
-        .or(host_header)
-        .unwrap_or("")
-        .to_string();
-    ctx.route_path = head
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/")
-        .to_string();
-    // Rust note: `HeaderMap::clone()` is a full copy, not a refcount bump --
-    // acceptable here because request header maps are small (LLM proxy
-    // traffic, not bulk data) and this only runs once per filter callback,
-    // never per-byte.
-    ctx.route_headers = head.headers.clone();
+    set_if_changed(
+        &mut ctx.route_authority,
+        head.uri
+            .authority()
+            .map(|a| a.as_str())
+            .or(host_header)
+            .unwrap_or(""),
+    );
+    set_if_changed(
+        &mut ctx.route_path,
+        head.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+    );
+    // Rust note: `HeaderMap::clone()` is a full copy, not a refcount bump. This runs before every decode callback
+    // and the headers rarely change between two of them, so compare first: the comparison allocates nothing,
+    // and the copy happens only when a filter actually edited the head.
+    if !same_headers(&ctx.route_headers, &head.headers) {
+        ctx.route_headers.clone_from(&head.headers);
+    }
+}
+
+/// Cheap "nothing changed" test for two header maps: same entries in the same iteration order. `HeaderMap`'s own
+/// `==` is order-independent but hashes every key, which costs more than the copy it would save. A clone keeps
+/// the iteration order, so an unedited head compares equal here; a false "different" only costs a redundant copy.
+pub(crate) fn same_headers(a: &HeaderMap, b: &HeaderMap) -> bool {
+    a.len() == b.len() && a.iter().eq(b.iter())
+}
+
+/// Overwrites `slot` with `new`, reusing its buffer, and only when the text differs.
+fn set_if_changed(slot: &mut String, new: &str) {
+    if slot != new {
+        slot.clear();
+        slot.push_str(new);
+    }
 }
 
 /// S2.8: resolve (and cache) the route against `ctx`'s current snapshot,
@@ -1697,7 +1712,13 @@ impl FilterManager {
         // dialect-injected provider credentials. That ordering is
         // load-bearing: an access log must never become a place a
         // `Authorization`/`x-api-key` header leaks to.
-        *ctx.request_headers_snapshot.borrow_mut() = Some(snapshot_request(&head));
+        {
+            // Usually no decode filter touched the headers, so the fallback snapshot taken above is still exact.
+            let mut slot = ctx.request_headers_snapshot.borrow_mut();
+            if !slot.as_ref().is_some_and(|s| s.matches(&head)) {
+                *slot = Some(snapshot_request(&head));
+            }
+        }
 
         // S2.5: a decoder filter may have called `send_local_reply` while the
         // chain above was running. If so, the request must not reach the
