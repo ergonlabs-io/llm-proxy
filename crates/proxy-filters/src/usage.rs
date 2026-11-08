@@ -1082,11 +1082,12 @@ impl SseUsageScanner {
         self.partial.extend_from_slice(chunk);
         // Peel off every complete (newline-terminated) line, leaving any
         // trailing partial line in the buffer for the next call.
-        while let Some(newline_pos) = self.partial.iter().position(|&b| b == b'\n') {
-            // Rust note: `drain(..=newline_pos)` removes the line *and* its `\n`
-            // from `partial` and yields them; we collect into an owned `Vec` so
-            // the borrow on `partial` ends before we touch `self.usage`.
-            let line: Vec<u8> = self.partial.drain(..=newline_pos).collect();
+        // Rust note: lines are scanned in place with a start offset and the consumed prefix is dropped once at
+        // the end, rather than copying each line out of `partial`. The `merge_line` arguments are disjoint fields
+        // of `self`, so borrowing `self.partial` alongside them is allowed.
+        let mut start = 0;
+        while let Some(offset) = self.partial[start..].iter().position(|&b| b == b'\n') {
+            let end = start + offset;
             merge_line(
                 &mut self.usage,
                 &mut self.modality,
@@ -1095,9 +1096,11 @@ impl SseUsageScanner {
                 &mut self.id_decided,
                 &mut self.text_bytes,
                 self.dialect,
-                &line[..line.len() - 1],
+                &self.partial[start..end],
             );
+            start = end + 1;
         }
+        self.partial.drain(..start);
         // What remains has no newline. If it has grown past the cap, this is an
         // upstream that never emits a newline; discard it (usage is best-effort
         // telemetry — losing a line beats an OOM) and resync at the next one.
@@ -2203,6 +2206,23 @@ mod tests {
             .expect("usage should survive byte-at-a-time chunking");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 5);
+    }
+
+    /// Several complete lines and a partial one in a single chunk: every complete line is consumed exactly once
+    /// (CRLF included), and the partial line survives intact until the rest of it arrives.
+    #[test]
+    fn a_chunk_of_many_lines_keeps_only_the_trailing_partial_line() {
+        let mut s = SseUsageScanner::new(Dialect::OpenAi);
+        s.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ab\"}}]}\r\n: keepalive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"cde\"}}]}\n\
+              data: {\"usage\":{\"prompt_tokens\":7,",
+        );
+        assert_eq!(s.text_bytes, 5, "both complete content frames counted once");
+        assert_eq!(s.usage(), None, "the cut usage line is not valid JSON yet");
+        s.push(b"\"completion_tokens\":3}}\n");
+        let usage = s.usage().expect("the completed line yields usage");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (7, 3));
+        assert_eq!(s.text_bytes, 5, "no frame was counted twice");
     }
 
     /// Splitting at every possible offset must never change the result.
