@@ -23,8 +23,8 @@ credential is a separate value on the provider. See
 
 To enable virtual keys, add an `auth:` block to the config file. Without
 `auth:`, the proxy does no application-level authentication. After the proxy
-authenticates a request, it removes the `Authorization` header. A provider
-never receives the virtual key.
+authenticates a request, it removes the `Authorization` and `x-api-key`
+headers. A provider never receives the virtual key.
 
 ## At a glance
 
@@ -71,6 +71,22 @@ A client sends the key as a bearer token:
 ```text
 Authorization: Bearer llmp_<the key>
 ```
+
+A client can also send the key in `x-api-key`, where Anthropic SDKs send
+their API key. Such a client needs only a new base URL and key:
+
+```text
+x-api-key: llmp_<the key>
+```
+
+The proxy reads `x-api-key` only when its value starts with `llmp_`. If
+`x-api-key` holds a virtual key and `Authorization` holds a different value
+(another virtual key, a JWT, or another scheme), the proxy refuses the
+request with `401` (`auth_conflicting_keys` in the access log). Both headers
+can hold the same key. After the proxy authenticates a request, it removes
+`x-api-key` whatever it held, so a client's own provider key never reaches a
+provider. An `anthropic` provider gets its own `x-api-key` from the provider
+config, on each provider of a fallback chain.
 
 Generate a key with `llm-proxy --mode keygen`. The key is `llmp_` followed by
 32 random bytes from the OS random generator, base64url-encoded without
@@ -161,7 +177,9 @@ a `www-authenticate: Bearer` header. A caller cannot learn from the response
 whether a key it guessed was ever valid.
 
 The proxy records the three reasons separately in the response-code details:
-`auth_no_credential`, `auth_unknown_key`, and `auth_revoked_key`. The access
+`auth_no_credential`, `auth_unknown_key`, and `auth_revoked_key`. An expired
+key, and the old key text of a rotated key after its overlap, also give
+`auth_revoked_key`. The access
 log shows them as `response_code_details` (`%RESPONSE_CODE_DETAILS%`). See
 [Access logs](/docs/llm-proxy/observability/access-logs/).
 
@@ -225,8 +243,10 @@ config-file edits:
 - `PUT /keys/{id}/budget`
 - `PUT /tenants/{id}/limits` and `PUT /keys/{id}/limits`
 - `PUT /keys/{id}/tags`
+- `POST /keys/{id}/rotate`, which gives a key new key text and keeps the old
+  text valid for an overlap.
 - `GET /keys`, which lists every key (id, tenant, revocation, policy, budget,
-  limits; no plaintext).
+  limits, expiry, overlap; no plaintext).
 - `GET /keys/{id}/spend`.
 
 See [Admin API](/docs/llm-proxy/administration/admin-api/) for the bodies and
@@ -266,7 +286,23 @@ expose money or identity: `GET .../spend` and `GET /keys`. The config-shaped
 reads (`/ready`, `/config_dump`, `/clusters`, `/models`, `/server_info`, and
 `/stats*`) ignore the token.
 
-For rotation, permanent revocation tombstones, API versioning, and migration,
+### Key expiry and rotation
+
+A minted key can expire: set `expires_at` (Unix seconds) on `POST /keys`.
+From that second, the key gets the same `401` as a revoked key. Each worker
+reads its clock on each request, so expiry does not wait for a policy poll
+or a reload.
+
+To change the key text without an outage, call `POST /keys/{id}/rotate` with
+an `overlap_seconds`. The answer holds the new key text. The old text
+authenticates as the same key until `previous_key_valid_until`. Move the
+clients to the new text in that time. If a key leaked, call `POST /keys`
+again instead: the old text stops on the next request. See
+[Admin API](/docs/llm-proxy/administration/admin-api/#key-expiry-and-rotation)
+for the bodies and status codes. Keys in `auth.keys` do not expire and
+cannot be rotated through the admin API.
+
+For permanent revocation tombstones, API versioning, and migration,
 see [Spend policies and recovery](/docs/llm-proxy/limits-and-budgets/spend-policies/).
 
 ### Per-user controls inside a tenant
@@ -458,7 +494,15 @@ above.
 - Digest comparison: `KeySet::find` in `crates/proxy-control/src/auth.rs`
   calls `ring::hmac::verify` once, on the single digest that a table lookup
   selected. The module doc, "Why keyed HMAC-SHA256", gives the reason. A
-  `KeyRecord` has only `key_id`, `tenant`, and `revoked`.
+  `KeyRecord` has `key_id`, `tenant`, `revoked`, `tags`, and `expires_at`.
+- Key expiry and rotation: `ControlPlane::mint_key_with` and
+  `ControlPlane::rotate_key` in `crates/proxy-control/src/control.rs`; the
+  previous digest is a second `KeySet` entry whose `expires_at` is the end of
+  the overlap. Tests: `crates/proxy-control/src/control/key_lifecycle_tests.rs`.
+- `x-api-key`: `presented_virtual_key` in `crates/proxy-control/src/auth.rs`.
+  The failover test is
+  `a_virtual_key_in_x_api_key_reaches_no_provider_across_failover` in
+  `crates/proxy/tests/credential_forwarding_e2e.rs`.
 - Authenticator chain: `AuthenticatorChain::authenticate` stops at the first
   `Rejected` result. The test
   `a_rejected_first_authenticator_short_circuits_a_chain_that_would_otherwise_authenticate`

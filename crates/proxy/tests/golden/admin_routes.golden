@@ -15,6 +15,7 @@
 /chains/{stat_prefix}/keys/{id}/budget PUT
 /chains/{stat_prefix}/keys/{id}/limits PUT
 /chains/{stat_prefix}/keys/{id}/policy PUT
+/chains/{stat_prefix}/keys/{id}/rotate POST
 /chains/{stat_prefix}/keys/{id}/spend GET
 /chains/{stat_prefix}/keys/{id}/tags PUT
 /chains/{stat_prefix}/pricing GET,PUT
@@ -38,6 +39,7 @@
 /keys/{id}/budget PUT
 /keys/{id}/limits PUT
 /keys/{id}/policy PUT
+/keys/{id}/rotate POST
 /keys/{id}/spend GET
 /keys/{id}/tags PUT
 /ledger/ack POST

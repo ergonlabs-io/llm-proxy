@@ -173,6 +173,9 @@ impl Rows {
                 tenant: tenant.into(),
                 revoked,
                 tags: Default::default(),
+                expires_at: None,
+                previous_digest: None,
+                previous_valid_until: None,
             })
         };
         Rows {
@@ -733,6 +736,8 @@ fn every_store_call_runs_on_the_connection_of_its_tier() {
         tenant: tenant.clone(),
         revoked: false,
         tags: Default::default(),
+        expires_at: None,
+        previous: None,
     };
     let period = PeriodKey::for_test("2026-10");
     let node = FlushToken {

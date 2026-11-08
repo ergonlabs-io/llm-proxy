@@ -435,7 +435,7 @@ local next = cjson.decode(ARGV[2])
 if raw then
   local previous = cjson.decode(raw)
   local version = previous['schema_version'] or 1
-  if version ~= 1 and version ~= 2 and version ~= 3 then return -3 end
+  if version ~= 1 and version ~= 2 and version ~= 3 and version ~= 4 then return -3 end
   if previous['tenant'] ~= next['tenant'] then return -1 end
   if previous['revoked'] then
     if not next['revoked'] then return -2 end
@@ -1876,6 +1876,8 @@ mod tests {
             tenant: TenantId::new("tenant-a"),
             revoked: false,
             tags: tags.clone(),
+            expires_at: None,
+            previous: None,
         };
         store.put_key(&row).unwrap();
         row.tags = ChargebackTags::new();
@@ -1898,6 +1900,38 @@ mod tests {
             .unwrap();
         assert!(back.revoked);
         assert_eq!(back.tags, tags);
+    }
+
+    /// Key expiry and a rotation overlap through the Lua scripts: the put
+    /// script accepts a version-4 row and a later rewrite of it, and the
+    /// revoke script's `cjson` round trip keeps both fields as integers the
+    /// row decoder still reads, at the largest expiry a key accepts.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_key_lifecycle_survives_put_and_revoke_scripts() {
+        use crate::control::{PreviousDigest, MAX_KEY_EXPIRES_AT};
+        let store = test_store("key-lifecycle");
+        let mut row = StoredKey {
+            key_id: KeyId::new("key-a"),
+            digest: [1; 32],
+            tenant: TenantId::new("tenant-a"),
+            revoked: false,
+            tags: ChargebackTags::new(),
+            expires_at: Some(MAX_KEY_EXPIRES_AT),
+            previous: None,
+        };
+        store.put_key(&row).unwrap();
+        row.digest = [2; 32];
+        row.previous = Some(PreviousDigest {
+            digest: [1; 32],
+            valid_until: 1_900_000_000,
+        });
+        store.put_key(&row).unwrap();
+        store.revoke_key(&row.key_id).unwrap();
+        let back = store.load().unwrap().keys.remove(0);
+        assert!(back.revoked);
+        assert_eq!(back.expires_at, Some(MAX_KEY_EXPIRES_AT));
+        assert_eq!(back.previous, row.previous);
     }
 
     /// Window rows against a real Redis: the script adds, dedups a replay and
@@ -2160,6 +2194,8 @@ mod tests {
             tenant: tenant.clone(),
             revoked: false,
             tags: Default::default(),
+            expires_at: None,
+            previous: None,
         };
         store.put_key(&row).unwrap();
         let budget = crate::spend::KeyBudget {
@@ -2542,6 +2578,8 @@ mod tests {
                 tenant: tenant.clone(),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         store.set_policy(&tenant, &ModelAccess::All).unwrap();

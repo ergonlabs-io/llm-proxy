@@ -31,7 +31,9 @@ use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_control::auth::{KeyId, TenantId};
-use proxy_control::control::{ControlPlane, CredentialStoreError, LimitPolicy, StoreError};
+use proxy_control::control::{
+    ControlPlane, CredentialStoreError, ExpiryChange, LimitPolicy, MintedKey, StoreError,
+};
 use proxy_control::model_authz::{ModelAccess, ModelPattern};
 use proxy_control::spend::{
     parse_micro_usd, KeyBudget, MicroUsd, Period, SpendAccumulator, TenantBudget,
@@ -86,6 +88,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/keys/{id}/limits",
     "/keys/{id}/policy",
     "/keys/{id}/tags",
+    "/keys/{id}/rotate",
     "/keys/{id}/spend",
     "/tenants",
     "/tenants/{id}",
@@ -105,6 +108,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/keys/{id}/limits",
     "/chains/{stat_prefix}/keys/{id}/policy",
     "/chains/{stat_prefix}/keys/{id}/tags",
+    "/chains/{stat_prefix}/keys/{id}/rotate",
     "/chains/{stat_prefix}/keys/{id}/spend",
     "/chains/{stat_prefix}/tenants",
     "/chains/{stat_prefix}/tenants/{id}",
@@ -797,6 +801,9 @@ fn dispatch_store_route(
         WriteRoute::KeyTags(id) | WriteRoute::ScopedKeyTags(_, id) => {
             handle_set_key_tags(control_plane, id, body)
         }
+        WriteRoute::KeyRotate(id) | WriteRoute::ScopedKeyRotate(_, id) => {
+            handle_rotate_key(control_plane, id, body)
+        }
         WriteRoute::KeyPolicy(id) | WriteRoute::ScopedKeyPolicy(_, id) => {
             handle_set_key_policy(factory_state, stat_prefix_opt, control_plane, id, body)
         }
@@ -942,6 +949,9 @@ enum WriteRoute<'a> {
     KeyPolicy(&'a str),
     /// `PUT /keys/{id}/tags`: replaces the key's chargeback tags.
     KeyTags(&'a str),
+    /// `POST /keys/{id}/rotate`: a new secret, with the old one still valid
+    /// for an overlap window.
+    KeyRotate(&'a str),
     KeySpend(&'a str),
     Tenants,
     TenantById(&'a str),
@@ -967,6 +977,7 @@ enum WriteRoute<'a> {
     ScopedKeyLimits(&'a str, &'a str),
     ScopedKeyPolicy(&'a str, &'a str),
     ScopedKeyTags(&'a str, &'a str),
+    ScopedKeyRotate(&'a str, &'a str),
     ScopedKeySpend(&'a str, &'a str),
     ScopedTenants(&'a str),
     ScopedTenantById(&'a str, &'a str),
@@ -988,6 +999,7 @@ impl<'a> WriteRoute<'a> {
     fn expected_method(&self) -> Method {
         match self {
             WriteRoute::Keys | WriteRoute::Tenants => Method::POST,
+            WriteRoute::KeyRotate(_) | WriteRoute::ScopedKeyRotate(..) => Method::POST,
             WriteRoute::KeyById(_) | WriteRoute::TenantById(_) => Method::DELETE,
             WriteRoute::KeyBudget(_)
             | WriteRoute::KeyLimits(_)
@@ -1053,6 +1065,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::KeyLimits(_)
             | WriteRoute::KeyPolicy(_)
             | WriteRoute::KeyTags(_)
+            | WriteRoute::KeyRotate(_)
             | WriteRoute::KeySpend(_)
             | WriteRoute::Tenants
             | WriteRoute::TenantById(_)
@@ -1078,6 +1091,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedKeyLimits(s, _)
             | WriteRoute::ScopedKeyPolicy(s, _)
             | WriteRoute::ScopedKeyTags(s, _)
+            | WriteRoute::ScopedKeyRotate(s, _)
             | WriteRoute::ScopedKeySpend(s, _)
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
@@ -1120,6 +1134,7 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["keys", id, "limits"] => Some(WriteRoute::KeyLimits(id)),
         ["keys", id, "policy"] => Some(WriteRoute::KeyPolicy(id)),
         ["keys", id, "tags"] => Some(WriteRoute::KeyTags(id)),
+        ["keys", id, "rotate"] => Some(WriteRoute::KeyRotate(id)),
         ["keys", id, "spend"] => Some(WriteRoute::KeySpend(id)),
         ["tenants"] => Some(WriteRoute::Tenants),
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
@@ -1178,6 +1193,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "keys", id, "tags"] => {
             Some(WriteRoute::ScopedKeyTags(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "keys", id, "rotate"] => {
+            Some(WriteRoute::ScopedKeyRotate(stat_prefix, id))
         }
         ["chains", stat_prefix, "keys", id, "spend"] => {
             Some(WriteRoute::ScopedKeySpend(stat_prefix, id))
@@ -2020,6 +2038,44 @@ struct MintKeyRequest {
     /// re-minted key's tags; a new key then has none.
     #[serde(default)]
     tags: Option<ChargebackTags>,
+    /// See [`expiry_change`].
+    #[serde(default, deserialize_with = "present_field")]
+    expires_at: Option<Option<u64>>,
+}
+
+/// `POST /keys/{id}/rotate`. `overlap_seconds` is required: there is no
+/// default window to fall back on.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateKeyRequest {
+    #[serde(
+        default,
+        rename = "schema_version",
+        deserialize_with = "read_api_schema_version"
+    )]
+    _schema_version: (),
+    overlap_seconds: u64,
+    /// See [`expiry_change`].
+    #[serde(default, deserialize_with = "present_field")]
+    expires_at: Option<Option<u64>>,
+}
+
+/// Tells an absent field (`None`, from `#[serde(default)]`) apart from an
+/// explicit `null` (`Some(None)`).
+fn present_field<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Option<u64>>, D::Error> {
+    <Option<u64> as serde::Deserialize>::deserialize(de).map(Some)
+}
+
+/// `expires_at` on a mint or rotation: absent keeps the key's expiry (a new
+/// key never expires), `null` removes it, and a number of Unix seconds sets
+/// it. Absent never clears an expiry, so a re-mint that does not mention it
+/// cannot make a key permanent.
+fn expiry_change(expires_at: Option<Option<u64>>) -> ExpiryChange {
+    match expires_at {
+        None => ExpiryChange::Keep,
+        Some(None) => ExpiryChange::Clear,
+        Some(Some(at)) => ExpiryChange::At(at),
+    }
 }
 
 /// `PUT /keys/{id}/tags`. `tags` is required: `{}` clears them.
@@ -2224,6 +2280,8 @@ fn handle_list_keys(control_plane: &ControlPlane) -> Response<Full<Bytes>> {
                 })),
                 "limits": listing.limits.map(render_limits),
                 "tags": &*listing.tags,
+                "expires_at": listing.expires_at,
+                "previous_key_valid_until": listing.previous_valid_until,
             })
         })
         .collect();
@@ -2275,6 +2333,7 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
         tenant,
         key_id,
         tags,
+        expires_at,
         ..
     } = match parse_json_body(body) {
         Ok(request) => request,
@@ -2297,10 +2356,11 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
         return bad_request(&format!("invalid `tags`: {reason}"));
     }
 
-    match control_plane.mint_key_with_tags(
+    match control_plane.mint_key_with(
         &TenantId::new(tenant),
         &KeyId::new(key_id),
         tags.as_ref(),
+        expiry_change(expires_at),
     ) {
         Ok(minted) => {
             tracing::info!(
@@ -2310,31 +2370,80 @@ fn handle_mint_key(control_plane: &ControlPlane, body: &[u8]) -> Response<Full<B
                 applied = minted.applied,
                 "admin: minted a virtual key"
             );
-            // `minted.plaintext` is returned here exactly once. The store keeps only its digest (see `MintedKey`), so
-            // this body is the only place the value will ever exist. That is why a mint whose reload failed still
-            // answers with the key: a 202 with `applied: false`, since the key 401s on this replica until its next
-            // successful poll.
-            let mut body = serde_json::json!({
-                "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
-                "key_id": minted.key_id.as_str(),
-                "tenant": minted.tenant.as_str(),
-                "tags": &minted.tags,
-                "key": minted.plaintext,
-            });
-            if minted.applied {
-                json(StatusCode::CREATED, &body)
-            } else {
-                tracing::error!(
-                    endpoint = "/keys",
-                    key_id = minted.key_id.as_str(),
-                    "admin: minted key stored but not applied on this replica; it is refused here until the \
-                     next successful poll"
-                );
-                body["applied"] = serde_json::Value::Bool(false);
-                json(StatusCode::ACCEPTED, &body)
-            }
+            minted_key_response("/keys", minted)
         }
         Err(err) => store_error_response("/keys", err),
+    }
+}
+
+/// The body of a mint or rotation: the plaintext key, exactly once. The store
+/// keeps only its digest (see `MintedKey`), so this body is the only place the
+/// value will ever exist. That is why a write whose reload failed still
+/// answers with the key: a 202 with `applied: false`, since the key 401s on
+/// this replica until its next successful poll.
+fn minted_key_response(endpoint: &str, minted: MintedKey) -> Response<Full<Bytes>> {
+    let mut body = serde_json::json!({
+        "schema_version": proxy_control::control::SPEND_SCHEMA_VERSION,
+        "key_id": minted.key_id.as_str(),
+        "tenant": minted.tenant.as_str(),
+        "tags": &minted.tags,
+        "expires_at": minted.expires_at,
+        "key": minted.plaintext,
+    });
+    if let Some(valid_until) = minted.previous_valid_until {
+        body["previous_key_valid_until"] = serde_json::json!(valid_until);
+    }
+    if minted.applied {
+        json(StatusCode::CREATED, &body)
+    } else {
+        tracing::error!(
+            endpoint,
+            key_id = minted.key_id.as_str(),
+            "admin: key written but not applied on this replica; its new secret is refused here until \
+             the next successful poll"
+        );
+        body["applied"] = serde_json::Value::Bool(false);
+        json(StatusCode::ACCEPTED, &body)
+    }
+}
+
+/// `POST /keys/{id}/rotate` and its scoped form: a new secret for a store key,
+/// with the current secret still accepted for `overlap_seconds`. Answers like
+/// a mint, plus `previous_key_valid_until`. A key from the configuration, a
+/// revoked key, or a key whose previous overlap is still open answers 409.
+fn handle_rotate_key(
+    control_plane: &ControlPlane,
+    key_id: &str,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    if key_id.is_empty() {
+        return bad_request("key_id must not be empty");
+    }
+    let RotateKeyRequest {
+        overlap_seconds,
+        expires_at,
+        ..
+    } = match parse_json_body(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match control_plane.rotate_key(
+        &KeyId::new(key_id),
+        overlap_seconds,
+        expiry_change(expires_at),
+    ) {
+        Ok(rotated) => {
+            tracing::info!(
+                endpoint = "/keys/{id}/rotate",
+                key_id = rotated.key_id.as_str(),
+                tenant = rotated.tenant.as_str(),
+                previous_key_valid_until = rotated.previous_valid_until,
+                applied = rotated.applied,
+                "admin: rotated a virtual key"
+            );
+            minted_key_response("/keys/{id}/rotate", rotated)
+        }
+        Err(err) => store_error_response("/keys/{id}/rotate", err),
     }
 }
 

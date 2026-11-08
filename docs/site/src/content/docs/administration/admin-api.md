@@ -254,8 +254,9 @@ for the key model and examples.
 
 | Route | Method | Success | What it does |
 |---|---|---|---|
-| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`, `limits`, `tags`. Sorted by tenant, then key id. |
-| `/keys` | POST | `201` | Mints a key. Body: `tenant`, `key_id`, optional `tags`. The answer holds the key text `key` once, and the key's `tags`. |
+| `/keys` | GET | `200` | Lists keys: `key_id`, `tenant`, `revoked`, `policy`, `budget`, `limits`, `tags`, `expires_at`, `previous_key_valid_until`. Sorted by tenant, then key id. |
+| `/keys` | POST | `201` | Mints a key. Body: `tenant`, `key_id`, optional `tags`, optional `expires_at`. The answer holds the key text `key` once, and the key's `tags` and `expires_at`. |
+| `/keys/{id}/rotate` | POST | `201` | Gives a key new key text and keeps the old text valid for an overlap. Body: `overlap_seconds`, optional `expires_at`. The answer is the mint answer plus `previous_key_valid_until`. See "Key expiry and rotation". |
 | `/keys/{id}` | DELETE | `204` | Revokes a key. |
 | `/keys/{id}/budget` | PUT | `204` | Sets or clears a key budget. |
 | `/keys/{id}/policy` | PUT | `204` | Sets the model allow-list of one key. The key can only narrow its tenant grant. See "Key model policy". |
@@ -285,6 +286,47 @@ request. If the body leaves out `tags`, the key keeps its tags.
 |---|---|
 | `400` | `tenant` or `key_id` is empty or not valid, a field is unknown, `schema_version` is not `2`, or the tenant is reserved. The tenant `default` is reserved. |
 | `409` | `key ownership is immutable` (the `key_id` belongs to another tenant), or `revoked key IDs cannot be reused`. |
+
+### Key expiry and rotation
+
+`expires_at` is a time in Unix seconds. From that second, the key gets the
+same `401` as a revoked key (`auth_revoked_key` in the access log). Each
+worker compares `expires_at` with its clock on each request, so the key
+expires at that time on every replica. It does not wait for a policy poll.
+The key stays in `GET /keys`.
+
+On `POST /keys` and `POST /keys/{id}/rotate`:
+
+- If the body leaves out `expires_at`, the key keeps its expiry. A new key
+  then never expires.
+- `"expires_at": null` removes the expiry.
+- A number sets the expiry. It must be later than now and not later than
+  `253402300799` (9999-12-31T23:59:59Z). Otherwise the answer is `400`. Thus,
+  to mint an expired key again, you must set a new `expires_at`.
+
+`POST /keys/{id}/rotate` with `{"overlap_seconds": 3600}` makes new key text
+for the key. The old key text stays valid for `overlap_seconds` (1 to
+2592000, that is 30 days). Both texts authenticate as the same key, with the
+same tenant, tags, budget, limits, and policy. `previous_key_valid_until` in
+the answer and in `GET /keys` is the time when the old text stops. After that
+time, the old text gets the same `401` as a revoked key. The old text never
+stays valid after the key expires. Replicas that share the store get the new
+text at their next policy poll, 48 to 60 seconds later, so set an overlap
+longer than that.
+
+`POST /keys` on an existing key ends an overlap at once: only the new text
+works. Use it, or `DELETE /keys/{id}`, for a key that leaked.
+
+| Status | Cause on `POST /keys/{id}/rotate` |
+|---|---|
+| `400` | `overlap_seconds` is missing, 0, or more than 2592000; `expires_at` is not valid; or a field is unknown. |
+| `404` | The key has no row in the store. |
+| `409` | The key is defined in the config file, the key is revoked, or the overlap of an earlier rotation has not ended. |
+
+A store that holds a key with an expiry or an open overlap cannot be read by
+1.0.0: the key row is stored as version 4, and 1.0.0 refuses to load it
+instead of serving the key with no expiry. A store with neither stays
+readable by 1.0.0.
 
 `DELETE /keys/{id}` revokes a key that has a row in the store. A key that
 exists only in `auth.keys` has no row, and the call answers `404` with the

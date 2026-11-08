@@ -48,6 +48,26 @@ surfaces that an upgrade within 1.x keeps stable.
   `llmproxy_router_provider_mcp_refused_total`. Envoy mode is unchanged: its
   `request_field_policy` metadata takes `deny_tool_types` and
   `provider_mcp: refuse`, and has no default.
+- Virtual key expiry: `expires_at` (Unix seconds) on `POST /keys`, shown in
+  `GET /keys`. From that second the key gets the same `401` as a revoked key
+  (`auth_revoked_key`). Each worker checks the clock per request, so expiry
+  does not wait for a policy poll. A re-mint that leaves out `expires_at`
+  keeps the expiry; `"expires_at": null` removes it.
+- Virtual key rotation with an overlap: `POST /keys/{id}/rotate` with
+  `overlap_seconds` (1 to 30 days) returns new key text and keeps the old text
+  valid until `previous_key_valid_until`, which `GET /keys` also shows. Both
+  texts authenticate as the same key. A re-mint through `POST /keys` still
+  replaces the text at once and ends an open overlap.
+- A store that holds a key with an expiry or an open overlap cannot be read by
+  1.0.0: the key row is stored as version 4, and 1.0.0 refuses to load it
+  instead of serving the key with no expiry. A store with neither stays
+  readable by 1.0.0.
+- The virtual key is also read from `x-api-key`, where Anthropic SDKs send
+  their key, when the value starts with `llmp_`. A request whose `x-api-key`
+  holds a virtual key and whose `authorization` holds a different credential
+  gets `401` (`auth_conflicting_keys`). The auth filter removes `x-api-key`
+  from every request it admits, so a client's own provider key never reaches
+  a provider.
 - Daily request and token limits: `requests_per_day` and `tokens_per_day` on a
   `limits` entry, and on the admin `PUT /tenants/{id}/limits` and
   `PUT /keys/{id}/limits` bodies (and in `GET /keys`). A day is a UTC calendar
@@ -67,6 +87,9 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Fixed
 
+- `PUT /keys/{id}/tags` no longer writes back a key's old secret when another
+  replica minted the key again since this replica's last poll: it answers
+  `409` and the new secret stays.
 - Outlier detection: the ejection-time multiplier now decays. It decreases by 1
   for each interval (10 seconds in `--config` mode) that a provider stays out
   of ejection, as in Envoy, so a provider that recovers goes back to

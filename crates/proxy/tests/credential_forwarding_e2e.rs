@@ -66,6 +66,14 @@ type ReceivedHeaders = Vec<(String, String)>;
 /// A mock provider that records each request's headers on a channel and
 /// answers `200` with an empty JSON object.
 fn spawn_recording_upstream() -> (SocketAddr, mpsc::Receiver<ReceivedHeaders>) {
+    spawn_recording_upstream_answering("200 OK")
+}
+
+/// [`spawn_recording_upstream`] answering `status` (for example
+/// `"503 Service Unavailable"`, which the router fails over on).
+fn spawn_recording_upstream_answering(
+    status: &'static str,
+) -> (SocketAddr, mpsc::Receiver<ReceivedHeaders>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind mock upstream");
     let addr = listener.local_addr().expect("no local addr");
     let (tx, rx) = mpsc::channel();
@@ -108,8 +116,11 @@ fn spawn_recording_upstream() -> (SocketAddr, mpsc::Receiver<ReceivedHeaders>) {
                 }
                 let _ = tx.send(headers);
                 let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                      Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                         Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                    .as_bytes(),
                 );
             });
         }
@@ -118,14 +129,22 @@ fn spawn_recording_upstream() -> (SocketAddr, mpsc::Receiver<ReceivedHeaders>) {
 }
 
 fn post(addr: SocketAddr, path: &str, authorization: &str, body: &str) -> String {
+    post_with_headers(addr, path, &[("Authorization", authorization)], body)
+}
+
+fn post_with_headers(addr: SocketAddr, path: &str, headers: &[(&str, &str)], body: &str) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("set_read_timeout");
+    let headers: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     stream
         .write_all(
             format!(
-                "POST {path} HTTP/1.1\r\nHost: proxy.local\r\nAuthorization: {authorization}\r\n\
+                "POST {path} HTTP/1.1\r\nHost: proxy.local\r\n{headers}\
                  Content-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
                 body.len()
@@ -260,4 +279,140 @@ auth:
         leaks.is_empty(),
         "the downstream virtual key was forwarded upstream: {leaks:?}"
     );
+}
+
+/// Spawns the proxy on `config` and waits for its listener.
+fn spawn_proxy(config: &str, listen_port: u16) -> (ChildGuard, std::path::PathBuf) {
+    let config_path = std::env::temp_dir().join(format!(
+        "llm-proxy-credential-forwarding-e2e-{}-{listen_port}.yaml",
+        std::process::id()
+    ));
+    std::fs::write(&config_path, config).expect("failed to write temp config");
+    let proxy = ChildGuard(
+        Command::new(BIN)
+            .args([
+                "--config",
+                config_path.to_str().expect("the temp dir path is UTF-8"),
+                "--concurrency",
+                "1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn llm-proxy"),
+    );
+    assert!(
+        wait_for_connectable(("127.0.0.1", listen_port), STARTUP_TIMEOUT),
+        "listener at 127.0.0.1:{listen_port} did not become connectable in time"
+    );
+    (proxy, config_path)
+}
+
+/// Anthropic SDKs send their key in `x-api-key`, so the virtual key is
+/// accepted there. Across failover each provider must receive only its own
+/// cluster credential: the fallback gets the fallback's key, and neither the
+/// client's virtual key nor the primary's key. A keyless provider gets no
+/// `x-api-key` at all, even when the client sent its own provider key there
+/// beside a virtual key in `authorization`.
+#[test]
+fn a_virtual_key_in_x_api_key_reaches_no_provider_across_failover() {
+    const PRIMARY_KEY: &str = "sk-ant-primary-provider-key";
+    const FALLBACK_KEY: &str = "sk-ant-fallback-provider-key";
+    const CLIENT_OWN_KEY: &str = "sk-ant-client-own-key";
+    let (primary_addr, primary_rx) = spawn_recording_upstream_answering("503 Service Unavailable");
+    let (fallback_addr, fallback_rx) = spawn_recording_upstream();
+    let (ollama_addr, ollama_rx) = spawn_recording_upstream();
+    let listen_port = free_port();
+    let admin_port = free_port();
+
+    let digest = digest_hex(&HmacSecret::new(HMAC_SECRET.as_bytes()), VIRTUAL_KEY);
+    let config = format!(
+        r#"version: 1
+listen: 127.0.0.1:{listen_port}
+admin: 127.0.0.1:{admin_port}
+providers:
+  primary:
+    type: anthropic
+    base_url: http://{primary_addr}
+    api_key: {PRIMARY_KEY}
+  fallback:
+    type: anthropic
+    base_url: http://{fallback_addr}
+    api_key: {FALLBACK_KEY}
+  ollama:
+    type: openai-compatible
+    base_url: http://{ollama_addr}
+routes:
+  - {{ model: "claude-*", provider: primary, fallbacks: [fallback] }}
+  - {{ model: "llama*", provider: ollama }}
+auth:
+  hmac_secret: "{HMAC_SECRET}"
+  enforce: {{ tenants_without_policy: allow }}
+  keys:
+    - {{ id: "key-1", tenant: "tenant-a", digest: "{digest}" }}
+"#
+    );
+    let (_proxy, config_path) = spawn_proxy(&config, listen_port);
+    let listen_addr: SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
+
+    let body = r#"{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+    let response = post_with_headers(
+        listen_addr,
+        "/v1/messages",
+        &[
+            ("x-api-key", VIRTUAL_KEY),
+            ("anthropic-version", "2023-06-01"),
+        ],
+        body,
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected the x-api-key request to fail over and succeed, got:\n{response}"
+    );
+    let primary = primary_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the primary never received the request");
+    let fallback = fallback_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the request did not fail over to the fallback");
+    for (provider, headers, own_key, other_key) in [
+        ("primary", &primary, PRIMARY_KEY, FALLBACK_KEY),
+        ("fallback", &fallback, FALLBACK_KEY, PRIMARY_KEY),
+    ] {
+        let leaked: Vec<_> = headers
+            .iter()
+            .filter(|(_, v)| v.contains(VIRTUAL_KEY) || v.contains(other_key))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{provider} received the client's virtual key or the other provider's key: {leaked:?}"
+        );
+        assert_eq!(
+            values(headers, "x-api-key"),
+            [own_key],
+            "{provider} must receive exactly its own cluster credential"
+        );
+    }
+
+    let body = r#"{"model":"llama3","messages":[{"role":"user","content":"hi"}]}"#;
+    let bearer = format!("Bearer {VIRTUAL_KEY}");
+    let response = post_with_headers(
+        listen_addr,
+        "/v1/chat/completions",
+        &[("Authorization", &bearer), ("x-api-key", CLIENT_OWN_KEY)],
+        body,
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected the keyless provider request to succeed, got:\n{response}"
+    );
+    let ollama = ollama_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the keyless provider never received the request");
+    assert!(
+        values(&ollama, "x-api-key").is_empty() && values(&ollama, "authorization").is_empty(),
+        "a keyless provider must receive no client credential: {ollama:?}"
+    );
+
+    let _ = std::fs::remove_file(&config_path);
 }

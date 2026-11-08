@@ -1778,6 +1778,130 @@ async fn post_keys_mints_a_key_that_authenticates_and_returns_plaintext_once() {
     }
 }
 
+/// The key lifecycle over HTTP: `expires_at` on a mint, `POST
+/// /keys/{id}/rotate` returning a new secret with the old one valid until
+/// `previous_key_valid_until`, both fields in `GET /keys`, a second rotation
+/// inside the overlap answering 409, and `"expires_at": null` on a re-mint
+/// clearing the expiry and ending the overlap.
+#[tokio::test]
+async fn keys_expire_and_rotate_with_an_overlap_over_http() {
+    let (factory_state, handle) = factory_state_with_control_plane();
+    let (_server, addr) = start_full(
+        snapshot_with_secret(),
+        None,
+        factory_state,
+        Some(ADMIN_TOKEN.to_string()),
+    )
+    .await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let post = |path: &'static str, body: String| async move {
+        let (status, _, body) = request(addr, "POST", path, Some(ADMIN_TOKEN), &body).await;
+        (status, body)
+    };
+    let json = |body: &str| -> serde_json::Value { serde_json::from_str(body).expect("JSON body") };
+
+    let (status, body) = post(
+        "/keys",
+        format!(
+            r#"{{"tenant":"tenant-a","key_id":"key-a","expires_at":{}}}"#,
+            now
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an expiry that is not in the future: {body}"
+    );
+
+    let expires_at = now + 86_400;
+    let (status, body) = post(
+        "/keys",
+        format!(r#"{{"tenant":"tenant-a","key_id":"key-a","expires_at":{expires_at}}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let minted = json(&body);
+    assert_eq!(minted["expires_at"], expires_at);
+    let old = minted["key"].as_str().unwrap().to_string();
+
+    let (status, body) = post("/keys/key-a/rotate", "{}".into()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "overlap_seconds is required: {body}"
+    );
+    let (status, body) = post("/keys/key-a/rotate", r#"{"overlap_seconds":3600}"#.into()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rotated = json(&body);
+    let new = rotated["key"].as_str().unwrap().to_string();
+    let valid_until = rotated["previous_key_valid_until"]
+        .as_u64()
+        .expect("a deadline");
+    assert!((now + 3600..now + 3700).contains(&valid_until), "{body}");
+    assert_eq!(
+        rotated["expires_at"], expires_at,
+        "a rotation keeps the expiry"
+    );
+
+    let authenticator = test_authenticator(handle);
+    for secret in [&old, &new] {
+        assert!(matches!(
+            authenticator.authenticate(&headers_with_bearer(secret)),
+            AuthOutcome::Authenticated(_)
+        ));
+    }
+    let (status, _, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = &json(&body)["keys"][0];
+    assert_eq!(listed["expires_at"], expires_at, "{body}");
+    assert_eq!(listed["previous_key_valid_until"], valid_until, "{body}");
+
+    for path in [
+        "/keys/key-a/rotate".to_string(),
+        format!("/chains/{TEST_CHAIN_STAT_PREFIX}/keys/key-a/rotate"),
+    ] {
+        let (status, _, body) = request(
+            addr,
+            "POST",
+            &path,
+            Some(ADMIN_TOKEN),
+            r#"{"overlap_seconds":60}"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{path}: an overlap is still open: {body}"
+        );
+    }
+
+    let (status, body) = post(
+        "/keys",
+        r#"{"tenant":"tenant-a","key_id":"key-a","expires_at":null}"#.into(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(json(&body)["expires_at"], serde_json::Value::Null);
+    for secret in [&old, &new] {
+        assert!(matches!(
+            authenticator.authenticate(&headers_with_bearer(secret)),
+            AuthOutcome::Rejected(AuthError::UnknownKey)
+        ));
+    }
+    let (_, _, body) = request(addr, "GET", "/keys", Some(ADMIN_TOKEN), "").await;
+    let listed = &json(&body)["keys"][0];
+    assert_eq!(listed["expires_at"], serde_json::Value::Null, "{body}");
+    assert_eq!(
+        listed["previous_key_valid_until"],
+        serde_json::Value::Null,
+        "{body}"
+    );
+}
+
 /// The important one, same shape as `config_dump_redacts_the_api_key` above:
 /// a minted plaintext key must never leak back out through a READ endpoint.
 #[tokio::test]

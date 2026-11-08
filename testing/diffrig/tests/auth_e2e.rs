@@ -274,12 +274,12 @@ async fn a_valid_virtual_key_reaches_the_upstream_and_returns_200() {
 }
 
 /// Review M9: the access log never carries a credential, even when the
-/// operator's format names the header. An admitted request's key is stripped
-/// by `llmproxy.auth` before the log renders, but a refused one keeps it (an
-/// unknown key may be a typo of a real one), and a provider key a client sends
-/// in `x-api-key` is never stripped. So the renderer redacts credential
-/// headers; this drives it through the real binary, for an admitted request
-/// and a refused one.
+/// operator's format names the header. On an admitted request `llmproxy.auth`
+/// strips `authorization` and `x-api-key` (a provider key the client sent
+/// there included) before the log renders, but a refused request keeps both
+/// (an unknown key may be a typo of a real one). So the renderer redacts
+/// credential headers; this drives it through the real binary, for an
+/// admitted request and a refused one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_access_log_never_renders_the_virtual_key_or_a_provider_key() {
     let upstream = OpenAiUpstream::spawn(upstream_config())
@@ -340,7 +340,7 @@ async fn the_access_log_never_renders_the_virtual_key_or_a_provider_key() {
         "{log}"
     );
     for (status, expected) in [
-        ("200", "auth=- api_key=[REDACTED] fallback=-"),
+        ("200", "auth=- api_key=- fallback=-"),
         (
             "401",
             "auth=[REDACTED] api_key=[REDACTED] fallback=[REDACTED]",

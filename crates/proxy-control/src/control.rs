@@ -31,6 +31,27 @@ use zeroize::Zeroizing;
 // and retrieves the resulting keys.
 use crate::spend::{key_spend_subject, KeyBudget, PeriodKey, TenantBudget};
 
+/// The latest `expires_at` a key accepts: 9999-12-31T23:59:59Z. The Redis
+/// store rewrites a key row through Lua `cjson` on revoke, which keeps 14
+/// significant digits of a number, so a larger value could come back as a
+/// float the row decoder refuses, and the whole load with it.
+pub const MAX_KEY_EXPIRES_AT: u64 = 253_402_300_799;
+
+/// Refuses an expiry that is not after `now` (a key minted or rotated with one
+/// would be refused on its first request) or that is past
+/// [`MAX_KEY_EXPIRES_AT`].
+fn check_expiry_in_future(expires_at: Option<u64>, now: u64) -> Result<(), StoreError> {
+    match expires_at {
+        Some(at) if at <= now => Err(StoreError::InvalidInput(
+            "expires_at is not in the future; set a later one".into(),
+        )),
+        Some(at) if at > MAX_KEY_EXPIRES_AT => Err(StoreError::InvalidInput(format!(
+            "expires_at must be at most {MAX_KEY_EXPIRES_AT} (9999-12-31T23:59:59Z)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Names a key's row in both the budgets and policies tables.
 fn key_budget_subject(key_id: &KeyId) -> TenantId {
     key_spend_subject(key_id)
@@ -74,6 +95,29 @@ pub struct StoredKey {
     /// Chargeback tags the admin set on the key (key metadata). Empty when
     /// none; validated by `chargeback::validate_key_tags` before a write.
     pub tags: ChargebackTags,
+    /// Unix seconds from which the key is refused as if revoked. `None`
+    /// never expires.
+    pub expires_at: Option<u64>,
+    /// The digest the key had before its last rotation, still accepted until
+    /// the end of the overlap window. `None` outside an overlap.
+    pub previous: Option<PreviousDigest>,
+}
+
+/// A rotated key's previous digest and the end of its overlap window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PreviousDigest {
+    pub digest: [u8; 32],
+    /// Unix seconds from which the previous digest is refused.
+    pub valid_until: u64,
+}
+
+impl std::fmt::Debug for PreviousDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The deadline only; see `StoredKey`'s `Debug` for the digest.
+        f.debug_struct("PreviousDigest")
+            .field("valid_until", &self.valid_until)
+            .finish_non_exhaustive()
+    }
 }
 
 // Rust note: hand-written, not derived -- same convention `auth.rs`'s module
@@ -89,6 +133,8 @@ impl std::fmt::Debug for StoredKey {
             .field("tenant", &self.tenant)
             .field("revoked", &self.revoked)
             .field("tags", &self.tags)
+            .field("expires_at", &self.expires_at)
+            .field("previous", &self.previous)
             .finish()
     }
 }
@@ -1735,6 +1781,16 @@ pub(crate) struct EncodedKeyRow {
     /// decode back into a map.
     #[serde(default, skip_serializing_if = "ChargebackTags::is_empty")]
     pub(crate) tags: ChargebackTags,
+    /// Absent in rows below [`KEY_LIFECYCLE_SCHEMA_VERSION`] and in rows
+    /// for keys that never expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<u64>,
+    /// The previous digest inside a rotation overlap. Absent outside one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_digest: Option<[u8; 32]>,
+    /// The end of the overlap; present exactly when `previous_digest` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_valid_until: Option<u64>,
 }
 
 /// The key-row version that adds `tags`. A row is stamped with it only when
@@ -1744,9 +1800,20 @@ pub(crate) struct EncodedKeyRow {
 /// revoke): the downgrade fails loudly rather than dropping attribution.
 pub(crate) const KEY_TAGS_SCHEMA_VERSION: u32 = 3;
 
+/// The key-row version that adds `expires_at` and the rotation overlap
+/// (`previous_digest`, `previous_valid_until`). Stamped only on a row that
+/// carries one of them, so a store whose keys never expire and are not inside
+/// an overlap stays readable by a build from before them. Such a build
+/// refuses a stamped row rather than read it without its expiry and serve an
+/// expired key forever.
+pub(crate) const KEY_LIFECYCLE_SCHEMA_VERSION: u32 = 4;
+
 fn read_key_row_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
     let version = <u32 as serde::Deserialize>::deserialize(de)?;
-    if matches!(version, 1 | SPEND_SCHEMA_VERSION | KEY_TAGS_SCHEMA_VERSION) {
+    if matches!(
+        version,
+        1 | SPEND_SCHEMA_VERSION | KEY_TAGS_SCHEMA_VERSION | KEY_LIFECYCLE_SCHEMA_VERSION
+    ) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(format!(
@@ -1758,25 +1825,50 @@ fn read_key_row_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Resul
 impl EncodedKeyRow {
     pub(crate) fn from_stored(key: &StoredKey) -> Self {
         Self {
-            schema_version: if key.tags.is_empty() {
-                SPEND_SCHEMA_VERSION
-            } else {
+            schema_version: if key.expires_at.is_some() || key.previous.is_some() {
+                KEY_LIFECYCLE_SCHEMA_VERSION
+            } else if !key.tags.is_empty() {
                 KEY_TAGS_SCHEMA_VERSION
+            } else {
+                SPEND_SCHEMA_VERSION
             },
             digest: key.digest,
             tenant: key.tenant.as_str().to_owned(),
             revoked: key.revoked,
             tags: key.tags.clone(),
+            expires_at: key.expires_at,
+            previous_digest: key.previous.map(|previous| previous.digest),
+            previous_valid_until: key.previous.map(|previous| previous.valid_until),
         }
     }
 
     pub(crate) fn into_stored(self, key_id: KeyId) -> StoredKey {
+        // A digest without its deadline would be accepted forever, and a
+        // deadline without a digest names nothing, so half a pair is dropped
+        // and logged. Only a hand-edited row can hold one: `from_stored`
+        // writes both or neither.
+        let previous = match (self.previous_digest, self.previous_valid_until) {
+            (Some(digest), Some(valid_until)) => Some(PreviousDigest {
+                digest,
+                valid_until,
+            }),
+            (None, None) => None,
+            _ => {
+                tracing::warn!(
+                    key_id = key_id.as_str(),
+                    "key row holds half of a rotation overlap; the previous secret is refused"
+                );
+                None
+            }
+        };
         StoredKey {
             key_id,
             digest: self.digest,
             tenant: TenantId::new(self.tenant),
             revoked: self.revoked,
             tags: self.tags,
+            expires_at: self.expires_at,
+            previous,
         }
     }
 }
@@ -3604,7 +3696,29 @@ pub struct MintedKey {
     /// A mint reports this rather than failing, because an error would drop
     /// the only copy of the plaintext for a key that does exist.
     pub applied: bool,
+    /// The key's expiry after the write (Unix seconds); `None` never expires.
+    pub expires_at: Option<u64>,
+    /// For a rotation, when the previous secret stops authenticating. `None`
+    /// for a mint, which ends any overlap at once.
+    pub previous_valid_until: Option<u64>,
 }
+
+/// How a mint or rotation changes a key's expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryChange {
+    /// Keep the expiry the key has; a new key never expires. A re-mint that
+    /// does not mention expiry must not drop it, or it would make a key
+    /// that was meant to expire permanent.
+    Keep,
+    /// Remove the expiry: the key never expires.
+    Clear,
+    /// Expire at this Unix second. Must be in the future.
+    At(u64),
+}
+
+/// The longest rotation overlap [`ControlPlane::rotate_key`] accepts: 30
+/// days. An overlap is a migration window, not a second key.
+pub const MAX_ROTATION_OVERLAP_SECS: u64 = 30 * 24 * 60 * 60;
 
 impl std::fmt::Debug for MintedKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3612,6 +3726,8 @@ impl std::fmt::Debug for MintedKey {
             .field("key_id", &self.key_id)
             .field("tenant", &self.tenant)
             .field("tags", &self.tags)
+            .field("expires_at", &self.expires_at)
+            .field("previous_valid_until", &self.previous_valid_until)
             .field("plaintext", &"<redacted>")
             .finish()
     }
@@ -3645,6 +3761,12 @@ pub struct KeyListing {
     pub model_access: Option<ModelAccess>,
     /// Chargeback tags set on the key (key metadata); empty when none.
     pub tags: Arc<ChargebackTags>,
+    /// When the key expires (Unix seconds); `None` never expires. A listing
+    /// keeps an expired key, as it keeps a revoked one.
+    pub expires_at: Option<u64>,
+    /// When the previous secret of a rotated key stops authenticating, while
+    /// the overlap is still open. `None` outside an overlap.
+    pub previous_valid_until: Option<u64>,
 }
 
 // Rust note: hand-written, not derived, matching every other `Debug` in this
@@ -3661,6 +3783,8 @@ impl std::fmt::Debug for KeyListing {
             .field("limits", &self.limits)
             .field("model_access", &self.model_access)
             .field("tags", &self.tags)
+            .field("expires_at", &self.expires_at)
+            .field("previous_valid_until", &self.previous_valid_until)
             .finish()
     }
 }
@@ -4629,10 +4753,19 @@ impl ControlPlane {
     /// of noise that hides a real diff.
     pub fn list_keys(&self) -> Vec<KeyListing> {
         let snapshot = self.published.load();
+        let now = unix_now_secs();
+        let previous_valid_until: HashMap<&KeyId, u64> = snapshot
+            .keys
+            .previous_records()
+            .filter(|record| !record.is_expired_at(now))
+            .filter_map(|record| Some((&record.key_id, record.expires_at?)))
+            .collect();
         let mut keys: Vec<KeyListing> = snapshot
             .keys
             .iter()
             .map(|(_digest, record)| KeyListing {
+                expires_at: record.expires_at,
+                previous_valid_until: previous_valid_until.get(&record.key_id).copied(),
                 key_id: record.key_id.clone(),
                 tenant: record.tenant.clone(),
                 revoked: record.revoked,
@@ -4671,6 +4804,24 @@ impl ControlPlane {
         key_id: &KeyId,
         tags: Option<&ChargebackTags>,
     ) -> Result<MintedKey, StoreError> {
+        self.mint_key_with(tenant, key_id, tags, ExpiryChange::Keep)
+    }
+
+    /// [`Self::mint_key_with_tags`] that also sets the key's expiry. A
+    /// re-mint replaces the secret at once and ends any rotation overlap: it
+    /// is the path for a leaked key. [`Self::rotate_key`] keeps the old
+    /// secret working for a while instead.
+    ///
+    /// The expiry the key ends up with must be in the future
+    /// (`InvalidInput`), so a re-mint of an expired key must set a new one,
+    /// and no mint returns a secret that is already refused.
+    pub fn mint_key_with(
+        &self,
+        tenant: &TenantId,
+        key_id: &KeyId,
+        tags: Option<&ChargebackTags>,
+        expiry: ExpiryChange,
+    ) -> Result<MintedKey, StoreError> {
         if let Some(tags) = tags {
             proxy_observability::chargeback::validate_key_tags(tags)
                 .map_err(|e| StoreError::InvalidInput(format!("tags: {e}")))?;
@@ -4705,7 +4856,36 @@ impl ControlPlane {
                 .map(|(_, record)| (*record.tags).clone())
                 .unwrap_or_default(),
         };
+        let snapshot_expiry = snapshot
+            .keys
+            .iter()
+            .find(|(_, record)| &record.key_id == key_id)
+            .and_then(|(_, record)| record.expires_at);
         drop(snapshot);
+        let expires_at = match expiry {
+            // Read from the store, not the snapshot: `Keep` must keep an
+            // expiry another replica set since this one last polled, or the
+            // re-mint would make the key permanent. When the row cannot be
+            // read the mint still goes ahead, as it did before expiry
+            // existed, on this replica's snapshot; that misses only an expiry
+            // set elsewhere since the last poll, so it is logged.
+            ExpiryChange::Keep => match self.stored_key(key_id) {
+                Ok(row) => row.and_then(|existing| existing.expires_at),
+                Err(err) => {
+                    tracing::warn!(
+                        key_id = key_id.as_str(),
+                        error = %err,
+                        "mint: could not read the key row; keeping the expiry from this \
+                         replica's snapshot, which misses one set on another replica since \
+                         its last poll"
+                    );
+                    snapshot_expiry
+                }
+            },
+            ExpiryChange::Clear => None,
+            ExpiryChange::At(at) => Some(at),
+        };
+        check_expiry_in_future(expires_at, unix_now_secs())?;
         let rng = ring::rand::SystemRandom::new();
         let plaintext = crate::auth::generate_plaintext_key(&rng);
         let digest = crate::auth::digest_bytes(&self.secret, &plaintext);
@@ -4715,6 +4895,8 @@ impl ControlPlane {
             tenant: tenant.clone(),
             revoked: false,
             tags: tags.clone(),
+            expires_at,
+            previous: None,
         })?;
         let applied = self.rebuild().is_ok();
         Ok(MintedKey {
@@ -4723,7 +4905,107 @@ impl ControlPlane {
             plaintext,
             tags,
             applied,
+            expires_at,
+            previous_valid_until: None,
         })
+    }
+
+    /// Gives the store key `key_id` a new secret and keeps the current one
+    /// valid for `overlap_secs` more seconds, so clients can move to the new
+    /// secret without an outage. Both digests reach every replica through
+    /// the policy snapshot. Tags, budget, limits and policy stay with the
+    /// key id, which does not change. `expiry` applies to the key (and caps
+    /// the old secret too).
+    ///
+    /// Refused: a key from the configuration (`Conflict`, rotate it there),
+    /// an unknown key (`NotFound`), a revoked key (`Conflict`), an overlap of
+    /// 0 or more than [`MAX_ROTATION_OVERLAP_SECS`] (`InvalidInput`), and a
+    /// key whose previous overlap is still open (`Conflict`): a second
+    /// rotation would cut off clients still on the oldest secret without
+    /// saying so. Re-mint the key to end an overlap at once.
+    ///
+    /// Reads the key's row from the store, not the snapshot, so the secret
+    /// that stays valid is the one the store holds now.
+    pub fn rotate_key(
+        &self,
+        key_id: &KeyId,
+        overlap_secs: u64,
+        expiry: ExpiryChange,
+    ) -> Result<MintedKey, StoreError> {
+        if overlap_secs == 0 || overlap_secs > MAX_ROTATION_OVERLAP_SECS {
+            return Err(StoreError::InvalidInput(format!(
+                "overlap_seconds must be between 1 and {MAX_ROTATION_OVERLAP_SECS}; \
+                 POST /keys replaces a secret with no overlap"
+            )));
+        }
+        if self
+            .bootstrap_keys
+            .iter()
+            .any(|(_, record)| &record.key_id == key_id)
+        {
+            return Err(StoreError::Conflict(
+                "key is defined in the configuration; rotate it there".into(),
+            ));
+        }
+        let Some(current) = self.stored_key(key_id)? else {
+            return Err(StoreError::NotFound);
+        };
+        if current.revoked {
+            return Err(StoreError::Conflict("key is revoked".into()));
+        }
+        let now = unix_now_secs();
+        if let Some(previous) = current.previous.filter(|p| now < p.valid_until) {
+            return Err(StoreError::Conflict(format!(
+                "a rotation overlap is open until {}; wait for it to end, or re-mint the key \
+                 to end it now",
+                previous.valid_until
+            )));
+        }
+        let expires_at = match expiry {
+            ExpiryChange::Keep => current.expires_at,
+            ExpiryChange::Clear => None,
+            ExpiryChange::At(at) => Some(at),
+        };
+        check_expiry_in_future(expires_at, now)?;
+        let valid_until = now.saturating_add(overlap_secs);
+        let rng = ring::rand::SystemRandom::new();
+        let plaintext = crate::auth::generate_plaintext_key(&rng);
+        let digest = crate::auth::digest_bytes(&self.secret, &plaintext);
+        let tags = current.tags.clone();
+        self.store.put_key(&StoredKey {
+            key_id: key_id.clone(),
+            digest,
+            tenant: current.tenant.clone(),
+            revoked: false,
+            tags: tags.clone(),
+            expires_at,
+            previous: Some(PreviousDigest {
+                digest: current.digest,
+                valid_until,
+            }),
+        })?;
+        let applied = self.rebuild().is_ok();
+        Ok(MintedKey {
+            key_id: key_id.clone(),
+            tenant: current.tenant,
+            plaintext,
+            tags,
+            applied,
+            expires_at,
+            previous_valid_until: Some(valid_until),
+        })
+    }
+
+    /// The store's row for `key_id`, read fresh. Admin writes that carry a
+    /// row's lifecycle fields forward read them here, so a stale snapshot
+    /// cannot drop an expiry or an overlap another replica wrote.
+    fn stored_key(&self, key_id: &KeyId) -> Result<Option<StoredKey>, StoreError> {
+        Ok(self
+            .store
+            .load()?
+            .keys
+            .into_iter()
+            .find(|key| &key.key_id == key_id))
     }
 
     /// Replaces the chargeback tags of the store key `key_id` (an empty map
@@ -4761,14 +5043,30 @@ impl ControlPlane {
         let digest: [u8; 32] = digest
             .try_into()
             .map_err(|_| StoreError::InvalidInput("key digest is not 32 bytes".into()))?;
+        let tenant = record.tenant.clone();
+        drop(snapshot);
+        // The lifecycle fields come from the store row: a tag write must not
+        // drop an expiry or an open overlap.
+        let (expires_at, previous) = match self.stored_key(key_id)? {
+            Some(row) if row.digest == digest => (row.expires_at, row.previous),
+            // The secret changed since this replica's last poll; writing the
+            // stale digest back would undo that mint or rotation.
+            Some(_) => {
+                return Err(StoreError::Conflict(
+                    "the key changed on another replica; retry".into(),
+                ))
+            }
+            None => return Err(StoreError::NotFound),
+        };
         let next = StoredKey {
             key_id: key_id.clone(),
             digest,
-            tenant: record.tenant.clone(),
+            tenant,
             revoked: false,
             tags: tags.clone(),
+            expires_at,
+            previous,
         };
-        drop(snapshot);
         self.store.put_key(&next)?;
         self.apply_write()?;
         Ok(())
@@ -4856,6 +5154,8 @@ impl ControlPlane {
                 tenant: tenant.clone(),
                 revoked: true,
                 tags: (*record.tags).clone(),
+                expires_at: None,
+                previous: None,
             })?;
             revoked += 1;
         }
@@ -5315,6 +5615,7 @@ impl ControlPlane {
         // consumed into a real (digest-keyed) `KeySet` before this function
         // returns.
         let mut by_key_id: HashMap<KeyId, (Vec<u8>, KeyRecord)> = HashMap::new();
+        let mut previous_digests: HashMap<KeyId, (Vec<u8>, KeyRecord)> = HashMap::new();
         let mut key_tenants = HashMap::new();
 
         for (digest, record) in bootstrap_keys.iter() {
@@ -5328,7 +5629,7 @@ impl ControlPlane {
                         tenant: record.tenant.clone(),
                         revoked: record.revoked,
                         tags: record.tags.clone(),
-                        expires_at: None,
+                        expires_at: record.expires_at,
                     },
                 ),
             );
@@ -5346,6 +5647,29 @@ impl ControlPlane {
                      the store record wins"
                 );
             }
+            let tags = Arc::new(stored.tags);
+            if let Some(previous) = stored.previous {
+                // The previous secret never outlives the key itself, and a
+                // revoke covers it too: both records come from one row.
+                let valid_until = stored
+                    .expires_at
+                    .map_or(previous.valid_until, |expires_at| {
+                        expires_at.min(previous.valid_until)
+                    });
+                previous_digests.insert(
+                    stored.key_id.clone(),
+                    (
+                        previous.digest.to_vec(),
+                        KeyRecord {
+                            key_id: stored.key_id.clone(),
+                            tenant: stored.tenant.clone(),
+                            revoked: stored.revoked,
+                            tags: Arc::clone(&tags),
+                            expires_at: Some(valid_until),
+                        },
+                    ),
+                );
+            }
             by_key_id.insert(
                 stored.key_id.clone(),
                 (
@@ -5354,8 +5678,8 @@ impl ControlPlane {
                         key_id: stored.key_id,
                         tenant: stored.tenant,
                         revoked: stored.revoked,
-                        tags: Arc::new(stored.tags),
-                        expires_at: None,
+                        tags,
+                        expires_at: stored.expires_at,
                     },
                 ),
             );
@@ -5364,6 +5688,11 @@ impl ControlPlane {
         let mut keys = KeySet::new();
         for (_key_id, (digest, record)) in by_key_id {
             keys.insert_digest(digest, record);
+        }
+        // Bootstrap keys never carry a previous digest, so only store rows
+        // fill this.
+        for (_key_id, (digest, record)) in previous_digests {
+            keys.insert_previous_digest(digest, record);
         }
 
         // `policies` is populated from the store only -- there is no
@@ -6022,6 +6351,9 @@ pub(crate) fn pre_flag_key_budget_rows() -> Vec<(KeyId, &'static str, KeyBudget)
 }
 
 #[cfg(test)]
+mod key_lifecycle_tests;
+
+#[cfg(test)]
 mod redb_spend_batch_tests;
 
 #[cfg(test)]
@@ -6468,6 +6800,8 @@ mod tests {
                 tenant: TenantId::new("tenant-store"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .expect("put_key must succeed against an in-memory store");
         cp.rebuild().unwrap();
@@ -6498,6 +6832,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: true,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
 
@@ -6589,6 +6925,8 @@ mod tests {
                 tenant: TenantId::new("tenant-store"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
 
@@ -6656,6 +6994,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         let store = ToggleStore {
@@ -6949,6 +7289,8 @@ mod tests {
             tenant: TenantId::new("t"),
             revoked: false,
             tags: ChargebackTags::new(),
+            expires_at: None,
+            previous: None,
         };
         let untagged = encode_json(&EncodedKeyRow::from_stored(&key));
         let text = String::from_utf8(untagged.clone()).unwrap();
@@ -8055,6 +8397,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
 
@@ -8080,6 +8424,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
 
@@ -8125,6 +8471,8 @@ mod tests {
                         tenant: TenantId::new("tenant-a"),
                         revoked: false,
                         tags: Default::default(),
+                        expires_at: None,
+                        previous: None,
                     })
                     .unwrap();
             }
@@ -8741,6 +9089,8 @@ mod tests {
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
                     tags: Default::default(),
+                    expires_at: None,
+                    previous: None,
                 })
                 .unwrap();
             // `store` (and its `redb::Database`) is dropped here -- there is
@@ -8772,6 +9122,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         store
@@ -8781,6 +9133,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         store
@@ -8790,6 +9144,8 @@ mod tests {
                 tenant: TenantId::new("tenant-b"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
 
@@ -8832,6 +9188,8 @@ mod tests {
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
                     tags: Default::default(),
+                    expires_at: None,
+                    previous: None,
                 })
                 .unwrap();
             store
@@ -8841,6 +9199,8 @@ mod tests {
                     tenant: TenantId::new("tenant-b"),
                     revoked: false,
                     tags: Default::default(),
+                    expires_at: None,
+                    previous: None,
                 })
                 .unwrap();
             store.revoke_key(&KeyId::new("k2")).unwrap();
@@ -8952,6 +9312,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         writer.revoke_key(&KeyId::new("k1")).unwrap();
@@ -9137,6 +9499,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         let store = ToggleStore {
@@ -9230,6 +9594,8 @@ mod tests {
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
                     tags: Default::default(),
+                    expires_at: None,
+                    previous: None,
                 })
                 .unwrap();
         };
@@ -9311,6 +9677,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         let cp = ControlPlane::new(
@@ -9437,6 +9805,8 @@ mod tests {
                 tenant: tenant.clone(),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         expected += 1;
@@ -9518,6 +9888,8 @@ mod tests {
                 tenant: tenant.clone(),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
         expected += 1;
@@ -11344,6 +11716,8 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: true,
                 tags: Default::default(),
+                expires_at: None,
+                previous: None,
             })
             .unwrap();
 

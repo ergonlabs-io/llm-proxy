@@ -54,6 +54,12 @@
 //! verify it. Cluster headers are applied after this filter, so a provider
 //! credential in `authorization` is unaffected. Requests this filter rejects
 //! never reach the router, so there is nothing to remove on those paths.
+//!
+//! `x-api-key` is removed the same way, whatever it held. Anthropic SDKs send
+//! their key there, so a virtual key is accepted from it
+//! (`auth::X_API_KEY`), and a client that sends its own provider key there
+//! must not have it forwarded. The provider's own `x-api-key` comes from the
+//! cluster, after this filter (AGENTS.md invariant 6).
 
 use std::collections::HashMap;
 use std::fs;
@@ -1719,6 +1725,10 @@ impl HttpFilter for AuthFilterInstance {
                 // "removed before forwarding" section. `remove` drops every
                 // value, not just the first one `authenticate` read.
                 headers.headers.remove(AUTHORIZATION);
+                // Removed whatever it held: a virtual key, or a client's own
+                // provider key that must not reach a provider the operator
+                // pays for. An `anthropic` cluster adds its own after this.
+                headers.headers.remove(crate::auth::X_API_KEY);
                 FilterHeadersStatus::Continue
             }
             AuthOutcome::Rejected(AuthError::UnknownKey) => {

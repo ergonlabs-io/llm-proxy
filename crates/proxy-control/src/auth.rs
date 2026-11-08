@@ -801,25 +801,11 @@ impl fmt::Debug for VirtualKeyAuthenticator {
 
 impl Authenticator for VirtualKeyAuthenticator {
     fn authenticate(&self, headers: &HeaderMap) -> AuthOutcome {
-        let Some(value) = headers.get(AUTHORIZATION) else {
-            return AuthOutcome::NoCredential;
+        let presented = match presented_virtual_key(headers) {
+            Presented::Key(presented) => presented,
+            Presented::Nothing => return AuthOutcome::NoCredential,
+            Presented::Conflict => return AuthOutcome::Rejected(AuthError::ConflictingKeys),
         };
-        // A header value that isn't valid UTF-8 isn't a `Bearer llmp_...`
-        // credential this authenticator can even parse -- treat it the same
-        // as "wrong shape", not as a known-bad credential.
-        let Ok(value) = value.to_str() else {
-            return AuthOutcome::NoCredential;
-        };
-        let Some(presented) = value.strip_prefix(BEARER_PREFIX) else {
-            return AuthOutcome::NoCredential;
-        };
-        if !presented.starts_with(KEY_PREFIX) {
-            // Not shaped like a virtual key -- may be a JWT (or anything
-            // else) meant for a later authenticator. This is the OIDC seam;
-            // see the module doc and `AuthOutcome::NoCredential`'s doc for
-            // why this must not become `Rejected`.
-            return AuthOutcome::NoCredential;
-        }
 
         // Past the staleness bound the snapshot may still hold a key that was
         // revoked elsewhere, so no virtual key is trusted (fail closed). Two
@@ -842,6 +828,12 @@ impl Authenticator for VirtualKeyAuthenticator {
         let snapshot = self.snapshot.load();
         match snapshot.keys.find(&self.secret, presented) {
             Some(record) if record.revoked => AuthOutcome::Rejected(AuthError::RevokedKey),
+            // The clock is read here, on the worker, so a key expires on time
+            // whatever the policy poll is doing. Only a record with an expiry
+            // pays for the clock read.
+            Some(record) if record.expires_at.is_some() && expired_now(record) => {
+                AuthOutcome::Rejected(AuthError::RevokedKey)
+            }
             // The credential set comes from this same guard, never a second
             // load, so a key revoked between two loads cannot mix states
             // (ADR-0007 decision 4).
@@ -858,6 +850,62 @@ impl Authenticator for VirtualKeyAuthenticator {
             }),
             None => AuthOutcome::Rejected(AuthError::UnknownKey),
         }
+    }
+}
+
+/// Whether `record` has expired by the wall clock. A clock that reads before
+/// the Unix epoch fails closed: every key with an expiry is refused, since
+/// reading it as 0 would let no key ever expire. Keys without an expiry are
+/// not affected.
+fn expired_now(record: &KeyRecord) -> bool {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(now) => record.is_expired_at(now.as_secs()),
+        Err(_) => true,
+    }
+}
+
+/// Where [`presented_virtual_key`] found a virtual key, if anywhere.
+enum Presented<'a> {
+    Key(&'a str),
+    /// No virtual key in either header; a later authenticator may own the
+    /// `authorization` value.
+    Nothing,
+    /// [`X_API_KEY`] holds a virtual key and `authorization` holds a
+    /// different credential.
+    Conflict,
+}
+
+/// Reads the virtual key from `authorization: Bearer llmp_...` or from
+/// [`X_API_KEY`]. Only the first value of each header is read, as before
+/// `x-api-key` was accepted.
+///
+/// Both headers may carry the same key (a client configured both ways). When
+/// `x-api-key` carries a virtual key and `authorization` carries anything else
+/// -- another virtual key, a JWT, another scheme -- the request is refused:
+/// choosing one would let a request name two principals.
+///
+/// A header value that is not valid UTF-8, or not shaped like a virtual key,
+/// is not this authenticator's credential, never a known-bad one.
+fn presented_virtual_key(headers: &HeaderMap) -> Presented<'_> {
+    let authorization = headers.get(AUTHORIZATION);
+    let bearer = authorization
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix(BEARER_PREFIX))
+        // Not shaped like a virtual key -- may be a JWT (or anything else)
+        // meant for a later authenticator. This is the OIDC seam; see the
+        // module doc and `AuthOutcome::NoCredential`'s doc for why this must
+        // not become `Rejected`.
+        .filter(|presented| presented.starts_with(KEY_PREFIX));
+    let api_key = headers
+        .get(X_API_KEY)
+        .and_then(|value| value.to_str().ok())
+        .filter(|presented| presented.starts_with(KEY_PREFIX));
+    match (bearer, api_key) {
+        (Some(bearer), None) => Presented::Key(bearer),
+        (Some(bearer), Some(api_key)) if bearer == api_key => Presented::Key(bearer),
+        (None, Some(api_key)) if authorization.is_none() => Presented::Key(api_key),
+        (_, Some(_)) => Presented::Conflict,
+        (None, None) => Presented::Nothing,
     }
 }
 
@@ -1067,6 +1115,68 @@ mod tests {
                 assert_eq!(principal.key_id.as_str(), "key-1");
             }
             other => panic!("expected Authenticated, got a different outcome (variant only, no Debug on AuthOutcome): matched={}", matches!(other, AuthOutcome::Authenticated(_))),
+        }
+    }
+
+    /// Where the virtual key may come from: `authorization: Bearer` or
+    /// `x-api-key` (what Anthropic SDKs send), or both when they agree. When
+    /// `x-api-key` holds a virtual key and `authorization` holds any other
+    /// credential, the request is refused rather than one being picked. A
+    /// non-virtual `x-api-key` (a client's own provider key) is not a
+    /// credential here at all.
+    #[test]
+    fn the_virtual_key_is_read_from_authorization_or_x_api_key_but_never_two_credentials() {
+        let auth = authenticator_with(
+            b"operator-secret",
+            KeyRecord {
+                key_id: KeyId::new("key-1"),
+                tenant: TenantId::new("tenant-a"),
+                revoked: false,
+                tags: Default::default(),
+                expires_at: None,
+            },
+            "llmp_right",
+        );
+        let cases: [(Option<&str>, Option<&str>, &str); 8] = [
+            (None, Some("llmp_right"), "authenticated"),
+            (
+                Some("Bearer llmp_right"),
+                Some("llmp_right"),
+                "authenticated",
+            ),
+            (
+                Some("Bearer llmp_right"),
+                Some("sk-ant-own"),
+                "authenticated",
+            ),
+            (None, Some("llmp_wrong"), "unknown"),
+            (Some("Bearer llmp_right"), Some("llmp_other"), "conflict"),
+            (Some("Bearer llmp_other"), Some("llmp_right"), "conflict"),
+            (Some("Bearer eyJ.jwt.like"), Some("llmp_right"), "conflict"),
+            (None, Some("sk-ant-own"), "no-credential"),
+        ];
+        for (authorization, api_key, expected) in cases {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = authorization {
+                headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+            }
+            if let Some(value) = api_key {
+                headers.insert(X_API_KEY, HeaderValue::from_str(value).unwrap());
+            }
+            let got = match auth.authenticate(&headers) {
+                AuthOutcome::Authenticated(principal) => {
+                    assert_eq!(principal.key_id.as_str(), "key-1");
+                    "authenticated"
+                }
+                AuthOutcome::Rejected(AuthError::UnknownKey) => "unknown",
+                AuthOutcome::Rejected(AuthError::ConflictingKeys) => "conflict",
+                AuthOutcome::Rejected(_) => "rejected:other",
+                AuthOutcome::NoCredential => "no-credential",
+            };
+            assert_eq!(
+                got, expected,
+                "authorization {authorization:?}, x-api-key {api_key:?}"
+            );
         }
     }
 
