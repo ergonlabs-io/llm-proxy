@@ -69,9 +69,97 @@ fn a_stripped_field_is_removed_before_the_upstream_sees_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The three ways a request asks the provider to dial an MCP server.
+const MCP_BODIES: [&str; 3] = [
+    r#"{"model":"gpt-4o-mini","mcp_servers":[{"type":"url","url":"https://mcp.example","name":"x"}],"messages":[]}"#,
+    r#"{"model":"gpt-4o-mini","tools":[{"type":"mcp","server_label":"x","server_url":"https://mcp.example"}]}"#,
+    r#"{"model":"gpt-4o-mini","tools":[{"type":"mcp_toolset","mcp_server_name":"x"}]}"#,
+];
+
+#[test]
+fn a_provider_with_no_setting_refuses_provider_side_mcp_and_forward_sends_it() {
+    let dir = scratch_dir("mcp");
+    let (upstream, received) = spawn_recording_upstream();
+    // No `request_fields` at all: the default must be to refuse.
+    let proxy = Proxy::start(&dir, upstream, "");
+    for body in MCP_BODIES {
+        let response = post(proxy.listen, body);
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "{body} got:\n{response}"
+        );
+        assert!(
+            response.contains("provider-side MCP is not permitted"),
+            "got:\n{response}"
+        );
+    }
+    assert!(
+        received.recv_timeout(Duration::from_millis(500)).is_err(),
+        "a refused request must not reach the upstream"
+    );
+    // Control: an ordinary request, tools included, still goes through.
+    let plain = r#"{"model":"gpt-4o-mini","tools":[{"type":"function","function":{"name":"f"}}]}"#;
+    let response = post(proxy.listen, plain);
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+    assert_eq!(received.recv_timeout(IO_TIMEOUT).expect("body"), plain);
+    let metrics = get(proxy.admin, "/stats/prometheus");
+    assert_eq!(
+        counter(&metrics, "llmproxy_router_provider_mcp_refused_total"),
+        3,
+        "{metrics}"
+    );
+    drop(proxy);
+
+    // `forward` sends all three, byte for byte.
+    let (upstream, received) = spawn_recording_upstream();
+    let proxy = Proxy::start(&dir, upstream, "{ provider_mcp: forward }");
+    for body in MCP_BODIES {
+        let response = post(proxy.listen, body);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "{body} got:\n{response}"
+        );
+        assert_eq!(received.recv_timeout(IO_TIMEOUT).expect("body"), body);
+    }
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ------------------------------------------------------------------ helpers --
 
+/// GETs `path` from the admin listener and returns the whole response text.
+fn get(addr: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).expect("connect admin");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("set_read_timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write");
+    let mut out = String::new();
+    let _ = stream.read_to_string(&mut out);
+    out
+}
+
+/// The value of the unlabelled Prometheus series named `name`, 0 if absent.
+fn counter(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .find(|l| !l.starts_with('#') && l.contains(name))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn config_text(listen: u16, admin: u16, upstream: SocketAddr, fields: &str) -> String {
+    // An empty `fields` leaves `request_fields` out of the file.
+    let request_fields = if fields.is_empty() {
+        String::new()
+    } else {
+        format!("    request_fields: {fields}\n")
+    };
     format!(
         r#"version: 1
 listen: "127.0.0.1:{listen}"
@@ -81,8 +169,7 @@ providers:
     type: openai
     base_url: http://{upstream}
     api_key: sk-upstream-provider-key
-    request_fields: {fields}
-routes:
+{request_fields}routes:
   - {{ model: "*", provider: openai }}
 "#
     )
@@ -128,6 +215,7 @@ fn post(addr: SocketAddr, body: &str) -> String {
 struct Proxy {
     child: Child,
     listen: SocketAddr,
+    admin: SocketAddr,
 }
 
 impl Proxy {
@@ -151,8 +239,9 @@ impl Proxy {
         let proxy = Proxy {
             child,
             listen: SocketAddr::from(([127, 0, 0, 1], listen)),
+            admin: SocketAddr::from(([127, 0, 0, 1], admin)),
         };
-        let admin = SocketAddr::from(([127, 0, 0, 1], admin));
+        let admin = proxy.admin;
         assert!(
             wait_for_connectable(admin, STARTUP_TIMEOUT),
             "admin listener at {admin} did not become connectable in time"

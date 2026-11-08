@@ -25,7 +25,7 @@ use proxy_cluster::manager::ClusterManager;
 use proxy_cluster::resolver::FakeResolver;
 use proxy_config::ir::{
     AccessLogFormat, AccessLogIR, AccessLogSink, ClusterConfig, ClusterKind, ClusterName,
-    DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch,
+    DiscoveryType, EndpointIR, ForwardAction, ForwardTarget, LbPolicy, PathMatch, ProviderMcp,
     ProviderRuntimeConfig, RequestFieldPolicy, RetryBackOff, RetryOn, RetryPolicyIR, RouteActionIR,
     RouteEntry, RouteMatcher, RouteTable, VirtualHostIR,
 };
@@ -393,6 +393,76 @@ async fn a_cluster_without_a_policy_forwards_the_body_byte_identical() {
             let (status, _) = post(&f.handler, body).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(only_request(&f.seen).1, body);
+        })
+        .await;
+}
+
+fn mcp_policy(
+    deny_tool_types: &[&str],
+    provider_mcp: ProviderMcp,
+) -> Option<ProviderRuntimeConfig> {
+    Some(ProviderRuntimeConfig {
+        credential: None,
+        path_template: None,
+        model_rewrites: Vec::new(),
+        request_field_policy: RequestFieldPolicy {
+            deny_tool_types: deny_tool_types.iter().map(|s| s.to_string()).collect(),
+            provider_mcp,
+            ..Default::default()
+        },
+        tenant_credential: None,
+    })
+}
+
+const MCP_TOOL_BODY: &str = r#"{"model":"m","tools":[{"type":"function","name":"f"},{"type":"mcp","server_url":"https://evil.example"}]}"#;
+
+#[tokio::test(flavor = "current_thread")]
+async fn deny_tool_types_refuses_an_mcp_tool_with_400() {
+    LocalSet::new()
+        .run_until(async {
+            // `a` is the first pick and live. The deny must be final: a
+            // failover would show up as a request seen by `b`.
+            let f = build_with(mcp_policy(&["mcp"], ProviderMcp::Allow), None, true).await;
+            let (status, text) = post(&f.handler, MCP_TOOL_BODY).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(text.contains("mcp"), "body must name the type: {text}");
+            assert!(
+                f.seen.lock().unwrap().is_empty(),
+                "a refused request must not be dialled"
+            );
+            assert!(code_details(&f.log_path).contains("request_tool_type_not_permitted"));
+
+            // Control: the same cluster forwards a tools array without the type.
+            let ok = r#"{"model":"m","tools":[{"type":"function","name":"f"}]}"#;
+            let (status, _) = post(&f.handler, ok).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(only_request(&f.seen).1, ok);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn each_failover_member_applies_its_own_provider_mcp_policy() {
+    LocalSet::new()
+        .run_until(async {
+            // `a` forwards MCP but is down; `b`, the member dialled after the
+            // failover, refuses it. `b`'s policy must decide, not `a`'s.
+            let f = build(
+                mcp_policy(&[], ProviderMcp::Allow),
+                mcp_policy(&[], ProviderMcp::Refuse),
+            )
+            .await;
+            let (status, _) = post(&f.handler, MCP_TOOL_BODY).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(f.seen.lock().unwrap().is_empty());
+            assert!(code_details(&f.log_path).contains("provider_mcp_refused"));
+
+            // Control: with `b` set to forward, the same body is dialled, so
+            // the refusal above came from `b`'s policy and not from the body.
+            let f = build(None, mcp_policy(&[], ProviderMcp::Allow)).await;
+            let (status, _) = post(&f.handler, MCP_TOOL_BODY).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(only_request(&f.seen).1, MCP_TOOL_BODY);
         })
         .await;
 }

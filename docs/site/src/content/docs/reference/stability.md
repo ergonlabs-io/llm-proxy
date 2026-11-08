@@ -107,6 +107,7 @@ Metrics:
     `llmproxy_provider_credential_requests_total` (tenant and minted
     credentials)
   - `llmproxy_router_max_output_tokens_rejected_total` (`max_output_tokens`)
+  - `llmproxy_router_provider_mcp_refused_total` (`provider_mcp`)
   - `llmproxy_router_session_affinity_total` (session affinity)
   - `llmproxy_trace_segments_uploaded_total` and
     `llmproxy_trace_upload_failures_total` (trace upload to S3)

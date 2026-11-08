@@ -5158,7 +5158,8 @@ fn convert_provider_runtime_metadata(
 
 /// Lower the optional `request_field_policy` object under
 /// `io.llmproxy.provider_auth`: `deny` and `strip` are lists of non-empty
-/// top-level body key names. Unknown keys, wrong types, empty names, and a
+/// top-level body key names, `deny_tool_types` a list of non-empty `tools[].type`
+/// values, and `provider_mcp` is `allow` (the default here) or `refuse`. Unknown keys, wrong types, empty names, and a
 /// name in both lists are load errors with their full dotted path.
 fn convert_request_field_policy(
     auth: &prost_types::Struct,
@@ -5171,19 +5172,24 @@ fn convert_request_field_policy(
     let Some(prost_types::value::Kind::StructValue(policy)) = value.kind.as_ref() else {
         return Err(invalid(
             &policy_path,
-            "must be an object with `deny` and/or `strip` lists",
+            "must be an object with `deny`, `strip` and `deny_tool_types` lists and a `provider_mcp` mode",
         ));
     };
     let mut unknown: Vec<&String> = policy
         .fields
         .keys()
-        .filter(|key| !matches!(key.as_str(), "deny" | "strip"))
+        .filter(|key| {
+            !matches!(
+                key.as_str(),
+                "deny" | "strip" | "deny_tool_types" | "provider_mcp"
+            )
+        })
         .collect();
     unknown.sort();
     if let Some(key) = unknown.first() {
         return Err(unsupported(
             format!("{policy_path}.{key}"),
-            "only `deny` and `strip` are supported",
+            "only `deny`, `strip`, `deny_tool_types` and `provider_mcp` are supported",
         ));
     }
     let names = |field: &str| -> Result<Vec<String>, ConfigError> {
@@ -5211,6 +5217,26 @@ fn convert_request_field_policy(
     };
     let deny = names("deny")?;
     let strip = names("strip")?;
+    let deny_tool_types = names("deny_tool_types")?;
+    let provider_mcp = match policy.fields.get("provider_mcp").map(|v| v.kind.as_ref()) {
+        None => ProviderMcp::Allow,
+        Some(Some(prost_types::value::Kind::StringValue(mode))) => match mode.as_str() {
+            "allow" => ProviderMcp::Allow,
+            "refuse" => ProviderMcp::Refuse,
+            _ => {
+                return Err(invalid(
+                    format!("{policy_path}.provider_mcp"),
+                    "must be `allow` or `refuse`",
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(invalid(
+                format!("{policy_path}.provider_mcp"),
+                "must be `allow` or `refuse`",
+            ))
+        }
+    };
     // A name in both lists has no sensible meaning (refuse or remove?), so
     // make the operator choose.
     for (i, name) in strip.iter().enumerate() {
@@ -5224,7 +5250,8 @@ fn convert_request_field_policy(
     Ok(RequestFieldPolicy {
         deny,
         strip,
-        ..Default::default()
+        deny_tool_types,
+        provider_mcp,
     })
 }
 

@@ -720,3 +720,35 @@ fn request_field_in_both_deny_and_strip_is_a_hard_error() {
     let err = snapshot_from(&policy_yaml("{ deny: [a, b], strip: [c, b] }")).unwrap_err();
     assert_eq!(err_path(&err), format!("{POLICY_PATH}.strip[1]"));
 }
+
+/// `deny_tool_types` and `provider_mcp` lower into the IR. A policy with only
+/// `provider_mcp: allow` is the IR default, so it is no runtime; Envoy mode
+/// leaves the mode `allow` when the key is absent.
+#[test]
+fn request_field_policy_lowers_tool_types_and_provider_mcp() {
+    use proxy_config::ir::ProviderMcp;
+    let snapshot = snapshot_from(&policy_yaml(
+        "{ deny_tool_types: [mcp, computer], provider_mcp: refuse }",
+    ))
+    .expect("lower");
+    let policy = snapshot.clusters["c1"]
+        .provider_runtime
+        .clone()
+        .expect("runtime")
+        .request_field_policy;
+    assert_eq!(policy.deny_tool_types, ["mcp", "computer"]);
+    assert_eq!(policy.provider_mcp, ProviderMcp::Refuse);
+
+    let snapshot = snapshot_from(&policy_yaml("{ provider_mcp: allow }")).expect("lower");
+    assert_eq!(snapshot.clusters["c1"].provider_runtime, None);
+}
+
+#[test]
+fn malformed_tool_types_and_provider_mcp_are_hard_errors() {
+    let err = snapshot_from(&policy_yaml("{ provider_mcp: block }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.provider_mcp"));
+    let err = snapshot_from(&policy_yaml("{ provider_mcp: true }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.provider_mcp"));
+    let err = snapshot_from(&policy_yaml("{ deny_tool_types: [mcp, \"\"] }")).unwrap_err();
+    assert_eq!(err_path(&err), format!("{POLICY_PATH}.deny_tool_types[1]"));
+}

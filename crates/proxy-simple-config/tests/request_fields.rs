@@ -57,13 +57,25 @@ fn policy_lands_on_the_provider_cluster_metadata() {
     };
     assert_eq!(
         auth(find("provider:openai"))["request_field_policy"],
-        serde_json::json!({ "deny": ["models", "route"], "strip": ["plugins"] })
+        serde_json::json!({
+            "deny": ["models", "route"],
+            "strip": ["plugins"],
+            "deny_tool_types": [],
+            "provider_mcp": "refuse",
+        })
     );
-    // Negative: the provider without the knob carries no policy, so the
-    // fallback is not constrained by the primary's.
-    assert!(auth(find("provider:fb1"))
-        .get("request_field_policy")
-        .is_none());
+    // Negative: the provider without the knob carries its own policy (no
+    // listed keys, MCP refused), not the primary's lists, so the fallback is
+    // not constrained by the primary's.
+    assert_eq!(
+        auth(find("provider:fb1"))["request_field_policy"],
+        serde_json::json!({
+            "deny": [],
+            "strip": [],
+            "deny_tool_types": [],
+            "provider_mcp": "refuse",
+        })
+    );
 }
 
 #[test]
@@ -79,10 +91,61 @@ fn strict_envoy_loader_builds_the_policy_into_the_ir() {
     assert_eq!(policy.deny, ["models", "route"]);
     assert_eq!(policy.strip, ["plugins"]);
     let fb = &snapshot.clusters["provider:fb1"];
-    assert!(fb
+    let fb_policy = &fb
         .provider_runtime
         .as_ref()
-        .is_none_or(|r| r.request_field_policy.is_empty()));
+        .expect("runtime")
+        .request_field_policy;
+    assert!(fb_policy.deny.is_empty() && fb_policy.strip.is_empty());
+}
+
+/// A provider that sets nothing refuses provider-side MCP, `forward` opts
+/// out, and each provider's mode lands on its own cluster (AGENTS.md
+/// invariant 6): a fallback that forwards is not made to refuse by a primary
+/// that refuses, and the reverse.
+#[test]
+fn provider_mcp_lowers_per_provider_with_refuse_as_the_default() {
+    use proxy_config::ir::ProviderMcp;
+    let text = r#"
+version: 1
+providers:
+  silent: { type: openai, api_key: ${OPENAI_API_KEY} }
+  empty: { type: openai-compatible, base_url: "http://e.internal:8000", request_fields: {} }
+  open: { type: openai-compatible, base_url: "http://o.internal:8000", request_fields: { provider_mcp: forward, deny_tool_types: [computer] } }
+  closed: { type: openai-compatible, base_url: "http://c.internal:8000", request_fields: { provider_mcp: refuse } }
+routes:
+  - { model: "*", provider: silent, fallbacks: [open, empty, closed] }
+"#;
+    let config = parse_simple_config_with_env(text, &test_env).expect("parse");
+    let loaded = lower_to_loaded(&config).expect("strict load");
+    let snapshot = proxy_config::build_snapshot(&loaded).expect("IR");
+    let policy = |name: &str| {
+        snapshot.clusters[name]
+            .provider_runtime
+            .as_ref()
+            .expect("runtime")
+            .request_field_policy
+            .clone()
+    };
+    assert_eq!(policy("provider:silent").provider_mcp, ProviderMcp::Refuse);
+    assert_eq!(policy("provider:empty").provider_mcp, ProviderMcp::Refuse);
+    assert_eq!(policy("provider:closed").provider_mcp, ProviderMcp::Refuse);
+    let open = policy("provider:open");
+    assert_eq!(open.provider_mcp, ProviderMcp::Allow);
+    assert_eq!(open.deny_tool_types, ["computer"]);
+    assert!(policy("provider:closed").deny_tool_types.is_empty());
+}
+
+#[test]
+fn malformed_mcp_fields_are_refused_with_dialect_paths() {
+    let err = load_error(r#"{ deny_tool_types: [""] }"#).to_string();
+    assert!(
+        err.contains("providers.openai.request_fields.deny_tool_types[0]"),
+        "{err}"
+    );
+    let err = parse_simple_config_with_env(&provider(r#"{ provider_mcp: block }"#), &test_env)
+        .expect_err("unknown mode");
+    assert!(err.to_string().contains("provider_mcp"), "{err}");
 }
 
 #[test]

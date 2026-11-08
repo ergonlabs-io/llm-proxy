@@ -315,6 +315,7 @@ fuzz_target!(|data: &[u8]| {
         request_field_policy: RequestFieldPolicy {
             deny: pick(*deny),
             strip: pick(*strip & !*deny),
+            ..Default::default()
         },
         tenant_credential: None,
     });

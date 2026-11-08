@@ -118,13 +118,81 @@ lists every field. Defaults come from `schema/llmproxy-v1.schema.json`
 | `circuit_breakers` | object | see [Concurrency ceilings](#concurrency-ceilings) | Ceilings on requests and connections. |
 | `unanswered_usage` | `none`, `input`, `output_cap` | `input` | What a request is charged when this provider got the whole request and sent no response. See [Spend policies](/docs/llm-proxy/limits-and-budgets/spend-policies/#requests-that-get-no-response). |
 | `outlier_detection` | object | absent: never ejected | Passes over a provider after repeated failures. See [Failover](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/). |
-| `request_fields` | object | none | Lists of top-level body keys to refuse (`deny`) or remove (`strip`) for this provider. |
+| `request_fields` | object | see [Provider-side MCP](#provider-side-mcp) | Lists of top-level body keys to refuse (`deny`) or remove (`strip`), tool types to refuse (`deny_tool_types`), and whether the provider may dial an MCP server (`provider_mcp`). |
 | `tenant_credentials` | boolean | `false` | Let a tenant send its own key for this provider. See [Tenant provider credentials](/docs/llm-proxy/authentication/tenant-provider-credentials/). |
 
 A name in `request_fields.deny` makes the request fail with `400` and the
 body `request field not permitted: <field>`. The rule runs
 on every attempt, against the provider that the proxy dials. It holds on
 failover.
+
+## Provider-side MCP
+
+Some provider APIs let a request name an MCP server that the provider then
+dials for the client, with the API key that the proxy holds for that provider.
+A tenant could use this to make the provider call a server of its choice under
+your key. By default the proxy refuses such a request. The request fails with
+`400` and the body `provider-side MCP is not permitted for this provider:
+<what was found>`. It is never sent to the provider, and it is not retried on
+another provider. Each refusal adds 1 to
+`llmproxy_router_provider_mcp_refused_total`.
+
+The proxy refuses a request that has any of these:
+
+- a top-level `mcp_servers` key (Anthropic Messages);
+- a `tools` array element with `"type": "mcp"` (OpenAI Responses);
+- a `tools` array element with `"type": "mcp_toolset"` (Anthropic Messages).
+
+Set `request_fields.provider_mcp: forward` on a provider to send these
+requests to it unchanged. Set it only for a provider where you accept that
+tenants choose the MCP servers that it dials. The setting is per provider. On
+a failover, the provider that the proxy dials applies its own setting.
+
+```yaml
+providers:
+  anthropic:
+    request_fields:
+      provider_mcp: forward
+```
+
+A provider with no `request_fields` refuses provider-side MCP. A `strip` entry
+of `mcp_servers` still removes that key instead of refusing it, and a `deny`
+entry still gives the `request field not permitted` error. `deny_tool_types`
+refuses other `tools[].type` values in the same way. It gives `400` with the
+body `tool type not permitted: <type>`.
+
+### What this control does not cover
+
+The proxy checks the top-level `mcp_servers` key and the `type` of each
+element of the top-level `tools` array in a JSON body. It does not check:
+
+- **Batches.** An Anthropic message batch holds its requests in
+  `requests[].params`, and an OpenAI batch reads its requests from an uploaded
+  JSONL file. A request in a batch can name an MCP server. The proxy forwards
+  batch paths only when no budget or token limit applies, and it does not read
+  the requests inside them.
+- **Stored provider objects.** The proxy does not read an uploaded file. It
+  does not read a stored prompt that a request names by ID (OpenAI Responses
+  `prompt`). Such an object can carry tools that the proxy never sees. The
+  proxy does not know which tools an object holds.
+- **Realtime sessions.** The tools of a Realtime session arrive in WebSocket
+  messages after the upgrade. The proxy does not read them.
+- **Other nesting.** The proxy does not look for `mcp_servers` or an MCP tool
+  below the top level of the body, and it does not look at MCP-like names in
+  other fields. Other providers can use other names for the same feature. Name
+  those with `deny` and `deny_tool_types`.
+- **A body that is not a JSON object.** With only the default setting, the
+  proxy sends a body that is not a JSON object (an empty body, a file upload)
+  to the provider unchanged. A provider cannot read an MCP server from it. A
+  `deny`, `strip` or `deny_tool_types` list makes the proxy refuse such a JSON
+  body, and refuse a multipart form.
+- **Envoy mode.** A bootstrap loaded with `-c` has no default. It refuses
+  provider-side MCP only when its `request_field_policy` metadata says
+  `provider_mcp: refuse`.
+
+The proxy cannot tell an MCP server that the operator trusts from one that a
+tenant chose. If you need MCP for a provider, use `forward` and treat the
+tenants of that provider as trusted.
 
 ## Credentials, TLS, and headers travel with the provider
 

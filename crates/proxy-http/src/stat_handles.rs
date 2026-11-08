@@ -26,6 +26,19 @@ pub const MAX_OUTPUT_TOKENS_REJECTED: Instrument = Instrument {
     buckets: None,
 };
 
+/// Requests refused with 400 because the cluster's `provider_mcp` mode is
+/// `refuse` and the request asked the provider to dial an MCP server
+/// (ADR-0017 decision 14). A refusal by an operator's own `deny` or
+/// `deny_tool_types` list is not counted here. No labels: the cluster is in the
+/// log line and the access log's response code details.
+pub const PROVIDER_MCP_REFUSED: Instrument = Instrument {
+    name: "llmproxy_router_provider_mcp_refused_total",
+    kind: InstrumentKind::Counter,
+    unit: "{request}",
+    attribute_keys: &[],
+    buckets: None,
+};
+
 /// Requests on a weighted route with a session hash policy (ADR-0016),
 /// by `outcome`: `hashed` (the session hash chose the member) or `unhashed`
 /// (no configured source had a value, so the draw was random). Two series at
@@ -251,6 +264,7 @@ pub struct RouterStats {
     worker: WorkerId,
     warned_unknown_clusters: UnknownNames,
     rejected_memo: HandleMemo<Handle>,
+    mcp_refused_memo: HandleMemo<Handle>,
     affinity_memo: HandleMemo<Handle>,
 }
 
@@ -262,6 +276,7 @@ impl RouterStats {
             worker,
             warned_unknown_clusters: UnknownNames::default(),
             rejected_memo: HandleMemo::new(),
+            mcp_refused_memo: HandleMemo::new(),
             affinity_memo: HandleMemo::new(),
         }
     }
@@ -292,6 +307,18 @@ impl RouterStats {
         let handle = self.registry.resolve_capped_memo(
             &self.rejected_memo,
             &MAX_OUTPUT_TOKENS_REJECTED,
+            &[],
+            1,
+            &[],
+        );
+        self.registry.incr(self.worker, handle, 1);
+    }
+
+    /// Counts one request refused by a cluster's `provider_mcp: refuse`.
+    pub fn record_provider_mcp_refused(&self) {
+        let handle = self.registry.resolve_capped_memo(
+            &self.mcp_refused_memo,
+            &PROVIDER_MCP_REFUSED,
             &[],
             1,
             &[],

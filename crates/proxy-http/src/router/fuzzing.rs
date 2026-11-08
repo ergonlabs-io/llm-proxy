@@ -41,6 +41,8 @@ pub fn reconcile_request_body(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyRefusal {
     FieldNotPermitted(String),
+    ToolTypeNotPermitted(String),
+    ProviderMcp(String),
     Invalid(String),
 }
 
@@ -55,6 +57,10 @@ pub fn prepare_attempt_body(
     super::prepare_attempt_body(runtime, requested_model, resolved_model, body).map_err(|refusal| {
         match refusal {
             super::BodyRefusal::FieldNotPermitted(field) => BodyRefusal::FieldNotPermitted(field),
+            super::BodyRefusal::ToolTypeNotPermitted(kind) => {
+                BodyRefusal::ToolTypeNotPermitted(kind)
+            }
+            super::BodyRefusal::ProviderMcp(found) => BodyRefusal::ProviderMcp(found),
             super::BodyRefusal::Invalid(message) => BodyRefusal::Invalid(message),
         }
     })

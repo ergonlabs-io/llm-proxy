@@ -1916,6 +1916,27 @@ impl RouterHandler {
                             &format!("request field not permitted: {field}"),
                         );
                     }
+                    Err(BodyRefusal::ToolTypeNotPermitted(kind)) => {
+                        tracing::warn!(cluster = %attempt_cluster, tool_type = %kind, "tool type not permitted by cluster policy");
+                        dcb.stream_info().response_code_details =
+                            Some("request_tool_type_not_permitted".to_string());
+                        return local_reply(
+                            StatusCode::BAD_REQUEST,
+                            &format!("tool type not permitted: {kind}"),
+                        );
+                    }
+                    Err(BodyRefusal::ProviderMcp(found)) => {
+                        self.stats.record_provider_mcp_refused();
+                        tracing::warn!(cluster = %attempt_cluster, found = %found, "provider-side MCP refused by cluster policy");
+                        dcb.stream_info().response_code_details =
+                            Some("provider_mcp_refused".to_string());
+                        return local_reply(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "provider-side MCP is not permitted for this provider: {found}"
+                            ),
+                        );
+                    }
                     Err(BodyRefusal::Invalid(err)) => {
                         tracing::warn!(cluster = %attempt_cluster, error = %err, "provider model rewrite failed");
                         return local_reply(
@@ -3285,22 +3306,141 @@ fn has_serde_raw_value_key(object: &RawObject) -> bool {
 enum BodyRefusal {
     /// A `request_field_policy.deny` key is present.
     FieldNotPermitted(String),
+    /// A `tools` element has a `type` in `request_field_policy.deny_tool_types`.
+    ToolTypeNotPermitted(String),
+    /// The cluster's `provider_mcp` is `refuse` and the request asks the
+    /// provider to dial an MCP server. Carries what was found, for the log.
+    ProviderMcp(String),
     /// The body could not be rewritten (not JSON, not an object, model
     /// disagreement).
     Invalid(String),
 }
 
-/// Top-level keys present in a body that the cluster policy names. Only keys
-/// the policy cares about are recorded; every value is skipped unparsed.
+/// The top-level key that names MCP servers for the provider to dial.
+const MCP_SERVERS_KEY: &str = "mcp_servers";
+/// `tools[].type` values that make the provider dial an MCP server: the
+/// OpenAI Responses `mcp` tool and the Anthropic `mcp_toolset` tool.
+const MCP_TOOL_TYPES: [&str; 2] = ["mcp", "mcp_toolset"];
+
+/// What a body contains that the cluster policy names. Only keys and tool
+/// types the policy cares about are recorded; every other value is skipped
+/// unparsed.
+#[derive(Default)]
 struct PolicyKeyScan {
     denied: Option<String>,
+    tool_type: Option<String>,
+    mcp: Option<String>,
     strip_present: bool,
+}
+
+/// Collects every `type` string of one `tools` element. A duplicate `type`
+/// key is collected too: the provider may read the first or the last, so
+/// both count.
+struct ToolElement<'a>(&'a mut Vec<String>);
+
+impl<'de, 'a> serde::de::Visitor<'de> for ToolElement<'a> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            if key == "type" {
+                if let serde_json::Value::String(kind) = map.next_value::<serde_json::Value>()? {
+                    self.0.push(kind);
+                }
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(())
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// The `type` strings of every element of a `tools` value. A `tools` value
+/// that is not an array has none.
+struct ToolTypes(Vec<String>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for &mut ToolTypes {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<(), D::Error> {
+        struct Elements<'a>(&'a mut Vec<String>);
+        impl<'de, 'a> serde::de::Visitor<'de> for Elements<'a> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                struct Element<'a>(&'a mut Vec<String>);
+                impl<'de, 'a> serde::de::DeserializeSeed<'de> for Element<'a> {
+                    type Value = ();
+                    fn deserialize<D: serde::Deserializer<'de>>(
+                        self,
+                        de: D,
+                    ) -> Result<(), D::Error> {
+                        de.deserialize_any(ToolElement(self.0))
+                    }
+                }
+                while seq.next_element_seed(Element(&mut *self.0))?.is_some() {}
+                Ok(())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_unit<E>(self) -> Result<(), E> {
+                Ok(())
+            }
+        }
+        de.deserialize_any(Elements(&mut self.0))
+    }
 }
 
 fn scan_policy_keys(
     policy: &proxy_config::ir::RequestFieldPolicy,
     body: &[u8],
 ) -> Result<PolicyKeyScan, String> {
+    use proxy_config::ir::ProviderMcp;
     // Rust note: a `DeserializeSeed`-free way to walk a map is a hand-written
     // `Visitor`; `IgnoredAny` makes serde validate and discard each value
     // without building a `Value` tree.
@@ -3314,19 +3454,41 @@ fn scan_policy_keys(
             self,
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
-            let mut scan = PolicyKeyScan {
-                denied: None,
-                strip_present: false,
-            };
+            let policy = self.0;
+            let refuse_mcp = policy.provider_mcp == ProviderMcp::Refuse;
+            let mut scan = PolicyKeyScan::default();
             // `Cow<str>` keys are unescaped, so `"mod\u0065ls"` matches `models`
             // exactly as the provider's decoder would see it.
             while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                if scan.denied.is_none() && self.0.deny.iter().any(|d| d == key.as_ref()) {
-                    scan.denied = Some(key.into_owned());
-                } else if self.0.strip.iter().any(|d| d == key.as_ref()) {
+                let key = key.as_ref();
+                if scan.denied.is_none() && policy.deny.iter().any(|d| d == key) {
+                    scan.denied = Some(key.to_string());
+                } else if policy.strip.iter().any(|d| d == key) {
+                    // A strip of `mcp_servers` already removes what
+                    // `provider_mcp` would refuse, so it is not refused.
                     scan.strip_present = true;
+                } else if refuse_mcp && key == MCP_SERVERS_KEY && scan.mcp.is_none() {
+                    scan.mcp = Some(MCP_SERVERS_KEY.to_string());
                 }
-                map.next_value::<serde::de::IgnoredAny>()?;
+                if key == "tools" && (refuse_mcp || !policy.deny_tool_types.is_empty()) {
+                    // A repeated `tools` key is walked each time: the
+                    // provider keeps one of them and the proxy cannot tell
+                    // which.
+                    let mut types = ToolTypes(Vec::new());
+                    map.next_value_seed(&mut types)?;
+                    for kind in types.0 {
+                        if scan.tool_type.is_none() && policy.deny_tool_types.contains(&kind) {
+                            scan.tool_type = Some(kind);
+                        } else if scan.mcp.is_none()
+                            && refuse_mcp
+                            && MCP_TOOL_TYPES.contains(&kind.as_str())
+                        {
+                            scan.mcp = Some(format!("tools[].type {kind}"));
+                        }
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
             }
             Ok(scan)
         }
@@ -3367,9 +3529,23 @@ fn prepare_attempt_body(
 
     let mut must_strip = false;
     if let Some(policy) = policy {
-        let scan = scan_policy_keys(policy, body).map_err(BodyRefusal::Invalid)?;
+        let scan = match scan_policy_keys(policy, body) {
+            Ok(scan) => scan,
+            // `provider_mcp` alone does not turn a body that is not a JSON
+            // object into a 400: such a body cannot name an MCP server, and
+            // the provider refuses it. An operator's own key or tool-type
+            // list does refuse it, because it cannot be checked.
+            Err(_) if !policy.names_json_keys() => PolicyKeyScan::default(),
+            Err(err) => return Err(BodyRefusal::Invalid(err)),
+        };
         if let Some(field) = scan.denied {
             return Err(BodyRefusal::FieldNotPermitted(field));
+        }
+        if let Some(kind) = scan.tool_type {
+            return Err(BodyRefusal::ToolTypeNotPermitted(kind));
+        }
+        if let Some(found) = scan.mcp {
+            return Err(BodyRefusal::ProviderMcp(found));
         }
         must_strip = scan.strip_present;
     }
@@ -4966,7 +5142,11 @@ mod tests {
                 Err(BodyRefusal::Invalid(message)) => {
                     assert_eq!(message, "request body uses a reserved key", "{body}")
                 }
-                Err(BodyRefusal::FieldNotPermitted(field)) => panic!("{body}: denied {field}"),
+                Err(
+                    BodyRefusal::FieldNotPermitted(refused)
+                    | BodyRefusal::ToolTypeNotPermitted(refused)
+                    | BodyRefusal::ProviderMcp(refused),
+                ) => panic!("{body}: refused {refused}"),
                 Ok(out) => panic!("{body} rewritten to {}", String::from_utf8_lossy(&out)),
             }
 
@@ -5230,6 +5410,115 @@ mod tests {
         let body = r#"{"model":"a","metadata":{"models":["b"]}}"#;
         let out = prepare(&runtime, None, body).unwrap_or_else(|_| panic!("nested key allowed"));
         assert_eq!(&out[..], body.as_bytes());
+    }
+
+    fn refusing_mcp() -> proxy_config::ir::ProviderRuntimeConfig {
+        runtime_with(
+            Vec::new(),
+            proxy_config::ir::RequestFieldPolicy {
+                provider_mcp: proxy_config::ir::ProviderMcp::Refuse,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn provider_mcp_refuse_catches_every_way_to_name_an_mcp_server() {
+        let runtime = refusing_mcp();
+        for body in [
+            r#"{"model":"m","mcp_servers":[{"url":"https://x"}]}"#,
+            r#"{"model":"m","mcp_server\u0073":[]}"#,
+            r#"{"model":"m","tools":[{"type":"mcp","server_url":"https://x"}]}"#,
+            r#"{"model":"m","tools":[{"type":"mcp_toolset","mcp_server_name":"x"}]}"#,
+            r#"{"model":"m","tools":[{"type":"function"},{"name":"n","type":"mcp"}]}"#,
+            r#"{"model":"m","tools":[{"ty\u0070e":"m\u0063p"}]}"#,
+            // The provider may keep either of two `type` keys.
+            r#"{"model":"m","tools":[{"type":"mcp","type":"function"}]}"#,
+            r#"{"model":"m","tools":[{"type":"function","type":"mcp"}]}"#,
+            // The provider may keep either of two `tools` keys.
+            r#"{"model":"m","tools":[{"type":"mcp"}],"tools":[]}"#,
+            r#"{"model":"m","tools":[],"tools":[{"type":"mcp"}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    prepare(&refusing_mcp(), None, body),
+                    Err(BodyRefusal::ProviderMcp(_))
+                ),
+                "{body}"
+            );
+        }
+        // The matrix must not pass because everything is refused.
+        for body in [
+            r#"{"model":"m","tools":[{"type":"function","name":"mcp"}]}"#,
+            r#"{"model":"m","tools":"mcp"}"#,
+            r#"{"model":"m","tools":[1,"mcp",null,[{"type":"mcp"}]]}"#,
+            r#"{"model":"m","tools":[{"type":["mcp"]}]}"#,
+            r#"{"model":"m","metadata":{"mcp_servers":[],"tools":[{"type":"mcp"}]}}"#,
+            r#"{"model":"m","tool_choice":{"type":"mcp"}}"#,
+        ] {
+            assert!(prepare(&runtime, None, body).is_ok(), "{body}");
+        }
+    }
+
+    #[test]
+    fn provider_mcp_allow_forwards_the_bytes_untouched() {
+        let runtime = runtime_with(Vec::new(), Default::default());
+        let body = r#"{"model":"m","mcp_servers":[],"tools":[{"type":"mcp"}]}"#;
+        let out = prepare(&runtime, None, body).unwrap_or_else(|_| panic!("forwarded"));
+        assert_eq!(&out[..], body.as_bytes());
+    }
+
+    #[test]
+    fn provider_mcp_refuse_alone_leaves_a_body_that_is_not_json_to_the_provider() {
+        // Such a body cannot name an MCP server, and an upload or a bodyless
+        // request must not turn into a 400 for providers that never set the
+        // knob. An operator's own list still refuses it (see
+        // `policy_with_a_non_object_body_is_refused`).
+        let runtime = refusing_mcp();
+        for body in ["", "not json", "[1]", r#"{"a":1} trailing"#] {
+            let out = prepare(&runtime, None, body).unwrap_or_else(|_| panic!("{body:?}"));
+            assert_eq!(&out[..], body.as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_strip_of_mcp_servers_wins_over_provider_mcp_refuse() {
+        // A 1.0 config that strips the key keeps stripping it.
+        let runtime = runtime_with(
+            Vec::new(),
+            proxy_config::ir::RequestFieldPolicy {
+                strip: vec!["mcp_servers".to_string()],
+                provider_mcp: proxy_config::ir::ProviderMcp::Refuse,
+                ..Default::default()
+            },
+        );
+        let out = prepare(&runtime, None, r#"{"model":"m","mcp_servers":[1]}"#)
+            .unwrap_or_else(|_| panic!("stripped, not refused"));
+        assert_eq!(&out[..], br#"{"model":"m"}"#);
+        // The tools array is still checked.
+        assert!(matches!(
+            prepare(&runtime, None, r#"{"tools":[{"type":"mcp"}]}"#),
+            Err(BodyRefusal::ProviderMcp(_))
+        ));
+    }
+
+    #[test]
+    fn a_form_body_is_not_refused_by_provider_mcp_but_is_by_a_tool_type_list() {
+        let body = Bytes::from_static(
+            b"--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--b--\r\n",
+        );
+        assert!(prepare_form_attempt_body(Some(&refusing_mcp()), None, None, &body, "b").is_ok());
+        let listed = runtime_with(
+            Vec::new(),
+            proxy_config::ir::RequestFieldPolicy {
+                deny_tool_types: vec!["mcp".to_string()],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            prepare_form_attempt_body(Some(&listed), None, None, &body, "b"),
+            Err(BodyRefusal::Invalid(_))
+        ));
     }
 
     #[test]

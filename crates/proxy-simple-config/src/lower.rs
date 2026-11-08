@@ -1366,9 +1366,15 @@ fn lower_provider(
     // Every cluster lowered from this provider gets the policy, aggregate
     // members included (AGENTS.md invariant 6): the policy follows the
     // provider actually dialled, not the route.
-    if let Some(fields) = &provider.request_fields {
-        provider_auth["request_field_policy"] = request_field_policy(name, fields)?;
-    }
+    // An absent `request_fields` still lowers a policy: `provider_mcp` is
+    // `refuse` unless the operator wrote `forward`, so a provider that says
+    // nothing never dials a client-chosen MCP server under the operator's key
+    // (AGENTS.md "Fail-open controls": unset never means open).
+    let default_fields = crate::model::RequestFields::default();
+    provider_auth["request_field_policy"] = request_field_policy(
+        name,
+        provider.request_fields.as_ref().unwrap_or(&default_fields),
+    )?;
     let mut path_template = None;
     match provider_type {
         ProviderType::Vertex => {
@@ -1802,7 +1808,11 @@ fn request_field_policy(
     name: &str,
     fields: &crate::model::RequestFields,
 ) -> Result<serde_json::Value, ConfigError> {
-    for (list, names) in [("deny", &fields.deny), ("strip", &fields.strip)] {
+    for (list, names) in [
+        ("deny", &fields.deny),
+        ("strip", &fields.strip),
+        ("deny_tool_types", &fields.deny_tool_types),
+    ] {
         for (i, field) in names.iter().enumerate() {
             if field.is_empty() {
                 return Err(ConfigError::InvalidValue {
@@ -1820,7 +1830,16 @@ fn request_field_policy(
             });
         }
     }
-    Ok(json!({ "deny": fields.deny, "strip": fields.strip }))
+    let provider_mcp = match fields.provider_mcp {
+        Some(crate::model::ProviderMcpMode::Forward) => "allow",
+        Some(crate::model::ProviderMcpMode::Refuse) | None => "refuse",
+    };
+    Ok(json!({
+        "deny": fields.deny,
+        "strip": fields.strip,
+        "deny_tool_types": fields.deny_tool_types,
+        "provider_mcp": provider_mcp,
+    }))
 }
 
 /// The `tenant_credential` slot under `io.llmproxy.provider_auth` for a

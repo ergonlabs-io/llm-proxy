@@ -151,6 +151,9 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
         &serde_json::json!({
             "headers": [{ "key": "host", "value": "api.openai.com" }],
             "models": [],
+            "request_field_policy": {
+                "deny": [], "strip": [], "deny_tool_types": [], "provider_mcp": "refuse",
+            },
             "tenant_credential": {
                 "provider": "openai",
                 "header": "authorization",
@@ -167,6 +170,9 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
                 { "key": "host", "value": "api.anthropic.com" },
             ],
             "models": [],
+            "request_field_policy": {
+                "deny": [], "strip": [], "deny_tool_types": [], "provider_mcp": "refuse",
+            },
             "tenant_credential": {
                 "provider": "anthropic",
                 "header": "x-api-key",
@@ -180,6 +186,9 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
         &serde_json::json!({
             "headers": [{ "key": "host", "value": "llm.example.com" }],
             "models": [],
+            "request_field_policy": {
+                "deny": [], "strip": [], "deny_tool_types": [], "provider_mcp": "refuse",
+            },
             "tenant_credential": {
                 "provider": "compat",
                 "header": "authorization",
@@ -192,6 +201,9 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
         &serde_json::json!({
             "headers": [{ "key": "host", "value": "openrouter.ai" }],
             "models": [],
+            "request_field_policy": {
+                "deny": [], "strip": [], "deny_tool_types": [], "provider_mcp": "refuse",
+            },
             "tenant_credential": {
                 "provider": "openrouter",
                 "header": "authorization",
@@ -205,6 +217,9 @@ fn each_header_api_key_type_gets_its_slot_shape_in_the_cluster_metadata() {
         &serde_json::json!({
             "headers": [{ "key": "host", "value": "azure.example.com" }],
             "models": [],
+            "request_field_policy": {
+                "deny": [], "strip": [], "deny_tool_types": [], "provider_mcp": "refuse",
+            },
             "tenant_credential": {
                 "provider": "azure",
                 "header": "api-key",
@@ -447,6 +462,9 @@ fn absent_tenant_fields_lower_byte_identical_to_the_pre_feature_output() {
                 { "key": "host", "value": "api.openai.com" },
             ],
             "models": [],
+            "request_field_policy": {
+                "deny": [], "strip": [], "deny_tool_types": [], "provider_mcp": "refuse",
+            },
         })
     );
     assert_eq!(

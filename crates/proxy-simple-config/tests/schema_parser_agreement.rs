@@ -266,6 +266,11 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_variants::<ProviderType>,
         ),
         (
+            "#/$defs/Provider/properties/request_fields/properties/provider_mcp",
+            "ProviderMcpMode",
+            parser_variants::<ProviderMcpMode>,
+        ),
+        (
             "#/$defs/Provider/properties/protocol",
             "UpstreamProtocol",
             parser_variants::<UpstreamProtocol>,

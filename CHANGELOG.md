@@ -33,6 +33,21 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Added
 
+- Provider-side MCP is refused by default. A request that asks a provider to
+  dial an MCP server (a top-level `mcp_servers` key, or a `tools` element of
+  type `mcp` or `mcp_toolset`) now fails with `400` and is never sent. Before,
+  the provider dialled the server a tenant chose, with the provider key the
+  proxy holds. **A config with no `request_fields` setting changes behavior on
+  upgrade:** no config edit is needed to load it, but clients that send MCP
+  requests through it get `400`. To keep sending them, set
+  `providers.<name>.request_fields.provider_mcp: forward` on that provider.
+  The new `request_fields.deny_tool_types` list refuses any other
+  `tools[].type`. A `strip` of `mcp_servers` keeps removing that key. The
+  control does not cover batches, stored provider objects, Realtime sessions
+  or nested keys; see Providers > Overview > Provider-side MCP. New counter
+  `llmproxy_router_provider_mcp_refused_total`. Envoy mode is unchanged: its
+  `request_field_policy` metadata takes `deny_tool_types` and
+  `provider_mcp: refuse`, and has no default.
 - Daily request and token limits: `requests_per_day` and `tokens_per_day` on a
   `limits` entry, and on the admin `PUT /tenants/{id}/limits` and
   `PUT /keys/{id}/limits` bodies (and in `GET /keys`). A day is a UTC calendar

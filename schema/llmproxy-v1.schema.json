@@ -819,7 +819,7 @@
         "request_fields": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Generic top-level request-body field policy for this provider, enforced per attempt against whichever provider is actually dialled (so it holds on failover). A name must not appear in both lists.",
+          "description": "Generic request-body policy for this provider, enforced per attempt against whichever provider is actually dialled (so it holds on failover). A name must not appear in both `deny` and `strip`.",
           "properties": {
             "deny": {
               "type": "array",
@@ -832,6 +832,17 @@
               "uniqueItems": true,
               "items": { "type": "string", "minLength": 1 },
               "description": "Top-level body keys removed before the request is sent to this provider."
+            },
+            "deny_tool_types": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 },
+              "description": "Values of `type` on an element of the top-level `tools` array that make the request fail with 400 `request_tool_type_not_permitted`. `deny` cannot reach these, because it looks at top-level keys only."
+            },
+            "provider_mcp": {
+              "enum": ["refuse", "forward"],
+              "default": "refuse",
+              "description": "Whether a request may ask this provider to dial an MCP server: a top-level `mcp_servers` key, or a `tools` element of type `mcp` or `mcp_toolset`. `refuse` answers such a request with 400 `provider_mcp_refused` and never dials. `forward` sends it as it is, and the provider dials the server with the key the proxy holds for it. Absent means `refuse`, also when `request_fields` is absent. A `strip` of `mcp_servers` removes that key instead of refusing it. Only the top-level `mcp_servers` key and the top-level `tools` array are checked."
             }
           }
         },

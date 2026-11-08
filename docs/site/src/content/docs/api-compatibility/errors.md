@@ -205,6 +205,8 @@ a path that does not end in `/realtime` also gets it. See
 | 400 | `request body has duplicate model keys` | The body repeats the `model` key. | Send one `model` key. |
 | 400 | `request model disagrees with routed model` | The `model` in the whole body differs from the model the proxy routed on. | Send one consistent `model`. |
 | 400 | `request field not permitted: <field>` | The body has a top-level key that the provider `request_fields.deny` list names. | Remove the field. |
+| 400 | `tool type not permitted: <type>` | A `tools` array element has a `type` that the provider `request_fields.deny_tool_types` list names. `response_code_details` is `request_tool_type_not_permitted`. | Remove the tool. |
+| 400 | `provider-side MCP is not permitted for this provider: <what>` | The body has a top-level `mcp_servers` key, or a `tools` element of type `mcp` or `mcp_toolset`, and the provider does not set `request_fields.provider_mcp: forward`. `response_code_details` is `provider_mcp_refused`. | Remove the MCP server from the request, or ask the operator. See [Provider-side MCP](/docs/llm-proxy/providers/overview/#provider-side-mcp). |
 | 400 | `provider model rewrite failed` | The proxy could not write the provider model name into the body. | Check the `provider/model` entry and the JSON body. |
 | 400 | `` `max_tokens` 9000 exceeds the maximum of 4096 output tokens for this model `` | The output limit is above the `max_output_tokens` of the model. The field name and numbers change. | Lower the limit. |
 | 400 | ``` `max_tokens` must be a non-negative integer ``` or ``` request body has duplicate `max_tokens` keys ``` | The output limit is not a non-negative integer, or the key repeats. The field name changes. | Send one integer. |

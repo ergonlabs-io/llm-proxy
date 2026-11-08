@@ -633,6 +633,24 @@ pub struct RequestFields {
     /// These top-level keys are removed before the request is sent upstream.
     #[serde(default)]
     pub strip: Vec<String>,
+    /// Requests with a `tools` element whose `type` is one of these get `400`.
+    /// `deny` cannot reach it: it looks at top-level keys only.
+    #[serde(default)]
+    pub deny_tool_types: Vec<String>,
+    /// Whether the provider may be asked to dial an MCP server named in the
+    /// request. Absent means `refuse` (ADR-0017 decision 14).
+    #[serde(default)]
+    pub provider_mcp: Option<ProviderMcpMode>,
+}
+
+/// `providers.<name>.request_fields.provider_mcp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderMcpMode {
+    /// Requests that ask the provider to dial an MCP server get `400`.
+    Refuse,
+    /// Such requests are sent to the provider as they are.
+    Forward,
 }
 
 /// `providers.<name>.protocol`: HTTP version used for this provider's cluster.

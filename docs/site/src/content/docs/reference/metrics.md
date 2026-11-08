@@ -115,6 +115,7 @@ listener scope.
 |---|---|---|---|---|
 | `llmproxy_router_session_affinity_total` | counter | requests | `outcome` | Requests on a weighted model with `session_affinity`. `outcome` is `hashed` (the session hash chose the provider) or `unhashed` (no source had a value, so the pick was random). |
 | `llmproxy_router_max_output_tokens_rejected_total` | counter | requests | none | Requests refused with `400` because of the `max_output_tokens` cap of the model. |
+| `llmproxy_router_provider_mcp_refused_total` | counter | requests | none | Requests refused with `400` because the provider has `request_fields.provider_mcp: refuse` (the default) and the request asked the provider to dial an MCP server. |
 | `llmproxy_guardrail_checks_total` | counter | checks | `scope`, `outcome` | Request guardrail outcomes: `allowed`, `denied`, `error`, `timeout`, `over_limit`, `failure_mode_allowed`. A fail-open admission counts both its cause and `failure_mode_allowed`. |
 | `llmproxy_chargeback_tags_dropped_total` | counter | tags | `reason` | Chargeback tags dropped: `not_allowed`, `too_long`, `over_count`, `malformed`, `overridden`. Tag keys and values are never labels. |
 
@@ -234,7 +235,7 @@ For maintainers. This page comes from these sources.
 - Registry metrics: the `instruments` module in
   `crates/proxy-observability/src/stats.rs`.
 - Metrics defined beside their recorder: `crates/proxy-http/src/stat_handles.rs`
-  (`MAX_OUTPUT_TOKENS_REJECTED`, `SESSION_AFFINITY`),
+  (`MAX_OUTPUT_TOKENS_REJECTED`, `PROVIDER_MCP_REFUSED`, `SESSION_AFFINITY`),
   `crates/proxy-filters/src/guardrail_filter.rs` (`CHECKS`),
   `crates/proxy-filters/src/chargeback_tags.rs` (`DROPPED`), and
   `crates/proxy-control/src/control_redis.rs` (`LOAD_DURATION`,
