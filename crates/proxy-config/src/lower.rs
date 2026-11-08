@@ -5221,7 +5221,11 @@ fn convert_request_field_policy(
             ));
         }
     }
-    Ok(RequestFieldPolicy { deny, strip })
+    Ok(RequestFieldPolicy {
+        deny,
+        strip,
+        ..Default::default()
+    })
 }
 
 /// Lower the optional `tenant_credential` object under

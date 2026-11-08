@@ -2484,9 +2484,10 @@ pub struct ProviderRuntimeConfig {
     pub tenant_credential: Option<TenantCredentialSlot>,
 }
 
-/// Generic, provider-agnostic policy over top-level JSON request-body keys.
-/// The proxy holds no knowledge of which keys matter; operators name them.
-/// Both lists are disjoint and contain no empty names (checked at load).
+/// Policy over the JSON request body that the cluster's provider will decode.
+/// The `deny` and `strip` lists are generic: the proxy holds no knowledge of
+/// which keys matter; operators name them. All lists contain no empty names
+/// and `deny` and `strip` are disjoint (checked at load).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestFieldPolicy {
     /// A request carrying any of these keys is refused locally with a 400 and
@@ -2494,12 +2495,46 @@ pub struct RequestFieldPolicy {
     pub deny: Vec<String>,
     /// These keys are removed before the request is forwarded.
     pub strip: Vec<String>,
+    /// A request whose top-level `tools` array holds an element with one of
+    /// these `type` values is refused locally with a 400 and never dialled.
+    /// `deny` cannot reach it because it looks at top-level keys only.
+    pub deny_tool_types: Vec<String>,
+    /// Whether the provider may be asked to dial an MCP server named in the
+    /// request. Unlike the lists above it has its own mode, so a request
+    /// that cannot carry MCP (a form upload, a body that is not JSON) is not
+    /// refused by it. `Allow` is the IR default, which is what Envoy mode
+    /// loads; the dialect lowers an unset `provider_mcp` to `Refuse`
+    /// (ADR-0017 decision 14).
+    pub provider_mcp: ProviderMcp,
+}
+
+/// What a cluster does with a request that asks its provider to dial an MCP
+/// server: a top-level `mcp_servers` key, or a `tools` element of type `mcp`
+/// or `mcp_toolset`. The provider would dial it under the key the proxy
+/// holds for that provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProviderMcp {
+    /// The request is forwarded as sent.
+    #[default]
+    Allow,
+    /// The request is refused locally with a 400 and never dialled.
+    Refuse,
 }
 
 impl RequestFieldPolicy {
     /// An empty policy is a no-op: the router must not parse the body.
     pub fn is_empty(&self) -> bool {
-        self.deny.is_empty() && self.strip.is_empty()
+        self.deny.is_empty()
+            && self.strip.is_empty()
+            && self.deny_tool_types.is_empty()
+            && self.provider_mcp == ProviderMcp::Allow
+    }
+
+    /// Whether the policy names JSON body keys or tool types, which a
+    /// `multipart/form-data` body cannot be checked against. `provider_mcp`
+    /// is left out on purpose: a form cannot carry MCP.
+    pub fn names_json_keys(&self) -> bool {
+        !self.deny.is_empty() || !self.strip.is_empty() || !self.deny_tool_types.is_empty()
     }
 }
 

@@ -54,6 +54,7 @@ fn policy(deny: &[&str], strip: &[&str]) -> Option<ProviderRuntimeConfig> {
         request_field_policy: RequestFieldPolicy {
             deny: deny.iter().map(|s| s.to_string()).collect(),
             strip: strip.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         },
         tenant_credential: None,
     })

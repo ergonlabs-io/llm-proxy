@@ -3476,7 +3476,7 @@ fn prepare_form_attempt_body(
     body: &Bytes,
     boundary: &str,
 ) -> Result<Bytes, BodyRefusal> {
-    if runtime.is_some_and(|runtime| !runtime.request_field_policy.is_empty()) {
+    if runtime.is_some_and(|runtime| runtime.request_field_policy.names_json_keys()) {
         return Err(BodyRefusal::Invalid(
             "a request field policy applies only to JSON request bodies".to_string(),
         ));
@@ -5187,6 +5187,7 @@ mod tests {
         proxy_config::ir::RequestFieldPolicy {
             deny: deny.iter().map(|s| s.to_string()).collect(),
             strip: strip.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
