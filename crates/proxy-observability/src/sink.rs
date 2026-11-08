@@ -38,6 +38,18 @@ pub trait AccessLogWriter: Send + Sync {
     /// Write one already-rendered line verbatim (no newline is added or
     /// assumed; Envoy format strings typically end with `\n` themselves).
     fn write_line(&self, line: &str);
+    /// [`Self::write_line`] for a caller that already owns the line. A queueing sink moves the `String` into its
+    /// queue instead of copying it; the default just borrows it.
+    fn write_owned(&self, line: String) {
+        self.write_line(&line);
+    }
+    /// Write several lines in order, as if by repeated [`Self::write_line`]. A destination with a per-write cost
+    /// (a lock, a syscall) overrides this to pay it once per batch.
+    fn write_batch(&self, lines: &[String]) {
+        for line in lines {
+            self.write_line(line);
+        }
+    }
     /// Flush any buffered bytes to the underlying destination.
     fn flush(&self);
     /// Close and reopen the same destination (logrotate: the file at this
@@ -97,9 +109,11 @@ impl RateLimiter {
 
 // ------------------------------------------------------------- stdout/stderr --
 
-/// Writes one line at a time to the process's stdout, flushing after every
-/// write so lines interleave cleanly with any other stdout writer (e.g.
-/// `tracing`'s own console output).
+/// Writes to the process's stdout under the process-wide stdout lock, so lines
+/// interleave cleanly with any other stdout writer (e.g. `tracing`'s own
+/// console output). A single line is flushed as soon as it is written; a batch
+/// (what the queued writer thread sends) takes the lock, issues one write and
+/// flushes once.
 pub struct StdoutSink {
     limiter: RateLimiter,
 }
@@ -125,6 +139,24 @@ impl AccessLogWriter for StdoutSink {
         // concurrent write from elsewhere.
         let mut out = io::stdout().lock();
         if let Err(e) = out.write_all(line.as_bytes()) {
+            self.limiter.warn("stdout", &e);
+            return;
+        }
+        if let Err(e) = out.flush() {
+            self.limiter.warn("stdout flush", &e);
+        }
+    }
+
+    fn write_batch(&self, lines: &[String]) {
+        // One buffer, one `write_all`: stdout is line-buffered, so writing each line separately would be one
+        // `write(2)` per line.
+        let total: usize = lines.iter().map(String::len).sum();
+        let mut buf = Vec::with_capacity(total);
+        for line in lines {
+            buf.extend_from_slice(line.as_bytes());
+        }
+        let mut out = io::stdout().lock();
+        if let Err(e) = out.write_all(&buf) {
             self.limiter.warn("stdout", &e);
             return;
         }
@@ -593,21 +625,28 @@ fn writer_loop(shared: &QueueShared, inner: &dyn AccessLogWriter) {
             std::mem::take(&mut st.items)
         };
         let mut dirty = false;
+        // Consecutive lines go to the destination as one batch; a control item ends the run so ordering holds.
+        let mut run: Vec<String> = Vec::new();
         for item in batch {
             match item {
                 Item::Line(line) => {
-                    inner.write_line(&line);
+                    run.push(line);
                     dirty = true;
                 }
                 Item::Flush(ack) => {
+                    inner.write_batch(&std::mem::take(&mut run));
                     inner.flush();
                     dirty = false;
                     let _ = ack.send(());
                 }
                 Item::Reopen(ack) => {
+                    inner.write_batch(&std::mem::take(&mut run));
                     let _ = ack.send(inner.reopen());
                 }
             }
+        }
+        if !run.is_empty() {
+            inner.write_batch(&run);
         }
         if dirty {
             inner.flush();
@@ -617,6 +656,10 @@ fn writer_loop(shared: &QueueShared, inner: &dyn AccessLogWriter) {
 
 impl AccessLogWriter for QueuedSink {
     fn write_line(&self, line: &str) {
+        self.write_owned(line.to_string());
+    }
+
+    fn write_owned(&self, line: String) {
         let mut st = self
             .shared
             .state
@@ -640,7 +683,7 @@ impl AccessLogWriter for QueuedSink {
         }
         let before = st.line_bytes;
         st.line_bytes += line.len();
-        st.items.push_back(Item::Line(line.to_string()));
+        st.items.push_back(Item::Line(line));
         // Wake the writer for the first line after idle and once per
         // crossing of the threshold, not per line: otherwise its own tick
         // picks the line up.
@@ -984,6 +1027,48 @@ mod tests {
         // writer's previous batch, a 100 ms stall each time.
         let flushes = inner.flushes.load(Ordering::Relaxed);
         assert!(flushes < 100, "{flushes} flushes for 100 lines");
+    }
+
+    /// Inner sink that receives lines only through `write_batch`, recording each batch.
+    #[derive(Default)]
+    struct BatchSink {
+        batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl AccessLogWriter for BatchSink {
+        fn write_line(&self, line: &str) {
+            panic!("the queued writer must deliver through write_batch, got {line:?}");
+        }
+        fn write_batch(&self, lines: &[String]) {
+            self.batches.lock().unwrap().push(lines.to_vec());
+        }
+        fn flush(&self) {}
+        fn reopen(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn owned_lines_reach_the_inner_sink_in_order_as_batches() {
+        let inner = Arc::new(BatchSink::default());
+        let sink = QueuedSink::new("batch", inner.clone()).unwrap();
+        for i in 0..50 {
+            sink.write_owned(format!("line {i}\n"));
+        }
+        // A flush is queued behind every line above, so all 50 are delivered once it returns.
+        sink.flush();
+        sink.write_line("borrowed\n");
+        sink.flush();
+
+        let batches = inner.batches.lock().unwrap();
+        assert!(
+            batches.iter().all(|b| !b.is_empty()),
+            "an empty batch means a wasted lock and flush: {batches:?}"
+        );
+        let delivered: Vec<&str> = batches.iter().flatten().map(String::as_str).collect();
+        let mut expected: Vec<String> = (0..50).map(|i| format!("line {i}\n")).collect();
+        expected.push("borrowed\n".to_string());
+        assert_eq!(delivered, expected);
     }
 
     #[test]

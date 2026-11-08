@@ -117,7 +117,7 @@ impl AccessLoggerRuntime {
         // Non-blocking by contract: production sinks are `QueuedSink`s whose
         // writer thread batches and flushes, so no per-request flush here
         // (a flush would block this worker until the writer caught up).
-        self.sink.write_line(&self.render_line(ctx));
+        self.sink.write_owned(self.render_line(ctx));
     }
 }
 
