@@ -169,6 +169,7 @@ fn printed_key_and_digest_authenticate_together_end_to_end() {
             tenant: TenantId::new("acme-corp"),
             revoked: false,
             tags: Default::default(),
+            expires_at: None,
         },
     );
 

@@ -5328,6 +5328,7 @@ impl ControlPlane {
                         tenant: record.tenant.clone(),
                         revoked: record.revoked,
                         tags: record.tags.clone(),
+                        expires_at: None,
                     },
                 ),
             );
@@ -5354,6 +5355,7 @@ impl ControlPlane {
                         tenant: stored.tenant,
                         revoked: stored.revoked,
                         tags: Arc::new(stored.tags),
+                        expires_at: None,
                     },
                 ),
             );
@@ -6533,6 +6535,7 @@ mod tests {
                 tenant: TenantId::new("tenant-bootstrap"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
 
@@ -6574,6 +6577,7 @@ mod tests {
                 tenant: TenantId::new("tenant-bootstrap"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
 
@@ -6988,6 +6992,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Arc::new(chargeback(&[("team", "infra")])),
+                expires_at: None,
             },
         );
         let cp = ControlPlane::new(
@@ -7319,6 +7324,7 @@ mod tests {
                     tenant: TenantId::new("tenant-a"),
                     revoked: false,
                     tags: Default::default(),
+                    expires_at: None,
                 },
             );
             keys

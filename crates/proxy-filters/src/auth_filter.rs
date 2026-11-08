@@ -1187,6 +1187,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
                 tenant: TenantId::new(tenant),
                 revoked,
                 tags: Arc::new(tags),
+                expires_at: None,
             },
         );
     }
@@ -1733,6 +1734,10 @@ impl HttpFilter for AuthFilterInstance {
             }
             AuthOutcome::Rejected(AuthError::RevokedKey) => {
                 self.deny(cb, "auth_revoked_key");
+                FilterHeadersStatus::Continue
+            }
+            AuthOutcome::Rejected(AuthError::ConflictingKeys) => {
+                self.deny(cb, "auth_conflicting_keys");
                 FilterHeadersStatus::Continue
             }
             // `crate::jwt_auth::JwtAuthenticator`'s rejection reasons. Each
@@ -2560,6 +2565,7 @@ mod tests {
                 tenant: TenantId::new(tenant),
                 revoked,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         let authenticator: Box<dyn Authenticator> = Box::new(VirtualKeyAuthenticator::new(
@@ -2693,6 +2699,7 @@ mod tests {
                 tenant: TenantId::new("tenant-t"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         keys.insert(
@@ -2703,6 +2710,7 @@ mod tests {
                 tenant: TenantId::new("tenant-u"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         let set = TenantCredentialSet::new(std::collections::HashMap::from([(
@@ -2810,6 +2818,7 @@ mod tests {
                 tenant: TenantId::new("tenant-t"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         let set = Arc::new(TenantCredentialSet::new(std::collections::HashMap::from([

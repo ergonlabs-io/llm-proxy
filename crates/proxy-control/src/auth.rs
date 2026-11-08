@@ -79,6 +79,13 @@ pub const BEARER_PREFIX: &str = "Bearer ";
 /// "whose kind is this" cannot silently drift apart.
 pub const KEY_PREFIX: &str = "llmp_";
 
+/// The header Anthropic SDKs send their API key in. A virtual key is accepted
+/// here as well as in `authorization`, so those SDKs need only a new base URL
+/// and key. Only a value with [`KEY_PREFIX`] is read as a credential; the auth
+/// filter removes the header from every request it admits, whatever it held,
+/// so a client's own provider key never reaches the upstream.
+pub const X_API_KEY: &str = "x-api-key";
+
 /// Rejects a tenant or key id that is empty or longer than
 /// [`proxy_observability::records::MAX_PRINCIPAL_ID_BYTES`]. A free function
 /// rather than a check inside [`TenantId::new`]/[`KeyId::new`] because those
@@ -286,8 +293,15 @@ pub enum AuthError {
     /// [`KeyRecord`].
     UnknownKey,
     /// The presented value's digest matched a configured [`KeyRecord`], but
-    /// that record is marked `revoked`.
+    /// that record is marked `revoked`, or its `expires_at` has passed (an
+    /// expired key and a rotated key's previous secret after the overlap get
+    /// the same refusal as a revoked one).
     RevokedKey,
+    /// [`X_API_KEY`] carried a virtual key and `authorization` carried a
+    /// different credential (another virtual key, or anything else). Refused
+    /// rather than picking one, because the two could name different
+    /// principals.
+    ConflictingKeys,
 
     // -- `proxy_filters::jwt_auth::JwtAuthenticator`'s
     // rejection reasons. Added here (not on a separate error type) for the
@@ -556,6 +570,20 @@ pub struct KeyRecord {
     /// Chargeback tags the admin set on this key. An `Arc` so authentication
     /// clones a pointer.
     pub tags: Arc<ChargebackTags>,
+    /// Unix seconds from which this digest is refused, as if revoked. `None`
+    /// never expires. Checked against the clock on every request, so expiry
+    /// takes effect without a snapshot republish. A rotated key's previous
+    /// digest carries the end of its overlap window here.
+    pub expires_at: Option<u64>,
+}
+
+impl KeyRecord {
+    /// Whether this record is refused at `now_secs` (Unix seconds). The
+    /// expiry instant itself is already refused.
+    pub fn is_expired_at(&self, now_secs: u64) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| now_secs >= expires_at)
+    }
 }
 
 impl fmt::Debug for KeyRecord {
@@ -565,6 +593,7 @@ impl fmt::Debug for KeyRecord {
             .field("tenant", &self.tenant)
             .field("revoked", &self.revoked)
             .field("tags", &self.tags)
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -593,12 +622,17 @@ impl fmt::Debug for KeyRecord {
 /// gets (200 vs 401).
 pub struct KeySet {
     entries: HashMap<Vec<u8>, KeyRecord>,
+    /// The previous digest of each key inside a rotation overlap window. Kept
+    /// apart from `entries` so [`Self::iter`] still yields one row per key:
+    /// the listing, the tag write and the mint checks all read it that way.
+    previous: HashMap<Vec<u8>, KeyRecord>,
 }
 
 impl KeySet {
     pub fn new() -> Self {
         KeySet {
             entries: HashMap::new(),
+            previous: HashMap::new(),
         }
     }
 
@@ -625,6 +659,19 @@ impl KeySet {
         self.entries.insert(digest, record);
     }
 
+    /// Adds the previous digest of a rotated key. `record.expires_at` must be
+    /// the end of the overlap window: after it only the current digest (from
+    /// [`Self::insert_digest`]) authenticates.
+    pub fn insert_previous_digest(&mut self, digest: Vec<u8>, record: KeyRecord) {
+        self.previous.insert(digest, record);
+    }
+
+    /// The previous-digest records still in the set, one per key inside a
+    /// rotation overlap. Their `expires_at` is the end of the overlap.
+    pub fn previous_records(&self) -> impl Iterator<Item = &KeyRecord> {
+        self.previous.values()
+    }
+
     /// Finds the record for `presented`: one HMAC to derive the digest, then
     /// one table lookup, which is the whole decision. See the module doc's
     /// "No byte comparison of secrets happens here" for why there is no
@@ -632,7 +679,9 @@ impl KeySet {
     /// meaningful side channel.
     fn find(&self, secret: &HmacSecret, presented: &str) -> Option<&KeyRecord> {
         let digest = ring::hmac::sign(&secret.0, presented.as_bytes());
-        self.entries.get(digest.as_ref())
+        self.entries
+            .get(digest.as_ref())
+            .or_else(|| self.previous.get(digest.as_ref()))
     }
 
     /// Iterates this set's `(digest, record)` pairs.
@@ -663,9 +712,10 @@ impl Default for KeySet {
 
 impl fmt::Debug for KeySet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only the count -- never a digest.
+        // Only the counts -- never a digest.
         f.debug_struct("KeySet")
             .field("len", &self.entries.len())
+            .field("previous", &self.previous.len())
             .finish()
     }
 }
@@ -1005,6 +1055,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
             "llmp_correct-key",
         );
@@ -1034,6 +1085,7 @@ mod tests {
                 tenant: TenantId::new("tenant-t"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         keys.insert(
@@ -1044,6 +1096,7 @@ mod tests {
                 tenant: TenantId::new("tenant-u"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         let set = TenantCredentialSet::new(HashMap::from([(
@@ -1158,6 +1211,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
             "llmp_the-configured-key",
         );
@@ -1184,6 +1238,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
             "llmp_the-configured-key",
         );
@@ -1209,6 +1264,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
             "llmp_the-configured-key",
         );
@@ -1240,6 +1296,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: true,
                 tags: Default::default(),
+                expires_at: None,
             },
             "llmp_revoked-key",
         );
@@ -1272,6 +1329,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
         );
         let auth = VirtualKeyAuthenticator::new(
@@ -1303,6 +1361,7 @@ mod tests {
             tenant: TenantId::new("tenant-a"),
             revoked: false,
             tags: Default::default(),
+            expires_at: None,
         };
         let mut keys = KeySet::new();
         keys.insert(&secret, plaintext_key, record);
@@ -1377,6 +1436,7 @@ mod tests {
                 tenant: TenantId::new("tenant-a"),
                 revoked: false,
                 tags: Default::default(),
+                expires_at: None,
             },
             "llmp_almost-the-right-key-A",
         );
