@@ -317,6 +317,8 @@ fn spend_charge(micro_usd: u64) -> LedgerCharge {
             scope: crate::records::ChargeScope::Tenant,
             id: "t1".into(),
             period: "2026-10".into(),
+            micro_usd: None,
+            alert_percent: None,
         }],
         rate_card_version: Some("v1".into()),
     }

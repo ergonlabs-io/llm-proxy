@@ -548,6 +548,120 @@ impl KeyBudget {
     }
 }
 
+/// A tenant budget narrowed to the requests that match it: by model pattern,
+/// by provider, or both. A tenant has any number of these beside its own
+/// [`TenantBudget`], and every one that matches a request is enforced.
+///
+/// # Models match the routing model, providers match the cluster dialled
+///
+/// `models` uses [`ModelPattern`] (an exact name, or a prefix ending in one
+/// `*`) against the model the request is routed as: the fleet alias the
+/// client sent, or the resolver's pick. Never the upstream model id: that id
+/// is a provider's value, so it would change with failover (AGENTS.md
+/// invariant 6), and the provider axis is `providers`. `providers` names
+/// clusters, compared with the cluster each attempt actually dialled, so a
+/// failover charges the member that served (AGENTS.md "Policy Domains").
+///
+/// Empty `models` matches every model; empty `providers` covers every
+/// cluster. At least one is non-empty: a budget narrowed by neither is a
+/// [`TenantBudget`], and the admin API refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedBudget {
+    /// Unique within the tenant; see [`ScopedBudget::is_valid_name`].
+    pub name: String,
+    pub max_micros: MicroUsd,
+    pub period: Period,
+    /// As [`TenantBudget::credential_source`]: enforced and charged only for
+    /// requests in this credential mode.
+    pub credential_source: CredentialSource,
+    pub models: Vec<crate::model_authz::ModelPattern>,
+    pub providers: Vec<String>,
+    /// Utilization levels, in whole percent of `max_micros`, at which a
+    /// charge is marked as an alert. Ascending, unique, each in `1..=100`.
+    pub alert_at_percent: Vec<u8>,
+}
+
+impl ScopedBudget {
+    /// Longest accepted name, in bytes.
+    pub const MAX_NAME_LEN: usize = 64;
+
+    /// Names are lowercase ASCII letters, digits, `-` and `_`, starting with
+    /// a letter or digit. They appear in metric labels, ledger entries and
+    /// store keys, so they never carry a separator or a reserved label (the
+    /// tenant's own series is `-tenant-`).
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= Self::MAX_NAME_LEN
+            && name
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+
+    /// Whether a request routed as `model` falls under this budget. A
+    /// request with no model matches only a budget that names no models.
+    pub fn matches_model(&self, model: Option<&str>) -> bool {
+        self.models.is_empty()
+            || model.is_some_and(|model| self.models.iter().any(|p| p.matches(model)))
+    }
+
+    /// Whether spend on `cluster` counts toward this budget.
+    pub fn covers_cluster(&self, cluster: &str) -> bool {
+        self.providers.is_empty() || self.providers.iter().any(|p| p == cluster)
+    }
+
+    /// The highest of [`Self::alert_at_percent`] that `total_micros` has
+    /// reached, if any. Integer arithmetic, so the threshold and the gauge
+    /// ([`utilization_percent`]) agree on every boundary.
+    pub fn alert_level(&self, total_micros: u64) -> Option<u8> {
+        let limit = self.max_micros.as_micros();
+        self.alert_at_percent
+            .iter()
+            .rev()
+            .copied()
+            .find(|percent| reached_percent(total_micros, limit, *percent))
+    }
+}
+
+/// Whether `total` is at least `percent` % of `limit`. A zero limit is
+/// reached at once, as admission treats it.
+fn reached_percent(total: u64, limit: u64, percent: u8) -> bool {
+    u128::from(total) * 100 >= u128::from(limit) * u128::from(percent)
+}
+
+/// `total` as whole percent of `limit`, floored. A zero limit reads as 100
+/// when nothing is spent and saturates otherwise.
+pub fn utilization_percent(total: u64, limit: u64) -> i64 {
+    if limit == 0 {
+        return if total == 0 { 100 } else { i64::MAX };
+    }
+    i64::try_from(u128::from(total) * 100 / u128::from(limit)).unwrap_or(i64::MAX)
+}
+
+/// The spend row of one scoped budget. Private to the store boundary like
+/// [`key_spend_subject`]: `\u{1f}scoped:<tenant>\u{1f}<name>`. The name
+/// has no separator ([`ScopedBudget::is_valid_name`]), so the last one
+/// splits it from the tenant.
+pub fn scoped_spend_subject(tenant: &TenantId, name: &str) -> TenantId {
+    TenantId::new(format!(
+        "{SCOPED_SUBJECT_PREFIX}{}\u{1f}{name}",
+        tenant.as_str()
+    ))
+}
+
+/// `(tenant, budget name)` of a [`scoped_spend_subject`], or `None` for any
+/// other subject.
+pub fn scoped_spend_subject_parts(subject: &str) -> Option<(&str, &str)> {
+    subject
+        .strip_prefix(SCOPED_SUBJECT_PREFIX)?
+        .rsplit_once('\u{1f}')
+}
+
+const SCOPED_SUBJECT_PREFIX: &str = "\u{1f}scoped:";
+
 /// What this replica does when its spend state has gone STALE -- when the
 /// accumulator has not reconciled with the store for longer than
 /// [`ReconciliationPolicy::bound`].

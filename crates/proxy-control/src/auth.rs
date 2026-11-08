@@ -212,6 +212,9 @@ pub struct TenantPolicy {
     /// CRUD keep the two distinguishable end to end; see [`crate::control::ControlPlane::set_budget`]
     /// and its store methods.
     pub budget: Option<crate::spend::TenantBudget>,
+    /// Budgets narrowed by model or provider, enforced beside `budget`. Empty
+    /// when the tenant has none. An `Arc` so a request clones a pointer.
+    pub scoped_budgets: Arc<[crate::spend::ScopedBudget]>,
 }
 
 impl fmt::Debug for TenantPolicy {
@@ -225,6 +228,7 @@ impl fmt::Debug for TenantPolicy {
         f.debug_struct("TenantPolicy")
             .field("model_access", &self.model_access)
             .field("budget", &self.budget)
+            .field("scoped_budgets", &self.scoped_budgets)
             .finish()
     }
 }

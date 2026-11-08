@@ -198,6 +198,11 @@ pub struct LoadBalancerContext {
     /// Rust note: `Arc<[String]>` because the list is built once per snapshot and shared by every request of that
     /// tenant. Each request clones a pointer, not the strings.
     pub credential_providers: Option<std::sync::Arc<[String]>>,
+    /// Clusters this request must not dial, whatever their health: an
+    /// aggregate skips such a member exactly as it skips one in
+    /// [`Self::attempted_clusters`]. Set from a spent provider budget.
+    /// `None` excludes nothing.
+    pub excluded_clusters: Option<std::sync::Arc<[String]>>,
 }
 
 /// Circuit-breaker accounting for one (cluster, priority): S5's four per-priority budgets. The router enforces

@@ -503,6 +503,9 @@ pub enum ChargeScope {
     Tenant,
     /// The virtual key, which is also the user.
     Key,
+    /// A tenant budget narrowed by model pattern or provider; `id` is the
+    /// budget's name within the entry's tenant.
+    Scoped,
 }
 
 /// One spend counter a charge was added to.
@@ -512,6 +515,17 @@ pub struct ChargedScope {
     pub id: String,
     /// The UTC budget period the charge fell in: `YYYY-MM-DD` or `YYYY-MM`.
     pub period: String,
+    /// The amount added to this counter, when it differs in kind from the
+    /// entry's `charged_micro_usd`: a provider-scoped budget is charged only
+    /// the attempts that dialled one of its providers. `None` for tenant and
+    /// key counters, which take the whole charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_usd: Option<u64>,
+    /// The highest alert threshold, in percent of the ceiling, that this
+    /// charge carried the counter's total to or past for the first time this
+    /// period on this replica. `None` when it crossed none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_percent: Option<u8>,
 }
 
 /// What the terminal-record point adds to the record to make an entry; the

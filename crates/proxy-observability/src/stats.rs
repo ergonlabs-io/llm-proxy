@@ -1308,6 +1308,24 @@ pub mod instruments {
         attribute_keys: &[],
         buckets: None,
     };
+    /// How much of a spend ceiling the current period has used, in whole
+    /// percent (floored; above 100 when in-flight requests overran it). One
+    /// series per chain (`scope`, the HCM `stat_prefix`, since each chain
+    /// keeps its own spend rows) and tenant budget (`budget` is
+    /// [`SPEND_BUDGET_TENANT`]) or scoped budget (`budget` is its name).
+    /// Key budgets are left out: a key is a user, and a user id never
+    /// becomes a label (AGENTS.md "Policy Domains"). Published by the spend
+    /// flusher, never on the request path.
+    pub const SPEND_BUDGET_UTILIZATION: Instrument = Instrument {
+        name: "llmproxy_spend_budget_utilization",
+        kind: InstrumentKind::UpDownCounter,
+        unit: "%",
+        attribute_keys: &["scope", "tenant", "budget"],
+        buckets: None,
+    };
+    /// [`SPEND_BUDGET_UTILIZATION`]'s `budget` value for a tenant's own
+    /// budget. Scoped budget names cannot take it: they never start with `-`.
+    pub const SPEND_BUDGET_TENANT: &str = "-tenant-";
     /// ADR-0010 decision 1: requests a spend budget or token limit refused
     /// because the proxy cannot count their endpoint. `endpoint` is the
     /// classifier's closed label set; `control` is `spend` or `token_limit`.

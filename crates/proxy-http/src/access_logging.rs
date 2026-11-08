@@ -2180,6 +2180,8 @@ mod tests {
             scope: proxy_observability::records::ChargeScope::Key,
             id: "key-a".into(),
             period: "2026-10".into(),
+            micro_usd: None,
+            alert_percent: None,
         };
         {
             let mut info = ctx.stream_info.borrow_mut();

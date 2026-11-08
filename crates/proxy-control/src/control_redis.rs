@@ -1197,6 +1197,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             policies,
             budgets,
             key_budgets,
+            scoped_budgets: HashMap::new(),
             limits,
             tenant_credentials,
             rate_cards,

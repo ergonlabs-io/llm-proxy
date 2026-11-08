@@ -906,6 +906,8 @@ impl SpendLimitFilterInstance {
                 scope: ChargeScope::Key,
                 id: key_id.as_str().to_owned(),
                 period: period.key_for(now).as_str().to_owned(),
+                micro_usd: None,
+                alert_percent: None,
             });
         }
         if let Some((tenant, tenant_period)) = &self.tenant {
@@ -925,6 +927,8 @@ impl SpendLimitFilterInstance {
                     scope: ChargeScope::Tenant,
                     id: tenant.as_str().to_owned(),
                     period: tenant_period.key_for(now).as_str().to_owned(),
+                    micro_usd: None,
+                    alert_percent: None,
                 });
             }
         }

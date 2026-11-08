@@ -190,6 +190,31 @@ pub struct AttemptCharge {
     pub attempt_index: Option<u16>,
 }
 
+/// Provider clusters a spent budget closes to one request, and the refusal
+/// the router sends when every cluster the route could dial is closed. The
+/// spend filter decides the clusters and builds the reply; the router only
+/// applies them, so the router never learns about money.
+#[derive(Debug, Clone)]
+pub struct SpendExclusion {
+    /// Cluster names, as the router's attempt loop sees them (a member's own
+    /// name on an aggregate).
+    pub clusters: std::sync::Arc<[String]>,
+    pub refusal: PreparedReply,
+}
+
+/// A complete local reply built ahead of time by a filter, for a later stage
+/// to send verbatim.
+#[derive(Debug, Clone)]
+pub struct PreparedReply {
+    pub status: http::StatusCode,
+    pub headers: http::HeaderMap,
+    pub body: bytes::Bytes,
+    /// `%RESPONSE_CODE_DETAILS%` for the reply.
+    pub details: &'static str,
+    /// The response flag the reply sets.
+    pub flag: ResponseFlag,
+}
+
 /// What the spend filter added to the spend counters for this request,
 /// published when it priced the request's usage so the ledger entry copies
 /// the charge instead of pricing it a second time (ADR-0009 decision 4).
@@ -562,6 +587,12 @@ pub struct StreamInfo {
     /// means platform mode. The request keeps this `Arc` for its lifetime, so
     /// a credential change applies to the next request, not to in-flight ones.
     pub tenant_credentials: Option<std::sync::Arc<proxy_credentials::TenantCredentialSet>>,
+    /// Clusters this request must not dial because a spend budget that
+    /// covers them is spent, with the reply to send when no other cluster is
+    /// left. Set by the spend filter at the end of the request body; the
+    /// router skips these clusters as it skips an aggregate member an earlier
+    /// attempt used. `None` means nothing is excluded.
+    pub spend_exclusion: Option<std::sync::Arc<SpendExclusion>>,
     /// Whose credential the most recent attempt was sent with. Kept here as
     /// well as on `AttemptInfo` because attempt snapshots exist only while
     /// request records are on, and access logs need it regardless.
@@ -674,6 +705,7 @@ impl Default for StreamInfo {
             llm: LlmStats::default(),
             auth: AuthInfo::default(),
             tenant_credentials: None,
+            spend_exclusion: None,
             credential_source: None,
             requested_model: None,
             request_facts: RequestFacts::default(),

@@ -266,6 +266,7 @@ pub fn parse_config(config: &DynamicMessage) -> Result<TenantPolicyMap, ConfigEr
             Arc::new(TenantPolicy {
                 model_access: Some(model_access),
                 budget: None,
+                scoped_budgets: Arc::default(),
             }),
         );
     }
@@ -1312,6 +1313,7 @@ mod tests {
                     Arc::new(TenantPolicy {
                         model_access: Some(model_access),
                         budget: None,
+                        scoped_budgets: Arc::default(),
                     }),
                 )
             })

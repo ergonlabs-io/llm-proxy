@@ -251,6 +251,10 @@ pub struct StoredControlPlane {
     /// Key budgets, filed in the same budgets table under the key's subject
     /// (see [`EncodedKeyBudget`]) and split out on load.
     pub key_budgets: HashMap<KeyId, KeyBudget>,
+    /// Each tenant's scoped budgets, filed as one row per tenant in the same
+    /// budgets table. A tenant with none has
+    /// no entry.
+    pub scoped_budgets: HashMap<TenantId, Vec<crate::spend::ScopedBudget>>,
     pub limits: HashMap<TenantId, LimitPolicy>,
     /// Every tenant credential row. A store that does not support them yet
     /// returns an empty list here and refuses writes.
@@ -568,6 +572,20 @@ pub trait ControlPlaneStore: Send + Sync {
         tenant: &TenantId,
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError>;
+
+    /// Replaces a tenant's whole set of scoped budgets; an empty slice
+    /// removes them. Bumps the policy generation. A store without support
+    /// refuses the write.
+    fn set_scoped_budgets(
+        &self,
+        tenant: &TenantId,
+        budgets: &[crate::spend::ScopedBudget],
+    ) -> Result<(), StoreError> {
+        let _ = (tenant, budgets);
+        Err(StoreError::Unavailable(
+            "scoped budgets are not supported by this store".into(),
+        ))
+    }
 
     /// Sets or clears a key's spend budget, the key-level twin of
     /// [`Self::set_budget`]. Each write bumps the policy generation.
@@ -1204,6 +1222,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
             key_budgets: state.key_budgets.clone(),
+            scoped_budgets: HashMap::new(),
             limits: state.limits.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
             rate_cards: state.rate_cards.values().cloned().collect(),
@@ -2804,6 +2823,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             policies,
             budgets,
             key_budgets,
+            scoped_budgets: HashMap::new(),
             limits,
             tenant_credentials,
             rate_cards,
@@ -5744,6 +5764,7 @@ impl ControlPlane {
                 Arc::new(TenantPolicy {
                     model_access: Some(access),
                     budget,
+                    scoped_budgets: Arc::default(),
                 }),
             );
         }
@@ -5754,6 +5775,7 @@ impl ControlPlane {
                     // A budget row is not a model grant (review H4).
                     model_access: None,
                     budget: Some(budget),
+                    scoped_budgets: Arc::default(),
                 }),
             );
         }
@@ -7738,6 +7760,7 @@ mod tests {
             Arc::new(TenantPolicy {
                 model_access: Some(access.clone()),
                 budget: None,
+                scoped_budgets: Arc::default(),
             }),
         );
 
@@ -7773,6 +7796,7 @@ mod tests {
             Arc::new(TenantPolicy {
                 model_access: Some(bootstrap_access),
                 budget: None,
+                scoped_budgets: Arc::default(),
             }),
         );
 
@@ -7810,6 +7834,7 @@ mod tests {
             Arc::new(TenantPolicy {
                 model_access: Some(bootstrap_access.clone()),
                 budget: None,
+                scoped_budgets: Arc::default(),
             }),
         );
 
