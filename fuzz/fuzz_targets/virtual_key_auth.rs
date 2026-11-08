@@ -11,6 +11,10 @@
 //! `NoCredential` (left to a later authenticator, such as JWT) exactly when it
 //! is not shaped `Bearer llmp_...`. Anything else shaped like a virtual key
 //! is `UnknownKey`.
+//!
+//! Only `Authorization` is set. The `x-api-key` rules and key expiry are
+//! pinned by the header table in `auth.rs` and `control/key_lifecycle_tests.rs`;
+//! neither adds parsing this target would reach.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -47,6 +51,7 @@ fuzz_target!(|data: &[u8]| {
             tenant: TenantId::new("tenant-a"),
             revoked: false,
             tags: Default::default(),
+            expires_at: None,
         },
     );
     keys.insert(
@@ -57,6 +62,7 @@ fuzz_target!(|data: &[u8]| {
             tenant: TenantId::new("tenant-a"),
             revoked: true,
             tags: Default::default(),
+            expires_at: None,
         },
     );
     let authenticator = VirtualKeyAuthenticator::from_static_keys(HmacSecret::new(SECRET), keys);
