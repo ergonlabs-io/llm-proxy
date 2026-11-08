@@ -112,6 +112,79 @@ export function parseLedgerPage(bodyText: string): LedgerPage | null {
   return { rows, committedThrough: v.committed_through }
 }
 
+/** How far back the spend page reads. */
+export const SPEND_DAYS = 30
+/** Most pages of 1000 entries one load reads; past it the page says the figures are partial. */
+export const SPEND_MAX_PAGES = 20
+const SPEND_PAGE = 1000
+
+/** One ledger read: entries with a cursor above `after`, at most `limit`. */
+export type FetchLedgerPage = (after: number, limit: number) => Promise<LedgerPage | null>
+
+export interface LedgerWindow {
+  rows: LedgerRow[]
+  /** The ledger holds older entries than were read, still inside the window. */
+  truncated: boolean
+}
+
+/**
+ * Reads ledger entries back from the newest until one is older than `sinceMs`,
+ * the ledger's start, or `maxPages` pages. Only reads what `/ledger/entries`
+ * already shows this token. Returns null when a page cannot be read.
+ */
+export async function readLedgerSince(
+  fetchPage: FetchLedgerPage,
+  sinceMs: number,
+  maxPages: number = SPEND_MAX_PAGES,
+): Promise<LedgerWindow | null> {
+  const head = await fetchPage(0, 1)
+  if (!head) return null
+  const rows: LedgerRow[] = []
+  let end = head.committedThrough
+  for (let page = 0; page < maxPages; page++) {
+    const after = Math.max(0, end - SPEND_PAGE)
+    const got = await fetchPage(after, end - after)
+    if (!got) return null
+    rows.push(...got.rows)
+    const oldest = got.rows[got.rows.length - 1]
+    // Rows are newest first; an empty page means the entries below were acknowledged away.
+    if (after === 0 || !oldest || Date.parse(oldest.finishedAt) < sinceMs) {
+      return { rows: rows.filter((r) => !(Date.parse(r.finishedAt) < sinceMs)), truncated: false }
+    }
+    end = after
+  }
+  return { rows: rows.filter((r) => !(Date.parse(r.finishedAt) < sinceMs)), truncated: true }
+}
+
+export interface SpendGroup {
+  tenant: string
+  key: string
+  model: string
+  requests: number
+  chargedMicroUsd: number
+}
+
+/** Ledger spend per tenant, key and requested model, largest charge first. */
+export function groupSpend(rows: LedgerRow[]): SpendGroup[] {
+  const groups = new Map<string, SpendGroup>()
+  for (const r of rows) {
+    const key = r.key ?? '-'
+    const model = r.requestedModel ?? '-'
+    const id = JSON.stringify([r.tenant, key, model])
+    const g = groups.get(id) ?? { tenant: r.tenant, key, model, requests: 0, chargedMicroUsd: 0 }
+    g.requests += 1
+    g.chargedMicroUsd += r.chargedMicroUsd
+    groups.set(id, g)
+  }
+  return [...groups.values()].sort(
+    (a, b) =>
+      b.chargedMicroUsd - a.chargedMicroUsd ||
+      a.tenant.localeCompare(b.tenant) ||
+      a.key.localeCompare(b.key) ||
+      a.model.localeCompare(b.model),
+  )
+}
+
 /** Micro-USD as dollars, without float drift for the amounts a ledger holds. */
 export function microUsd(amount: number): string {
   const whole = Math.floor(amount / 1_000_000)

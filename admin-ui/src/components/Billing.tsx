@@ -8,6 +8,7 @@ import { Table, THead, TRow, TH, TD } from './ui/table'
 import { ResultPanel } from './forms'
 import { apiFetch, type AdminConn, type ApiResult } from '../lib/api'
 import type { AdminState } from '../lib/useAdminState'
+import { SpendByModel } from './SpendByModel'
 import { microUsd, newestWindowAfter, parseLedgerPage, showFeature, type LedgerRow } from '../lib/observability'
 
 const WINDOWS = [50, 200, 1000]
@@ -71,6 +72,7 @@ export function Billing({ conn, state }: { conn: AdminConn; state: AdminState })
 
   return (
     <div className="space-y-4">
+      {showFeature(state.ledger) && <SpendByModel conn={conn} refreshKey={`${state.ledger}${state.tokensSeen}`} />}
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between gap-2">

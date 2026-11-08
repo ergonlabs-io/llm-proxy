@@ -10,6 +10,21 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ## [Unreleased]
 
+### Added
+
+- Usage and spend analytics without a proxy database
+  ([docs](docs/site/src/content/docs/observability/spend-analytics.md)):
+  - DuckDB queries in `examples/analytics/` for spend by tenant, key and model
+    over saved `/ledger/entries` pages, and for requests and tokens over the
+    `--request-records-file` output. An ignored end-to-end test runs them
+    against records from the real binary and checks the totals against the
+    ledger.
+  - A Grafana dashboard, `deploy/grafana/llm-proxy-dashboard.json`. A test
+    checks every panel query against the exported metric names and labels.
+  - A "Spend by model and key, last 30 days" table on the admin UI Billing
+    page, grouped in the browser from `/ledger/entries`. No admin route is
+    added.
+
 ### Changed
 
 - Rate-limit and spend 429s (`llmproxy.token_limit`, `llmproxy.spend_limit`):

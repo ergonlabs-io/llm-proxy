@@ -8,6 +8,7 @@ lastUpdated: 2026-10-21
 related:
   - observability/access-logs
   - observability/request-capture
+  - observability/spend-analytics
   - observability/metrics-and-stats
   - observability/trace-export
   - limits-and-budgets/billing-ledger

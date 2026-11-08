@@ -126,6 +126,7 @@ export default defineConfig({
 						{ label: 'Metrics and /stats', slug: 'observability/metrics-and-stats' },
 						{ label: 'Tracing', slug: 'observability/tracing' },
 						{ label: 'Request records', slug: 'observability/request-capture' },
+						{ label: 'Usage and spend analytics', slug: 'observability/spend-analytics' },
 						{ label: 'Request and response body export', slug: 'observability/trace-export' },
 					],
 				},

@@ -7,6 +7,9 @@ import {
   parseLedgerPage,
   parseTraceCounters,
   parseTraceGate,
+  groupSpend,
+  readLedgerSince,
+  type FetchLedgerPage,
 } from './observability'
 
 // The 404 bodies the admin server sends when a block is absent from the config.
@@ -144,5 +147,73 @@ describe('trace gate', () => {
   it('parses the gate status', () => {
     expect(parseTraceGate('{"disabled":false,"generation":0}')).toEqual({ disabled: false, generation: 0 })
     expect(parseTraceGate('{"disabled":"no"}')).toBeNull()
+  })
+})
+
+describe('spend by model and key', () => {
+  const page = (entries: ReturnType<typeof entry>[], through: number) =>
+    parseLedgerPage(JSON.stringify({ entries, committed_through: through }))
+
+  it('sums the ledger charge per tenant, key and requested model, largest first', () => {
+    const rows = page(
+      [
+        entry(1, { key_id: 'a', requested_model: 'gpt-4o' }),
+        entry(2, { key_id: 'a', requested_model: 'gpt-4o' }),
+        entry(3, { key_id: 'b', requested_model: 'gpt-4o' }),
+        { ...entry(4, { key_id: 'b', requested_model: 'mini', tenant_id: 'other' }), charged_micro_usd: 100 },
+      ],
+      4,
+    )!.rows
+    expect(groupSpend(rows)).toEqual([
+      { tenant: 'other', key: 'b', model: 'mini', requests: 1, chargedMicroUsd: 100 },
+      { tenant: 'team', key: 'a', model: 'gpt-4o', requests: 2, chargedMicroUsd: 24 },
+      { tenant: 'team', key: 'b', model: 'gpt-4o', requests: 1, chargedMicroUsd: 12 },
+    ])
+  })
+
+  it('does not merge groups whose fields only look alike when joined', () => {
+    const rows = page(
+      [entry(1, { key_id: 'a|b', requested_model: 'c' }), entry(2, { key_id: 'a', requested_model: 'b|c' })],
+      2,
+    )!.rows
+    expect(groupSpend(rows)).toHaveLength(2)
+  })
+
+  // A ledger of 2500 entries, cursor n finished on day n of a fake clock.
+  const day = 86_400_000
+  const t0 = Date.parse('2026-01-01T00:00:00Z')
+  const ledger = (total: number): FetchLedgerPage => async (after, limit) => {
+    const entries = []
+    for (let c = after + 1; c <= Math.min(total, after + limit); c++) {
+      entries.push(entry(c, { finished_at: new Date(t0 + c * day / 100).toISOString() }))
+    }
+    return page(entries, total)
+  }
+
+  it('reads back to the window start and stops there', async () => {
+    // Cursor c finished 0.01 day * c after t0, so a window from day 10 starts at cursor 1000.
+    const inner = ledger(2500)
+    const reads: number[] = []
+    const got = await readLedgerSince(async (after, limit) => {
+      reads.push(after)
+      return inner(after, limit)
+    }, t0 + 10 * day)
+    // The head read, then the pages after 1500 and after 500; never the oldest page.
+    expect(reads).toEqual([0, 1500, 500])
+    // Entries older than day 10 (cursor < 1000) are dropped; the read stopped after the page holding them.
+    expect(got?.truncated).toBe(false)
+    expect(got?.rows.length).toBe(1501)
+    expect(Math.min(...got!.rows.map((r) => r.cursor))).toBe(1000)
+  })
+
+  it('reports a partial read when the page cap cuts it off', async () => {
+    const got = await readLedgerSince(ledger(2500), t0, 2)
+    expect(got?.truncated).toBe(true)
+    expect(got?.rows.length).toBe(2000)
+  })
+
+  it('fails the whole read when any page fails', async () => {
+    const failing: FetchLedgerPage = async (_after, limit) => (limit === 1 ? page([], 2500) : null)
+    expect(await readLedgerSince(failing, t0)).toBeNull()
   })
 })

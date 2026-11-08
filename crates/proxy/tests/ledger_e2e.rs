@@ -358,6 +358,183 @@ fn chargeback_tags_reach_the_ledger_entry_and_never_a_metric_label() {
     assert_eq!(spend["tags"], serde_json::json!({"team": "infra"}));
 }
 
+/// The DuckDB recipe in `examples/analytics` run against what the real binary
+/// wrote: ledger pages from `/ledger/entries` and the `--request-records-file`
+/// sink. Per tenant, key and model, the recipe's charge must equal the sum of
+/// the ledger entries' own `charged_micro_usd`, and in total the spend counter.
+/// Needs the `duckdb` CLI (`DUCKDB_BIN` overrides the path).
+#[test]
+#[ignore = "needs the duckdb CLI on PATH, or DUCKDB_BIN"]
+fn the_duckdb_recipe_totals_match_the_ledger() {
+    use std::collections::BTreeMap;
+    let dir = TempLedgerDir::new();
+    let ledger = dir.config(1024, OnUnavailable::Reject);
+    let config = billing_config(&ledger, mock_upstream(), "reject", 1024);
+    let records_file = dir.root.path().join("request-records.jsonl");
+    let proxy = Proxy::start_with_args(
+        dir.root.path(),
+        &config,
+        Some(NODE),
+        &["--request-records-file", records_file.to_str().unwrap()],
+    );
+    let key_a = proxy.mint_key_with(r#"{"tenant":"t1","key_id":"key-a"}"#);
+    let created = http(
+        proxy.admin(),
+        "POST",
+        "/keys",
+        Some(ADMIN_TOKEN),
+        r#"{"tenant":"t1","key_id":"key-b"}"#,
+    );
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    let key_b = json_body(&created)["key"].as_str().unwrap().to_owned();
+
+    let chat = |key: &str, model: &str| {
+        let body =
+            format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+        let response = http(
+            proxy.listen,
+            "POST",
+            "/v1/chat/completions",
+            Some(key),
+            &body,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    };
+    for _ in 0..3 {
+        chat(&key_a, "gpt-4o");
+    }
+    chat(&key_b, "gpt-4o");
+    chat(&key_b, "gpt-4o");
+    chat(&key_b, "gpt-4o-mini");
+    // Refused before a provider: in the records file, not in the ledger.
+    let refused = http(
+        proxy.listen,
+        "POST",
+        "/v1/chat/completions",
+        Some("not-a-key"),
+        r#"{"model":"gpt-4o","messages":[]}"#,
+    );
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+
+    let scrape =
+        proxy.scrape_until(|s| counter(s, "envoy_llmproxy_ledger_entries_committed_total") == 6);
+    let page_response = http(
+        proxy.admin(),
+        "GET",
+        "/ledger/entries?limit=1000",
+        Some(ADMIN_TOKEN),
+        "",
+    );
+    assert!(page_response.starts_with("HTTP/1.1 200"), "{page_response}");
+    let page_body = page_response.split_once("\r\n\r\n").unwrap().1;
+    let work = dir.root.path();
+    std::fs::write(work.join("ledger-entries-1.json"), page_body).unwrap();
+    // The sink is asynchronous: wait for all seven records.
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while std::fs::read_to_string(&records_file)
+        .unwrap_or_default()
+        .lines()
+        .count()
+        < 7
+    {
+        assert!(Instant::now() < deadline, "records never reached the file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Expected values come from the ledger entries themselves, grouped here.
+    let mut expected: BTreeMap<(String, String, String), (u64, u64)> = BTreeMap::new();
+    for entry in json_body_str(page_body)["entries"].as_array().unwrap() {
+        let record = &entry["record"];
+        let group = expected
+            .entry((
+                record["tenant_id"].as_str().unwrap().to_owned(),
+                record["key_id"].as_str().unwrap().to_owned(),
+                record["requested_model"].as_str().unwrap().to_owned(),
+            ))
+            .or_default();
+        group.0 += 1;
+        group.1 += entry["charged_micro_usd"].as_u64().unwrap();
+    }
+    assert_eq!(expected.len(), 3, "{expected:?}");
+    let ledger_total: u64 = expected.values().map(|v| v.1).sum();
+    assert!(ledger_total > 0, "nothing was priced: {expected:?}");
+    assert_eq!(
+        ledger_total,
+        counter(&scrape, "envoy_llmproxy_spend_charged_micro_usd_total")
+    );
+
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/analytics");
+    // The docs page shows these exact queries.
+    let docs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/site/src/content/docs/observability/spend-analytics.md"),
+    )
+    .unwrap();
+    for file in [
+        "spend-by-model-and-key.sql",
+        "requests-by-model-and-key.sql",
+    ] {
+        let sql = std::fs::read_to_string(examples.join(file)).unwrap();
+        assert!(
+            docs.contains(sql.trim_end()),
+            "docs page drifted from {file}"
+        );
+    }
+    let rows = duckdb(work, &examples.join("spend-by-model-and-key.sql"));
+    let got: BTreeMap<(String, String, String), (u64, u64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                (
+                    r["tenant"].as_str().unwrap().to_owned(),
+                    r["key"].as_str().unwrap().to_owned(),
+                    r["model"].as_str().unwrap().to_owned(),
+                ),
+                (
+                    r["requests"].as_u64().unwrap(),
+                    r["charged_micro_usd"].as_u64().unwrap(),
+                ),
+            )
+        })
+        .collect();
+    assert_eq!(got, expected, "ledger recipe disagrees with the ledger");
+
+    // The records-file recipe sees the refused request too, charged 0, and
+    // its joined charges add up to the same total.
+    let rows = duckdb(work, &examples.join("requests-by-model-and-key.sql"));
+    assert_eq!(
+        rows.len(),
+        4,
+        "three groups and the refused request: {rows:?}"
+    );
+    let refused_row = rows.iter().find(|r| r["key"].is_null()).unwrap();
+    assert_eq!(refused_row["requests"], 1);
+    assert_eq!(refused_row["charged_micro_usd"], 0);
+    for row in rows.iter().filter(|r| !r["key"].is_null()) {
+        let group = (
+            row["tenant"].as_str().unwrap().to_owned(),
+            row["key"].as_str().unwrap().to_owned(),
+            row["model"].as_str().unwrap().to_owned(),
+        );
+        assert_eq!(
+            (
+                row["requests"].as_u64().unwrap(),
+                row["charged_micro_usd"].as_u64().unwrap()
+            ),
+            expected[&group],
+            "{group:?}"
+        );
+        assert_eq!(
+            row["input_tokens"].as_u64().unwrap(),
+            6 * expected[&group].0
+        );
+        assert_eq!(
+            row["output_tokens"].as_u64().unwrap(),
+            4 * expected[&group].0
+        );
+    }
+}
+
 // ------------------------------------------------------------------ helpers --
 
 /// A ledger, an admin listener, an `auth` block (so the spend filter charges
@@ -394,6 +571,14 @@ pricing:
             cached_input_nanodollars_per_token: 1000
             cache_write_nanodollars_per_token: 1000
             output_nanodollars_per_token: 2000
+      - provider_type: openai
+        model: gpt-4o-mini
+        tier_mode: whole_request
+        tiers:
+          - input_nanodollars_per_token: 500
+            cached_input_nanodollars_per_token: 500
+            cache_write_nanodollars_per_token: 500
+            output_nanodollars_per_token: 1000
       - provider_type: openai
         model: gpt-image-1
         basis: images
@@ -478,7 +663,12 @@ struct Proxy {
 }
 
 impl Proxy {
-    fn spawn(dir: &Path, config: &str, node: Option<&str>) -> (Child, std::path::PathBuf) {
+    fn spawn(
+        dir: &Path,
+        config: &str,
+        node: Option<&str>,
+        extra_args: &[&str],
+    ) -> (Child, std::path::PathBuf) {
         let path = dir.join("llmproxy.yaml");
         std::fs::write(&path, config).unwrap();
         let stderr = dir.join(format!("stderr-{}.log", free_port()));
@@ -486,6 +676,7 @@ impl Proxy {
         command
             .args(["--config", path.to_str().unwrap(), "--concurrency", "1"])
             .args(["--drain-time-s", "1"])
+            .args(extra_args)
             .env("LLMPROXY_ADMIN_TOKEN", ADMIN_TOKEN)
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&stderr).unwrap());
@@ -496,6 +687,11 @@ impl Proxy {
     }
 
     fn start(dir: &Path, config: &str, node: Option<&str>) -> Proxy {
+        Self::start_with_args(dir, config, node, &[])
+    }
+
+    /// [`Self::start`] with more command-line arguments.
+    fn start_with_args(dir: &Path, config: &str, node: Option<&str>, extra_args: &[&str]) -> Proxy {
         let port = |marker: &str| -> Option<SocketAddr> {
             let port: u16 = config
                 .split(marker)
@@ -507,7 +703,7 @@ impl Proxy {
                 .ok()?;
             Some(SocketAddr::from(([127, 0, 0, 1], port)))
         };
-        let (child, stderr) = Self::spawn(dir, config, node);
+        let (child, stderr) = Self::spawn(dir, config, node, extra_args);
         let proxy = Proxy {
             child,
             listen: port("listen: 127.0.0.1:").unwrap(),
@@ -530,7 +726,7 @@ impl Proxy {
 
     /// Runs a proxy that must exit non-zero on its own; returns its stderr.
     fn fails(dir: &Path, config: &str, node: Option<&str>) -> String {
-        let (mut child, stderr) = Self::spawn(dir, config, node);
+        let (mut child, stderr) = Self::spawn(dir, config, node, &[]);
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -699,7 +895,29 @@ fn http_with(
 
 fn json_body(response: &str) -> serde_json::Value {
     let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b);
-    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
+    json_body_str(body)
+}
+
+fn json_body_str(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+}
+
+/// Runs the SQL file with the `duckdb` CLI in `work` (where the recipe finds
+/// its input files) and parses its `-json` output.
+fn duckdb(work: &Path, sql: &Path) -> Vec<serde_json::Value> {
+    let bin = std::env::var("DUCKDB_BIN").unwrap_or_else(|_| "duckdb".to_owned());
+    let output = Command::new(bin)
+        .arg("-json")
+        .current_dir(work)
+        .stdin(std::fs::File::open(sql).unwrap())
+        .output()
+        .expect("run duckdb");
+    assert!(
+        output.status.success(),
+        "duckdb failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn mock_upstream() -> SocketAddr {
