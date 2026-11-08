@@ -16,6 +16,7 @@
 //! module under its old `proxy_filters::` path.
 
 pub mod auth;
+mod budget_utilization;
 pub mod control;
 pub mod control_redis;
 pub mod model_authz;

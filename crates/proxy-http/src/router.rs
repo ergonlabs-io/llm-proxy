@@ -800,8 +800,24 @@ impl RouterHandler {
         if let Some(set) = &tenant_set {
             ctx.credential_providers = Some(set.providers().clone());
         }
+        // A spent provider budget closes clusters (the spend filter decides
+        // which). A routed plain cluster that is closed is refused before any
+        // pick; an aggregate skips closed members as it skips tried ones.
+        let spend_exclusion = dcb.stream_info().spend_exclusion.clone();
+        if let Some(exclusion) = &spend_exclusion {
+            if exclusion.clusters.contains(&cluster_name) {
+                return spend_closed_reply(&mut dcb.stream_info(), exclusion);
+            }
+            ctx.excluded_clusters = Some(Arc::clone(&exclusion.clusters));
+        }
         let sel = match select_host_for_request(entry.as_ref(), &mut ctx) {
             Ok(sel) => sel,
+            Err(NoHost::SpendClosed) => {
+                let exclusion = spend_exclusion
+                    .as_deref()
+                    .expect("SpendClosed is returned only while an exclusion is set");
+                return spend_closed_reply(&mut dcb.stream_info(), exclusion);
+            }
             Err(NoHost::Ineligible(provider)) => {
                 self.stats.record_tenant_credential(
                     provider
@@ -1369,6 +1385,16 @@ impl RouterHandler {
         if let Some(set) = &tenant_set {
             ctx.credential_providers = Some(set.providers().clone());
         }
+        // A spent provider budget closes clusters (the spend filter decides
+        // which). A routed plain cluster that is closed is refused before any
+        // pick; an aggregate skips closed members as it skips tried ones.
+        let spend_exclusion = dcb.stream_info().spend_exclusion.clone();
+        if let Some(exclusion) = &spend_exclusion {
+            if exclusion.clusters.contains(&cluster_name) {
+                return spend_closed_reply(&mut dcb.stream_info(), exclusion);
+            }
+            ctx.excluded_clusters = Some(Arc::clone(&exclusion.clusters));
+        }
         if let Some(policy) = fwd.retry_policy.as_ref() {
             ctx.avoid_previous_hosts = policy.avoid_previous_hosts;
             ctx.host_selection_retry_max_attempts = policy.host_selection_retry_max_attempts;
@@ -1457,6 +1483,12 @@ impl RouterHandler {
                 }
                 let sel = match selected {
                     Ok(sel) => sel,
+                    Err(NoHost::SpendClosed) => {
+                        let exclusion = spend_exclusion
+                            .as_deref()
+                            .expect("SpendClosed is returned only while an exclusion is set");
+                        return spend_closed_reply(&mut dcb.stream_info(), exclusion);
+                    }
                     Err(NoHost::Ineligible(provider)) => {
                         self.stats.record_tenant_credential(
                             provider
@@ -3979,6 +4011,20 @@ fn tenant_credential_missing_reply(provider: Option<&str>) -> HttpResponseParts 
     resp
 }
 
+/// The spend filter's prepared refusal for a request whose every dialable
+/// cluster a spent provider budget closed.
+fn spend_closed_reply(
+    info: &mut crate::StreamInfo,
+    exclusion: &crate::stream_info::SpendExclusion,
+) -> HttpResponseParts {
+    let reply = &exclusion.refusal;
+    info.set_response_flag(reply.flag);
+    info.response_code_details = Some(reply.details.to_string());
+    let mut parts = local_reply_with_status(reply.status, reply.body.clone());
+    parts.head.headers = reply.headers.clone();
+    parts
+}
+
 /// Why [`select_host_for_request`] found no host.
 enum NoHost {
     /// Nothing healthy to dial: `503 no healthy upstream`.
@@ -3986,12 +4032,17 @@ enum NoHost {
     /// A host exists but the tenant has no credential for it: `403`. Carries
     /// the provider named by the first such cluster's slot, if it has one.
     Ineligible(Option<String>),
+    /// A host exists but a spent provider budget closed every cluster that
+    /// has one: the spend filter's prepared `429`.
+    SpendClosed,
 }
 
 /// Run host selection. In tenant mode, distinguish "no eligible cluster" from
 /// "nothing healthy": when the tenant-filtered pick finds nothing on the
 /// first attempt, probe once without the filter. A host there means the
 /// failure is eligibility, so `Err(Ineligible)`; otherwise `Err(Unhealthy)`.
+/// Spend exclusions are probed the same way, first: a host there means a
+/// spent provider budget refused, so `Err(SpendClosed)`.
 fn select_host_for_request(
     entry: &dyn ClusterEntry,
     ctx: &mut LoadBalancerContext,
@@ -4001,7 +4052,19 @@ fn select_host_for_request(
     }
     // On a retry the eligible members are exhausted, which is a health
     // outcome, so only the first pick is probed.
-    if ctx.credential_providers.is_none() || !ctx.attempted_clusters.is_empty() {
+    if !ctx.attempted_clusters.is_empty() {
+        return Err(NoHost::Unhealthy);
+    }
+    // A pick that succeeds once spend exclusions are lifted failed on spend.
+    if ctx.excluded_clusters.is_some() {
+        let excluded = ctx.excluded_clusters.take();
+        let probe = entry.select_host(ctx);
+        ctx.excluded_clusters = excluded;
+        if probe.is_some() {
+            return Err(NoHost::SpendClosed);
+        }
+    }
+    if ctx.credential_providers.is_none() {
         return Err(NoHost::Unhealthy);
     }
     let filter = ctx.credential_providers.take();

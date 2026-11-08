@@ -30,7 +30,7 @@ use chrono::Utc;
 use http::StatusCode;
 use prost_reflect::DynamicMessage;
 
-use crate::limit_reply::Reply;
+use crate::limit_reply::{BudgetScope, Reply};
 use proxy_config::ConfigError;
 use proxy_credentials::CredentialSource;
 use proxy_http::endpoint::Endpoint;
@@ -39,7 +39,7 @@ use proxy_http::filter::{
     FilterInstanceFactory, FilterTrailersStatus, HttpFilter, HttpFilterFactory, RequestHeaders,
     RequestTrailers, ResponseHeaders, ResponseTrailers,
 };
-use proxy_http::stream_info::LlmSpendCharge;
+use proxy_http::stream_info::{LlmSpendCharge, SpendExclusion};
 use proxy_observability::records::{ChargeScope, ChargedScope};
 use proxy_observability::ResponseFlag;
 
@@ -49,7 +49,7 @@ use crate::control::{ControlPlane, ControlPlaneSnapshot};
 use crate::repeat_warner::{Due, RepeatWarner};
 use crate::spend::{
     self, Charge, KeyBudget, MicroUsd, OnReconciliationExpired, Period, ReconciliationPolicy,
-    SpendAccumulator,
+    ScopedBudget, SpendAccumulator,
 };
 use crate::unmetered::{self, RefusalCounter};
 use crate::usage_filter::PricingRegistry;
@@ -369,15 +369,27 @@ impl HttpFilterFactory for SpendLimitFilterFactory {
                     .collect();
                 // A failed prefetch fails open, loudly: see
                 // `SpendAccumulator::prepare_request_workers`.
+                let scoped: Vec<_> = snapshot
+                    .policies
+                    .iter()
+                    .flat_map(|(tenant, policy)| {
+                        policy
+                            .scoped_budgets
+                            .iter()
+                            .map(move |budget| (TenantId::new(tenant.clone()), budget.clone()))
+                    })
+                    .collect();
                 if let Err(err) = accumulator
                     .prepare_tenant_request_workers(&tenants)
                     .and(accumulator.prepare_request_workers(&keys))
+                    .and(accumulator.prepare_scoped_request_workers(&scoped))
                 {
                     warn_prefetch_failed(&ctx.stat_prefix, &err);
                 }
                 let accumulator = Arc::new(accumulator);
                 if let Some(registry) = &stats_registry {
                     accumulator.export_reconciliation_age(Arc::clone(registry));
+                    accumulator.export_budget_utilization(Arc::clone(registry));
                 }
                 accumulator.start_flusher(flush_interval);
                 Ok(Arc::new(SharedSpendLimitState {
@@ -539,6 +551,8 @@ impl FilterInstanceFactory for SpendLimitInstanceFactory {
             period: None,
             key_budget: None,
             tenant_budget_scope: None,
+            scoped_budgets: Arc::default(),
+            mode: CredentialSource::Platform,
             budget_applies: false,
             recorded: false,
             body_checked: false,
@@ -742,6 +756,12 @@ struct SpendLimitFilterInstance {
     /// non-matching budget is absent for admission (ADR-0007 decision 8) but
     /// still decides at encode whether the tenant is charged.
     tenant_budget_scope: Option<CredentialSource>,
+    /// The tenant's scoped budgets, captured at admission whatever their
+    /// credential scope: as for the tenant budget, the scope decides at
+    /// encode whether each is charged.
+    scoped_budgets: Arc<[ScopedBudget]>,
+    /// The request's credential mode, decided at admission.
+    mode: CredentialSource,
     /// Whether a budget actually applied to this request -- distinguishes
     /// "no usage at encode time on a budgeted tenant" (warn: see the module
     /// doc) from "no usage on an unbudgeted tenant" (silent: nothing was
@@ -808,20 +828,25 @@ impl SpendLimitFilterInstance {
         // so the spend charge and the record agree when a provider served a
         // different model than the one sent.
         let sent_model = selected_model.as_deref().or(model.as_deref());
-        let priced = if attempts.is_empty() {
-            PricingRegistry::price_served(
-                self.pricing_snapshot.as_ref(),
-                cluster.as_deref(),
-                sent_model,
-                served_model.as_deref(),
-                &usage,
-            )
+        // Each part is one cluster's share of the request, so a provider
+        // budget can be charged only what was spent on its own clusters.
+        let parts: Vec<(Option<String>, Option<crate::pricing::Priced>)> = if attempts.is_empty() {
+            vec![(
+                cluster.clone(),
+                PricingRegistry::price_served(
+                    self.pricing_snapshot.as_ref(),
+                    cluster.as_deref(),
+                    sent_model,
+                    served_model.as_deref(),
+                    &usage,
+                ),
+            )]
         } else {
             // Charged across attempts (one got no response): each is priced
             // at its own cluster, as the usage filter priced the record.
             attempts
                 .iter()
-                .filter_map(|attempt| {
+                .map(|attempt| {
                     let priced = PricingRegistry::price_served(
                         self.pricing_snapshot.as_ref(),
                         Some(&attempt.cluster),
@@ -845,14 +870,11 @@ impl SpendLimitFilterInstance {
                             },
                         );
                     }
-                    priced
+                    (Some(attempt.cluster.clone()), priced)
                 })
-                .reduce(|sum, priced| crate::pricing::Priced {
-                    nanodollars: sum.nanodollars + priced.nanodollars,
-                    basis: sum.basis,
-                    underpriced_modality: sum.underpriced_modality || priced.underpriced_modality,
-                })
+                .collect()
         };
+        let priced = sum_priced(parts.iter().filter_map(|(_, priced)| *priced));
         if self.budget_applies && priced.is_some_and(|priced| priced.underpriced_modality) {
             self.unpriced_warner
                 .note_underpriced(sent_model, cluster.as_deref());
@@ -932,6 +954,47 @@ impl SpendLimitFilterInstance {
                 });
             }
         }
+        if let Some((tenant, _)) = &self.tenant {
+            for budget in self.scoped_budgets.iter() {
+                if credential_source != Some(budget.credential_source)
+                    || !budget.matches_model(model.as_deref())
+                {
+                    continue;
+                }
+                let Some(scoped_charge) = scoped_charge(budget, charge, &parts) else {
+                    continue;
+                };
+                let alert_percent = self.accumulator.record_scoped(
+                    tenant,
+                    budget,
+                    now,
+                    scoped_charge,
+                    cluster.as_deref(),
+                    selected_model.as_deref().or(model.as_deref()),
+                );
+                if let Some(percent) = alert_percent {
+                    // Once per budget, level, period and replica: rare by
+                    // construction, so a log line costs nothing on the
+                    // healthy path. Renders tenant and budget names only.
+                    tracing::warn!(
+                        tenant = %tenant.as_str(),
+                        budget = %budget.name,
+                        percent,
+                        "spend budget reached an alert threshold"
+                    );
+                }
+                scopes.push(ChargedScope {
+                    scope: ChargeScope::Scoped,
+                    id: budget.name.clone(),
+                    period: budget.period.key_for(now).as_str().to_owned(),
+                    micro_usd: Some(match scoped_charge {
+                        Charge::Priced(amount) => amount.as_micros(),
+                        Charge::Unpriced => 0,
+                    }),
+                    alert_percent,
+                });
+            }
+        }
         // The ledger copies this rather than pricing the request again: the
         // usage filter's card snapshot can differ from this one across a
         // card swap (ADR-0009 decision 4).
@@ -960,17 +1023,68 @@ impl SpendLimitFilterInstance {
     }
 }
 
+/// The sum of several priced parts, `None` when none is priced.
+fn sum_priced(
+    parts: impl Iterator<Item = crate::pricing::Priced>,
+) -> Option<crate::pricing::Priced> {
+    parts.reduce(|sum, priced| crate::pricing::Priced {
+        nanodollars: sum.nanodollars + priced.nanodollars,
+        basis: sum.basis,
+        underpriced_modality: sum.underpriced_modality || priced.underpriced_modality,
+    })
+}
+
+/// What a scoped budget is charged for a request whose whole charge is
+/// `charge`, split by cluster as `parts`. A budget with no providers takes the
+/// whole charge. A provider budget takes only the parts on its own clusters,
+/// so after a failover it is charged for the member that served, never for
+/// the primary unless the primary was also charged; `None` when no part is
+/// on its clusters.
+fn scoped_charge(
+    budget: &ScopedBudget,
+    charge: Charge,
+    parts: &[(Option<String>, Option<crate::pricing::Priced>)],
+) -> Option<Charge> {
+    if budget.providers.is_empty() {
+        return Some(charge);
+    }
+    let mut covered = parts
+        .iter()
+        .filter(|(cluster, _)| {
+            cluster
+                .as_deref()
+                .is_some_and(|cluster| budget.covers_cluster(cluster))
+        })
+        .peekable();
+    covered.peek()?;
+    Some(
+        sum_priced(covered.filter_map(|(_, priced)| *priced)).map_or(Charge::Unpriced, |priced| {
+            Charge::Priced(MicroUsd::from_micros(PricingRegistry::charge_micro_usd(
+                priced.nanodollars,
+            )))
+        }),
+    )
+}
+
 impl SpendLimitFilterInstance {
     /// Refuse a budgeted request whose body shape cannot be counted
     /// (ADR-0010 decision 5), with the same 403 as an unmetered endpoint.
     /// Only the endpoints whose countability depends on the body are
     /// checked, and only where a budget binds the request.
     fn admit_body(&mut self, cb: &mut dyn DecoderCallbacks) {
-        if self.body_checked || !self.budget_applies || !unmetered::needs_body_facts(self.endpoint)
-        {
+        if self.body_checked || !self.budget_applies || self.recorded {
             return;
         }
         self.body_checked = true;
+        if unmetered::needs_body_facts(self.endpoint) && !self.countable_body(cb) {
+            return;
+        }
+        self.admit_scoped(cb);
+    }
+
+    /// The body-shape half of [`Self::admit_body`]: refuses, and returns
+    /// `false`, when the body cannot be counted.
+    fn countable_body(&mut self, cb: &mut dyn DecoderCallbacks) -> bool {
         let countable = {
             let info = cb.stream_info();
             unmetered::countable_under_spend(
@@ -988,6 +1102,66 @@ impl SpendLimitFilterInstance {
                 unmetered::Control::Spend,
                 self.unmetered.as_deref(),
             );
+        }
+        countable
+    }
+
+    /// Enforces the tenant's scoped budgets once the routing model is known
+    /// (the end of the body, after `body_rewrite` published it).
+    ///
+    /// A spent budget that names no provider refuses the request here. A
+    /// spent budget that names providers closes those clusters instead: the
+    /// router skips them as it skips an aggregate member already tried, so a
+    /// request fails over to a provider with room, and gets this budget's 429
+    /// only when no cluster is left. Spend is charged at encode to the
+    /// cluster each attempt dialled, so the provider is never guessed here:
+    /// as for every budget, there is no reservation, and requests in flight
+    /// can overrun a ceiling by what they cost.
+    fn admit_scoped(&mut self, cb: &mut dyn DecoderCallbacks) {
+        let Some((tenant, _)) = &self.tenant else {
+            return;
+        };
+        if self.scoped_budgets.is_empty() {
+            return;
+        }
+        let model = cb.stream_info().routing_model().map(str::to_owned);
+        let now = Utc::now();
+        let mut closed: Vec<String> = Vec::new();
+        let mut refusal: Option<Reply> = None;
+        for budget in self.scoped_budgets.iter() {
+            if budget.credential_source != self.mode || !budget.matches_model(model.as_deref()) {
+                continue;
+            }
+            let limit_micros = budget.max_micros.as_micros();
+            let current_micros = self.accumulator.admission_total_scoped(tenant, budget, now);
+            if current_micros < limit_micros {
+                continue;
+            }
+            let reset_secs = budget.period.seconds_until_reset(now);
+            let reply = Reply::budget(
+                limit_micros,
+                limit_micros.saturating_sub(current_micros),
+                reset_secs,
+                reset_secs,
+            )
+            .budget_scope(BudgetScope::Scoped(&budget.name));
+            if budget.providers.is_empty() {
+                // Nothing was dialled, so there is nothing to record.
+                self.recorded = true;
+                cb.stream_info()
+                    .set_response_flag(ResponseFlag::RateLimited);
+                reply.send(cb, None);
+                return;
+            }
+            closed.extend(budget.providers.iter().cloned());
+            refusal.get_or_insert(reply);
+        }
+        if let Some(refusal) = refusal {
+            let endpoint = self.endpoint;
+            cb.stream_info().spend_exclusion = Some(Arc::new(SpendExclusion {
+                clusters: closed.into(),
+                refusal: refusal.prepare(endpoint),
+            }));
         }
     }
 }
@@ -1019,7 +1193,10 @@ impl HttpFilter for SpendLimitFilterInstance {
         };
         let snapshot = self.snapshot.load();
         let tenant_budgets_configured = (key_id.is_none() || tenant.is_none())
-            && snapshot.policies.values().any(|p| p.budget.is_some());
+            && snapshot
+                .policies
+                .values()
+                .any(|p| p.budget.is_some() || !p.scoped_budgets.is_empty());
         let Some(key_id) = key_id else {
             self.key_id = None;
             self.period = None;
@@ -1027,6 +1204,7 @@ impl HttpFilter for SpendLimitFilterInstance {
             self.budget_applies = false;
             self.key_budget = None;
             self.tenant_budget_scope = None;
+            self.scoped_budgets = Arc::default();
             if !snapshot.key_budgets.is_empty() || tenant_budgets_configured {
                 cb.send_local_reply(
                     StatusCode::FORBIDDEN,
@@ -1055,10 +1233,13 @@ impl HttpFilter for SpendLimitFilterInstance {
         // decision 8), so it is captured even for a budget this request does
         // not enforce below.
         let key_budget_configured = snapshot.key_budgets.get(&key_id).copied();
-        let tenant_budget_configured = tenant
+        let tenant_policy = tenant
             .as_ref()
-            .and_then(|id| snapshot.policies.get(id.as_str()))
-            .and_then(|p| p.budget);
+            .and_then(|id| snapshot.policies.get(id.as_str()));
+        let tenant_budget_configured = tenant_policy.and_then(|p| p.budget);
+        let scoped_budgets = tenant_policy
+            .map(|p| Arc::clone(&p.scoped_budgets))
+            .unwrap_or_default();
         // Admission enforces only the budgets that bind this request's mode:
         // a key budget always in platform mode and in tenant mode only with
         // `include_byok_in_limit` (ADR-0007 amendment 1), a tenant budget
@@ -1084,9 +1265,15 @@ impl HttpFilter for SpendLimitFilterInstance {
                 tenant_budget.map(|b| b.period).unwrap_or(default_period),
             )
         });
-        self.budget_applies = key_budget.is_some() || tenant_budget.is_some();
+        // A scoped budget in this request's mode binds it as far as
+        // countability goes: which model or provider it narrows to is known
+        // only later, and an uncountable request would escape it.
+        let scoped_binds = scoped_budgets.iter().any(|b| b.credential_source == mode);
+        self.budget_applies = key_budget.is_some() || tenant_budget.is_some() || scoped_binds;
         self.key_budget = key_budget_configured;
         self.tenant_budget_scope = tenant_budget_configured.map(|b| b.credential_source);
+        self.scoped_budgets = scoped_budgets;
+        self.mode = mode;
         // A budget that binds this request must be able to count it, or the
         // request would be charged $0 (ADR-0010 decision 1). Refused before
         // the ceiling check: the request is uncountable whatever the spend.
@@ -1113,6 +1300,7 @@ impl HttpFilter for SpendLimitFilterInstance {
         let ceilings = [
             key_budget.map(|budget| {
                 (
+                    BudgetScope::Key,
                     budget.max_micros,
                     budget.period,
                     self.accumulator.admission_total_key(
@@ -1124,6 +1312,7 @@ impl HttpFilter for SpendLimitFilterInstance {
             }),
             tenant_budget.map(|budget| {
                 (
+                    BudgetScope::Tenant,
                     budget.max_micros,
                     budget.period,
                     self.accumulator.admission_total(
@@ -1136,7 +1325,7 @@ impl HttpFilter for SpendLimitFilterInstance {
                 )
             }),
         ];
-        for (max_micros, period, current_micros) in ceilings.into_iter().flatten() {
+        for (scope, max_micros, period, current_micros) in ceilings.into_iter().flatten() {
             let limit_micros = max_micros.as_micros();
 
             // At or over the ceiling denies -- see the module doc's "A
@@ -1158,6 +1347,7 @@ impl HttpFilter for SpendLimitFilterInstance {
                 // carries USD in `x-llmproxy-budget-*`, not the request- and
                 // token-count `x-ratelimit-*` names.
                 Reply::budget(limit_micros, remaining_micros, reset_secs, retry_secs)
+                    .budget_scope(scope)
                     .send(cb, None);
                 // Rust note: the returned status is irrelevant here --
                 // `drive_decode` checks `ctx.local_reply.is_some()` right after
@@ -1196,6 +1386,10 @@ impl HttpFilter for SpendLimitFilterInstance {
             OnReconciliationExpired::Allow => {
                 self.accumulator.note_admission(now);
             }
+        }
+        // A request with no body has nothing more to wait for.
+        if end_stream {
+            self.admit_body(cb);
         }
 
         FilterHeadersStatus::Continue
@@ -1735,6 +1929,8 @@ mod tests {
                 period: None,
                 key_budget: None,
                 tenant_budget_scope: None,
+                scoped_budgets: Arc::default(),
+                mode: CredentialSource::Platform,
                 budget_applies: false,
                 recorded: false,
                 body_checked: false,
@@ -2600,6 +2796,63 @@ mod tests {
                 .0,
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    /// The threshold event: a scoped budget's ledger scope carries the alert
+    /// level the charge first reached, once per level and period, and none on
+    /// a charge below a level or one that repeats a reached level.
+    #[test]
+    fn a_scoped_budget_marks_each_alert_level_once_on_the_charge_that_reaches_it() {
+        let cp = control_plane_with(&[(
+            "tenant-a",
+            KeyBudget {
+                max_micros: MicroUsd::from_micros(1_000),
+                period: Period::Daily,
+                include_byok_in_limit: false,
+            },
+        )]);
+        cp.set_scoped_budgets(
+            &TenantId::new("tenant-a"),
+            &[ScopedBudget {
+                name: "m-cap".into(),
+                max_micros: MicroUsd::from_micros(10),
+                period: Period::Monthly,
+                credential_source: CredentialSource::Platform,
+                models: vec![crate::model_authz::ModelPattern::new("m*")],
+                providers: Vec::new(),
+                alert_at_percent: vec![50, 90],
+            }],
+        )
+        .unwrap();
+        let mut table = Card::default();
+        table.insert("cluster-a", "m", 1_000_000);
+        let harness = filter_with(&cp, table, Period::Monthly);
+        let alert = |tokens: u64| {
+            let (reply, cb) =
+                run_request(&harness, "tenant-a", Some(("cluster-a", "m")), Some(tokens));
+            assert!(reply.is_none(), "under the ceiling: {reply:?}");
+            let info = cb.stream_info.borrow();
+            let scope = info
+                .llm
+                .spend_charge
+                .as_ref()
+                .and_then(|charge| {
+                    charge
+                        .scopes
+                        .iter()
+                        .find(|scope| scope.scope == ChargeScope::Scoped)
+                        .cloned()
+                })
+                .expect("the scoped budget is charged");
+            assert_eq!(scope.id, "m-cap");
+            assert_eq!(scope.micro_usd, Some(tokens), "one micro-dollar a token");
+            scope.alert_percent
+        };
+        // Totals 4, 5, 7, 10 micro-dollars of a 10 micro-dollar ceiling.
+        assert_eq!(alert(4), None, "40% reaches no level");
+        assert_eq!(alert(1), Some(50), "50% reaches the first level");
+        assert_eq!(alert(2), None, "70% repeats a reached level");
+        assert_eq!(alert(3), Some(90), "100% reaches the second level");
     }
 
     #[test]

@@ -27,6 +27,7 @@
 /chains/{stat_prefix}/tenants/{id}/policy PUT
 /chains/{stat_prefix}/tenants/{id}/provider_credentials GET
 /chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider} PUT,DELETE
+/chains/{stat_prefix}/tenants/{id}/scoped_budgets GET,PUT
 /chains/{stat_prefix}/tenants/{id}/spend GET
 /chains/{stat_prefix}/tenants/{id}/trace_export GET,PUT
 /clusters GET,POST,PUT,DELETE
@@ -58,6 +59,7 @@
 /tenants/{id}/policy PUT
 /tenants/{id}/provider_credentials GET
 /tenants/{id}/provider_credentials/{provider} PUT,DELETE
+/tenants/{id}/scoped_budgets GET,PUT
 /tenants/{id}/spend GET
 /tenants/{id}/trace_export GET,PUT
 /traces/capture GET,POST

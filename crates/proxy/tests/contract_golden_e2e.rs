@@ -263,6 +263,9 @@ impl Scenario {
         assert!(anonymous.starts_with("HTTP/1.1 401"), "{anonymous}");
 
         proxy.wait_for_access_log_lines(3);
+        // The spend flusher publishes the budget utilization gauge on its
+        // tick, after the traffic; the families settle only once it has.
+        proxy.wait_for_family("llmproxy_spend_budget_utilization");
         let scrape = proxy.settled_scrape();
         Scenario {
             dir,
@@ -503,6 +506,18 @@ impl Proxy {
     /// A scrape whose family lines match the scrape before it, so counters
     /// written after the response (ledger commits, connection teardown) have
     /// landed before the comparison.
+    /// Waits, bounded, until a scrape renders a sample of `family`.
+    fn wait_for_family(&self, family: &str) {
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        while !self.scrape().contains(&format!("{family}{{")) {
+            assert!(
+                Instant::now() < deadline,
+                "/stats/prometheus never rendered {family}"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
     fn settled_scrape(&self) -> String {
         let deadline = Instant::now() + SETTLE_TIMEOUT;
         let mut previous = self.scrape();

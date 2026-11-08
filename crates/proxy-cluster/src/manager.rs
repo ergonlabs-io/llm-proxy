@@ -1087,7 +1087,12 @@ impl ClusterHandle {
         require_healthy: bool,
     ) -> Option<HostSelection> {
         for name in members {
-            if ctx.attempted_clusters.contains(name) {
+            if ctx.attempted_clusters.contains(name)
+                || ctx
+                    .excluded_clusters
+                    .as_ref()
+                    .is_some_and(|excluded| excluded.contains(name))
+            {
                 continue;
             }
             // The second pass revisits members the first already warned about, so only the first warns.

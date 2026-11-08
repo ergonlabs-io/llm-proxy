@@ -2093,6 +2093,9 @@ fn needs_body_rewrite_filter(config: &SimpleConfig) -> bool {
         // publishes; without it every request would look model-less and be
         // refused, even in a config that otherwise needs no body peek.
         || enforces_model_policy(config)
+        // `llmproxy.spend_limit` matches scoped budgets against the same
+        // model; without it a model-scoped budget would match nothing.
+        || enforces_spend(config)
 }
 
 /// `auth` is set and `auth.enforce.model_policy` is on: the chain carries

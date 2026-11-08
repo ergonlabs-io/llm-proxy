@@ -4,7 +4,7 @@ description: "Every reply that llm-proxy makes itself: status, body, headers, ca
 summary: Reference for proxy-made error replies - authentication, model
   access, limits and budgets, request checks, credentials, and upstream
   failures - with the exact body text of each.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-08
 related:
   - api-compatibility/overview
   - authentication/virtual-keys
@@ -158,7 +158,7 @@ Available when you set a spend budget. See
 
 | Status | Message | Cause | Fix |
 | --- | --- | --- | --- |
-| 429 | `spend budget exceeded` (code `spend_budget_exceeded`) | The budget for the period is used. Flag `RL`. | Wait for `retry-after` seconds, or ask the operator to raise the budget. |
+| 429 | `spend budget exceeded` (code `spend_budget_exceeded`) | A key, tenant, or scoped budget for the period is used. Flag `RL`. The `x-llmproxy-budget-scope` header names which one. | Wait for `retry-after` seconds, or ask the operator to raise the budget. |
 | 403 | `authenticated key identity required for spend policy` | A key budget applies and the request has no authenticated key. | Send a valid virtual key. |
 | 403 | `authenticated tenant identity required for spend policy` | A tenant budget applies and the request has no authenticated tenant. | Send a valid virtual key. |
 
@@ -171,6 +171,8 @@ headers, whose names mean requests or tokens. It sends:
 | `x-llmproxy-budget-limit-usd` | The ceiling, in USD, for example `10.000000`. |
 | `x-llmproxy-budget-remaining-usd` | What is left, in USD. `0.000000` when the budget is used. |
 | `x-llmproxy-budget-reset` | Seconds until the period resets. Equal to `retry-after`. |
+| `x-llmproxy-budget-scope` | The kind of budget that refused: `key`, `tenant`, or `scoped`. |
+| `x-llmproxy-budget-name` | The name of the scoped budget that refused. Only when `x-llmproxy-budget-scope` is `scoped`. |
 
 Before this change a spend 429 sent `x-ratelimit-*` headers with values in
 micro-dollars. Clients that read them must move to the headers above.

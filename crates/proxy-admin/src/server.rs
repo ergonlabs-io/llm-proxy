@@ -57,6 +57,7 @@ use tokio::task::JoinHandle;
 
 mod auth_limit;
 mod json_object;
+mod scoped_budgets;
 use auth_limit::{AuthFailureLimiter, Verdict};
 mod transport;
 use transport::{AdminTransport, TransportCache, HANDSHAKE_TIMEOUT};
@@ -94,6 +95,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}",
     "/tenants/{id}/policy",
     "/tenants/{id}/budget",
+    "/tenants/{id}/scoped_budgets",
     "/tenants/{id}/limits",
     "/tenants/{id}/trace_export",
     "/tenants/{id}/objects/{object_id}",
@@ -114,6 +116,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}",
     "/chains/{stat_prefix}/tenants/{id}/policy",
     "/chains/{stat_prefix}/tenants/{id}/budget",
+    "/chains/{stat_prefix}/tenants/{id}/scoped_budgets",
     "/chains/{stat_prefix}/tenants/{id}/limits",
     "/chains/{stat_prefix}/tenants/{id}/trace_export",
     "/chains/{stat_prefix}/tenants/{id}/objects/{object_id}",
@@ -738,6 +741,28 @@ async fn handle(
         .await;
     }
 
+    // The scoped budget PUT checks providers against the published clusters, which the store closure cannot reach.
+    if let WriteRoute::TenantScopedBudgets(id) | WriteRoute::ScopedTenantScopedBudgets(_, id) =
+        route
+    {
+        let known_clusters: std::collections::HashSet<String> =
+            config.load().clusters.keys().cloned().collect();
+        let tenant = id.to_owned();
+        let stat_prefix = stat_prefix_opt.map(str::to_owned);
+        let factory_state = Arc::clone(factory_state);
+        return run_store(move || {
+            scoped_budgets::handle_set_scoped_budgets(
+                &factory_state,
+                stat_prefix.as_deref(),
+                &control_plane,
+                &tenant,
+                &body,
+                &known_clusters,
+            )
+        })
+        .await;
+    }
+
     // Every other route here reads or writes the store, so it runs off the control runtime. The closure must own
     // what it uses, and `route` borrows `path`, so it moves `path` in and matches it again.
     let factory_state = Arc::clone(factory_state);
@@ -824,6 +849,17 @@ fn dispatch_store_route(
         }
         WriteRoute::TenantLimits(id) | WriteRoute::ScopedTenantLimits(_, id) => {
             handle_set_tenant_limits(factory_state, stat_prefix_opt, control_plane, id, body)
+        }
+        WriteRoute::TenantScopedBudgets(..) | WriteRoute::ScopedTenantScopedBudgets(..) => {
+            unreachable!("the scoped budget PUT returns before the store dispatch")
+        }
+        WriteRoute::TenantScopedBudgetsGet(id)
+        | WriteRoute::ScopedTenantScopedBudgetsGet(_, id) => {
+            let accumulator = match stat_prefix_opt {
+                Some(stat_prefix) => resolve_spend_state_by_name(factory_state, stat_prefix),
+                None => resolve_spend_state(factory_state).ok().flatten(),
+            };
+            scoped_budgets::handle_get_scoped_budgets(control_plane, accumulator, id)
         }
         WriteRoute::TenantTraceExport(id) | WriteRoute::ScopedTenantTraceExport(_, id) => {
             handle_set_trace_export(control_plane, id, body)
@@ -957,6 +993,10 @@ enum WriteRoute<'a> {
     TenantById(&'a str),
     TenantPolicy(&'a str),
     TenantBudget(&'a str),
+    /// `PUT /tenants/{id}/scoped_budgets`: replaces the tenant's scoped budgets.
+    TenantScopedBudgets(&'a str),
+    /// `GET /tenants/{id}/scoped_budgets`: the budgets and their live spend.
+    TenantScopedBudgetsGet(&'a str),
     TenantLimits(&'a str),
     TenantSpend(&'a str),
     /// `GET /tenants/{id}/provider_credentials` -- metadata only, gated like
@@ -983,6 +1023,8 @@ enum WriteRoute<'a> {
     ScopedTenantById(&'a str, &'a str),
     ScopedTenantPolicy(&'a str, &'a str),
     ScopedTenantBudget(&'a str, &'a str),
+    ScopedTenantScopedBudgets(&'a str, &'a str),
+    ScopedTenantScopedBudgetsGet(&'a str, &'a str),
     ScopedTenantLimits(&'a str, &'a str),
     ScopedTenantSpend(&'a str, &'a str),
     Pricing,
@@ -1018,6 +1060,11 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::TenantObject(..) | WriteRoute::ScopedTenantObject(..) => Method::PUT,
             WriteRoute::TenantObjectGet(..) | WriteRoute::ScopedTenantObjectGet(..) => Method::GET,
             WriteRoute::TenantBudget(_) | WriteRoute::TenantLimits(_) => Method::PUT,
+            WriteRoute::TenantScopedBudgets(_) | WriteRoute::ScopedTenantScopedBudgets(..) => {
+                Method::PUT
+            }
+            WriteRoute::TenantScopedBudgetsGet(_)
+            | WriteRoute::ScopedTenantScopedBudgetsGet(..) => Method::GET,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
             WriteRoute::TenantCredentials(_) | WriteRoute::ScopedTenantCredentials(..) => {
                 Method::GET
@@ -1071,6 +1118,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantById(_)
             | WriteRoute::TenantPolicy(_)
             | WriteRoute::TenantBudget(_)
+            | WriteRoute::TenantScopedBudgets(_)
+            | WriteRoute::TenantScopedBudgetsGet(_)
             | WriteRoute::TenantLimits(_)
             | WriteRoute::TenantTraceExport(_)
             | WriteRoute::TenantTraceExportGet(_)
@@ -1096,6 +1145,8 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenantById(s, _)
             | WriteRoute::ScopedTenantPolicy(s, _)
             | WriteRoute::ScopedTenantBudget(s, _)
+            | WriteRoute::ScopedTenantScopedBudgets(s, _)
+            | WriteRoute::ScopedTenantScopedBudgetsGet(s, _)
             | WriteRoute::ScopedTenantLimits(s, _)
             | WriteRoute::ScopedTenantTraceExport(s, _)
             | WriteRoute::ScopedTenantTraceExportGet(s, _)
@@ -1140,6 +1191,10 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         ["tenants", id] => Some(WriteRoute::TenantById(id)),
         ["tenants", id, "policy"] => Some(WriteRoute::TenantPolicy(id)),
         ["tenants", id, "budget"] => Some(WriteRoute::TenantBudget(id)),
+        ["tenants", id, "scoped_budgets"] if *method == Method::GET => {
+            Some(WriteRoute::TenantScopedBudgetsGet(id))
+        }
+        ["tenants", id, "scoped_budgets"] => Some(WriteRoute::TenantScopedBudgets(id)),
         ["tenants", id, "limits"] => Some(WriteRoute::TenantLimits(id)),
         ["tenants", id, "trace_export"] if *method == Method::GET => {
             Some(WriteRoute::TenantTraceExportGet(id))
@@ -1209,6 +1264,12 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "tenants", id, "budget"] => {
             Some(WriteRoute::ScopedTenantBudget(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "scoped_budgets"] if *method == Method::GET => {
+            Some(WriteRoute::ScopedTenantScopedBudgetsGet(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "scoped_budgets"] => {
+            Some(WriteRoute::ScopedTenantScopedBudgets(stat_prefix, id))
         }
         ["chains", stat_prefix, "tenants", id, "limits"] => {
             Some(WriteRoute::ScopedTenantLimits(stat_prefix, id))

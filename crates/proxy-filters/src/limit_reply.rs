@@ -25,6 +25,7 @@
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use proxy_http::endpoint::Endpoint;
 use proxy_http::filter::DecoderCallbacks;
+use proxy_http::stream_info::PreparedReply;
 
 /// The longest `retry-after`, in seconds, the official SDKs act on. A longer
 /// wait is advertised with `x-should-retry: false`.
@@ -161,41 +162,94 @@ impl Reply {
         }
     }
 
+    /// Names the spend budget that refused: `x-llmproxy-budget-scope` is
+    /// `key`, `tenant` or `scoped`, and a scoped budget adds its name in
+    /// `x-llmproxy-budget-name`. The amounts stay in the other
+    /// `x-llmproxy-budget-*` headers; nothing here is an `x-ratelimit-*`.
+    pub(crate) fn budget_scope(mut self, scope: BudgetScope<'_>) -> Self {
+        let (scope, name) = match scope {
+            BudgetScope::Key => ("key", None),
+            BudgetScope::Tenant => ("tenant", None),
+            BudgetScope::Scoped(name) => ("scoped", Some(name)),
+        };
+        self.headers.push((
+            HeaderName::from_static("x-llmproxy-budget-scope"),
+            HeaderValue::from_static(scope),
+        ));
+        // A scoped budget name is lowercase ASCII (`ScopedBudget::
+        // is_valid_name`), so the conversion only fails on a value the store
+        // never holds; such a reply simply omits the name.
+        if let Some(Ok(value)) = name.map(HeaderValue::from_str) {
+            self.headers
+                .push((HeaderName::from_static("x-llmproxy-budget-name"), value));
+        }
+        self
+    }
+
     /// Send the 429. `message` replaces the cause's default text when the
     /// caller knows more (for example which period refused).
     pub(crate) fn send(self, cb: &mut dyn DecoderCallbacks, message: Option<&str>) {
         let endpoint = cb.stream_info().llm.endpoint;
+        let code = self.cause.code();
+        let (body, headers) = self.into_parts(endpoint, message);
+        cb.send_local_reply_exact(
+            StatusCode::TOO_MANY_REQUESTS,
+            &body,
+            Some(Box::new(move |map: &mut HeaderMap| {
+                for (name, value) in &headers {
+                    map.insert(name.clone(), value.clone());
+                }
+            })),
+            code,
+        );
+    }
+
+    /// The same reply, built for a later stage to send: the router sends it
+    /// when a spent provider budget leaves no cluster to dial.
+    pub(crate) fn prepare(self, endpoint: Endpoint) -> PreparedReply {
+        let details = self.cause.code();
+        let (body, headers) = self.into_parts(endpoint, None);
+        PreparedReply {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            headers,
+            body: bytes::Bytes::from(body),
+            details,
+            flag: proxy_observability::ResponseFlag::RateLimited,
+        }
+    }
+
+    fn into_parts(self, endpoint: Endpoint, message: Option<&str>) -> (String, HeaderMap) {
         let body = body(
             endpoint,
             message.unwrap_or_else(|| self.cause.message()),
             self.cause.code(),
         );
-        let Reply {
-            cause,
-            retry_after_secs,
-            headers,
-        } = self;
-        cb.send_local_reply_exact(
-            StatusCode::TOO_MANY_REQUESTS,
-            &body,
-            Some(Box::new(move |map: &mut HeaderMap| {
-                map.insert(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                for (name, value) in headers {
-                    map.insert(name, value);
-                }
-                map.insert("retry-after", HeaderValue::from(retry_after_secs));
-                map.insert(
-                    "x-should-retry",
-                    HeaderValue::from_static(should_retry(retry_after_secs)),
-                );
-            })),
-            cause.code(),
+        let mut map = HeaderMap::new();
+        map.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
         );
+        for (name, value) in self.headers {
+            map.insert(name, value);
+        }
+        map.insert("retry-after", HeaderValue::from(self.retry_after_secs));
+        map.insert(
+            "x-should-retry",
+            HeaderValue::from_static(should_retry(self.retry_after_secs)),
+        );
+        (body, map)
     }
 }
+
+/// Which spend budget a 429 names; see [`Reply::budget_scope`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BudgetScope<'a> {
+    Key,
+    Tenant,
+    Scoped(&'a str),
+}
+
+impl Reply {}
 
 /// `x-should-retry` for a wait of `retry_after_secs`.
 fn should_retry(retry_after_secs: u64) -> &'static str {

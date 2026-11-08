@@ -2,10 +2,10 @@
 title: Spend policies
 description: "Set dollar ceilings on keys and tenants, learn which endpoints a budget can count, and see how spend is shared across replicas and recovered."
 summary: >-
-  How key and tenant spend budgets work, the admin calls that set them, which
-  endpoints a budget refuses, how estimated charges for cut streams work, and
-  how replicas share spend through the auth store.
-lastUpdated: 2026-10-21
+  How key, tenant, and scoped spend budgets work, the admin calls that set
+  them, which endpoints a budget refuses, how estimated charges for cut streams
+  work, and how replicas share spend through the auth store.
+lastUpdated: 2026-11-08
 related:
   - limits-and-budgets/pricing-and-cost-tracking
   - limits-and-budgets/token-rate-limiting
@@ -21,11 +21,14 @@ card to the config file. Then set a ceiling with `PUT /keys/{id}/budget` or
 `PUT /tenants/{id}/budget` on the admin API. See
 [Set a budget](#set-a-budget).
 
-Spend enforcement uses two kinds of ceiling, and either one can refuse a
+Spend enforcement uses three kinds of ceiling, and any one can refuse a
 request. A key budget counts the spend of one stable `key_id`. A tenant budget
 counts the spend of every key of one tenant. Each ceiling uses its own UTC
 budget period (`daily`, `weekly`, or `monthly`) and counts spend across every model and
 selected provider. A key budget never grants model access.
+
+A scoped budget is a tenant budget that counts only some models, some
+providers, or both. See [Scoped budgets](#scoped-budgets).
 
 A JWT caller counts against the budget of its tenant. For a ceiling on one JWT
 user, mint a key whose `key_id` is the JWT user id under the same tenant, and
@@ -379,18 +382,255 @@ a key budget, except that it takes `credential_source` instead of
 `include_byok_in_limit`. `GET /tenants/{id}/spend` returns the tenant ledger. The ledger
 adds the spend of every key of the tenant, in the tenant budget's own period.
 
-A request gets `429` when its key ceiling or its tenant ceiling is reached.
-Clearing one ceiling does not change the spend or the ceiling of the other. A
+A request gets `429` when its key ceiling, its tenant ceiling, or a scoped
+ceiling that matches it is reached. Clearing one ceiling does not change the spend or the ceiling of the other. A
 tenant budget counts only the requests in its credential scope, and a key
 budget counts BYOK requests only with `include_byok_in_limit`; see
 [Budgets](/docs/llm-proxy/authentication/tenant-provider-credentials/#budgets).
 `%RESPONSE_CODE_DETAILS%` shows `spend_budget_exceeded` for the `429`.
 
-When any key budget or tenant budget is configured, a request without an
-authenticated key identity returns `403`. A request that has a key but no
-tenant also returns `403` when any tenant budget is configured.
+When any key budget, tenant budget, or scoped budget is configured, a request
+without an authenticated key identity returns `403`. A request that has a key but no
+tenant also returns `403` when any tenant budget or scoped budget is
+configured.
 `%RESPONSE_CODE_DETAILS%` shows `spend_identity_missing` for both.
 
+
+## Scoped budgets
+
+A scoped budget is a ceiling on part of the spend of one tenant. It counts
+only the requests for the models you name, the providers you name, or both.
+A tenant can hold up to 32 scoped budgets beside its tenant budget. Use one to
+cap a costly model, or to cap what one provider bills you.
+
+The proxy enforces every budget that matches a request: the key budget, the
+tenant budget, and each matching scoped budget. The first ceiling that is
+reached refuses the request. Each scoped budget has its own period and its own
+spend counter.
+
+### How a scoped budget matches
+
+A scoped budget has a `name`, a ceiling, and a period. It also has a list of
+`models`, a list of `providers`, or both. A budget with neither list is
+refused with `400`. Use the tenant budget for all spend of a tenant.
+
+- **`models`** holds exact model names, or names that end in one `*`. The
+  patterns follow the same rule as the model grants of a tenant. They match
+  the model that the request is routed as: the alias that the client sent, or
+  the model that the resolver picked. They never match the model ID that the
+  provider receives.
+- **`providers`** holds provider names. The proxy matches them with the
+  cluster that each attempt dialled. After a failover, the provider that
+  served the request is charged, and the provider that failed is not.
+- An empty `models` list matches every model. An empty `providers` list
+  covers every provider. When both lists are set, a request must match both.
+- A request with no model matches only a budget that names no models.
+
+A scoped budget has a `credential_source`, as a tenant budget has. The default
+is `platform`. A budget counts and enforces only the requests in its
+credential scope. See
+[Budgets](/docs/llm-proxy/authentication/tenant-provider-credentials/#budgets).
+
+### Set the scoped budgets of a tenant
+
+`PUT /tenants/{id}/scoped_budgets` replaces the whole list of the tenant. The
+call does not merge with the list that is stored. To remove all scoped budgets
+of a tenant, send an empty list. The proxy checks every field before it
+stores anything. If one budget is not valid, the call stores nothing.
+
+```bash
+curl --max-time 10 -X PUT \
+  http://127.0.0.1:53422/tenants/acme/scoped_budgets \
+  -H "Authorization: Bearer $LLMPROXY_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "budgets": [
+      {
+        "name": "gpt-4o-monthly",
+        "max_usd": "50.00",
+        "period": "monthly",
+        "models": ["gpt-4o*"],
+        "alert_at_percent": [80, 100]
+      },
+      {
+        "name": "openai-daily",
+        "max_usd": "20.00",
+        "period": "daily",
+        "providers": ["openai"]
+      }
+    ]
+  }'
+```
+
+The call returns `204`. `{"budgets":[]}` removes every scoped budget of the
+tenant.
+
+| Field | Type | Default | Required | What it does |
+|---|---|---|---|---|
+| `name` | string | none | yes | The name of the budget. It is unique for the tenant. It has 1 to 64 characters of `a-z`, `0-9`, `-` and `_`, and starts with a letter or a digit. |
+| `max_usd` | string | none | yes | The ceiling in USD, for example `"50.00"`. |
+| `period` | string | none | yes | `daily`, `weekly`, or `monthly`. All use UTC. |
+| `credential_source` | string | `platform` | no | `platform` or `tenant`. |
+| `models` | list of strings | empty | one of `models` or `providers` | Up to 64 exact model names, or names that end in one `*`. |
+| `providers` | list of strings | empty | one of `models` or `providers` | Up to 64 providers. Each is a cluster name, or a provider name of the `--config` file. |
+| `alert_at_percent` | list of integers | empty | no | Alert levels, each from 1 to 100, with no repeats. See [Alerts](#alerts-on-a-scoped-budget). |
+
+The body can also hold `"schema_version": 2`. The proxy rejects other
+versions. An unknown field gives `400`.
+
+A provider name in `providers` must exist in the config of this proxy. The
+proxy first looks for a cluster with that exact name. If there is none, it
+looks for the provider of the same name in a `--config` file. The proxy stores
+the cluster name. A name that matches neither gives `400`. This check stops a
+budget on a misspelled provider, which would match nothing and cap nothing.
+
+| Status | Cause |
+|---|---|
+| `400` | A field is not valid, a name repeats, a budget names no models and no providers, a list is too long, or there are more than 32 budgets. The message names the field and the index of the budget. It does not repeat the rejected value. |
+| `409` | `{"error":"not_enforced", ...}`. No listener chain runs `llmproxy.spend_limit`, so the budgets would not be enforced. The call stores nothing. An empty list is always accepted. |
+
+### Read the scoped budgets of a tenant
+
+`GET /tenants/{id}/scoped_budgets` returns each budget as stored, with the
+spend of this replica for the current period:
+
+```json
+{
+  "tenant": "acme",
+  "budgets": [
+    {
+      "name": "gpt-4o-monthly",
+      "max_usd": "50.000000",
+      "max_micro_usd": 50000000,
+      "period": "monthly",
+      "credential_source": "platform",
+      "models": ["gpt-4o*"],
+      "providers": [],
+      "alert_at_percent": [80, 100],
+      "current_period": "2026-11",
+      "period_started_at": "2026-11-01T00:00:00+00:00",
+      "period_ends_at": "2026-12-01T00:00:00+00:00",
+      "spend_micro_usd": 12500000,
+      "spend_usd": "12.500000",
+      "remaining_micro_usd": 37500000,
+      "utilization_percent": 25
+    }
+  ]
+}
+```
+
+`remaining_micro_usd` stops at 0 when requests in flight overran the ceiling.
+`utilization_percent` is not capped, so it can be above 100. The call returns
+`503` with `llmproxy.spend_limit is not configured on this chain, so there is
+no spend accumulator to report from` when the chain has no spend filter.
+
+Both calls need the admin token. In a config with more than one chain, use
+`/chains/{stat_prefix}/tenants/{id}/scoped_budgets`. See
+[Admin API](/docs/llm-proxy/administration/admin-api/#keys-and-tenants).
+
+### What a spent budget does
+
+The proxy checks scoped budgets at the end of the request body, because the
+routing model is known only then. A request with no body is checked after its
+headers. What happens depends on the lists of the spent budget:
+
+| The spent budget names | Effect |
+|---|---|
+| Only `models` | The proxy refuses the request with `429`. No provider receives it. |
+| `providers` (with or without `models`) | The proxy closes those providers for the request. See [Failover](#failover-and-closed-providers). |
+
+An uncountable endpoint is refused with `403` under a scoped budget, as it is
+under any other budget. See
+[Endpoints a budget cannot count](#endpoints-a-budget-cannot-count).
+
+### The 429 reply
+
+Every spend `429` has the headers below. The scoped `429` has the same JSON
+body, `retry-after`, and `x-should-retry` as the other spend `429` replies.
+The body `code` is `spend_budget_exceeded`.
+
+| Header | Value |
+|---|---|
+| `x-llmproxy-budget-scope` | `key`, `tenant`, or `scoped`: the kind of budget that refused. |
+| `x-llmproxy-budget-name` | The `name` of the budget. Only on a `scoped` refusal. |
+| `x-llmproxy-budget-limit-usd`, `x-llmproxy-budget-remaining-usd`, `x-llmproxy-budget-reset` | The ceiling, what is left, and the seconds until the period resets. These describe the budget that refused. |
+
+The spend `429` sends no `x-ratelimit-*` header. See
+[Errors](/docs/llm-proxy/api-compatibility/errors/#spend-budgets).
+
+### Failover and closed providers
+
+A spent budget with `providers` closes those providers. The router skips a
+closed provider in the same way as it skips a member of an aggregate that it
+already tried. The result depends on the route:
+
+- A request fails over to a provider that has room. The proxy never dials a
+  closed provider.
+- If no provider has room on the first pick, the client gets the `429` of the
+  spent budget.
+- If an earlier attempt already failed and only closed providers remain, the
+  client gets the response of that attempt. This is the same result as for any
+  fallback chain with nothing left.
+- A route that goes straight to a closed provider, with no fallback, is
+  refused with the `429` before the router picks a host.
+
+A provider budget is charged only for the attempts on its own providers.
+After a failover, the budget of the primary does not pay for the fallback.
+
+### Alerts on a scoped budget
+
+`alert_at_percent` lists the levels at which the proxy marks a charge as an
+alert. A level is a whole percent of the ceiling. When a charge takes the
+spend of the budget to a level, the proxy reports the highest level that it
+reached. It reports each level once for each budget, period, and replica.
+
+- The proxy writes a warning log line: `spend budget reached an alert
+  threshold`. The fields are `tenant`, `budget`, and `percent`.
+- The ledger entry for the request carries the level in `alert_percent` of
+  the charged scope. See [Billing ledger](/docs/llm-proxy/limits-and-budgets/billing-ledger/).
+- The proxy does not journal the marks. After a restart, a replica can report a
+  level again.
+- Spend that other replicas added counts in the total. A replica reports a
+  level that their spend crossed at its next charge.
+
+### The utilization gauge
+
+The gauge `llmproxy_spend_budget_utilization` shows how much of a ceiling the
+current period used. On `/stats/prometheus` its name is
+`envoy_llmproxy_spend_budget_utilization`.
+
+- The value is a whole percent, rounded down. It is above 100 when requests in
+  flight overran the ceiling.
+- The labels are `scope` (the listener scope, `llmproxy` in a config file),
+  `tenant`, and `budget`. `budget` is `-tenant-` for the tenant budget and the
+  budget name for a scoped budget.
+- A key budget has no series. The gauge has no key or user label.
+- The flusher publishes the gauge at each tick. A series with no reading for
+  the current period goes to 0.
+- Series past 4096 share one series, with `tenant` and `budget` set to
+  `-cardinality-overflow-`.
+
+See [Metrics reference](/docs/llm-proxy/reference/metrics/).
+
+### Limits of scoped budgets
+
+- A scoped budget has one ceiling and one period. There are no several
+  windows for one scope, and no lifetime period.
+- `alert_at_percent` exists on scoped budgets only. Tenant budgets and key
+  budgets have no alerts.
+- There is no webhook for alerts. The alert is a log line and a ledger field.
+- There is no spend reservation, as for every budget. Requests in flight can
+  overrun a scoped ceiling. See
+  [Admission and overspend](#admission-and-overspend).
+- A scoped budget limits spend and does not grant model access.
+
+### Downgrade
+
+The store keeps the scoped budgets of one tenant as one row at version 3. A
+store that holds such a row cannot be read by 1.0.x: it reads the row as a
+tenant budget and refuses version 3. Before a downgrade to 1.0.x, send
+`{"budgets":[]}` to `PUT /tenants/{id}/scoped_budgets` for every tenant that
+has scoped budgets.
 
 ## Shared accounting and crash recovery
 
@@ -496,7 +736,8 @@ metric labels.
   `auth.spend.recovery_journal_path` it also loses the backlog of a store
   outage.
 - A budget has a period of `daily`, `weekly`, or `monthly`. There is no other
-  period, and a key or tenant has one budget at a time.
+  period. A key and a tenant each have one budget. A tenant can also hold
+  scoped budgets, each with one ceiling and one period.
 
 See [Limitations](/docs/llm-proxy/help/limitations/) for the full list.
 

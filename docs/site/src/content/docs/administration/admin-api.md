@@ -3,7 +3,7 @@ title: Admin API
 description: "Use the admin server: readiness, config dump, stats, the web UI, and the bearer-gated write API for keys, tenants, budgets, limits, credentials, and pricing."
 summary: Reference for every route the admin server answers, which routes
   need the admin token, the request body limits, and the status codes.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-08
 related:
   - administration/admin-ui
   - authentication/virtual-keys
@@ -186,6 +186,7 @@ writes need the matching `auth.enforce` field to stay `true` (the default):
 |---|---|
 | `PUT /tenants/{id}/policy`, `PUT /keys/{id}/policy` | `auth.enforce.model_policy` |
 | `PUT /tenants/{id}/budget` | `auth.enforce.spend` |
+| `PUT /tenants/{id}/scoped_budgets` with one or more budgets | `auth.enforce.spend` |
 | `PUT /tenants/{id}/limits`, `PUT /keys/{id}/limits` | `auth.enforce.limits` |
 | `PUT /tenants/{id}/objects/{object_id}` | `auth.enforce.object_ownership` |
 
@@ -267,6 +268,8 @@ for the key model and examples.
 | `/tenants/{id}` | DELETE | `204` | Deletes a tenant and revokes every key that authenticates as it. Minted keys are revoked and their rows stay. Config-file `auth.keys` entries for the tenant are revoked by a revoked store row with the same key id. That row wins on every replica that shares the store, and across restarts. Revoked key ids are permanent. The next request with any of those keys gets `401`. |
 | `/tenants/{id}/policy` | PUT | `204` | Sets the model-access policy. Body: `access` (`all` or `{"only": [...]}`) and optional `deny`. An invalid pattern gives `400`. |
 | `/tenants/{id}/budget` | PUT | `204` | Sets or clears the spend ceiling. |
+| `/tenants/{id}/scoped_budgets` | PUT | `204` | Replaces the whole list of scoped budgets of a tenant. `{"budgets":[]}` removes them all. See "Scoped budgets". |
+| `/tenants/{id}/scoped_budgets` | GET | `200` | Reads the scoped budgets of a tenant, with the spend of this replica for the current period. See "Scoped budgets". |
 | `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
 | `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Request and response body export](/docs/llm-proxy/observability/trace-export/). |
@@ -343,6 +346,32 @@ tenant budget use the same body shape, with one extra field for each:
   `tenant`. A key budget with this field gives `400`.
 - A key budget takes `include_byok_in_limit` (default `false`). A tenant
   budget with this field gives `400`.
+
+### Scoped budgets
+
+A scoped budget caps the spend of a tenant on some models, some providers, or
+both. The routes are also available as
+`/chains/{stat_prefix}/tenants/{id}/scoped_budgets`.
+
+- `PUT` replaces the whole list. The body is `{"budgets": [...]}`. It can
+  also hold `"schema_version": 2`. The proxy checks every budget before it
+  stores any, and answers `400` for the first one that is not valid.
+- A tenant holds at most 32 scoped budgets. A budget names at most 64 models
+  and at most 64 providers.
+- The fields of a budget are `name`, `max_usd`, `period`, `credential_source`,
+  `models`, `providers`, and `alert_at_percent`. A budget with neither
+  `models` nor `providers` gives `400`. Use `PUT /tenants/{id}/budget` for all
+  spend of a tenant.
+- A provider is a cluster name, or a provider name of the `--config` file.
+  A name that matches neither gives `400`.
+- `PUT` with one or more budgets answers `409` `not_enforced` when no chain
+  runs `llmproxy.spend_limit`. An empty list is always accepted.
+- `GET` answers `503` with `llmproxy.spend_limit is not configured on this
+  chain, so there is no spend accumulator to report from` when the chain has
+  no spend filter.
+
+See [Scoped budgets](/docs/llm-proxy/limits-and-budgets/spend-policies/#scoped-budgets)
+for the field table, the response, and the effect on requests.
 
 The spend reads answer `503` with `llmproxy.spend_limit is not configured on
 this chain, so there is no spend accumulator to report from` when

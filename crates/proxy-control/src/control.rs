@@ -62,6 +62,23 @@ pub(crate) fn key_id_from_budget_subject(subject: &TenantId) -> Option<KeyId> {
     subject.as_str().strip_prefix("\u{1f}key:").map(KeyId::new)
 }
 
+/// The budgets-table row that holds every scoped budget of `tenant`. Ids
+/// carry no control characters ([`reject_control_characters`]), so the
+/// prefix cannot collide with a tenant's own row.
+pub(crate) fn scoped_budgets_row_subject(tenant: &TenantId) -> String {
+    format!("{SCOPED_BUDGETS_ROW_PREFIX}{}", tenant.as_str())
+}
+
+/// The tenant whose scoped budgets a budgets-table row holds, or `None` for
+/// any other row.
+pub(crate) fn tenant_from_scoped_budgets_row(subject: &str) -> Option<TenantId> {
+    subject
+        .strip_prefix(SCOPED_BUDGETS_ROW_PREFIX)
+        .map(TenantId::new)
+}
+
+const SCOPED_BUDGETS_ROW_PREFIX: &str = "\u{1f}scoped-budgets:";
+
 fn reject_control_characters(field: &str, id: &str) -> Result<(), StoreError> {
     if id.chars().any(|ch| ch.is_ascii_control()) {
         return Err(StoreError::InvalidInput(format!(
@@ -1077,6 +1094,7 @@ struct InMemoryState {
     // `StoredControlPlane::budgets`'s doc.
     budgets: HashMap<TenantId, TenantBudget>,
     key_budgets: HashMap<KeyId, KeyBudget>,
+    scoped_budgets: HashMap<TenantId, Vec<crate::spend::ScopedBudget>>,
     limits: HashMap<TenantId, LimitPolicy>,
     // Credential rows keyed by `(tenant, provider)` -- the exact
     // create-or-replace identity `put_tenant_credential` names (ADR-0007
@@ -1140,6 +1158,7 @@ impl InMemoryControlPlaneStore {
                 policies: HashMap::new(),
                 budgets: HashMap::new(),
                 key_budgets: HashMap::new(),
+                scoped_budgets: HashMap::new(),
                 limits: HashMap::new(),
                 tenant_credentials: HashMap::new(),
                 rate_cards: HashMap::new(),
@@ -1222,7 +1241,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             policies: state.policies.clone(),
             budgets: state.budgets.clone(),
             key_budgets: state.key_budgets.clone(),
-            scoped_budgets: HashMap::new(),
+            scoped_budgets: state.scoped_budgets.clone(),
             limits: state.limits.clone(),
             tenant_credentials: state.tenant_credentials.values().cloned().collect(),
             rate_cards: state.rate_cards.values().cloned().collect(),
@@ -1261,6 +1280,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         // with it, the same "a deleted tenant carries no leftover
         // configuration" rule `set_policy`'s removal already follows.
         state.budgets.remove(tenant);
+        state.scoped_budgets.remove(tenant);
         state.limits.remove(tenant);
         // A deleted tenant's consent goes with it: re-creating the id must
         // not inherit an opt-in someone else gave.
@@ -1400,6 +1420,26 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             None => {
                 state.budgets.remove(tenant);
             }
+        }
+        state.generation += 1;
+        Ok(())
+    }
+
+    fn set_scoped_budgets(
+        &self,
+        tenant: &TenantId,
+        budgets: &[crate::spend::ScopedBudget],
+    ) -> Result<(), StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        if budgets.is_empty() {
+            state.scoped_budgets.remove(tenant);
+        } else {
+            state
+                .scoped_budgets
+                .insert(tenant.clone(), budgets.to_vec());
         }
         state.generation += 1;
         Ok(())
@@ -2106,6 +2146,98 @@ impl From<EncodedKeyBudget> for KeyBudget {
     }
 }
 
+/// Schema version of a tenant's scoped budget row ([`EncodedScopedBudgets`]).
+/// Tenant and key budget rows stay at [`SPEND_SCHEMA_VERSION`]; only this row
+/// carries 3. A build that reads only versions 1 and 2 of the budgets table
+/// refuses the row, so it fails to load the store rather than serve the
+/// tenant with its caps silently gone (CHANGELOG, downgrade note).
+pub const SCOPED_BUDGETS_SCHEMA_VERSION: u32 = 3;
+
+fn read_scoped_budgets_schema_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<u32, D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if version == SCOPED_BUDGETS_SCHEMA_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported scoped budget schema version {version}"
+        )))
+    }
+}
+
+/// Every scoped budget of one tenant, as one budgets-table row filed under
+/// [`scoped_budgets_row_subject`]. One row per tenant, so deleting a tenant
+/// removes one field and the admin API replaces the set in one write.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EncodedScopedBudgets {
+    #[serde(deserialize_with = "read_scoped_budgets_schema_version")]
+    schema_version: u32,
+    budgets: Vec<EncodedScopedBudget>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedScopedBudget {
+    name: String,
+    max_micros: u64,
+    period: EncodedPeriod,
+    credential_source: EncodedCredentialSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    alert_at_percent: Vec<u8>,
+}
+
+impl From<&[crate::spend::ScopedBudget]> for EncodedScopedBudgets {
+    fn from(budgets: &[crate::spend::ScopedBudget]) -> Self {
+        EncodedScopedBudgets {
+            schema_version: SCOPED_BUDGETS_SCHEMA_VERSION,
+            budgets: budgets
+                .iter()
+                .map(|budget| EncodedScopedBudget {
+                    name: budget.name.clone(),
+                    max_micros: budget.max_micros.as_micros(),
+                    period: budget.period.into(),
+                    credential_source: budget.credential_source.into(),
+                    models: budget
+                        .models
+                        .iter()
+                        .map(|p| p.as_str().to_owned())
+                        .collect(),
+                    providers: budget.providers.clone(),
+                    alert_at_percent: budget.alert_at_percent.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<EncodedScopedBudgets> for Vec<crate::spend::ScopedBudget> {
+    fn from(encoded: EncodedScopedBudgets) -> Self {
+        encoded
+            .budgets
+            .into_iter()
+            .map(|budget| crate::spend::ScopedBudget {
+                name: budget.name,
+                max_micros: crate::spend::MicroUsd::from_micros(budget.max_micros),
+                period: budget.period.into(),
+                credential_source: budget.credential_source.into(),
+                models: budget
+                    .models
+                    .into_iter()
+                    .map(crate::model_authz::ModelPattern::new)
+                    .collect(),
+                providers: budget.providers,
+                alert_at_percent: budget.alert_at_percent,
+            })
+            .collect()
+    }
+}
+
 /// Versioned durable row kept separate from budget and model policy rows.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct EncodedLimitPolicy {
@@ -2756,8 +2888,14 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         let budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
         let mut budgets = HashMap::new();
         let mut key_budgets = HashMap::new();
+        let mut scoped_budgets = HashMap::new();
         for entry in budgets_table.iter().map_err(store_err)? {
             let (key, value) = entry.map_err(store_err)?;
+            if let Some(tenant) = tenant_from_scoped_budgets_row(key.value()) {
+                let encoded: EncodedScopedBudgets = decode_json(value.value())?;
+                scoped_budgets.insert(tenant, encoded.into());
+                continue;
+            }
             let subject = TenantId::new(key.value());
             if let Some(key_id) = key_id_from_budget_subject(&subject) {
                 let encoded: EncodedKeyBudget = decode_json(value.value())?;
@@ -2823,7 +2961,7 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             policies,
             budgets,
             key_budgets,
-            scoped_budgets: HashMap::new(),
+            scoped_budgets,
             limits,
             tenant_credentials,
             rate_cards,
@@ -2864,6 +3002,9 @@ impl ControlPlaneStore for RedbControlPlaneStore {
             // comment.
             let mut budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
             budgets_table.remove(tenant.as_str()).map_err(store_err)?;
+            budgets_table
+                .remove(scoped_budgets_row_subject(tenant).as_str())
+                .map_err(store_err)?;
         }
         {
             let mut limits_table = txn.open_table(LIMITS_TABLE).map_err(store_err)?;
@@ -3099,6 +3240,29 @@ impl ControlPlaneStore for RedbControlPlaneStore {
                 None => {
                     table.remove(tenant.as_str()).map_err(store_err)?;
                 }
+            }
+        }
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    fn set_scoped_budgets(
+        &self,
+        tenant: &TenantId,
+        budgets: &[crate::spend::ScopedBudget],
+    ) -> Result<(), StoreError> {
+        let subject = scoped_budgets_row_subject(tenant);
+        let txn = self.db.begin_write().map_err(store_err)?;
+        {
+            let mut table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
+            if budgets.is_empty() {
+                table.remove(subject.as_str()).map_err(store_err)?;
+            } else {
+                let encoded = EncodedScopedBudgets::from(budgets);
+                table
+                    .insert(subject.as_str(), encode_json(&encoded).as_slice())
+                    .map_err(store_err)?;
             }
         }
         Self::bump_generation(&txn)?;
@@ -5206,6 +5370,19 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Replaces `tenant`'s scoped budgets with `budgets` (empty removes
+    /// them) and republishes. The caller validates them; see
+    /// [`crate::spend::ScopedBudget`].
+    pub fn set_scoped_budgets(
+        &self,
+        tenant: &TenantId,
+        budgets: &[crate::spend::ScopedBudget],
+    ) -> Result<(), StoreError> {
+        self.store.set_scoped_budgets(tenant, budgets)?;
+        self.apply_write()?;
+        Ok(())
+    }
+
     /// Records `tenant`'s trace-export opt-in (ADR-0008 decision 2) and
     /// republishes, so this replica's next request sees it; other replicas
     /// see it on their next poll.
@@ -5740,6 +5917,7 @@ impl ControlPlane {
         // looks a tenant's budget up independently of where its policy row
         // came from.
         let mut budgets = loaded.budgets;
+        let mut scoped_budgets = loaded.scoped_budgets;
         let key_budgets = loaded.key_budgets;
         let mut tenant_limits = loaded.limits;
         let mut key_limits = HashMap::new();
@@ -5759,23 +5937,36 @@ impl ControlPlane {
                 continue;
             }
             let budget = budgets.remove(&tenant);
+            let scoped = scoped_budgets.remove(&tenant).unwrap_or_default();
             policies.insert(
                 tenant.as_str().to_string(),
                 Arc::new(TenantPolicy {
                     model_access: Some(access),
                     budget,
-                    scoped_budgets: Arc::default(),
+                    scoped_budgets: scoped.into(),
                 }),
             );
         }
         for (tenant, budget) in budgets {
+            let scoped = scoped_budgets.remove(&tenant).unwrap_or_default();
             policies.insert(
                 tenant.as_str().to_string(),
                 Arc::new(TenantPolicy {
                     // A budget row is not a model grant (review H4).
                     model_access: None,
                     budget: Some(budget),
-                    scoped_budgets: Arc::default(),
+                    scoped_budgets: scoped.into(),
+                }),
+            );
+        }
+        // Tenants with scoped budgets and neither a policy nor a budget row.
+        for (tenant, scoped) in scoped_budgets {
+            policies.insert(
+                tenant.as_str().to_string(),
+                Arc::new(TenantPolicy {
+                    model_access: None,
+                    budget: None,
+                    scoped_budgets: scoped.into(),
                 }),
             );
         }
@@ -6174,6 +6365,13 @@ impl ControlPlaneStore for SharedMemoryStore {
     }
     fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
         self.inner.set_key_budget(key_id, budget)
+    }
+    fn set_scoped_budgets(
+        &self,
+        tenant: &TenantId,
+        budgets: &[crate::spend::ScopedBudget],
+    ) -> Result<(), StoreError> {
+        self.inner.set_scoped_budgets(tenant, budgets)
     }
     fn set_limits(
         &self,
@@ -8659,6 +8857,76 @@ mod tests {
             loaded.budgets.get(&TenantId::new("tenant-a")),
             Some(&budget)
         );
+    }
+
+    /// The stored contract of scoped budgets: the set survives a reopen
+    /// exactly; its row is version 3 while the tenant's own budget row stays
+    /// version 2 (byte-compatible with 1.0.0); a reader that knows only the
+    /// tenant row (1.0.0 decodes every non-key budgets row with
+    /// `EncodedTenantBudget`, accepting versions 1 and 2) refuses the row,
+    /// so a downgrade fails its load instead of dropping the caps; and
+    /// deleting the tenant removes the row.
+    #[test]
+    fn scoped_budgets_round_trip_at_version_3_which_a_1_0_reader_refuses() {
+        let path = temp_db_path("scoped-budgets");
+        let tenant = TenantId::new("tenant-a");
+        let budgets = vec![
+            crate::spend::ScopedBudget {
+                name: "gpt".into(),
+                max_micros: MicroUsd::from_micros(25),
+                period: Period::Weekly,
+                credential_source: CredentialSource::Tenant,
+                models: vec![crate::model_authz::ModelPattern::new("gpt-4o*")],
+                providers: vec!["provider:fallback".into()],
+                alert_at_percent: vec![50, 90],
+            },
+            crate::spend::ScopedBudget {
+                name: "cheap".into(),
+                max_micros: MicroUsd::from_micros(0),
+                period: Period::Daily,
+                credential_source: CredentialSource::Platform,
+                models: Vec::new(),
+                providers: vec!["c1".into()],
+                alert_at_percent: Vec::new(),
+            },
+        ];
+        let tenant_budget = TenantBudget {
+            max_micros: MicroUsd::from_micros(7),
+            period: Period::Monthly,
+            credential_source: CredentialSource::Platform,
+        };
+        {
+            let store = RedbControlPlaneStore::open(&path).unwrap();
+            store.set_budget(&tenant, Some(&tenant_budget)).unwrap();
+            store.set_scoped_budgets(&tenant, &budgets).unwrap();
+        }
+        let store = RedbControlPlaneStore::open(&path).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.scoped_budgets.get(&tenant), Some(&budgets));
+        assert_eq!(loaded.budgets.get(&tenant), Some(&tenant_budget));
+
+        let (scoped_row, tenant_row) = {
+            let txn = store.db.begin_read().unwrap();
+            let table = txn.open_table(BUDGETS_TABLE).unwrap();
+            let read = |subject: &str| table.get(subject).unwrap().unwrap().value().to_vec();
+            (
+                read(scoped_budgets_row_subject(&tenant).as_str()),
+                read(tenant.as_str()),
+            )
+        };
+        let version = |row: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(row).unwrap()["schema_version"].clone()
+        };
+        assert_eq!(version(&scoped_row), 3);
+        assert_eq!(version(&tenant_row), 2, "the tenant row is unchanged");
+        assert!(
+            decode_json::<EncodedTenantBudget>(&scoped_row).is_err(),
+            "a 1.0.0 reader must refuse the scoped row, not load it as a tenant budget"
+        );
+
+        store.delete_tenant(&tenant).unwrap();
+        assert!(store.load().unwrap().scoped_budgets.is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     /// ADR-0007 amendment 1, redb upgrade: a database written before

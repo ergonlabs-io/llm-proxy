@@ -814,6 +814,12 @@ struct Bucket {
     /// row created memory-only, whose base is not the store's.
     #[serde(skip)]
     synced_at: Option<DateTime<Utc>>,
+    /// The highest scoped-budget alert level, in percent, this replica has
+    /// already marked for this row ([`SpendAccumulator::record_scoped`]).
+    /// Not journaled: after a restart the next charge marks the current
+    /// level once more, which repeats an alert rather than losing one.
+    #[serde(skip)]
+    alerted_percent: u8,
 }
 
 /// The longest a budgeted row below half its ceiling goes without a
@@ -1129,6 +1135,9 @@ struct Inner {
     /// The `spend` series of `llmproxy_counter_reconciliation_age_seconds`,
     /// once exported; the flusher sets it after every tick.
     age_gauge: OnceLock<ReconciliationAgeGauge>,
+    /// `llmproxy_spend_budget_utilization`, once exported; the flusher sets
+    /// it after every tick.
+    utilization: OnceLock<crate::budget_utilization::BudgetUtilizationGauges>,
 }
 
 impl Inner {
@@ -1136,6 +1145,49 @@ impl Inner {
         if let Some(gauge) = self.age_gauge.get() {
             gauge.publish(self.reconciliation_age(now));
         }
+    }
+
+    /// Publishes the utilization of every tenant and scoped budget row whose
+    /// period contains `now` and that a budget has consulted (its ceiling is
+    /// known). Key rows are skipped: see [`crate::budget_utilization`]. The
+    /// bucket mutex is held only to copy the figures out.
+    fn publish_utilization(&self, now: DateTime<Utc>) {
+        let Some(gauges) = self.utilization.get() else {
+            return;
+        };
+        let readings: Vec<_> = {
+            let buckets = self.lock_buckets();
+            buckets
+                .active
+                .iter()
+                .filter(|(_, bucket)| {
+                    bucket.period_start.is_some_and(|start| start <= now) && !bucket.is_ended(now)
+                })
+                .filter_map(|((subject, _), bucket)| {
+                    let limit = bucket.limit_micros?;
+                    let (tenant, budget) = match scoped_spend_subject_parts(subject.as_str()) {
+                        Some((tenant, name)) => (tenant.to_owned(), name.to_owned()),
+                        // Key rows and any other reserved subject start with
+                        // the separator; a tenant id never does.
+                        None if subject.as_str().starts_with('\u{1f}') => return None,
+                        None => (
+                            subject.as_str().to_owned(),
+                            proxy_observability::stats::instruments::SPEND_BUDGET_TENANT.to_owned(),
+                        ),
+                    };
+                    let used = bucket
+                        .base_micros
+                        .saturating_add(bucket.pending_delta_micros);
+                    Some(crate::budget_utilization::Reading {
+                        subject: subject.clone(),
+                        tenant,
+                        budget,
+                        percent: utilization_percent(used, limit),
+                    })
+                })
+                .collect()
+        };
+        gauges.publish(readings);
     }
 
     /// Locks the buckets with `key`'s bucket in `active`, inserting a freshly
@@ -1684,6 +1736,31 @@ pub struct SpendAccumulator {
     flusher: Mutex<Option<Flusher>>,
 }
 
+/// Adds one charge to a bucket: a price to its pending delta, an unpriced
+/// request to its unpriced counts.
+fn apply_charge(bucket: &mut Bucket, charge: Charge, cluster: Option<&str>, model: Option<&str>) {
+    match charge {
+        Charge::Priced(amount) => {
+            bucket.pending_delta_micros = bucket
+                .pending_delta_micros
+                .saturating_add(amount.as_micros());
+        }
+        Charge::Unpriced => {
+            bucket.unpriced_requests += 1;
+            if let (Some(cluster), Some(model)) = (cluster, model) {
+                let pair = (cluster.to_string(), model.to_string());
+                if !bucket.unpriced_pairs.contains(&pair) {
+                    if bucket.unpriced_pairs.len() < MAX_UNPRICED_PAIRS {
+                        bucket.unpriced_pairs.insert(pair);
+                    } else {
+                        bucket.unpriced_pairs_truncated = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Converts a public key identity into the opaque row key used by the
 /// pre-existing spend store. This prefix is private to the store boundary;
 /// callers must use the `*_key` methods above rather than construct it.
@@ -1759,6 +1836,7 @@ impl SpendAccumulator {
                 reconciliation,
                 unreconciled_admissions: AtomicU64::new(0),
                 age_gauge: OnceLock::new(),
+                utilization: OnceLock::new(),
             }),
             flusher: Mutex::new(None),
         }
@@ -1827,6 +1905,21 @@ impl SpendAccumulator {
                 .iter()
                 .map(|(tenant, budget)| (tenant.clone(), budget.period, budget.max_micros)),
         )
+    }
+
+    /// [`Self::prepare_request_workers`] for scoped budgets, each with the
+    /// tenant that owns it.
+    pub fn prepare_scoped_request_workers(
+        &self,
+        budgets: &[(TenantId, ScopedBudget)],
+    ) -> Result<(), StoreError> {
+        self.prepare_request_subjects(budgets.iter().map(|(tenant, budget)| {
+            (
+                scoped_spend_subject(tenant, &budget.name),
+                budget.period,
+                budget.max_micros,
+            )
+        }))
     }
 
     fn prepare_request_subjects(
@@ -1923,27 +2016,7 @@ impl SpendAccumulator {
         let key = (tenant.clone(), period.key_for(now));
         let mut buckets = self.inner.lock_with_bucket(&key);
         let bucket = buckets.active.get_mut(&key).expect("just ensured");
-
-        match charge {
-            Charge::Priced(amount) => {
-                bucket.pending_delta_micros = bucket
-                    .pending_delta_micros
-                    .saturating_add(amount.as_micros());
-            }
-            Charge::Unpriced => {
-                bucket.unpriced_requests += 1;
-                if let (Some(cluster), Some(model)) = (cluster, model) {
-                    let pair = (cluster.to_string(), model.to_string());
-                    if !bucket.unpriced_pairs.contains(&pair) {
-                        if bucket.unpriced_pairs.len() < MAX_UNPRICED_PAIRS {
-                            bucket.unpriced_pairs.insert(pair);
-                        } else {
-                            bucket.unpriced_pairs_truncated = true;
-                        }
-                    }
-                }
-            }
-        }
+        apply_charge(bucket, charge, cluster, model);
     }
 
     /// [`Self::record`] against the real wall clock (`Utc::now()`) -- the
@@ -2142,6 +2215,77 @@ impl SpendAccumulator {
             ReconciliationAgeGauge::new(registry, &self.inner.stat_prefix, Seam::Spend)
         });
         gauge.publish(self.inner.reconciliation_age(Utc::now()));
+    }
+
+    /// Exports `llmproxy_spend_budget_utilization` from this accumulator;
+    /// the flusher publishes it after every tick. Idempotent.
+    pub fn export_budget_utilization(&self, registry: Arc<proxy_observability::stats::Registry>) {
+        self.inner.utilization.get_or_init(|| {
+            crate::budget_utilization::BudgetUtilizationGauges::new(
+                registry,
+                &self.inner.stat_prefix,
+            )
+        });
+    }
+
+    /// Publishes the utilization gauge as of `now`, as a flusher tick does.
+    /// A no-op until [`Self::export_budget_utilization`] has run.
+    pub fn publish_budget_utilization(&self, now: DateTime<Utc>) {
+        self.inner.publish_utilization(now);
+    }
+
+    /// The live total of `budget`'s row for `tenant` in the period `now`
+    /// falls in, as admission compares it. Records the ceiling on the row,
+    /// as [`Self::admission_total`] does.
+    pub fn admission_total_scoped(
+        &self,
+        tenant: &TenantId,
+        budget: &ScopedBudget,
+        now: DateTime<Utc>,
+    ) -> u64 {
+        self.total(
+            &scoped_spend_subject(tenant, &budget.name),
+            &budget.period.key_for(now),
+            Some(budget.max_micros.as_micros()),
+        )
+    }
+
+    /// [`Self::record`] on `budget`'s row for `tenant`. Returns the highest
+    /// of the budget's alert levels the row's total has reached that this
+    /// replica had not marked yet this period, and marks it, so each level
+    /// is reported once per replica and period. The total includes what
+    /// other replicas spent as of the last flush, so a level crossed by
+    /// their spend is reported on this replica's next charge.
+    #[must_use = "the crossed alert level is the request record's threshold event"]
+    pub fn record_scoped(
+        &self,
+        tenant: &TenantId,
+        budget: &ScopedBudget,
+        now: DateTime<Utc>,
+        charge: Charge,
+        cluster: Option<&str>,
+        model: Option<&str>,
+    ) -> Option<u8> {
+        let key = (
+            scoped_spend_subject(tenant, &budget.name),
+            budget.period.key_for(now),
+        );
+        let mut buckets = self.inner.lock_with_bucket(&key);
+        let bucket = buckets
+            .active
+            .get_mut(&key)
+            .expect("lock_with_bucket leaves the key's bucket in active");
+        apply_charge(bucket, charge, cluster, model);
+        bucket.limit_micros = Some(budget.max_micros.as_micros());
+        let total = bucket
+            .base_micros
+            .saturating_add(bucket.pending_delta_micros);
+        let level = budget.alert_level(total)?;
+        if level <= bucket.alerted_percent {
+            return None;
+        }
+        bucket.alerted_percent = level;
+        Some(level)
     }
 
     /// Set the exported gauge to the age as of `now`. A no-op until
@@ -2407,7 +2551,9 @@ fn run_flusher(inner: Arc<Inner>, shutdown: Arc<ShutdownSignal>, interval: Durat
             // finish before it can even set the flag.
             drop(guard);
             let flushed = inner.flush_now();
-            inner.publish_age(Utc::now());
+            let now = Utc::now();
+            inner.publish_age(now);
+            inner.publish_utilization(now);
             if let Err(err) = flushed {
                 // Two log lines, not one, because they say different things
                 // and an operator acts on them differently: the first is

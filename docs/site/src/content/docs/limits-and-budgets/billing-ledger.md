@@ -4,7 +4,7 @@ description: "Write a durable, per-request billing record stream and read its de
 summary: A durable, encrypted record of every request the proxy sends to a
   provider. What an entry holds, the ledger config, what happens when the
   ledger is full or fails, and how a consumer pulls and acknowledges entries.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-08
 related:
   - limits-and-budgets/spend-policies
   - administration/admin-api
@@ -98,9 +98,23 @@ The entry exists whether or not request capture is on.
 | `policy_generation` | integer or null | The policy generation the request was admitted under. |
 | `record` | object | The terminal request record. |
 
-Each item in `charged_scopes` has `scope` (`tenant` or `key`), `id`, and
-`period`. The `period` is the UTC budget period of the charge, `YYYY-MM-DD` or
-`YYYY-MM`.
+Each item in `charged_scopes` has `scope` (`tenant`, `key`, or `scoped`),
+`id`, and `period`. The `period` is the UTC budget period of the charge:
+`YYYY-MM-DD` (daily), `YYYY-Www` (weekly), or `YYYY-MM` (monthly). For a
+`scoped` item, `id` is the name of the scoped budget in the tenant of the
+entry. See
+[Scoped budgets](/docs/llm-proxy/limits-and-budgets/spend-policies/#scoped-budgets).
+
+A `scoped` item can also have these fields. The ledger leaves out a field that
+does not apply:
+
+| Field | Type | What it holds |
+|---|---|---|
+| `micro_usd` | integer | The amount added to this counter, in micro-dollars. A budget with `providers` takes only the attempts on its own providers, so the amount can be less than `charged_micro_usd`. A `tenant` or `key` item has no `micro_usd`: it takes the whole charge. |
+| `alert_percent` | integer | The highest alert level that this charge took the budget to, for the first time in this period on this replica. The item has no `alert_percent` if the charge reached no level. |
+
+The proxy does not journal the alert marks. After a restart, a later entry can
+carry a level that an earlier entry already carried.
 
 `charged_micro_usd` has two meanings:
 

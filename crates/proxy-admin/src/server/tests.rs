@@ -3695,5 +3695,6 @@ mod object_bodies;
 mod object_owners;
 mod policy_publish;
 mod pricing;
+mod scoped_budgets;
 mod tenant_budget_cutover;
 mod trace_export;

@@ -30,6 +30,13 @@ surfaces that an upgrade within 1.x keeps stable.
   - Deprecated: the unsuffixed `x-ratelimit-limit`, `x-ratelimit-remaining`
     and `x-ratelimit-reset` on token and request 429s. They stay for one more
     minor release.
+- Every spend 429 (key, tenant, or scoped budget) now also sends
+  `x-llmproxy-budget-scope` (`key`, `tenant`, or `scoped`). A scoped budget
+  adds `x-llmproxy-budget-name`. The spend 429 still sends no `x-ratelimit-*`
+  header.
+- A `--config` file that enforces spend now adds the body parser to the chain,
+  as it does for model policy. Scoped budgets match the routing model, which
+  the parser publishes.
 
 ### Added
 
@@ -84,6 +91,32 @@ surfaces that an upgrade within 1.x keeps stable.
 - Spend budgets: `period` can be `weekly`, an ISO week that starts on Monday at
   00:00 UTC. A store that holds a weekly budget cannot be read by 1.0.0, so
   change or clear weekly budgets before a downgrade.
+- Scoped budgets: a tenant can hold up to 32 spend budgets that each cover only
+  the requests for some models, some providers, or both, beside the tenant
+  budget. Set the whole list with `PUT /tenants/{id}/scoped_budgets`, and read
+  it with spend and utilization with `GET /tenants/{id}/scoped_budgets`. Both
+  routes also exist as `/chains/{stat_prefix}/tenants/{id}/scoped_budgets`.
+  Every budget that matches a request is enforced, with the key and tenant
+  budgets. A spent model budget refuses the request with `429`. A spent
+  provider budget closes its clusters: the request fails over to a provider
+  with room, and gets `429` only when none is left. Each budget can set
+  `alert_at_percent` levels. The ledger and a warning log line report each
+  level once for each budget, period and replica. See Limits and budgets >
+  Spend policies > Scoped budgets.
+- Gauge `llmproxy_spend_budget_utilization` (labels `scope`, `tenant`,
+  `budget`): the whole percent of each tenant or scoped budget that the
+  current period has used. A key budget has no series.
+- Billing ledger: `charged_scopes[].scope` can be `scoped`. A charged scope can
+  carry `micro_usd` (the amount added to that counter; every `scoped` scope
+  has it, since a provider budget can take only part of the charge) and
+  `alert_percent` (the alert level that the
+  charge reached). The ledger leaves out both fields when they do not apply.
+- A store that holds scoped budgets cannot be read by 1.0.x: the tenant's
+  scoped budgets are stored as one row at version 3, and 1.0.x refuses to load
+  a version it does not know instead of serving the tenant with no caps.
+  **Before a downgrade to 1.0.x, remove the scoped budgets of every tenant
+  with `PUT /tenants/{id}/scoped_budgets` and the body `{"budgets":[]}`.** A
+  store with no scoped budget stays readable by 1.0.x.
 
 ### Fixed
 

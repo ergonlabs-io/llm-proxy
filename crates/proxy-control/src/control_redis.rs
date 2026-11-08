@@ -10,6 +10,7 @@
 //! {ns}:keys                                 HASH key_id -> encode_json(EncodedKeyRow)
 //! {ns}:policies                             HASH tenant -> encode_json(EncodedModelAccess)
 //! {ns}:budgets                              HASH subject -> encode_json(EncodedTenantBudget)
+//!                                           (a tenant's scoped budgets: one field, EncodedScopedBudgets)
 //! {ns}:limits                               HASH subject -> encode_json(EncodedLimitPolicy)
 //! {ns}:tenant_credentials                   HASH <esc(tenant)>|<esc(provider)> -> encode_json(EncodedTenantCredentialRow)
 //! {ns}:rate_cards                           HASH chain (the usage filter's stat_prefix) -> encode_json(EncodedRateCardRow)
@@ -64,6 +65,9 @@ use crate::control::{
     WindowDelta, WindowRow, TENANT_CREDENTIALS_SCHEMA_VERSION, WINDOW_ROW_GRACE_SECS,
 };
 use crate::control::{decode_trace_export_row, encode_trace_export_row};
+use crate::control::{
+    scoped_budgets_row_subject, tenant_from_scoped_budgets_row, EncodedScopedBudgets,
+};
 use crate::model_authz::ModelAccess;
 use crate::spend::{key_spend_subject, KeyBudget, PeriodKey, TenantBudget};
 use crate::window_counter::{FleetLeases, LeaseRow, LeaseStore};
@@ -466,11 +470,12 @@ return 1
 /// `<esc(tenant)>|` matches exactly that tenant: an escaped tenant contains
 /// no `|`. `KEYS` = tenants, policies, budgets, limits, credentials,
 /// trace-export opt-ins, generation.
-/// `ARGV[1]` = tenant, `ARGV[2]` = credential field prefix.
+/// `ARGV[1]` = tenant, `ARGV[2]` = credential field prefix, `ARGV[3]` = the
+/// tenant's scoped budget row in the budgets hash.
 const DELETE_TENANT_LUA: &str = r#"
 redis.call('SREM', KEYS[1], ARGV[1])
 redis.call('HDEL', KEYS[2], ARGV[1])
-redis.call('HDEL', KEYS[3], ARGV[1])
+redis.call('HDEL', KEYS[3], ARGV[1], ARGV[3])
 redis.call('HDEL', KEYS[4], ARGV[1])
 local prefix = ARGV[2]
 for _, field in ipairs(redis.call('HKEYS', KEYS[5])) do
@@ -1113,7 +1118,13 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         // `EncodedKeyBudget` for how a row from before the flag reads.
         let mut budgets = HashMap::new();
         let mut key_budgets = HashMap::new();
+        let mut scoped_budgets = HashMap::new();
         for (subject, bytes) in budgets_raw {
+            if let Some(tenant) = tenant_from_scoped_budgets_row(&subject) {
+                let encoded: EncodedScopedBudgets = decode_json(&bytes)?;
+                scoped_budgets.insert(tenant, encoded.into());
+                continue;
+            }
             let subject = TenantId::new(subject);
             if let Some(key_id) = key_id_from_budget_subject(&subject) {
                 let encoded: EncodedKeyBudget = decode_json(&bytes)?;
@@ -1197,7 +1208,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
             policies,
             budgets,
             key_budgets,
-            scoped_budgets: HashMap::new(),
+            scoped_budgets,
             limits,
             tenant_credentials,
             rate_cards,
@@ -1247,6 +1258,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .key(self.generation_key())
                 .arg(tenant.as_str())
                 .arg(prefix)
+                .arg(scoped_budgets_row_subject(tenant))
                 .invoke::<i64>(conn)
         })?;
         Ok(())
@@ -1367,6 +1379,16 @@ impl ControlPlaneStore for RedisControlPlaneStore {
     ) -> Result<(), StoreError> {
         let bytes = budget.map(|budget| encode_json(&EncodedTenantBudget::from(budget)));
         self.write_budget_row(tenant.as_str(), bytes)
+    }
+
+    fn set_scoped_budgets(
+        &self,
+        tenant: &TenantId,
+        budgets: &[crate::spend::ScopedBudget],
+    ) -> Result<(), StoreError> {
+        let bytes =
+            (!budgets.is_empty()).then(|| encode_json(&EncodedScopedBudgets::from(budgets)));
+        self.write_budget_row(&scoped_budgets_row_subject(tenant), bytes)
     }
 
     fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {

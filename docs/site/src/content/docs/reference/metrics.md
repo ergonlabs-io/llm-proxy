@@ -4,7 +4,7 @@ description: "Every metric that llm-proxy records, with its type, unit, labels, 
 summary: One table for each area (traffic, usage and cost, credentials, state
   and policy, telemetry health, request records, ledger, body export) that
   lists each metric name, type, unit, labels, and what it counts.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-08
 related:
   - observability/metrics-and-stats
   - observability/tracing
@@ -140,6 +140,7 @@ These metrics describe the shared store that `auth.store` selects. They are on
 | `llmproxy_policy_store_emptied_total` | counter | events | `scope` | Policy loads that found no keys, or no tenants, after the previous load found some. Every virtual key the store held then gets 401. |
 | `llmproxy_policy_store_rows` | gauge | rows | `scope`, `kind` | Keys and tenants in the last load. `kind` is `keys` or `tenants`. A `keys` value of 0 means every stored virtual key gets 401. |
 | `llmproxy_counter_reconciliation_age_seconds` | gauge | s | `scope`, `seam` | Time since the counters of one seam last reconciled with the store. `seam` is `rate_window`, `stream_lease`, or `spend`. The value grows while the store is unreachable. During that time the proxy admits requests against the last known totals. |
+| `llmproxy_spend_budget_utilization` | gauge | % | `scope`, `tenant`, `budget` | The whole percent (rounded down) of a tenant budget or scoped budget that the current period used. It is above 100 when requests in flight overran the ceiling. `budget` is `-tenant-` for the tenant budget, or the name of the scoped budget. A key budget has no series. The flusher publishes it at each tick, and a series with no reading for the current period goes to 0. Series past 4096 share one series with `tenant` and `budget` set to `-cardinality-overflow-`. See [Scoped budgets](/docs/llm-proxy/limits-and-budgets/spend-policies/#scoped-budgets). |
 | `llmproxy_control_plane_store_info` | gauge | stores | `scope`, `store`, `node_id` | Always 1. `store` is `in_memory`, `persistent`, or `shared`. `node_id` is the configured node id, or `-`. |
 | `llmproxy_control_plane_load_duration` | histogram | ms | `scope` | Duration of each successful load from the Redis-backed store. 19 bucket boundaries from 0.5 to 3,600,000. |
 | `llmproxy_control_plane_load_payload_bytes` | gauge | bytes | `scope` | Size of the last successful load from the Redis-backed store. |
