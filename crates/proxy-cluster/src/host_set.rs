@@ -71,6 +71,11 @@ impl HostSet {
         self.by_priority.values().flatten().cloned().collect()
     }
 
+    /// Borrowing form of [`Self::all_hosts`], in the same order, for callers that only look.
+    pub fn iter_hosts(&self) -> impl Iterator<Item = &Arc<Host>> + '_ {
+        self.by_priority.values().flatten()
+    }
+
     /// Whether any host at any priority is healthy (not ejected, not failing active health checks). Does not
     /// allocate, unlike [`Self::all_hosts`], because an aggregate asks this of members on every pick.
     pub fn has_healthy_host(&self) -> bool {

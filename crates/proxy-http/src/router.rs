@@ -53,7 +53,9 @@ use crate::route::{
     DrawSource, HashIdentity, MemberSignals,
 };
 use crate::stat_handles::RouterStats;
-use crate::upstream_pool::{ConnKey, H1ConnCache, LeasedH1, PooledSendRequest, UpstreamConnCache};
+use crate::upstream_pool::{
+    ConnKey, H1ConnCache, LazyPool, LeasedH1, PooledSendRequest, UpstreamConnCache,
+};
 use guarded::GuardedBody;
 use idle::IdleTimeoutBody;
 use proxy_credentials::{CredentialSource, TenantCredential, TenantCredentialSet, TenantSecret};
@@ -1724,7 +1726,8 @@ impl RouterHandler {
                     (attempt_trace, SystemTime::now(), attempt_info)
                 };
                 let attempt_guard = crate::attempt_logging::AttemptGuard(attempt_info.clone());
-                let pool = attempt_entry.http_pool(&host, proto);
+                // Built on first dial only: a cached connection never needs it.
+                let pool = LazyPool::new(attempt_entry, &host, proto);
                 // Both protocols are now cache-key'd --
                 // h2 upstreams are reused across requests via this worker's
                 // `UpstreamConnCache` (one TCP connection, or a small bounded
@@ -1751,13 +1754,13 @@ impl RouterHandler {
                 let connect_result: Result<Connected, PoolError> = match proto {
                     UpstreamProtocol::Http2 => self
                         .conn_cache
-                        .get_or_connect(conn_key.clone(), pool.as_ref())
+                        .get_or_connect(conn_key.clone(), &pool)
                         .await
                         .map(Connected::Http2),
                     UpstreamProtocol::Http1 => self
                         .h1_cache
                         .clone()
-                        .get_or_connect_h1(conn_key.clone(), pool.as_ref())
+                        .get_or_connect_h1(conn_key.clone(), &pool)
                         .await
                         .map(Connected::Http1),
                 };

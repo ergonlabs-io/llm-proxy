@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use rand::distributions::uniform::{SampleRange, SampleUniform};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -157,25 +158,56 @@ impl LoadBalancer for RoundRobinLb {
     }
 }
 
+// ---------------------------------------------------------------------- RNG --
+
+/// Where a picker draws random numbers from.
+///
+/// Production pickers use `Thread`: the per-thread generator needs no lock, so concurrent workers never contend on
+/// a pick. The `with_seed` constructors use `Seeded`, a fixed-seed generator behind a `Mutex`, so statistical tests
+/// stay reproducible.
+enum LbRng {
+    Thread,
+    // Boxed so the lock-free production variant stays pointer-sized.
+    Seeded(Box<Mutex<StdRng>>),
+}
+
+impl LbRng {
+    fn seeded(seed: u64) -> Self {
+        Self::Seeded(Box::new(Mutex::new(StdRng::seed_from_u64(seed))))
+    }
+
+    fn gen_range<T, R>(&self, range: R) -> T
+    where
+        T: SampleUniform,
+        R: SampleRange<T>,
+    {
+        match self {
+            Self::Thread => rand::thread_rng().gen_range(range),
+            Self::Seeded(rng) => rng
+                .lock()
+                .expect("lock poisoned: a holder panicked")
+                .gen_range(range),
+        }
+    }
+}
+
 // ------------------------------------------------------------------- RANDOM --
 
 /// `RANDOM` (S7): uniform pick over the candidate set.
 pub struct RandomLb {
-    // Rust note: same interior-mutability story as `RoundRobinLb::swrr` --
-    // drawing a random number needs `&mut`, `pick` only has `&self`.
-    rng: Mutex<StdRng>,
+    rng: LbRng,
 }
 
 impl RandomLb {
     pub fn new() -> Self {
-        Self::with_seed(rand::random())
+        Self { rng: LbRng::Thread }
     }
 
     /// Test/reproducibility seam: a fixed seed makes `RANDOM`'s statistical
     /// tests deterministic instead of flaky.
     pub fn with_seed(seed: u64) -> Self {
         Self {
-            rng: Mutex::new(StdRng::seed_from_u64(seed)),
+            rng: LbRng::seeded(seed),
         }
     }
 }
@@ -188,12 +220,11 @@ impl Default for RandomLb {
 
 impl LoadBalancer for RandomLb {
     fn pick(&self, hosts: &[Arc<Host>], _ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
-        if hosts.is_empty() {
-            return None;
+        match hosts {
+            [] => None,
+            [only] => Some(Arc::clone(only)),
+            _ => Some(Arc::clone(&hosts[self.rng.gen_range(0..hosts.len())])),
         }
-        let mut rng = self.rng.lock().expect("lock poisoned: a holder panicked");
-        let idx = rng.gen_range(0..hosts.len());
-        Some(Arc::clone(&hosts[idx]))
     }
 }
 
@@ -208,18 +239,21 @@ const DEFAULT_CHOICE_COUNT: usize = 2;
 /// idle this is uniform random.
 pub struct LeastRequestLb {
     choice_count: usize,
-    rng: Mutex<StdRng>,
+    rng: LbRng,
 }
 
 impl LeastRequestLb {
     pub fn new() -> Self {
-        Self::with_seed(DEFAULT_CHOICE_COUNT, rand::random())
+        Self {
+            choice_count: DEFAULT_CHOICE_COUNT,
+            rng: LbRng::Thread,
+        }
     }
 
     pub fn with_seed(choice_count: usize, seed: u64) -> Self {
         Self {
             choice_count: choice_count.max(1),
-            rng: Mutex::new(StdRng::seed_from_u64(seed)),
+            rng: LbRng::seeded(seed),
         }
     }
 }
@@ -238,14 +272,13 @@ impl LoadBalancer for LeastRequestLb {
         if hosts.len() == 1 {
             return Some(Arc::clone(&hosts[0]));
         }
-        let mut rng = self.rng.lock().expect("lock poisoned: a holder panicked");
         let k = self.choice_count.min(hosts.len());
         // Rust note: partial Fisher-Yates shuffles only the first `k` slots, since P2C needs `k` distinct candidates.
         // Sampling without replacement matters: sampling with replacement could draw the same host twice and never
         // compare it against anything. That made this fail non-deterministically in early testing with 2 hosts.
         let mut indices: Vec<usize> = (0..hosts.len()).collect();
         for i in 0..k {
-            let j = rng.gen_range(i..indices.len());
+            let j = self.rng.gen_range(i..indices.len());
             indices.swap(i, j);
         }
         let mut best_idx = indices[0];
@@ -269,20 +302,22 @@ impl LoadBalancer for LeastRequestLb {
 /// policies.
 pub struct HostPicker {
     policy: Box<dyn LoadBalancer>,
-    // Rust note: the priority a request lands on is a weighted random draw (see `choose_priority`), which needs the
-    // same `&self`-but-mutates seam as the policies.
-    priority_rng: Mutex<StdRng>,
+    // The priority a request lands on is a weighted random draw (see `choose_priority`).
+    priority_rng: LbRng,
 }
 
 impl HostPicker {
     pub fn new(policy: Box<dyn LoadBalancer>) -> Self {
-        Self::with_seed(policy, rand::random())
+        Self {
+            policy,
+            priority_rng: LbRng::Thread,
+        }
     }
 
     pub fn with_seed(policy: Box<dyn LoadBalancer>, seed: u64) -> Self {
         Self {
             policy,
-            priority_rng: Mutex::new(StdRng::seed_from_u64(seed)),
+            priority_rng: LbRng::seeded(seed),
         }
     }
 
@@ -293,7 +328,7 @@ impl HostPicker {
     pub fn pick(&self, host_set: &HostSet, ctx: &LoadBalancerContext) -> Option<Arc<Host>> {
         // The override is a hint. Honor it only when the address is in the set; otherwise select normally.
         if let Some(addr) = ctx.host_override {
-            if let Some(host) = host_set.all_hosts().iter().find(|h| h.address == addr) {
+            if let Some(host) = host_set.iter_hosts().find(|h| h.address == addr) {
                 if !ctx.avoid_previous_hosts || !ctx.attempted_hosts.contains(&addr) {
                     return Some(Arc::clone(host));
                 }
@@ -312,11 +347,15 @@ impl HostPicker {
         // the healthy-only path.
         let panicking = healthy_count * 100 < total_count * PANIC_THRESHOLD_PERCENT;
 
-        let candidates: Vec<Arc<Host>> = if panicking {
+        // Borrow the member list when every candidate is in it (all healthy, or panicking); only a partly
+        // unhealthy set needs a filtered copy.
+        let candidates: std::borrow::Cow<'_, [Arc<Host>]> = if panicking {
             // TODO (stats): count this as `lb_healthy_panic`.
-            members.to_vec()
+            std::borrow::Cow::Borrowed(members)
+        } else if healthy_count == total_count {
+            std::borrow::Cow::Borrowed(members)
         } else {
-            members.iter().filter(|h| h.is_healthy()).cloned().collect()
+            std::borrow::Cow::Owned(members.iter().filter(|h| h.is_healthy()).cloned().collect())
         };
         if candidates.is_empty() {
             return None;
@@ -327,7 +366,7 @@ impl HostPicker {
             0
         };
         for selection_attempt in 0..=max_retries {
-            let picked = self.policy.pick(&candidates, ctx)?;
+            let picked = self.policy.pick(candidates.as_ref(), ctx)?;
             if !ctx.avoid_previous_hosts
                 || !ctx.attempted_hosts.contains(&picked.address)
                 || selection_attempt == max_retries
@@ -348,10 +387,13 @@ impl HostPicker {
     /// goes to P1 (the last priority) regardless of its ratio. A fully healthy P0 gets 100, so nothing spills. A
     /// fully unhealthy P0 gets 0, so P1 absorbs all 100.
     fn choose_priority(&self, host_set: &HostSet) -> Option<u32> {
-        let priorities: Vec<u32> = host_set.priorities().collect();
-        if priorities.is_empty() {
-            return None;
+        // One priority is the common case: it takes all the load, so there is nothing to draw.
+        let mut iter = host_set.priorities();
+        let first = iter.next()?;
+        if iter.next().is_none() {
+            return Some(first);
         }
+        let priorities: Vec<u32> = host_set.priorities().collect();
         let last = *priorities.last().expect("checked non-empty above");
 
         let mut loads: Vec<(u32, u64)> = Vec::with_capacity(priorities.len());
@@ -372,11 +414,7 @@ impl HostPicker {
             remaining = remaining.saturating_sub(load);
         }
 
-        let mut rng = self
-            .priority_rng
-            .lock()
-            .expect("lock poisoned: a holder panicked");
-        let draw = rng.gen_range(0..100u64);
+        let draw = self.priority_rng.gen_range(0..100u64);
         let mut acc = 0u64;
         for (priority, load) in &loads {
             acc += load;

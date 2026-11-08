@@ -19,16 +19,20 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::client::conn::http1::SendRequest as Http1SendRequest;
 use hyper::client::conn::http2::SendRequest;
 use proxy_cluster::pool::ClusterBuildId;
-use proxy_cluster::{ConnectTiming, HttpConnPool, PoolError, UpstreamProtocol, UpstreamStream};
+use proxy_cluster::{
+    ClusterEntry, ConnectTiming, Host, HttpConnPool, PoolError, UpstreamProtocol, UpstreamStream,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -78,6 +82,41 @@ impl Hash for ConnKey {
         self.addr.hash(state);
         matches!(self.protocol, UpstreamProtocol::Http2).hash(state);
         self.build.hash(state);
+    }
+}
+
+/// An [`HttpConnPool`] that asks the cluster for the real pool only when a connection is actually dialled.
+///
+/// The router needs a pool to hand to the connection caches, but a cache hit never dials. Building the real pool
+/// allocates (the TLS server name) and clones the cluster's handles, so deferring it makes a reused connection pay
+/// nothing. `new_stream` builds the pool once and reuses it.
+pub(crate) struct LazyPool<'a> {
+    entry: &'a dyn ClusterEntry,
+    host: &'a Arc<Host>,
+    proto: UpstreamProtocol,
+    pool: OnceLock<Arc<dyn HttpConnPool>>,
+}
+
+impl<'a> LazyPool<'a> {
+    pub(crate) fn new(
+        entry: &'a dyn ClusterEntry,
+        host: &'a Arc<Host>,
+        proto: UpstreamProtocol,
+    ) -> Self {
+        Self {
+            entry,
+            host,
+            proto,
+            pool: OnceLock::new(),
+        }
+    }
+}
+
+impl HttpConnPool for LazyPool<'_> {
+    fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>> {
+        self.pool
+            .get_or_init(|| self.entry.http_pool(self.host, self.proto))
+            .new_stream()
     }
 }
 
@@ -1249,6 +1288,99 @@ thread_local! {
 /// [`worker_conn_cache`] -- see that function's doc for why.
 pub fn worker_h1_conn_cache() -> Rc<H1ConnCache> {
     WORKER_H1_CONN_CACHE.with(Rc::clone)
+}
+
+#[cfg(test)]
+mod lazy_pool_tests {
+    use super::*;
+    use proxy_cluster::{CircuitBreakerState, HostSelection, LoadBalancerContext, RoutingPriority};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingPool;
+    impl HttpConnPool for FailingPool {
+        fn new_stream(&self) -> BoxFuture<'static, Result<UpstreamStream, PoolError>> {
+            Box::pin(async { Err(PoolError::Overflow) })
+        }
+    }
+
+    /// A cluster entry that only counts how many pools were requested.
+    struct CountingEntry(AtomicUsize);
+    impl ClusterEntry for CountingEntry {
+        fn select_host(&self, _: &LoadBalancerContext) -> Option<HostSelection> {
+            None
+        }
+        fn http_pool(&self, _: &Arc<Host>, _: UpstreamProtocol) -> Arc<dyn HttpConnPool> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Arc::new(FailingPool)
+        }
+        fn upstream_protocol(&self) -> UpstreamProtocol {
+            UpstreamProtocol::Http1
+        }
+        fn circuit_breaker(&self, _: RoutingPriority) -> &CircuitBreakerState {
+            unreachable!("LazyPool only asks the entry for a pool")
+        }
+        fn request_headers_to_add(&self) -> &[proxy_config::ir::HeaderMutation] {
+            &[]
+        }
+        fn request_path_rewrite(&self) -> Option<&proxy_config::ir::RequestPathRewrite> {
+            None
+        }
+        fn provider_runtime(&self) -> Option<&proxy_config::ir::ProviderRuntimeConfig> {
+            None
+        }
+        fn usage_dialect(&self) -> Option<proxy_config::ir::UsageDialect> {
+            None
+        }
+        fn unanswered_usage(&self) -> proxy_config::ir::UnansweredUsage {
+            unreachable!("LazyPool only asks the entry for a pool")
+        }
+        fn report_outlier_result(
+            &self,
+            _: std::net::SocketAddr,
+            _: proxy_cluster::outlier::RequestResult,
+        ) {
+        }
+    }
+
+    fn host() -> Arc<Host> {
+        Arc::new(Host {
+            address: "127.0.0.1:80".parse().expect("literal address"),
+            hostname: None,
+            metadata: Default::default(),
+            weight: 1,
+            priority: 0,
+            health_flags: Default::default(),
+            active_requests: Default::default(),
+        })
+    }
+
+    /// A reused connection never dials, so the cluster must not be asked for a pool until `new_stream` runs, and
+    /// then only once.
+    #[tokio::test]
+    async fn pool_is_built_on_first_dial_and_only_once() {
+        let entry = CountingEntry(AtomicUsize::new(0));
+        let host = host();
+        let lazy = LazyPool::new(&entry, &host, UpstreamProtocol::Http1);
+        assert_eq!(
+            entry.0.load(Ordering::SeqCst),
+            0,
+            "constructing must not build the pool"
+        );
+
+        assert!(
+            lazy.new_stream().await.is_err(),
+            "the stub pool refuses every stream"
+        );
+        assert!(
+            lazy.new_stream().await.is_err(),
+            "the stub pool refuses every stream"
+        );
+        assert_eq!(
+            entry.0.load(Ordering::SeqCst),
+            1,
+            "two dials must share one pool"
+        );
+    }
 }
 
 #[cfg(test)]
