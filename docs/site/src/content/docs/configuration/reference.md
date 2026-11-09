@@ -91,6 +91,7 @@ Downstream authentication. Exactly one of `hmac_secret` / `hmac_secret_file` is 
 | `max_policy_staleness` | [Duration](#duration) | no | `4m` | How old this replica's copy of keys, revocations, and tenant policies may get while the store cannot be read. Before this age the last copy keeps serving; past it every virtual-key request, and every JWT request of a tenant holding stored provider credentials, is refused with 503 (`auth_policy_stale`) until the store answers again, because the copy may still hold a key revoked or a credential deleted elsewhere. Whole seconds, at least `96s` (2 x the 48-second policy poll). The age is exported as `envoy_llmproxy_policy_snapshot_age_seconds`. |
 | `stored_output_owner_ttl` | [Duration](#duration) | no | `720h` | How long the proxy keeps the owner of a stored response (`/v1/responses`) or a stored chat completion (`/v1/chat/completions` with `store: true`). These are created by inference requests, so their owners expire rather than accumulate. After the TTL the object is refused to every tenant, its creator included, until `PUT /tenants/{id}/objects/{object_id}` assigns it again; set it to at least the provider's retention. Whole seconds, at least `1s`. A load error with `enforce.object_ownership: false`, which omits the filter that reads it. |
 | `jwt` | array of [AuthJwtProvider](#authjwtprovider) | no | `[]` | JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. A tenant's stored provider credentials (`tenant_credentials`) apply to its JWT callers exactly as to its virtual keys. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning. |
+| `declared_policy` | [DeclaredPolicy](#declaredpolicy) | no | none | Tenants, model policies, budgets, scoped budgets and limits declared in this file. The proxy reconciles them into the control-plane store at start and on reload: a declared row is created or updated, and a row this file owned earlier and no longer declares is removed. Rows set through the admin API are never touched. Needs `auth.store` to be `persistent` or `shared` to survive a restart. Absent changes nothing. |
 | `chargeback_tags` | [ChargebackTags](#chargebacktags) | no | none | Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A JWT caller's tags come from the verified claims its provider maps (`jwt[].claim_tags`) instead of key metadata. A tag key that key metadata or a claim mapping sets is never taken from the header, so a client cannot override the admin or the identity provider. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget. |
 
 Any other field is a load error.
@@ -388,6 +389,19 @@ One JWT issuer. Every field except `claim_tags` is required.
 | `tenant` | [AuthJwtTenant](#authjwttenant) | yes | none | Which claim names the tenant, and which claim values are admitted as which tenant. |
 | `user` | [AuthJwtUser](#authjwtuser) | yes | none | Which claim names the user. |
 | `claim_tags` | array of [AuthJwtClaimTag](#authjwtclaimtag) | no | none | Verified claims that set chargeback tags, so the identity provider, not the client, sets a JWT caller's attribution. Requires `auth.chargeback_tags`. A tag set here is never taken from the `x-cost-tags` header. A claim that is missing, or is not a string of tag value characters, sets no tag: the tag is dropped and counted in `envoy_llmproxy_chargeback_tags_dropped_total` (`claim_missing` or `malformed`), and the request is not refused. The allow-list and caps of `auth.chargeback_tags` apply to claim values as to every tag. |
+
+Any other field is a load error.
+
+## `DeclaredPolicy`
+
+Used at: `auth.declared_policy`.
+
+The declared tenants and the revision that orders them across replicas.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `revision` | integer; minimum 1 | yes | none | Raise it on every edit. Replicas that share a store apply a revision only when it is not lower than the one the store last applied, so a replica still on an older file cannot undo a newer one. The same revision with different content is refused. |
+| `tenants` | array of [DeclaredTenant](#declaredtenant) | no | `[]` | The declared tenants, in any order. May be empty, which removes every file-owned row. |
 
 Any other field is a load error.
 
@@ -699,6 +713,22 @@ One claim-to-tag mapping.
 
 Any other field is a load error.
 
+## `DeclaredTenant`
+
+Used at: `auth.declared_policy.tenants[]`.
+
+One declared tenant. Each block present is one stored row; a block left out declares no row, so a file-owned row of that kind is removed.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `id` | string; minimum length 1, maximum length 128 | yes | none | The tenant id. Unique in the list, no control characters, and not a reserved id (`default` or `unauthenticated`). |
+| `policy` | [DeclaredModelPolicy](#declaredmodelpolicy) | no | none | The tenant's model access, as `PUT /tenants/{id}/policy`. Needs `auth.enforce.model_policy: true`. |
+| `budget` | [DeclaredBudget](#declaredbudget) | no | none | The tenant's spend budget, as `PUT /tenants/{id}/budget`. Needs `auth.enforce.spend: true`. |
+| `scoped_budgets` | array of [DeclaredScopedBudget](#declaredscopedbudget); maximum items 32 | no | `[]` | Budgets that cover only some models or providers. Names are unique within the tenant. |
+| `limits` | [DeclaredLimits](#declaredlimits) | no | none | The tenant's rate limits, as `PUT /tenants/{id}/limits`. Needs `auth.enforce.limits: true` and at least one field. An unset field sets no limit; zero refuses all traffic on that counter. |
+
+Any other field is a load error.
+
 ## `ChargebackAllowedTag`
 
 Used at: `auth.chargeback_tags.allowed[]`.
@@ -786,6 +816,67 @@ One RSA public key, as in a JWKS document.
 
 Any other field is a load error.
 
+## `DeclaredModelPolicy`
+
+Used at: `auth.declared_policy.tenants[].policy`.
+
+The tenant's model access, as `PUT /tenants/{id}/policy`. Needs `auth.enforce.model_policy: true`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `access` | constant `all` or [DeclaredOnlyAccess](#declaredonlyaccess) | yes | none | `all` grants every model; `{only: [...]}` grants only those patterns (an empty list grants nothing). |
+| `deny` | array of [DeclaredModelPattern](#declaredmodelpattern) | no | `[]` | Patterns refused even when `access` grants them. |
+
+Any other field is a load error.
+
+## `DeclaredBudget`
+
+Used at: `auth.declared_policy.tenants[].budget`.
+
+The tenant's spend budget, as `PUT /tenants/{id}/budget`. Needs `auth.enforce.spend: true`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `max_usd` | [DeclaredAmount](#declaredamount) | yes | none | A USD amount: a quoted decimal string with at most 6 decimal places, or a whole number. An unquoted number with a fraction is an error; quote it. |
+| `period` | [DeclaredPeriod](#declaredperiod) | yes | none | How often the budget resets. |
+| `credential_source` | [DeclaredCredentialSource](#declaredcredentialsource) | no | none | Whose provider credentials the budget covers. Absent means `platform`. |
+
+Any other field is a load error.
+
+## `DeclaredScopedBudget`
+
+Used at: `auth.declared_policy.tenants[].scoped_budgets[]`.
+
+A budget that covers only the models or providers it names, as an entry of `PUT /tenants/{id}/scoped_budgets`. Needs `auth.enforce.spend: true`, and at least one of `models` and `providers`.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string; pattern `^[a-z0-9][a-z0-9_-]{0,63}$` | yes | none | Unique within the tenant. |
+| `max_usd` | [DeclaredAmount](#declaredamount) | yes | none | A USD amount: a quoted decimal string with at most 6 decimal places, or a whole number. An unquoted number with a fraction is an error; quote it. |
+| `period` | [DeclaredPeriod](#declaredperiod) | yes | none | How often the budget resets. |
+| `credential_source` | [DeclaredCredentialSource](#declaredcredentialsource) | no | none | Whose provider credentials the budget covers. Absent means `platform`. |
+| `models` | array of [DeclaredModelPattern](#declaredmodelpattern); maximum items 64 | no | `[]` | Model patterns the budget covers. |
+| `providers` | array of string; maximum items 64 | no | `[]` | Names of entries in the top-level `providers` map. Requests served by one of them count against the budget, after fallback. |
+| `alert_at_percent` | array of integer; items unique | no | `[]` | Percentages of the budget at which to raise an alert. |
+
+Any other field is a load error.
+
+## `DeclaredLimits`
+
+Used at: `auth.declared_policy.tenants[].limits`.
+
+The tenant's rate limits, as `PUT /tenants/{id}/limits`. Needs `auth.enforce.limits: true` and at least one field. An unset field sets no limit; zero refuses all traffic on that counter.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `tokens_per_minute` | integer; minimum 0 | no | none | Tokens per minute. |
+| `requests_per_minute` | integer; minimum 0 | no | none | Requests per minute. |
+| `tokens_per_day` | integer; minimum 0 | no | none | Tokens per UTC calendar day, counted beside `tokens_per_minute`. |
+| `requests_per_day` | integer; minimum 0 | no | none | Requests per UTC calendar day, counted beside `requests_per_minute`. |
+| `concurrent_streams` | integer; minimum 0, maximum 4294967295 | no | none | Streams open at the same time. |
+
+Any other field is a load error.
+
 ## `ImagePrice`
 
 Used at: `pricing.price_list.entries[].image_prices[]`.
@@ -813,6 +904,18 @@ Used at: `pricing.price_list.entries[].tiers[]`.
 | `image_output_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one image output token, in nanodollars. Set it on every band of the entry or on none. |
 | `audio_input_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one audio input token, in nanodollars. Set it on every band of the entry or on none. |
 | `audio_output_nanodollars_per_token` | integer; minimum 0 | no | none | The price of one audio output token, in nanodollars. Set it on every band of the entry or on none. |
+
+Any other field is a load error.
+
+## `DeclaredOnlyAccess`
+
+Used at: `auth.declared_policy.tenants[].policy.access`.
+
+Grant only these model patterns.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `only` | array of [DeclaredModelPattern](#declaredmodelpattern) | yes | none | The model patterns granted. Empty grants nothing. |
 
 Any other field is a load error.
 
@@ -867,3 +970,39 @@ A token count: a plain integer, or a string with `k` (thousands) / `m` (millions
 Used at: `limits[].tokens_per_minute`, `limits[].requests_per_minute`, `limits[].tokens_per_day`, `limits[].requests_per_day`.
 
 Examples: `8000`, `100k`, `2m`.
+
+### DeclaredModelPattern
+
+Type: string; minimum length 1, pattern `^[^*]*\*?$`.
+
+An exact model name, or a prefix ending in one `*`.
+
+Used at: `auth.declared_policy.tenants[].policy.deny[]`, `auth.declared_policy.tenants[].scoped_budgets[].models[]`, `auth.declared_policy.tenants[].policy.access.only[]`.
+
+Examples: `gpt-4o`, `claude-*`.
+
+### DeclaredAmount
+
+Type: string (pattern `^[0-9]+(\.[0-9]{1,6})?$`) or integer (minimum 0).
+
+A USD amount: a quoted decimal string with at most 6 decimal places, or a whole number. An unquoted number with a fraction is an error; quote it.
+
+Used at: `auth.declared_policy.tenants[].budget.max_usd`, `auth.declared_policy.tenants[].scoped_budgets[].max_usd`.
+
+Examples: `500.00`, `500`.
+
+### DeclaredPeriod
+
+Type: one of `daily`, `weekly`, `monthly`.
+
+How often the budget resets.
+
+Used at: `auth.declared_policy.tenants[].budget.period`, `auth.declared_policy.tenants[].scoped_budgets[].period`.
+
+### DeclaredCredentialSource
+
+Type: one of `platform`, `tenant`.
+
+Whose provider credentials the budget covers. Absent means `platform`.
+
+Used at: `auth.declared_policy.tenants[].budget.credential_source`, `auth.declared_policy.tenants[].scoped_budgets[].credential_source`.

@@ -97,6 +97,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/tenants/{id}/budget",
     "/tenants/{id}/scoped_budgets",
     "/tenants/{id}/limits",
+    "/tenants/{id}/override",
     "/tenants/{id}/trace_export",
     "/tenants/{id}/objects/{object_id}",
     "/tenants/{id}/provider_credentials",
@@ -118,6 +119,7 @@ const AVAILABLE_ENDPOINTS: &[&str] = &[
     "/chains/{stat_prefix}/tenants/{id}/budget",
     "/chains/{stat_prefix}/tenants/{id}/scoped_budgets",
     "/chains/{stat_prefix}/tenants/{id}/limits",
+    "/chains/{stat_prefix}/tenants/{id}/override",
     "/chains/{stat_prefix}/tenants/{id}/trace_export",
     "/chains/{stat_prefix}/tenants/{id}/objects/{object_id}",
     "/chains/{stat_prefix}/tenants/{id}/provider_credentials",
@@ -850,6 +852,9 @@ fn dispatch_store_route(
         WriteRoute::TenantLimits(id) | WriteRoute::ScopedTenantLimits(_, id) => {
             handle_set_tenant_limits(factory_state, stat_prefix_opt, control_plane, id, body)
         }
+        WriteRoute::TenantOverride(id) | WriteRoute::ScopedTenantOverride(_, id) => {
+            handle_hand_back(control_plane, id)
+        }
         WriteRoute::TenantScopedBudgets(..) | WriteRoute::ScopedTenantScopedBudgets(..) => {
             unreachable!("the scoped budget PUT returns before the store dispatch")
         }
@@ -998,6 +1003,9 @@ enum WriteRoute<'a> {
     /// `GET /tenants/{id}/scoped_budgets`: the budgets and their live spend.
     TenantScopedBudgetsGet(&'a str),
     TenantLimits(&'a str),
+    /// `DELETE /tenants/{id}/override`: hands the tenant's admin-owned rows
+    /// back to the config file's declared policy.
+    TenantOverride(&'a str),
     TenantSpend(&'a str),
     /// `GET /tenants/{id}/provider_credentials` -- metadata only, gated like
     /// the other identity reads (ADR-0007 decision 9).
@@ -1026,6 +1034,7 @@ enum WriteRoute<'a> {
     ScopedTenantScopedBudgets(&'a str, &'a str),
     ScopedTenantScopedBudgetsGet(&'a str, &'a str),
     ScopedTenantLimits(&'a str, &'a str),
+    ScopedTenantOverride(&'a str, &'a str),
     ScopedTenantSpend(&'a str, &'a str),
     Pricing,
     ScopedPricing(&'a str),
@@ -1066,6 +1075,7 @@ impl<'a> WriteRoute<'a> {
             WriteRoute::TenantScopedBudgetsGet(_)
             | WriteRoute::ScopedTenantScopedBudgetsGet(..) => Method::GET,
             WriteRoute::TenantSpend(_) | WriteRoute::ScopedTenantSpend(..) => Method::GET,
+            WriteRoute::TenantOverride(_) | WriteRoute::ScopedTenantOverride(..) => Method::DELETE,
             WriteRoute::TenantCredentials(_) | WriteRoute::ScopedTenantCredentials(..) => {
                 Method::GET
             }
@@ -1121,6 +1131,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::TenantScopedBudgets(_)
             | WriteRoute::TenantScopedBudgetsGet(_)
             | WriteRoute::TenantLimits(_)
+            | WriteRoute::TenantOverride(_)
             | WriteRoute::TenantTraceExport(_)
             | WriteRoute::TenantTraceExportGet(_)
             | WriteRoute::TenantObject(..)
@@ -1148,6 +1159,7 @@ impl<'a> WriteRoute<'a> {
             | WriteRoute::ScopedTenantScopedBudgets(s, _)
             | WriteRoute::ScopedTenantScopedBudgetsGet(s, _)
             | WriteRoute::ScopedTenantLimits(s, _)
+            | WriteRoute::ScopedTenantOverride(s, _)
             | WriteRoute::ScopedTenantTraceExport(s, _)
             | WriteRoute::ScopedTenantTraceExportGet(s, _)
             | WriteRoute::ScopedTenantObject(s, ..)
@@ -1196,6 +1208,7 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["tenants", id, "scoped_budgets"] => Some(WriteRoute::TenantScopedBudgets(id)),
         ["tenants", id, "limits"] => Some(WriteRoute::TenantLimits(id)),
+        ["tenants", id, "override"] => Some(WriteRoute::TenantOverride(id)),
         ["tenants", id, "trace_export"] if *method == Method::GET => {
             Some(WriteRoute::TenantTraceExportGet(id))
         }
@@ -1273,6 +1286,9 @@ fn match_write_route<'a>(segments: &[&'a str], method: &Method) -> Option<WriteR
         }
         ["chains", stat_prefix, "tenants", id, "limits"] => {
             Some(WriteRoute::ScopedTenantLimits(stat_prefix, id))
+        }
+        ["chains", stat_prefix, "tenants", id, "override"] => {
+            Some(WriteRoute::ScopedTenantOverride(stat_prefix, id))
         }
         ["chains", stat_prefix, "tenants", id, "trace_export"] if *method == Method::GET => {
             Some(WriteRoute::ScopedTenantTraceExportGet(stat_prefix, id))
@@ -2574,6 +2590,50 @@ fn handle_create_tenant(control_plane: &ControlPlane, body: &[u8]) -> Response<F
             )
         }
         Err(err) => store_error_response("/tenants", err),
+    }
+}
+
+/// `DELETE /tenants/{id}/override`: hands every row of the tenant an admin write owns back to this replica's
+/// declared policy, then reconciles, so the rows take the file's values and a row the file does not declare
+/// for the tenant is removed. 409 when this replica's config does not declare the tenant.
+fn handle_hand_back(control_plane: &ControlPlane, tenant: &str) -> Response<Full<Bytes>> {
+    use proxy_control::control::HandBackError;
+    use proxy_control::declared::{ReconcileOutcome, RowKind};
+    if tenant.is_empty() {
+        return bad_request("tenant must not be empty");
+    }
+    let kind_name = |kind: RowKind| kind.field().unwrap_or("tenant");
+    match control_plane.hand_back_to_file(&TenantId::new(tenant)) {
+        Ok(hand_back) => {
+            let reconcile = match &hand_back.outcome {
+                ReconcileOutcome::Applied(_) => "applied",
+                ReconcileOutcome::StaleRevision { .. } => "stale_revision",
+                ReconcileOutcome::RevisionConflict => "revision_conflict",
+            };
+            let handed_back: Vec<&str> = hand_back.kinds.iter().copied().map(kind_name).collect();
+            tracing::info!(
+                endpoint = "/tenants/{id}/override",
+                tenant,
+                handed_back = ?handed_back,
+                reconcile,
+                "admin: handed a tenant's rows back to the config file"
+            );
+            json(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "tenant": tenant,
+                    "handed_back": handed_back,
+                    "reconcile": reconcile,
+                }),
+            )
+        }
+        Err(HandBackError::NotDeclared) => text(
+            StatusCode::CONFLICT,
+            "this replica's config does not declare the tenant in auth.declared_policy \
+             (typed_config.declared_policy), so there is no file value to hand its rows to. \
+             Nothing was changed.",
+        ),
+        Err(HandBackError::Store(err)) => store_error_response("/tenants/{id}/override", err),
     }
 }
 

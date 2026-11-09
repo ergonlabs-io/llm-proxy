@@ -7,8 +7,10 @@
 //!
 //! ```text
 //! {ns}:tenants                              SET of tenant id
+//! {ns}:tenant_sources                       HASH tenant -> encode_tenant_row(File), file-owned tenants only
+//! {ns}:declared_policy                      STRING encode_applied_marker(..), the last applied declared policy
 //! {ns}:keys                                 HASH key_id -> encode_json(EncodedKeyRow)
-//! {ns}:policies                             HASH tenant -> encode_json(EncodedModelAccess)
+//! {ns}:policies                             HASH tenant -> encode_policy_row(..)
 //! {ns}:budgets                              HASH subject -> encode_json(EncodedTenantBudget)
 //!                                           (a tenant's scoped budgets: one field, EncodedScopedBudgets)
 //! {ns}:limits                               HASH subject -> encode_json(EncodedLimitPolicy)
@@ -38,6 +40,11 @@
 //! Rate-card rows use the chain name and keep pricing JSON opaque. Card writes
 //! and generation bumps are atomic so pollers cannot observe only one.
 //!
+//! A declared-policy reconcile `WATCH`es the generation and the marker, reads
+//! the rows, and writes in one `MULTI`/`EXEC`; every admin write `INCR`s the
+//! generation in its own transaction, so one landing in between aborts the
+//! reconcile, which then re-reads and tries again.
+//!
 //! Tenant credential fields join escaped tenant and provider names with `|`;
 //! values contain ciphertext only and are never decrypted here (ADR-0007).
 
@@ -58,6 +65,10 @@ use crate::control::{
     check_object_id, decode_object_owner_row, encode_object_owner_row, ObjectOwner,
 };
 use crate::control::{
+    decode_applied_marker, decode_policy_row, encode_applied_marker, encode_row_write,
+    file_current_row,
+};
+use crate::control::{
     decode_json, decode_rate_card_row, encode_json, key_id_from_budget_subject, store_err,
     ControlPlaneStore, EncodedKeyBudget, EncodedKeyRow, EncodedLimitPolicy, EncodedModelAccess,
     EncodedRateCardRow, EncodedTenantBudget, EncodedTenantCredentialRow, FlushToken, LimitPolicy,
@@ -67,6 +78,10 @@ use crate::control::{
 use crate::control::{decode_trace_export_row, encode_trace_export_row};
 use crate::control::{
     scoped_budgets_row_subject, tenant_from_scoped_budgets_row, EncodedScopedBudgets,
+};
+use crate::declared::{
+    plan_hand_back, plan_reconcile, CurrentRows, DeclaredPolicy, ReconcileOutcome, ReconcilePlan,
+    RowKind, RowWrite,
 };
 use crate::model_authz::ModelAccess;
 use crate::spend::{key_spend_subject, KeyBudget, PeriodKey, TenantBudget};
@@ -94,6 +109,11 @@ const DEFAULT_NAMESPACE: &str = "llmproxy";
 /// control lane, which is the revocation path. A load that does time out
 /// keeps the last-good policy and retries on the next poll.
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How many times a reconcile or hand-back re-reads after a concurrent write
+/// aborted its transaction before it gives up for this call. Admin writes are
+/// rare, so needing more than a few means something writes in a loop.
+const MAX_WATCH_ATTEMPTS: u32 = 8;
 
 /// Each successful [`RedisControlPlaneStore::load`]'s duration, in
 /// milliseconds: the same figure as the load log line's `duration_ms`.
@@ -469,7 +489,7 @@ return 1
 /// fields are `<esc(tenant)>|<esc(provider)>`, so the prefix
 /// `<esc(tenant)>|` matches exactly that tenant: an escaped tenant contains
 /// no `|`. `KEYS` = tenants, policies, budgets, limits, credentials,
-/// trace-export opt-ins, generation.
+/// trace-export opt-ins, generation, tenant sources.
 /// `ARGV[1]` = tenant, `ARGV[2]` = credential field prefix, `ARGV[3]` = the
 /// tenant's scoped budget row in the budgets hash.
 const DELETE_TENANT_LUA: &str = r#"
@@ -484,6 +504,7 @@ for _, field in ipairs(redis.call('HKEYS', KEYS[5])) do
   end
 end
 redis.call('HDEL', KEYS[6], ARGV[1])
+redis.call('HDEL', KEYS[8], ARGV[1])
 redis.call('INCR', KEYS[7])
 return 1
 "#;
@@ -811,6 +832,101 @@ impl RedisControlPlaneStore {
         format!("{}:generation", self.namespace)
     }
 
+    fn tenant_sources_key(&self) -> String {
+        format!("{}:tenant_sources", self.namespace)
+    }
+
+    fn declared_marker_key(&self) -> String {
+        format!("{}:declared_policy", self.namespace)
+    }
+
+    /// The rows a reconcile or hand-back reads, from inside a `WATCH`.
+    fn read_current_rows(
+        &self,
+        conn: &mut Connection,
+    ) -> redis::RedisResult<Result<CurrentRows, StoreError>> {
+        type Hash = HashMap<String, Vec<u8>>;
+        let (tenants, sources, policies, budgets, limits): (Vec<String>, Hash, Hash, Hash, Hash) =
+            redis::pipe()
+                .cmd("SMEMBERS")
+                .arg(self.tenants_key())
+                .cmd("HGETALL")
+                .arg(self.tenant_sources_key())
+                .cmd("HGETALL")
+                .arg(self.policies_key())
+                .cmd("HGETALL")
+                .arg(self.budgets_key())
+                .cmd("HGETALL")
+                .arg(self.limits_key())
+                .query(conn)?;
+        let mut current = CurrentRows::default();
+        let file = || -> Result<(), StoreError> {
+            for tenant in tenants {
+                // A tenant row's source lives beside the set: absent is admin.
+                let value = sources.get(&tenant).map(Vec::as_slice).unwrap_or_default();
+                file_current_row(&mut current, RowKind::Tenant, &tenant, value)?;
+            }
+            for (kind, hash) in [
+                (RowKind::Policy, policies),
+                (RowKind::Budget, budgets),
+                (RowKind::Limits, limits),
+            ] {
+                for (subject, value) in hash {
+                    file_current_row(&mut current, kind, &subject, &value)?;
+                }
+            }
+            Ok(())
+        };
+        Ok(file().map(|()| current))
+    }
+
+    /// Queues `writes` on `pipe`, filing each row where [`Self::load`] reads it.
+    fn queue_row_writes(&self, pipe: &mut redis::Pipeline, writes: &[RowWrite]) {
+        for write in writes {
+            let (kind, field, value) = encode_row_write(write);
+            if kind == RowKind::Tenant {
+                // The set holds membership; the sources hash holds a file
+                // row's encoded source, and no field for an admin row.
+                match value {
+                    Some(bytes) => {
+                        pipe.cmd("SADD")
+                            .arg(self.tenants_key())
+                            .arg(&field)
+                            .ignore();
+                        if bytes.is_empty() {
+                            pipe.cmd("HDEL").arg(self.tenant_sources_key()).arg(&field);
+                        } else {
+                            pipe.cmd("HSET")
+                                .arg(self.tenant_sources_key())
+                                .arg(&field)
+                                .arg(bytes);
+                        }
+                    }
+                    None => {
+                        pipe.cmd("SREM")
+                            .arg(self.tenants_key())
+                            .arg(&field)
+                            .ignore();
+                        pipe.cmd("HDEL").arg(self.tenant_sources_key()).arg(&field);
+                    }
+                }
+                pipe.ignore();
+                continue;
+            }
+            let hash = match kind {
+                RowKind::Policy => self.policies_key(),
+                RowKind::Budget | RowKind::ScopedBudgets => self.budgets_key(),
+                RowKind::Limits => self.limits_key(),
+                RowKind::Tenant => unreachable!("tenant rows are filed above"),
+            };
+            match value {
+                Some(bytes) => pipe.cmd("HSET").arg(hash).arg(&field).arg(bytes),
+                None => pipe.cmd("HDEL").arg(hash).arg(&field),
+            }
+            .ignore();
+        }
+    }
+
     /// Joins the three escaped spend-row components with `|`. Not a full key
     /// on its own -- [`Self::spend_key`] and [`Self::seq_key`] each wrap the
     /// result in the literal `{...}` the module doc's key layout shows.
@@ -1110,8 +1226,8 @@ impl ControlPlaneStore for RedisControlPlaneStore {
 
         let mut policies = HashMap::new();
         for (tenant, bytes) in policies_raw {
-            let encoded: EncodedModelAccess = decode_json(&bytes)?;
-            policies.insert(TenantId::new(tenant), encoded.into());
+            let (_source, access) = decode_policy_row(&bytes)?;
+            policies.insert(TenantId::new(tenant), access);
         }
 
         // Key budgets share this hash under the key's subject; see
@@ -1226,12 +1342,18 @@ impl ControlPlaneStore for RedisControlPlaneStore {
 
     fn create_tenant(&self, tenant: &TenantId) -> Result<(), StoreError> {
         let tenants_key = self.tenants_key();
+        let tenant_sources_key = self.tenant_sources_key();
         let generation_key = self.generation_key();
         self.with_connection(Lane::Control, |conn| {
             redis::pipe()
                 .atomic()
                 .cmd("SADD")
                 .arg(&tenants_key)
+                .arg(tenant.as_str())
+                .ignore()
+                // An admin create makes the tenant row admin-owned.
+                .cmd("HDEL")
+                .arg(&tenant_sources_key)
                 .arg(tenant.as_str())
                 .ignore()
                 .cmd("INCR")
@@ -1256,6 +1378,7 @@ impl ControlPlaneStore for RedisControlPlaneStore {
                 .key(self.tenant_credentials_key())
                 .key(self.trace_export_key())
                 .key(self.generation_key())
+                .key(self.tenant_sources_key())
                 .arg(tenant.as_str())
                 .arg(prefix)
                 .arg(scoped_budgets_row_subject(tenant))
@@ -1389,6 +1512,85 @@ impl ControlPlaneStore for RedisControlPlaneStore {
         let bytes =
             (!budgets.is_empty()).then(|| encode_json(&EncodedScopedBudgets::from(budgets)));
         self.write_budget_row(&scoped_budgets_row_subject(tenant), bytes)
+    }
+
+    /// `WATCH`es the generation and the marker, reads the rows, and applies
+    /// the plan in one `MULTI`/`EXEC`. An admin write in between bumps the
+    /// generation, which aborts the `EXEC`; the read and plan then run again,
+    /// so a reconcile never overwrites a row an admin just took over.
+    fn reconcile_declared(
+        &self,
+        declared: &DeclaredPolicy,
+    ) -> Result<ReconcileOutcome, StoreError> {
+        let watched = [self.generation_key(), self.declared_marker_key()];
+        let mut attempts = 0;
+        self.with_connection(Lane::Control, |conn| {
+            redis::transaction(conn, &watched, |conn, pipe| {
+                attempts += 1;
+                if attempts > MAX_WATCH_ATTEMPTS {
+                    return Ok(Some(Err(StoreError::Unavailable(
+                        "declared policy reconcile kept racing admin writes; retrying later".into(),
+                    ))));
+                }
+                let current = match self.read_current_rows(conn)? {
+                    Ok(current) => current,
+                    Err(err) => return Ok(Some(Err(err))),
+                };
+                let marker: Option<Vec<u8>> = redis::cmd("GET")
+                    .arg(self.declared_marker_key())
+                    .query(conn)?;
+                let applied = match marker.as_deref().map(decode_applied_marker).transpose() {
+                    Ok(applied) => applied,
+                    Err(err) => return Ok(Some(Err(err))),
+                };
+                match plan_reconcile(&current, applied, declared) {
+                    ReconcilePlan::Refuse(outcome) => Ok(Some(Ok(outcome))),
+                    ReconcilePlan::Apply {
+                        writes,
+                        marker,
+                        report,
+                    } => {
+                        self.queue_row_writes(pipe, &writes);
+                        pipe.cmd("SET")
+                            .arg(self.declared_marker_key())
+                            .arg(encode_applied_marker(&marker))
+                            .ignore();
+                        if !writes.is_empty() {
+                            pipe.cmd("INCR").arg(self.generation_key()).ignore();
+                        }
+                        let committed: Option<()> = pipe.query(conn)?;
+                        Ok(committed.map(|()| Ok(ReconcileOutcome::Applied(report))))
+                    }
+                }
+            })
+        })?
+    }
+
+    fn hand_back_to_file(&self, tenant: &TenantId) -> Result<Vec<RowKind>, StoreError> {
+        let watched = [self.generation_key()];
+        let mut attempts = 0;
+        self.with_connection(Lane::Control, |conn| {
+            redis::transaction(conn, &watched, |conn, pipe| {
+                attempts += 1;
+                if attempts > MAX_WATCH_ATTEMPTS {
+                    return Ok(Some(Err(StoreError::Unavailable(
+                        "hand-back kept racing other admin writes; try again".into(),
+                    ))));
+                }
+                let current = match self.read_current_rows(conn)? {
+                    Ok(current) => current,
+                    Err(err) => return Ok(Some(Err(err))),
+                };
+                let (writes, kinds) = plan_hand_back(&current, tenant);
+                if writes.is_empty() {
+                    return Ok(Some(Ok(kinds)));
+                }
+                self.queue_row_writes(pipe, &writes);
+                pipe.cmd("INCR").arg(self.generation_key()).ignore();
+                let committed: Option<()> = pipe.query(conn)?;
+                Ok(committed.map(|()| Ok(kinds)))
+            })
+        })?
     }
 
     fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
@@ -3176,5 +3378,78 @@ mod tests {
              -- neither resetting it (losing the 3,000,000 already flushed) nor double- \
              charging it (re-sending a total the store already has)"
         );
+    }
+
+    /// Declared policy through the Redis key layout: file rows land where
+    /// `load` reads them, an admin create and budget write take rows over, a
+    /// hand-back returns them, a removed tenant drops its source field with
+    /// its set member, and an older revision is refused.
+    #[test]
+    #[ignore = "needs a real Redis -- see this module's doc comment"]
+    fn redis_declared_policy_reconciles_hands_back_and_orders_revisions() {
+        use crate::declared::{DeclaredTenant, RowKind};
+        use crate::spend::{MicroUsd, Period};
+        let store = test_store("declared");
+        let acme = TenantId::new("acme");
+        let budget = |micros| TenantBudget {
+            max_micros: MicroUsd::from_micros(micros),
+            period: Period::Daily,
+            credential_source: proxy_credentials::CredentialSource::Platform,
+        };
+        let declared = |revision, micros| {
+            DeclaredPolicy::new(
+                revision,
+                vec![DeclaredTenant {
+                    tenant: acme.clone(),
+                    policy: Some(ModelAccess::All),
+                    budget: Some(budget(micros)),
+                    scoped_budgets: Vec::new(),
+                    limits: None,
+                }],
+            )
+        };
+        assert!(matches!(
+            store.reconcile_declared(&declared(1, 10)).unwrap(),
+            ReconcileOutcome::Applied(_)
+        ));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.tenants, std::slice::from_ref(&acme));
+        assert_eq!(loaded.budgets[&acme], budget(10));
+
+        store.create_tenant(&acme).unwrap();
+        store.set_budget(&acme, Some(&budget(99))).unwrap();
+        let ReconcileOutcome::Applied(report) = store.reconcile_declared(&declared(2, 20)).unwrap()
+        else {
+            panic!("revision 2 applies");
+        };
+        assert_eq!(
+            report
+                .shadowed
+                .iter()
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            [RowKind::Tenant, RowKind::Budget]
+        );
+        assert_eq!(store.load().unwrap().budgets[&acme], budget(99));
+
+        assert_eq!(
+            store.hand_back_to_file(&acme).unwrap(),
+            [RowKind::Tenant, RowKind::Budget]
+        );
+        store.reconcile_declared(&declared(2, 20)).unwrap();
+        assert_eq!(store.load().unwrap().budgets[&acme], budget(20));
+
+        assert_eq!(
+            store
+                .reconcile_declared(&DeclaredPolicy::new(1, vec![]))
+                .unwrap(),
+            ReconcileOutcome::StaleRevision { stored: 2 }
+        );
+        store
+            .reconcile_declared(&DeclaredPolicy::new(3, vec![]))
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.tenants.is_empty() && loaded.budgets.is_empty());
+        assert!(store.hand_back_to_file(&acme).unwrap().is_empty());
     }
 }

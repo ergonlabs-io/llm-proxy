@@ -17,6 +17,7 @@ use crate::model::*;
 use crate::parse::parse_host_port;
 
 mod chargeback;
+mod declared_policy;
 mod jwt;
 
 /// The request header the route table matches models against. Populated
@@ -3165,6 +3166,9 @@ fn lower_auth(
     // Same rule: absent adds no field.
     if let Some(tags) = &auth.chargeback_tags {
         typed_config["chargeback_tags"] = chargeback::lower_policy(tags)?;
+    }
+    if let Some(declared) = &auth.declared_policy {
+        typed_config["declared_policy"] = declared_policy::lower(config, auth, declared)?;
     }
     // Only an explicit `store:` adds a member. Absent means no store field at
     // all, which is what keeps configs written before this field lowering

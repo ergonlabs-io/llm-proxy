@@ -609,6 +609,31 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "tenant_credentials",
             "max_policy_staleness_seconds",
             "chargeback_tags",
+            "declared_policy",
+        ],
+        "llmproxy.filters.v0.DeclaredPolicy" => &["revision", "tenants"],
+        "llmproxy.filters.v0.DeclaredTenant" => {
+            &["id", "policy", "budget", "scoped_budgets", "limits"]
+        }
+        "llmproxy.filters.v0.DeclaredModelPolicy" => &["all", "only", "deny"],
+        "llmproxy.filters.v0.DeclaredAllModels" => &[],
+        "llmproxy.filters.v0.DeclaredModelList" => &["patterns"],
+        "llmproxy.filters.v0.DeclaredBudget" => &["max_usd", "period", "credential_source"],
+        "llmproxy.filters.v0.DeclaredScopedBudget" => &[
+            "name",
+            "max_usd",
+            "period",
+            "credential_source",
+            "models",
+            "providers",
+            "alert_at_percent",
+        ],
+        "llmproxy.filters.v0.DeclaredLimits" => &[
+            "tokens_per_minute",
+            "requests_per_minute",
+            "tokens_per_day",
+            "requests_per_day",
+            "concurrent_streams",
         ],
         "llmproxy.filters.v0.ChargebackTags" => {
             &["allowed", "from_header", "max_tags", "max_value_bytes"]
@@ -4615,6 +4640,81 @@ pub fn validate_cross_resource<'a>(
     let mut seen_stat_prefixes = std::collections::HashMap::new();
     for (path, listener) in listener_roots {
         check_admin_addressable_stat_prefixes(listener, &path, &mut seen_stat_prefixes)?;
+        if dangling == DanglingClusterRefs::Reject {
+            check_declared_budget_providers(listener, &path, clusters)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every provider a declared scoped budget names in `llmproxy.auth`
+/// (`declared_policy.tenants[i].scoped_budgets[j].providers[k]`) must name a
+/// cluster: a budget on a misspelled one matches no attempt and caps
+/// nothing. Read by field name from the filter's config, which this crate
+/// stores undecoded.
+fn check_declared_budget_providers(
+    listener: &ListenerConfig,
+    path: &str,
+    clusters: &std::collections::HashMap<ClusterName, Arc<ClusterConfig>>,
+) -> Result<(), ConfigError> {
+    let list = |msg: &prost_reflect::DynamicMessage, field: &str| -> Vec<prost_reflect::Value> {
+        msg.get_field_by_name(field)
+            .and_then(|v| v.as_list().map(<[_]>::to_vec))
+            .unwrap_or_default()
+    };
+    let chains = listener
+        .filter_chains
+        .iter()
+        .enumerate()
+        .map(|(i, fc)| (format!("{path}.filter_chains[{i}]"), fc))
+        .chain(
+            listener
+                .default_filter_chain
+                .iter()
+                .map(|fc| (format!("{path}.default_filter_chain"), fc)),
+        );
+    for (chain_path, fc) in chains {
+        for (k, filter) in fc.filters.iter().enumerate() {
+            let NetworkFilterSpec::HttpConnectionManager(hcm) = filter else {
+                continue;
+            };
+            for (h, http_filter) in hcm.http_filters.iter().enumerate() {
+                if http_filter.type_url != AUTH_FILTER_TYPE {
+                    continue;
+                }
+                let Some(declared) = http_filter
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.get_field_by_name("declared_policy"))
+                    .and_then(|v| v.as_message().cloned())
+                else {
+                    continue;
+                };
+                for (t, tenant) in list(&declared, "tenants").iter().enumerate() {
+                    let Some(tenant) = tenant.as_message() else {
+                        continue;
+                    };
+                    for (b, budget) in list(tenant, "scoped_budgets").iter().enumerate() {
+                        let Some(budget) = budget.as_message() else {
+                            continue;
+                        };
+                        for (p, provider) in list(budget, "providers").iter().enumerate() {
+                            let provider = provider.as_str().unwrap_or_default();
+                            if !clusters.contains_key(provider) {
+                                return Err(invalid(
+                                    format!(
+                                        "{chain_path}.filters[{k}].typed_config.http_filters[{h}]\
+                                         .typed_config.declared_policy.tenants[{t}]\
+                                         .scoped_budgets[{b}].providers[{p}]"
+                                    ),
+                                    format!("unknown cluster `{provider}`"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

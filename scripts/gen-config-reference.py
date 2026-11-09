@@ -32,7 +32,7 @@ KNOWN_KEYWORDS = {
     "$schema", "$id", "$ref", "$defs", "title", "description", "type", "properties",
     "required", "additionalProperties", "patternProperties", "items", "enum", "const",
     "default", "examples", "format", "pattern", "minimum", "maximum", "minLength",
-    "minItems", "maxItems", "minProperties", "uniqueItems", "oneOf", "anyOf", "allOf", "not",
+    "maxLength", "minItems", "maxItems", "minProperties", "uniqueItems", "oneOf", "anyOf", "allOf", "not",
     "if", "then",
 }
 
@@ -157,8 +157,9 @@ class Renderer:
     def constraints(self, node):
         parts = []
         for key, word in (("minimum", "minimum"), ("maximum", "maximum"),
-                          ("minLength", "minimum length"), ("minItems", "minimum items"),
-                          ("maxItems", "maximum items"), ("minProperties", "minimum entries")):
+                          ("minLength", "minimum length"), ("maxLength", "maximum length"),
+                          ("minItems", "minimum items"), ("maxItems", "maximum items"),
+                          ("minProperties", "minimum entries")):
             if key in node:
                 parts.append(f"{word} {node[key]}")
         if node.get("uniqueItems"):

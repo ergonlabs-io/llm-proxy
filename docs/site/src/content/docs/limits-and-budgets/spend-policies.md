@@ -5,7 +5,7 @@ summary: >-
   How key, tenant, and scoped spend budgets work, the admin calls that set
   them, which endpoints a budget refuses, how estimated charges for cut streams
   work, and how replicas share spend through the auth store.
-lastUpdated: 2026-11-08
+lastUpdated: 2026-11-09
 related:
   - limits-and-budgets/pricing-and-cost-tracking
   - limits-and-budgets/token-rate-limiting
@@ -13,6 +13,7 @@ related:
   - authentication/virtual-keys
   - authentication/tenant-provider-credentials
   - administration/admin-api
+  - operations/config-reload
 ---
 
 Use a spend budget to stop a key or a tenant from spending more than a set
@@ -630,7 +631,46 @@ The store keeps the scoped budgets of one tenant as one row at version 3. A
 store that holds such a row cannot be read by 1.0.x: it reads the row as a
 tenant budget and refuses version 3. Before a downgrade to 1.0.x, send
 `{"budgets":[]}` to `PUT /tenants/{id}/scoped_budgets` for every tenant that
-has scoped budgets.
+has scoped budgets. A scoped budget row that the config file wrote is stored
+at version 4 and also blocks an older build. See
+[Downgrade](/docs/llm-proxy/operations/config-reload/#downgrade).
+
+## Declare budgets in the config file
+
+Instead of `PUT /tenants/{id}/budget` and `PUT /tenants/{id}/scoped_budgets`,
+you can declare the budgets of a tenant in `auth.declared_policy`. The body of
+`budget` and of each `scoped_budgets` entry is the body of the matching admin
+call. In a scoped budget, `providers` names entries of the top-level
+`providers` map.
+
+```yaml title="llmproxy.yaml"
+auth:
+  declared_policy:
+    revision: 3
+    tenants:
+      - id: acme
+        budget:
+          max_usd: "500.00"
+          period: monthly
+        scoped_budgets:
+          - name: openai-daily
+            max_usd: "20"
+            period: daily
+            providers: [openai]
+```
+
+- Quote `max_usd`. An unquoted number with a fraction is a load error.
+- Set `auth.enforce.spend` to `true`. With `false`, a declared budget is a load
+  error.
+- Raise `revision` on every edit.
+- A budget set with the admin API is admin-owned. The file leaves it alone
+  until you call `DELETE /tenants/{id}/override`.
+- A scoped budget that you remove from the file is removed from the store at
+  the next reconcile. The list in the file replaces the whole list of the
+  tenant, as `PUT` does.
+
+See [Declare tenant policy in the config file](/docs/llm-proxy/operations/config-reload/#declare-tenant-policy-in-the-config-file)
+for the reload rules, the revision rules, and the downgrade steps.
 
 ## Shared accounting and crash recovery
 

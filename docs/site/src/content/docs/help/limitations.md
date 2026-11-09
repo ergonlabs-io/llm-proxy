@@ -4,7 +4,7 @@ description: "What llm-proxy does not do with a --config file, grouped by area, 
 summary: One list of what is not built, partly built, or deliberately
   different, and a list of the capabilities that only an Envoy bootstrap
   reaches. Each entry says what the proxy does today.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-09
 related:
   - getting-started/introduction
   - help/faq
@@ -73,6 +73,8 @@ Use the status words this way:
 |---|---|---|---|
 | Config file watching | Not built | A reload happens only on `SIGHUP`. | Send `SIGHUP` from your deploy tool. |
 | Reload of auth settings | By design | A `SIGHUP` that changes `auth.hmac_secret`, `auth.hmac_secret_file`, `auth.keys`, `auth.store`, or `auth.tenant_credentials` is refused whole. The proxy logs `SIGHUP: config reload refused; continuing to serve the previous snapshot`. | Restart the proxy. Use the admin API to change keys and policies at run time. |
+| Reload of `auth.declared_policy` | By design | A `SIGHUP` that changes `auth.declared_policy` is accepted. The proxy writes the change to the store in the background after it publishes the new config. A row an admin call wrote stays as it is until `DELETE /tenants/{id}/override`. | Raise `revision` on every edit. See [Reload configuration](/docs/llm-proxy/operations/config-reload/#declare-tenant-policy-in-the-config-file). |
+| Keys in `auth.declared_policy` | Not built | The block declares model policy, budgets, scoped budgets, and limits. It does not declare keys. Removing a tenant from the block leaves its keys. | Mint keys with `POST /keys`. Revoke them with `DELETE /tenants/{id}`. |
 | Reload of OTLP, ledger, and trace export settings | By design | A `SIGHUP` that changes `observability.tracing`, `observability.metrics`, `ledger`, or `observability.traces` is refused whole. | Restart the proxy. |
 | Credential files | Partly built | The proxy reads a credential file at start and again at each `SIGHUP`. It does not watch the file. | Send `SIGHUP` after you change a provider credential file. |
 | Automatic certificate renewal | Not built | No file watching and no ACME. A renewed certificate needs a `SIGHUP`. | See [TLS](/docs/llm-proxy/operations/tls/). |

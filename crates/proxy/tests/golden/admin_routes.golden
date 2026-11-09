@@ -24,6 +24,7 @@
 /chains/{stat_prefix}/tenants/{id}/budget PUT
 /chains/{stat_prefix}/tenants/{id}/limits PUT
 /chains/{stat_prefix}/tenants/{id}/objects/{object_id} GET,PUT
+/chains/{stat_prefix}/tenants/{id}/override DELETE
 /chains/{stat_prefix}/tenants/{id}/policy PUT
 /chains/{stat_prefix}/tenants/{id}/provider_credentials GET
 /chains/{stat_prefix}/tenants/{id}/provider_credentials/{provider} PUT,DELETE
@@ -56,6 +57,7 @@
 /tenants/{id}/budget PUT
 /tenants/{id}/limits PUT
 /tenants/{id}/objects/{object_id} GET,PUT
+/tenants/{id}/override DELETE
 /tenants/{id}/policy PUT
 /tenants/{id}/provider_credentials GET
 /tenants/{id}/provider_credentials/{provider} PUT,DELETE

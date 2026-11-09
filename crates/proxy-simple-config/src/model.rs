@@ -13,7 +13,9 @@ use std::time::Duration;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+mod declared_policy;
 mod jwt;
+pub use declared_policy::*;
 pub use jwt::*;
 
 /// The schema version this build writes in examples and expects: `version: 1`.
@@ -716,6 +718,10 @@ pub struct Auth {
     /// tag header is never read.
     #[serde(default)]
     pub chargeback_tags: Option<ChargebackTagsDef>,
+    /// Tenants, model policies, budgets and limits declared in this file and
+    /// reconciled into the control-plane store.
+    #[serde(default)]
+    pub declared_policy: Option<DeclaredPolicyDef>,
 }
 
 /// `auth.spend`: settings of the `llmproxy.spend_limit` filter that

@@ -359,6 +359,52 @@ pub fn check_reload_compatible(
     Err(refusals.join("; "))
 }
 
+/// The declared tenant policy of every `llmproxy.auth` chain in `snapshot`
+/// that already runs a control plane, to apply once `snapshot` is published.
+/// A config that no longer parses was refused by [`check_reload_compatible`]
+/// first, so a parse error here is only logged.
+pub fn pending_declares(
+    snapshot: &ConfigSnapshot,
+    factory_state: &SharedFactoryState,
+) -> Vec<proxy_filters::auth_filter::PendingDeclare> {
+    let mut pending = Vec::new();
+    for listener in snapshot.listeners.values() {
+        let chains = listener
+            .filter_chains
+            .iter()
+            .enumerate()
+            .map(|(i, chain)| (Some(i), chain))
+            .chain(
+                listener
+                    .default_filter_chain
+                    .iter()
+                    .map(|chain| (None, chain)),
+            );
+        for (index, chain) in chains {
+            let Some(NetworkFilterSpec::HttpConnectionManager(hcm)) = chain.filters.last() else {
+                continue;
+            };
+            let context = chain_context(&listener.name, index);
+            for f in &hcm.http_filters {
+                if f.type_url != proxy_filters::auth_filter::TYPE_URL {
+                    continue;
+                }
+                let Some(config) = &f.config else { continue };
+                match proxy_filters::auth_filter::prepare_declare(config, &context, factory_state) {
+                    Ok(Some(declare)) => pending.push(declare),
+                    Ok(None) => {}
+                    Err(err) => tracing::error!(
+                        chain = %context,
+                        error = %err,
+                        "declared tenant policy not handed over: the chain's config does not parse"
+                    ),
+                }
+            }
+        }
+    }
+    pending
+}
+
 /// Build the compiled HTTP handler for every chain (`filter_chains[i]` and
 /// `default_filter_chain`) whose terminal filter is an HCM. Other chains get a `None` slot,
 /// mirroring `build_listener_tls`.

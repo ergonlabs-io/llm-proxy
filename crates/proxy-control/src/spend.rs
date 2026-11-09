@@ -581,7 +581,131 @@ pub struct ScopedBudget {
     pub alert_at_percent: Vec<u8>,
 }
 
+/// One scoped budget as an operator writes it, before validation. Shared by
+/// `PUT /tenants/{id}/scoped_budgets` and the config file's declared policy,
+/// so the two cannot accept different budgets.
+pub struct ScopedBudgetSpec {
+    pub name: String,
+    pub max_usd: String,
+    pub period: Period,
+    /// `"platform"` (when `None`) or `"tenant"`.
+    pub credential_source: Option<String>,
+    pub models: Vec<String>,
+    pub providers: Vec<String>,
+    pub alert_at_percent: Vec<u32>,
+}
+
+/// Validates every spec in order and returns the budgets, or the first
+/// failure as a message naming the field under `at(i)` (for example
+/// `budgets[0].name`), never the rejected value. `resolve_provider` maps a
+/// provider as written to the cluster name stored, or `None` when it names
+/// nothing this proxy knows.
+pub fn validate_scoped_budgets(
+    specs: Vec<ScopedBudgetSpec>,
+    at: impl Fn(usize) -> String,
+    resolve_provider: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<ScopedBudget>, String> {
+    if specs.len() > ScopedBudget::MAX_PER_TENANT {
+        return Err(format!(
+            "at most {} scoped budgets per tenant",
+            ScopedBudget::MAX_PER_TENANT
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut budgets = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.into_iter().enumerate() {
+        let at = at(i);
+        if !ScopedBudget::is_valid_name(&spec.name) {
+            return Err(format!(
+                "invalid `{at}.name`: 1 to {} characters of a-z, 0-9, `-` and `_`, starting with a letter or digit",
+                ScopedBudget::MAX_NAME_LEN
+            ));
+        }
+        if !names.insert(spec.name.clone()) {
+            return Err(format!("duplicate `{at}.name`"));
+        }
+        let max_micros = parse_micro_usd(&spec.max_usd)
+            .map_err(|err| format!("invalid `{at}.max_usd`: {err}"))?;
+        let credential_source = match spec.credential_source.as_deref() {
+            None | Some("platform") => CredentialSource::Platform,
+            Some("tenant") => CredentialSource::Tenant,
+            Some(_) => {
+                return Err(format!(
+                    "invalid `{at}.credential_source`: expected \"platform\" or \"tenant\""
+                ))
+            }
+        };
+        if spec.models.is_empty() && spec.providers.is_empty() {
+            return Err(format!(
+                "`{at}` names no models and no providers; a budget on all of a tenant's spend is \
+                 PUT /tenants/{{id}}/budget"
+            ));
+        }
+        let max = ScopedBudget::MAX_MATCHERS;
+        if spec.models.len() > max || spec.providers.len() > max {
+            return Err(format!("`{at}` names more than {max} models or providers"));
+        }
+        if let Some(j) = spec
+            .models
+            .iter()
+            .position(|m| !crate::model_authz::ModelPattern::is_valid(m))
+        {
+            return Err(format!(
+                "invalid `{at}.models[{j}]`: an exact model name, or a prefix ending in one `*`"
+            ));
+        }
+        let mut providers = Vec::with_capacity(spec.providers.len());
+        for (j, provider) in spec.providers.iter().enumerate() {
+            let Some(cluster) = resolve_provider(provider) else {
+                return Err(format!(
+                    "invalid `{at}.providers[{j}]`: neither a cluster nor a `providers` entry in \
+                     this proxy's config"
+                ));
+            };
+            if !providers.contains(&cluster) {
+                providers.push(cluster);
+            }
+        }
+        let in_range = |p: &u32| (1..=100).contains(p);
+        if !spec.alert_at_percent.iter().all(in_range) {
+            return Err(format!(
+                "invalid `{at}.alert_at_percent`: each level is 1 to 100"
+            ));
+        }
+        let mut alert_at_percent: Vec<u8> = spec
+            .alert_at_percent
+            .iter()
+            .map(|p| u8::try_from(*p).expect("levels were checked to be 1 to 100"))
+            .collect();
+        alert_at_percent.sort_unstable();
+        if alert_at_percent.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(format!("duplicate level in `{at}.alert_at_percent`"));
+        }
+        budgets.push(ScopedBudget {
+            name: spec.name,
+            max_micros,
+            period: spec.period,
+            credential_source,
+            models: spec
+                .models
+                .into_iter()
+                .map(crate::model_authz::ModelPattern::new)
+                .collect(),
+            providers,
+            alert_at_percent,
+        });
+    }
+    Ok(budgets)
+}
+
 impl ScopedBudget {
+    /// The most scoped budgets one tenant may hold. Every request of the
+    /// tenant walks them.
+    pub const MAX_PER_TENANT: usize = 32;
+
+    /// The most model patterns or providers one scoped budget may name.
+    pub const MAX_MATCHERS: usize = 64;
+
     /// Longest accepted name, in bytes.
     pub const MAX_NAME_LEN: usize = 64;
 

@@ -20,6 +20,10 @@ use rand::Rng;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::auth::{HmacSecret, KeyId, KeyRecord, KeySet, TenantId, TenantPolicy};
+use crate::declared::{
+    plan_hand_back, plan_reconcile, AppliedMarker, CurrentRows, ReconcileOutcome, ReconcilePlan,
+    RowKind, RowSource, RowWrite,
+};
 use crate::model_authz::{ModelAccess, ModelPattern, TenantPolicyMap};
 use crate::tenant_credential_crypto::{
     self as credential_crypto, CryptoError, KeyRing, TenantSecret,
@@ -1169,6 +1173,10 @@ struct InMemoryState {
     // without bound.
     windows: HashMap<(String, WindowRow), u64>,
     window_seq: HashMap<(String, WindowRow, String), u64>,
+    // The declared rows the config file owns. A row not listed here is
+    // admin-owned; every admin write removes its row from the set.
+    file_rows: HashSet<(TenantId, RowKind)>,
+    applied_marker: Option<AppliedMarker>,
     // Bumped by every tier-2 write below, under this SAME mutex
     // acquisition -- see `ControlPlaneStore::policy_generation`'s doc for why
     // a spend write (`add_spend` above) must never touch this field.
@@ -1210,6 +1218,8 @@ impl InMemoryControlPlaneStore {
                 spend_seq: HashMap::new(),
                 windows: HashMap::new(),
                 window_seq: HashMap::new(),
+                file_rows: HashSet::new(),
+                applied_marker: None,
                 generation: 0,
             }),
         }
@@ -1217,6 +1227,113 @@ impl InMemoryControlPlaneStore {
 }
 
 impl InMemoryControlPlaneStore {
+    fn source_of(state: &InMemoryState, tenant: &TenantId, kind: RowKind) -> RowSource {
+        if state.file_rows.contains(&(tenant.clone(), kind)) {
+            RowSource::File
+        } else {
+            RowSource::Admin
+        }
+    }
+
+    fn current_rows(state: &InMemoryState) -> CurrentRows {
+        let declarable = |tenant: &&TenantId| key_id_from_budget_subject(tenant).is_none();
+        let with_source = |tenant: &TenantId, kind| Self::source_of(state, tenant, kind);
+        CurrentRows {
+            tenants: state
+                .tenants
+                .iter()
+                .map(|t| (t.clone(), with_source(t, RowKind::Tenant)))
+                .collect(),
+            policies: state
+                .policies
+                .iter()
+                .filter(|(t, _)| declarable(t))
+                .map(|(t, v)| (t.clone(), (with_source(t, RowKind::Policy), v.clone())))
+                .collect(),
+            budgets: state
+                .budgets
+                .iter()
+                .filter(|(t, _)| declarable(t))
+                .map(|(t, v)| (t.clone(), (with_source(t, RowKind::Budget), *v)))
+                .collect(),
+            scoped_budgets: state
+                .scoped_budgets
+                .iter()
+                .map(|(t, v)| {
+                    (
+                        t.clone(),
+                        (with_source(t, RowKind::ScopedBudgets), v.clone()),
+                    )
+                })
+                .collect(),
+            limits: state
+                .limits
+                .iter()
+                .filter(|(t, _)| declarable(t))
+                .map(|(t, v)| (t.clone(), (with_source(t, RowKind::Limits), *v)))
+                .collect(),
+        }
+    }
+
+    /// Applies `writes` and records each row's source in `file_rows`.
+    fn apply_row_writes(state: &mut InMemoryState, writes: Vec<RowWrite>) {
+        fn put<T>(
+            map: &mut HashMap<TenantId, T>,
+            file_rows: &mut HashSet<(TenantId, RowKind)>,
+            tenant: TenantId,
+            kind: RowKind,
+            row: Option<(RowSource, T)>,
+        ) {
+            file_rows.remove(&(tenant.clone(), kind));
+            match row {
+                Some((source, value)) => {
+                    if source == RowSource::File {
+                        file_rows.insert((tenant.clone(), kind));
+                    }
+                    map.insert(tenant, value);
+                }
+                None => {
+                    map.remove(&tenant);
+                }
+            }
+        }
+        for write in writes {
+            let file_rows = &mut state.file_rows;
+            match write {
+                RowWrite::Tenant(tenant, source) => {
+                    file_rows.remove(&(tenant.clone(), RowKind::Tenant));
+                    match source {
+                        Some(source) => {
+                            if source == RowSource::File {
+                                file_rows.insert((tenant.clone(), RowKind::Tenant));
+                            }
+                            if !state.tenants.contains(&tenant) {
+                                state.tenants.push(tenant);
+                            }
+                        }
+                        None => state.tenants.retain(|t| t != &tenant),
+                    }
+                }
+                RowWrite::Policy(t, row) => {
+                    put(&mut state.policies, file_rows, t, RowKind::Policy, row)
+                }
+                RowWrite::Budget(t, row) => {
+                    put(&mut state.budgets, file_rows, t, RowKind::Budget, row)
+                }
+                RowWrite::ScopedBudgets(t, row) => put(
+                    &mut state.scoped_budgets,
+                    file_rows,
+                    t,
+                    RowKind::ScopedBudgets,
+                    row,
+                ),
+                RowWrite::Limits(t, row) => {
+                    put(&mut state.limits, file_rows, t, RowKind::Limits, row)
+                }
+            }
+        }
+    }
+
     fn prune_windows_locked(state: &mut InMemoryState, now_secs: u64) {
         let expired = |row: &WindowRow| {
             row.window.end_secs().saturating_add(WINDOW_ROW_GRACE_SECS) < now_secs
@@ -1306,6 +1423,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         if !state.tenants.contains(tenant) {
             state.tenants.push(tenant.clone());
         }
+        state.file_rows.remove(&(tenant.clone(), RowKind::Tenant));
         state.generation += 1;
         Ok(())
     }
@@ -1332,6 +1450,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
         // the tenant gone while one of its credential rows is still there
         // to be applied upstream.
         state.tenant_credentials.retain(|(t, _), _| t != tenant);
+        state.file_rows.retain(|(t, _)| t != tenant);
         state.generation += 1;
         Ok(())
     }
@@ -1441,6 +1560,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
             .lock()
             .expect("control-plane store mutex poisoned");
         state.policies.insert(tenant.clone(), access.clone());
+        state.file_rows.remove(&(tenant.clone(), RowKind::Policy));
         state.generation += 1;
         Ok(())
     }
@@ -1462,6 +1582,7 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
                 state.budgets.remove(tenant);
             }
         }
+        state.file_rows.remove(&(tenant.clone(), RowKind::Budget));
         state.generation += 1;
         Ok(())
     }
@@ -1482,6 +1603,9 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
                 .scoped_budgets
                 .insert(tenant.clone(), budgets.to_vec());
         }
+        state
+            .file_rows
+            .remove(&(tenant.clone(), RowKind::ScopedBudgets));
         state.generation += 1;
         Ok(())
     }
@@ -1520,8 +1644,50 @@ impl ControlPlaneStore for InMemoryControlPlaneStore {
                 state.limits.remove(subject);
             }
         }
+        state.file_rows.remove(&(subject.clone(), RowKind::Limits));
         state.generation += 1;
         Ok(())
+    }
+
+    fn reconcile_declared(
+        &self,
+        declared: &crate::declared::DeclaredPolicy,
+    ) -> Result<ReconcileOutcome, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        let current = Self::current_rows(&state);
+        match plan_reconcile(&current, state.applied_marker, declared) {
+            ReconcilePlan::Refuse(outcome) => Ok(outcome),
+            ReconcilePlan::Apply {
+                writes,
+                marker,
+                report,
+            } => {
+                let changed = !writes.is_empty();
+                Self::apply_row_writes(&mut state, writes);
+                state.applied_marker = Some(marker);
+                if changed {
+                    state.generation += 1;
+                }
+                Ok(ReconcileOutcome::Applied(report))
+            }
+        }
+    }
+
+    fn hand_back_to_file(&self, tenant: &TenantId) -> Result<Vec<RowKind>, StoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane store mutex poisoned");
+        let current = Self::current_rows(&state);
+        let (writes, kinds) = plan_hand_back(&current, tenant);
+        if !writes.is_empty() {
+            Self::apply_row_writes(&mut state, writes);
+            state.generation += 1;
+        }
+        Ok(kinds)
     }
 
     fn set_trace_export(&self, tenant: &TenantId, enabled: bool) -> Result<(), StoreError> {
@@ -1840,6 +2006,11 @@ const OBJECT_OWNERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("
 // (expires_at, object id) of every owner row that expires, in expiry order,
 // so a claim removes expired rows without scanning the owners table.
 const OBJECT_EXPIRY_TABLE: TableDefinition<(u64, &str), ()> = TableDefinition::new("object_expiry");
+// The revision and digest of the declared policy the store last applied,
+// one row under `APPLIED_MARKER_ROW`. Not tier 2 on its own: it changes only
+// inside a reconcile, which bumps the generation when it changes a row.
+const DECLARED_POLICY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("declared_policy");
+const APPLIED_MARKER_ROW: &str = "applied";
 
 /// One `keys` row, exactly as `redb` stores it -- everything a [`StoredKey`]
 /// carries except `key_id`, which is already the table's key and would just
@@ -2018,6 +2189,131 @@ impl From<EncodedModelAccess> for ModelAccess {
     }
 }
 
+/// The `source` field of a file-written row. Only `file` is ever written: a
+/// row without the field is admin-owned, which is what every row written
+/// before sources existed means. An unknown value fails the load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EncodedRowSource {
+    File,
+}
+
+fn encoded_source(source: RowSource) -> Option<EncodedRowSource> {
+    match source {
+        RowSource::Admin => None,
+        RowSource::File => Some(EncodedRowSource::File),
+    }
+}
+
+fn row_source(encoded: Option<EncodedRowSource>) -> RowSource {
+    match encoded {
+        None => RowSource::Admin,
+        Some(EncodedRowSource::File) => RowSource::File,
+    }
+}
+
+/// Version of a file-owned tenant row. An admin tenant row stays the empty
+/// marker it always was, so a store without file rows is unchanged.
+const FILE_TENANT_ROW_SCHEMA_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedFileTenantRow {
+    #[serde(deserialize_with = "read_file_tenant_row_schema_version")]
+    schema_version: u32,
+    source: EncodedRowSource,
+}
+
+fn read_file_tenant_row_schema_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<u32, D::Error> {
+    exact_version(de, FILE_TENANT_ROW_SCHEMA_VERSION, "tenant row")
+}
+
+fn exact_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+    expected: u32,
+    what: &str,
+) -> Result<u32, D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if version == expected {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported {what} schema version {version}"
+        )))
+    }
+}
+
+/// A tenant row's value: empty for an admin row (the marker every build
+/// wrote), JSON for a file row. Redb keeps it as the tenants-table value.
+pub(crate) fn encode_tenant_row(source: RowSource) -> Vec<u8> {
+    match source {
+        RowSource::Admin => Vec::new(),
+        RowSource::File => encode_json(&EncodedFileTenantRow {
+            schema_version: FILE_TENANT_ROW_SCHEMA_VERSION,
+            source: EncodedRowSource::File,
+        }),
+    }
+}
+
+pub(crate) fn decode_tenant_row(bytes: &[u8]) -> Result<RowSource, StoreError> {
+    if bytes.is_empty() {
+        return Ok(RowSource::Admin);
+    }
+    let row: EncodedFileTenantRow = decode_json(bytes)?;
+    Ok(row_source(Some(row.source)))
+}
+
+/// Version of a file-owned policy row. An admin policy row stays the bare
+/// [`EncodedModelAccess`] every build wrote. A build that reads only the bare
+/// form fails to load a file row rather than misread it.
+const FILE_POLICY_SCHEMA_VERSION: u32 = 2;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedFilePolicyRow {
+    #[serde(deserialize_with = "read_file_policy_schema_version")]
+    schema_version: u32,
+    source: EncodedRowSource,
+    access: EncodedModelAccess,
+}
+
+fn read_file_policy_schema_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<u32, D::Error> {
+    exact_version(de, FILE_POLICY_SCHEMA_VERSION, "policy row")
+}
+
+/// Rust note: `untagged` tries each variant in order. The bare form is an
+/// externally tagged enum (`"All"`, `{"Only": [...]}`), which a
+/// `{"schema_version": ...}` object never matches, so the order only decides
+/// which error a row matching neither reports.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum EncodedPolicyRow {
+    File(EncodedFilePolicyRow),
+    Admin(EncodedModelAccess),
+}
+
+pub(crate) fn encode_policy_row(access: &ModelAccess, source: RowSource) -> Vec<u8> {
+    match source {
+        RowSource::Admin => encode_json(&EncodedModelAccess::from(access)),
+        RowSource::File => encode_json(&EncodedFilePolicyRow {
+            schema_version: FILE_POLICY_SCHEMA_VERSION,
+            source: EncodedRowSource::File,
+            access: access.into(),
+        }),
+    }
+}
+
+pub(crate) fn decode_policy_row(bytes: &[u8]) -> Result<(RowSource, ModelAccess), StoreError> {
+    match decode_json::<EncodedPolicyRow>(bytes)? {
+        EncodedPolicyRow::File(row) => Ok((row_source(Some(row.source)), row.access.into())),
+        EncodedPolicyRow::Admin(access) => Ok((RowSource::Admin, access.into())),
+    }
+}
+
 /// [`crate::spend::Period`] as `serde_json` sees it. A local mirror, not a
 /// `serde` derive on `Period` itself -- same reasoning as
 /// [`EncodedModelAccess`]'s doc: `Period` lives in `spend.rs`, which this
@@ -2098,13 +2394,54 @@ fn legacy_credential_source() -> EncodedCredentialSource {
 pub(crate) struct EncodedTenantBudget {
     #[serde(
         default = "legacy_schema_version",
-        deserialize_with = "read_schema_version"
+        deserialize_with = "read_tenant_budget_schema_version"
     )]
     schema_version: u32,
     max_micros: u64,
     period: EncodedPeriod,
     #[serde(default = "legacy_credential_source")]
     credential_source: EncodedCredentialSource,
+    /// Present only on a file row, which is stamped
+    /// [`FILE_TENANT_BUDGET_SCHEMA_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<EncodedRowSource>,
+}
+
+/// Version of a file-owned tenant budget row. An admin row stays at
+/// [`SPEND_SCHEMA_VERSION`]; a build that reads only versions 1 and 2 fails to
+/// load a file row rather than read it as an admin row it may never delete.
+const FILE_TENANT_BUDGET_SCHEMA_VERSION: u32 = 3;
+
+fn read_tenant_budget_schema_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<u32, D::Error> {
+    let version = <u32 as serde::Deserialize>::deserialize(de)?;
+    if matches!(
+        version,
+        1 | SPEND_SCHEMA_VERSION | FILE_TENANT_BUDGET_SCHEMA_VERSION
+    ) {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported spend schema version {version}"
+        )))
+    }
+}
+
+pub(crate) fn encode_tenant_budget_row(budget: &TenantBudget, source: RowSource) -> Vec<u8> {
+    let mut encoded = EncodedTenantBudget::from(budget);
+    if let Some(file) = encoded_source(source) {
+        encoded.schema_version = FILE_TENANT_BUDGET_SCHEMA_VERSION;
+        encoded.source = Some(file);
+    }
+    encode_json(&encoded)
+}
+
+pub(crate) fn decode_tenant_budget_row(
+    bytes: &[u8],
+) -> Result<(RowSource, TenantBudget), StoreError> {
+    let encoded: EncodedTenantBudget = decode_json(bytes)?;
+    Ok((row_source(encoded.source), encoded.into()))
 }
 
 impl From<&TenantBudget> for EncodedTenantBudget {
@@ -2114,6 +2451,7 @@ impl From<&TenantBudget> for EncodedTenantBudget {
             max_micros: budget.max_micros.as_micros(),
             period: budget.period.into(),
             credential_source: budget.credential_source.into(),
+            source: None,
         }
     }
 }
@@ -2194,11 +2532,18 @@ impl From<EncodedKeyBudget> for KeyBudget {
 /// tenant with its caps silently gone (CHANGELOG, downgrade note).
 pub const SCOPED_BUDGETS_SCHEMA_VERSION: u32 = 3;
 
+/// Version of a file-owned scoped budget row, the only one that carries
+/// `source`. A build that reads only version 3 fails to load it.
+const FILE_SCOPED_BUDGETS_SCHEMA_VERSION: u32 = 4;
+
 fn read_scoped_budgets_schema_version<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<u32, D::Error> {
     let version = <u32 as serde::Deserialize>::deserialize(de)?;
-    if version == SCOPED_BUDGETS_SCHEMA_VERSION {
+    if matches!(
+        version,
+        SCOPED_BUDGETS_SCHEMA_VERSION | FILE_SCOPED_BUDGETS_SCHEMA_VERSION
+    ) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(format!(
@@ -2216,6 +2561,27 @@ pub(crate) struct EncodedScopedBudgets {
     #[serde(deserialize_with = "read_scoped_budgets_schema_version")]
     schema_version: u32,
     budgets: Vec<EncodedScopedBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<EncodedRowSource>,
+}
+
+pub(crate) fn encode_scoped_budgets_row(
+    budgets: &[crate::spend::ScopedBudget],
+    source: RowSource,
+) -> Vec<u8> {
+    let mut encoded = EncodedScopedBudgets::from(budgets);
+    if let Some(file) = encoded_source(source) {
+        encoded.schema_version = FILE_SCOPED_BUDGETS_SCHEMA_VERSION;
+        encoded.source = Some(file);
+    }
+    encode_json(&encoded)
+}
+
+pub(crate) fn decode_scoped_budgets_row(
+    bytes: &[u8],
+) -> Result<(RowSource, Vec<crate::spend::ScopedBudget>), StoreError> {
+    let encoded: EncodedScopedBudgets = decode_json(bytes)?;
+    Ok((row_source(encoded.source), encoded.into()))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2253,6 +2619,7 @@ impl From<&[crate::spend::ScopedBudget]> for EncodedScopedBudgets {
                     alert_at_percent: budget.alert_at_percent.clone(),
                 })
                 .collect(),
+            source: None,
         }
     }
 }
@@ -2297,6 +2664,9 @@ pub(crate) struct EncodedLimitPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requests_per_day: Option<u64>,
     concurrent_streams: Option<u32>,
+    /// Present only on a file row, stamped [`LIMITS_SCHEMA_V3`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<EncodedRowSource>,
 }
 
 /// The limits row version a row without daily limits is written with.
@@ -2305,6 +2675,23 @@ const LIMITS_SCHEMA_V1: u32 = 1;
 /// `requests_per_day`. A build that reads only version 1 refuses to load it,
 /// rather than reading the row and silently dropping the daily limits.
 const LIMITS_SCHEMA_V2: u32 = 2;
+/// The limits row version of a file-owned row, the only one that carries
+/// `source`. A build that reads only versions 1 and 2 fails to load it.
+const LIMITS_SCHEMA_V3: u32 = 3;
+
+pub(crate) fn encode_limits_row(limits: &LimitPolicy, source: RowSource) -> Vec<u8> {
+    let mut encoded = EncodedLimitPolicy::from(limits);
+    if let Some(file) = encoded_source(source) {
+        encoded.schema_version = LIMITS_SCHEMA_V3;
+        encoded.source = Some(file);
+    }
+    encode_json(&encoded)
+}
+
+pub(crate) fn decode_limits_row(bytes: &[u8]) -> Result<(RowSource, LimitPolicy), StoreError> {
+    let encoded: EncodedLimitPolicy = decode_json(bytes)?;
+    Ok((row_source(encoded.source), encoded.into()))
+}
 
 pub(crate) const TRACE_EXPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -2431,7 +2818,10 @@ pub(crate) fn decode_object_owner_row(value: &[u8]) -> Result<ObjectOwner, Store
 
 fn read_limits_schema_version<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
     let version = <u32 as serde::Deserialize>::deserialize(de)?;
-    if matches!(version, LIMITS_SCHEMA_V1 | LIMITS_SCHEMA_V2) {
+    if matches!(
+        version,
+        LIMITS_SCHEMA_V1 | LIMITS_SCHEMA_V2 | LIMITS_SCHEMA_V3
+    ) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(format!(
@@ -2454,6 +2844,7 @@ impl From<&LimitPolicy> for EncodedLimitPolicy {
             tokens_per_day: limits.tokens_per_day,
             requests_per_day: limits.requests_per_day,
             concurrent_streams: limits.concurrent_streams,
+            source: None,
         }
     }
 }
@@ -2525,6 +2916,130 @@ impl From<&StoredTenantCredential> for EncodedTenantCredentialRow {
 
 /// Lowercase hex rendering of `bytes` -- the encoding
 /// [`EncodedTenantCredentialRow`] stores `nonce`/`ciphertext` in.
+/// Version of the applied-marker row ([`AppliedMarker`]), the same JSON in
+/// redb and Redis.
+const APPLIED_MARKER_SCHEMA_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedAppliedMarker {
+    #[serde(deserialize_with = "read_applied_marker_schema_version")]
+    schema_version: u32,
+    revision: u64,
+    /// Lowercase hex SHA-256.
+    digest: String,
+}
+
+fn read_applied_marker_schema_version<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<u32, D::Error> {
+    exact_version(de, APPLIED_MARKER_SCHEMA_VERSION, "declared policy marker")
+}
+
+pub(crate) fn encode_applied_marker(marker: &AppliedMarker) -> Vec<u8> {
+    encode_json(&EncodedAppliedMarker {
+        schema_version: APPLIED_MARKER_SCHEMA_VERSION,
+        revision: marker.revision,
+        digest: encode_hex_lower(&marker.digest),
+    })
+}
+
+pub(crate) fn decode_applied_marker(bytes: &[u8]) -> Result<AppliedMarker, StoreError> {
+    let encoded: EncodedAppliedMarker = decode_json(bytes)?;
+    let digest = decode_hex_lower(&encoded.digest)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            StoreError::Unavailable(
+                "corrupt control-plane store row: declared policy marker digest".into(),
+            )
+        })?;
+    Ok(AppliedMarker {
+        revision: encoded.revision,
+        digest,
+    })
+}
+
+/// Files one row a reconcile reads into `current`, by the table it came
+/// from. Key rows share the policies, budgets and limits tables under a key
+/// subject; they are never declared, so they are skipped. Shared by the
+/// redb and Redis stores.
+pub(crate) fn file_current_row(
+    current: &mut CurrentRows,
+    kind: RowKind,
+    subject: &str,
+    value: &[u8],
+) -> Result<(), StoreError> {
+    if key_id_from_budget_subject(&TenantId::new(subject)).is_some() {
+        return Ok(());
+    }
+    match kind {
+        RowKind::Tenant => {
+            current
+                .tenants
+                .insert(TenantId::new(subject), decode_tenant_row(value)?);
+        }
+        RowKind::Policy => {
+            current
+                .policies
+                .insert(TenantId::new(subject), decode_policy_row(value)?);
+        }
+        RowKind::Budget | RowKind::ScopedBudgets => {
+            if let Some(tenant) = tenant_from_scoped_budgets_row(subject) {
+                current
+                    .scoped_budgets
+                    .insert(tenant, decode_scoped_budgets_row(value)?);
+            } else {
+                current
+                    .budgets
+                    .insert(TenantId::new(subject), decode_tenant_budget_row(value)?);
+            }
+        }
+        RowKind::Limits => {
+            current
+                .limits
+                .insert(TenantId::new(subject), decode_limits_row(value)?);
+        }
+    }
+    Ok(())
+}
+
+/// One [`RowWrite`] as the table it lands in, the field or key it is filed
+/// under, and the encoded value (`None` deletes). Shared by the redb and
+/// Redis stores so both file a row the same way.
+pub(crate) fn encode_row_write(write: &RowWrite) -> (RowKind, String, Option<Vec<u8>>) {
+    match write {
+        RowWrite::Tenant(tenant, source) => (
+            RowKind::Tenant,
+            tenant.as_str().to_owned(),
+            source.map(encode_tenant_row),
+        ),
+        RowWrite::Policy(tenant, row) => (
+            RowKind::Policy,
+            tenant.as_str().to_owned(),
+            row.as_ref()
+                .map(|(source, access)| encode_policy_row(access, *source)),
+        ),
+        RowWrite::Budget(tenant, row) => (
+            RowKind::Budget,
+            tenant.as_str().to_owned(),
+            row.as_ref()
+                .map(|(source, budget)| encode_tenant_budget_row(budget, *source)),
+        ),
+        RowWrite::ScopedBudgets(tenant, row) => (
+            RowKind::ScopedBudgets,
+            scoped_budgets_row_subject(tenant),
+            row.as_ref()
+                .map(|(source, budgets)| encode_scoped_budgets_row(budgets, *source)),
+        ),
+        RowWrite::Limits(tenant, row) => (
+            RowKind::Limits,
+            tenant.as_str().to_owned(),
+            row.as_ref()
+                .map(|(source, limits)| encode_limits_row(limits, *source)),
+        ),
+    }
+}
+
 fn encode_hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -2804,7 +3319,55 @@ impl RedbControlPlaneStore {
         txn.open_table(WINDOWS_TABLE).map_err(store_err)?;
         txn.open_table(WINDOW_SEQ_TABLE).map_err(store_err)?;
         txn.open_table(GENERATION_TABLE).map_err(store_err)?;
+        txn.open_table(DECLARED_POLICY_TABLE).map_err(store_err)?;
         txn.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Every tenant, policy, tenant budget, scoped budget and limits row,
+    /// with its source, read inside the write transaction that will apply
+    /// the reconcile, so nothing can change between the read and the write.
+    fn read_current_rows(txn: &redb::WriteTransaction) -> Result<CurrentRows, StoreError> {
+        let mut current = CurrentRows::default();
+        for (kind, definition) in [
+            (RowKind::Tenant, TENANTS_TABLE),
+            (RowKind::Policy, POLICIES_TABLE),
+            (RowKind::Budget, BUDGETS_TABLE),
+            (RowKind::Limits, LIMITS_TABLE),
+        ] {
+            let table = txn.open_table(definition).map_err(store_err)?;
+            for entry in table.iter().map_err(store_err)? {
+                let (key, value) = entry.map_err(store_err)?;
+                file_current_row(&mut current, kind, key.value(), value.value())?;
+            }
+        }
+        Ok(current)
+    }
+
+    fn apply_row_writes(
+        txn: &redb::WriteTransaction,
+        writes: &[RowWrite],
+    ) -> Result<(), StoreError> {
+        for write in writes {
+            let (kind, subject, value) = encode_row_write(write);
+            let definition = match kind {
+                RowKind::Tenant => TENANTS_TABLE,
+                RowKind::Policy => POLICIES_TABLE,
+                RowKind::Budget | RowKind::ScopedBudgets => BUDGETS_TABLE,
+                RowKind::Limits => LIMITS_TABLE,
+            };
+            let mut table = txn.open_table(definition).map_err(store_err)?;
+            match value {
+                Some(bytes) => {
+                    table
+                        .insert(subject.as_str(), bytes.as_slice())
+                        .map_err(store_err)?;
+                }
+                None => {
+                    table.remove(subject.as_str()).map_err(store_err)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2922,8 +3485,8 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         let mut policies = HashMap::new();
         for entry in policies_table.iter().map_err(store_err)? {
             let (key, value) = entry.map_err(store_err)?;
-            let encoded: EncodedModelAccess = decode_json(value.value())?;
-            policies.insert(TenantId::new(key.value()), encoded.into());
+            let (_source, access) = decode_policy_row(value.value())?;
+            policies.insert(TenantId::new(key.value()), access);
         }
 
         let budgets_table = txn.open_table(BUDGETS_TABLE).map_err(store_err)?;
@@ -3309,6 +3872,58 @@ impl ControlPlaneStore for RedbControlPlaneStore {
         Self::bump_generation(&txn)?;
         txn.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    fn reconcile_declared(
+        &self,
+        declared: &crate::declared::DeclaredPolicy,
+    ) -> Result<ReconcileOutcome, StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let current = Self::read_current_rows(&txn)?;
+        let applied = {
+            let table = txn.open_table(DECLARED_POLICY_TABLE).map_err(store_err)?;
+            let row = table.get(APPLIED_MARKER_ROW).map_err(store_err)?;
+            row.map(|row| decode_applied_marker(row.value()))
+                .transpose()?
+        };
+        match plan_reconcile(&current, applied, declared) {
+            // Dropping the transaction aborts it: nothing was written.
+            ReconcilePlan::Refuse(outcome) => Ok(outcome),
+            ReconcilePlan::Apply {
+                writes,
+                marker,
+                report,
+            } => {
+                Self::apply_row_writes(&txn, &writes)?;
+                {
+                    let mut table = txn.open_table(DECLARED_POLICY_TABLE).map_err(store_err)?;
+                    table
+                        .insert(
+                            APPLIED_MARKER_ROW,
+                            encode_applied_marker(&marker).as_slice(),
+                        )
+                        .map_err(store_err)?;
+                }
+                if !writes.is_empty() {
+                    Self::bump_generation(&txn)?;
+                }
+                txn.commit().map_err(store_err)?;
+                Ok(ReconcileOutcome::Applied(report))
+            }
+        }
+    }
+
+    fn hand_back_to_file(&self, tenant: &TenantId) -> Result<Vec<RowKind>, StoreError> {
+        let txn = self.db.begin_write().map_err(store_err)?;
+        let current = Self::read_current_rows(&txn)?;
+        let (writes, kinds) = plan_hand_back(&current, tenant);
+        if writes.is_empty() {
+            return Ok(kinds);
+        }
+        Self::apply_row_writes(&txn, &writes)?;
+        Self::bump_generation(&txn)?;
+        txn.commit().map_err(store_err)?;
+        Ok(kinds)
     }
 
     fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError> {
@@ -4421,6 +5036,64 @@ pub struct ControlPlane {
     /// (ADR-0006 amendment E): set for a shared store, so the leases live in
     /// the same Redis as the counters; `None` keeps them in process.
     lease_store: Option<Arc<dyn crate::window_counter::LeaseStore>>,
+    /// The tenant policy the config file declares, and how far reconciling
+    /// it has got. See [`Self::declare`].
+    declared: Mutex<DeclaredState>,
+}
+
+/// The declared policy a [`ControlPlane`] reconciles into its store.
+#[derive(Default)]
+struct DeclaredState {
+    /// What the latest config build declared. `None` until a build declares
+    /// a block, and again after a reload removes it.
+    wanted: Option<Arc<crate::declared::DeclaredPolicy>>,
+    /// The revision and digest of the last reconcile that finished, applied
+    /// or refused for its revision. A failed one leaves this behind
+    /// `wanted`, which is what the policy poller retries.
+    settled: Option<(u64, [u8; 32])>,
+    /// A reconcile thread is running; [`ControlPlane::declare`] leaves a
+    /// newer policy in `wanted` for it rather than starting a second one.
+    running: bool,
+}
+
+fn declared_identity(policy: &crate::declared::DeclaredPolicy) -> (u64, [u8; 32]) {
+    (policy.revision, policy.digest)
+}
+
+/// The dotted path of one declared row, in Envoy mode and in the dialect.
+/// Entries are named by tenant id: a reconcile sees the sorted policy, not
+/// the file's order, and the id is what an operator searches the file for.
+fn declared_row_paths(tenant: &TenantId, kind: RowKind) -> (String, String) {
+    let entry = format!("declared_policy.tenants[{}]", tenant.as_str());
+    let entry = match kind.field() {
+        Some(field) => format!("{entry}.{field}"),
+        None => entry,
+    };
+    (format!("typed_config.{entry}"), format!("auth.{entry}"))
+}
+
+/// Why [`ControlPlane::hand_back_to_file`] refused.
+#[derive(Debug)]
+pub enum HandBackError {
+    /// This replica's config declares no entry for the tenant, so there is
+    /// no file value to hand the rows to.
+    NotDeclared,
+    Store(StoreError),
+}
+
+impl From<StoreError> for HandBackError {
+    fn from(err: StoreError) -> Self {
+        HandBackError::Store(err)
+    }
+}
+
+/// What [`ControlPlane::hand_back_to_file`] did.
+#[derive(Debug)]
+pub struct HandBack {
+    /// The rows that were admin-owned and are now file-owned.
+    pub kinds: Vec<RowKind>,
+    /// The reconcile that ran right after, against this replica's file.
+    pub outcome: ReconcileOutcome,
 }
 
 /// Who wants to hear when a chain's stored rate card changes.
@@ -4533,6 +5206,7 @@ impl ControlPlane {
             rate_cards: Mutex::new(rate_cards),
             rate_card_watches: Mutex::new(Vec::new()),
             lease_store: None,
+            declared: Mutex::new(DeclaredState::default()),
         })
     }
 
@@ -5336,6 +6010,7 @@ impl ControlPlane {
     /// minted after this returns belongs to a new tenant of the same name,
     /// because tenants are implicit (a key or a policy creates one).
     pub fn delete_tenant(&self, tenant: &TenantId) -> Result<usize, StoreError> {
+        self.warn_if_declared(tenant, RowKind::Tenant);
         let mut revoked = self.revoke_tenant_keys(tenant)?;
         self.store.delete_tenant(tenant)?;
         revoked += self.revoke_tenant_keys(tenant)?;
@@ -5406,6 +6081,9 @@ impl ControlPlane {
         tenant: &TenantId,
         budget: Option<&TenantBudget>,
     ) -> Result<(), StoreError> {
+        if budget.is_none() {
+            self.warn_if_declared(tenant, RowKind::Budget);
+        }
         self.store.set_budget(tenant, budget)?;
         self.apply_write()?;
         Ok(())
@@ -5419,6 +6097,9 @@ impl ControlPlane {
         tenant: &TenantId,
         budgets: &[crate::spend::ScopedBudget],
     ) -> Result<(), StoreError> {
+        if budgets.is_empty() {
+            self.warn_if_declared(tenant, RowKind::ScopedBudgets);
+        }
         self.store.set_scoped_budgets(tenant, budgets)?;
         self.apply_write()?;
         Ok(())
@@ -5445,9 +6126,230 @@ impl ControlPlane {
         tenant: &TenantId,
         limits: Option<&LimitPolicy>,
     ) -> Result<(), StoreError> {
+        if limits.is_none_or(|limits| limits.is_empty()) {
+            self.warn_if_declared(tenant, RowKind::Limits);
+        }
         self.store.set_limits(tenant, limits)?;
         self.apply_write()?;
         Ok(())
+    }
+
+    /// Records the tenant policy this replica's config declares and, when it
+    /// differs from the last one, reconciles it on a background thread.
+    /// Returns at once: the auth filter calls this from every chain build,
+    /// which runs on request workers, and workers never wait on the store.
+    /// They keep reading the published snapshot, and the reconcile publishes
+    /// a new one through [`Self::rebuild`] when it changed a row.
+    ///
+    /// `None` (a config with no declared block) forgets the policy and leaves
+    /// the store as it is.
+    pub fn declare(self: &Arc<Self>, declared: Option<Arc<crate::declared::DeclaredPolicy>>) {
+        let mut state = self.declared.lock().expect("control plane mutex poisoned");
+        let Some(policy) = declared else {
+            state.wanted = None;
+            return;
+        };
+        if state.wanted.as_deref().map(declared_identity) == Some(declared_identity(&policy)) {
+            return;
+        }
+        state.wanted = Some(policy);
+        self.start_declared_reconciler(&mut state);
+    }
+
+    /// Starts the reconcile thread unless one runs. Called with the state
+    /// lock held, so two callers cannot both start one.
+    fn start_declared_reconciler(self: &Arc<Self>, state: &mut DeclaredState) {
+        if state.running {
+            return;
+        }
+        state.running = true;
+        // A `Weak`, for the reason `start_policy_poller` gives.
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("declared-policy-reconcile".to_string())
+            .spawn(move || run_declared_reconciler(weak));
+        if let Err(err) = spawned {
+            state.running = false;
+            tracing::error!(
+                error = %err,
+                "declared tenant policy: could not start the reconcile thread; the policy poller \
+                 retries it"
+            );
+        }
+    }
+
+    /// Called by the policy poller each tick: restarts a reconcile that
+    /// failed, so a store outage during a reload delays the file, never
+    /// loses it.
+    fn retry_declared(self: &Arc<Self>) {
+        let mut state = self.declared.lock().expect("control plane mutex poisoned");
+        let behind = state
+            .wanted
+            .as_deref()
+            .is_some_and(|wanted| state.settled != Some(declared_identity(wanted)));
+        if behind {
+            self.start_declared_reconciler(&mut state);
+        }
+    }
+
+    /// The tenant policy this replica's config declares, if any.
+    pub fn declared_policy(&self) -> Option<Arc<crate::declared::DeclaredPolicy>> {
+        self.declared
+            .lock()
+            .expect("control plane mutex poisoned")
+            .wanted
+            .clone()
+    }
+
+    /// Reconciles `declared` into the store now, on the calling thread, logs
+    /// what it did, and republishes when a row changed. The auth filter calls
+    /// this once at startup, before any worker serves, so declared rows are
+    /// enforced from the first request; later reconciles go through
+    /// [`Self::declare`].
+    ///
+    /// Each shadowed row gets one warning per reconcile naming its dotted
+    /// path, because the reviewed file then disagrees with what is enforced.
+    pub fn reconcile_declared_now(
+        &self,
+        declared: &Arc<crate::declared::DeclaredPolicy>,
+    ) -> Result<ReconcileOutcome, StoreError> {
+        {
+            let mut state = self.declared.lock().expect("control plane mutex poisoned");
+            if state.wanted.is_none() {
+                state.wanted = Some(Arc::clone(declared));
+            }
+        }
+        let outcome = match self.store.reconcile_declared(declared) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    revision = declared.revision,
+                    "declared tenant policy: reconcile failed; the store keeps its rows and the \
+                     policy poller retries"
+                );
+                return Err(err);
+            }
+        };
+        match &outcome {
+            ReconcileOutcome::Applied(report) => {
+                if report.written + report.deleted > 0 {
+                    // A failed rebuild is already logged; the poller sees
+                    // the generation the reconcile bumped and republishes.
+                    let _ = self.rebuild();
+                }
+                tracing::info!(
+                    revision = declared.revision,
+                    written = report.written,
+                    deleted = report.deleted,
+                    shadowed = report.shadowed.len(),
+                    "declared tenant policy reconciled"
+                );
+                for row in &report.shadowed {
+                    let (field, dialect_field) = declared_row_paths(&row.tenant, row.kind);
+                    tracing::warn!(
+                        %field,
+                        %dialect_field,
+                        tenant = %row.tenant.as_str(),
+                        "declared tenant policy: an admin write owns this row, so the store keeps \
+                         the admin value and the file entry is not enforced. \
+                         DELETE /tenants/{{id}}/override hands it back to the file"
+                    );
+                }
+                self.warn_live_keys_of_removed_tenants(&report.removed_tenants);
+            }
+            ReconcileOutcome::StaleRevision { stored } => tracing::error!(
+                revision = declared.revision,
+                stored_revision = stored,
+                "declared tenant policy not applied: the store already applied a newer \
+                 revision, so this replica's config is older than another replica's. Roll out \
+                 the newer file"
+            ),
+            ReconcileOutcome::RevisionConflict => tracing::error!(
+                revision = declared.revision,
+                "declared tenant policy not applied: the store applied this revision with other \
+                 content. Change `revision` on every edit of the declared block"
+            ),
+        }
+        self.declared
+            .lock()
+            .expect("control plane mutex poisoned")
+            .settled = Some(declared_identity(declared));
+        Ok(outcome)
+    }
+
+    /// A tenant the file stopped declaring may still hold keys an admin
+    /// minted. Keys are not declared rows, so the reconcile leaves them; say
+    /// so, since they now authenticate a tenant with no policy row.
+    fn warn_live_keys_of_removed_tenants(&self, removed: &[TenantId]) {
+        if removed.is_empty() {
+            return;
+        }
+        let keys = self.list_keys();
+        for tenant in removed {
+            let live = keys
+                .iter()
+                .filter(|key| &key.tenant == tenant && !key.revoked)
+                .count();
+            if live > 0 {
+                tracing::warn!(
+                    tenant = %tenant.as_str(),
+                    live_keys = live,
+                    "declared tenant policy: the file no longer declares this tenant, so its \
+                     tenant row was removed, but it still has live keys. Revoke them with \
+                     DELETE /tenants/{{id}}"
+                );
+            }
+        }
+    }
+
+    /// Warns when an admin clear or delete removes a row this replica's file
+    /// declares: the next reconcile writes the file value back.
+    fn warn_if_declared(&self, tenant: &TenantId, kind: RowKind) {
+        let Some(policy) = self.declared_policy() else {
+            return;
+        };
+        let Some(entry) = policy.tenant(tenant) else {
+            return;
+        };
+        let declared = match kind {
+            RowKind::Tenant => true,
+            RowKind::Policy => entry.policy.is_some(),
+            RowKind::Budget => entry.budget.is_some(),
+            RowKind::ScopedBudgets => !entry.scoped_budgets.is_empty(),
+            RowKind::Limits => entry.limits.is_some(),
+        };
+        if declared {
+            let (field, dialect_field) = declared_row_paths(tenant, kind);
+            tracing::warn!(
+                %field,
+                %dialect_field,
+                tenant = %tenant.as_str(),
+                "admin: removed a row the config file declares; the next reconcile (restart or \
+                 SIGHUP that changes the block) writes the file value back. Remove the entry \
+                 from the file to remove it for good"
+            );
+        }
+    }
+
+    /// Hands every admin-owned row of `tenant` back to the config file and
+    /// reconciles at once, so the rows take the file's values, and a row the
+    /// file does not declare for the tenant is removed. Refused when this
+    /// replica's config does not declare the tenant: there would be no file
+    /// value to take, and the reconcile would delete the tenant.
+    pub fn hand_back_to_file(&self, tenant: &TenantId) -> Result<HandBack, HandBackError> {
+        let Some(policy) = self
+            .declared_policy()
+            .filter(|policy| policy.tenant(tenant).is_some())
+        else {
+            return Err(HandBackError::NotDeclared);
+        };
+        let kinds = self.store.hand_back_to_file(tenant)?;
+        let outcome = self.reconcile_declared_now(&policy)?;
+        // The hand-back moved the generation even when the reconcile then
+        // had nothing to change, so republish here as any admin write does.
+        self.apply_write()?;
+        Ok(HandBack { kinds, outcome })
     }
 
     /// Creates or replaces `rec`'s credential row -- keyed
@@ -6046,6 +6948,34 @@ impl Drop for ControlPlane {
 /// to it) is gone, which is this thread's own signal to return -- see
 /// [`ControlPlane::start_policy_poller`]'s doc for why it cannot hold a
 /// strong `Arc` itself.
+/// The body of the thread [`ControlPlane::declare`] starts: reconciles the
+/// wanted policy until no newer one arrived while it ran. Stops on a failed
+/// reconcile, which the policy poller retries.
+fn run_declared_reconciler(control: Weak<ControlPlane>) {
+    loop {
+        let Some(cp) = control.upgrade() else {
+            return;
+        };
+        let wanted = cp
+            .declared
+            .lock()
+            .expect("control plane mutex poisoned")
+            .wanted
+            .clone();
+        let reconciled = match &wanted {
+            Some(policy) => cp.reconcile_declared_now(policy).is_ok(),
+            None => true,
+        };
+        let mut state = cp.declared.lock().expect("control plane mutex poisoned");
+        let newer = state.wanted.as_deref().map(declared_identity)
+            != wanted.as_deref().map(declared_identity);
+        if !reconciled || !newer {
+            state.running = false;
+            return;
+        }
+    }
+}
+
 fn run_policy_poller(control: Weak<ControlPlane>, shutdown: Arc<PollShutdown>, interval: Duration) {
     // AGENTS.md "Fail-open controls": a control that degrades must be loud, but a poller
     // ticking every tens of seconds must not re-warn every tick while the
@@ -6090,6 +7020,7 @@ fn run_policy_poller(control: Weak<ControlPlane>, shutdown: Arc<PollShutdown>, i
             let bound = interval + interval / 4;
             let polled = cp.poll_once();
             cp.publish_snapshot_age();
+            cp.retry_declared();
             match polled {
                 Ok(_rebuilt) => {
                     if announced_expiry {
@@ -9373,7 +10304,7 @@ mod tests {
             let txn = store.db.begin_write().unwrap();
             {
                 let mut table = txn.open_table(LIMITS_TABLE).unwrap();
-                table.insert("tenant-a", br#"{"schema_version":3,"tokens_per_minute":5,"requests_per_minute":null,"concurrent_streams":null}"#.as_slice()).unwrap();
+                table.insert("tenant-a", br#"{"schema_version":4,"tokens_per_minute":5,"requests_per_minute":null,"concurrent_streams":null}"#.as_slice()).unwrap();
             }
             txn.commit().unwrap();
         }

@@ -48,6 +48,51 @@ surfaces that an upgrade within 1.x keeps stable.
   skipped because the retry goes to another member. Route metadata
   `io.llmproxy.retry: { retry_on_per_try_timeout: true }` retries a per-try
   timeout without the `reset` trigger.
+- Tenant policy in the config file
+  ([docs](docs/site/src/content/docs/operations/config-reload.md#declare-tenant-policy-in-the-config-file)):
+  - New block `auth.declared_policy` (Envoy mode: `declared_policy`, field 11 of
+    `llmproxy.filters.v0.Authentication`). It has a required `revision` (1 or
+    more) and a list of `tenants`. Each tenant has an `id` and any of `policy`,
+    `budget`, `scoped_budgets` and `limits`. Each block has the body of the
+    matching admin `PUT`. A scoped budget names `providers` entries of the
+    config file.
+  - At start the proxy writes the block to the store before it serves. A store
+    that cannot take it fails the start. A `SIGHUP` (or xDS update) that
+    changes the block starts the same write in the background after the new
+    config is published. Request workers never wait for it. The policy poller
+    retries a write that failed. An unchanged block is not written again.
+    Removing the whole block leaves the stored rows as they are. Declare
+    `tenants: []` with a higher `revision` to remove every file row.
+  - Each stored row records who wrote it. The file creates, updates and deletes
+    only its own rows. An admin write makes the row admin-owned: the file
+    leaves it, and each reconcile logs one warning for it that names
+    `auth.declared_policy.tenants[<id>].<field>`. Rows stored before this
+    release count as admin-owned. An admin clear of a declared row is allowed
+    and logs a warning. The next reconcile writes the file value back.
+  - New route `DELETE /tenants/{id}/override`, also
+    `/chains/{stat_prefix}/tenants/{id}/override`. It gives the admin-owned rows
+    of a tenant back to the file and reconciles at once. It answers `200` with
+    `tenant`, `handed_back` and `reconcile`, or `409` when this replica's config
+    does not declare the tenant.
+  - Replicas that share a store order their files by `revision`. The store
+    keeps the last applied revision and digest. A lower revision, or the same
+    revision with other content, is not applied and logs an error. Raise
+    `revision` on every edit.
+  - Removing a tenant from the block does not remove its keys, because keys are
+    not declared. The proxy warns when the tenant still has live keys. A change
+    to `auth.keys` is still refused on `SIGHUP`.
+  - Strict config: an unknown field fails with its full dotted path, at load
+    and on `SIGHUP`. A declared row whose control is off
+    (`auth.enforce.model_policy`, `spend` or `limits` set to `false`) is a load
+    error.
+  - **Downgrade:** a store that holds a row written by the file cannot be read
+    by an older build. The row versions are 2 (model policy), 3 (tenant
+    budget), 4 (scoped budgets) and 3 (limits). The older build fails to load
+    the store and says so. Before a downgrade, remove the tenants from
+    `auth.declared_policy` and reload so the proxy removes the file rows, or
+    write each row with the admin API to make it admin-owned. A store with no
+    file row stays readable. Redis adds the keys `{ns}:tenant_sources` and
+    `{ns}:declared_policy`. The embedded store adds the table `declared_policy`.
 
 ### Changed
 

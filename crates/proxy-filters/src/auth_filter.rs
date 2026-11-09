@@ -93,6 +93,8 @@ use crate::jwt_auth::{JwkRsaKey, JwtAuthenticator, JwtKeySet, JwtValidationConfi
 use crate::tenant_credential_crypto::{CredentialKek, KekError, KeyRing};
 use crate::window_counter::LeaseStore;
 
+mod declared_policy;
+
 /// Type URL this filter is registered under.
 pub const TYPE_URL: &str = "type.llmproxy.dev/llmproxy.filters.v0.Authentication";
 
@@ -590,6 +592,10 @@ struct AuthConfig {
     /// `typed_config.chargeback_tags`; `None` attributes no tags. Not a boot
     /// input: each chain build applies its own, so a reload changes it.
     tag_policy: Option<proxy_observability::chargeback::TagPolicy>,
+    /// `typed_config.declared_policy`, or `None` when unset. Not a boot
+    /// input: every build hands it to the running control plane, which
+    /// reconciles a changed one, so a reload applies it.
+    declared: Option<Arc<proxy_control::declared::DeclaredPolicy>>,
 }
 
 /// The singleton key under which each chain records the [`BootInputs`] its
@@ -704,6 +710,46 @@ pub fn check_reload(
         return Ok(());
     };
     reloaded.refusal(&running).map_or(Ok(()), Err)
+}
+
+/// A reloaded chain's declared policy, ready to hand to the chain's running
+/// [`ControlPlane`] once the snapshot that carries it is published.
+///
+/// A reload does not rebuild a chain until the chain next serves, so the
+/// build-time [`ControlPlane::declare`] alone would leave a quiet replica on
+/// the old file. The reload and xDS paths take one of these before they
+/// publish and apply it after, so a refused snapshot reconciles nothing.
+#[must_use = "a prepared declaration does nothing until `apply` is called"]
+pub struct PendingDeclare {
+    control_plane: Arc<ControlPlane>,
+    declared: Option<Arc<proxy_control::declared::DeclaredPolicy>>,
+}
+
+impl PendingDeclare {
+    /// Hands the policy over. Returns at once; see [`ControlPlane::declare`].
+    pub fn apply(self) {
+        self.control_plane.declare(self.declared);
+    }
+}
+
+/// The [`PendingDeclare`] for the chain `scope`, or `None` when that chain
+/// has no running control plane yet (its first build reconciles instead).
+pub fn prepare_declare(
+    config: &DynamicMessage,
+    scope: &str,
+    shared: &proxy_http::filter::SharedFactoryState,
+) -> Result<Option<PendingDeclare>, ConfigError> {
+    let declared = declared_policy::parse(config)?.map(Arc::new);
+    let Some(control_plane) = shared
+        .get(scope, TYPE_URL)
+        .and_then(|any| any.downcast::<ControlPlane>().ok())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PendingDeclare {
+        control_plane,
+        declared,
+    }))
 }
 
 /// One parsed `typed_config.jwt_providers[i]` -- the pieces
@@ -1242,6 +1288,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
     let jwt_providers = parse_jwt_providers(config)?;
     let tag_policy = crate::chargeback_tags::parse_policy(config)?;
     check_claim_tags(&jwt_providers, tag_policy.as_ref())?;
+    let declared = declared_policy::parse(config)?.map(Arc::new);
     Ok(AuthConfig {
         secret_bytes,
         bootstrap_keys: key_set,
@@ -1252,6 +1299,7 @@ fn parse_config(config: &DynamicMessage) -> Result<AuthConfig, ConfigError> {
         credential_ring,
         boot_inputs,
         tag_policy,
+        declared,
     })
 }
 
@@ -1340,6 +1388,7 @@ impl HttpFilterFactory for AuthFilterFactory {
             credential_ring,
             boot_inputs,
             tag_policy,
+            declared,
         } = parse_config(config)?;
 
         // A reload is refused before publish when these differ (see
@@ -1498,6 +1547,20 @@ impl HttpFilterFactory for AuthFilterFactory {
                     Some(leases) => cp.with_lease_store(leases),
                     None => cp,
                 };
+                // The first build reconciles the declared policy here, before
+                // any worker serves, so declared rows are enforced from the
+                // first request. A store that cannot apply it fails the start
+                // like a store that cannot load: a declared cap must never be
+                // silently missing. A refused revision is logged and serving
+                // continues, since the store then holds a newer file's rows.
+                if let Some(policy) = &declared {
+                    cp.reconcile_declared_now(policy).map_err(|e| {
+                        invalid(
+                            "typed_config.declared_policy",
+                            format!("the declared tenant policy could not be applied: {e}"),
+                        )
+                    })?;
+                }
                 // Start the policy poller HERE, not in `main.rs` --
                 // `main.rs` never holds a `ControlPlane` handle at all (this
                 // `get_or_try_init` closure is the one place a fresh
@@ -1522,6 +1585,9 @@ impl HttpFilterFactory for AuthFilterFactory {
         ctx.get_or_try_init(BOOT_INPUTS_KEY, || {
             Ok(Arc::new(boot_inputs) as Arc<dyn std::any::Any + Send + Sync>)
         })?;
+        // Every build, the first included: a reload that changed the block
+        // starts a reconcile off this thread; an unchanged one does nothing.
+        control_plane.declare(declared);
         // The chain's rate card lives in this store. If the usage filter was
         // built before this one (the lowering does not fix their relative
         // order), it could not find the store, so link it from this side.
@@ -1832,6 +1898,7 @@ mod tests {
     use crate::control::test_snapshot_handle;
 
     mod chargeback;
+    mod declared_policy;
     use proxy_http::filter::SharedFactoryState;
 
     // --- config-message scaffolding ------------------------------------------

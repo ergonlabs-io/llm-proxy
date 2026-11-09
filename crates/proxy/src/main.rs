@@ -1732,6 +1732,7 @@ async fn apply_ads_snapshot(
         let _ = reply.send(Err(detail));
         return None;
     }
+    let declares = proxy_core::listener::pending_declares(&snapshot, factory_state);
     let applied = apply_snapshot(
         snapshot,
         OnClusterRejection::RefuseSnapshot,
@@ -1742,7 +1743,12 @@ async fn apply_ads_snapshot(
     )
     .await;
     let (outcome, version) = match applied {
-        Ok((version, _)) => (Ok(()), Some(version)),
+        Ok((version, _)) => {
+            for declare in declares {
+                declare.apply();
+            }
+            (Ok(()), Some(version))
+        }
         Err(rejected) => {
             let detail = cluster_rejection_detail(&rejected);
             tracing::error!(
@@ -1882,6 +1888,8 @@ async fn reload(
     // the success log line further down can still report them.
     let listeners = snapshot.listeners.len();
     let clusters = snapshot.clusters.len();
+    // Applied only after the snapshot is published: see `PendingDeclare`.
+    let declares = proxy_core::listener::pending_declares(&snapshot, factory_state);
 
     let applied = apply_snapshot(
         snapshot,
@@ -1921,6 +1929,9 @@ async fn reload(
         rejected_clusters = rejected.len(),
         "SIGHUP: config reload succeeded"
     );
+    for declare in declares {
+        declare.apply();
+    }
     Some(version)
 }
 

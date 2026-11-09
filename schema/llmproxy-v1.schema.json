@@ -359,6 +359,10 @@
           "description": "JWT/OIDC providers (ADR-0014). A `Bearer` value that is not a virtual key (`llmp_...`) is verified against the first entry whose `issuer` equals the token's `iss`. Only RS256 tokens with a `kid` header are accepted, with 60 seconds of clock skew. A token that is expired, not yet valid, wrongly signed, for another audience, or carries an unmapped tenant claim value gets 401. A verified token is admitted as the tenant its `tenant.values` entry names, and the user `jwt:<issuer>:<tenant>:<user claim>`. That tenant's model policy, budget, limits and object ownership apply exactly as for a virtual key; a token carries no grants of its own, so a mapped tenant with no stored model policy is refused (403) under the default `enforce.tenants_without_policy: deny`. A tenant's stored provider credentials (`tenant_credentials`) apply to its JWT callers exactly as to its virtual keys. May be combined with `keys`; with `jwt` set, `keys` may be empty without a warning.",
           "items": { "$ref": "#/$defs/AuthJwtProvider" }
         },
+        "declared_policy": {
+          "$ref": "#/$defs/DeclaredPolicy",
+          "description": "Tenants, model policies, budgets, scoped budgets and limits declared in this file. The proxy reconciles them into the control-plane store at start and on reload: a declared row is created or updated, and a row this file owned earlier and no longer declares is removed. Rows set through the admin API are never touched. Needs `auth.store` to be `persistent` or `shared` to survive a restart. Absent changes nothing."
+        },
         "chargeback_tags": {
           "$ref": "#/$defs/ChargebackTags",
           "description": "Which chargeback tags a request may carry into its usage record and billing-ledger entry (`tags`), to attribute spend to a project, team or cost centre. Tags come from key metadata (`keys[].tags`, or the admin API's `POST /keys` and `PUT /keys/{id}/tags`) and, with `from_header: true`, from the `x-cost-tags` request header. A JWT caller's tags come from the verified claims its provider maps (`jwt[].claim_tags`) instead of key metadata. A tag key that key metadata or a claim mapping sets is never taken from the header, so a client cannot override the admin or the identity provider. Absent means no tags are attributed and the header is never read. Tags are never a metric label; dropped tags are counted in `envoy_llmproxy_chargeback_tags_dropped_total{reason}`. There is no tag budget."
@@ -576,6 +580,169 @@
           "additionalProperties": { "type": "string", "pattern": "^[A-Za-z0-9_.:/@+-]{1,256}$" },
           "examples": [{ "team": "infra", "project": "search" }]
         }
+      }
+    },
+    "DeclaredPolicy": {
+      "type": "object",
+      "description": "The declared tenants and the revision that orders them across replicas.",
+      "additionalProperties": false,
+      "required": ["revision"],
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Raise it on every edit. Replicas that share a store apply a revision only when it is not lower than the one the store last applied, so a replica still on an older file cannot undo a newer one. The same revision with different content is refused."
+        },
+        "tenants": {
+          "type": "array",
+          "default": [],
+          "description": "The declared tenants, in any order. May be empty, which removes every file-owned row.",
+          "items": { "$ref": "#/$defs/DeclaredTenant" }
+        }
+      }
+    },
+    "DeclaredTenant": {
+      "type": "object",
+      "description": "One declared tenant. Each block present is one stored row; a block left out declares no row, so a file-owned row of that kind is removed.",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The tenant id. Unique in the list, no control characters, and not a reserved id (`default` or `unauthenticated`)."
+        },
+        "policy": { "$ref": "#/$defs/DeclaredModelPolicy" },
+        "budget": { "$ref": "#/$defs/DeclaredBudget" },
+        "scoped_budgets": {
+          "type": "array",
+          "maxItems": 32,
+          "default": [],
+          "description": "Budgets that cover only some models or providers. Names are unique within the tenant.",
+          "items": { "$ref": "#/$defs/DeclaredScopedBudget" }
+        },
+        "limits": { "$ref": "#/$defs/DeclaredLimits" }
+      }
+    },
+    "DeclaredModelPolicy": {
+      "type": "object",
+      "description": "The tenant's model access, as `PUT /tenants/{id}/policy`. Needs `auth.enforce.model_policy: true`.",
+      "additionalProperties": false,
+      "required": ["access"],
+      "properties": {
+        "access": {
+          "description": "`all` grants every model; `{only: [...]}` grants only those patterns (an empty list grants nothing).",
+          "oneOf": [
+            { "type": "string", "const": "all" },
+            { "$ref": "#/$defs/DeclaredOnlyAccess" }
+          ]
+        },
+        "deny": {
+          "type": "array",
+          "default": [],
+          "description": "Patterns refused even when `access` grants them.",
+          "items": { "$ref": "#/$defs/DeclaredModelPattern" }
+        }
+      }
+    },
+    "DeclaredOnlyAccess": {
+      "type": "object",
+      "description": "Grant only these model patterns.",
+      "additionalProperties": false,
+      "required": ["only"],
+      "properties": {
+        "only": {
+          "description": "The model patterns granted. Empty grants nothing.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/DeclaredModelPattern" }
+        }
+      }
+    },
+    "DeclaredModelPattern": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^*]*\\*?$",
+      "description": "An exact model name, or a prefix ending in one `*`.",
+      "examples": ["gpt-4o", "claude-*"]
+    },
+    "DeclaredAmount": {
+      "description": "A USD amount: a quoted decimal string with at most 6 decimal places, or a whole number. An unquoted number with a fraction is an error; quote it.",
+      "oneOf": [
+        { "type": "string", "pattern": "^[0-9]+(\\.[0-9]{1,6})?$" },
+        { "type": "integer", "minimum": 0 }
+      ],
+      "examples": ["500.00", 500]
+    },
+    "DeclaredPeriod": {
+      "type": "string",
+      "enum": ["daily", "weekly", "monthly"],
+      "description": "How often the budget resets."
+    },
+    "DeclaredCredentialSource": {
+      "type": "string",
+      "enum": ["platform", "tenant"],
+      "description": "Whose provider credentials the budget covers. Absent means `platform`."
+    },
+    "DeclaredBudget": {
+      "type": "object",
+      "description": "The tenant's spend budget, as `PUT /tenants/{id}/budget`. Needs `auth.enforce.spend: true`.",
+      "additionalProperties": false,
+      "required": ["max_usd", "period"],
+      "properties": {
+        "max_usd": { "$ref": "#/$defs/DeclaredAmount" },
+        "period": { "$ref": "#/$defs/DeclaredPeriod" },
+        "credential_source": { "$ref": "#/$defs/DeclaredCredentialSource" }
+      }
+    },
+    "DeclaredScopedBudget": {
+      "type": "object",
+      "description": "A budget that covers only the models or providers it names, as an entry of `PUT /tenants/{id}/scoped_budgets`. Needs `auth.enforce.spend: true`, and at least one of `models` and `providers`.",
+      "additionalProperties": false,
+      "required": ["name", "max_usd", "period"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "description": "Unique within the tenant."
+        },
+        "max_usd": { "$ref": "#/$defs/DeclaredAmount" },
+        "period": { "$ref": "#/$defs/DeclaredPeriod" },
+        "credential_source": { "$ref": "#/$defs/DeclaredCredentialSource" },
+        "models": {
+          "type": "array",
+          "maxItems": 64,
+          "default": [],
+          "description": "Model patterns the budget covers.",
+          "items": { "$ref": "#/$defs/DeclaredModelPattern" }
+        },
+        "providers": {
+          "type": "array",
+          "maxItems": 64,
+          "default": [],
+          "description": "Names of entries in the top-level `providers` map. Requests served by one of them count against the budget, after fallback.",
+          "items": { "type": "string" }
+        },
+        "alert_at_percent": {
+          "type": "array",
+          "default": [],
+          "uniqueItems": true,
+          "description": "Percentages of the budget at which to raise an alert.",
+          "items": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }
+      }
+    },
+    "DeclaredLimits": {
+      "type": "object",
+      "description": "The tenant's rate limits, as `PUT /tenants/{id}/limits`. Needs `auth.enforce.limits: true` and at least one field. An unset field sets no limit; zero refuses all traffic on that counter.",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "tokens_per_minute": { "description": "Tokens per minute.", "type": "integer", "minimum": 0 },
+        "requests_per_minute": { "description": "Requests per minute.", "type": "integer", "minimum": 0 },
+        "tokens_per_day": { "description": "Tokens per UTC calendar day, counted beside `tokens_per_minute`.", "type": "integer", "minimum": 0 },
+        "requests_per_day": { "description": "Requests per UTC calendar day, counted beside `requests_per_minute`.", "type": "integer", "minimum": 0 },
+        "concurrent_streams": { "description": "Streams open at the same time.", "type": "integer", "minimum": 0, "maximum": 4294967295 }
       }
     },
     "ChargebackTags": {

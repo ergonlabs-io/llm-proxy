@@ -120,6 +120,41 @@ fn object_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             parser_fields::<AllowedTagDef>,
         ),
         (
+            "#/$defs/DeclaredPolicy",
+            "DeclaredPolicyDef",
+            parser_fields::<DeclaredPolicyDef>,
+        ),
+        (
+            "#/$defs/DeclaredTenant",
+            "DeclaredTenantDef",
+            parser_fields::<DeclaredTenantDef>,
+        ),
+        (
+            "#/$defs/DeclaredModelPolicy",
+            "DeclaredModelPolicyDef",
+            parser_fields::<DeclaredModelPolicyDef>,
+        ),
+        (
+            "#/$defs/DeclaredOnlyAccess",
+            "DeclaredOnlyAccess",
+            parser_fields::<DeclaredOnlyAccess>,
+        ),
+        (
+            "#/$defs/DeclaredBudget",
+            "DeclaredBudgetDef",
+            parser_fields::<DeclaredBudgetDef>,
+        ),
+        (
+            "#/$defs/DeclaredScopedBudget",
+            "DeclaredScopedBudgetDef",
+            parser_fields::<DeclaredScopedBudgetDef>,
+        ),
+        (
+            "#/$defs/DeclaredLimits",
+            "DeclaredLimitsDef",
+            parser_fields::<DeclaredLimitsDef>,
+        ),
+        (
             "#/$defs/AuthJwtProvider",
             "JwtProviderDef",
             parser_fields::<JwtProviderDef>,
@@ -259,6 +294,16 @@ fn enum_table() -> Vec<(&'static str, &'static str, FieldProbe)> {
             "#/$defs/AuthEnforce/properties/tenants_without_policy",
             "TenantsWithoutPolicy",
             parser_variants::<TenantsWithoutPolicy>,
+        ),
+        (
+            "#/$defs/DeclaredPeriod",
+            "DeclaredPeriod",
+            parser_variants::<DeclaredPeriod>,
+        ),
+        (
+            "#/$defs/DeclaredCredentialSource",
+            "DeclaredCredentialSource",
+            parser_variants::<DeclaredCredentialSource>,
         ),
         (
             "#/$defs/Provider/properties/type",
@@ -465,6 +510,7 @@ fn every_strict_model_type_is_paired_with_a_schema_location() {
     // Every file of the `model` module, its submodules included.
     let source = [
         include_str!("../src/model.rs"),
+        include_str!("../src/model/declared_policy.rs"),
         include_str!("../src/model/jwt.rs"),
     ]
     .join("\n");

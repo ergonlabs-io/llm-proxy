@@ -3,12 +3,13 @@ title: Admin API
 description: "Use the admin server: readiness, config dump, stats, the web UI, and the bearer-gated write API for keys, tenants, budgets, limits, credentials, and pricing."
 summary: Reference for every route the admin server answers, which routes
   need the admin token, the request body limits, and the status codes.
-lastUpdated: 2026-11-08
+lastUpdated: 2026-11-09
 related:
   - administration/admin-ui
   - authentication/virtual-keys
   - authentication/tenant-provider-credentials
   - limits-and-budgets/spend-policies
+  - operations/config-reload
   - limits-and-budgets/billing-ledger
   - limits-and-budgets/pricing-and-cost-tracking
   - operations/draining-and-shutdown
@@ -271,6 +272,7 @@ for the key model and examples.
 | `/tenants/{id}/scoped_budgets` | PUT | `204` | Replaces the whole list of scoped budgets of a tenant. `{"budgets":[]}` removes them all. See "Scoped budgets". |
 | `/tenants/{id}/scoped_budgets` | GET | `200` | Reads the scoped budgets of a tenant, with the spend of this replica for the current period. See "Scoped budgets". |
 | `/tenants/{id}/limits` | PUT | `204` | Sets or clears the rate limits of a tenant. See "Tenant and key limits". |
+| `/tenants/{id}/override` | DELETE | `200` | Gives the admin-owned rows of a tenant back to the config file. Needs `auth.declared_policy` to declare the tenant. See "Declared tenant policy". |
 | `/tenants/{id}/spend` | GET | `200` | Reads the spend of a tenant. |
 | `/tenants/{id}/trace_export` | PUT, GET | `204`, `200` | Sets or reads the trace-export opt-in of a tenant. Body: `{"schema_version": 1, "enabled": true}`. See [Request and response body export](/docs/llm-proxy/observability/trace-export/). |
 | `/tenants/{id}/objects/{object_id}` | PUT | `204` | Assigns a provider object that no tenant owns to the tenant. No body. See "Object ownership". |
@@ -372,6 +374,36 @@ both. The routes are also available as
 
 See [Scoped budgets](/docs/llm-proxy/limits-and-budgets/spend-policies/#scoped-budgets)
 for the field table, the response, and the effect on requests.
+
+### Declared tenant policy
+
+A tenant can be declared in `auth.declared_policy` in the config file. See
+[Declare tenant policy in the config file](/docs/llm-proxy/operations/config-reload/#declare-tenant-policy-in-the-config-file).
+An admin write to a declared row is allowed. It makes the row admin-owned, and
+the file value is not enforced until you hand the row back.
+
+`DELETE /tenants/{id}/override` hands the rows back. The route is also
+available as `/chains/{stat_prefix}/tenants/{id}/override`. It has no body.
+
+1. The proxy marks every admin-owned row of the tenant as file-owned.
+2. The proxy reconciles the declared block at once, on the calling thread.
+   The rows take the file values.
+3. A row that the file does not declare for the tenant is removed.
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"tenant":"acme","handed_back":["policy"],"reconcile":"applied"}` | `handed_back` lists the rows that were admin-owned. The names are `tenant`, `policy`, `budget`, `scoped_budgets` and `limits`. |
+| `409` | `this replica's config does not declare the tenant in auth.declared_policy (typed_config.declared_policy), so there is no file value to hand its rows to. Nothing was changed.` | This replica has no entry for the tenant. |
+
+The `reconcile` field is `applied`, `stale_revision` or `revision_conflict`.
+With `stale_revision`, the store already applied a newer revision, and the
+file value is not written. With `revision_conflict`, the store applied the
+same revision with other content. In both cases the proxy logs an error. See
+the revision rules in the page linked above.
+
+An admin clear or delete of a declared row is allowed and logs a warning. An
+example is `PUT /tenants/{id}/budget` with the body `{"budget": null}`. The
+next reconcile writes the file value back.
 
 The spend reads answer `503` with `llmproxy.spend_limit is not configured on
 this chain, so there is no spend accumulator to report from` when

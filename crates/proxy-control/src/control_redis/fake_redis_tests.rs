@@ -1225,9 +1225,9 @@ fn deleting_a_tenant_includes_its_limits_and_opt_in_hashes_in_the_atomic_script(
     assert_eq!(sent.len(), 1, "one script call: {sent:?}");
     let args = &sent[0].1;
     assert_eq!(args[0], "EVALSHA");
-    assert_eq!(args[2], "7");
+    assert_eq!(args[2], "8");
     assert_eq!(
-        args[3..10],
+        args[3..11],
         [
             "lanes:tenants",
             "lanes:policies",
@@ -1236,6 +1236,9 @@ fn deleting_a_tenant_includes_its_limits_and_opt_in_hashes_in_the_atomic_script(
             "lanes:tenant_credentials",
             "lanes:trace_export",
             "lanes:generation",
+            // A file-owned tenant's source goes with it, or a later admin
+            // create of the same id would read as file-owned.
+            "lanes:tenant_sources",
         ]
     );
 }
