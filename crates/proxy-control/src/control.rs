@@ -225,10 +225,12 @@ pub struct StoredRateCard {
     pub version: String,
     /// The pricing document, as compact JSON.
     pub card_json: String,
-    /// [`RATE_CARD_SCHEMA_V1`], or [`RATE_CARD_SCHEMA_V2`] for a card that
+    /// [`RATE_CARD_SCHEMA_V1`], [`RATE_CARD_SCHEMA_V2`] for a card that
     /// uses a field added by ADR-0010 (a price basis, modality rates, image
-    /// prices). An older replica skips a v2 row and keeps its last card,
-    /// rather than misreading one (ADR-0010 decision 3, "Mixed fleets").
+    /// prices), or [`RATE_CARD_SCHEMA_V3`] for a card with an entry keyed on
+    /// one cluster. An older replica skips a row newer than it reads and keeps
+    /// its last card, rather than misreading one (ADR-0010 decision 3,
+    /// "Mixed fleets").
     pub schema_version: u16,
 }
 
@@ -236,6 +238,9 @@ pub struct StoredRateCard {
 pub const RATE_CARD_SCHEMA_V1: u16 = 1;
 /// A rate card that uses a field added by ADR-0010.
 pub const RATE_CARD_SCHEMA_V2: u16 = 2;
+/// A rate card with an entry keyed on one dialled cluster rather than only on
+/// a provider type.
+pub const RATE_CARD_SCHEMA_V3: u16 = 3;
 
 // Rust note: hand-written, not derived. A derived `Debug` would print the
 // whole document, which for the shipped OpenRouter card is a quarter of a
@@ -2572,7 +2577,7 @@ pub(crate) fn decode_tenant_credential_row(
 
 /// The newest rate card row version this build understands; it reads every
 /// version from [`RATE_CARD_SCHEMA_V1`] up to this one.
-pub(crate) const RATE_CARD_SCHEMA_VERSION: u16 = RATE_CARD_SCHEMA_V2;
+pub(crate) const RATE_CARD_SCHEMA_VERSION: u16 = RATE_CARD_SCHEMA_V3;
 
 /// One `rate_cards` row as the persistent stores keep it. The chain is the
 /// table key (redb) or hash field (Redis), so it is not repeated in the value,
@@ -11956,6 +11961,31 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Every rate-card schema version this build writes, the cluster-keyed
+    /// version 3 included, loads back. A version this build cannot read is
+    /// skipped instead (`redb_a_rate_card_row_this_build_cannot_read_...`).
+    #[test]
+    fn redb_loads_a_rate_card_row_at_every_schema_version_it_writes() {
+        let store = RedbControlPlaneStore::in_memory();
+        let cards: Vec<StoredRateCard> = [
+            crate::control::RATE_CARD_SCHEMA_V1,
+            crate::control::RATE_CARD_SCHEMA_V2,
+            crate::control::RATE_CARD_SCHEMA_V3,
+        ]
+        .into_iter()
+        .map(|schema_version| StoredRateCard {
+            schema_version,
+            ..rate_card(&format!("chain-{schema_version}"), "card")
+        })
+        .collect();
+        for card in &cards {
+            store.put_rate_card(card).unwrap();
+        }
+        let mut loaded = store.load().unwrap().rate_cards;
+        loaded.sort_by(|a, b| a.chain.cmp(&b.chain));
+        assert_eq!(loaded, cards);
+    }
+
     #[test]
     fn redb_opens_a_database_file_created_before_the_rate_cards_table_existed() {
         let path = temp_db_path("pre-rate-cards-table");
@@ -12016,8 +12046,12 @@ mod tests {
 
         // Written raw, bypassing `put_rate_card`: a hand-edited row, and the
         // shape of one a NEWER build would write (one past
-        // `RATE_CARD_SCHEMA_VERSION`, which is 2).
-        let future = br#"{"schema_version":3,"version":"v9","card":"FUTURE-CARD-CONTENT"}"#;
+        // `RATE_CARD_SCHEMA_VERSION`).
+        let future = format!(
+            r#"{{"schema_version":{},"version":"v9","card":"FUTURE-CARD-CONTENT"}}"#,
+            RATE_CARD_SCHEMA_VERSION + 1
+        );
+        let future = future.as_bytes();
         {
             let txn = store.db.begin_write().unwrap();
             {
@@ -12025,7 +12059,7 @@ mod tests {
                 table
                     .insert("chain-garbage", b"GARBAGE-ROW-CONTENT".as_slice())
                     .unwrap();
-                table.insert("chain-future", future.as_slice()).unwrap();
+                table.insert("chain-future", future).unwrap();
             }
             txn.commit().unwrap();
         }

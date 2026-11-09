@@ -721,11 +721,11 @@ fn lower_pricing(
                     reason: error.inner().to_string(),
                 }
             })?;
-            validate_price_list(&list)?;
+            validate_price_list(config, &list)?;
             Ok(Some(price_list_filter_config(config, &list)))
         }
         (None, Some(list)) => {
-            validate_price_list(list)?;
+            validate_price_list(config, list)?;
             Ok(Some(price_list_filter_config(config, list)))
         }
         (None, None) => Err(ConfigError::InvalidValue {
@@ -748,10 +748,26 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
         .entries
         .iter()
         .map(|entry| {
+            // A `provider` entry prices the one cluster the router dials for
+            // that provider, at the type the providers map gives it, so the
+            // price stays on the cluster (AGENTS.md invariant 6).
+            let (provider_type, cluster) = match &entry.provider {
+                Some(name) => {
+                    let provider = config
+                        .providers
+                        .get(name)
+                        .expect("validate_price_list checked the provider exists");
+                    (
+                        provider.effective_type(name).as_str().to_string(),
+                        Some(format!("provider:{name}")),
+                    )
+                }
+                None => (entry.provider_type.clone(), None),
+            };
             let mut value = json!({
                 "cached_input_unpriced": entry.cached_input_unpriced,
                 "cache_write_unpriced": entry.cache_write_unpriced,
-                "provider_type": entry.provider_type,
+                "provider_type": provider_type,
                 "model": entry.model,
             });
             // Rust note: `as_object_mut` borrows the JSON map so keys can be
@@ -759,6 +775,9 @@ fn price_list_filter_config(config: &SimpleConfig, list: &PriceListDef) -> Value
             // an existing token card lowers to byte-identical JSON, and its
             // version hash does not change across an upgrade.
             let object = value.as_object_mut().expect("json! object");
+            if let Some(cluster) = cluster {
+                object.insert("cluster".into(), json!(cluster));
+            }
             if entry.basis == Some(PriceBasisDef::Images) {
                 object.insert("basis".into(), json!("images"));
                 object.insert(
@@ -875,7 +894,7 @@ fn pricing_file_path(path: &str) -> String {
     }
 }
 
-fn validate_price_list(list: &PriceListDef) -> Result<(), ConfigError> {
+fn validate_price_list(config: &SimpleConfig, list: &PriceListDef) -> Result<(), ConfigError> {
     chrono::DateTime::parse_from_rfc3339(&list.effective_from).map_err(|error| {
         ConfigError::InvalidValue {
             field_path: "pricing.price_list.effective_from".into(),
@@ -889,13 +908,30 @@ fn validate_price_list(list: &PriceListDef) -> Result<(), ConfigError> {
         });
     }
     let mut seen = HashMap::new();
+    let mut seen_provider = HashMap::new();
     for (entry_index, entry) in list.entries.iter().enumerate() {
         let path = format!("pricing.price_list.entries[{entry_index}]");
-        if entry.provider_type.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field_path: format!("{path}.provider_type"),
-                reason: "must not be empty".into(),
-            });
+        match &entry.provider {
+            Some(_) if !entry.provider_type.is_empty() => {
+                return Err(invalid(
+                    format!("{path}.provider"),
+                    "set provider_type or provider, not both",
+                ));
+            }
+            Some(name) if !config.providers.contains_key(name) => {
+                return Err(invalid(
+                    format!("{path}.provider"),
+                    format!("names `{name}`, which is not in providers"),
+                ));
+            }
+            Some(_) => {}
+            None if entry.provider_type.is_empty() => {
+                return Err(invalid(
+                    format!("{path}.provider_type"),
+                    "must not be empty; set provider_type, or provider to price one provider",
+                ));
+            }
+            None => {}
         }
         if entry.model.is_empty() {
             return Err(ConfigError::InvalidValue {
@@ -903,10 +939,18 @@ fn validate_price_list(list: &PriceListDef) -> Result<(), ConfigError> {
                 reason: "must not be empty".into(),
             });
         }
-        if let Some(first) = seen.insert((&entry.provider_type, &entry.model), entry_index) {
+        let first = match &entry.provider {
+            Some(name) => seen_provider
+                .insert((name, &entry.model), entry_index)
+                .map(|first| ("provider", first)),
+            None => seen
+                .insert((&entry.provider_type, &entry.model), entry_index)
+                .map(|first| ("provider_type", first)),
+        };
+        if let Some((key, first)) = first {
             return Err(ConfigError::InvalidValue {
                 field_path: format!("{path}.model"),
-                reason: format!("duplicate (provider_type, model), first used at entries[{first}]"),
+                reason: format!("duplicate ({key}, model), first used at entries[{first}]"),
             });
         }
         let basis = entry.basis.unwrap_or(PriceBasisDef::Tokens);

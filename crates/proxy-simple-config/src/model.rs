@@ -1465,7 +1465,15 @@ pub struct PriceEntryDef {
     pub cached_input_unpriced: bool,
     #[serde(default)]
     pub cache_write_unpriced: bool,
+    /// The provider type the entry prices. Empty when unset; an entry sets
+    /// this or `provider`.
+    #[serde(default)]
     pub provider_type: String,
+    /// One provider, by its name in `providers`, that the entry prices instead
+    /// of every provider of its type. Wins over a `provider_type` entry for
+    /// the same model.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub model: String,
     /// Required even for a one-tier entry: a later edit adding tiers must not
     /// change money semantics by guessing a default.

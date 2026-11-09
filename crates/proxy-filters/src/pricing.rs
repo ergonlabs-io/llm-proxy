@@ -96,6 +96,13 @@ pub struct PriceEntry {
     pub cached_input_unpriced: bool,
     pub cache_write_unpriced: bool,
     pub provider_type: String,
+    /// The one dialled cluster this entry prices, when the operator priced a
+    /// provider rather than every provider of its type. Such an entry wins
+    /// over the type entry for the same model, and a type lookup never
+    /// matches it: two providers of one type that serve the same upstream
+    /// model can then charge different prices, each on the cluster that
+    /// served (AGENTS.md invariant 6 and "Policy Domains").
+    pub cluster: Option<String>,
     pub model: String,
     pub tier_basis: TierBasis,
     pub tier_mode: TierMode,
@@ -167,9 +174,19 @@ impl PriceList {
         cluster_providers: BTreeMap<String, String>,
     ) -> Self {
         let mut canonical: Vec<&PriceEntry> = entries.iter().collect();
+        // Rust note: `None` sorts before `Some`, so a card with no cluster
+        // entries sorts exactly as it did before they existed.
         canonical.sort_by(|a, b| {
-            (a.provider_type.as_str(), a.model.as_str())
-                .cmp(&(b.provider_type.as_str(), b.model.as_str()))
+            (
+                a.provider_type.as_str(),
+                a.model.as_str(),
+                a.cluster.as_deref(),
+            )
+                .cmp(&(
+                    b.provider_type.as_str(),
+                    b.model.as_str(),
+                    b.cluster.as_deref(),
+                ))
         });
         let mut bytes = Vec::new();
         for e in canonical {
@@ -216,6 +233,12 @@ impl PriceList {
                     push_option_u64(&mut bytes, e.nanodollars_per_second);
                 }
             }
+            // The cluster key, only when set, so a card keyed on provider
+            // types alone keeps its version. 0xfb follows the scheme above.
+            if let Some(cluster) = &e.cluster {
+                bytes.push(0xfb);
+                push_option_str(&mut bytes, Some(cluster));
+            }
             bytes.push(0xff);
         }
         // The provider map, after the entries. 0xfd and 0xfe are never part of
@@ -253,6 +276,13 @@ impl PriceList {
         self.entries.iter().any(PriceEntry::uses_media_fields)
     }
 
+    /// Whether any entry is keyed on one cluster. A stored card that has one is
+    /// written at rate-card schema version 3, so an older replica skips it
+    /// instead of charging every provider of the type one provider's price.
+    pub fn uses_cluster_keys(&self) -> bool {
+        self.entries.iter().any(|entry| entry.cluster.is_some())
+    }
+
     pub fn cluster_providers(&self) -> &BTreeMap<String, String> {
         &self.cluster_providers
     }
@@ -275,10 +305,23 @@ impl PriceList {
     pub fn entries(&self) -> &[PriceEntry] {
         &self.entries
     }
+    /// The type entry for `(provider_type, model)`. Never an entry keyed on
+    /// one cluster, which prices only that cluster.
     pub fn lookup(&self, provider_type: &str, model: &str) -> Option<&PriceEntry> {
+        self.entries.iter().find(|entry| {
+            entry.cluster.is_none() && entry.provider_type == provider_type && entry.model == model
+        })
+    }
+
+    /// The entry that prices `model` on the dialled `cluster`: the cluster's
+    /// own entry, else the entry for the provider type the map gives it.
+    /// `None` also covers a cluster the map does not name.
+    pub fn lookup_for_cluster(&self, cluster: &str, model: &str) -> Option<&PriceEntry> {
+        let provider_type = self.provider_for(cluster)?;
         self.entries
             .iter()
-            .find(|entry| entry.provider_type == provider_type && entry.model == model)
+            .find(|entry| entry.cluster.as_deref() == Some(cluster) && entry.model == model)
+            .or_else(|| self.lookup(provider_type, model))
     }
 
     /// The model to price a request at, and whether that is the served model.
@@ -296,23 +339,23 @@ impl PriceList {
         served: Option<&'a str>,
         usage: &LlmUsage,
     ) -> (&'a str, bool) {
-        if let (Some(served), Some(provider)) = (served, self.provider_for(cluster)) {
-            if served != base && self.price(provider, served, usage).is_some() {
+        if let Some(served) = served {
+            if served != base && self.price_for_cluster(cluster, served, usage).is_some() {
                 return (served, true);
             }
         }
         (base, false)
     }
 
-    /// As [`Self::price`], for the cluster a request actually dialled. `None`
-    /// also covers a cluster the card's map does not name.
+    /// As [`Self::price`], for the cluster a request actually dialled, at the
+    /// entry [`Self::lookup_for_cluster`] picks.
     pub fn price_for_cluster(
         &self,
         cluster: &str,
         model: &str,
         usage: &LlmUsage,
     ) -> Option<Priced> {
-        self.price(self.provider_for(cluster)?, model, usage)
+        price_entry(self.lookup_for_cluster(cluster, model)?, usage)
     }
 
     /// As [`Self::list_cost_nanodollars`], for the cluster a request actually
@@ -348,52 +391,55 @@ impl PriceList {
     /// a request is unpriced, exactly like an unpriced model (ADR-0010
     /// decision 3).
     pub fn price(&self, provider_type: &str, model: &str, usage: &LlmUsage) -> Option<Priced> {
-        let entry = self.lookup(provider_type, model)?;
-        match entry.basis {
-            PriceBasis::Tokens => {
-                let tokens = usage.tokens?;
-                if entry.cached_input_unpriced && tokens.cached_tokens > 0
-                    || entry.cache_write_unpriced && tokens.cache_creation_tokens > 0
-                {
-                    return None;
-                }
-                Some(Priced {
-                    nanodollars: list_cost_nanodollars(entry, &tokens),
-                    basis: PriceBasis::Tokens,
-                    underpriced_modality: underpriced_modality(entry, &tokens),
-                })
+        price_entry(self.lookup(provider_type, model)?, usage)
+    }
+}
+
+fn price_entry(entry: &PriceEntry, usage: &LlmUsage) -> Option<Priced> {
+    match entry.basis {
+        PriceBasis::Tokens => {
+            let tokens = usage.tokens?;
+            if entry.cached_input_unpriced && tokens.cached_tokens > 0
+                || entry.cache_write_unpriced && tokens.cache_creation_tokens > 0
+            {
+                return None;
             }
-            PriceBasis::Images => {
-                let images = usage.meters.images?;
-                let row = image_price(
-                    &entry.image_prices,
-                    usage.meters.image_size.as_deref(),
-                    usage.meters.image_quality.as_deref(),
-                )?;
-                Some(Priced {
-                    nanodollars: images.saturating_mul(row.nanodollars_per_image),
-                    basis: PriceBasis::Images,
-                    underpriced_modality: false,
-                })
-            }
-            PriceBasis::Characters => {
-                let characters = usage.meters.input_characters?;
-                Some(Priced {
-                    nanodollars: characters.saturating_mul(entry.nanodollars_per_character?),
-                    basis: PriceBasis::Characters,
-                    underpriced_modality: false,
-                })
-            }
-            PriceBasis::AudioSeconds => {
-                let milliseconds = usage.meters.audio_milliseconds?;
-                Some(Priced {
-                    nanodollars: milliseconds
-                        .saturating_mul(entry.nanodollars_per_second?)
-                        .div_ceil(1000),
-                    basis: PriceBasis::AudioSeconds,
-                    underpriced_modality: false,
-                })
-            }
+            Some(Priced {
+                nanodollars: list_cost_nanodollars(entry, &tokens),
+                basis: PriceBasis::Tokens,
+                underpriced_modality: underpriced_modality(entry, &tokens),
+            })
+        }
+        PriceBasis::Images => {
+            let images = usage.meters.images?;
+            let row = image_price(
+                &entry.image_prices,
+                usage.meters.image_size.as_deref(),
+                usage.meters.image_quality.as_deref(),
+            )?;
+            Some(Priced {
+                nanodollars: images.saturating_mul(row.nanodollars_per_image),
+                basis: PriceBasis::Images,
+                underpriced_modality: false,
+            })
+        }
+        PriceBasis::Characters => {
+            let characters = usage.meters.input_characters?;
+            Some(Priced {
+                nanodollars: characters.saturating_mul(entry.nanodollars_per_character?),
+                basis: PriceBasis::Characters,
+                underpriced_modality: false,
+            })
+        }
+        PriceBasis::AudioSeconds => {
+            let milliseconds = usage.meters.audio_milliseconds?;
+            Some(Priced {
+                nanodollars: milliseconds
+                    .saturating_mul(entry.nanodollars_per_second?)
+                    .div_ceil(1000),
+                basis: PriceBasis::AudioSeconds,
+                underpriced_modality: false,
+            })
         }
     }
 }
@@ -644,6 +690,7 @@ mod tests {
             cached_input_unpriced: false,
             cache_write_unpriced: false,
             provider_type: "openai".into(),
+            cluster: None,
             model: "gpt-5".into(),
             tier_basis: TierBasis::InputTokens,
             tier_mode: mode,
@@ -932,5 +979,114 @@ mod tests {
             Some(5)
         );
         assert_eq!(list.list_cost_for_cluster("provider:z", "gpt-5", &u), None);
+    }
+
+    /// An entry with input rate `input` (output 0) for `model`, keyed on
+    /// `cluster` when given, else on provider type `openai-compatible`.
+    fn keyed(cluster: Option<&str>, model: &str, input: u64) -> PriceEntry {
+        PriceEntry {
+            provider_type: "openai-compatible".into(),
+            cluster: cluster.map(str::to_owned),
+            model: model.into(),
+            ..entry(TierMode::WholeRequest, vec![tier(None, input, 0, 0, 0)])
+        }
+    }
+
+    fn two_hosts(entries: Vec<PriceEntry>) -> PriceList {
+        PriceList::new(
+            Some("v1"),
+            SystemTime::UNIX_EPOCH,
+            entries,
+            providers(&[
+                ("provider:a", "openai-compatible"),
+                ("provider:b", "openai-compatible"),
+            ]),
+        )
+    }
+
+    /// Two providers of one type sell one model: the cluster entry prices its
+    /// own cluster, wins over the type entry there, and never reaches the
+    /// other cluster of the same type, which keeps the type's price.
+    #[test]
+    fn a_cluster_entry_wins_on_its_cluster_and_the_type_entry_prices_the_rest() {
+        let list = two_hosts(vec![
+            keyed(None, "open-model", 7),
+            keyed(Some("provider:a"), "open-model", 3),
+        ]);
+        let u = priced(1, 0, 0, 0);
+        assert_eq!(
+            list.list_cost_for_cluster("provider:a", "open-model", &u),
+            Some(3),
+            "the cluster entry, not the type entry (7)"
+        );
+        assert_eq!(
+            list.list_cost_for_cluster("provider:b", "open-model", &u),
+            Some(7),
+            "the type entry, not provider:a's entry (3)"
+        );
+        assert_eq!(
+            list.list_cost_nanodollars("openai-compatible", "open-model", &u),
+            Some(7),
+            "a type lookup never matches a cluster entry"
+        );
+
+        // With no type entry, the other cluster is unpriced rather than
+        // charged a price set for one provider.
+        let only_a = two_hosts(vec![keyed(Some("provider:a"), "open-model", 3)]);
+        assert_eq!(
+            only_a.list_cost_for_cluster("provider:a", "open-model", &u),
+            Some(3)
+        );
+        assert_eq!(
+            only_a.list_cost_for_cluster("provider:b", "open-model", &u),
+            None
+        );
+        assert_eq!(
+            only_a.list_cost_nanodollars("openai-compatible", "open-model", &u),
+            None
+        );
+    }
+
+    /// The served model is repriced only where the dialled cluster has an
+    /// entry for it, its own or its type's.
+    #[test]
+    fn a_served_model_is_repriced_only_on_the_cluster_its_entry_names() {
+        let list = two_hosts(vec![
+            keyed(None, "sent", 7),
+            keyed(Some("provider:a"), "served", 3),
+        ]);
+        let u = priced(1, 0, 0, 0);
+        assert_eq!(
+            list.model_to_price("provider:a", "sent", Some("served"), &u),
+            ("served", true)
+        );
+        assert_eq!(
+            list.model_to_price("provider:b", "sent", Some("served"), &u),
+            ("sent", false)
+        );
+    }
+
+    /// A cluster key is part of what a request costs, so it is part of the
+    /// version; a card without one hashes exactly as before cluster keys
+    /// existed (the pinned hash is the one the code before them computes).
+    #[test]
+    fn the_cluster_key_is_hashed_only_when_set() {
+        let typed = two_hosts(vec![keyed(None, "open-model", 7)]);
+        assert_eq!(typed.version().as_str(), "v1+51d49f290907");
+        let keyed_a = two_hosts(vec![keyed(Some("provider:a"), "open-model", 7)]);
+        let keyed_b = two_hosts(vec![keyed(Some("provider:b"), "open-model", 7)]);
+        assert_ne!(typed.version(), keyed_a.version());
+        assert_ne!(keyed_a.version(), keyed_b.version());
+        assert!(keyed_a.uses_cluster_keys() && !typed.uses_cluster_keys());
+        let both = vec![
+            keyed(Some("provider:a"), "open-model", 3),
+            keyed(None, "open-model", 7),
+        ];
+        let reversed = both.iter().rev().cloned().collect();
+        assert_eq!(
+            two_hosts(both).version(),
+            two_hosts(reversed).version(),
+            "the order the entries were written in is not content"
+        );
     }
 }

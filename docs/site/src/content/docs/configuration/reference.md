@@ -571,7 +571,7 @@ Used at: `pricing.price_list`.
 |---|---|---|---|---|
 | `version` | string | no | none | Human label; recorded version includes a content hash. |
 | `effective_from` | string (date-time) | yes | none | An RFC 3339 date for the list, shown in `GET /pricing`. A list applies from the moment the proxy installs it, not from this date; a date in the future is an error. |
-| `entries` | array of [PriceEntry](#priceentry); minimum items 1 | yes | none | The prices. Each pair of `provider_type` and `model` may appear once; a duplicate pair is a load error. |
+| `entries` | array of [PriceEntry](#priceentry); minimum items 1 | yes | none | The prices. Each pair of `provider_type` and `model` may appear once, and each pair of `provider` and `model` may appear once; a duplicate pair is a load error. |
 
 Any other field is a load error.
 
@@ -744,7 +744,8 @@ Used at: `pricing.price_list.entries[]`.
 | `image_prices` | array of [ImagePrice](#imageprice); minimum items 1 | no | none | Required for `basis: images`, and not allowed otherwise. The most specific matching row prices each image: a row naming both `size` and `quality` first, then one naming one, then one naming neither. A request matches a row when each attribute the row names equals the value in the response, or in the request body when the response does not echo it. Values are plain strings matched exactly. A request that matches no row is unpriced: it costs zero and is logged, like an unpriced model. Two rows of the same specificity that one request could match are a load error: identical `size` and `quality` pairs, or a row naming only `size` beside a row naming only `quality`. |
 | `cached_input_unpriced` | boolean | no | `false` | Requests reporting cached input remain unpriced. |
 | `cache_write_unpriced` | boolean | no | `false` | Requests reporting cache creation remain unpriced. |
-| `provider_type` | string; minimum length 1 | yes | none | The provider type the price applies to, for example `openai` or `anthropic`. Matches the `type` of the provider that served the request, set or inferred from its name. |
+| `provider_type` | string; minimum length 1 | no | none | The provider type the price applies to, for example `openai` or `anthropic`. Matches the `type` of the provider that served the request, set or inferred from its name. Set this or `provider`, not both. |
+| `provider` | string; minimum length 1 | no | none | The name of one provider in `providers`. The entry prices only that provider, so two providers of one type that serve the same model can have different prices, and a request is charged the price of the provider that served it, also after a failover. It wins over a `provider_type` entry for the same model; a provider with no `provider` entry for the model gets the `provider_type` entry. Set this or `provider_type`, not both. |
 | `model` | string; minimum length 1 | yes | none | The model name, matched exactly and case-sensitively against the selected model: the upstream model name for the provider that served the request, or the requested model when no mapping applies. |
 | `tier_mode` | one of `whole_request`, `graduated` | no | none | Required for `basis: tokens`, and not allowed for `images`. How `tiers` price a request. `whole_request`: the band selected by the input context size prices every token of the request. `graduated`: each context token costs the rate of the band that holds its position, and output tokens cost the rate of the band the whole context selects. No default, because the two modes give different prices. |
 | `tiers` | array of [PricingTier](#pricingtier); minimum items 1 | no | none | Required for `basis: tokens`, and not allowed for `images`. The price bands, in increasing `up_to` order; exactly one band, the last, leaves `up_to` out. |
@@ -753,6 +754,7 @@ Any other field is a load error.
 
 Rules:
 
+- Set exactly one of `provider_type`, `provider`.
 - When `basis` is `images`: `image_prices` must be set. None of `tier_mode`, `tiers`, `nanodollars_per_character`, `nanodollars_per_second` is set.
 - When `basis` is `characters`: `nanodollars_per_character` must be set. None of `tier_mode`, `tiers`, `image_prices`, `nanodollars_per_second` is set.
 - When `basis` is `audio_seconds`: `nanodollars_per_second` must be set. None of `tier_mode`, `tiers`, `image_prices`, `nanodollars_per_character` is set.

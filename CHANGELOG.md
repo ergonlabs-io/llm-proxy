@@ -175,6 +175,22 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Fixed
 
+- Pricing: a rate-card entry can price one provider, not only every provider
+  of a type ([docs](docs/site/src/content/docs/limits-and-budgets/pricing-and-cost-tracking.md#price-one-provider)).
+  Before, two providers of one type that served the same model had to share
+  one price, so after a failover between them the fallback's tokens were
+  charged at the price of the one entry for the type. A `--config` entry now
+  sets `provider: <name>` instead of `provider_type`; in the card that
+  `GET /pricing` returns, `PUT /pricing` accepts and Envoy mode configures,
+  the entry carries `cluster`, the dialled cluster it prices. A `provider`
+  entry wins over a `provider_type` entry for the same model. A card with no
+  such entry is unchanged: same JSON, same version hash, same stored schema
+  version.
+  - Stored format: the auth store writes a card with a `cluster` entry at
+    rate-card schema version 3. Version 1.0.0 reads versions 1 and 2 only:
+    it skips such a card with a warning and keeps its last card. Upgrade
+    every replica before you publish one.
+
 - ADS and delta ADS: a response for a type the proxy did not subscribe to is
   dropped with one warning per type, as Envoy does. Before, it closed the
   stream, and the proxy reconnected every 0-500 ms for as long as the control

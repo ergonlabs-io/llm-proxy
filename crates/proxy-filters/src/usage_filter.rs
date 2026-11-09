@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth_filter;
 use crate::control::{
     ControlPlane, RateCardDelivery, StoredRateCard, RATE_CARD_SCHEMA_V1, RATE_CARD_SCHEMA_V2,
+    RATE_CARD_SCHEMA_V3,
 };
 use crate::media_scan::{seconds_to_millis, MediaJsonScanner, MediaSseScanner};
 use crate::pricing::{
@@ -272,9 +273,10 @@ impl PricingRegistry {
         let Some(provider) = pricing.list.provider_for(cluster) else {
             return format!("the rate card's providers map does not name cluster `{cluster}`");
         };
-        let Some(entry) = pricing.list.lookup(provider, model) else {
+        let Some(entry) = pricing.list.lookup_for_cluster(cluster, model) else {
             return format!(
-                "the rate card has no entry for provider type `{provider}` and this model"
+                "the rate card has no entry for provider type `{provider}` and this model, \
+                 nor one for cluster `{cluster}`"
             );
         };
         match entry.basis {
@@ -1248,6 +1250,10 @@ struct PriceEntryWire {
     #[serde(default)]
     cache_write_unpriced: bool,
     provider_type: String,
+    /// Prices only this dialled cluster, which `providers` must map to
+    /// `provider_type`; it wins over the type entry for the same model.
+    #[serde(default)]
+    cluster: Option<String>,
     model: String,
     /// `tokens` (the default), `images`, `characters` or `audio_seconds`
     /// (ADR-0010 decision 3).
@@ -1327,14 +1333,19 @@ impl PricingContext {
     /// keeping the caller's text, means every source (configuration, a `PUT`,
     /// the legacy carrier) stores the same compact shape, and anything stored
     /// parses back to this exact card.
-    /// The store row for this card. A card that uses an ADR-0010 field is
-    /// written at schema version 2, which an older replica skips.
+    /// The store row for this card, at the lowest schema version that holds
+    /// it, so an older replica reads every card it can price correctly and
+    /// skips the rest: version 3 for an entry keyed on one cluster, which a
+    /// replica before it would reject; version 2 for an ADR-0010 field;
+    /// version 1 otherwise.
     fn stored_row(&self, chain: &str) -> StoredRateCard {
         StoredRateCard {
             chain: chain.to_string(),
             version: self.list.version().to_string(),
             card_json: self.to_wire_json(),
-            schema_version: if self.list.uses_media_fields() {
+            schema_version: if self.list.uses_cluster_keys() {
+                RATE_CARD_SCHEMA_V3
+            } else if self.list.uses_media_fields() {
                 RATE_CARD_SCHEMA_V2
             } else {
                 RATE_CARD_SCHEMA_V1
@@ -1386,6 +1397,8 @@ struct PriceEntryJsonView {
     cached_input_unpriced: bool,
     cache_write_unpriced: bool,
     provider_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster: Option<String>,
     model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     basis: Option<&'static str>,
@@ -1441,6 +1454,7 @@ impl From<PricingContext> for PricingJsonView {
                     cached_input_unpriced: entry.cached_input_unpriced,
                     cache_write_unpriced: entry.cache_write_unpriced,
                     provider_type: entry.provider_type.clone(),
+                    cluster: entry.cluster.clone(),
                     model: entry.model.clone(),
                     basis: (!tokens).then(|| entry.basis.as_str()),
                     tier_mode: tokens.then_some(match entry.tier_mode {
@@ -1517,7 +1531,18 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
         .with_timezone(&chrono::Utc)
         .into();
     let mut entries = Vec::with_capacity(wire.price_list.entries.len());
+    let mut cluster_entries = HashMap::new();
     for (entry_index, entry) in wire.price_list.entries.into_iter().enumerate() {
+        if let Some(cluster) = &entry.cluster {
+            check_cluster_key(&wire.providers, entry_index, cluster, &entry.provider_type)?;
+            let key = (cluster.clone(), entry.model.clone());
+            if let Some(first) = cluster_entries.insert(key, entry_index) {
+                return Err(invalid_config(format!(
+                    "price_list.entries[{entry_index}] repeats the (cluster, model) of \
+                     entries[{first}]"
+                )));
+            }
+        }
         entries.push(parse_entry(entry_index, entry)?);
     }
     Ok(PricingContext {
@@ -1529,6 +1554,30 @@ fn parse_pricing(wire: PricingWire) -> Result<PricingContext, ConfigError> {
         )),
         catalog: wire.catalog.map(Arc::new),
     })
+}
+
+/// A cluster entry must name a cluster the `providers` map prices as the
+/// entry's own `provider_type`. A typo would otherwise leave the provider at
+/// its type's price with nothing to show for it, and a mismatched type would
+/// make the card's two statements about one cluster disagree.
+fn check_cluster_key(
+    providers: &HashMap<String, String>,
+    entry_index: usize,
+    cluster: &str,
+    provider_type: &str,
+) -> Result<(), ConfigError> {
+    let at = format!("price_list.entries[{entry_index}].cluster");
+    match providers.get(cluster) {
+        _ if cluster.is_empty() => Err(invalid_config(format!("{at} must not be empty"))),
+        None => Err(invalid_config(format!(
+            "{at} names `{cluster}`, which the providers map does not name"
+        ))),
+        Some(mapped) if mapped != provider_type => Err(invalid_config(format!(
+            "{at} names `{cluster}`, which the providers map prices as provider type \
+             `{mapped}`, not `{provider_type}`"
+        ))),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Parse one price entry. An entry prices only the meters of its basis, so a
@@ -1599,6 +1648,7 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
         cached_input_unpriced: false,
         cache_write_unpriced: false,
         provider_type: entry.provider_type.clone(),
+        cluster: entry.cluster.clone(),
         model: entry.model.clone(),
         tier_basis: TierBasis::InputTokens,
         // Unused for a unit basis; fixed so the version hash is stable.
@@ -1666,6 +1716,7 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
             cached_input_unpriced: false,
             cache_write_unpriced: false,
             provider_type: entry.provider_type,
+            cluster: entry.cluster,
             model: entry.model,
             tier_basis: TierBasis::InputTokens,
             // Unused for basis images; fixed so the version hash is stable.
@@ -1747,6 +1798,7 @@ fn parse_entry(entry_index: usize, entry: PriceEntryWire) -> Result<PriceEntry, 
         cached_input_unpriced: entry.cached_input_unpriced,
         cache_write_unpriced: entry.cache_write_unpriced,
         provider_type: entry.provider_type,
+        cluster: entry.cluster,
         model: entry.model,
         tier_basis: TierBasis::InputTokens,
         tier_mode,
@@ -2469,12 +2521,11 @@ impl UsageFilterInstance {
         usage: &LlmUsage,
     ) -> Option<(Priced, LlmListCost)> {
         let pricing = self.pricing.as_ref()?;
-        let provider_type = pricing.list.provider_for(cluster)?;
         let (model, repriced) =
             pricing
                 .list
                 .model_to_price(cluster, sent_model, served_model, usage);
-        let priced = pricing.list.price(provider_type, model, usage)?;
+        let priced = pricing.list.price_for_cluster(cluster, model, usage)?;
         if repriced {
             self.stats.note_served_model_repriced();
         }
@@ -3039,6 +3090,7 @@ mod tests {
                     cached_input_unpriced: false,
                     cache_write_unpriced: false,
                     provider_type: "openai".into(),
+                    cluster: None,
                     model: model.into(),
                     tier_basis: TierBasis::InputTokens,
                     tier_mode: TierMode::WholeRequest,
@@ -4916,6 +4968,123 @@ mod tests {
             parse_card_json(&modality.to_wire_json()).unwrap().version(),
             modality.version()
         );
+    }
+
+    fn two_host_card(entries: serde_json::Value) -> Result<PricingContext, ConfigError> {
+        parse_card_json(
+            &serde_json::json!({
+                "price_list": {"effective_from": "2026-01-01T00:00:00Z", "entries": entries},
+                "providers": {"provider:a": "openai-compatible", "provider:b": "openai-compatible",
+                              "provider:o": "openai"},
+            })
+            .to_string(),
+        )
+    }
+
+    fn two_host_entry(cluster: Option<&str>, provider_type: &str, input: u64) -> serde_json::Value {
+        let mut entry = serde_json::json!({"provider_type": provider_type, "model": "open-model",
+            "tier_mode": "whole_request", "tiers": [token_tier(input, 0)]});
+        if let Some(cluster) = cluster {
+            entry["cluster"] = cluster.into();
+        }
+        entry
+    }
+
+    /// A card with a cluster entry is stored at schema version 3, which a
+    /// replica that reads only versions 1 and 2 skips, and its wire document
+    /// (`GET /pricing`, the store) carries the cluster and parses back to the
+    /// same card. A card without one keeps version 1 and its wire JSON.
+    #[test]
+    fn a_cluster_keyed_card_is_stored_at_schema_version_3_and_round_trips() {
+        let keyed = two_host_card(serde_json::json!([
+            two_host_entry(None, "openai-compatible", 7),
+            two_host_entry(Some("provider:a"), "openai-compatible", 3),
+        ]))
+        .unwrap();
+        let row = keyed.stored_row("chain");
+        assert_eq!(row.schema_version, RATE_CARD_SCHEMA_V3);
+        let wire: serde_json::Value = serde_json::from_str(&row.card_json).unwrap();
+        assert_eq!(
+            wire["price_list"]["entries"][1]["cluster"], "provider:a",
+            "{wire}"
+        );
+        assert!(
+            wire["price_list"]["entries"][0].get("cluster").is_none(),
+            "a type entry renders no cluster key: {wire}"
+        );
+        let reparsed = parse_card_json(&row.card_json).unwrap();
+        assert_eq!(reparsed.version(), keyed.version());
+        let usage = LlmUsage::from_tokens(LlmTokenUsage {
+            input_tokens: 1,
+            ..LlmTokenUsage::default()
+        });
+        assert_eq!(
+            reparsed
+                .list
+                .list_cost_for_cluster("provider:a", "open-model", &usage),
+            Some(3)
+        );
+
+        let typed = two_host_card(serde_json::json!([two_host_entry(
+            None,
+            "openai-compatible",
+            7
+        )]))
+        .unwrap();
+        let row = typed.stored_row("chain");
+        assert_eq!(row.schema_version, RATE_CARD_SCHEMA_V1);
+        assert!(!row.card_json.contains("cluster"), "{}", row.card_json);
+    }
+
+    /// A cluster entry that names a cluster the map lacks, or a type the map
+    /// does not give that cluster, or repeats a (cluster, model), would price
+    /// a request other than as written, so it fails to load.
+    #[test]
+    fn a_cluster_entry_that_disagrees_with_the_providers_map_fails_to_load() {
+        let error = |entries: serde_json::Value| match two_host_card(entries) {
+            Err(ConfigError::InvalidValue { reason, .. }) => reason,
+            other => panic!("expected a load error, got {other:?}"),
+        };
+        let reason = error(serde_json::json!([two_host_entry(
+            Some("provider:z"),
+            "openai-compatible",
+            1
+        )]));
+        assert!(
+            reason.contains("entries[0].cluster") && reason.contains("does not name"),
+            "{reason}"
+        );
+        let reason = error(serde_json::json!([two_host_entry(
+            Some("provider:o"),
+            "openai-compatible",
+            1
+        )]));
+        assert!(
+            reason.contains("entries[0].cluster") && reason.contains("provider type `openai`"),
+            "{reason}"
+        );
+        let reason = error(serde_json::json!([two_host_entry(
+            Some(""),
+            "openai-compatible",
+            1
+        )]));
+        assert!(reason.contains("must not be empty"), "{reason}");
+        let reason = error(serde_json::json!([
+            two_host_entry(Some("provider:a"), "openai-compatible", 1),
+            two_host_entry(Some("provider:a"), "openai-compatible", 2),
+        ]));
+        assert!(
+            reason.contains("entries[1]") && reason.contains("entries[0]"),
+            "{reason}"
+        );
+        // The same model on two clusters, or on a cluster and its type, is
+        // the point of the key.
+        two_host_card(serde_json::json!([
+            two_host_entry(Some("provider:a"), "openai-compatible", 1),
+            two_host_entry(Some("provider:b"), "openai-compatible", 2),
+            two_host_entry(None, "openai-compatible", 3),
+        ]))
+        .expect("distinct keys load");
     }
 
     /// An entry prices only the meters of its basis, so a field of the other

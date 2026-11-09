@@ -16,6 +16,8 @@ interface Tier {
 }
 interface Entry {
   provider_type: string
+  /** Set when the entry prices one dialled cluster (`provider:<name>`) rather than every provider of its type. */
+  cluster?: string
   model: string
   basis?: string
   tiers?: Tier[]
@@ -117,7 +119,7 @@ export function Pricing({ conn, state }: { conn: AdminConn; state: AdminState })
                 <THead>
                   <TRow>
                     <TH>Model</TH>
-                    <TH>Provider type</TH>
+                    <TH>Provider</TH>
                     <TH>Input</TH>
                     <TH>Cached input</TH>
                     <TH>Output</TH>
@@ -127,9 +129,11 @@ export function Pricing({ conn, state }: { conn: AdminConn; state: AdminState })
                   {inventory.price_list.entries.slice(0, 200).map((e) => {
                     const t = e.tiers?.[0]
                     return (
-                      <TRow key={`${e.provider_type}/${e.model}`}>
+                      <TRow key={`${e.cluster ?? e.provider_type}/${e.model}`}>
                         <TD className="font-mono text-xs">{e.model}</TD>
-                        <TD className="text-xs">{e.provider_type}</TD>
+                        <TD className="text-xs">
+                          {e.cluster ? `${e.cluster.replace(/^provider:/, '')} (${e.provider_type})` : `any ${e.provider_type}`}
+                        </TD>
                         <TD className="text-xs">{e.basis && e.basis !== 'tokens' ? e.basis : perMillion(t?.input_nanodollars_per_token)}</TD>
                         <TD className="text-xs">{perMillion(t?.cached_input_nanodollars_per_token)}</TD>
                         <TD className="text-xs">{perMillion(t?.output_nanodollars_per_token)}</TD>

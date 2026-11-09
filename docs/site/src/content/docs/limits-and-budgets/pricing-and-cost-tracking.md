@@ -6,7 +6,7 @@ summary: >-
   which endpoints it can price and in which unit, which provider the charge
   uses after failover, where the cost appears, and how to read and replace the
   card.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-09
 related:
   - limits-and-budgets/spend-policies
   - limits-and-budgets/token-rate-limiting
@@ -109,7 +109,8 @@ is priced from an estimate, and the cost kind is `estimate`. See
 A request is unpriced in these cases:
 
 - The response has no usage of the entry's basis.
-- The card has no entry for the pair of provider type and model.
+- The card has no entry for the model on the provider that served the request,
+  and no entry for the model on that provider's type.
 - The entry sets `cached_input_unpriced` and the request reports cache-read
   tokens.
 - The entry sets `cache_write_unpriced` and the request reports cache-write
@@ -251,6 +252,53 @@ price. Three parts make this work:
   If the card has no entry for the served model, the proxy keeps the model it
   sent.
 
+## Price one provider
+
+An entry with `provider_type` prices a model on every provider of that type.
+Two providers of one type can sell the same model at different prices, for
+example two `openai-compatible` providers that serve the same open-weight
+model. To give each one its own price, write the entry with `provider`, the
+name of the provider in your `providers` block, instead of `provider_type`:
+
+```yaml
+providers:
+  host-a: { type: openai-compatible, base_url: "https://a.example.com/v1" }
+  host-b: { type: openai-compatible, base_url: "https://b.example.com/v1" }
+routes:
+  - { model: "*", provider: host-a, fallbacks: [host-b] }
+pricing:
+  price_list:
+    effective_from: "2026-11-01T00:00:00Z"
+    entries:
+      - provider: host-a
+        model: example-open-model
+        tier_mode: whole_request
+        tiers:
+          - { input_nanodollars_per_token: 100, cached_input_nanodollars_per_token: 100,
+              cache_write_nanodollars_per_token: 100, output_nanodollars_per_token: 300 }
+      - provider: host-b
+        model: example-open-model
+        tier_mode: whole_request
+        tiers:
+          - { input_nanodollars_per_token: 150, cached_input_nanodollars_per_token: 150,
+              cache_write_nanodollars_per_token: 150, output_nanodollars_per_token: 450 }
+```
+
+The prices are examples, not the rates of a real provider. If `host-a` fails
+and `host-b` serves the request, the proxy charges `host-b`'s price.
+
+An entry with `provider` wins over an entry with `provider_type` for the same
+model. A provider that has no `provider` entry for the model gets the
+`provider_type` entry, if there is one. An entry sets `provider` or
+`provider_type`, not both.
+
+In the card that `GET /pricing` returns and `PUT /pricing` accepts, the
+proxy writes such an entry with `provider_type` set to the provider's type and
+`cluster` set to the key of the provider in the `providers` map, for example
+`provider:host-a`. In Envoy mode, set `cluster` to the name of the cluster
+that the router dials. The `providers` map must name that cluster with the
+same `provider_type`.
+
 ## Requests that use a tenant credential
 
 A request that uses a stored tenant credential has a price like any other
@@ -288,8 +336,9 @@ section lists the fields that this page explains.
 | `pricing.catalog` | object | none | Public source metadata for the admin pricing inventory. The proxy never uses it as a rate. |
 | `price_list.version` | string | none | Human label. |
 | `price_list.effective_from` | RFC 3339 date-time | none (required) | Date of the list, shown in `GET /pricing`. A future date is an error. |
-| `price_list.entries[]` | list | none (1 or more required) | One entry for each pair of `provider_type` and `model`. |
-| `entries[].provider_type` | string | none (required) | Provider type, for example `openai`. It matches the type of the provider that served the request. |
+| `price_list.entries[]` | list | none (1 or more required) | One entry for each pair of `provider_type` and `model`, and one for each pair of `provider` and `model`. |
+| `entries[].provider_type` | string | none | Provider type, for example `openai`. It matches the type of the provider that served the request. Set this or `provider`. |
+| `entries[].provider` | string | none | Name of one provider in the `providers` block. The entry prices only that provider, and wins over a `provider_type` entry for the same model. Set this or `provider_type`. |
 | `entries[].model` | string | none (required) | Exact, case-sensitive model name. |
 | `entries[].basis` | `tokens`, `images`, `characters`, `audio_seconds` | `tokens` | What the entry prices. |
 | `entries[].tier_mode` | `whole_request` or `graduated` | none | Required for `tokens`. Not allowed for the other bases. |
@@ -308,7 +357,10 @@ at load:
 
 - `effective_from` is RFC 3339, and it is not in the future.
 - The list has at least one entry.
-- A pair of `provider_type` and `model` appears once.
+- Each entry sets exactly one of `provider_type` or `provider`.
+- A `provider` names a provider in the `providers` block.
+- A pair of `provider_type` and `model` appears once, and a pair of
+  `provider` and `model` appears once.
 - A `tokens` entry has `tier_mode` and at least one tier.
 - The `up_to` values increase, and exactly one open-ended tier is last.
 - An entry sets only the fields of its own basis.
@@ -325,6 +377,12 @@ A card that uses `basis`, `image_prices`, `nanodollars_per_character`,
 `nanodollars_per_second` or an image or audio token rate is stored at rate-card
 schema version 2. An older replica ignores such a card and keeps its last
 card. Upgrade every replica before you publish such a card.
+
+A card with a `provider` entry (`cluster` in the stored card) is stored at
+rate-card schema version 3. A replica that reads only versions 1 and 2,
+including version 1.0.0, ignores such a card and keeps its last card. A card
+with no `provider` entry keeps the schema version and the version hash it had
+before.
 
 ## Read and replace the card at run time
 

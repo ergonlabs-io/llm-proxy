@@ -537,3 +537,88 @@ fn unit_basis_entries_reject_missing_and_foreign_fields() {
         "pricing.price_list.entries[0].nanodollars_per_second"
     );
 }
+
+/// Two providers of one type, each with its own price for one model, and a
+/// type entry for the same model.
+const TWO_HOSTS: &str = r#"
+version: 1
+providers:
+  host-a: { type: openai-compatible, base_url: "http://127.0.0.1:1" }
+  host-b: { type: openai-compatible, base_url: "http://127.0.0.1:2" }
+routes:
+  - { model: "*", provider: host-a, fallbacks: [host-b] }
+pricing:
+  price_list:
+    effective_from: "2026-09-01T00:00:00Z"
+    entries:
+"#;
+
+fn two_hosts_entry(key: &str) -> String {
+    format!(
+        "      - {key}
+        model: open-model
+        tier_mode: whole_request
+        tiers:
+          - {{ input_nanodollars_per_token: 1, cached_input_nanodollars_per_token: 1,
+              cache_write_nanodollars_per_token: 1, output_nanodollars_per_token: 1 }}
+"
+    )
+}
+
+/// A `provider` entry lowers to the cluster the router dials for that
+/// provider, at the type the providers map gives it, so the usage filter
+/// prices the member that served after failover.
+#[test]
+fn a_provider_entry_lowers_to_its_dialled_cluster_and_type() {
+    let config = format!(
+        "{TWO_HOSTS}{}{}",
+        two_hosts_entry("provider: host-b"),
+        two_hosts_entry("provider_type: openai-compatible")
+    );
+    let carrier = carrier(&config);
+    let entries = &carrier["price_list"]["entries"];
+    assert_eq!(entries[0]["cluster"], "provider:host-b", "{carrier}");
+    assert_eq!(entries[0]["provider_type"], "openai-compatible");
+    assert!(entries[0].get("provider").is_none(), "{carrier}");
+    assert!(entries[1].get("cluster").is_none(), "{carrier}");
+    assert_eq!(
+        carrier["providers"]["provider:host-b"], "openai-compatible",
+        "the map names the entry's cluster at the entry's type"
+    );
+}
+
+#[test]
+fn a_provider_entry_is_checked_with_its_full_path() {
+    let reject = |keys: &[&str], path: &str| {
+        let entries: String = keys.iter().map(|key| two_hosts_entry(key)).collect();
+        assert_eq!(
+            error_path(&format!("{TWO_HOSTS}{entries}")),
+            path,
+            "{keys:?}"
+        );
+    };
+    reject(
+        &["provider: host-z"],
+        "pricing.price_list.entries[0].provider",
+    );
+    reject(
+        &["provider: host-a\n        provider_type: openai-compatible"],
+        "pricing.price_list.entries[0].provider",
+    );
+    reject(
+        &["cached_input_unpriced: false"],
+        "pricing.price_list.entries[0].provider_type",
+    );
+    reject(
+        &["provider: host-a", "provider: host-a"],
+        "pricing.price_list.entries[1].model",
+    );
+    // One model on each provider and on their type is not a duplicate.
+    lower(&parse(&format!(
+        "{TWO_HOSTS}{}{}{}",
+        two_hosts_entry("provider: host-a"),
+        two_hosts_entry("provider: host-b"),
+        two_hosts_entry("provider_type: openai-compatible")
+    )))
+    .expect("distinct keys load");
+}

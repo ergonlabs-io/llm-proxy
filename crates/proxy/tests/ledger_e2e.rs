@@ -18,6 +18,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
@@ -535,6 +537,88 @@ fn the_duckdb_recipe_totals_match_the_ledger() {
     }
 }
 
+/// Two providers of one type serve the same model at different prices. The
+/// primary answers 503 and the fallback serves, so the ledger entry must
+/// carry the fallback's price: not the primary's (which the route named), and
+/// not the type's (which a card keyed on provider type alone would charge).
+#[test]
+fn after_failover_the_ledger_charges_the_fallback_providers_own_price() {
+    // The mock's usage is 6 input and 4 output tokens.
+    const PRIMARY_MICRO_USD: u64 = 14; // 6 * 1000 + 4 * 2000 nanodollars
+    const FALLBACK_MICRO_USD: u64 = 38; // 6 * 3000 + 4 * 5000
+    const TYPE_MICRO_USD: u64 = 24; // 6 * 2000 + 4 * 3000
+    let dir = TempLedgerDir::new();
+    let ledger = dir.config(1024, OnUnavailable::Reject);
+    let (primary, primary_hits) = unavailable_upstream();
+    let entry = |key: &str, input: u64, output: u64| {
+        format!(
+            "      - {key}
+        model: gpt-4o
+        tier_mode: whole_request
+        tiers:
+          - {{ input_nanodollars_per_token: {input}, cached_input_nanodollars_per_token: 0,
+              cache_write_nanodollars_per_token: 0, output_nanodollars_per_token: {output} }}
+"
+        )
+    };
+    let config = format!(
+        r#"version: 1
+listen: 127.0.0.1:{listen}
+admin: 127.0.0.1:{admin}
+providers:
+  host-a:
+    type: openai-compatible
+    base_url: http://{primary}
+  host-b:
+    type: openai-compatible
+    base_url: http://{fallback}
+routes:
+  - {{ model: "*", provider: host-a, fallbacks: [host-b] }}
+auth:
+  hmac_secret: "ledger-e2e-hmac-secret"
+pricing:
+  price_list:
+    effective_from: "2026-01-01T00:00:00Z"
+    entries:
+{type_entry}{primary_entry}{fallback_entry}ledger:
+  directory: {directory}
+  encryption_key_file: {key}
+  encryption_key_id: {key_id}
+  max_disk_bytes: {disk}
+  group_commit_interval: 10ms
+  on_unavailable: reject
+"#,
+        listen = free_port(),
+        admin = free_port(),
+        fallback = mock_upstream(),
+        type_entry = entry("provider_type: openai-compatible", 2000, 3000),
+        primary_entry = entry("provider: host-a", 1000, 2000),
+        fallback_entry = entry("provider: host-b", 3000, 5000),
+        directory = ledger.directory.display(),
+        key = ledger.encryption_key.file.display(),
+        key_id = ledger.encryption_key.id,
+        disk = ledger.max_disk_bytes,
+    );
+    let proxy = Proxy::start(dir.root.path(), &config, Some(NODE));
+    let key = proxy.mint_key();
+    let response = proxy.chat_as(Some(&key));
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        1,
+        "the primary was dialled and failed, so the fallback served"
+    );
+
+    proxy.scrape_until(|s| counter(s, "envoy_llmproxy_ledger_entries_committed_total") == 1);
+    let page = proxy.admin_json("GET", "/ledger/entries");
+    let entries = page["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{page}");
+    let charged = entries[0]["charged_micro_usd"].as_u64().unwrap();
+    assert_ne!(charged, PRIMARY_MICRO_USD, "charged the primary's price");
+    assert_ne!(charged, TYPE_MICRO_USD, "charged the provider type's price");
+    assert_eq!(charged, FALLBACK_MICRO_USD, "{}", entries[0]);
+}
+
 // ------------------------------------------------------------------ helpers --
 
 /// A ledger, an admin listener, an `auth` block (so the spend filter charges
@@ -918,6 +1002,43 @@ fn duckdb(work: &Path, sql: &Path) -> Vec<serde_json::Value> {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// An upstream that answers every request `503`, which a route's fallback
+/// chain treats as a failure, and counts the requests it answered.
+fn unavailable_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let counted = Arc::clone(&counted);
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":{"message":"unavailable"}}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            });
+        }
+    });
+    (addr, hits)
 }
 
 fn mock_upstream() -> SocketAddr {
