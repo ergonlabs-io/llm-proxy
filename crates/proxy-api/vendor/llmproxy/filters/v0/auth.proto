@@ -126,6 +126,100 @@ message Authentication {
   // ledger entry may carry. UNSET means no tags are attributed: key
   // metadata tags are not copied and the `x-cost-tags` header is never read.
   ChargebackTags chargeback_tags = 10;
+
+  // Tenants, model policies, budgets, scoped budgets and limits declared in
+  // the config file and reconciled into the control-plane store. UNSET
+  // leaves the store as it is: rows an earlier config declared stay, and no
+  // row is created or deleted.
+  //
+  // Not fixed at startup: a reload that changes this field is accepted and
+  // reconciled. The admin API wins over the file: a row an admin call wrote
+  // is not touched until `DELETE /tenants/{id}/override` hands it back.
+  DeclaredPolicy declared_policy = 11;
+}
+
+// The declared tenants and the revision that orders them across replicas.
+message DeclaredPolicy {
+  // Required, at least 1. Replicas that share a store apply a revision only
+  // when it is not lower than the one the store last applied, so a replica
+  // still on an older file cannot undo a newer one. Change it on every edit:
+  // the same revision with different content is refused at reconcile.
+  uint64 revision = 1;
+
+  // The declared tenants. May be empty, which removes every file-owned row.
+  repeated DeclaredTenant tenants = 2;
+}
+
+// One declared tenant. Each member is one stored row; an UNSET member
+// declares no row, so a file-owned row of that kind is removed.
+message DeclaredTenant {
+  // Required. Unique within `tenants`; not the reserved `default`.
+  string id = 1;
+
+  // The tenant's model access, as `PUT /tenants/{id}/policy`.
+  DeclaredModelPolicy policy = 2;
+
+  // The tenant's spend budget, as `PUT /tenants/{id}/budget`.
+  DeclaredBudget budget = 3;
+
+  // The tenant's scoped budgets, as `PUT /tenants/{id}/scoped_budgets`.
+  // Empty declares none.
+  repeated DeclaredScopedBudget scoped_budgets = 4;
+
+  // The tenant's rate limits, as `PUT /tenants/{id}/limits`.
+  DeclaredLimits limits = 5;
+}
+
+// Exactly one of `all` and `only`.
+message DeclaredModelPolicy {
+  oneof access {
+    // Grant every model.
+    DeclaredAllModels all = 1;
+    // Grant only these patterns: an exact model or a prefix ending in one
+    // `*`. Empty grants nothing.
+    DeclaredModelList only = 2;
+  }
+  // Patterns refused even when `access` grants them.
+  repeated string deny = 3;
+}
+
+message DeclaredAllModels {}
+
+message DeclaredModelList {
+  repeated string patterns = 1;
+}
+
+message DeclaredBudget {
+  // Required. A decimal USD amount, for example `"500.00"`.
+  string max_usd = 1;
+  // Required. `daily`, `weekly` or `monthly`.
+  string period = 2;
+  // `platform` (the default when empty) or `tenant`.
+  string credential_source = 3;
+}
+
+message DeclaredScopedBudget {
+  // Required. Unique within the tenant: 1 to 64 of a-z, 0-9, `-` and `_`.
+  string name = 1;
+  string max_usd = 2;
+  string period = 3;
+  string credential_source = 4;
+  // Model patterns. At least one of `models` and `providers`.
+  repeated string models = 5;
+  // Cluster names. Each must name a configured cluster.
+  repeated string providers = 6;
+  // Alert levels, each 1 to 100, unique.
+  repeated uint32 alert_at_percent = 7;
+}
+
+// At least one field. An unset field sets no limit; zero refuses all traffic
+// on that counter.
+message DeclaredLimits {
+  optional uint64 tokens_per_minute = 1;
+  optional uint64 requests_per_minute = 2;
+  optional uint64 tokens_per_day = 3;
+  optional uint64 requests_per_day = 4;
+  optional uint32 concurrent_streams = 5;
 }
 
 // The operator's chargeback-tag policy. Tags come from key metadata (set on a

@@ -9,6 +9,8 @@
 //! - [`spend`] accumulates spend against tenant and key budgets;
 //!   [`window_counter`] and [`window_usage`] do the same for token windows,
 //!   with [`token_limit`] as the budget library and [`token_usage`] its input.
+//! - [`declared`] holds the tenant policy a config file declares, which
+//!   the store reconciles beside admin writes.
 //! - [`tenant_credential_crypto`] seals BYOK credentials at rest, and
 //!   [`reconciliation_age`] reports how stale the reconciled counters are.
 //!
@@ -19,6 +21,7 @@ pub mod auth;
 mod budget_utilization;
 pub mod control;
 pub mod control_redis;
+pub mod declared;
 pub mod model_authz;
 pub mod reconciliation_age;
 pub mod spend;

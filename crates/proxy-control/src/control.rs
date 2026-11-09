@@ -609,6 +609,42 @@ pub trait ControlPlaneStore: Send + Sync {
         ))
     }
 
+    /// Makes the declared rows of the store match `declared`, in one atomic
+    /// write, and bumps the policy generation only when a row changed.
+    ///
+    /// A declared row that is absent or file-owned is written as a file row;
+    /// one an admin owns is left alone and reported as shadowed. A file-owned
+    /// row `declared` does not name is deleted. The store records the
+    /// revision and digest it applied, and refuses an older revision, or the
+    /// same revision with another digest, without writing anything.
+    ///
+    /// The default refuses: a store without row sources cannot tell a row
+    /// the file may delete from one an operator made.
+    fn reconcile_declared(
+        &self,
+        declared: &crate::declared::DeclaredPolicy,
+    ) -> Result<crate::declared::ReconcileOutcome, StoreError> {
+        let _ = declared;
+        Err(StoreError::Unavailable(
+            "declared tenant policy is not supported by this store".into(),
+        ))
+    }
+
+    /// Rewrites every admin-owned row of `tenant` as a file row, keeping its
+    /// value, in one write that bumps the generation. Returns the kinds it
+    /// handed back, sorted; empty (and no bump) when there were none. The
+    /// next [`Self::reconcile_declared`] then applies the file's value, or
+    /// deletes the row when the file does not declare it.
+    fn hand_back_to_file(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<crate::declared::RowKind>, StoreError> {
+        let _ = tenant;
+        Err(StoreError::Unavailable(
+            "declared tenant policy is not supported by this store".into(),
+        ))
+    }
+
     /// Sets or clears a key's spend budget, the key-level twin of
     /// [`Self::set_budget`]. Each write bumps the policy generation.
     fn set_key_budget(&self, key_id: &KeyId, budget: Option<&KeyBudget>) -> Result<(), StoreError>;
