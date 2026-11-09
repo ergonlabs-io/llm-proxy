@@ -26,7 +26,8 @@ pub use ir::ConfigSnapshot;
 pub use loader::{load_bootstrap_file, parse_bootstrap, ConfigFormat, LoadedBootstrap};
 pub use lower::{
     build_snapshot, lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener,
-    lower_dynamic_route, tenant_credential_verify_path_problem,
+    lower_dynamic_route, tenant_credential_verify_path_problem, validate_cross_resource,
+    DanglingClusterRefs,
 };
 pub use validate::validate_message;
 

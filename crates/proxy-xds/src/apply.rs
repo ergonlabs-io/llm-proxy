@@ -51,6 +51,7 @@ use proxy_config::ir::{
 };
 use proxy_config::{
     lower_dynamic_cluster, lower_dynamic_endpoints, lower_dynamic_listener, lower_dynamic_route,
+    validate_cross_resource, DanglingClusterRefs,
 };
 
 use crate::client::ResponseHandler;
@@ -1461,6 +1462,10 @@ impl ResourceApplier {
             }
         }
 
+        if let Err(error) = self.check_cross_resource() {
+            return Verdict::Reject(error.to_string());
+        }
+
         self.refresh_active_dynamic_listeners();
         let snapshot = self.assemble_snapshot();
         if !same_published_resources(&self.current, &snapshot) {
@@ -1472,6 +1477,52 @@ impl ResourceApplier {
             self.current = snapshot;
         }
         Verdict::Accept
+    }
+
+    /// Run the cross-resource checks `build_snapshot` runs on a bootstrap
+    /// over the static base plus every staged dynamic cluster and listener.
+    /// A listener still waiting on RDS is checked too: it goes live when its
+    /// routes arrive, with no further LDS response to NACK.
+    ///
+    /// Static resources passed these checks at load, and a dynamic name
+    /// never shadows a static one, so only dynamic clusters are roots. Static
+    /// listeners come first so a `stat_prefix` collision names the dynamic
+    /// listener. Dangling cluster names are tolerated, as Envoy does: a delta
+    /// update or TTL expiry may remove a member before its aggregate.
+    fn check_cross_resource(&self) -> Result<(), proxy_config::ConfigError> {
+        let mut clusters = self.base.clusters.clone();
+        for name in self.clusters.names() {
+            let entry = self
+                .clusters
+                .get(name)
+                .expect("a cluster SotwSet name must resolve to an entry");
+            clusters.insert(name.to_string(), Arc::clone(&entry.ir));
+        }
+        let cluster_roots = self.clusters.names().into_iter().map(|name| {
+            let entry = self
+                .clusters
+                .get(name)
+                .expect("a cluster SotwSet name must resolve to an entry");
+            (format!("cds.clusters[{name}]"), entry.ir.as_ref())
+        });
+        let static_listeners = self
+            .base
+            .listeners
+            .iter()
+            .map(|(name, ir)| (format!("static_resources.listeners[{name}]"), ir.as_ref()));
+        let dynamic_listeners = self.listeners.names().into_iter().map(|name| {
+            let entry = self
+                .listeners
+                .get(name)
+                .expect("a listener SotwSet name must resolve to an entry");
+            (format!("lds.listeners[{name}]"), entry.ir.as_ref())
+        });
+        validate_cross_resource(
+            &clusters,
+            cluster_roots,
+            static_listeners.chain(dynamic_listeners),
+            DanglingClusterRefs::Tolerate,
+        )
     }
 
     /// The state a CDS, LDS or RDS response changes before [`Publish`] can

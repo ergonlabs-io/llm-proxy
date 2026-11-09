@@ -2570,14 +2570,13 @@ fn start_ads(
     ));
     // Seeded for the same reason as EDS above, plus one that is not about
     // subscribing at all: `client.rs`'s pump resolves an incoming response's
-    // `type_url` against THIS list, and a response whose type_url is absent
-    // returns `AdsError::UnknownTypeUrl`, which propagates out of the pump
-    // and tears down the WHOLE ADS stream -- CDS and LDS with it, not just
-    // the secret. So the state is pushed unconditionally, even when the boot
-    // snapshot names no SDS secrets at all: an empty `Names` set sends no
-    // initial request (`SubscriptionState::has_nothing_to_request`), but it
-    // still makes an SDS response the proxy did not ask for a NACK instead of
-    // a disconnect. `Names`, never `Wildcard` -- SDS is by-name like EDS (S8).
+    // `type_url` against THIS list, and drops a response whose type_url is
+    // absent without an ACK or NACK, as Envoy does. So the state is pushed
+    // unconditionally, even when the boot snapshot names no SDS secrets at
+    // all: an empty `Names` set sends no initial request
+    // (`SubscriptionState::has_nothing_to_request`), but an SDS response the
+    // proxy did not ask for is then NACKed by name rather than dropped
+    // unanswered. `Names`, never `Wildcard` -- SDS is by-name like EDS (S8).
     states.push(SubscriptionState::new(
         SDS_TYPE_URL,
         Subscription::Names(applier.sds_resource_names()),

@@ -94,16 +94,22 @@ fn dead_addr() -> SocketAddr {
     listener.local_addr().expect("local addr")
 }
 
-fn static_cluster(name: &str, addr: SocketAddr, dialect: &str) -> String {
+/// `dialect: None` declares no usage dialect, so the filter default applies.
+fn static_cluster(name: &str, addr: SocketAddr, dialect: Option<&str>) -> String {
+    let metadata = dialect.map_or(String::new(), |dialect| {
+        format!(
+            r#"
+      metadata:
+        filter_metadata:
+          io.llmproxy.usage:
+            dialect: {dialect}"#
+        )
+    });
     format!(
         r#"
     - name: {name}
       type: STATIC
-      connect_timeout: 2s
-      metadata:
-        filter_metadata:
-          io.llmproxy.usage:
-            dialect: {dialect}
+      connect_timeout: 2s{metadata}
       load_assignment:
         cluster_name: {name}
         endpoints:
@@ -233,20 +239,26 @@ static_resources:
 /// `anthropic`, the filter default says `openai`, and the cluster wins.
 #[test]
 fn cluster_usage_dialect_applies_on_a_plain_forward() {
-    let clusters = static_cluster("claude", spawn_upstream(ANTHROPIC_BODY), "anthropic");
+    let clusters = static_cluster("claude", spawn_upstream(ANTHROPIC_BODY), Some("anthropic"));
     assert_eq!(token_line(&clusters, "claude"), "21 5");
 }
 
-/// The first member (dead, `openai`) fails to connect and the request falls
-/// back to the second (`anthropic`). Usage must be parsed with the dialect of
-/// the member that answered, not the failed attempt's and not the filter
-/// default.
+/// The first member (dead, no declared dialect, so the filter default
+/// `openai`) fails to connect and the request falls back to the second
+/// (`anthropic`). Usage must be parsed with the dialect of the member that
+/// answered, not the failed attempt's and not the filter default. The
+/// primary declares no dialect because an aggregate whose members declare
+/// two different ones is a load error (AGENTS.md invariant 7).
 #[test]
 fn cluster_usage_dialect_follows_failover_to_the_dialled_member() {
     let clusters = format!(
         "{}{}{}",
-        static_cluster("primary", dead_addr(), "openai"),
-        static_cluster("fallback", spawn_upstream(ANTHROPIC_BODY), "anthropic"),
+        static_cluster("primary", dead_addr(), None),
+        static_cluster(
+            "fallback",
+            spawn_upstream(ANTHROPIC_BODY),
+            Some("anthropic")
+        ),
         r#"
     - name: providers
       lb_policy: CLUSTER_PROVIDED

@@ -91,12 +91,6 @@ pub enum AdsError {
     #[error("ADS stream error: {0}")]
     Stream(Box<tonic::Status>),
 
-    /// A `DiscoveryResponse` named a `type_url` no [`SubscriptionState`] this
-    /// client was constructed with covers. Never silently ignored -- this is
-    /// as much a "field this build cannot handle" as any config field is.
-    #[error("ADS response for type_url `{0}`, which no subscribed SubscriptionState covers")]
-    UnknownTypeUrl(String),
-
     /// The outbound request channel's receiver was dropped -- i.e. the gRPC
     /// stream ended -- while a request was still queued to send on it.
     #[error("ADS outbound request channel closed while the stream was still open")]
@@ -198,6 +192,46 @@ pub struct AdsClient {
     /// The xDS `Node` identity this client announces. `None` sends no node, so
     /// a control plane that routes by `node.id` will not find a snapshot.
     node: Option<NodeIdentity>,
+    unsubscribed: UnsubscribedTypeWarnings,
+}
+
+/// Warns once per `type_url` a control plane sends that this client never
+/// subscribed to. Envoy's gRPC mux drops such a response without an ACK or
+/// a NACK. Failing the stream instead made the client reconnect every
+/// 0-500 ms forever, because a response resets the backoff first.
+///
+/// The set is bounded: the `type_url` comes from the control plane, so an
+/// unbounded set would let it grow memory without limit. Past the bound,
+/// further types are dropped without a log line, which the last warning says.
+#[derive(Default)]
+pub(crate) struct UnsubscribedTypeWarnings {
+    warned: BTreeSet<String>,
+}
+
+impl UnsubscribedTypeWarnings {
+    const MAX_DISTINCT: usize = 16;
+    /// Long enough for any real type URL; a hostile one is cut, not logged whole.
+    const MAX_LOGGED_LEN: usize = 256;
+
+    pub(crate) fn ignore(&mut self, protocol: &'static str, type_url: &str) {
+        if self.warned.len() >= Self::MAX_DISTINCT || self.warned.contains(type_url) {
+            return;
+        }
+        let shown: String = type_url.chars().take(Self::MAX_LOGGED_LEN).collect();
+        self.warned.insert(type_url.to_string());
+        let suppression = if self.warned.len() == Self::MAX_DISTINCT {
+            "; further unsubscribed type URLs are dropped without a log line"
+        } else {
+            ""
+        };
+        tracing::warn!(
+            protocol,
+            type_url = %shown,
+            "{protocol} response for type_url `{shown}`, which this client did not subscribe \
+             to, is ignored without an ACK or NACK, as Envoy does; repeats are not logged\
+             {suppression}"
+        );
+    }
 }
 
 impl AdsClient {
@@ -206,6 +240,7 @@ impl AdsClient {
             states,
             attempt: 0,
             node: None,
+            unsubscribed: UnsubscribedTypeWarnings::default(),
         }
     }
 
@@ -319,11 +354,14 @@ impl AdsClient {
             // The control plane answered, so reset the backoff. See `attempt`.
             self.attempt = 0;
 
-            let state = self
+            let Some(state) = self
                 .states
                 .iter_mut()
                 .find(|s| s.type_url() == resp.type_url.as_str())
-                .ok_or_else(|| AdsError::UnknownTypeUrl(resp.type_url.clone()))?;
+            else {
+                self.unsubscribed.ignore("ADS", &resp.type_url);
+                continue;
+            };
 
             let verdict = handler.handle(&resp).await;
             let next = state.on_response(&resp.version_info, &resp.nonce, verdict);

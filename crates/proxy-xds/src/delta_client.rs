@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
 use crate::backoff;
-use crate::client::Reconnect;
+use crate::client::{Reconnect, UnsubscribedTypeWarnings};
 use crate::delta_subscription::{DeltaRequest, DeltaSubscriptionState, ResourceVersion};
 use crate::subscription::Verdict;
 
@@ -51,11 +51,6 @@ pub enum DeltaAdsError {
     // bytes; boxing keeps this enum small while `From` preserves `?`.
     #[error("delta ADS stream error: {0}")]
     Stream(Box<tonic::Status>),
-
-    #[error(
-        "delta ADS response for type_url `{0}`, which no subscribed DeltaSubscriptionState covers"
-    )]
-    UnknownTypeUrl(String),
 
     #[error("delta ADS outbound request channel closed while stream was still open")]
     OutboundClosed,
@@ -107,6 +102,7 @@ pub struct DeltaAdsClient {
     states: Vec<DeltaSubscriptionState>,
     attempt: u32,
     node: Option<NodeIdentity>,
+    unsubscribed: UnsubscribedTypeWarnings,
 }
 
 impl DeltaAdsClient {
@@ -115,6 +111,7 @@ impl DeltaAdsClient {
             states,
             attempt: 0,
             node: None,
+            unsubscribed: UnsubscribedTypeWarnings::default(),
         }
     }
 
@@ -190,11 +187,14 @@ impl DeltaAdsClient {
             };
             self.attempt = 0;
 
-            let state = self
+            let Some(state) = self
                 .states
                 .iter_mut()
                 .find(|state| state.type_url() == response.type_url.as_str())
-                .ok_or_else(|| DeltaAdsError::UnknownTypeUrl(response.type_url.clone()))?;
+            else {
+                self.unsubscribed.ignore("delta ADS", &response.type_url);
+                continue;
+            };
 
             let verdict = handler.handle(&response).await;
             let versions = response.resources.iter().map(|resource| ResourceVersion {

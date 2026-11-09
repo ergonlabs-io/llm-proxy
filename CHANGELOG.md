@@ -52,6 +52,22 @@ surfaces that an upgrade within 1.x keeps stable.
 - A `--config` file that enforces spend now adds the body parser to the chain,
   as it does for model policy. Scoped budgets match the routing model, which
   the parser publishes.
+- xDS: CDS and LDS responses now get the cross-resource checks a bootstrap
+  gets, over the static resources plus every dynamic one. A response is
+  NACKed, and the last accepted config stays in force, when an aggregate
+  cluster names itself, names another aggregate, or names a member twice;
+  when an aggregate's members declare different usage dialects
+  (`io.llmproxy.usage`); or when two listeners that configure `llmproxy.auth`
+  use one `stat_prefix`. The NACK names the resource path, for example
+  `cds.clusters[agg].cluster_type.typed_config.clusters[1]`. A control plane
+  that sent these before had them accepted; it now gets a NACK. An aggregate
+  member that names no cluster yet is still accepted, as in Envoy.
+- Envoy-mode bootstrap: an aggregate cluster whose members declare different
+  usage dialects is now a load error (AGENTS.md invariant 7; the `--config`
+  dialect already refused it).
+- Envoy-mode bootstrap: `node` accepts only `id`, `cluster` and `metadata`.
+  Any other `Node` field (`locality`, `user_agent_name`, `client_features`,
+  ...) did nothing; it now fails with its path, for example `node.locality`.
 
 ### Added
 
@@ -135,6 +151,10 @@ surfaces that an upgrade within 1.x keeps stable.
 
 ### Fixed
 
+- ADS and delta ADS: a response for a type the proxy did not subscribe to is
+  dropped with one warning per type, as Envoy does. Before, it closed the
+  stream, and the proxy reconnected every 0-500 ms for as long as the control
+  plane kept sending that type.
 - `PUT /keys/{id}/tags` no longer writes back a key's old secret when another
   replica minted the key again since this replica's last poll: it answers
   `409` and the new secret stays.

@@ -595,3 +595,22 @@ fn the_ads_metadata_key_is_strict() {
         assert_eq!(err_path(&err), path);
     }
 }
+
+/// `Node.id`, `Node.cluster` and `Node.metadata` are lowered; every other
+/// set `Node` field would load and do nothing (AGENTS.md invariant 1), so
+/// each one fails with its dotted path.
+#[test]
+fn a_node_field_other_than_id_cluster_and_metadata_is_refused() {
+    for (field, path) in [
+        ("locality: { region: us-east-1 }", "node.locality"),
+        ("user_agent_name: custom", "node.user_agent_name"),
+        (
+            "client_features: [envoy.lb.does_not_support_overprovisioning]",
+            "node.client_features",
+        ),
+    ] {
+        let yaml = format!("node:\n  id: proxy-1\n  {field}\nstatic_resources:\n  listeners: []\n");
+        let err = snapshot_from(&yaml).expect_err(field);
+        assert_eq!(err_path(&err), path, "{field}: {err}");
+    }
+}

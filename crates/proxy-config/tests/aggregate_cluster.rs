@@ -623,3 +623,46 @@ static_resources:
     let agg = snapshot.clusters.get("agg").expect("cluster");
     assert!(matches!(agg.kind, ClusterKind::Aggregate { .. }));
 }
+
+/// AGENTS.md invariant 7 in Envoy mode: an aggregate failing over from an
+/// OpenAI-dialect member to an Anthropic-dialect member is rejected at the
+/// second member. The same members with one dialect lower, so the error is
+/// about the dialect and not the metadata.
+#[test]
+fn aggregate_across_usage_dialects_is_rejected() {
+    let yaml_for = |second_dialect: &str| {
+        format!(
+            r#"
+static_resources:
+  clusters:
+    - name: a
+      type: STATIC
+      metadata: {{ filter_metadata: {{ io.llmproxy.usage: {{ dialect: openai }} }} }}
+      load_assignment:
+        cluster_name: a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: {{ socket_address: {{ address: 10.0.0.1, port_value: 443 }} }}
+    - name: b
+      type: STATIC
+      metadata: {{ filter_metadata: {{ io.llmproxy.usage: {{ dialect: {second_dialect} }} }} }}
+      load_assignment:
+        cluster_name: b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: {{ socket_address: {{ address: 10.0.0.2, port_value: 443 }} }}
+    - name: agg
+{VALID_AGGREGATE}
+"#
+        )
+    };
+    snapshot_from(&yaml_for("openai")).expect("a same-dialect aggregate must lower");
+    let err = snapshot_from(&yaml_for("anthropic")).expect_err("cross-dialect must fail");
+    assert_eq!(
+        err_path(&err),
+        "static_resources.clusters[2].cluster_type.typed_config.clusters[1]"
+    );
+    assert!(err.to_string().contains("invariant 7"), "got: {err}");
+}

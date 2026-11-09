@@ -1932,3 +1932,205 @@ async fn an_identity_hashed_rds_route_needs_an_authenticating_listener() {
     assert_eq!(applier.on_response(&routes).await, Verdict::Accept);
     assert!(applier.current().listeners.contains_key("ingress"));
 }
+
+const AGGREGATE_CONFIG_TYPE: &str = "envoy.extensions.clusters.aggregate.v3.ClusterConfig";
+
+/// An `envoy.clusters.aggregate` cluster failing over across `members` in
+/// listed order.
+fn aggregate_cluster(name: &str, members: &[&str]) -> cluster_v3::Cluster {
+    use proxy_api::envoy::extensions::clusters::aggregate::v3::ClusterConfig;
+    cluster_v3::Cluster {
+        name: name.to_string(),
+        lb_policy: cluster_v3::cluster::LbPolicy::ClusterProvided as i32,
+        cluster_discovery_type: Some(cluster_v3::cluster::ClusterDiscoveryType::ClusterType(
+            cluster_v3::cluster::CustomClusterType {
+                name: "envoy.clusters.aggregate".to_string(),
+                typed_config: Some(any_of(
+                    &ClusterConfig {
+                        clusters: members.iter().map(|m| m.to_string()).collect(),
+                    },
+                    AGGREGATE_CONFIG_TYPE,
+                )),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+/// `minimal_cluster` declaring the usage dialect its upstream speaks, the
+/// way the `llmproxy` dialect lowers a provider.
+fn cluster_speaking(name: &str, port: u32, dialect: &str) -> cluster_v3::Cluster {
+    use prost_types::value::Kind;
+    let usage = prost_types::Struct {
+        fields: [(
+            "dialect".to_string(),
+            prost_types::Value {
+                kind: Some(Kind::StringValue(dialect.to_string())),
+            },
+        )]
+        .into(),
+    };
+    cluster_v3::Cluster {
+        metadata: Some(core_v3::Metadata {
+            filter_metadata: [("io.llmproxy.usage".to_string(), usage)].into(),
+            ..Default::default()
+        }),
+        ..minimal_cluster(name, port)
+    }
+}
+
+/// Accept `good`, then send `bad` and expect a NACK naming `path`. A NACK
+/// rejects the whole response (S8): nothing is published, and the previous
+/// accepted state stays in force, so the next response is compared against
+/// `good`, not against the refused one.
+async fn assert_nacked_and_last_good_kept(
+    good: &DiscoveryResponse,
+    bad: &DiscoveryResponse,
+    path: &str,
+) -> String {
+    let (publish, published) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+    assert_eq!(applier.on_response(good).await, Verdict::Accept);
+    let before = Arc::clone(applier.current());
+    let published_before = published.lock().unwrap().len();
+
+    let Verdict::Reject(reason) = applier.on_response(bad).await else {
+        panic!("expected a NACK naming `{path}`");
+    };
+    assert!(reason.contains(path), "NACK must name `{path}`: {reason}");
+    assert!(
+        Arc::ptr_eq(&before, applier.current()),
+        "a NACK must leave the last accepted snapshot in force"
+    );
+    assert_eq!(published.lock().unwrap().len(), published_before);
+
+    // The refused resources did not leak into the sets: resending `good`
+    // changes nothing, so it publishes nothing.
+    assert_eq!(applier.on_response(good).await, Verdict::Accept);
+    assert_eq!(published.lock().unwrap().len(), published_before);
+    reason
+}
+
+/// `build_snapshot` rejects these aggregate graphs in a bootstrap; CDS must
+/// NACK them too, or a control plane installs a fallback that never
+/// receives traffic.
+#[tokio::test]
+async fn cds_aggregates_that_nest_name_themselves_or_repeat_a_member_are_nacked() {
+    let good = cds_response(
+        "v1",
+        &[
+            minimal_cluster("a", 8080),
+            minimal_cluster("b", 8081),
+            aggregate_cluster("agg", &["a", "b"]),
+        ],
+    );
+    let cases = [
+        (
+            "nested",
+            vec![
+                minimal_cluster("a", 8080),
+                minimal_cluster("b", 8081),
+                aggregate_cluster("inner", &["a", "b"]),
+                aggregate_cluster("agg", &["a", "inner"]),
+            ],
+            "cds.clusters[agg].cluster_type.typed_config.clusters[1]",
+            "itself an aggregate",
+        ),
+        (
+            "self",
+            vec![
+                minimal_cluster("a", 8080),
+                aggregate_cluster("agg", &["a", "agg"]),
+            ],
+            "cds.clusters[agg].cluster_type.typed_config.clusters[1]",
+            "names itself",
+        ),
+        (
+            "duplicate",
+            vec![
+                minimal_cluster("a", 8080),
+                aggregate_cluster("agg", &["a", "a"]),
+            ],
+            "cds.clusters[agg].cluster_type.typed_config.clusters[1]",
+            "duplicate member",
+        ),
+    ];
+    for (case, clusters, path, why) in cases {
+        let bad = cds_response("v2", &clusters);
+        let reason = assert_nacked_and_last_good_kept(&good, &bad, path).await;
+        assert!(reason.contains(why), "{case}: {reason}");
+    }
+}
+
+/// An aggregate member that names no cluster yet is accepted, as Envoy
+/// does: a delta update or TTL expiry can remove a member before the
+/// aggregate naming it, and refusing that would wedge every later update.
+#[tokio::test]
+async fn a_cds_aggregate_naming_a_cluster_not_yet_delivered_is_accepted() {
+    let (publish, _) = recording_publisher();
+    let mut applier = ResourceApplier::new(empty_base(), publish);
+    let resp = cds_response(
+        "v1",
+        &[
+            minimal_cluster("a", 8080),
+            aggregate_cluster("agg", &["a", "later"]),
+        ],
+    );
+    assert_eq!(applier.on_response(&resp).await, Verdict::Accept);
+    assert!(applier.current().clusters.contains_key("agg"));
+}
+
+/// AGENTS.md invariant 7 on the xDS path: an aggregate failing over from an
+/// OpenAI-dialect member to an Anthropic-dialect member is NACKed. The same
+/// aggregate over one dialect is accepted, so the NACK is about the dialect.
+#[tokio::test]
+async fn a_cds_aggregate_across_usage_dialects_is_nacked() {
+    let good = cds_response(
+        "v1",
+        &[
+            cluster_speaking("openai-a", 8080, "openai"),
+            cluster_speaking("openai-b", 8081, "openai"),
+            aggregate_cluster("agg", &["openai-a", "openai-b"]),
+        ],
+    );
+    let bad = cds_response(
+        "v2",
+        &[
+            cluster_speaking("openai-a", 8080, "openai"),
+            cluster_speaking("anthropic", 8081, "anthropic"),
+            aggregate_cluster("agg", &["openai-a", "anthropic"]),
+        ],
+    );
+    let reason = assert_nacked_and_last_good_kept(
+        &good,
+        &bad,
+        "cds.clusters[agg].cluster_type.typed_config.clusters[1]",
+    )
+    .await;
+    assert!(reason.contains("invariant 7"), "{reason}");
+}
+
+/// Two listeners configuring `llmproxy.auth` under one `stat_prefix` are
+/// NACKed even while both still wait on RDS: they go live when routes
+/// arrive, with no further LDS response to refuse.
+#[tokio::test]
+async fn lds_listeners_sharing_an_auth_stat_prefix_are_nacked() {
+    let good = lds_response(
+        "v1",
+        &[authenticated_rds_listener("first", "routes", 10000)],
+    );
+    let bad = lds_response(
+        "v2",
+        &[
+            authenticated_rds_listener("first", "routes", 10000),
+            authenticated_rds_listener("second", "routes", 10001),
+        ],
+    );
+    let reason = assert_nacked_and_last_good_kept(
+        &good,
+        &bad,
+        "lds.listeners[second].filter_chains[0].filters[0].typed_config.stat_prefix",
+    )
+    .await;
+    assert!(reason.contains("duplicate stat_prefix"), "{reason}");
+}

@@ -120,13 +120,9 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         return Ok(snapshot);
     };
 
-    // Auth stat prefixes must be unique across listeners for admin addressing.
-    let mut seen_stat_prefixes: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
     for (i, l) in sr.listeners.iter().enumerate() {
         let path = format!("static_resources.listeners[{i}]");
         let ir = convert_listener(l, &path)?;
-        check_admin_addressable_stat_prefixes(&ir, &path, &mut seen_stat_prefixes)?;
         if snapshot
             .listeners
             .insert(ir.name.clone(), Arc::new(ir))
@@ -153,7 +149,26 @@ pub fn build_snapshot(loaded: &LoadedBootstrap) -> Result<ConfigSnapshot, Config
         }
     }
     // Validate references after all clusters exist; members may be declared later.
-    validate_cluster_graph(sr, &snapshot)?;
+    let cluster_roots = sr.clusters.iter().enumerate().map(|(i, c)| {
+        let ir = snapshot
+            .clusters
+            .get(&c.name)
+            .expect("every sr.clusters entry was inserted under its name; a duplicate returned");
+        (format!("static_resources.clusters[{i}]"), ir.as_ref())
+    });
+    let listener_roots = sr.listeners.iter().enumerate().map(|(i, l)| {
+        let ir = snapshot
+            .listeners
+            .get(&l.name)
+            .expect("every sr.listeners entry was inserted under its name; a duplicate returned");
+        (format!("static_resources.listeners[{i}]"), ir.as_ref())
+    });
+    validate_cross_resource(
+        &snapshot.clusters,
+        cluster_roots,
+        listener_roots,
+        DanglingClusterRefs::Reject,
+    )?;
 
     // ADS cluster references must resolve against the complete static cluster map.
     if let Some(ads) = &ads_pending {
@@ -447,6 +462,11 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
         // `buffer_factory_config`) is refused by this allow-list.
         "envoy.config.overload.v3.OverloadManager" => &["resource_monitors"],
         "envoy.config.overload.v3.ResourceMonitor" => &["name", "typed_config"],
+        // `Node.id` and `Node.cluster` identify this proxy to the ADS
+        // server; `metadata` carries the `io.llmproxy.*` namespaces. Every
+        // other field (`locality`, `user_agent_*`, `extensions`,
+        // `client_features`, ...) would load and do nothing.
+        "envoy.config.core.v3.Node" => &["id", "cluster", "metadata"],
         "envoy.config.bootstrap.v3.Bootstrap.DynamicResources" => {
             &["lds_config", "cds_config", "ads_config"]
         }
@@ -4551,18 +4571,62 @@ fn convert_eds_cluster_config(
     Ok(EdsClusterConfig { service_name })
 }
 
+/// Whether a cross-resource check rejects a reference to a cluster that is
+/// not in the map it checks against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DanglingClusterRefs {
+    /// Static bootstrap: every cluster is in one file, so a name that
+    /// resolves to nothing is a typo.
+    Reject,
+    /// xDS: Envoy resolves aggregate members and other cluster names when
+    /// a request uses them, and a delta update or a TTL expiry can remove a
+    /// member before the aggregate that names it. A dangling name is
+    /// skipped here, as before; only checks that a removal cannot cause run.
+    Tolerate,
+}
+
+/// The cross-resource checks that a single resource's lowering cannot do:
+/// the cluster graph ([`validate_cluster_graph`]) and the uniqueness of
+/// admin-addressable `stat_prefix`es across listeners
+/// ([`check_admin_addressable_stat_prefixes`]).
+///
+/// `build_snapshot` runs them over the static resources. The xDS applier
+/// runs them over the static base plus every staged dynamic resource
+/// before it publishes, and NACKs the whole response on an error, so CDS
+/// and LDS cannot install a graph a bootstrap could not load.
+///
+/// `clusters` is every cluster a reference may resolve to. `cluster_roots`
+/// and `listener_roots` are the resources to check, each with the dotted
+/// path an error names; a listener's `stat_prefix` is compared with every
+/// listener before it in `listener_roots`, so list the ones already
+/// accepted first.
+pub fn validate_cross_resource<'a>(
+    clusters: &std::collections::HashMap<ClusterName, Arc<ClusterConfig>>,
+    cluster_roots: impl IntoIterator<Item = (String, &'a ClusterConfig)>,
+    listener_roots: impl IntoIterator<Item = (String, &'a ListenerConfig)>,
+    dangling: DanglingClusterRefs,
+) -> Result<(), ConfigError> {
+    validate_cluster_graph(clusters, cluster_roots, dangling)?;
+    let mut seen_stat_prefixes = std::collections::HashMap::new();
+    for (path, listener) in listener_roots {
+        check_admin_addressable_stat_prefixes(listener, &path, &mut seen_stat_prefixes)?;
+    }
+    Ok(())
+}
+
 /// A cross-cluster post-pass over the assembled
 /// cluster map, checking that every aggregate's members are wired correctly.
 /// It cannot run inside `build_snapshot`'s per-cluster loop -- a member
 /// cluster may be declared *after* the aggregate that names it, and
 /// declaration order must not matter, so the whole map has to exist first.
 ///
-/// For every `ClusterKind::Aggregate`, walks its `members` in listed order
-/// and rejects the first of:
+/// For every `ClusterKind::Aggregate` in `roots`, walks its `members` in
+/// listed order and rejects the first of:
 /// - the aggregate naming itself (checked before the nested-aggregate check
 ///   below, so the error says plainly "names itself" rather than the more
 ///   confusing "member `agg` is itself an aggregate")
-/// - a member naming no cluster in the snapshot ("unknown cluster")
+/// - a member naming no cluster in `clusters` ("unknown cluster"), under
+///   [`DanglingClusterRefs::Reject`] only
 /// - a member whose own `kind` is `Aggregate` -- aggregates cannot nest;
 ///   `ClusterHandle::select_aggregate_member` (`proxy-cluster/src/manager.rs`)
 ///   deliberately refuses to recurse into one, so that member would be
@@ -4570,25 +4634,24 @@ fn convert_eds_cluster_config(
 /// - a duplicate member name within one aggregate -- always a runtime no-op,
 ///   since `LoadBalancerContext::attempted_clusters` skips a cluster already
 ///   tried this request
+/// - a member whose usage dialect differs from an earlier member's
+///   (AGENTS.md invariant 7): a fallback would send one dialect's request
+///   body to an upstream that speaks another, and parse its usage with the
+///   wrong parser. A member that declares no dialect is not compared.
 ///
 /// AGENTS.md invariant 1's shape exactly: each of these degrades into a silent
 /// runtime no-op (a 503 with no explanation, or a fallback that never
 /// receives traffic) instead of a config-time error, unless caught here.
 ///
-/// Rust note: `sr.clusters` (the original proto list) is re-walked with
-/// `enumerate()` rather than iterating `snapshot.clusters` (a `HashMap`,
-/// keyed by name) so the error path can report the aggregate's original
-/// config index -- the name-keyed IR map has already forgotten it, and a
-/// `HashMap`'s iteration order is unspecified besides.
-fn validate_cluster_graph(
-    sr: &proxy_api::envoy::config::bootstrap::v3::bootstrap::StaticResources,
-    snapshot: &ConfigSnapshot,
+/// Rust note: `roots` carries each cluster's error path because the
+/// name-keyed `HashMap` has forgotten the config index a bootstrap error
+/// names, and its iteration order is unspecified besides.
+fn validate_cluster_graph<'a>(
+    clusters: &std::collections::HashMap<ClusterName, Arc<ClusterConfig>>,
+    roots: impl IntoIterator<Item = (String, &'a ClusterConfig)>,
+    dangling: DanglingClusterRefs,
 ) -> Result<(), ConfigError> {
-    for (i, c) in sr.clusters.iter().enumerate() {
-        let ir = snapshot
-            .clusters
-            .get(&c.name)
-            .expect("build_snapshot just inserted every sr.clusters entry by this same name");
+    for (root, ir) in roots {
         // A minted credential's token endpoint is dialled through a named cluster; one that names nothing
         // would refuse every request to this provider at runtime.
         if let Some(ProviderCredential::OAuth2JwtBearer(oauth2)) = ir
@@ -4597,12 +4660,14 @@ fn validate_cluster_graph(
             .and_then(|runtime| runtime.credential.as_ref())
         {
             let path = format!(
-                "static_resources.clusters[{i}].metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"].oauth2_jwt_bearer.token_cluster"
+                "{root}.metadata.filter_metadata[\"{PROVIDER_AUTH_METADATA_KEY}\"].oauth2_jwt_bearer.token_cluster"
             );
-            if oauth2.token_cluster == c.name {
+            if oauth2.token_cluster == ir.name {
                 return Err(invalid(&path, "a cluster cannot be its own token cluster"));
             }
-            if !snapshot.clusters.contains_key(&oauth2.token_cluster) {
+            if dangling == DanglingClusterRefs::Reject
+                && !clusters.contains_key(&oauth2.token_cluster)
+            {
                 return Err(invalid(
                     &path,
                     format!("unknown cluster `{}`", oauth2.token_cluster),
@@ -4612,18 +4677,33 @@ fn validate_cluster_graph(
         let ClusterKind::Aggregate { members } = &ir.kind else {
             continue;
         };
-        let path = format!("static_resources.clusters[{i}].cluster_type.typed_config.clusters");
+        let path = format!("{root}.cluster_type.typed_config.clusters");
         let mut seen = std::collections::HashSet::new();
+        let mut first_dialect: Option<(&str, UsageDialect)> = None;
         for (j, member) in members.iter().enumerate() {
             let member_path = format!("{path}[{j}]");
-            if member == &c.name {
+            if member == &ir.name {
                 return Err(invalid(
                     &member_path,
-                    format!("aggregate cluster `{}` names itself as a member", c.name),
+                    format!("aggregate cluster `{}` names itself as a member", ir.name),
                 ));
             }
-            let Some(member_ir) = snapshot.clusters.get(member) else {
-                return Err(invalid(&member_path, format!("unknown cluster `{member}`")));
+            if !seen.insert(member.as_str()) {
+                return Err(invalid(
+                    &member_path,
+                    format!(
+                        "duplicate member `{member}` in aggregate cluster `{}`",
+                        ir.name
+                    ),
+                ));
+            }
+            let Some(member_ir) = clusters.get(member) else {
+                match dangling {
+                    DanglingClusterRefs::Reject => {
+                        return Err(invalid(&member_path, format!("unknown cluster `{member}`")));
+                    }
+                    DanglingClusterRefs::Tolerate => continue,
+                }
             };
             if matches!(member_ir.kind, ClusterKind::Aggregate { .. }) {
                 return Err(invalid(
@@ -4635,14 +4715,24 @@ fn validate_cluster_graph(
                     ),
                 ));
             }
-            if !seen.insert(member.as_str()) {
-                return Err(invalid(
-                    &member_path,
-                    format!(
-                        "duplicate member `{member}` in aggregate cluster `{}`",
-                        c.name
-                    ),
-                ));
+            let Some(dialect) = member_ir.usage_dialect else {
+                continue;
+            };
+            match first_dialect {
+                None => first_dialect = Some((member.as_str(), dialect)),
+                Some((first, first_dialect)) if first_dialect != dialect => {
+                    return Err(invalid(
+                        &member_path,
+                        format!(
+                            "member `{member}` speaks the {dialect:?} usage dialect, but member \
+                             `{first}` speaks {first_dialect:?}; a fallback across dialects \
+                             would send a request body the upstream cannot parse and read its \
+                             usage with the wrong parser, so cross-dialect fallback is rejected \
+                             (AGENTS.md invariant 7)"
+                        ),
+                    ));
+                }
+                Some(_) => {}
             }
         }
     }

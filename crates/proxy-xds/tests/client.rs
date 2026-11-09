@@ -831,3 +831,50 @@ async fn a_desired_names_change_sends_a_follow_up_request_after_the_triggering_a
     run.abort();
     harness.shutdown().await;
 }
+
+/// A response for a type this client never subscribed to is dropped, as
+/// Envoy's gRPC mux does, and the stream stays up. Failing the stream made
+/// the client reconnect every 0-500 ms forever, because the response had
+/// already reset the backoff. Proof the stream survived: a later CDS
+/// response on the same stream is ACKed, and nothing answered the EDS one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_for_an_unsubscribed_type_is_ignored_and_the_stream_stays_up() {
+    let harness = Harness::spawn(vec![
+        Step::Push {
+            type_url: EDS.to_string(),
+            version_info: "e1".to_string(),
+            nonce: "n0".to_string(),
+            resources: vec![],
+        },
+        Step::Send {
+            type_url: CDS.to_string(),
+            version_info: "v1".to_string(),
+            nonce: "n1".to_string(),
+            resources: vec![],
+        },
+    ])
+    .await
+    .expect("harness spawns");
+
+    let mut client = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+
+    let mut ads = AdsClient::new(vec![SubscriptionState::new(CDS, Subscription::Wildcard)]);
+    let run = tokio::spawn(async move {
+        ads.run_once(&mut client, &mut FnHandler(always_accept()))
+            .await
+    });
+
+    wait_for_log_len(&harness.log, 2).await;
+
+    let log = harness.log.snapshot();
+    assert_eq!(log.len(), 2, "only the CDS request and its ACK: {log:?}");
+    assert_eq!(log[1].kind(), RequestKind::Ack, "got {:?}", log[1]);
+    assert_eq!(log[1].type_url, CDS);
+    assert_eq!(log[1].response_nonce, "n1");
+    assert!(!run.is_finished(), "the stream must still be open");
+
+    run.abort();
+    harness.shutdown().await;
+}

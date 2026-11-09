@@ -250,3 +250,47 @@ async fn removed_resources_reach_handler_before_delta_ack() {
     assert!(requests[1].error_detail.is_none());
     harness.shutdown().await;
 }
+
+/// The delta twin of `client.rs`'s unsubscribed-type test: the response is
+/// dropped without a reply and the stream stays up instead of failing into
+/// a reconnect loop. This harness sends one response per stream and then
+/// waits for a reply, so a surviving stream shows as a pump still running
+/// at the deadline; the pre-fix pump returned an error at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delta_response_for_an_unsubscribed_type_is_ignored_and_the_stream_stays_up() {
+    const EDS: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
+    let harness = DeltaHarness::spawn(DeltaDiscoveryResponse {
+        type_url: EDS.to_string(),
+        nonce: "nonce-1".to_string(),
+        ..Default::default()
+    })
+    .await
+    .expect("delta harness spawns");
+    let mut grpc = AggregatedDiscoveryServiceClient::connect(format!("http://{}", harness.addr))
+        .await
+        .expect("client connects");
+    let mut client = DeltaAdsClient::new(vec![DeltaSubscriptionState::new(
+        CDS,
+        Subscription::Wildcard,
+    )]);
+    let handled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&handled);
+    let mut handler = FnDeltaHandler(Box::new(move |_| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Verdict::Accept
+    }));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.run_once(&mut grpc, &mut handler),
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the pump must keep the stream open, got {outcome:?}"
+    );
+    assert_eq!(handled.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let requests = harness.requests();
+    assert_eq!(requests.len(), 1, "no reply to the dropped response");
+    harness.shutdown().await;
+}
