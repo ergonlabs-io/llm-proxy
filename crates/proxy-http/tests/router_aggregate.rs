@@ -602,11 +602,23 @@ async fn build_failover_handler(
     retry_on: &str,
     num_retries: u32,
 ) -> FilterChainHandler {
+    build_failover_handler_with(a, b, retry_on, num_retries, |_| {}).await
+}
+
+/// [`build_failover_handler`] with `adjust` applied to the retry policy.
+async fn build_failover_handler_with(
+    a: SocketAddr,
+    b: SocketAddr,
+    retry_on: &str,
+    num_retries: u32,
+    adjust: impl FnOnce(&mut RetryPolicyIR),
+) -> FilterChainHandler {
     build_failover_handler_over(
         member_cluster("a", a, Vec::new()),
         member_cluster("b", b, Vec::new()),
         retry_on,
         num_retries,
+        adjust,
     )
     .await
 }
@@ -617,6 +629,7 @@ async fn build_failover_handler_over(
     b: ClusterConfig,
     retry_on: &str,
     num_retries: u32,
+    adjust: impl FnOnce(&mut RetryPolicyIR),
 ) -> FilterChainHandler {
     let manager = ClusterManager::with_default_transport(Arc::new(FakeResolver::new()));
     let mut snapshot: HashMap<ClusterName, Arc<ClusterConfig>> = HashMap::new();
@@ -627,6 +640,7 @@ async fn build_failover_handler_over(
     let mut fwd = forward_to_providers();
     let mut policy = retry_policy(retry_on, num_retries);
     policy.retriable_status_codes = vec![429];
+    adjust(&mut policy);
     fwd.retry_policy = Some(policy);
     let route_table = RouteTable::new(
         "test-routes".to_string(),
@@ -740,6 +754,47 @@ async fn exhausting_every_member_returns_the_last_upstream_response() {
         .await;
 }
 
+/// A `Retry-After` speaks for the provider that sent it. On an aggregate the
+/// retry goes to the next member, which has its own rate limit, so it does
+/// not wait: member `a`'s hour-long `Retry-After` under a 300 s cap must not
+/// delay the failover to `b`: the guard is far below the 300 s it would wait.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_after_from_one_member_does_not_delay_failover_to_the_next() {
+    use proxy_config::ir::{RateLimitedBackOff, ResetHeader, ResetHeaderFormat};
+    LocalSet::new()
+        .run_until(async {
+            let (a, _) = spawn_scripted_upstream(
+                b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 3600\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                false,
+            )
+            .await;
+            let (b, _) = spawn_scripted_upstream(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                false,
+            )
+            .await;
+            let handler = build_failover_handler_with(a, b, "retriable-status-codes", 1, |policy| {
+                policy.rate_limited_back_off = Some(Box::new(RateLimitedBackOff {
+                    reset_headers: vec![ResetHeader {
+                        name: http::HeaderName::from_static("retry-after"),
+                        format: ResetHeaderFormat::Seconds,
+                    }],
+                    max_interval: Duration::from_secs(300),
+                }));
+            })
+            .await;
+
+            let resp = tokio::time::timeout(
+                Duration::from_secs(30),
+                handler.handle(request("/v1/chat/completions")),
+            )
+            .await
+            .expect("the failover waited on a's Retry-After");
+            assert_eq!(resp.head.status, StatusCode::OK);
+        })
+        .await;
+}
+
 /// A failed attempt whose body never ends must not stall or grow the proxy:
 /// the drain is capped, the attempt is abandoned (its connection closed, which
 /// ends the upstream's writer), and the retry reaches the healthy member.
@@ -797,7 +852,7 @@ async fn a_returned_held_response_keeps_its_members_permit() {
             a.circuit_breakers.default.max_requests = 1;
             let mut b = member_cluster("b", a_addr, Vec::new());
             b.endpoints.clear();
-            let handler = build_failover_handler_over(a, b, "5xx", 1).await;
+            let handler = build_failover_handler_over(a, b, "5xx", 1, |_| {}).await;
 
             let first = tokio::time::timeout(
                 Duration::from_secs(10),

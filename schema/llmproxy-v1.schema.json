@@ -1143,13 +1143,13 @@
           "description": "Where matching requests go. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`."
         },
         "fallbacks": {
-          "description": "Tried in order when the primary provider fails (connection failure, a connection reset before the request was fully sent, or a 429, 500, 502 or 503 response — never after the provider received the whole request and then closed the connection, and never after the first response byte of a stream has been sent to the client), or when the primary's credential cannot be applied (no unexpired minted token, a failed Bedrock signature). A credential failure moves to the next provider without using a retry. Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
+          "description": "Tried in order when the primary provider fails (connection failure, a connection reset before the request was fully sent, a status in `retries.on_status` (default 429, 500, 502 or 503), or no response headers within `retries.per_try_timeout` — never after the provider received the whole request and then closed the connection, and never after the first response byte of a stream has been sent to the client), or when the primary's credential cannot be applied (no unexpired minted token, a failed Bedrock signature). A credential failure moves to the next provider without using a retry. Each fallback gets a fresh attempt with the same request body. Every fallback must speak the same dialect as the primary; a mismatch is a load error. The `provider/model` form does not rewrite the model yet; see `ProviderModelRef`.",
           "type": "array",
           "items": { "$ref": "#/$defs/ProviderModelRef" }
         },
         "retries": {
           "type": "object",
-          "description": "Retry policy for this route. A retry fires on a connection failure, a refused HTTP/2 stream, a connection reset before the request was fully sent, or a 429, 500, 502 or 503 response. A connection that closes after the provider received the whole request is not retried, because the provider can already be generating a response and a second attempt can be billed again. A request is never replayed once streaming to the client has begun. NOT a separate budget from `fallbacks` -- both draw on one retry count, and each retry against a fallback chain moves to the NEXT member rather than repeating the primary.",
+          "description": "Retry policy for this route. A retry fires on a connection failure, a refused HTTP/2 stream, a connection reset before the request was fully sent, a status listed in `on_status` (default 429, 500, 502 or 503), or an attempt that passes `per_try_timeout`. A connection that closes after the provider received the whole request is not retried, because the provider can already be generating a response and a second attempt can be billed again. A request is never replayed once streaming to the client has begun. NOT a separate budget from `fallbacks` -- both draw on one retry count, and each retry against a fallback chain moves to the NEXT member rather than repeating the primary.",
           "additionalProperties": false,
           "properties": {
             "attempts": {
@@ -1158,6 +1158,21 @@
               "maximum": 5,
               "default": 1,
               "description": "Extra attempts (0 disables retries). On a route with `fallbacks`, retries walk the chain instead of repeating the primary, and the emitted retry count is raised to whichever is larger -- this value, or the number needed to reach the last fallback -- so 0 does NOT disable failover there."
+            },
+            "per_try_timeout": {
+              "$ref": "#/$defs/Duration",
+              "description": "Longest wait for one attempt's response headers, from when the attempt is sent. On expiry the attempt is abandoned and the next attempt goes out (the next fallback, or the same provider again); with no attempt left the client gets a 504. Greater than 0 and at most 1h. Absent: no per-attempt limit. It does not bound the response body, so a streaming provider that sends headers before its first token is not cut by it. A timed-out attempt that the provider received in full is charged by that provider's `unanswered_usage`, because the provider can still be generating and billing it."
+            },
+            "on_status": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": { "type": "integer", "minimum": 400, "maximum": 599 },
+              "description": "Response statuses that move the request to its next attempt. Absent: 429, 500, 502 and 503. An empty list retries no status. Any 4xx or 5xx code may be listed (for example 504, or 529 for an overloaded provider); an unlisted status is returned to the client. Providers normally do not bill a 4xx answer, so retrying one does not charge twice. Not allowed with `attempts: 0` and no `fallbacks`, where it could never act."
+            },
+            "max_retry_after": {
+              "$ref": "#/$defs/Duration",
+              "description": "When a retried response carries `Retry-After` in seconds, wait that long (plus up to half again as jitter) before retrying the same provider, but never longer than this. Greater than 0 and at most 60s. Absent: `Retry-After` is ignored and the retry waits only the short exponential back-off. A `Retry-After` given as an HTTP date is ignored. Not allowed on a route with `fallbacks`, whose retries go to another provider, or with `attempts: 0`."
             }
           }
         },

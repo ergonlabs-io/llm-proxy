@@ -3,7 +3,7 @@ title: Timeouts and retries
 description: "Set request and idle timeouts, and configure when llm-proxy retries a failed provider request."
 summary: The timeouts a route and a listener have, exactly which failures
   trigger a retry, and what bounds a slow or silent provider.
-lastUpdated: 2026-10-21
+lastUpdated: 2026-11-09
 related:
   - providers/overview
   - providers-and-routing/failover-and-aggregates
@@ -51,13 +51,48 @@ cluster's concurrency permit. The default is long on purpose: a non-streaming
 generation sends nothing until it finishes. Lower it if you only serve
 streaming traffic.
 
-This cuts the request. It does not fail over to the next provider, because
-`routes[].retries` has no `per_try_timeout`. A hung provider therefore ends
-the request instead of moving to a fallback.
+This cuts the request. It does not fail over to the next provider. To fail
+over instead, set `routes[].retries.per_try_timeout` (next section).
 
 `listen.max_stream_duration` (default: no limit) bounds the whole life of a
 request, however active the stream is. Before response headers the proxy
 answers `504` (`UMSDR`). After headers the stream ends without a clean finish.
+
+## `per_try_timeout`: fail over when a provider does not answer
+
+Set per route (`routes[].retries.per_try_timeout`, no default, above `0` and
+at most `1h`). It bounds the wait for one attempt's response headers, from
+when the proxy sends the attempt. When it expires, the proxy abandons the
+attempt and sends the next one: the next provider in `fallbacks`, or the same
+provider again while `attempts` remain. With no attempt left, the client gets
+`504` (`upstream request timeout`, response flag `UT`) at once, instead of
+waiting for `stream_idle_timeout`. Each attempt gets the full timeout.
+
+```yaml
+routes:
+  - model: "gpt-*"
+    provider: openai
+    fallbacks: [azure]
+    retries: { per_try_timeout: 30s }
+```
+
+Choose a value above the longest time a healthy provider takes to send
+response headers. For a non-streaming request that is the whole generation
+time, because the provider sends nothing until it finishes.
+
+The timeout ends when response headers arrive. It does not bound the
+response body. A streaming provider that sends headers at once and then
+stalls before its first token is not cut by `per_try_timeout`; the route
+`idle_timeout` cuts that stream, and no failover occurs, because the client
+already has the headers.
+
+A timed-out attempt is charged. The provider received the whole request and
+can still be generating, and billing, a response nobody reads. The proxy
+charges that attempt by the provider's `unanswered_usage` (default `input`:
+the estimated input tokens), on top of the attempt that answered. Each
+attempt is charged at its own provider's rate card. Set `unanswered_usage:
+none` on the provider to charge nothing; the proxy then counts and logs the
+uncharged attempt.
 
 ## `connect_timeout`: bounds establishing the connection
 
@@ -81,8 +116,8 @@ an idle-based guard is the correct one for the response direction.
 ## What triggers a same-provider retry
 
 `routes[].retries.attempts` (default `1`, maximum `5`) sets how many extra
-attempts a route gets. Every retry in this configuration format's routes
-uses the same fixed trigger set. You cannot widen or narrow it:
+attempts a route gets. `routes[].retries.on_status` sets which response
+statuses are retried; the other triggers are fixed:
 
 | Outcome | Retried? |
 |---|---|
@@ -90,17 +125,37 @@ uses the same fixed trigger set. You cannot widen or narrow it:
 | h2 `REFUSED_STREAM` | Yes |
 | Connection reset before the provider received the whole request | Yes |
 | Connection reset after the provider received the whole request, before any response byte | **No** |
-| Response status `429` | Yes |
-| Response status `500`, `502`, `503` | Yes |
-| Response status `501`, `504`, or any other status | **No** |
+| No response headers within `per_try_timeout` (when set) | Yes |
+| A response status listed in `on_status` (default `429`, `500`, `502`, `503`) | Yes |
+| Any other response status | **No** |
 | Provider over its concurrency ceiling (the proxy answers `503` with the flag `UO`) | **No** |
 | Anything after the client has started receiving the stream | Never |
 
+```yaml
+routes:
+  - model: "claude-*"
+    provider: anthropic
+    fallbacks: [bedrock]
+    # Fail over on a gateway timeout and on a 529 (overloaded),
+    # but return a 429 to the client.
+    retries: { on_status: [500, 502, 503, 504, 529] }
+```
+
+`on_status` takes at most 16 codes from `400` to `599`, each once. An empty
+list retries no status. Absent, the list is `429, 500, 502, 503`. An unlisted
+status passes straight through to the client. On a route with
+`attempts: 0` and no `fallbacks` the field is a load error, because no retry
+can happen.
+
+Retrying a `4xx` answer is safe for billing in the normal case: providers do
+not bill a request they refused with a `4xx`. Check your provider's terms
+before you list a `4xx` other than `429`.
+
 The dialect uses the retry tokens `connect-failure`, `refused-stream`,
-`reset-before-request`, and `retriable-status-codes`, with the status list
-`429, 500, 502, 503`. It does not use the broad `5xx`, `gateway-error`, or
-`reset` tokens. A `501` or a `504` that a provider returns passes straight
-through and is not retried.
+`reset-before-request`, and `retriable-status-codes` (with the `on_status`
+list). It does not use the broad `5xx`, `gateway-error`, or `reset` tokens. A
+`per_try_timeout` is retried through a separate trigger, so setting it does
+not make a reset after the whole request was sent retriable.
 
 A connection that closes after the provider received the whole request is not
 retried. The provider can already be generating a response, and a second
@@ -134,6 +189,34 @@ defaults in this configuration format (there is no field to change
 them). The point of drawing a random delay rather than waiting exactly the
 cap is to keep clients that all failed at once from retrying in lockstep and
 hammering a struggling upstream on a fixed beat.
+
+## `max_retry_after`: wait for a rate-limited provider
+
+By default the proxy ignores `Retry-After`, so a `429` on a route with no
+`fallbacks` is retried against the same provider after the short back-off
+above, and that retry usually gets another `429`. Set
+`routes[].retries.max_retry_after` (above `0`, at most `60s`) to honour the
+header:
+
+```yaml
+routes:
+  - model: "gpt-*"
+    provider: openai
+    retries: { attempts: 2, max_retry_after: 10s }
+```
+
+When a response that is retried carries `Retry-After` as a number of seconds,
+the proxy waits that long, plus a random extra of up to half the value so
+that clients do not retry together, but never longer than `max_retry_after`.
+A longer `Retry-After` waits `max_retry_after`. A `Retry-After` given as an
+HTTP date, or a missing header, gives the normal back-off. The wait is a
+timer: it holds the client request, not a proxy thread.
+
+The field is a load error on a route with `fallbacks`: each retry there goes to
+the next provider, which has its own rate limit, so the proxy never waits on
+the previous provider's `Retry-After`. It is also a load error with
+`attempts: 0`. When no retry remains, the client gets the provider's response
+with its `Retry-After` unchanged.
 
 ## What the client sees when the provider resets before any response byte
 
@@ -185,8 +268,19 @@ non-obvious case where `attempts: 0` does *not* disable failover.
 
 This section is for maintainers.
 
-- Dialect retry tokens and the fixed status list: `lower_route` in
-  `crates/proxy-simple-config/src/lower.rs`. Dialect timeout defaults:
+- Dialect retry tokens and the default status list: `lower_retry_policy` in
+  `crates/proxy-simple-config/src/lower.rs`; field bounds: `validate_retries`
+  in `crates/proxy-simple-config/src/parse.rs`, tests in
+  `crates/proxy-simple-config/tests/retries.rs`. Per-try timeout failover,
+  its charge and credential isolation:
+  `a_primary_that_never_answers_fails_over_at_the_per_try_timeout`, and
+  `on_status`: `on_status_decides_which_answers_fail_over`, both in
+  `crates/proxy/tests/partial_usage_e2e.rs`. `Retry-After`:
+  `rate_limited_delay` in `crates/proxy-http/src/retry.rs`,
+  `retry_after_sets_the_wait_before_the_retry_and_is_capped` in
+  `router_retry.rs`, and
+  `a_retry_after_from_one_member_does_not_delay_failover_to_the_next` in
+  `router_aggregate.rs`. Dialect timeout defaults:
   `crates/proxy-simple-config/src/model.rs`. The retry engine's trigger set:
   unit tests in `crates/proxy-http/src/retry.rs`, for example
   `gateway_error_is_502_503_504_or_no_response_only` (504 needs the

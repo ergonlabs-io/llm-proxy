@@ -975,8 +975,13 @@ fn allowed_fields(message: &str) -> Option<&'static [&'static str]> {
             "retry_back_off",
             "host_selection_retry_max_attempts",
             "retry_host_predicate",
+            "rate_limited_retry_back_off",
         ],
         "envoy.config.route.v3.RetryPolicy.RetryHostPredicate" => &["name", "typed_config"],
+        "envoy.config.route.v3.RetryPolicy.RateLimitedRetryBackOff" => {
+            &["reset_headers", "max_interval"]
+        }
+        "envoy.config.route.v3.RetryPolicy.ResetHeader" => &["name", "format"],
         "envoy.config.route.v3.RetryPolicy.RetryBackOff" => &["base_interval", "max_interval"],
         "envoy.config.route.v3.HedgePolicy" => &[
             "initial_requests",
@@ -5692,6 +5697,57 @@ fn convert_selection_metadata(
     }
 }
 
+/// Namespace for retry triggers Envoy has no `retry_on` token for
+/// (`envoy-divergences.md`, per-try timeout retry row).
+const RETRY_METADATA_KEY: &str = "io.llmproxy.retry";
+
+/// Read `Route.metadata.filter_metadata["io.llmproxy.retry"]`.
+///
+/// The only accepted form is `{ retry_on_per_try_timeout: true }`: a per-try
+/// timeout is retried without `reset`, which would also resend a request the
+/// provider received in full and then reset. Any other key or value is
+/// refused with its path.
+fn convert_retry_metadata(
+    metadata: Option<&core_v3::Metadata>,
+    path: &str,
+) -> Result<bool, ConfigError> {
+    let Some(retry) = metadata.and_then(|m| m.filter_metadata.get(RETRY_METADATA_KEY)) else {
+        return Ok(false);
+    };
+    let retry_path = format!("{path}.metadata.filter_metadata[\"{RETRY_METADATA_KEY}\"]");
+    let mut unknown: Vec<&String> = retry
+        .fields
+        .keys()
+        .filter(|k| k.as_str() != "retry_on_per_try_timeout")
+        .collect();
+    unknown.sort();
+    if let Some(key) = unknown.first() {
+        return Err(unsupported(
+            format!("{retry_path}.{key}"),
+            format!("`{RETRY_METADATA_KEY}` only supports `retry_on_per_try_timeout: true`"),
+        ));
+    }
+    match retry
+        .fields
+        .get("retry_on_per_try_timeout")
+        .and_then(|v| v.kind.as_ref())
+    {
+        Some(prost_types::value::Kind::BoolValue(true)) => Ok(true),
+        Some(prost_types::value::Kind::BoolValue(false)) => Err(invalid(
+            format!("{retry_path}.retry_on_per_try_timeout"),
+            "must be true; omit `io.llmproxy.retry` to leave per-try timeouts to `retry_on`",
+        )),
+        Some(_) => Err(invalid(
+            format!("{retry_path}.retry_on_per_try_timeout"),
+            "must be a boolean",
+        )),
+        None => Err(invalid(
+            format!("{retry_path}.retry_on_per_try_timeout"),
+            "is required",
+        )),
+    }
+}
+
 /// Read `Route.metadata.filter_metadata["io.llmproxy.streaming"]`.
 ///
 /// The only accepted form is `{ strict: true }`.  `false` is rejected instead
@@ -7076,6 +7132,22 @@ fn convert_route(
         }
     }
 
+    if convert_retry_metadata(r.metadata.as_ref(), path)? {
+        let metadata_path = format!("{path}.metadata.filter_metadata[\"{RETRY_METADATA_KEY}\"]");
+        match &mut action {
+            RouteActionIR::Forward(ForwardAction {
+                retry_policy: Some(retry),
+                ..
+            }) if retry.per_try_timeout.is_some() => retry.retry_on_per_try_timeout = true,
+            _ => {
+                return Err(invalid(
+                    format!("{metadata_path}.retry_on_per_try_timeout"),
+                    "requires a route retry_policy with a per_try_timeout",
+                ))
+            }
+        }
+    }
+
     Ok(RouteEntry {
         name: (!r.name.is_empty()).then(|| r.name.clone()),
         matcher,
@@ -7534,7 +7606,57 @@ fn convert_retry_policy(
         host_selection_retry_max_attempts,
         avoid_previous_hosts,
         retry_on_per_try_timeout: false,
-        rate_limited_back_off: None,
+        rate_limited_back_off: rp
+            .rate_limited_retry_back_off
+            .as_ref()
+            .map(|rl| {
+                convert_rate_limited_back_off(rl, &format!("{path}.rate_limited_retry_back_off"))
+                    .map(Box::new)
+            })
+            .transpose()?,
+    })
+}
+
+/// Envoy's default `rate_limited_retry_back_off.max_interval`.
+const DEFAULT_RATE_LIMITED_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// S3.3 rate-limited back-off. The proto's own validation already refuses an
+/// empty `reset_headers` and a zero `max_interval` with their paths.
+fn convert_rate_limited_back_off(
+    rl: &route_v3::retry_policy::RateLimitedRetryBackOff,
+    path: &str,
+) -> Result<RateLimitedBackOff, ConfigError> {
+    use route_v3::retry_policy::ResetHeaderFormat as ProtoFormat;
+    let mut reset_headers = Vec::with_capacity(rl.reset_headers.len());
+    for (i, header) in rl.reset_headers.iter().enumerate() {
+        let header_path = format!("{path}.reset_headers[{i}]");
+        let name = http::HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
+            invalid(
+                format!("{header_path}.name"),
+                format!("`{}` is not a valid header name", header.name),
+            )
+        })?;
+        let format = match ProtoFormat::try_from(header.format) {
+            Ok(ProtoFormat::Seconds) => ResetHeaderFormat::Seconds,
+            Ok(ProtoFormat::UnixTimestamp) => ResetHeaderFormat::UnixTimestamp,
+            Err(_) => {
+                return Err(invalid(
+                    format!("{header_path}.format"),
+                    "must be SECONDS or UNIX_TIMESTAMP",
+                ))
+            }
+        };
+        reset_headers.push(ResetHeader { name, format });
+    }
+    let max_interval = rl
+        .max_interval
+        .as_ref()
+        .map(|d| to_std_duration(d, &format!("{path}.max_interval")))
+        .transpose()?
+        .unwrap_or(DEFAULT_RATE_LIMITED_MAX_INTERVAL);
+    Ok(RateLimitedBackOff {
+        reset_headers,
+        max_interval,
     })
 }
 

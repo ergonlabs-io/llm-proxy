@@ -379,6 +379,11 @@ fn validate_semantics(config: &SimpleConfig) -> Result<(), ConfigError> {
                     reason: "at most 5 retry attempts are allowed".to_string(),
                 });
             }
+            validate_retries(
+                retries,
+                !route.fallbacks.is_empty(),
+                &format!("routes[{i}].retries"),
+            )?;
         }
     }
 
@@ -1308,6 +1313,86 @@ fn check_route_ref_dialect(
 }
 
 /// Parse `host:port` (IPv6 in brackets) into (host, port).
+/// Longest `routes[].retries.per_try_timeout`.
+const MAX_PER_TRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Longest `routes[].retries.max_retry_after`: the wait holds the client, up
+/// to once per retry.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// Most entries in `routes[].retries.on_status`.
+const MAX_ON_STATUS: usize = 16;
+
+/// The bounds of `routes[].retries`' failover fields, each refused with its
+/// own dotted path. A field that could never act on this route is refused
+/// too (AGENTS.md invariant 1).
+fn validate_retries(
+    retries: &crate::model::Retries,
+    has_fallbacks: bool,
+    path: &str,
+) -> Result<(), ConfigError> {
+    let invalid = |field: String, reason: &str| ConfigError::InvalidValue {
+        field_path: field,
+        reason: reason.to_string(),
+    };
+    // The emitted retry count (see `lower_route`): fallbacks raise it.
+    let retries_possible = retries.attempts > 0 || has_fallbacks;
+    if let Some(timeout) = retries.per_try_timeout {
+        if timeout.0.is_zero() || timeout.0 > MAX_PER_TRY_TIMEOUT {
+            return Err(invalid(
+                format!("{path}.per_try_timeout"),
+                "must be greater than 0 and at most 1h",
+            ));
+        }
+    }
+    if let Some(codes) = &retries.on_status {
+        if codes.len() > MAX_ON_STATUS {
+            return Err(invalid(
+                format!("{path}.on_status"),
+                "at most 16 status codes are allowed",
+            ));
+        }
+        for (j, code) in codes.iter().enumerate() {
+            if !(400..=599).contains(code) {
+                return Err(invalid(
+                    format!("{path}.on_status[{j}]"),
+                    "must be a 4xx or 5xx status (400-599)",
+                ));
+            }
+            if codes[..j].contains(code) {
+                return Err(invalid(format!("{path}.on_status[{j}]"), "is listed twice"));
+            }
+        }
+        if !retries_possible {
+            return Err(invalid(
+                format!("{path}.on_status"),
+                "has no effect with `attempts: 0` and no `fallbacks`",
+            ));
+        }
+    }
+    if let Some(wait) = retries.max_retry_after {
+        if wait.0.is_zero() || wait.0 > MAX_RETRY_AFTER {
+            return Err(invalid(
+                format!("{path}.max_retry_after"),
+                "must be greater than 0 and at most 60s",
+            ));
+        }
+        if has_fallbacks {
+            return Err(invalid(
+                format!("{path}.max_retry_after"),
+                "has no effect on a route with `fallbacks`: each retry moves to the next \
+                 provider, which has its own rate limit, so it never waits on the last one's \
+                 Retry-After",
+            ));
+        }
+        if !retries_possible {
+            return Err(invalid(
+                format!("{path}.max_retry_after"),
+                "has no effect with `attempts: 0`",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_host_port(s: &str, path: &str) -> Result<(String, u16), ConfigError> {
     let bad = |reason: String| ConfigError::InvalidValue {
         field_path: path.to_string(),

@@ -519,7 +519,15 @@ fn every_strict_model_type_is_paired_with_a_schema_location() {
 fn the_probe_reads_serdes_accepted_field_list() {
     assert_eq!(
         parser_fields::<Retries>(),
-        BTreeSet::from(["attempts".to_owned()])
+        BTreeSet::from(
+            [
+                "attempts",
+                "max_retry_after",
+                "on_status",
+                "per_try_timeout"
+            ]
+            .map(str::to_owned)
+        )
     );
     assert_eq!(parser_fields::<InMemoryStore>(), BTreeSet::new());
     assert_eq!(

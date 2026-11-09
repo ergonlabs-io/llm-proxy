@@ -1107,6 +1107,84 @@ fn retry_policy_with_per_try_timeout(
     }
 }
 
+/// An upstream that answers its first request `429` with `retry-after:
+/// <retry_after>` and every later request `200`, counting requests.
+async fn spawn_upstream_rate_limits_once(
+    retry_after: &'static str,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_task = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let attempt = count_task.fetch_add(1, Ordering::SeqCst);
+            let _ = read_one_request(&mut stream).await;
+            let response = if attempt == 0 {
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: {retry_after}\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+            };
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    (addr, count)
+}
+
+/// S3.3 rate-limited back-off on a plain cluster: the retry after a `429`
+/// waits at least what `Retry-After` asks, and a value far above
+/// `max_interval` waits the cap, not the hour it asks for. The exact wait,
+/// jitter included, is pinned by `retry::tests`; here only bounds a loaded
+/// box cannot miss are asserted: the lower bound (the exponential back-off
+/// alone is microseconds) and a guard far below the uncapped wait.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_after_sets_the_wait_before_the_retry_and_is_capped() {
+    use proxy_config::ir::{RateLimitedBackOff, ResetHeader, ResetHeaderFormat};
+    for (retry_after, max) in [
+        ("1", Duration::from_secs(60)),
+        ("3600", Duration::from_secs(1)),
+    ] {
+        LocalSet::new()
+            .run_until(async {
+                let (addr, count) = spawn_upstream_rate_limits_once(retry_after).await;
+                let mut policy = retry_policy("retriable-status-codes", 1);
+                policy.retriable_status_codes = vec![429];
+                policy.rate_limited_back_off = Some(Box::new(RateLimitedBackOff {
+                    reset_headers: vec![ResetHeader {
+                        name: http::HeaderName::from_static("retry-after"),
+                        format: ResetHeaderFormat::Seconds,
+                    }],
+                    max_interval: max,
+                }));
+                let router = build_router(addr, forward_to_up(Some(policy))).await;
+
+                let start = std::time::Instant::now();
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    router.handle(request("/v1/chat")),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("Retry-After {retry_after}: the wait was not capped"));
+                assert_eq!(
+                    resp.head.status,
+                    StatusCode::OK,
+                    "Retry-After {retry_after}"
+                );
+                assert_eq!(count.load(Ordering::SeqCst), 2, "Retry-After {retry_after}");
+                assert!(
+                    start.elapsed() >= Duration::from_secs(1),
+                    "Retry-After {retry_after} with cap {max:?} retried after {:?}",
+                    start.elapsed()
+                );
+            })
+            .await;
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn per_try_timeout_abandons_a_stalling_attempt_and_the_retry_succeeds() {
     tokio::time::timeout(Duration::from_secs(2), async {

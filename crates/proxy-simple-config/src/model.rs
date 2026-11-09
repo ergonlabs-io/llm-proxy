@@ -1181,7 +1181,27 @@ pub enum StreamingMode {
 #[serde(deny_unknown_fields)]
 pub struct Retries {
     /// Extra attempts against the primary provider; 0 disables. Max 5.
+    #[serde(default = "default_retry_attempts")]
     pub attempts: u32,
+    /// Time from sending an attempt to its response headers before the
+    /// attempt is abandoned and the next one (the next fallback, or the same
+    /// provider again) goes out. Absent: no per-attempt limit.
+    #[serde(default)]
+    pub per_try_timeout: Option<SimpleDuration>,
+    /// Response statuses that move the request to its next attempt. Absent:
+    /// 429, 500, 502 and 503. Empty: no status retries.
+    #[serde(default)]
+    pub on_status: Option<Vec<u16>>,
+    /// Honour a `Retry-After` header (in seconds) on a retried response, up
+    /// to this long, before the retry to the same provider. Absent: the
+    /// header is ignored.
+    #[serde(default)]
+    pub max_retry_after: Option<SimpleDuration>,
+}
+
+/// The schema's documented default for `routes[].retries.attempts`.
+fn default_retry_attempts() -> u32 {
+    1
 }
 
 #[derive(Debug, Deserialize)]

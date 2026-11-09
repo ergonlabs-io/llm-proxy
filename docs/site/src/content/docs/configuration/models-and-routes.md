@@ -102,6 +102,9 @@ specificity. Put specific patterns above broad ones.
 | `provider` | string | required | A key in `providers`. |
 | `fallbacks` | list of strings | none | Providers to try, in order, when the first provider fails. |
 | `retries.attempts` | integer, 0 to 5 | `1` | Extra attempts. A value above 5 is a load error. |
+| `retries.per_try_timeout` | duration, above 0 and at most `1h` | none | Longest wait for one attempt's response headers. On expiry the next attempt goes out. |
+| `retries.on_status` | list of 400 to 599, at most 16 | `[429, 500, 502, 503]` | Response statuses that move the request to its next attempt. |
+| `retries.max_retry_after` | duration, above 0 and at most `60s` | none | Honour `Retry-After` up to this long before a retry to the same provider. Not allowed with `fallbacks`. |
 | `idle_timeout` | duration | `90s` | Maximum time with no bytes flowing. There is no total timeout. |
 | `streaming` | `strict` | unset | Fail the load if a filter can buffer a response on this route. |
 
@@ -153,8 +156,9 @@ provider in the chain.
   number of fallbacks. So `retries.attempts: 0` does not turn off failover on
   a route that has fallbacks.
 - The proxy retries on a connection failure, a refused stream, a reset
-  before the provider received the whole request, and the status codes 429,
-  500, 502, and 503.
+  before the provider received the whole request, the status codes in
+  `retries.on_status` (default 429, 500, 502, and 503), and an attempt that
+  passes `retries.per_try_timeout`.
 
 See [Failover and aggregates](/docs/llm-proxy/providers-and-routing/failover-and-aggregates/)
 for the runtime behavior.

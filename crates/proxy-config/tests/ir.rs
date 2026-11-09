@@ -362,6 +362,144 @@ fn hedge_on_per_try_timeout_lowers_into_the_retry_policy() {
     assert_eq!(policy.per_try_timeout, Some(Duration::from_millis(50)));
 }
 
+/// Route metadata `io.llmproxy.retry` makes a per-try timeout retriable on
+/// its own, and `rate_limited_retry_back_off` lowers its reset headers in
+/// order with their formats, `max_interval` defaulting to Envoy's 300 s.
+#[test]
+fn per_try_timeout_trigger_and_rate_limited_back_off_lower_into_the_retry_policy() {
+    let snapshot = hcm_snapshot(
+        r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          metadata:
+                            filter_metadata:
+                              io.llmproxy.retry: { retry_on_per_try_timeout: true }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "reset-before-request"
+                              per_try_timeout: 2s
+                              rate_limited_retry_back_off:
+                                reset_headers:
+                                  - { name: Retry-After, format: SECONDS }
+                                  - { name: X-RateLimit-Reset, format: UNIX_TIMESTAMP }
+                        - match: { prefix: "/b" }
+                          route:
+                            cluster: c
+                            retry_policy:
+                              retry_on: "reset-before-request"
+                              rate_limited_retry_back_off:
+                                reset_headers: [{ name: retry-after }]
+                                max_interval: 10s
+"#,
+    );
+    let table = route_table(&snapshot);
+    let policy = |i: usize| {
+        let RouteActionIR::Forward(f) = &table.virtual_hosts[0].routes[i].action else {
+            panic!("expected forward");
+        };
+        f.retry_policy.as_ref().expect("retry policy")
+    };
+    assert!(policy(0).retry_on_per_try_timeout);
+    assert_eq!(
+        policy(0).rate_limited_back_off,
+        Some(Box::new(RateLimitedBackOff {
+            reset_headers: vec![
+                ResetHeader {
+                    name: http::HeaderName::from_static("retry-after"),
+                    format: ResetHeaderFormat::Seconds,
+                },
+                ResetHeader {
+                    name: http::HeaderName::from_static("x-ratelimit-reset"),
+                    format: ResetHeaderFormat::UnixTimestamp,
+                },
+            ],
+            max_interval: Duration::from_secs(300),
+        }))
+    );
+    assert!(!policy(1).retry_on_per_try_timeout);
+    assert_eq!(
+        policy(1)
+            .rate_limited_back_off
+            .as_ref()
+            .map(|b| b.max_interval),
+        Some(Duration::from_secs(10))
+    );
+}
+
+/// AGENTS.md invariant 1: every malformed form of the two retry extensions
+/// is a load error naming its own dotted path.
+#[test]
+fn malformed_retry_extensions_are_rejected_with_their_path() {
+    let route = |metadata: &str, retry_policy: &str| {
+        format!(
+            r#"
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          metadata: {{ filter_metadata: {{ {metadata} }} }}
+                          route:
+                            cluster: c
+                            retry_policy: {{ retry_on: "reset-before-request"{retry_policy} }}
+"#
+        )
+    };
+    let meta = "metadata.filter_metadata[\"io.llmproxy.retry\"]";
+    for (metadata, retry_policy, path) in [
+        (
+            "io.llmproxy.retry: { retry_on_per_try_timeout: true }",
+            "",
+            format!("{meta}.retry_on_per_try_timeout"),
+        ),
+        (
+            "io.llmproxy.retry: { retry_on_per_try_timeout: false }",
+            ", per_try_timeout: 1s",
+            format!("{meta}.retry_on_per_try_timeout"),
+        ),
+        (
+            "io.llmproxy.retry: { retry_on_per_try_timeout: \"yes\" }",
+            ", per_try_timeout: 1s",
+            format!("{meta}.retry_on_per_try_timeout"),
+        ),
+        (
+            "io.llmproxy.retry: { retry_on_per_try_timeout: true, retry_on_reset: true }",
+            ", per_try_timeout: 1s",
+            format!("{meta}.retry_on_reset"),
+        ),
+        (
+            "",
+            ", rate_limited_retry_back_off: { reset_headers: [] }",
+            "retry_policy.rate_limited_retry_back_off.reset_headers".to_owned(),
+        ),
+        (
+            "",
+            ", rate_limited_retry_back_off: { reset_headers: [{ name: \"bad header\" }] }",
+            "retry_policy.rate_limited_retry_back_off.reset_headers[0].name".to_owned(),
+        ),
+        (
+            "",
+            ", rate_limited_retry_back_off: { reset_headers: [{ name: retry-after }], max_interval: 0s }",
+            "retry_policy.rate_limited_retry_back_off.max_interval".to_owned(),
+        ),
+        (
+            "",
+            ", rate_limited_retry_back_off: { reset_headers: [{ name: retry-after }], jitter: 1 }",
+            "rate_limited_retry_back_off.jitter".to_owned(),
+        ),
+    ] {
+        let message = hcm_snapshot_err(&route(metadata, retry_policy)).to_string();
+        assert!(
+            message.contains(&path),
+            "{metadata} {retry_policy}: expected `{path}` in: {message}"
+        );
+    }
+}
+
 #[test]
 fn hedge_on_per_try_timeout_requires_a_retriable_per_try_policy() {
     let err = hcm_snapshot_err(

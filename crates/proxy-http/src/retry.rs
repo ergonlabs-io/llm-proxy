@@ -139,7 +139,13 @@ fn trigger_fires(policy: &RetryPolicyIR, outcome: &AttemptOutcome) -> bool {
         // "read timeout before response" as a `reset` trigger too.
         // `connect-failure` deliberately does NOT fire here (it excludes
         // request timeout -- see `AttemptOutcome::ConnectFailure`'s doc).
-        AttemptOutcome::PerTryTimeout => on.five_xx || on.gateway_error || on.reset,
+        //
+        // `retry_on_per_try_timeout` (route metadata `io.llmproxy.retry`)
+        // retries a timeout without `reset`, which would also resend a
+        // request the provider received in full and then reset.
+        AttemptOutcome::PerTryTimeout => {
+            on.five_xx || on.gateway_error || on.reset || policy.retry_on_per_try_timeout
+        }
         // A pending-queue/CB overflow is answered with a synthesized 503
         // (S5), so it falls under the same "no response from upstream, but
         // Envoy would emit a 5xx" bucket as connect failures.
@@ -202,6 +208,47 @@ pub fn backoff_delay(
 
     let draw = rng().clamp(0.0, 1.0);
     cap.mul_f64(draw)
+}
+
+/// S3.3 rate-limited back-off: the wait a retried response asks for through
+/// one of `policy.rate_limited_back_off`'s reset headers, or `None` when no
+/// header is configured, present or parseable (the exponential back-off then
+/// applies).
+///
+/// Headers are tried in order and the first that parses wins; only its first
+/// value is read (Envoy). The interval gets Envoy's jitter, a draw from
+/// `[interval, 1.5 * interval]`, and the result is capped at `max_interval`.
+/// Envoy instead discards a header asking for more than `max_interval`
+/// (`envoy-divergences.md`, rate-limited back-off row): the header is only a
+/// hint, and discarding it would retry at once, which is what it asked the
+/// client not to do. A `UNIX_TIMESTAMP` already past waits zero.
+///
+/// `now_unix_secs` and `rng` are injected so tests can pin exact delays.
+pub fn rate_limited_delay(
+    policy: &RetryPolicyIR,
+    headers: &http::HeaderMap,
+    now_unix_secs: u64,
+    rng: &mut impl FnMut() -> f64,
+) -> Option<Duration> {
+    use proxy_config::ir::ResetHeaderFormat;
+    let back_off = policy.rate_limited_back_off.as_ref()?;
+    let interval = back_off.reset_headers.iter().find_map(|header| {
+        let value = headers.get(&header.name)?.to_str().ok()?.trim();
+        let n: u64 = value.parse().ok()?;
+        Some(match header.format {
+            ResetHeaderFormat::Seconds => n,
+            ResetHeaderFormat::UnixTimestamp => n.saturating_sub(now_unix_secs),
+        })
+    })?;
+    let max = back_off.max_interval;
+    let factor = 1.0 + 0.5 * rng().clamp(0.0, 1.0);
+    // `try_from_secs_f64` rather than `Duration::mul_f64`, which panics on
+    // overflow: a header can name up to `u64::MAX` seconds.
+    Some(
+        Duration::try_from_secs_f64(interval as f64 * factor)
+            .unwrap_or(max)
+            .min(max),
+    )
 }
 
 /// Per-request retry bookkeeping: how many retries have been spent against
@@ -280,6 +327,17 @@ impl<'a> RetryState<'a> {
     /// the retry about to be issued).
     pub fn backoff_delay(&self, rng: &mut impl FnMut() -> f64) -> Duration {
         backoff_delay(self.policy, self.attempts_used + 1, rng)
+    }
+
+    /// [`rate_limited_delay`] for this request's policy, read from the
+    /// response that is about to be retried.
+    pub fn rate_limited_delay(
+        &self,
+        headers: &http::HeaderMap,
+        now_unix_secs: u64,
+        rng: &mut impl FnMut() -> f64,
+    ) -> Option<Duration> {
+        rate_limited_delay(self.policy, headers, now_unix_secs, rng)
     }
 
     /// Record that a retry attempt was just issued, consuming one unit of
@@ -680,5 +738,130 @@ mod tests {
         state.record_attempt();
         state.mark_body_not_retriable();
         assert!(!state.retry_limit_exceeded(&AttemptOutcome::Response(500)));
+    }
+
+    // ------------------------------------------- per-try timeout trigger --
+
+    /// The dialect's triggers plus `retry_on_per_try_timeout`: a timeout is
+    /// retried, but a reset after the provider read the whole request still
+    /// is not. Adding `reset` instead would pass the first assertion and fail
+    /// the second.
+    #[test]
+    fn per_try_timeout_trigger_retries_the_timeout_but_not_a_reset_after_send() {
+        let mut p = policy("connect-failure,refused-stream,reset-before-request", 1);
+        assert!(!should_retry(&p, &AttemptOutcome::PerTryTimeout, 0));
+        p.retry_on_per_try_timeout = true;
+        assert!(should_retry(&p, &AttemptOutcome::PerTryTimeout, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::ResetAwaitingResponse, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::ResetAfterHeaders, 0));
+        assert!(!should_retry(&p, &AttemptOutcome::Response(504), 0));
+    }
+
+    // ------------------------------------------- rate-limited back-off --
+
+    fn rate_limited(max: Duration) -> RetryPolicyIR {
+        use proxy_config::ir::{RateLimitedBackOff, ResetHeader, ResetHeaderFormat};
+        let mut p = policy("retriable-status-codes", 1);
+        p.rate_limited_back_off = Some(Box::new(RateLimitedBackOff {
+            reset_headers: vec![
+                ResetHeader {
+                    name: http::HeaderName::from_static("retry-after"),
+                    format: ResetHeaderFormat::Seconds,
+                },
+                ResetHeader {
+                    name: http::HeaderName::from_static("x-ratelimit-reset"),
+                    format: ResetHeaderFormat::UnixTimestamp,
+                },
+            ],
+            max_interval: max,
+        }));
+        p
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(*name, http::HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn retry_after_seconds_wait_between_the_value_and_half_again() {
+        let p = rate_limited(Duration::from_secs(60));
+        let h = headers(&[("retry-after", "4")]);
+        assert_eq!(
+            rate_limited_delay(&p, &h, NOW, &mut || 0.0),
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(
+            rate_limited_delay(&p, &h, NOW, &mut || 1.0),
+            Some(Duration::from_secs(6))
+        );
+    }
+
+    /// Envoy discards a value above `max_interval`; this proxy caps it, so a
+    /// long `Retry-After` still waits, never longer than the cap, jitter
+    /// included.
+    #[test]
+    fn retry_after_above_the_cap_waits_exactly_the_cap() {
+        let p = rate_limited(Duration::from_secs(10));
+        for value in ["3600", "18446744073709551615"] {
+            let h = http::HeaderMap::from_iter([(
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderValue::from_str(value).unwrap(),
+            )]);
+            for draw in [0.0, 0.5, 1.0] {
+                assert_eq!(
+                    rate_limited_delay(&p, &h, NOW, &mut || draw),
+                    Some(Duration::from_secs(10)),
+                    "Retry-After {value}, draw {draw}"
+                );
+            }
+        }
+        // Jitter alone is capped too: 8s plus half again would be 12s.
+        let h = headers(&[("retry-after", "8")]);
+        assert_eq!(
+            rate_limited_delay(&p, &h, NOW, &mut || 1.0),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn reset_headers_are_tried_in_order_and_only_a_parseable_one_counts() {
+        let p = rate_limited(Duration::from_secs(60));
+        // The first configured header wins when both parse.
+        let both = headers(&[("retry-after", "2"), ("x-ratelimit-reset", "1800000030")]);
+        assert_eq!(
+            rate_limited_delay(&p, &both, NOW, &mut || 0.0),
+            Some(Duration::from_secs(2))
+        );
+        // An HTTP-date Retry-After does not parse; the timestamp is used.
+        let date = headers(&[
+            ("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("x-ratelimit-reset", "1800000030"),
+        ]);
+        assert_eq!(
+            rate_limited_delay(&p, &date, NOW, &mut || 0.0),
+            Some(Duration::from_secs(30))
+        );
+        // A reset time already past waits nothing.
+        let past = headers(&[("x-ratelimit-reset", "1700000000")]);
+        assert_eq!(
+            rate_limited_delay(&p, &past, NOW, &mut || 1.0),
+            Some(Duration::ZERO)
+        );
+        // Nothing usable: the exponential back-off applies.
+        let none = headers(&[("retry-after", "soon"), ("x-other", "5")]);
+        assert_eq!(rate_limited_delay(&p, &none, NOW, &mut || 0.0), None);
+    }
+
+    #[test]
+    fn without_rate_limited_back_off_retry_after_is_ignored() {
+        let p = policy("retriable-status-codes", 1);
+        let h = headers(&[("retry-after", "4")]);
+        assert_eq!(rate_limited_delay(&p, &h, NOW, &mut || 0.0), None);
     }
 }

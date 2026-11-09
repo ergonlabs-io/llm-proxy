@@ -1794,8 +1794,13 @@ impl RouterHandler {
                         );
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome)
-                                && sleep_backoff_and_reserve_retry(state, cb, &mut retry_guard)
-                                    .await
+                                && sleep_backoff_and_reserve_retry(
+                                    state,
+                                    cb,
+                                    &mut retry_guard,
+                                    None,
+                                )
+                                .await
                             {
                                 continue;
                             }
@@ -2406,6 +2411,7 @@ impl RouterHandler {
                                             state,
                                             cb,
                                             &mut retry_guard,
+                                            None,
                                         )
                                         .await
                                     {
@@ -2495,11 +2501,28 @@ impl RouterHandler {
                         let retriable = retry_state
                             .as_ref()
                             .is_some_and(|state| state.should_retry(&outcome));
+                        // A reset header (`Retry-After`) speaks for the
+                        // cluster that sent it. On a plain cluster the retry
+                        // goes back to it, so its wait applies; an aggregate's
+                        // retry moves to a member not yet tried, which has its
+                        // own rate limit, so the ordinary back-off applies.
+                        let reset_wait = if retriable && outcome_cluster == cluster_name {
+                            retry_state.as_ref().and_then(|state| {
+                                state.rate_limited_delay(
+                                    &resp.head.headers,
+                                    unix_now_secs(),
+                                    &mut rand::random::<f64>,
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         if retriable
                             && sleep_backoff_and_reserve_retry(
                                 retry_state.as_mut().expect("checked Some above"),
                                 cb,
                                 &mut retry_guard,
+                                reset_wait,
                             )
                             .await
                         {
@@ -2602,8 +2625,13 @@ impl RouterHandler {
                         );
                         if let Some(state) = &mut retry_state {
                             if state.should_retry(&outcome)
-                                && sleep_backoff_and_reserve_retry(state, cb, &mut retry_guard)
-                                    .await
+                                && sleep_backoff_and_reserve_retry(
+                                    state,
+                                    cb,
+                                    &mut retry_guard,
+                                    None,
+                                )
+                                .await
                             {
                                 continue;
                             }
@@ -2783,12 +2811,18 @@ fn finalize_upstream_response<G: Unpin + 'static>(
 /// threading a `rand::Rng` through) since this is the one real (not
 /// deterministically-tested) call site -- `retry.rs`'s own tests inject a
 /// fixed closure instead.
+///
+/// `reset_wait`, when set, replaces the exponential delay: the wait a
+/// rate-limited response asked for through a reset header such as
+/// `Retry-After`, already capped (`retry::rate_limited_delay`). The sleep is a
+/// timer, so the worker serves other streams meanwhile.
 async fn sleep_backoff_and_reserve_retry(
     state: &mut RetryState<'_>,
     cb: &proxy_cluster::CircuitBreakerState,
     retry_guard: &mut Option<CbGuard>,
+    reset_wait: Option<Duration>,
 ) -> bool {
-    let delay = state.backoff_delay(&mut rand::random::<f64>);
+    let delay = reset_wait.unwrap_or_else(|| state.backoff_delay(&mut rand::random::<f64>));
     tokio::time::sleep(delay).await;
     // A prior retry has just finished; it cannot consume a slot while this
     // request asks to issue its next retry. The request guard is still alive
@@ -2801,6 +2835,15 @@ async fn sleep_backoff_and_reserve_retry(
     *retry_guard = Some(guard);
     state.record_attempt();
     true
+}
+
+/// Wall-clock seconds since the Unix epoch, for `UNIX_TIMESTAMP` reset
+/// headers. A clock before the epoch reads as 0, which makes any such header
+/// wait its full (capped) value rather than panic.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The one call site for `ResponseFlag::UpstreamRetryLimitExceeded`

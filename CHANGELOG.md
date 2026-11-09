@@ -24,6 +24,30 @@ surfaces that an upgrade within 1.x keeps stable.
   - A "Spend by model and key, last 30 days" table on the admin UI Billing
     page, grouped in the browser from `/ledger/entries`. No admin route is
     added.
+- Failover and retry policy per route in the `--config` dialect, under
+  `routes[].retries`
+  ([docs](docs/site/src/content/docs/providers-and-routing/timeouts-and-retries.md)):
+  - `per_try_timeout`: an attempt with no response headers by then is
+    abandoned and the next attempt (the next fallback) goes out, instead of
+    the client waiting for `stream_idle_timeout`. With no attempt left the
+    client gets `504` (`UT`). The timed-out attempt is charged by its
+    provider's `unanswered_usage`. Opt-in; it does not bound the response
+    body.
+  - `on_status`: the statuses that fail over (default `429, 500, 502, 503`),
+    for example `[500, 502, 503, 504, 529]` to fail over on 504 and 529 but
+    return 429.
+  - `max_retry_after`: honour `Retry-After` (seconds) up to this cap before a
+    retry to the same provider. Not allowed on a route with `fallbacks`.
+  - A reset after the provider received the whole request is still never
+    retried.
+  - `retries.attempts` now defaults to `1` when `retries` is given without it,
+    as the schema documents.
+- Envoy mode: `RetryPolicy.rate_limited_retry_back_off` (`SECONDS` and
+  `UNIX_TIMESTAMP` reset headers). A header value above `max_interval` is
+  capped, where Envoy discards it, and on an aggregate cluster the wait is
+  skipped because the retry goes to another member. Route metadata
+  `io.llmproxy.retry: { retry_on_per_try_timeout: true }` retries a per-try
+  timeout without the `reset` trigger.
 
 ### Changed
 

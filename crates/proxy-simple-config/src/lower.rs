@@ -2264,6 +2264,41 @@ fn model_glob_matcher(pattern: &str) -> Option<Value> {
 const AGGREGATE_CLUSTER_CONFIG_TYPE_URL: &str =
     "type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig";
 
+/// Statuses that move a request to its next attempt when a route sets no
+/// `retries.on_status`.
+const DEFAULT_RETRY_STATUSES: [u16; 4] = [429, 500, 502, 503];
+
+/// S3, LLM-safe: retry a connect failure, a refused stream, a reset before
+/// the request was fully sent, and the route's `on_status` answers (by
+/// default 429, 500, 502 and 503). A reset after the provider read the whole
+/// request is never retried (`reset` is not set): the provider may already be
+/// generating, and a second dispatch could be billed twice. Envoy's router
+/// never retries once response bytes have streamed downstream.
+fn lower_retry_policy(retries: Option<&crate::model::Retries>, num_retries: u32) -> Value {
+    let statuses: &[u16] = retries
+        .and_then(|r| r.on_status.as_deref())
+        .unwrap_or(&DEFAULT_RETRY_STATUSES);
+    let mut policy = json!({
+        "retry_on": "connect-failure,refused-stream,reset-before-request",
+        "num_retries": num_retries,
+    });
+    if !statuses.is_empty() {
+        policy["retry_on"] =
+            json!("connect-failure,refused-stream,reset-before-request,retriable-status-codes");
+        policy["retriable_status_codes"] = json!(statuses);
+    }
+    if let Some(timeout) = retries.and_then(|r| r.per_try_timeout) {
+        policy["per_try_timeout"] = json!(timeout.to_string());
+    }
+    if let Some(wait) = retries.and_then(|r| r.max_retry_after) {
+        policy["rate_limited_retry_back_off"] = json!({
+            "reset_headers": [{ "name": "retry-after", "format": "SECONDS" }],
+            "max_interval": wait.to_string(),
+        });
+    }
+    policy
+}
+
 /// Lower `rule.provider` + `rule.fallbacks` into the route's `route.cluster`
 /// and, if there are fallbacks, the extra aggregate cluster that names them.
 /// Returns `(route, aggregate_cluster)`; the caller
@@ -2388,12 +2423,7 @@ fn lower_route(
         "host_rewrite_literal": up.host,
     });
 
-    // S3, LLM-safe: retry a connect failure, a refused stream, a reset before
-    // the request was fully sent, and a 429/500/502/503 answer. A reset after
-    // the provider read the whole request is not retried (`reset` is not
-    // set): the provider may already be generating, and a second dispatch
-    // could be billed twice. Envoy's router never retries once response bytes
-    // have streamed downstream.
+    // Triggers: see `lower_retry_policy`.
     let attempts = rule.retries.as_ref().map_or(1, |r| r.attempts);
     // `LoadBalancerContext::attempted_clusters` makes
     // each retry against an aggregate pick the NEXT member, so reaching the
@@ -2402,22 +2432,24 @@ fn lower_route(
     // AGENTS.md invariant 1's "accepted but not honored" shape again.
     let min_retries_for_failover = u32::try_from(member_count - 1).unwrap_or(u32::MAX);
     let num_retries = attempts.max(min_retries_for_failover);
-    if num_retries > 0 {
-        action["retry_policy"] = json!({
-            "retry_on": "connect-failure,refused-stream,reset-before-request,retriable-status-codes",
-            "num_retries": num_retries,
-            "retriable_status_codes": [429, 500, 502, 503],
-        });
+    let per_try_timeout = rule.retries.as_ref().and_then(|r| r.per_try_timeout);
+    // A per-try timeout acts with no retry left too: the attempt is cut and
+    // the client gets a 504 instead of waiting for the idle timeout.
+    if num_retries > 0 || per_try_timeout.is_some() {
+        action["retry_policy"] = lower_retry_policy(rule.retries.as_ref(), num_retries);
     }
 
     let mut route = json!({ "match": r#match, "route": action });
 
     if matches!(rule.streaming, Some(crate::model::StreamingMode::Strict)) {
-        route["metadata"] = json!({
-            "filter_metadata": {
-                "io.llmproxy.streaming": { "strict": true }
-            }
-        });
+        route["metadata"]["filter_metadata"]["io.llmproxy.streaming"] = json!({ "strict": true });
+    }
+    // Envoy's per-try timeout retries only under `5xx`, `gateway-error` or
+    // `reset`, and each of those would also resend a request the provider
+    // read in full and then reset. This trigger retries the timeout alone.
+    if per_try_timeout.is_some() {
+        route["metadata"]["filter_metadata"]["io.llmproxy.retry"] =
+            json!({ "retry_on_per_try_timeout": true });
     }
 
     // Token accounting follows the ROUTE's provider, not the listener's: one

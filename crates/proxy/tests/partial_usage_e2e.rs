@@ -31,6 +31,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_llm-proxy");
@@ -46,6 +47,10 @@ static UPSTREAM_QUIET: AtomicUsize = AtomicUsize::new(0);
 /// Requests with the `dropconn` marker: read in full, then the connection is
 /// closed with no response.
 static UPSTREAM_DROPPED: AtomicUsize = AtomicUsize::new(0);
+/// The `authorization` value of every request the streaming mock read.
+static UPSTREAM_AUTH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The `authorization` value of every request `spawn_silent_upstream` read.
+static SILENT_AUTH: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 const HMAC_SECRET: &str = "partial-usage-e2e-secret";
 const ADMIN_TOKEN: &str = "partial-usage-e2e-admin-token";
@@ -464,6 +469,113 @@ fn a_fallback_that_never_answers_is_charged_by_its_own_unanswered_usage() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `retries.per_try_timeout` on a route with a fallback: the primary reads
+/// the whole request and never answers, the attempt is abandoned at the
+/// timeout, and the client gets the backup's answer instead of waiting for the
+/// stream idle timeout. The abandoned attempt is charged by the primary's
+/// `unanswered_usage` (default `input`), on top of the backup's own usage,
+/// because the primary may still be generating it. The backup request carries
+/// only the backup's key, never the primary's (AGENTS.md invariant 6).
+#[test]
+fn a_primary_that_never_answers_fails_over_at_the_per_try_timeout() {
+    let dir = scratch_dir("per-try-timeout");
+    let proxy = Proxy::start(
+        &dir,
+        Extras {
+            providers: "  backup:\n    type: openai\n    base_url: http://{mock}\n    \
+                        api_key: sk-backup-provider-key\n",
+            route: ", fallbacks: [backup], retries: { per_try_timeout: 1s }",
+            primary: Some(spawn_silent_upstream()),
+            ..NO_EXTRAS
+        },
+    );
+    let key = mint_key(&proxy);
+    let response = post_to_end(proxy.listen, &key, &chat_body("clean"));
+    assert!(response.starts_with("HTTP/1.1 200"), "got:\n{response}");
+
+    let record = proxy.wait_for_records(1).remove(0);
+    let attempts = record["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2, "{record}");
+    assert_eq!(attempts[0]["cluster"], "provider:openai", "{record}");
+    assert_eq!(attempts[0]["termination"], "timeout", "{record}");
+    assert_eq!(attempts[1]["cluster"], "provider:backup", "{record}");
+    assert_eq!(attempts[1]["status"], 200, "{record}");
+
+    // The primary's estimate (request size over four, no output) plus the
+    // backup's reported 11 input and 5 output tokens.
+    let input = record["bytes_request"].as_u64().unwrap().div_ceil(4);
+    assert_eq!(attempts[0]["usage"]["input_tokens"], input, "{record}");
+    assert_eq!(attempts[0]["usage"]["output_tokens"], 0, "{record}");
+    let estimate = input * INPUT_NANO;
+    let answered = 11 * INPUT_NANO + 5 * OUTPUT_NANO;
+    assert_eq!(attempts[0]["cost"]["amount"], estimate, "{record}");
+    assert_eq!(attempts[1]["cost"]["amount"], answered, "{record}");
+    assert_eq!(
+        proxy.spend_micros(),
+        (estimate + answered) / 1000,
+        "both attempts charged once each: {record}"
+    );
+
+    assert_eq!(
+        *SILENT_AUTH.lock().unwrap(),
+        vec!["bearer sk-upstream-provider-key".to_owned()],
+        "the primary got its own key, once"
+    );
+    let backup_auth = UPSTREAM_AUTH.lock().unwrap().clone();
+    assert_eq!(
+        backup_auth,
+        vec!["bearer sk-backup-provider-key".to_owned()],
+        "the backup got only its own key"
+    );
+    drop(proxy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `retries.on_status` decides which answers fail over: a listed status
+/// (529) moves to the backup; 429 left out of the list is returned to the
+/// client, as is a status from the old default list (503) that this route no
+/// longer lists. The backup is the streaming mock, which answers 200.
+#[test]
+fn on_status_decides_which_answers_fail_over() {
+    for (on_status, primary_status, fails_over) in [
+        ("[504, 529]", 529, true),
+        ("[500, 503]", 429, false),
+        ("[504]", 503, false),
+    ] {
+        let dir = scratch_dir(&format!("on-status-{primary_status}"));
+        let route: &'static str = Box::leak(
+            format!(", fallbacks: [backup], retries: {{ on_status: {on_status} }}")
+                .into_boxed_str(),
+        );
+        let proxy = Proxy::start(
+            &dir,
+            Extras {
+                providers: "  backup:\n    type: openai\n    base_url: http://{mock}\n    \
+                            api_key: sk-backup-provider-key\n",
+                route,
+                primary: Some(spawn_status_upstream(primary_status)),
+                ..NO_EXTRAS
+            },
+        );
+        let key = mint_key(&proxy);
+        let response = post_to_end(proxy.listen, &key, &chat_body("clean"));
+        let expected = if fails_over { 200 } else { primary_status };
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {expected}")),
+            "on_status {on_status}, primary {primary_status}: got\n{response}"
+        );
+        let record = proxy.wait_for_records(1).remove(0);
+        let attempts = record["attempts"].as_array().unwrap();
+        assert_eq!(
+            attempts.len(),
+            if fails_over { 2 } else { 1 },
+            "on_status {on_status}, primary {primary_status}: {record}"
+        );
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The dialect's default retry does not send a request again after the
 /// provider read the whole of it and closed the connection without a response:
 /// the provider may already be generating, so a second dispatch could be
@@ -521,9 +633,58 @@ fn assert_input_estimate_charged(proxy: &Proxy, record: &serde_json::Value, outp
     input
 }
 
+/// The `authorization` header value in a lowercased request head, or empty.
+fn authorization(head: &str) -> String {
+    head.lines()
+        .find_map(|l| l.strip_prefix("authorization:"))
+        .map(|v| v.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// An upstream that reads each request in full, records its
+/// `authorization`, and never answers: it holds the connection until the
+/// proxy closes it (bounded by the read timeout).
+fn spawn_silent_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent upstream");
+    let addr = listener.local_addr().expect("no local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let head_end = loop {
+                    if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i;
+                    }
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+                SILENT_AUTH.lock().unwrap().push(authorization(&head));
+                // Read the body and wait for the proxy to hang up.
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 /// An upstream that answers every request `503` once it has read it.
 fn spawn_503_upstream() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 503 upstream");
+    spawn_status_upstream(503)
+}
+
+/// An upstream that answers every request `status` once it has read it.
+fn spawn_status_upstream(status: u16) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind status upstream");
     let addr = listener.local_addr().expect("no local addr");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -533,8 +694,11 @@ fn spawn_503_upstream() -> SocketAddr {
                 let mut buf = [0u8; 8192];
                 let _ = stream.read(&mut buf);
                 let _ = stream.write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
-                      Connection: close\r\n\r\n",
+                    format!(
+                        "HTTP/1.1 {status} Upstream\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
                 );
             });
         }
@@ -1125,6 +1289,7 @@ fn serve_stream(stream: &mut TcpStream) {
         }
     }
     let body = String::from_utf8_lossy(&raw[head_end + 4..]).to_string();
+    UPSTREAM_AUTH.lock().unwrap().push(authorization(&head));
     let abort = body.contains("abort");
     let reset = body.contains("reset");
     let stall = body.contains("stall");
