@@ -7533,6 +7533,8 @@ fn convert_retry_policy(
         retry_back_off,
         host_selection_retry_max_attempts,
         avoid_previous_hosts,
+        retry_on_per_try_timeout: false,
+        rate_limited_back_off: None,
     })
 }
 

@@ -6549,6 +6549,8 @@ mod tests {
             },
             host_selection_retry_max_attempts: 1,
             avoid_previous_hosts: false,
+            retry_on_per_try_timeout: false,
+            rate_limited_back_off: None,
         }
     }
 

@@ -1880,6 +1880,46 @@ pub struct RetryPolicyIR {
     /// configured.  The router records every dispatched host on the request
     /// context; the load balancer re-picks when this predicate rejects one.
     pub avoid_previous_hosts: bool,
+    /// A per-try timeout is retriable on its own, without the `5xx`,
+    /// `gateway-error` or `reset` triggers that would also retry a reset
+    /// after the provider received the whole request. Set from
+    /// `Route.metadata.filter_metadata["io.llmproxy.retry"]`; Envoy has no
+    /// such trigger (`envoy-divergences.md`, per-try timeout retry row).
+    pub retry_on_per_try_timeout: bool,
+    /// S3.3 rate-limited back-off: a retried response that carries one of
+    /// these headers waits the interval it names, capped, instead of the
+    /// exponential back-off. `None` when `rate_limited_retry_back_off` is
+    /// absent. Boxed: it is rare, and inline it would make every route
+    /// action carry its size.
+    pub rate_limited_back_off: Option<Box<RateLimitedBackOff>>,
+}
+
+/// Envoy `RetryPolicy.rate_limited_retry_back_off`: wait the interval a
+/// response header such as `Retry-After` names before the retry. The wait is
+/// capped at `max_interval`; Envoy instead discards a longer value
+/// (`envoy-divergences.md`, rate-limited back-off row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitedBackOff {
+    /// Tried in order; the first that parses is used. Never empty.
+    pub reset_headers: Vec<ResetHeader>,
+    /// The longest wait a header can ask for. Envoy default 300s.
+    pub max_interval: Duration,
+}
+
+/// One `rate_limited_retry_back_off.reset_headers` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetHeader {
+    pub name: http::HeaderName,
+    pub format: ResetHeaderFormat,
+}
+
+/// How a reset header's value names the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetHeaderFormat {
+    /// An integer number of seconds to wait (`Retry-After: 120`).
+    Seconds,
+    /// An integer Unix time in seconds to retry at (`X-RateLimit-Reset`).
+    UnixTimestamp,
 }
 
 /// S3.3 backoff: attempt *n* (1-based) waits a delay drawn uniformly from

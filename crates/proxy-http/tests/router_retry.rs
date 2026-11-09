@@ -76,6 +76,8 @@ fn retry_policy(retry_on: &str, num_retries: u32) -> RetryPolicyIR {
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,
         avoid_previous_hosts: false,
+        retry_on_per_try_timeout: false,
+        rate_limited_back_off: None,
     }
 }
 
@@ -1100,6 +1102,8 @@ fn retry_policy_with_per_try_timeout(
         retry_back_off: fast_backoff(),
         host_selection_retry_max_attempts: 1,
         avoid_previous_hosts: false,
+        retry_on_per_try_timeout: false,
+        rate_limited_back_off: None,
     }
 }
 

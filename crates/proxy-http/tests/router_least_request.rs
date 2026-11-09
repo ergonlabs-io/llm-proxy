@@ -328,6 +328,8 @@ async fn a_failed_attempt_leaves_no_count_and_the_retry_is_counted() {
                 },
                 host_selection_retry_max_attempts: 1,
                 avoid_previous_hosts: false,
+                retry_on_per_try_timeout: false,
+                rate_limited_back_off: None,
             };
             let h = build(&[closed, live], Some(policy)).await;
 
@@ -574,6 +576,8 @@ async fn a_hedge_counts_each_attempted_host_once_and_releases_both() {
                 },
                 host_selection_retry_max_attempts: 1,
                 avoid_previous_hosts: false,
+                retry_on_per_try_timeout: false,
+                rate_limited_back_off: None,
             };
             let h = build(&addrs, Some(policy)).await;
             let mut req = request();
